@@ -5,10 +5,13 @@
 This guide focuses **exclusively on guest hotspot users** - customers who pay for temporary internet access (e.g., 1 hour, 24 hours, 7 days).
 
 ### Guest Hotspot User Flow:
-1. Customer connects to WiFi and gets captive portal
-2. Customer selects a plan and pays via M-Pesa
-3. System provisions them on MikroTik with time limit
-4. When time expires, access is automatically cut off
+1. **Unknown guest** connects to WiFi → Gets captive portal
+2. Guest selects plan (1h, 24h, 7d) and pays via M-Pesa
+3. Payment callback **auto-registers** guest in system
+4. System provisions them on MikroTik with time limit
+5. When time expires, access is automatically cut off
+
+**✨ No pre-registration required!** System creates customer on first payment.
 
 ---
 
@@ -27,13 +30,14 @@ http://localhost:8000
 
 ---
 
-## 🚀 Quick Start (5 Steps to Test Guest Hotspot)
+## 🚀 Quick Start (4 Steps to Test Guest Hotspot)
 
 1. **Setup Router** → Add your MikroTik router
 2. **Create Plans** → Define time-based plans (1h, 24h, 7d)
-3. **Test Registration** → Register guest with MAC address
-4. **Test Payment** → Simulate payment callback
-5. **Verify Access** → Check MikroTik provisioning
+3. **Test Payment** → Simulate payment (auto-registers guest)
+4. **Verify Access** → Check customer created & MikroTik provisioning
+
+**✨ NEW:** No pre-registration needed! Payment auto-creates guest accounts.
 
 ---
 
@@ -221,106 +225,23 @@ Body: None
 
 ---
 
-## ✅ **STEP 3: Register Guest Customer**
+## ✅ **STEP 3: Simulate Guest Payment (Auto-Registration)**
 
-### 3.1: Register Guest with MAC Address
-
-#### Purpose
-Register a guest customer who will pay for access
-
-#### Request
-```
-Method: POST
-URL: http://localhost:8000/api/customers/register
-Headers: 
-    Content-Type: application/json
-Body: (raw JSON)
-```
-
-```json
-{
-    "name": "Guest User 1",
-    "phone": "+254712345678",
-    "plan_id": 2,
-    "router_id": 1,
-    "mac_address": "AA:BB:CC:DD:EE:FF"
-}
-```
-
-**Note:** 
-- `plan_id: 2` = 24 Hours Plan
-- `mac_address` = Customer's device MAC address from captive portal
-
-#### Expected Response
-```json
-{
-    "id": 1,
-    "name": "Guest User 1",
-    "phone": "+254712345678",
-    "mac_address": "AA:BB:CC:DD:EE:FF",
-    "pppoe_username": null,
-    "static_ip": null,
-    "status": "INACTIVE",
-    "plan_id": 2,
-    "router_id": 1,
-    "user_id": 1,
-    "expiry": null,
-    "created_at": "2025-10-20T10:30:00.000000"
-}
-```
-
-**Status:** `INACTIVE` - Customer registered but hasn't paid yet
-
----
-
-### 3.2: Verify Customer Registered
-
-#### Request
-```
-Method: GET
-URL: http://localhost:8000/api/customers
-Headers: None
-Body: None
-```
-
-#### Expected Response
-```json
-[
-    {
-        "id": 1,
-        "name": "Guest User 1",
-        "phone": "+254712345678",
-        "mac_address": "AA:BB:CC:DD:EE:FF",
-        "status": "INACTIVE",
-        "expiry": null,
-        "plan": {
-            "id": 2,
-            "name": "24 Hours Plan",
-            "price": 100
-        },
-        "router": {
-            "id": 1,
-            "name": "Guest Hotspot Router"
-        }
-    }
-]
-```
-
----
-
-## ✅ **STEP 4: Process Payment (Guest Pays for Access)**
-
-### 4.1: Simulate M-Pesa Payment Callback
+### 3.1: Simulate M-Pesa Payment Callback
 
 #### Purpose
-Test the complete payment-to-provisioning workflow for guest user
+Test the complete payment workflow for a **NEW unknown guest**
 
 #### Real-World Flow:
-1. Guest selects "24 Hours Plan" on captive portal
-2. Enters phone number and initiates M-Pesa payment
-3. Pays KES 100 via M-Pesa
-4. Payment gateway calls this webhook
-5. System provisions guest on MikroTik with 24h time limit
+1. **Unknown guest** connects to WiFi → Gets captive portal with MAC address
+2. Guest selects "24 Hours Plan" on captive portal
+3. Enters phone number `+254712345678` and initiates M-Pesa payment
+4. Pays KES 100 via M-Pesa
+5. **Payment gateway calls this webhook** with guest info
+6. System **auto-registers** the guest (creates customer record)
+7. System provisions guest on MikroTik with 24h time limit
+
+**🎯 Key Point:** No pre-registration needed! Payment auto-creates the customer.
 
 #### Request
 ```
@@ -334,6 +255,9 @@ Body: (raw JSON)
 ```json
 {
     "customer_ref": "AA:BB:CC:DD:EE:FF",
+    "phone_number": "+254712345678",
+    "plan_id": 2,
+    "router_id": 1,
     "status": "completed",
     "amount": 100,
     "lipay_tx_no": "QAB12345678",
@@ -342,7 +266,13 @@ Body: (raw JSON)
 }
 ```
 
-**Note:** `customer_ref` is the MAC address
+**Payload Fields:**
+- `customer_ref` = MAC address from captive portal
+- `phone_number` = Guest's M-Pesa phone number
+- `plan_id` = Plan selected (2 = 24 Hours Plan)
+- `router_id` = Router at the location (1 = Guest Hotspot Router)
+- `amount` = Payment amount
+- `status` = "completed" for successful payment
 
 #### Expected Response
 ```json
@@ -352,14 +282,21 @@ Body: (raw JSON)
 }
 ```
 
+**What Happened:**
+1. ✅ System detected MAC `AA:BB:CC:DD:EE:FF` doesn't exist
+2. ✅ Auto-created customer record: `Guest 5678` (last 4 digits of phone)
+3. ✅ Set status to `ACTIVE`
+4. ✅ Calculated expiry: 24 hours from now
+5. ✅ Provisioned on MikroTik router with time limit
+
 #### Status Code
 `200 OK`
 
 ---
 
-## ✅ **STEP 5: Verify Guest Provisioning**
+## ✅ **STEP 4: Verify Guest Provisioning**
 
-### 5.1: Check Customer Status in Database
+### 4.1: Check Customer Auto-Created
 
 #### Request
 ```
@@ -374,7 +311,7 @@ Body: None
 [
     {
         "id": 1,
-        "name": "Guest User 1",
+        "name": "Guest 5678",
         "phone": "+254712345678",
         "mac_address": "AA:BB:CC:DD:EE:FF",
         "status": "ACTIVE",
@@ -383,17 +320,23 @@ Body: None
             "id": 2,
             "name": "24 Hours Plan",
             "price": 100
+        },
+        "router": {
+            "id": 1,
+            "name": "Guest Hotspot Router"
         }
     }
 ]
 ```
 
-**✅ Status changed:** `INACTIVE` → `ACTIVE`  
-**✅ Expiry set:** 24 hours from payment time
+**✅ Customer auto-created:** `Guest 5678` (from phone number)  
+**✅ Status:** `ACTIVE`  
+**✅ Expiry set:** 24 hours from payment time  
+**✅ Assigned to router:** Router ID 1
 
 ---
 
-### 5.2: Check MAC Registration Status
+### 4.2: Check MAC Registration Status
 
 #### Purpose
 Verify guest is provisioned on MikroTik
@@ -422,7 +365,7 @@ Body: None
 
 ---
 
-### 5.3: Verify on MikroTik Router
+### 4.3: Verify on MikroTik Router
 
 #### Manual Verification Steps:
 
@@ -626,7 +569,9 @@ Expiry extended by another 24 hours
 
 ### Setup
 - `POST /api/routers/create` - Add router
+- `PUT /api/routers/{id}` - Update router
 - `POST /api/plans/create` - Create time-based plan
+- `DELETE /api/plans/{id}` - Delete plan
 - `GET /api/plans` - List all plans
 
 ### Guest Operations
@@ -636,9 +581,593 @@ Expiry extended by another 24 hours
 - `POST /api/public/disconnect/{router_id}/{mac}` - Disconnect
 - `DELETE /api/public/remove-bypassed/{router_id}/{mac}` - Remove
 
+### Dashboard & Analytics
+- `GET /api/dashboard/overview` - Complete dashboard with revenue & metrics
+- `GET /api/customers/active` - List currently active guests
+- `GET /api/plans/performance` - Plan sales & revenue analysis
+
 ### Monitoring
 - `GET /api/customers` - List all guests
 - `GET /api/routers/{id}/users` - Active users on router
+- `GET /api/mpesa/transactions` - View M-Pesa transactions with filters
+- `GET /api/mpesa/transactions/summary` - Transaction statistics
+
+---
+
+## 📊 **Dashboard Endpoints for Business Management**
+
+### Get Dashboard Overview
+
+#### Purpose
+Get complete business metrics for your dashboard homepage
+
+#### Request
+```
+Method: GET
+URL: http://localhost:8000/api/dashboard/overview
+Headers: None
+Body: None
+```
+
+#### Expected Response
+```json
+{
+    "revenue": {
+        "today": 500.0,
+        "this_week": 3500.0,
+        "this_month": 15000.0,
+        "all_time": 50000.0
+    },
+    "customers": {
+        "total": 150,
+        "active": 45,
+        "inactive": 105
+    },
+    "revenue_by_router": [
+        {
+            "router_id": 1,
+            "router_name": "Guest Hotspot Router",
+            "transaction_count": 120,
+            "revenue": 12000.0
+        }
+    ],
+    "revenue_by_plan": [
+        {
+            "plan_id": 1,
+            "plan_name": "1 Hour Plan",
+            "plan_price": 50,
+            "sales_count": 80,
+            "revenue": 4000.0
+        },
+        {
+            "plan_id": 2,
+            "plan_name": "24 Hours Plan",
+            "plan_price": 100,
+            "sales_count": 60,
+            "revenue": 6000.0
+        }
+    ],
+    "recent_transactions": [
+        {
+            "payment_id": 10,
+            "amount": 100.0,
+            "customer_name": "Guest 5678",
+            "customer_phone": "+254712345678",
+            "plan_name": "24 Hours Plan",
+            "payment_date": "2025-10-20T15:30:00.000000",
+            "payment_method": "mobile_money"
+        }
+    ],
+    "expiring_soon": [
+        {
+            "customer_id": 5,
+            "customer_name": "Guest 1234",
+            "customer_phone": "+254798765432",
+            "mac_address": "BB:CC:DD:EE:FF:00",
+            "expiry": "2025-10-21T10:30:00.000000",
+            "hours_remaining": 3.5
+        }
+    ],
+    "generated_at": "2025-10-20T16:00:00.000000"
+}
+```
+
+**Use Cases:**
+- Homepage dashboard widget
+- Quick business overview
+- Identify guests expiring soon (renewal opportunities)
+- Compare router performance
+- Identify best-selling plans
+
+---
+
+### Get Active Guests
+
+#### Purpose
+List all currently active guests with time remaining
+
+#### Request
+```
+Method: GET
+URL: http://localhost:8000/api/customers/active
+Headers: None
+Body: None
+```
+
+#### Expected Response
+```json
+[
+    {
+        "id": 1,
+        "name": "Guest 5678",
+        "phone": "+254712345678",
+        "mac_address": "AA:BB:CC:DD:EE:FF",
+        "status": "active",
+        "expiry": "2025-10-21T10:30:00.000000",
+        "hours_remaining": 18.5,
+        "plan": {
+            "id": 2,
+            "name": "24 Hours Plan",
+            "price": 100
+        },
+        "router": {
+            "id": 1,
+            "name": "Guest Hotspot Router"
+        }
+    }
+]
+```
+
+**Sorted by:** Expiry time (soonest first)
+
+**Use Cases:**
+- Monitor who's online
+- See when guests will expire
+- Proactive customer service
+
+---
+
+### Get Plan Performance
+
+#### Purpose
+Analyze which plans are selling best
+
+#### Request - All Time
+```
+Method: GET
+URL: http://localhost:8000/api/plans/performance
+Headers: None
+Body: None
+```
+
+#### Request - Specific Period
+```
+Method: GET
+URL: http://localhost:8000/api/plans/performance?start_date=2025-10-01&end_date=2025-10-31
+Headers: None
+Body: None
+```
+
+#### Expected Response
+```json
+{
+    "plans": [
+        {
+            "plan_id": 1,
+            "plan_name": "1 Hour Plan",
+            "plan_price": 50,
+            "duration": "1 hours",
+            "total_customers": 80,
+            "total_sales": 120,
+            "total_revenue": 6000.0,
+            "average_revenue_per_sale": 50.0,
+            "active_customers": 15
+        },
+        {
+            "plan_id": 2,
+            "plan_name": "24 Hours Plan",
+            "plan_price": 100,
+            "duration": "24 hours",
+            "total_customers": 60,
+            "total_sales": 80,
+            "total_revenue": 8000.0,
+            "average_revenue_per_sale": 100.0,
+            "active_customers": 25
+        },
+        {
+            "plan_id": 3,
+            "plan_name": "7 Days Plan",
+            "plan_price": 500,
+            "duration": "7 days",
+            "total_customers": 10,
+            "total_sales": 15,
+            "total_revenue": 7500.0,
+            "average_revenue_per_sale": 500.0,
+            "active_customers": 5
+        }
+    ],
+    "period": {
+        "start_date": "2025-10-01",
+        "end_date": "2025-10-31"
+    }
+}
+```
+
+**Insights:**
+- Which plans generate most revenue
+- Which plans are most popular
+- Repeat purchase rate (total_sales vs total_customers)
+- Current active users per plan
+
+---
+
+### Update Router
+
+#### Purpose
+Update router IP, credentials, or name
+
+#### Request
+```
+Method: PUT
+URL: http://localhost:8000/api/routers/1
+Headers: 
+    Content-Type: application/json
+Body: (raw JSON)
+```
+
+```json
+{
+    "name": "Updated Router Name",
+    "ip_address": "192.168.88.2",
+    "username": "admin",
+    "password": "newpassword",
+    "port": 8728
+}
+```
+
+#### Expected Response
+```json
+{
+    "id": 1,
+    "name": "Updated Router Name",
+    "ip_address": "192.168.88.2",
+    "username": "admin",
+    "port": 8728,
+    "user_id": 1,
+    "updated_at": "2025-10-20T16:00:00.000000"
+}
+```
+
+---
+
+### Delete Plan
+
+#### Purpose
+Remove a plan (only if no active customers using it)
+
+#### Request
+```
+Method: DELETE
+URL: http://localhost:8000/api/plans/1
+Headers: None
+Body: None
+```
+
+#### Expected Response - Success
+```json
+{
+    "success": true,
+    "message": "Plan '1 Hour Plan' deleted successfully"
+}
+```
+
+#### Expected Response - Has Active Customers
+```json
+{
+    "detail": "Cannot delete plan. 15 active customer(s) are using this plan"
+}
+```
+
+**Status Code:** `400 Bad Request`
+
+**Safety:** Cannot delete plans with active users
+
+---
+
+## 📊 **M-Pesa Transaction Monitoring**
+
+### View All Transactions
+
+#### Purpose
+View all M-Pesa payment transactions with filtering options
+
+#### Request - Get All Transactions
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions
+Headers: None
+Body: None
+```
+
+#### Expected Response
+```json
+[
+    {
+        "transaction_id": 1,
+        "checkout_request_id": "ws_CO_12345678901234567890",
+        "phone_number": "+254712345678",
+        "amount": 100.0,
+        "reference": "AA:BB:CC:DD:EE:FF",
+        "lipay_tx_no": "QAB12345678",
+        "status": "completed",
+        "mpesa_receipt_number": "QAB12345678",
+        "transaction_date": "2025-10-20T10:30:00.000000",
+        "created_at": "2025-10-20T10:25:00.000000",
+        "customer": {
+            "id": 1,
+            "name": "Guest User 1",
+            "phone": "+254712345678",
+    "mac_address": "AA:BB:CC:DD:EE:FF",
+            "status": "active"
+        },
+        "router": {
+            "id": 1,
+            "name": "Guest Hotspot Router",
+            "ip_address": "192.168.88.1"
+        },
+        "plan": {
+            "id": 2,
+            "name": "24 Hours Plan",
+            "price": 100,
+            "duration_value": 24,
+            "duration_unit": "HOURS"
+        }
+    }
+]
+```
+
+---
+
+### Filter Transactions by Router
+
+#### Purpose
+View transactions for a specific router only
+
+#### Request
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions?router_id=1
+Headers: None
+Body: None
+```
+
+**Filter:** Only shows transactions from guests connected to Router ID 1
+
+---
+
+### Filter Transactions by Date Range
+
+#### Purpose
+View transactions within a specific time period
+
+#### Request - Daily Report
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions?start_date=2025-10-20&end_date=2025-10-20
+Headers: None
+Body: None
+```
+
+#### Request - Monthly Report
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions?start_date=2025-10-01&end_date=2025-10-31
+Headers: None
+Body: None
+```
+
+#### Request - With Specific Time
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions?start_date=2025-10-20T00:00:00&end_date=2025-10-20T23:59:59
+Headers: None
+Body: None
+```
+
+**Date Format Options:**
+- `YYYY-MM-DD` - Full day (e.g., `2025-10-20`)
+- `YYYY-MM-DDTHH:MM:SS` - Specific time (e.g., `2025-10-20T14:30:00`)
+
+---
+
+### Filter Transactions by Status
+
+#### Purpose
+View only completed, pending, or failed transactions
+
+#### Request - Completed Payments Only
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions?status=completed
+Headers: None
+Body: None
+```
+
+#### Request - Failed Payments Only
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions?status=failed
+Headers: None
+Body: None
+```
+
+#### Request - Pending Payments
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions?status=pending
+Headers: None
+Body: None
+```
+
+**Valid Status Values:**
+- `completed` - Successful payments
+- `pending` - Payment in progress
+- `failed` - Failed payments
+- `expired` - Expired payment requests
+
+---
+
+### Combined Filters
+
+#### Purpose
+Combine multiple filters for specific reports
+
+#### Request - Router Transactions for Today (Completed)
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions?router_id=1&start_date=2025-10-20&end_date=2025-10-20&status=completed
+Headers: None
+Body: None
+```
+
+#### Request - Last Week's Failed Payments
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions?start_date=2025-10-13&end_date=2025-10-20&status=failed
+Headers: None
+Body: None
+```
+
+---
+
+### Get Transaction Summary (Statistics)
+
+#### Purpose
+Get aggregated statistics about transactions
+
+#### Request
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions/summary
+Headers: None
+Body: None
+```
+
+#### Expected Response
+```json
+{
+    "total_transactions": 15,
+    "total_amount": 1500.0,
+    "status_breakdown": {
+        "completed": {
+            "count": 12,
+            "amount": 1200.0
+        },
+        "pending": {
+            "count": 2,
+            "amount": 200.0
+        },
+        "failed": {
+            "count": 1,
+            "amount": 100.0
+        }
+    },
+    "router_breakdown": {
+        "Guest Hotspot Router": {
+            "count": 15,
+            "amount": 1500.0,
+            "router_id": 1
+        }
+    },
+    "period": {
+        "start_date": null,
+        "end_date": null
+    }
+}
+```
+
+---
+
+### Summary with Filters
+
+#### Request - Today's Summary for Specific Router
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions/summary?router_id=1&start_date=2025-10-20&end_date=2025-10-20
+Headers: None
+Body: None
+```
+
+#### Request - Monthly Summary
+```
+Method: GET
+URL: http://localhost:8000/api/mpesa/transactions/summary?start_date=2025-10-01&end_date=2025-10-31
+Headers: None
+Body: None
+```
+
+#### Expected Response
+```json
+{
+    "total_transactions": 45,
+    "total_amount": 4500.0,
+    "status_breakdown": {
+        "completed": {
+            "count": 40,
+            "amount": 4000.0
+        },
+        "failed": {
+            "count": 5,
+            "amount": 500.0
+        }
+    },
+    "router_breakdown": {
+        "Guest Hotspot Router": {
+            "count": 45,
+            "amount": 4500.0,
+            "router_id": 1
+        }
+    },
+    "period": {
+        "start_date": "2025-10-01",
+        "end_date": "2025-10-31"
+    }
+}
+```
+
+---
+
+## 📈 **Common Use Cases for Transaction Monitoring**
+
+### Daily Revenue Report
+```
+GET /api/mpesa/transactions/summary?start_date=2025-10-20&end_date=2025-10-20
+```
+**Use:** Check today's earnings
+
+### Weekly Performance
+```
+GET /api/mpesa/transactions/summary?start_date=2025-10-13&end_date=2025-10-20
+```
+**Use:** Analyze weekly trends
+
+### Router-Specific Report
+```
+GET /api/mpesa/transactions?router_id=1&start_date=2025-10-01&end_date=2025-10-31
+```
+**Use:** Check performance of specific router
+
+### Failed Payment Investigation
+```
+GET /api/mpesa/transactions?status=failed&start_date=2025-10-01&end_date=2025-10-31
+```
+**Use:** Investigate payment issues
+
+### Hourly Sales (Today)
+```
+GET /api/mpesa/transactions?start_date=2025-10-20T00:00:00&end_date=2025-10-20T23:59:59&status=completed
+```
+**Use:** Track sales throughout the day
 
 ---
 

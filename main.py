@@ -250,14 +250,17 @@ async def mpesa_callback(payload: dict, background_tasks: BackgroundTasks, db: A
     logger.info(f"--- M-Pesa Callback Received: {json.dumps(payload, indent=2)}")
 
     # Extract values from the incoming payload
-    mac_address = payload.get("customer_ref")
+    mac_address = payload.get("customer_ref")  # MAC address
+    phone_number = payload.get("phone_number")  # Guest's phone number
     status = payload.get("status")
     amount = payload.get("amount")
     tx_no = payload.get("lipay_tx_no")
-    checkout_request_id = payload.get("checkout_request_id")  # If available
-    receipt_number = payload.get("receipt_number")  # If available
+    checkout_request_id = payload.get("checkout_request_id")
+    receipt_number = payload.get("receipt_number")
+    plan_id = payload.get("plan_id")  # Plan selected by guest
+    router_id = payload.get("router_id")  # Router at the location
 
-    logger.info(f"Parsed payload - mac_address: {mac_address}, status: {status}, amount: {amount}, tx_no: {tx_no}")
+    logger.info(f"Parsed payload - mac: {mac_address}, phone: {phone_number}, status: {status}, amount: {amount}, plan_id: {plan_id}, router_id: {router_id}")
 
     if not mac_address:
         logger.error("Missing MAC Address in callback")
@@ -273,8 +276,57 @@ async def mpesa_callback(payload: dict, background_tasks: BackgroundTasks, db: A
     customer = result.scalar_one_or_none()
     logger.info(f"Customers found for MAC {mac_address}: {'1' if customer else '0'}")
 
-    if not customer:
-        logger.error(f"No customer found for MAC {mac_address}")
+    # AUTO-REGISTER: If customer doesn't exist and payment is completed, create them
+    if not customer and status == "completed":
+        logger.info(f"New guest detected. Auto-registering MAC {mac_address}")
+        
+        # Validate required fields for new customer
+        if not plan_id or not router_id or not phone_number:
+            logger.error(f"Missing required fields for new customer. plan_id: {plan_id}, router_id: {router_id}, phone: {phone_number}")
+            return {"ResultCode": 1, "ResultDesc": "Missing plan_id, router_id, or phone_number for new customer"}
+        
+        # Verify plan exists
+        plan_stmt = select(Plan).where(Plan.id == plan_id)
+        plan_result = await db.execute(plan_stmt)
+        plan = plan_result.scalar_one_or_none()
+        if not plan:
+            logger.error(f"Plan {plan_id} not found")
+            return {"ResultCode": 1, "ResultDesc": f"Plan {plan_id} not found"}
+        
+        # Verify router exists
+        router_stmt = select(Router).where(Router.id == router_id)
+        router_result = await db.execute(router_stmt)
+        router = router_result.scalar_one_or_none()
+        if not router:
+            logger.error(f"Router {router_id} not found")
+            return {"ResultCode": 1, "ResultDesc": f"Router {router_id} not found"}
+        
+        # Create new customer
+        customer = Customer(
+            name=f"Guest {phone_number[-4:]}",  # Use last 4 digits of phone
+            phone=phone_number,
+            mac_address=mac_address,
+            status=CustomerStatus.INACTIVE,  # Will be set to ACTIVE below
+            plan_id=plan_id,
+            router_id=router_id,
+            user_id=router.user_id  # Assign to router owner
+        )
+        db.add(customer)
+        await db.flush()  # Get customer ID before commit
+        
+        logger.info(f"[AUTO-REGISTER] New customer created: ID {customer.id}, MAC {mac_address}, Plan {plan_id}, Router {router_id}")
+        
+        # Reload with relationships
+        stmt = (
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(Customer.id == customer.id)
+        )
+        result = await db.execute(stmt)
+        customer = result.scalar_one_or_none()
+    
+    elif not customer:
+        logger.error(f"No customer found for MAC {mac_address} and status is not completed")
         return {"ResultCode": 1, "ResultDesc": "Customer not found"}
 
     if status == "completed":
@@ -1843,6 +1895,430 @@ async def get_mpesa_transactions_summary(
 @app.get("/")
 def read_root():
     return {"message": "ISP Billing SaaS API", "version": "1.0.0"}
+
+# Dashboard Overview Endpoint
+@app.get("/api/dashboard/overview")
+async def get_dashboard_overview(
+    user_id: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get dashboard overview with key business metrics
+    
+    Returns:
+    - Total revenue (today, this week, this month, all time)
+    - Active guests count
+    - Total guests count
+    - Revenue by router
+    - Revenue by plan
+    - Recent transactions
+    """
+    try:
+        from sqlalchemy import func
+        from datetime import date, timedelta
+        
+        now = datetime.utcnow()
+        today_start = datetime(now.year, now.month, now.day)
+        week_start = today_start - timedelta(days=now.weekday())
+        month_start = datetime(now.year, now.month, 1)
+        
+        # Get all customers for this user
+        customers_stmt = select(Customer).where(Customer.user_id == user_id)
+        customers_result = await db.execute(customers_stmt)
+        all_customers = customers_result.scalars().all()
+        
+        total_customers = len(all_customers)
+        active_customers = sum(1 for c in all_customers if c.status == CustomerStatus.ACTIVE)
+        
+        # Get revenue from customer_payments
+        from app.db.models import CustomerPayment
+        
+        # Total revenue all time
+        total_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+            CustomerPayment.reseller_id == user_id
+        )
+        total_revenue_result = await db.execute(total_revenue_stmt)
+        total_revenue = float(total_revenue_result.scalar() or 0)
+        
+        # Today's revenue
+        today_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+            CustomerPayment.reseller_id == user_id,
+            CustomerPayment.created_at >= today_start
+        )
+        today_revenue_result = await db.execute(today_revenue_stmt)
+        today_revenue = float(today_revenue_result.scalar() or 0)
+        
+        # This week's revenue
+        week_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+            CustomerPayment.reseller_id == user_id,
+            CustomerPayment.created_at >= week_start
+        )
+        week_revenue_result = await db.execute(week_revenue_stmt)
+        week_revenue = float(week_revenue_result.scalar() or 0)
+        
+        # This month's revenue
+        month_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+            CustomerPayment.reseller_id == user_id,
+            CustomerPayment.created_at >= month_start
+        )
+        month_revenue_result = await db.execute(month_revenue_stmt)
+        month_revenue = float(month_revenue_result.scalar() or 0)
+        
+        # Revenue by router
+        router_revenue_stmt = select(
+            Router.id,
+            Router.name,
+            func.count(CustomerPayment.id).label('transaction_count'),
+            func.sum(CustomerPayment.amount).label('revenue')
+        ).join(
+            Customer, Customer.router_id == Router.id
+        ).join(
+            CustomerPayment, CustomerPayment.customer_id == Customer.id
+        ).where(
+            Router.user_id == user_id
+        ).group_by(Router.id, Router.name)
+        
+        router_revenue_result = await db.execute(router_revenue_stmt)
+        router_revenue = [
+            {
+                "router_id": row.id,
+                "router_name": row.name,
+                "transaction_count": row.transaction_count,
+                "revenue": float(row.revenue or 0)
+            }
+            for row in router_revenue_result
+        ]
+        
+        # Revenue by plan
+        plan_revenue_stmt = select(
+            Plan.id,
+            Plan.name,
+            Plan.price,
+            func.count(CustomerPayment.id).label('sales_count'),
+            func.sum(CustomerPayment.amount).label('revenue')
+        ).join(
+            Customer, Customer.plan_id == Plan.id
+        ).join(
+            CustomerPayment, CustomerPayment.customer_id == Customer.id
+        ).where(
+            Plan.user_id == user_id
+        ).group_by(Plan.id, Plan.name, Plan.price)
+        
+        plan_revenue_result = await db.execute(plan_revenue_stmt)
+        plan_revenue = [
+            {
+                "plan_id": row.id,
+                "plan_name": row.name,
+                "plan_price": row.price,
+                "sales_count": row.sales_count,
+                "revenue": float(row.revenue or 0)
+            }
+            for row in plan_revenue_result
+        ]
+        
+        # Recent transactions (last 10)
+        recent_txn_stmt = select(CustomerPayment, Customer, Plan).join(
+            Customer, CustomerPayment.customer_id == Customer.id
+        ).join(
+            Plan, Customer.plan_id == Plan.id, isouter=True
+        ).where(
+            CustomerPayment.reseller_id == user_id
+        ).order_by(CustomerPayment.created_at.desc()).limit(10)
+        
+        recent_txn_result = await db.execute(recent_txn_stmt)
+        recent_transactions = [
+            {
+                "payment_id": payment.id,
+                "amount": float(payment.amount),
+                "customer_name": customer.name,
+                "customer_phone": customer.phone,
+                "plan_name": plan.name if plan else None,
+                "payment_date": payment.created_at.isoformat(),
+                "payment_method": payment.payment_method.value
+            }
+            for payment, customer, plan in recent_txn_result
+        ]
+        
+        # Expiring soon (next 24 hours)
+        expiring_soon_date = now + timedelta(hours=24)
+        expiring_stmt = select(Customer).where(
+            Customer.user_id == user_id,
+            Customer.status == CustomerStatus.ACTIVE,
+            Customer.expiry.isnot(None),
+            Customer.expiry <= expiring_soon_date,
+            Customer.expiry > now
+        ).order_by(Customer.expiry)
+        
+        expiring_result = await db.execute(expiring_stmt)
+        expiring_soon = [
+            {
+                "customer_id": c.id,
+                "customer_name": c.name,
+                "customer_phone": c.phone,
+                "mac_address": c.mac_address,
+                "expiry": c.expiry.isoformat(),
+                "hours_remaining": (c.expiry - now).total_seconds() / 3600
+            }
+            for c in expiring_result.scalars().all()
+        ]
+        
+        return {
+            "revenue": {
+                "today": today_revenue,
+                "this_week": week_revenue,
+                "this_month": month_revenue,
+                "all_time": total_revenue
+            },
+            "customers": {
+                "total": total_customers,
+                "active": active_customers,
+                "inactive": total_customers - active_customers
+            },
+            "revenue_by_router": router_revenue,
+            "revenue_by_plan": plan_revenue,
+            "recent_transactions": recent_transactions,
+            "expiring_soon": expiring_soon,
+            "generated_at": now.isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching dashboard overview: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch dashboard: {str(e)}")
+
+# Get Active Guests Endpoint
+@app.get("/api/customers/active")
+async def get_active_customers(
+    user_id: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all currently active guests"""
+    try:
+        stmt = select(Customer).where(
+            Customer.user_id == user_id,
+            Customer.status == CustomerStatus.ACTIVE
+        ).options(
+            selectinload(Customer.plan),
+            selectinload(Customer.router)
+        ).order_by(Customer.expiry)
+        
+        result = await db.execute(stmt)
+        customers = result.scalars().all()
+        
+        now = datetime.utcnow()
+        
+        return [
+            {
+                "id": c.id,
+                "name": c.name,
+                "phone": c.phone,
+                "mac_address": c.mac_address,
+                "status": c.status.value,
+                "expiry": c.expiry.isoformat() if c.expiry else None,
+                "hours_remaining": (c.expiry - now).total_seconds() / 3600 if c.expiry and c.expiry > now else 0,
+                "plan": {
+                    "id": c.plan.id,
+                    "name": c.plan.name,
+                    "price": c.plan.price
+                } if c.plan else None,
+                "router": {
+                    "id": c.router.id,
+                    "name": c.router.name
+                } if c.router else None
+            }
+            for c in customers
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching active customers: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch active customers")
+
+# Get Plan Performance Endpoint
+@app.get("/api/plans/performance")
+async def get_plan_performance(
+    user_id: int = 1,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get performance metrics for each plan
+    
+    Shows:
+    - Total sales per plan
+    - Revenue per plan
+    - Average revenue per sale
+    - Current active customers per plan
+    """
+    try:
+        from sqlalchemy import func
+        from app.db.models import CustomerPayment
+        
+        # Base query for plan performance
+        stmt = select(
+            Plan.id,
+            Plan.name,
+            Plan.price,
+            Plan.duration_value,
+            Plan.duration_unit,
+            func.count(Customer.id.distinct()).label('total_customers'),
+            func.count(CustomerPayment.id).label('total_sales'),
+            func.sum(CustomerPayment.amount).label('total_revenue')
+        ).outerjoin(
+            Customer, Customer.plan_id == Plan.id
+        ).outerjoin(
+            CustomerPayment, CustomerPayment.customer_id == Customer.id
+        ).where(
+            Plan.user_id == user_id
+        )
+        
+        # Apply date filters if provided
+        if start_date:
+            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            stmt = stmt.where(CustomerPayment.created_at >= start_dt)
+        
+        if end_date:
+            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+            if 'T' not in end_date:
+                end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            stmt = stmt.where(CustomerPayment.created_at <= end_dt)
+        
+        stmt = stmt.group_by(Plan.id, Plan.name, Plan.price, Plan.duration_value, Plan.duration_unit)
+        
+        result = await db.execute(stmt)
+        
+        # Get active customers per plan
+        active_stmt = select(
+            Plan.id,
+            func.count(Customer.id).label('active_count')
+        ).join(
+            Customer, Customer.plan_id == Plan.id
+        ).where(
+            Plan.user_id == user_id,
+            Customer.status == CustomerStatus.ACTIVE
+        ).group_by(Plan.id)
+        
+        active_result = await db.execute(active_stmt)
+        active_counts = {row.id: row.active_count for row in active_result}
+        
+        plans = []
+        for row in result:
+            total_revenue = float(row.total_revenue or 0)
+            total_sales = row.total_sales or 0
+            avg_revenue = total_revenue / total_sales if total_sales > 0 else 0
+            
+            plans.append({
+                "plan_id": row.id,
+                "plan_name": row.name,
+                "plan_price": row.price,
+                "duration": f"{row.duration_value} {row.duration_unit.lower()}",
+                "total_customers": row.total_customers,
+                "total_sales": total_sales,
+                "total_revenue": total_revenue,
+                "average_revenue_per_sale": round(avg_revenue, 2),
+                "active_customers": active_counts.get(row.id, 0)
+            })
+        
+        return {
+            "plans": plans,
+            "period": {
+                "start_date": start_date,
+                "end_date": end_date
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching plan performance: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch plan performance: {str(e)}")
+
+# Update Router Endpoint
+@app.put("/api/routers/{router_id}")
+async def update_router(
+    router_id: int,
+    request: RouterCreateRequest,
+    user_id: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update router details"""
+    try:
+        # Get existing router
+        stmt = select(Router).where(Router.id == router_id, Router.user_id == user_id)
+        result = await db.execute(stmt)
+        router = result.scalar_one_or_none()
+        
+        if not router:
+            raise HTTPException(status_code=404, detail="Router not found")
+        
+        # Update fields
+        router.name = request.name
+        router.ip_address = request.ip_address
+        router.username = request.username
+        router.password = request.password
+        router.port = request.port
+        
+        await db.commit()
+        await db.refresh(router)
+        
+        return {
+            "id": router.id,
+            "name": router.name,
+            "ip_address": router.ip_address,
+            "username": router.username,
+            "port": router.port,
+            "user_id": router.user_id,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating router: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update router: {str(e)}")
+
+# Delete Plan Endpoint
+@app.delete("/api/plans/{plan_id}")
+async def delete_plan(
+    plan_id: int,
+    user_id: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a plan (only if no active customers using it)"""
+    try:
+        # Check if plan exists
+        plan_stmt = select(Plan).where(Plan.id == plan_id, Plan.user_id == user_id)
+        plan_result = await db.execute(plan_stmt)
+        plan = plan_result.scalar_one_or_none()
+        
+        if not plan:
+            raise HTTPException(status_code=404, detail="Plan not found")
+        
+        # Check for active customers using this plan
+        active_customers_stmt = select(func.count(Customer.id)).where(
+            Customer.plan_id == plan_id,
+            Customer.status == CustomerStatus.ACTIVE
+        )
+        active_count_result = await db.execute(active_customers_stmt)
+        active_count = active_count_result.scalar()
+        
+        if active_count > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot delete plan. {active_count} active customer(s) are using this plan"
+            )
+        
+        await db.delete(plan)
+        await db.commit()
+        
+        return {
+            "success": True,
+            "message": f"Plan '{plan.name}' deleted successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting plan: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete plan: {str(e)}")
 
 @app.get("/health")
 def health_check():
