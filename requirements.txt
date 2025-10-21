@@ -1,0 +1,32 @@
+# FastAPI and web framework
+fastapi
+uvicorn[standard]
+
+# Database and ORM
+sqlalchemy
+asyncpg
+aiosqlite
+alembic
+
+# Authentication and security
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+
+# GraphQL - using graphene instead of strawberry for Python 3.13 compatibility
+graphene
+graphene-fastapi
+
+# HTTP client
+httpx
+
+# MikroTik router management
+librouteros
+
+# Environment and configuration
+python-dotenv
+pydantic
+pydantic-settings
+
+# Utilities and formatting
+python-dateutil

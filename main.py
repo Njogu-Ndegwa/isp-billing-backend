@@ -1,9 +1,9 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from strawberry.fastapi import GraphQLRouter
+# from strawberry.fastapi import GraphQLRouter  # Temporarily commented out
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from app.graphql.schema import schema
+# from app.graphql.schema import schema  # Temporarily commented out
 from app.db.database import get_db
 from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus
 from app.services.auth import verify_token, get_current_user
@@ -18,6 +18,7 @@ from typing import Dict, Optional, Any
 from datetime import datetime, timedelta
 import hashlib
 from pprint import pformat
+from pydantic import BaseModel
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -59,9 +60,9 @@ async def get_router_by_id(
         stmt = stmt.where(Router.user_id == user_id)
     res = await db.execute(stmt)
     return res.scalar_one_or_none()
-# Mount GraphQL router
-graphql_app = GraphQLRouter(schema, context_getter=get_context)
-app.include_router(graphql_app, prefix="/graphql")
+# Mount GraphQL router - temporarily commented out
+# graphql_app = GraphQLRouter(schema, context_getter=get_context)
+# app.include_router(graphql_app, prefix="/graphql")
 
 
 
@@ -1219,6 +1220,626 @@ async def remove_bypassed_user_public(
     finally:
         api.disconnect()
 
+# ============================================
+# REST API ENDPOINTS FOR CRUD OPERATIONS
+# ============================================
+
+# User Management Endpoints
+class UserRegisterRequest(BaseModel):
+    email: str
+    password: str
+    role: str
+    organization_name: str
+
+@app.post("/api/users/register")
+async def register_user_api(
+    request: UserRegisterRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Register a new user (admin or reseller)"""
+    try:
+        from app.services.auth import create_user
+        from app.db.models import UserRole
+        
+        # Validate role
+        try:
+            role_enum = UserRole(request.role.lower())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid role. Must be 'admin' or 'reseller'")
+        
+        # Check if user already exists
+        existing_user_stmt = select(User).filter(User.email == request.email.lower())
+        existing_result = await db.execute(existing_user_stmt)
+        if existing_result.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="User with this email already exists")
+        
+        user = await create_user(db, request.email, request.password, role_enum, request.organization_name)
+        
+        return {
+            "id": user.id,
+            "email": user.email,
+            "user_code": user.user_code,
+            "role": user.role.value,
+            "organization_name": user.organization_name,
+            "created_at": user.created_at.isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error registering user: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+@app.post("/api/auth/login")
+async def login_api(
+    request: LoginRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Login and get JWT token"""
+    try:
+        from app.services.auth import authenticate_user
+        from app.core.security import create_access_token
+        
+        user = await authenticate_user(db, request.email, request.password)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+        # Create JWT token
+        token_data = {
+            "user_code": user.user_code,
+            "user_id": user.id,
+            "role": user.role.value,
+            "organization_name": user.organization_name
+        }
+        access_token = create_access_token(token_data)
+        
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "role": user.role.value,
+                "organization_name": user.organization_name
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Login failed")
+
+# Router Management Endpoints
+class RouterCreateRequest(BaseModel):
+    name: str
+    ip_address: str
+    username: str
+    password: str
+    port: int = 8728
+    user_id: int = 1  # Default to user_id 1 for testing (REMOVE IN PRODUCTION)
+
+@app.post("/api/routers/create")
+async def create_router_api(
+    request: RouterCreateRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new router (authentication temporarily disabled for testing)"""
+    try:
+        # Check if router with same IP already exists for this user
+        existing_router_stmt = select(Router).filter(
+            Router.ip_address == request.ip_address,
+            Router.user_id == request.user_id
+        )
+        existing_result = await db.execute(existing_router_stmt)
+        if existing_result.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Router with this IP address already exists")
+        
+        # Create new router
+        router = Router(
+            user_id=request.user_id,
+            name=request.name,
+            ip_address=request.ip_address,
+            username=request.username,
+            password=request.password,
+            port=request.port
+        )
+        
+        db.add(router)
+        await db.commit()
+        await db.refresh(router)
+        
+        logger.info(f"Router created: {router.id} by user {request.user_id}")
+        
+        return {
+            "id": router.id,
+            "name": router.name,
+            "ip_address": router.ip_address,
+            "username": router.username,
+            "port": router.port,
+            "user_id": router.user_id,
+            "created_at": router.created_at.isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating router: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create router: {str(e)}")
+
+# Plan Management Endpoints
+class PlanCreateRequest(BaseModel):
+    name: str
+    speed: str
+    price: int
+    duration_value: int
+    duration_unit: str
+    connection_type: str
+    router_profile: Optional[str] = None
+    user_id: int = 1  # Default to user_id 1 for testing (REMOVE IN PRODUCTION)
+
+@app.post("/api/plans/create")
+async def create_plan_api(
+    request: PlanCreateRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new internet plan (authentication temporarily disabled for testing)"""
+    try:
+        # user = await get_current_user(token, db)  # Temporarily disabled for testing
+        
+        # Validate price and duration
+        if request.price < 0:
+            raise HTTPException(status_code=400, detail="Price cannot be negative")
+        if request.duration_value < 1:
+            raise HTTPException(status_code=400, detail="Duration value must be at least 1")
+        
+        # Validate connection type
+        try:
+            connection_type_enum = ConnectionType(request.connection_type.lower())
+        except ValueError:
+            valid_types = [ct.value for ct in ConnectionType]
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid connection type. Must be one of: {', '.join(valid_types)}"
+            )
+        
+        # Validate duration unit
+        try:
+            from app.db.models import DurationUnit
+            duration_unit_enum = DurationUnit(request.duration_unit.upper())
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid duration unit. Must be 'DAYS' or 'HOURS'"
+            )
+        
+        # Check for duplicate plan name
+        existing_plan_stmt = select(Plan).filter(
+            Plan.name == request.name,
+            Plan.user_id == request.user_id
+        )
+        existing_result = await db.execute(existing_plan_stmt)
+        if existing_result.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Plan with this name already exists")
+        
+        # Create new plan
+        plan = Plan(
+            name=request.name,
+            speed=request.speed,
+            price=request.price,
+            duration_value=request.duration_value,
+            duration_unit=duration_unit_enum,
+            connection_type=connection_type_enum,
+            user_id=request.user_id,
+            router_profile=request.router_profile
+        )
+        
+        db.add(plan)
+        await db.commit()
+        await db.refresh(plan)
+        
+        logger.info(f"Plan created: {plan.id} by user {request.user_id}")
+        
+        return {
+            "id": plan.id,
+            "name": plan.name,
+            "speed": plan.speed,
+            "price": plan.price,
+            "duration_value": plan.duration_value,
+            "duration_unit": plan.duration_unit.value,
+            "connection_type": plan.connection_type.value,
+            "router_profile": plan.router_profile,
+            "user_id": plan.user_id,
+            "created_at": plan.created_at.isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating plan: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create plan: {str(e)}")
+
+@app.get("/api/plans")
+async def get_plans_api(
+    user_id: int = 1,  # Default to user_id 1 for testing (REMOVE IN PRODUCTION)
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all plans (authentication temporarily disabled for testing)"""
+    try:
+        # user = await get_current_user(token, db)  # Temporarily disabled for testing
+        
+        stmt = select(Plan).where(Plan.user_id == user_id)
+        result = await db.execute(stmt)
+        plans = result.scalars().all()
+        
+        return [
+            {
+                "id": p.id,
+                "name": p.name,
+                "speed": p.speed,
+                "price": p.price,
+                "duration_value": p.duration_value,
+                "duration_unit": p.duration_unit.value,
+                "connection_type": p.connection_type.value,
+                "router_profile": p.router_profile
+            }
+            for p in plans
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching plans: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch plans")
+
+@app.delete("/api/plans/{plan_id}")
+async def delete_plan_api(
+    plan_id: int,
+    user_id: int = 1,  # Default to user_id 1 for testing (REMOVE IN PRODUCTION)
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a plan (authentication temporarily disabled for testing)"""
+    try:
+        # user = await get_current_user(token, db)  # Temporarily disabled for testing
+        
+        # Get plan
+        plan_stmt = select(Plan).where(Plan.id == plan_id, Plan.user_id == user_id)
+        plan_result = await db.execute(plan_stmt)
+        plan = plan_result.scalar_one_or_none()
+        
+        if not plan:
+            raise HTTPException(status_code=404, detail="Plan not found")
+        
+        await db.delete(plan)
+        await db.commit()
+        
+        logger.info(f"Plan deleted: {plan_id} by user {user_id}")
+        
+        return {"success": True, "message": f"Plan {plan_id} deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting plan: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete plan: {str(e)}")
+
+# Customer Management Endpoints
+class CustomerRegisterRequest(BaseModel):
+    name: str
+    phone: str
+    plan_id: int
+    router_id: int
+    mac_address: Optional[str] = None
+    pppoe_username: Optional[str] = None
+    pppoe_password: Optional[str] = None
+    static_ip: Optional[str] = None
+    user_id: int = 1  # Default to user_id 1 for testing (REMOVE IN PRODUCTION)
+
+@app.post("/api/customers/register")
+async def register_customer_api(
+    request: CustomerRegisterRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Register a new customer (authentication temporarily disabled for testing)"""
+    try:
+        # user = await get_current_user(token, db)  # Temporarily disabled for testing
+        
+        # Validate plan exists
+        plan_stmt = select(Plan).where(Plan.id == request.plan_id, Plan.user_id == request.user_id)
+        plan_result = await db.execute(plan_stmt)
+        plan = plan_result.scalar_one_or_none()
+        if not plan:
+            raise HTTPException(status_code=404, detail="Plan not found")
+        
+        # Validate router exists
+        router_stmt = select(Router).where(Router.id == request.router_id, Router.user_id == request.user_id)
+        router_result = await db.execute(router_stmt)
+        router = router_result.scalar_one_or_none()
+        if not router:
+            raise HTTPException(status_code=404, detail="Router not found")
+        
+        # Check if customer with MAC already exists
+        if request.mac_address:
+            existing_customer_stmt = select(Customer).where(Customer.mac_address == request.mac_address)
+            existing_result = await db.execute(existing_customer_stmt)
+            if existing_result.scalar_one_or_none():
+                raise HTTPException(status_code=409, detail="Customer with this MAC address already exists")
+        
+        # Create customer
+        customer = Customer(
+            name=request.name,
+            phone=request.phone,
+            mac_address=request.mac_address,
+            pppoe_username=request.pppoe_username,
+            pppoe_password=request.pppoe_password,
+            static_ip=request.static_ip,
+            status=CustomerStatus.INACTIVE,
+            plan_id=request.plan_id,
+            user_id=request.user_id,
+            router_id=request.router_id
+        )
+        
+        db.add(customer)
+        await db.commit()
+        await db.refresh(customer)
+        
+        logger.info(f"Customer registered: {customer.id} by user {request.user_id}")
+        
+        return {
+            "id": customer.id,
+            "name": customer.name,
+            "phone": customer.phone,
+            "mac_address": customer.mac_address,
+            "pppoe_username": customer.pppoe_username,
+            "static_ip": customer.static_ip,
+            "status": customer.status.value,
+            "plan_id": customer.plan_id,
+            "router_id": customer.router_id,
+            "user_id": customer.user_id,
+            "expiry": customer.expiry.isoformat() if customer.expiry else None,
+            "created_at": customer.created_at.isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error registering customer: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to register customer: {str(e)}")
+
+@app.get("/api/customers")
+async def get_customers_api(
+    user_id: int = 1,  # Default to user_id 1 for testing (REMOVE IN PRODUCTION)
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all customers (authentication temporarily disabled for testing)"""
+    try:
+        # user = await get_current_user(token, db)  # Temporarily disabled for testing
+        
+        stmt = select(Customer).where(Customer.user_id == user_id).options(
+            selectinload(Customer.plan),
+            selectinload(Customer.router)
+        )
+        result = await db.execute(stmt)
+        customers = result.scalars().all()
+        
+        return [
+            {
+                "id": c.id,
+                "name": c.name,
+                "phone": c.phone,
+                "mac_address": c.mac_address,
+                "status": c.status.value,
+                "expiry": c.expiry.isoformat() if c.expiry else None,
+                "plan": {
+                    "id": c.plan.id,
+                    "name": c.plan.name,
+                    "price": c.plan.price
+                } if c.plan else None,
+                "router": {
+                    "id": c.router.id,
+                    "name": c.router.name
+                } if c.router else None
+            }
+            for c in customers
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching customers: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch customers")
+
+# M-Pesa Transaction Endpoints
+@app.get("/api/mpesa/transactions")
+async def get_mpesa_transactions(
+    router_id: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    status: Optional[str] = None,
+    user_id: int = 1,  # Default to user_id 1 for testing
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get M-Pesa transactions with filters
+    
+    Query Parameters:
+    - router_id: Filter by specific router (optional)
+    - start_date: Start date (ISO format: 2025-10-20 or 2025-10-20T10:30:00)
+    - end_date: End date (ISO format: 2025-10-21 or 2025-10-21T23:59:59)
+    - status: Filter by status (pending, completed, failed, expired)
+    - user_id: Owner/reseller ID (defaults to 1 for testing)
+    """
+    try:
+        # Build base query joining transactions with customers and routers
+        stmt = select(MpesaTransaction, Customer, Router, Plan).join(
+            Customer, MpesaTransaction.customer_id == Customer.id, isouter=True
+        ).join(
+            Router, Customer.router_id == Router.id, isouter=True
+        ).join(
+            Plan, Customer.plan_id == Plan.id, isouter=True
+        ).where(
+            (Customer.user_id == user_id) | (MpesaTransaction.customer_id == None)
+        )
+        
+        # Apply router filter
+        if router_id:
+            stmt = stmt.where(Router.id == router_id)
+        
+        # Apply date range filter
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                stmt = stmt.where(MpesaTransaction.created_at >= start_dt)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format. Use ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)")
+        
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                # If only date provided, set to end of day
+                if 'T' not in end_date:
+                    end_dt = end_dt.replace(hour=23, minute=59, second=59)
+                stmt = stmt.where(MpesaTransaction.created_at <= end_dt)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format. Use ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)")
+        
+        # Apply status filter
+        if status:
+            try:
+                status_enum = MpesaTransactionStatus(status.lower())
+                stmt = stmt.where(MpesaTransaction.status == status_enum)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: pending, completed, failed, expired")
+        
+        # Order by most recent first
+        stmt = stmt.order_by(MpesaTransaction.created_at.desc())
+        
+        result = await db.execute(stmt)
+        transactions = result.all()
+        
+        return [
+            {
+                "transaction_id": tx.id,
+                "checkout_request_id": tx.checkout_request_id,
+                "phone_number": tx.phone_number,
+                "amount": float(tx.amount),
+                "reference": tx.reference,
+                "lipay_tx_no": tx.lipay_tx_no,
+                "status": tx.status.value,
+                "mpesa_receipt_number": tx.mpesa_receipt_number,
+                "transaction_date": tx.transaction_date.isoformat() if tx.transaction_date else None,
+                "created_at": tx.created_at.isoformat(),
+                "customer": {
+                    "id": customer.id,
+                    "name": customer.name,
+                    "phone": customer.phone,
+                    "mac_address": customer.mac_address,
+                    "status": customer.status.value
+                } if customer else None,
+                "router": {
+                    "id": router.id,
+                    "name": router.name,
+                    "ip_address": router.ip_address
+                } if router else None,
+                "plan": {
+                    "id": plan.id,
+                    "name": plan.name,
+                    "price": plan.price,
+                    "duration_value": plan.duration_value,
+                    "duration_unit": plan.duration_unit.value
+                } if plan else None
+            }
+            for tx, customer, router, plan in transactions
+        ]
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching M-Pesa transactions: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch transactions: {str(e)}")
+
+@app.get("/api/mpesa/transactions/summary")
+async def get_mpesa_transactions_summary(
+    router_id: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_id: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get M-Pesa transactions summary with statistics
+    
+    Returns:
+    - Total transactions
+    - Total amount
+    - Breakdown by status
+    - Breakdown by router (if applicable)
+    """
+    try:
+        from sqlalchemy import func
+        
+        # Build base query
+        stmt = select(MpesaTransaction, Customer, Router).join(
+            Customer, MpesaTransaction.customer_id == Customer.id, isouter=True
+        ).join(
+            Router, Customer.router_id == Router.id, isouter=True
+        ).where(
+            (Customer.user_id == user_id) | (MpesaTransaction.customer_id == None)
+        )
+        
+        # Apply filters
+        if router_id:
+            stmt = stmt.where(Router.id == router_id)
+        
+        if start_date:
+            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            stmt = stmt.where(MpesaTransaction.created_at >= start_dt)
+        
+        if end_date:
+            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+            if 'T' not in end_date:
+                end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            stmt = stmt.where(MpesaTransaction.created_at <= end_dt)
+        
+        result = await db.execute(stmt)
+        transactions = result.all()
+        
+        # Calculate statistics
+        total_transactions = len(transactions)
+        total_amount = sum(float(tx.amount) for tx, _, _ in transactions)
+        
+        # Breakdown by status
+        status_breakdown = {}
+        for tx, _, _ in transactions:
+            status = tx.status.value
+            if status not in status_breakdown:
+                status_breakdown[status] = {"count": 0, "amount": 0}
+            status_breakdown[status]["count"] += 1
+            status_breakdown[status]["amount"] += float(tx.amount)
+        
+        # Breakdown by router
+        router_breakdown = {}
+        for tx, customer, router in transactions:
+            if router:
+                router_name = router.name
+                if router_name not in router_breakdown:
+                    router_breakdown[router_name] = {"count": 0, "amount": 0, "router_id": router.id}
+                router_breakdown[router_name]["count"] += 1
+                router_breakdown[router_name]["amount"] += float(tx.amount)
+        
+        return {
+            "total_transactions": total_transactions,
+            "total_amount": total_amount,
+            "status_breakdown": status_breakdown,
+            "router_breakdown": router_breakdown,
+            "period": {
+                "start_date": start_date,
+                "end_date": end_date
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching transaction summary: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch summary: {str(e)}")
+
 @app.get("/")
 def read_root():
     return {"message": "ISP Billing SaaS API", "version": "1.0.0"}
@@ -1229,4 +1850,4 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8008, reload=False)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

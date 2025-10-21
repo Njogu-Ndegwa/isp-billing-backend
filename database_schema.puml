@@ -1,0 +1,242 @@
+@startuml ISP_Billing_Database_Schema
+
+!define table(x) class x << (T,#FFAAAA) >>
+!define primary_key(x) <u>x</u>
+!define foreign_key(x) #x
+
+skinparam classAttributeIconSize 0
+skinparam class {
+    BackgroundColor<<Enum>> LightYellow
+    BorderColor Black
+    ArrowColor Black
+}
+
+' ==================== ENUMS ====================
+
+enum UserRole << (E,#FFDDAA) >> {
+    ADMIN
+    RESELLER
+}
+
+enum ConnectionType << (E,#FFDDAA) >> {
+    HOTSPOT
+    PPPOE
+    STATIC_IP
+}
+
+enum CustomerStatus << (E,#FFDDAA) >> {
+    ACTIVE
+    INACTIVE
+    PENDING
+}
+
+enum PaymentStatus << (E,#FFDDAA) >> {
+    PENDING
+    COMPLETED
+    FAILED
+    REFUNDED
+}
+
+enum PaymentMethod << (E,#FFDDAA) >> {
+    CASH
+    MOBILE_MONEY
+    BANK_TRANSFER
+    CARD
+    OTHER
+}
+
+enum DurationUnit << (E,#FFDDAA) >> {
+    HOURS
+    DAYS
+}
+
+enum MpesaTransactionStatus << (E,#FFDDAA) >> {
+    pending
+    completed
+    failed
+    expired
+}
+
+' ==================== TABLES ====================
+
+table(users) {
+    primary_key(id) : Integer
+    user_code : BigInteger <<unique>>
+    email : String <<unique>>
+    password_hash : String
+    role : UserRole
+    organization_name : String
+    foreign_key(created_by) : Integer
+    created_at : DateTime
+}
+
+table(routers) {
+    primary_key(id) : Integer
+    foreign_key(user_id) : Integer
+    name : String
+    ip_address : String
+    username : String
+    password : String
+    port : Integer
+    created_at : DateTime
+}
+
+table(plans) {
+    primary_key(id) : Integer
+    name : String
+    speed : String
+    price : Integer
+    duration_value : Integer
+    duration_unit : DurationUnit
+    connection_type : ConnectionType
+    foreign_key(user_id) : Integer
+    router_profile : String
+    created_at : DateTime
+}
+
+table(customers) {
+    primary_key(id) : Integer
+    name : String
+    phone : String
+    mac_address : String <<unique>>
+    pppoe_username : String
+    pppoe_password : String
+    static_ip : String
+    status : CustomerStatus
+    expiry : DateTime
+    foreign_key(plan_id) : Integer
+    foreign_key(user_id) : Integer
+    foreign_key(router_id) : Integer
+    pending_update_data : JSON
+    created_at : DateTime
+}
+
+table(customer_payments) {
+    primary_key(id) : Integer
+    foreign_key(customer_id) : Integer
+    foreign_key(reseller_id) : Integer
+    amount : Float
+    payment_method : PaymentMethod
+    payment_reference : String
+    payment_date : DateTime
+    days_paid_for : Integer
+    status : PaymentStatus
+    notes : String
+    lipay_tx_no : String
+    created_at : DateTime
+}
+
+table(payments) {
+    primary_key(id) : Integer
+    foreign_key(customer_id) : Integer
+    amount : Integer
+    days_paid_for : Integer
+    paid_on : DateTime
+}
+
+table(provisioning_logs) {
+    primary_key(id) : Integer
+    foreign_key(customer_id) : Integer
+    foreign_key(router_id) : Integer
+    mac_address : String
+    action : String
+    status : String
+    error : String
+    details : String
+    log_date : DateTime
+}
+
+table(mpesa_transactions) {
+    primary_key(id) : Integer
+    checkout_request_id : String <<unique>>
+    phone_number : String
+    amount : Decimal
+    reference : String
+    lipay_tx_no : String
+    status : MpesaTransactionStatus
+    foreign_key(customer_id) : Integer
+    merchant_request_id : String
+    mpesa_receipt_number : String
+    transaction_date : DateTime
+    created_at : DateTime
+    updated_at : DateTime
+}
+
+table(reseller_financials) {
+    primary_key(id) : Integer
+    foreign_key(user_id) : Integer <<unique>>
+    total_revenue : Float
+    total_customers : Integer
+    active_customers : Integer
+    last_payment_date : DateTime
+    updated_at : DateTime
+}
+
+table(subscriptions) {
+    primary_key(id) : Integer
+    foreign_key(user_id) : Integer
+    is_active : Boolean
+    paid_on : DateTime
+    expires_on : DateTime
+    plan_type : String
+    cost : Float
+}
+
+' ==================== RELATIONSHIPS ====================
+
+' User relationships
+users "1" -- "0..*" users : creates
+users "1" -- "0..*" routers : owns
+users "1" -- "0..*" plans : creates
+users "1" -- "0..*" customers : manages
+users "1" -- "0..1" reseller_financials : has
+users "1" -- "0..*" subscriptions : subscribes
+users "1" -- "0..*" customer_payments : receives
+
+' Customer relationships
+customers "1" -- "0..*" customer_payments : pays
+customers "1" -- "0..*" payments : has
+customers "1" -- "0..*" provisioning_logs : generates
+customers "1" -- "0..*" mpesa_transactions : initiates
+customers "0..*" -- "1" plans : subscribes_to
+customers "0..*" -- "1" routers : connected_to
+
+' Router relationships
+routers "1" -- "0..*" provisioning_logs : provisions
+
+' Notes
+note right of customers
+  **Guest Hotspot Flow:**
+  1. Register with MAC address
+  2. Select plan (1h, 24h, 7d)
+  3. Pay via M-Pesa
+  4. Status: INACTIVE → ACTIVE
+  5. Provisioned on router
+  6. Expires after time limit
+end note
+
+note right of plans
+  **Time-based plans:**
+  - 1 Hour: KES 50
+  - 24 Hours: KES 100
+  - 7 Days: KES 500
+  
+  duration_unit: HOURS or DAYS
+  connection_type: HOTSPOT
+end note
+
+note right of mpesa_transactions
+  **Payment Gateway:**
+  Tracks M-Pesa payments
+  Links to customer via MAC
+  Triggers provisioning
+end note
+
+note right of provisioning_logs
+  **Audit Trail:**
+  Records all provisioning
+  actions to MikroTik router
+end note
+
+@enduml
+
