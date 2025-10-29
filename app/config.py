@@ -10,6 +10,12 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "your-secret-key"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+    
+    # MikroTik Configuration (via WireGuard VPN)
+    MIKROTIK_HOST: str = "10.0.0.2"  # MikroTik IP over WireGuard VPN
+    MIKROTIK_PORT: int = 8728
+    MIKROTIK_USERNAME: str = "admin"
+    MIKROTIK_PASSWORD: str = ""  # Set in .env file
 
     class Config:
         env_file = ".env"
