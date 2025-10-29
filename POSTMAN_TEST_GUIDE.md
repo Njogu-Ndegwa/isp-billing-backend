@@ -5,13 +5,16 @@
 This guide focuses **exclusively on guest hotspot users** - customers who pay for temporary internet access (e.g., 1 hour, 24 hours, 7 days).
 
 ### Guest Hotspot User Flow:
-1. **Unknown guest** connects to WiFi → Gets captive portal
-2. Guest selects plan (1h, 24h, 7d) and pays via M-Pesa
-3. Payment callback **auto-registers** guest in system
-4. System provisions them on MikroTik with time limit
-5. When time expires, access is automatically cut off
+1. **Unknown guest** connects to WiFi → Gets captive portal with MAC address
+2. Guest selects plan (1h, 24h, 7d) and enters phone number
+3. Captive portal calls `POST /api/hotspot/register-and-pay` → Creates customer with status `PENDING`
+4. System sends STK Push to guest's phone with MAC as reference
+5. Guest enters M-Pesa PIN and pays
+6. Payment gateway calls `POST /api/lipay/callback` → Customer updated to `ACTIVE`
+7. System provisions guest on MikroTik with time limit
+8. When time expires, access is automatically cut off
 
-**✨ No pre-registration required!** System creates customer on first payment.
+**✨ Key Flow:** REST API → STK Push → Payment → Callback → Provisioning
 
 ---
 
@@ -34,10 +37,10 @@ http://localhost:8000
 
 1. **Setup Router** → Add your MikroTik router
 2. **Create Plans** → Define time-based plans (1h, 24h, 7d)
-3. **Test Payment** → Simulate payment (auto-registers guest)
+3. **Initiate Payment** → Call REST API to register guest & send STK Push
 4. **Verify Access** → Check customer created & MikroTik provisioning
 
-**✨ NEW:** No pre-registration needed! Payment auto-creates guest accounts.
+**Flow:** `POST /api/hotspot/register-and-pay` → STK Push → Guest pays → Payment callback → MikroTik provisioning
 
 ---
 
@@ -225,23 +228,85 @@ Body: None
 
 ---
 
-## ✅ **STEP 3: Simulate Guest Payment (Auto-Registration)**
+## ✅ **STEP 3: Initiate Guest Payment**
 
-### 3.1: Simulate M-Pesa Payment Callback
+### 3.1: Register Guest and Initiate Payment
 
 #### Purpose
-Test the complete payment workflow for a **NEW unknown guest**
+Guest registers and initiates M-Pesa STK Push payment
 
 #### Real-World Flow:
 1. **Unknown guest** connects to WiFi → Gets captive portal with MAC address
 2. Guest selects "24 Hours Plan" on captive portal
-3. Enters phone number `+254712345678` and initiates M-Pesa payment
-4. Pays KES 100 via M-Pesa
-5. **Payment gateway calls this webhook** with guest info
-6. System **auto-registers** the guest (creates customer record)
-7. System provisions guest on MikroTik with 24h time limit
+3. Enters phone number `+254712345678` 
+4. **Captive portal calls REST API** `/api/hotspot/register-and-pay`
+5. System creates customer record with status `PENDING`
+6. System sends STK Push to guest's phone (with MAC as `customer_ref`)
+7. Guest enters M-Pesa PIN and pays KES 100
+8. **Payment gateway calls `/api/lipay/callback`** with payment confirmation
+9. Callback receives `customer_ref` (MAC address) from gateway
+10. System updates customer to `ACTIVE` and provisions on MikroTik
 
-**🎯 Key Point:** No pre-registration needed! Payment auto-creates the customer.
+**🎯 Key Point:** Guest registration happens BEFORE payment, provisioning happens AFTER payment.
+
+#### Request - REST API
+```
+Method: POST
+URL: http://localhost:8000/api/hotspot/register-and-pay
+Headers: 
+    Content-Type: application/json
+Body: (raw JSON)
+```
+
+```json
+{
+    "phone": "+254712345678",
+    "plan_id": 2,
+    "mac_address": "AA:BB:CC:DD:EE:FF",
+    "router_id": 1,
+    "payment_method": "mobile_money"
+}
+```
+
+**Request Fields:**
+- `phone` = Guest's M-Pesa phone number
+- `plan_id` = Plan selected (2 = 24 Hours Plan)
+- `mac_address` = Guest's device MAC address from captive portal
+- `router_id` = Router at the location (1 = Guest Hotspot Router)
+- `payment_method` = "mobile_money" (triggers STK Push) or "cash"
+- `name` = (Optional) Guest name, defaults to "Guest XXXX" (last 4 digits of phone)
+
+#### Expected Response
+```json
+{
+    "id": 1,
+    "name": "Guest 5678",
+    "phone": "+254712345678",
+    "mac_address": "AA:BB:CC:DD:EE:FF",
+    "status": "pending",
+    "plan_id": 2,
+    "router_id": 1,
+    "message": "STK Push sent to phone"
+}
+```
+
+**What Happened:**
+1. ✅ Customer created with status `pending`
+2. ✅ STK Push sent to `+254712345678` with `customer_ref=AA:BB:CC:DD:EE:FF`
+3. ✅ Guest receives prompt on phone to enter M-Pesa PIN
+4. ⏳ Waiting for payment confirmation...
+
+#### Status Code
+`200 OK`
+
+---
+
+### 3.2: Simulate Payment Callback (For Testing Only)
+
+#### Purpose
+Simulate what the payment gateway does after successful payment (for testing without actual M-Pesa)
+
+**⚠️ NOTE:** In production, this endpoint is called by the payment gateway, NOT by your captive portal!
 
 #### Request
 ```
@@ -267,10 +332,10 @@ Body: (raw JSON)
 ```
 
 **Payload Fields:**
-- `customer_ref` = MAC address from captive portal
+- `customer_ref` = MAC address (echoed back from STK Push request)
 - `phone_number` = Guest's M-Pesa phone number
-- `plan_id` = Plan selected (2 = 24 Hours Plan)
-- `router_id` = Router at the location (1 = Guest Hotspot Router)
+- `plan_id` = Plan ID
+- `router_id` = Router ID
 - `amount` = Payment amount
 - `status` = "completed" for successful payment
 
@@ -283,9 +348,9 @@ Body: (raw JSON)
 ```
 
 **What Happened:**
-1. ✅ System detected MAC `AA:BB:CC:DD:EE:FF` doesn't exist
-2. ✅ Auto-created customer record: `Guest 5678` (last 4 digits of phone)
-3. ✅ Set status to `ACTIVE`
+1. ✅ Callback received `customer_ref=AA:BB:CC:DD:EE:FF`
+2. ✅ Found customer with MAC address
+3. ✅ Updated customer status from `PENDING` to `ACTIVE`
 4. ✅ Calculated expiry: 24 hours from now
 5. ✅ Provisioned on MikroTik router with time limit
 

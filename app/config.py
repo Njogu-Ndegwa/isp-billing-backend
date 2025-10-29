@@ -16,6 +16,14 @@ class Settings(BaseSettings):
     MIKROTIK_PORT: int = 8728
     MIKROTIK_USERNAME: str = "admin"
     MIKROTIK_PASSWORD: str = ""  # Set in .env file
+    
+    # M-Pesa Configuration
+    MPESA_CONSUMER_KEY: str
+    MPESA_CONSUMER_SECRET: str
+    MPESA_SHORTCODE: str
+    MPESA_PASSKEY: str
+    MPESA_CALLBACK_URL: str
+    MPESA_ENVIRONMENT: str
 
     class Config:
         env_file = ".env"

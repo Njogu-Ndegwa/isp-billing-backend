@@ -1,9 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-# from strawberry.fastapi import GraphQLRouter  # Temporarily commented out
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-# from app.graphql.schema import schema  # Temporarily commented out
 from app.db.database import get_db
 from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus
 from app.services.auth import verify_token, get_current_user
@@ -35,20 +33,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Context getter for GraphQL
-async def get_context(request: Request, db: AsyncSession = Depends(get_db)):
-    auth_header = request.headers.get("Authorization")
-    token = None
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
-    return {
-        "db": db,
-        "user": token
-    }
-
-
-
-
 async def get_router_by_id(
     db: AsyncSession,
     router_id: int,
@@ -60,9 +44,6 @@ async def get_router_by_id(
         stmt = stmt.where(Router.user_id == user_id)
     res = await db.execute(stmt)
     return res.scalar_one_or_none()
-# Mount GraphQL router - temporarily commented out
-# graphql_app = GraphQLRouter(schema, context_getter=get_context)
-# app.include_router(graphql_app, prefix="/graphql")
 
 
 
@@ -245,305 +226,137 @@ async def get_router_by_id(
 #     else:
 #         logger.info(f"Payment status for customer {customer.id}: {status} (no action taken)")
 #         return {"ResultCode": 0, "ResultDesc": f"No action taken for status: {status}"}
-@app.post("/api/lipay/callback")
-async def mpesa_callback(payload: dict, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
-    logger.info(f"--- M-Pesa Callback Received: {json.dumps(payload, indent=2)}")
-
-    # Extract values from the incoming payload
-    mac_address = payload.get("customer_ref")  # MAC address
-    phone_number = payload.get("phone_number")  # Guest's phone number
-    status = payload.get("status")
-    amount = payload.get("amount")
-    tx_no = payload.get("lipay_tx_no")
-    checkout_request_id = payload.get("checkout_request_id")
-    receipt_number = payload.get("receipt_number")
-    plan_id = payload.get("plan_id")  # Plan selected by guest
-    router_id = payload.get("router_id")  # Router at the location
-
-    logger.info(f"Parsed payload - mac: {mac_address}, phone: {phone_number}, status: {status}, amount: {amount}, plan_id: {plan_id}, router_id: {router_id}")
-
-    if not mac_address:
-        logger.error("Missing MAC Address in callback")
-        return {"ResultCode": 1, "ResultDesc": "Missing MAC Address"}
-
-    # Fetch customer with plan and router details
-    stmt = (
-        select(Customer)
-        .options(selectinload(Customer.plan), selectinload(Customer.router))
-        .where(Customer.mac_address == mac_address)
-    )
-    result = await db.execute(stmt)
-    customer = result.scalar_one_or_none()
-    logger.info(f"Customers found for MAC {mac_address}: {'1' if customer else '0'}")
-
-    # AUTO-REGISTER: If customer doesn't exist and payment is completed, create them
-    if not customer and status == "completed":
-        logger.info(f"New guest detected. Auto-registering MAC {mac_address}")
+@app.post("/api/mpesa/callback")
+async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    """Handle standard M-Pesa STK Push callback"""
+    logger.info(f"--- M-Pesa Direct Callback Received: {json.dumps(payload, indent=2)}")
+    
+    try:
+        # Extract M-Pesa callback data
+        body = payload.get("Body", {})
+        stk_callback = body.get("stkCallback", {})
         
-        # Validate required fields for new customer
-        if not plan_id or not router_id or not phone_number:
-            logger.error(f"Missing required fields for new customer. plan_id: {plan_id}, router_id: {router_id}, phone: {phone_number}")
-            return {"ResultCode": 1, "ResultDesc": "Missing plan_id, router_id, or phone_number for new customer"}
+        checkout_request_id = stk_callback.get("CheckoutRequestID")
+        merchant_request_id = stk_callback.get("MerchantRequestID")
+        result_code = stk_callback.get("ResultCode")
+        result_desc = stk_callback.get("ResultDesc")
         
-        # Verify plan exists
-        plan_stmt = select(Plan).where(Plan.id == plan_id)
-        plan_result = await db.execute(plan_stmt)
-        plan = plan_result.scalar_one_or_none()
-        if not plan:
-            logger.error(f"Plan {plan_id} not found")
-            return {"ResultCode": 1, "ResultDesc": f"Plan {plan_id} not found"}
+        if not checkout_request_id:
+            logger.error("Missing CheckoutRequestID in callback")
+            return {"ResultCode": 1, "ResultDesc": "Missing CheckoutRequestID"}
         
-        # Verify router exists
-        router_stmt = select(Router).where(Router.id == router_id)
-        router_result = await db.execute(router_stmt)
-        router = router_result.scalar_one_or_none()
-        if not router:
-            logger.error(f"Router {router_id} not found")
-            return {"ResultCode": 1, "ResultDesc": f"Router {router_id} not found"}
+        # Look up transaction
+        from app.db.models import MpesaTransaction, MpesaTransactionStatus
+        stmt = select(MpesaTransaction).where(MpesaTransaction.checkout_request_id == checkout_request_id)
+        result = await db.execute(stmt)
+        mpesa_txn = result.scalar_one_or_none()
         
-        # Create new customer
-        customer = Customer(
-            name=f"Guest {phone_number[-4:]}",  # Use last 4 digits of phone
-            phone=phone_number,
-            mac_address=mac_address,
-            status=CustomerStatus.INACTIVE,  # Will be set to ACTIVE below
-            plan_id=plan_id,
-            router_id=router_id,
-            user_id=router.user_id  # Assign to router owner
-        )
-        db.add(customer)
-        await db.flush()  # Get customer ID before commit
+        if not mpesa_txn:
+            logger.error(f"Transaction not found for CheckoutRequestID: {checkout_request_id}")
+            return {"ResultCode": 1, "ResultDesc": "Transaction not found"}
         
-        logger.info(f"[AUTO-REGISTER] New customer created: ID {customer.id}, MAC {mac_address}, Plan {plan_id}, Router {router_id}")
+        # Extract callback metadata
+        callback_metadata = stk_callback.get("CallbackMetadata", {})
+        items = callback_metadata.get("Item", [])
         
-        # Reload with relationships
+        receipt_number = None
+        amount = None
+        phone_number = None
+        
+        for item in items:
+            name = item.get("Name")
+            if name == "MpesaReceiptNumber":
+                receipt_number = item.get("Value")
+            elif name == "Amount":
+                amount = item.get("Value")
+            elif name == "PhoneNumber":
+                phone_number = item.get("Value")
+        
+        # Update transaction status
+        if result_code == 0:
+            mpesa_txn.status = MpesaTransactionStatus.completed
+            mpesa_txn.mpesa_receipt_number = receipt_number
+            status = "completed"
+        else:
+            mpesa_txn.status = MpesaTransactionStatus.failed
+            status = "failed"
+        
+        mpesa_txn.updated_at = datetime.utcnow()
+        await db.commit()
+        
+        # Get customer via transaction
+        customer_id = mpesa_txn.customer_id
         stmt = (
             select(Customer)
             .options(selectinload(Customer.plan), selectinload(Customer.router))
-            .where(Customer.id == customer.id)
+            .where(Customer.id == customer_id)
         )
         result = await db.execute(stmt)
         customer = result.scalar_one_or_none()
-    
-    elif not customer:
-        logger.error(f"No customer found for MAC {mac_address} and status is not completed")
-        return {"ResultCode": 1, "ResultDesc": "Customer not found"}
-
-    if status == "completed":
-        logger.info(f"PAYMENT CONFIRMED for customer {customer.id} ({mac_address})")
         
-        # 🔥 NEW: Record the transaction in CustomerPayment table
-        try:
+        if not customer:
+            logger.error(f"Customer {customer_id} not found")
+            return {"ResultCode": 1, "ResultDesc": "Customer not found"}
+        
+        # Process payment similar to lipay callback
+        if status == "completed":
+            logger.info(f"PAYMENT CONFIRMED for customer {customer.id}")
+            
+            # Record payment
             from app.services.reseller_payments import record_customer_payment
             from app.db.models import PaymentMethod
             
-            # Get payment details from pending_update_data or current plan
-            pending_update_data = customer.pending_update_data
             plan = customer.plan
-            duration_value = None
-            
-            if pending_update_data:
-                if isinstance(pending_update_data, str):
-                    pending_update_data = json.loads(pending_update_data)
-                duration_value = pending_update_data.get("duration_value")
-                plan_id = pending_update_data.get("plan_id")
-                
-                # Fetch the plan if different
-                if plan_id != customer.plan_id:
-                    plan_stmt = select(Plan).where(Plan.id == plan_id)
-                    plan_result = await db.execute(plan_stmt)
-                    plan = plan_result.scalar_one_or_none()
-            
-            if not duration_value and plan:
-                duration_value = plan.duration_value
-            
-            # Convert duration to days for payment record
+            duration_value = plan.duration_value if plan else 1
             days_paid_for = duration_value
-            if plan and plan.duration_unit.value.upper() == "HOURS":
-                days_paid_for = max(1, duration_value // 24)  # Convert hours to days, minimum 1 day
             
-            # Record the payment
+            if plan and plan.duration_unit.value.upper() == "HOURS":
+                days_paid_for = max(1, duration_value // 24)
+            
             payment = await record_customer_payment(
                 db=db,
                 customer_id=customer.id,
-                reseller_id=customer.user_id,  # Router owner/reseller
-                amount=float(amount),
+                reseller_id=customer.user_id,
+                amount=float(amount or mpesa_txn.amount),
                 payment_method=PaymentMethod.MOBILE_MONEY,
                 days_paid_for=days_paid_for,
-                payment_reference=receipt_number or tx_no,
-                notes=f"M-Pesa payment via callback. TX: {tx_no}"
+                payment_reference=receipt_number,
+                notes=f"M-Pesa STK Push. TX: {checkout_request_id}"
             )
             
-            logger.info(f"[AUDIT] CustomerPayment record created: ID {payment.id}, Amount: {amount}, Days: {days_paid_for}")
+            logger.info(f"[AUDIT] Payment recorded: ID {payment.id}, Amount: {amount}, Days: {days_paid_for}")
             
-        except Exception as payment_error:
-            logger.error(f"Failed to record CustomerPayment for customer {customer.id}: {payment_error}")
-            # Continue with customer update even if payment recording fails
+            # Provision to MikroTik if hotspot
+            if customer.mac_address and customer.router:
+                router = customer.router
+                time_limit = f"{int(duration_value)}{'d' if plan.duration_unit.value.upper() == 'DAYS' else 'h'}"
+                
+                hotspot_payload = {
+                    "mac_address": customer.mac_address,
+                    "username": customer.mac_address.replace(":", ""),
+                    "password": customer.mac_address.replace(":", ""),
+                    "time_limit": time_limit,
+                    "bandwidth_limit": f"{plan.speed}",
+                    "comment": f"Payment successful for {customer.name}",
+                    "router_ip": router.ip_address,
+                    "router_username": router.username,
+                    "router_password": router.password,
+                }
+                logger.info(f"Prepared MikroTik Payload for customer {customer.id}")
+                background_tasks.add_task(call_mikrotik_bypass, hotspot_payload)
+            
+            return {"ResultCode": 0, "ResultDesc": "Payment processed successfully"}
         
-        # 🔥 NEW: Update MpesaTransaction record if it exists
-        if checkout_request_id:
-            try:
-                from app.services.mpesa_transactions import update_mpesa_transaction_status
-                from app.db.models import MpesaTransactionStatus
-                
-                await update_mpesa_transaction_status(
-                    db=db,
-                    checkout_request_id=checkout_request_id,
-                    status=MpesaTransactionStatus.COMPLETED,
-                    receipt_number=receipt_number,
-                    result_code="0",
-                    result_desc="Payment completed successfully"
-                )
-                
-                logger.info(f"[AUDIT] MpesaTransaction updated: {checkout_request_id}")
-                
-            except Exception as mpesa_error:
-                logger.error(f"Failed to update MpesaTransaction {checkout_request_id}: {mpesa_error}")
-
-        # Continue with existing customer update logic...
-        pending_update_data = customer.pending_update_data
-        now = datetime.utcnow()
-        plan = customer.plan
-        router = customer.router
-
-        if pending_update_data:
-            # Handle existing customer with pending update data
-            if isinstance(pending_update_data, str):
-                try:
-                    pending_update_data = json.loads(pending_update_data)
-                    logger.info(f"Parsed pending_update_data for customer {customer.id}: {json.dumps(pending_update_data)}")
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON in pending_update_data for customer {customer.id}: {e}")
-                    return {"ResultCode": 1, "ResultDesc": "Invalid pending update data format"}
-
-            duration_value = pending_update_data.get("duration_value")
-            duration_unit = pending_update_data.get("duration_unit")
-            applied_plan_id = pending_update_data.get("plan_id")
-            requested_router_id = pending_update_data.get("router_id")
-
-            if duration_value is None or duration_unit is None or requested_router_id is None:
-                logger.error(f"Missing duration_value, duration_unit, or router_id in pending_update_data for customer {customer.id}")
-                return {"ResultCode": 1, "ResultDesc": "Missing required fields in pending update data"}
-
-            # Convert duration to time limit for MikroTik
-            if duration_unit.upper() == "DAYS":
-                time_limit = f"{int(duration_value)}d"
-            elif duration_unit.upper() == "HOURS":
-                time_limit = f"{int(duration_value)}h"
-            else:
-                logger.error(f"Unsupported duration_unit {duration_unit} for customer {customer.id}")
-                return {"ResultCode": 1, "ResultDesc": f"Unsupported duration unit: {duration_unit}"}
-
-            # Fetch the plan and router from pending_update_data
-            plan_stmt = select(Plan).where(Plan.id == applied_plan_id)
-            plan_result = await db.execute(plan_stmt)
-            plan = plan_result.scalar_one_or_none()
-
-            router_stmt = select(Router).where(Router.id == requested_router_id)
-            router_result = await db.execute(router_stmt)
-            router = router_result.scalar_one_or_none()
-
-            if not plan or not router:
-                logger.error(f"Plan {applied_plan_id} or Router {requested_router_id} not found")
-                return {"ResultCode": 1, "ResultDesc": "Plan or Router not found"}
-
-            # Calculate new expiry
-            if duration_unit.upper() == "DAYS":
-                if customer.expiry and customer.expiry > now:
-                    new_expiry = customer.expiry + timedelta(days=int(duration_value))
-                else:
-                    new_expiry = now + timedelta(days=int(duration_value))
-            elif duration_unit.upper() == "HOURS":
-                if customer.expiry and customer.expiry > now:
-                    new_expiry = customer.expiry + timedelta(hours=int(duration_value))
-                else:
-                    new_expiry = now + timedelta(hours=int(duration_value))
-
-            # Update customer
-            customer.expiry = new_expiry
-            customer.plan_id = applied_plan_id
-            customer.router_id = requested_router_id
-            customer.status = CustomerStatus.ACTIVE
-            customer.pending_update_data = None  # Clear pending data
-
-            logger.info(f"[AUDIT] Applied pending_update_data for customer {customer.id}")
-
         else:
-            # Handle new customer (no pending_update_data)
-            if not plan or not router:
-                logger.error(f"Customer {customer.id} missing plan or router configuration")
-                return {"ResultCode": 1, "ResultDesc": "Customer missing plan or router configuration"}
+            logger.info(f"Payment failed for customer {customer.id}")
+            customer.status = CustomerStatus.INACTIVE
+            await db.commit()
+            return {"ResultCode": 0, "ResultDesc": "Payment failed"}
+            
+    except Exception as e:
+        logger.error(f"Error processing M-Pesa callback: {str(e)}")
+        return {"ResultCode": 1, "ResultDesc": f"Error: {str(e)}"}
 
-            duration_value = plan.duration_value
-            duration_unit = plan.duration_unit.value
-
-            if duration_unit.upper() == "DAYS":
-                time_limit = f"{int(duration_value)}d"
-                new_expiry = now + timedelta(days=int(duration_value))
-            elif duration_unit.upper() == "HOURS":
-                time_limit = f"{int(duration_value)}h"
-                new_expiry = now + timedelta(hours=int(duration_value))
-            else:
-                logger.error(f"Unsupported duration_unit {duration_unit} for customer {customer.id}")
-                return {"ResultCode": 1, "ResultDesc": f"Unsupported duration unit: {duration_unit}"}
-
-            customer.expiry = new_expiry
-            customer.status = CustomerStatus.ACTIVE
-            logger.info(f"[AUDIT] New customer {customer.id} payment processed")
-
-        # Commit customer updates
-        await db.commit()
-
-        # Prepare payload for MikroTik provisioning
-        if router and plan:
-            hotspot_payload = {
-                "mac_address": customer.mac_address,
-                "username": customer.mac_address.replace(":", ""),
-                "password": customer.mac_address.replace(":", ""),
-                "time_limit": time_limit,
-                "bandwidth_limit": f"{plan.speed}",
-                "comment": f"Payment successful for {customer.name} on {datetime.utcnow().isoformat()}",
-                "router_ip": router.ip_address,
-                "router_username": router.username,
-                "router_password": router.password,
-            }
-            logger.info(f"Prepared MikroTik Payload for customer {customer.id}")
-            background_tasks.add_task(call_mikrotik_bypass, hotspot_payload)
-
-        return {
-            "ResultCode": 0,
-            "ResultDesc": f"Customer {customer.id} updated to ACTIVE, payment recorded, and MikroTik user created. New expiry: {customer.expiry}"
-        }
-
-    elif status == "failed":
-        # 🔥 NEW: Update transaction records for failed payments
-        if checkout_request_id:
-            try:
-                from app.services.mpesa_transactions import update_mpesa_transaction_status
-                from app.db.models import MpesaTransactionStatus
-                
-                await update_mpesa_transaction_status(
-                    db=db,
-                    checkout_request_id=checkout_request_id,
-                    status=MpesaTransactionStatus.FAILED,
-                    result_code="1",
-                    result_desc="Payment failed"
-                )
-                
-                logger.info(f"[AUDIT] MpesaTransaction marked as failed: {checkout_request_id}")
-                
-            except Exception as mpesa_error:
-                logger.error(f"Failed to update failed MpesaTransaction {checkout_request_id}: {mpesa_error}")
-        
-        customer.status = CustomerStatus.INACTIVE
-        await db.commit()
-        logger.info(f"Customer {customer.id} status set to INACTIVE due to failed payment")
-        return {"ResultCode": 0, "ResultDesc": "Customer updated to INACTIVE, transaction marked as failed"}
-
-    else:
-        logger.info(f"Payment status for customer {customer.id}: {status} (no action taken)")
-        return {"ResultCode": 0, "ResultDesc": f"No action taken for status: {status}"}
-    
 async def call_mikrotik_bypass(hotspot_payload: dict):
     try:
         # Use tunnel endpoint from settings instead of direct router IP
@@ -1595,6 +1408,238 @@ class CustomerRegisterRequest(BaseModel):
     pppoe_password: Optional[str] = None
     static_ip: Optional[str] = None
     user_id: int = 1  # Default to user_id 1 for testing (REMOVE IN PRODUCTION)
+
+class HotspotPaymentRequest(BaseModel):
+    phone: str
+    plan_id: int
+    mac_address: str
+    router_id: int
+    name: Optional[str] = None
+    payment_method: str = "mobile_money"  # mobile_money or cash
+    payment_reference: Optional[str] = None
+
+class InitiateMpesaPaymentRequest(BaseModel):
+    customer_id: int
+    amount: float
+    phone: str
+
+@app.post("/api/mpesa/initiate-payment")
+async def initiate_mpesa_payment_api(
+    request: InitiateMpesaPaymentRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Initiate M-Pesa payment for existing customer"""
+    try:
+        from app.services.mpesa import initiate_stk_push
+        from app.services.mpesa_transactions import save_mpesa_transaction, link_transaction_to_customer
+        
+        # Validate input parameters
+        if request.amount <= 0:
+            raise HTTPException(status_code=400, detail="Payment amount must be greater than 0")
+        
+        if not request.phone or len(request.phone.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Invalid phone number format")
+        
+        # Validate customer exists
+        stmt = select(Customer).where(Customer.id == request.customer_id)
+        result = await db.execute(stmt)
+        customer = result.scalar_one_or_none()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        
+        reference = f"PAYMENT-{request.customer_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        stk_response = await initiate_stk_push(
+            phone_number=request.phone,
+            amount=request.amount,
+            reference=reference,
+            user_id=customer.user_id,
+            mac_address=customer.mac_address
+        )
+        
+        if not stk_response:
+            raise HTTPException(status_code=400, detail="Failed to initiate mobile money payment. Please try again.")
+        
+        # Save transaction to database
+        transaction = await save_mpesa_transaction(
+            db=db,
+            checkout_request_id=stk_response.get("checkoutRequestId") or stk_response.get("checkout_request_id"),
+            phone_number=request.phone,
+            amount=request.amount,
+            reference=reference,
+            merchant_request_id=stk_response.get("merchantRequestId") or stk_response.get("merchant_request_id")
+        )
+        
+        # Link transaction to customer
+        await link_transaction_to_customer(
+            db=db,
+            checkout_request_id=stk_response.get("checkoutRequestId") or stk_response.get("checkout_request_id"),
+            customer_id=request.customer_id
+        )
+        
+        logger.info(f"STK Push initiated for customer {request.customer_id}, checkout_request_id: {stk_response.get('checkoutRequestId')}")
+        
+        return {
+            "message": "Mobile money payment initiated successfully. Please check your phone to complete payment.",
+            "checkout_request_id": stk_response.get("checkoutRequestId") or stk_response.get("checkout_request_id"),
+            "customer_id": request.customer_id,
+            "status": "PENDING"
+        }
+        
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error initiating M-Pesa payment: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to initiate payment: {str(e)}")
+
+@app.post("/api/hotspot/register-and-pay")
+async def register_hotspot_and_pay_api(
+    request: HotspotPaymentRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Register guest hotspot user and initiate payment"""
+    try:
+        from app.services.mpesa import initiate_stk_push
+        from app.services.reseller_payments import record_customer_payment
+        from app.db.models import PaymentMethod
+        
+        # Validate payment method
+        try:
+            payment_method_enum = PaymentMethod(request.payment_method.lower())
+        except ValueError:
+            valid_methods = [method.value for method in PaymentMethod]
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid payment method. Must be one of: {', '.join(valid_methods)}"
+            )
+        
+        # Validate router exists and get user_id
+        router_stmt = select(Router).where(Router.id == request.router_id)
+        router_result = await db.execute(router_stmt)
+        router = router_result.scalar_one_or_none()
+        if not router:
+            raise HTTPException(status_code=404, detail="Router not found")
+        user_id = router.user_id
+        # Validate plan exists
+        plan_stmt = select(Plan).where(Plan.id == request.plan_id)
+        plan_result = await db.execute(plan_stmt)
+        plan = plan_result.scalar_one_or_none()
+        if not plan:
+            raise HTTPException(status_code=404, detail="Plan not found")
+        # Validate phone number
+        if not request.phone or len(request.phone.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Invalid phone number format")
+
+        # Check if customer exists by MAC
+        customer_stmt = select(Customer).options(
+            selectinload(Customer.plan),
+            selectinload(Customer.router)
+        ).where(Customer.mac_address == request.mac_address)
+        customer_result = await db.execute(customer_stmt)
+        existing_customer = customer_result.scalar_one_or_none()
+        if existing_customer:
+            # Store intended change in pending_update_data
+            pending_data = {
+                "requested_at": datetime.utcnow().isoformat(),
+                "plan_id": request.plan_id,
+                "plan_name": plan.name,
+                "duration_value": plan.duration_value,
+                "duration_unit": plan.duration_unit.value,
+                "payment_method": payment_method_enum.value,
+                "router_id": request.router_id,
+                "phone": request.phone,
+                "name": request.name,
+                "requested_by_user_id": user_id
+            }
+            existing_customer.pending_update_data = json.dumps(pending_data)
+            existing_customer.status = CustomerStatus.PENDING if payment_method_enum == PaymentMethod.MOBILE_MONEY else CustomerStatus.ACTIVE
+            if request.name:
+                existing_customer.name = request.name
+            existing_customer.phone = request.phone
+            customer = existing_customer
+            await db.flush()
+        else:
+            # Create new customer
+            customer_name = request.name if request.name else f"Guest {request.phone[-4:]}"
+            customer = Customer(
+                name=customer_name,
+                phone=request.phone,
+                mac_address=request.mac_address,
+                status=CustomerStatus.INACTIVE,
+                plan_id=request.plan_id,
+                user_id=user_id,
+                router_id=request.router_id
+            )
+            db.add(customer)
+            await db.flush()
+        
+        if payment_method_enum == PaymentMethod.MOBILE_MONEY:
+            try:
+                reference = f"HOTSPOT-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+                
+                # Initiate STK push and get response
+                stk_response = await initiate_stk_push(
+                    phone_number=request.phone,
+                    amount=float(plan.price),
+                    reference=reference
+                )
+                
+                # Store transaction mapping for callback lookup
+                from app.db.models import MpesaTransaction, MpesaTransactionStatus
+                mpesa_txn = MpesaTransaction(
+                    checkout_request_id=stk_response.checkout_request_id,
+                    merchant_request_id=stk_response.merchant_request_id,
+                    phone_number=request.phone,
+                    amount=float(plan.price),
+                    reference=reference,
+                    customer_id=customer.id,
+                    status=MpesaTransactionStatus.pending
+                )
+                db.add(mpesa_txn)
+                await db.flush()
+                
+                # Now update status and commit
+                customer.status = CustomerStatus.PENDING
+                await db.commit()
+                await db.refresh(customer)
+                
+                logger.info(f"STK Push initiated for customer {customer.id} ({request.mac_address})")
+            except Exception as e:
+                customer_id = getattr(customer, "id", None)
+                await db.rollback()
+                logger.exception("Payment initiation failed for customer %s", customer_id)
+                
+                raise HTTPException(status_code=400, detail=f"Mobile money payment initiation failed: {str(e)}")
+        else:
+            # For cash payments, process immediately
+            try:
+                await record_customer_payment(
+                    db, customer.id, user_id, float(plan.price),
+                    payment_method_enum, plan.duration_value, request.payment_reference
+                )
+                customer.status = CustomerStatus.ACTIVE
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                logger.error(f"Cash payment processing failed for customer {customer.id}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Payment processing failed: {str(e)}")
+        return {
+            "id": customer.id,
+            "name": customer.name,
+            "phone": customer.phone,
+            "mac_address": customer.mac_address,
+            "status": customer.status.value,
+            "plan_id": customer.plan_id,
+            "router_id": customer.router_id,
+            "message": "STK Push sent to phone" if payment_method_enum == PaymentMethod.MOBILE_MONEY else "Payment recorded successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error in hotspot registration and payment")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to register and initiate payment: {str(e)}")
 
 @app.post("/api/customers/register")
 async def register_customer_api(

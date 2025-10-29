@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import NullPool
 from app.config import settings
 
 # ✅ Required for defining models
@@ -10,12 +11,12 @@ DATABASE_URL = settings.DATABASE_URL
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 
-# Create async engine
+# Create async engine with NullPool for SQLite to avoid connection issues
 async_engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     future=True,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+    poolclass=NullPool if DATABASE_URL.startswith("sqlite") else None
 )
 
 # Create sessionmaker for async sessions
