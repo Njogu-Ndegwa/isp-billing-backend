@@ -56,5 +56,3 @@ volumes:
 networks:
   isp-network:
     driver: bridge
-
-
