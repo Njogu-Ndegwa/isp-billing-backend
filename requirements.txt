@@ -5,17 +5,13 @@ uvicorn[standard]
 # Database and ORM
 sqlalchemy
 asyncpg
-aiosqlite
 alembic
 
 # Authentication and security
 python-jose[cryptography]
 passlib[bcrypt]
+bcrypt==4.0.1
 python-multipart
-
-# GraphQL - using graphene instead of strawberry for Python 3.13 compatibility
-graphene
-graphene-fastapi
 
 # HTTP client
 httpx

@@ -1,0 +1,57 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: isp_billing_postgres
+    environment:
+      POSTGRES_DB: isp_billing_db
+      POSTGRES_USER: isp_user
+      POSTGRES_PASSWORD: isp_secure_pass_2024
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - isp-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U isp_user -d isp_billing_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    container_name: isp_billing_app
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://isp_user:isp_secure_pass_2024@db:5432/isp_billing_db
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=1440
+      - MIKROTIK_HOST=${MIKROTIK_HOST:-10.0.0.2}
+      - MIKROTIK_PORT=${MIKROTIK_PORT:-8728}
+      - MIKROTIK_USERNAME=${MIKROTIK_USERNAME:-admin}
+      - MIKROTIK_PASSWORD=${MIKROTIK_PASSWORD}
+      - MPESA_CONSUMER_KEY=${MPESA_CONSUMER_KEY}
+      - MPESA_CONSUMER_SECRET=${MPESA_CONSUMER_SECRET}
+      - MPESA_SHORTCODE=${MPESA_SHORTCODE}
+      - MPESA_PASSKEY=${MPESA_PASSKEY}
+      - MPESA_CALLBACK_URL=${MPESA_CALLBACK_URL}
+      - MPESA_ENVIRONMENT=${MPESA_ENVIRONMENT:-sandbox}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - isp-network
+
+volumes:
+  postgres_data:
+
+networks:
+  isp-network:
+    driver: bridge
+
