@@ -146,34 +146,42 @@ sudo ufw status
 - Upgrade to RouterOS v7+ via **System → Packages → Check For Updates**
 - Or download from [mikrotik.com/download](https://mikrotik.com/download)
 
-### Step 2: Generate WireGuard Keys (MikroTik)
+### Step 2: Create WireGuard Interface (Auto-generates Keys)
 
 Open **New Terminal** in Winbox and run:
 
 ```routeros
-/interface/wireguard/keys
-generate
+/interface wireguard add name=wg-aws listen-port=51820
+```
 
-print
+### Step 3: View Generated Keys
+
+In Terminal, run:
+
+```routeros
+/interface wireguard print detail
 ```
 
 **Save the output** - you'll see:
-- Private key (keep secret)
-- Public key (give to AWS server)
+- `private-key` (keep secret)
+- `public-key` (give to AWS server)
 
-### Step 3: Create WireGuard Interface
+You can also retrieve individual keys:
 
-In Winbox:
-
-1. Go to **WireGuard** (in left menu)
-2. Click **+** (Add New)
-3. Configure:
-   - **Name:** `wg-aws`
-   - **Private Key:** Paste the private key from Step 2
-   - **Listen Port:** `51820` (or leave blank for auto)
-4. Click **OK**
+```routeros
+/interface wireguard get wg-aws private-key
+/interface wireguard get wg-aws public-key
+```
 
 ### Step 4: Add IP Address to WireGuard Interface
+
+In Terminal, run:
+
+```routeros
+/ip address add address=10.0.0.2/24 interface=wg-aws
+```
+
+Or via Winbox GUI:
 
 1. Go to **IP → Addresses**
 2. Click **+** (Add New)
@@ -183,6 +191,19 @@ In Winbox:
 4. Click **OK**
 
 ### Step 5: Add WireGuard Peer (AWS Server)
+
+In Terminal, run (replace placeholders with your actual values):
+
+```routeros
+/interface wireguard peers add interface=wg-aws public-key="<AWS_SERVER_PUBLIC_KEY>" endpoint-address=<YOUR_AWS_PUBLIC_IP> endpoint-port=51820 allowed-address=10.0.0.1/32 persistent-keepalive=25s
+```
+
+Example:
+```routeros
+/interface wireguard peers add interface=wg-aws public-key="abc123XYZ456==" endpoint-address=54.123.45.67 endpoint-port=51820 allowed-address=10.0.0.1/32 persistent-keepalive=25s
+```
+
+Or via Winbox GUI:
 
 1. Go to **WireGuard** (left menu)
 2. Select your `wg-aws` interface
@@ -197,6 +218,14 @@ In Winbox:
 6. Click **OK**
 
 ### Step 6: Add Firewall Rules (Optional but Recommended)
+
+In Terminal, run:
+
+```routeros
+/ip firewall filter add chain=input protocol=udp dst-port=51820 action=accept comment="Allow WireGuard"
+```
+
+Or via Winbox GUI:
 
 1. Go to **IP → Firewall → Filter Rules**
 2. Add rule to accept WireGuard:
@@ -213,10 +242,10 @@ Open **Terminal** in Winbox:
 
 ```routeros
 # Check WireGuard interface status
-/interface/wireguard/print
+/interface wireguard print detail
 
 # Check peers
-/interface/wireguard/peers/print
+/interface wireguard peers print detail
 
 # Ping AWS server through VPN
 /ping 10.0.0.1 count=5
@@ -237,7 +266,7 @@ Now that you have the MikroTik public key:
 sudo nano /etc/wireguard/wg0.conf
 ```
 
-Replace `<MIKROTIK_PUBLIC_KEY_WILL_GO_HERE>` with the actual MikroTik public key from Part 2, Step 2.
+Replace `<MIKROTIK_PUBLIC_KEY_WILL_GO_HERE>` with the actual MikroTik public key from Part 2, Step 3.
 
 ### Step 2: Start WireGuard on AWS
 
@@ -338,8 +367,8 @@ sudo journalctl -u wg-quick@wg0 -f
 
 **On MikroTik (Winbox Terminal):**
 ```routeros
-/interface/wireguard/print
-/interface/wireguard/peers/print detail
+/interface wireguard print detail
+/interface wireguard peers print detail
 /ping 10.0.0.1 count=10
 ```
 
@@ -352,8 +381,8 @@ sudo systemctl restart wg-quick@wg0
 
 **On MikroTik (Winbox Terminal):**
 ```routeros
-/interface/wireguard/disable wg-aws
-/interface/wireguard/enable wg-aws
+/interface wireguard disable wg-aws
+/interface wireguard enable wg-aws
 ```
 
 ---
@@ -373,7 +402,7 @@ ip addr show wg0
 
 **Check on MikroTik:**
 ```routeros
-/interface/wireguard/peers/print
+/interface wireguard peers print detail
 # Look for "last-handshake" - should be recent
 ```
 
@@ -465,8 +494,8 @@ ping 10.0.0.2                        # Test connectivity
 
 **MikroTik:**
 ```routeros
-/interface/wireguard/print           # Show interfaces
-/interface/wireguard/peers/print     # Show peers
+/interface wireguard print detail    # Show interfaces
+/interface wireguard peers print     # Show peers
 /ping 10.0.0.1                       # Test connectivity
 ```
 
