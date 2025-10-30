@@ -21,26 +21,124 @@ This guide focuses **exclusively on guest hotspot users** - customers who pay fo
 ## 🔧 Test Environment Setup
 
 ### Prerequisites
-- ✅ Server running on `http://localhost:8000`
-- ✅ SQLite database (auto-created)
-- ✅ MikroTik router accessible with hotspot configured
+- ✅ Server running on `https://isp.bitwavetechnologies.com`
+- ✅ PostgreSQL database initialized (run `docker exec -it isp_billing_app python init_db.py`)
+- ✅ MikroTik router accessible via WireGuard VPN (10.0.0.2)
 - ✅ Postman installed
 
+**⚠️ IMPORTANT:** Before testing, initialize the database:
+```bash
+# On AWS server
+docker exec -it isp_billing_app python init_db.py
+```
+
 ### Base URL
+
+**Production:**
+```
+https://isp.bitwavetechnologies.com
+```
+
+**Local Testing:**
 ```
 http://localhost:8000
 ```
 
 ---
 
-## 🚀 Quick Start (4 Steps to Test Guest Hotspot)
+## 🚀 Quick Start (5 Steps to Test Guest Hotspot)
 
-1. **Setup Router** → Add your MikroTik router
-2. **Create Plans** → Define time-based plans (1h, 24h, 7d)
-3. **Initiate Payment** → Call REST API to register guest & send STK Push
-4. **Verify Access** → Check customer created & MikroTik provisioning
+1. **Register Admin User** → Create your admin account
+2. **Setup Router** → Add your MikroTik router
+3. **Create Plans** → Define time-based plans (1h, 24h, 7d)
+4. **Initiate Payment** → Call REST API to register guest & send STK Push
+5. **Verify Access** → Check customer created & MikroTik provisioning
 
-**Flow:** `POST /api/hotspot/register-and-pay` → STK Push → Guest pays → Payment callback → MikroTik provisioning
+**Flow:** Register → Login → Add Router → Create Plans → `POST /api/hotspot/register-and-pay` → STK Push → Guest pays → Payment callback → MikroTik provisioning
+
+---
+
+## ✅ **STEP 0: Register Admin User & Login**
+
+### 0.1: Register Admin User
+
+#### Purpose
+Create your admin account (required before creating routers)
+
+#### Request
+```
+Method: POST
+URL: https://isp.bitwavetechnologies.com/api/users/register
+Headers: 
+    Content-Type: application/json
+Body: (raw JSON)
+```
+
+```json
+{
+    "email": "admin@bitwavetechnologies.com",
+    "password": "YourSecurePassword123",
+    "role": "admin",
+    "organization_name": "Bitwave Technologies"
+}
+```
+
+#### Expected Response
+```json
+{
+    "id": 1,
+    "email": "admin@bitwavetechnologies.com",
+    "user_code": "USR001",
+    "role": "admin",
+    "organization_name": "Bitwave Technologies",
+    "created_at": "2025-10-30T12:00:00.000000"
+}
+```
+
+#### Status Code
+`200 OK`
+
+---
+
+### 0.2: Login to Get Token
+
+#### Purpose
+Authenticate and receive JWT token for protected endpoints
+
+#### Request
+```
+Method: POST
+URL: https://isp.bitwavetechnologies.com/api/auth/login
+Headers: 
+    Content-Type: application/json
+Body: (raw JSON)
+```
+
+```json
+{
+    "email": "admin@bitwavetechnologies.com",
+    "password": "YourSecurePassword123"
+}
+```
+
+#### Expected Response
+```json
+{
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "token_type": "bearer",
+    "user": {
+        "id": 1,
+        "email": "admin@bitwavetechnologies.com",
+        "role": "admin",
+        "user_code": "USR001"
+    }
+}
+```
+
+**⚠️ Important:** Save the `access_token` - you'll need it for protected endpoints!
+
+#### Status Code
+`200 OK`
 
 ---
 
@@ -54,7 +152,7 @@ Add your MikroTik router to the system
 #### Request
 ```
 Method: POST
-URL: http://localhost:8000/api/routers/create
+URL: https://isp.bitwavetechnologies.com/api/routers/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -63,9 +161,9 @@ Body: (raw JSON)
 ```json
 {
     "name": "Guest Hotspot Router",
-    "ip_address": "192.168.88.1",
+    "ip_address": "10.0.0.2",
     "username": "admin",
-    "password": "password",
+    "password": "mvnm",
     "port": 8728
 }
 ```
@@ -100,7 +198,7 @@ Create a short-duration guest plan
 #### Request
 ```
 Method: POST
-URL: http://localhost:8000/api/plans/create
+URL: https://isp.bitwavetechnologies.com/api/plans/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -140,7 +238,7 @@ Body: (raw JSON)
 #### Request
 ```
 Method: POST
-URL: http://localhost:8000/api/plans/create
+URL: https://isp.bitwavetechnologies.com/api/plans/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -164,7 +262,7 @@ Body: (raw JSON)
 #### Request
 ```
 Method: POST
-URL: http://localhost:8000/api/plans/create
+URL: https://isp.bitwavetechnologies.com/api/plans/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -188,7 +286,7 @@ Body: (raw JSON)
 #### Request
 ```
 Method: GET
-URL: http://localhost:8000/api/plans
+URL: https://isp.bitwavetechnologies.com/api/plans
 Headers: None
 Body: None
 ```
@@ -252,7 +350,7 @@ Guest registers and initiates M-Pesa STK Push payment
 #### Request - REST API
 ```
 Method: POST
-URL: http://localhost:8000/api/hotspot/register-and-pay
+URL: https://isp.bitwavetechnologies.com/api/hotspot/register-and-pay
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -311,7 +409,7 @@ Simulate what the payment gateway does after successful payment (for testing wit
 #### Request
 ```
 Method: POST
-URL: http://localhost:8000/api/lipay/callback
+URL: https://isp.bitwavetechnologies.com/api/lipay/callback
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -581,6 +679,9 @@ Expiry extended by another 24 hours
 ## 📝 Test Execution Checklist
 
 ### Initial Setup (One-Time)
+- [ ] Database initialized (`docker exec -it isp_billing_app python init_db.py`)
+- [ ] Admin user registered
+- [ ] Logged in and got JWT token
 - [ ] Router added to system
 - [ ] 3 plans created (1h, 24h, 7d)
 - [ ] Plans verified with GET request
