@@ -308,10 +308,15 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             
             plan = customer.plan
             duration_value = plan.duration_value if plan else 1
-            days_paid_for = duration_value
+            duration_unit = plan.duration_unit.value.upper() if plan else "DAYS"
             
-            if plan and plan.duration_unit.value.upper() == "HOURS":
-                days_paid_for = max(1, duration_value // 24)
+            # Calculate days_paid_for for financial tracking (minimum 1 day)
+            if duration_unit == "MINUTES":
+                days_paid_for = max(1, duration_value // (24 * 60))  # minutes to days
+            elif duration_unit == "HOURS":
+                days_paid_for = max(1, duration_value // 24)  # hours to days
+            else:  # DAYS
+                days_paid_for = duration_value
             
             payment = await record_customer_payment(
                 db=db,
@@ -329,7 +334,17 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             # Provision to MikroTik if hotspot
             if customer.mac_address and customer.router:
                 router = customer.router
-                time_limit = f"{int(duration_value)}{'d' if plan.duration_unit.value.upper() == 'DAYS' else 'h'}"
+                
+                # Convert duration to MikroTik format (m=minutes, h=hours, d=days)
+                duration_unit = plan.duration_unit.value.upper()
+                if duration_unit == "MINUTES":
+                    time_limit = f"{int(duration_value)}m"
+                elif duration_unit == "HOURS":
+                    time_limit = f"{int(duration_value)}h"
+                elif duration_unit == "DAYS":
+                    time_limit = f"{int(duration_value)}d"
+                else:
+                    time_limit = f"{int(duration_value)}h"  # Default to hours
                 
                 hotspot_payload = {
                     "mac_address": customer.mac_address,
@@ -454,7 +469,10 @@ async def register_mac_address(
             current_time = datetime.utcnow()
             time_limit = registration["time_limit"]
 
-            if time_limit.endswith('h'):
+            if time_limit.endswith('m'):
+                minutes = int(time_limit[:-1])
+                expires_at = current_time + timedelta(minutes=minutes)
+            elif time_limit.endswith('h'):
                 hours = int(time_limit[:-1])
                 expires_at = current_time + timedelta(hours=hours)
             elif time_limit.endswith('d'):
@@ -1338,14 +1356,23 @@ async def create_plan_api(
 
 @app.get("/api/plans")
 async def get_plans_api(
-    user_id: int = 1,  # Default to user_id 1 for testing (REMOVE IN PRODUCTION)
+    user_id: Optional[int] = None,
+    connection_type: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all plans (authentication temporarily disabled for testing)"""
+    """Get all plans with optional filters (user_id, connection_type)"""
     try:
         # user = await get_current_user(token, db)  # Temporarily disabled for testing
         
-        stmt = select(Plan).where(Plan.user_id == user_id)
+        stmt = select(Plan)
+        
+        # Apply filters if provided
+        if user_id is not None:
+            stmt = stmt.where(Plan.user_id == user_id)
+        
+        if connection_type is not None:
+            stmt = stmt.where(Plan.connection_type == connection_type)
+        
         result = await db.execute(stmt)
         plans = result.scalars().all()
         
@@ -1358,44 +1385,14 @@ async def get_plans_api(
                 "duration_value": p.duration_value,
                 "duration_unit": p.duration_unit.value,
                 "connection_type": p.connection_type.value,
-                "router_profile": p.router_profile
+                "router_profile": p.router_profile,
+                "user_id": p.user_id
             }
             for p in plans
         ]
     except Exception as e:
         logger.error(f"Error fetching plans: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch plans")
-
-@app.delete("/api/plans/{plan_id}")
-async def delete_plan_api(
-    plan_id: int,
-    user_id: int = 1,  # Default to user_id 1 for testing (REMOVE IN PRODUCTION)
-    db: AsyncSession = Depends(get_db)
-):
-    """Delete a plan (authentication temporarily disabled for testing)"""
-    try:
-        # user = await get_current_user(token, db)  # Temporarily disabled for testing
-        
-        # Get plan
-        plan_stmt = select(Plan).where(Plan.id == plan_id, Plan.user_id == user_id)
-        plan_result = await db.execute(plan_stmt)
-        plan = plan_result.scalar_one_or_none()
-        
-        if not plan:
-            raise HTTPException(status_code=404, detail="Plan not found")
-        
-        await db.delete(plan)
-        await db.commit()
-        
-        logger.info(f"Plan deleted: {plan_id} by user {user_id}")
-        
-        return {"success": True, "message": f"Plan {plan_id} deleted successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting plan: {str(e)}")
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to delete plan: {str(e)}")
 
 # Customer Management Endpoints
 class CustomerRegisterRequest(BaseModel):

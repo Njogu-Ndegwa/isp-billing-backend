@@ -50,11 +50,13 @@ http://localhost:8000
 
 1. **Register Admin User** → Create your admin account
 2. **Setup Router** → Add your MikroTik router
-3. **Create Plans** → Define time-based plans (1h, 24h, 7d)
+3. **Create Plans** → Define time-based plans (5min, 10min, 20min for testing | 1h, 24h, 7d for production)
 4. **Initiate Payment** → Call REST API to register guest & send STK Push
 5. **Verify Access** → Check customer created & MikroTik provisioning
 
 **Flow:** Register → Login → Add Router → Create Plans → `POST /api/hotspot/register-and-pay` → STK Push → Guest pays → Payment callback → MikroTik provisioning
+
+**💡 Testing Tip:** Use the 5/10/20 minute plans for quick testing without waiting hours!
 
 ---
 
@@ -281,12 +283,169 @@ Body: (raw JSON)
 
 ---
 
-### 2.4: Verify Plans Created
+## 🧪 **Quick Testing Plans (Minutes)**
+
+**Purpose:** Short-duration plans for easy testing without waiting hours/days
+
+### Create 5 Minute Plan
 
 #### Request
 ```
+Method: POST
+URL: https://isp.bitwavetechnologies.com/api/plans/create
+Headers: 
+    Content-Type: application/json
+Body: (raw JSON)
+```
+
+```json
+{
+    "name": "5 Minutes Test Plan",
+    "speed": "1M/2M",
+    "price": 10,
+    "duration_value": 5,
+    "duration_unit": "MINUTES",
+    "connection_type": "hotspot"
+}
+```
+
+#### Expected Response
+```json
+{
+    "id": 4,
+    "name": "5 Minutes Test Plan",
+    "speed": "1M/2M",
+    "price": 10,
+    "duration_value": 5,
+    "duration_unit": "MINUTES",
+    "connection_type": "hotspot",
+    "router_profile": null,
+    "user_id": 1,
+    "created_at": "2025-11-01T10:30:00.000000"
+}
+```
+
+---
+
+### Create 10 Minute Plan
+
+#### Request
+```
+Method: POST
+URL: https://isp.bitwavetechnologies.com/api/plans/create
+Headers: 
+    Content-Type: application/json
+Body: (raw JSON)
+```
+
+```json
+{
+    "name": "10 Minutes Test Plan",
+    "speed": "1M/2M",
+    "price": 15,
+    "duration_value": 10,
+    "duration_unit": "MINUTES",
+    "connection_type": "hotspot"
+}
+```
+
+#### Expected Response
+```json
+{
+    "id": 5,
+    "name": "10 Minutes Test Plan",
+    "speed": "1M/2M",
+    "price": 15,
+    "duration_value": 10,
+    "duration_unit": "MINUTES",
+    "connection_type": "hotspot",
+    "router_profile": null,
+    "user_id": 1,
+    "created_at": "2025-11-01T10:30:00.000000"
+}
+```
+
+---
+
+### Create 20 Minute Plan
+
+#### Request
+```
+Method: POST
+URL: https://isp.bitwavetechnologies.com/api/plans/create
+Headers: 
+    Content-Type: application/json
+Body: (raw JSON)
+```
+
+```json
+{
+    "name": "20 Minutes Test Plan",
+    "speed": "2M/3M",
+    "price": 20,
+    "duration_value": 20,
+    "duration_unit": "MINUTES",
+    "connection_type": "hotspot"
+}
+```
+
+#### Expected Response
+```json
+{
+    "id": 6,
+    "name": "20 Minutes Test Plan",
+    "speed": "2M/3M",
+    "price": 20,
+    "duration_value": 20,
+    "duration_unit": "MINUTES",
+    "connection_type": "hotspot",
+    "router_profile": null,
+    "user_id": 1,
+    "created_at": "2025-11-01T10:30:00.000000"
+}
+```
+
+**💡 Testing Tip:** Use these short plans to quickly test:
+- Payment flow (guest pays and gets provisioned)
+- Expiry behavior (wait 5-20 minutes and verify access is cut off)
+- Renewal flow (guest pays again before expiry)
+- MikroTik provisioning (verify hotspot user, IP binding, queue created)
+
+---
+
+### 2.4: List All Plans
+
+#### Purpose
+View all plans with optional filtering by user or connection type
+
+#### Request - Get All Plans
+```
 Method: GET
 URL: https://isp.bitwavetechnologies.com/api/plans
+Headers: None
+Body: None
+```
+
+#### Request - Filter Plans by User
+```
+Method: GET
+URL: https://isp.bitwavetechnologies.com/api/plans?user_id=1
+Headers: None
+Body: None
+```
+
+#### Request - Filter Plans by Connection Type
+```
+Method: GET
+URL: https://isp.bitwavetechnologies.com/api/plans?connection_type=hotspot
+Headers: None
+Body: None
+```
+
+#### Request - Combined Filters
+```
+Method: GET
+URL: https://isp.bitwavetechnologies.com/api/plans?user_id=1&connection_type=hotspot
 Headers: None
 Body: None
 ```
@@ -301,7 +460,9 @@ Body: None
         "price": 50,
         "duration_value": 1,
         "duration_unit": "HOURS",
-        "connection_type": "hotspot"
+        "connection_type": "hotspot",
+        "router_profile": null,
+        "user_id": 1
     },
     {
         "id": 2,
@@ -310,7 +471,9 @@ Body: None
         "price": 100,
         "duration_value": 24,
         "duration_unit": "HOURS",
-        "connection_type": "hotspot"
+        "connection_type": "hotspot",
+        "router_profile": null,
+        "user_id": 1
     },
     {
         "id": 3,
@@ -319,10 +482,61 @@ Body: None
         "price": 500,
         "duration_value": 7,
         "duration_unit": "DAYS",
-        "connection_type": "hotspot"
+        "connection_type": "hotspot",
+        "router_profile": null,
+        "user_id": 1
     }
 ]
 ```
+
+**Query Parameters:**
+- `user_id` (optional) - Filter plans by user ID
+- `connection_type` (optional) - Filter by connection type (hotspot, pppoe, static)
+
+---
+
+### 2.5: Delete a Plan
+
+#### Purpose
+Delete a specific plan (only if no active customers are using it)
+
+#### Request
+```
+Method: DELETE
+URL: https://isp.bitwavetechnologies.com/api/plans/1
+Headers: None
+Body: None
+```
+
+#### Expected Response - Success
+```json
+{
+    "success": true,
+    "message": "Plan '1 Hour Plan' deleted successfully"
+}
+```
+
+**Status Code:** `200 OK`
+
+#### Expected Response - Has Active Customers
+```json
+{
+    "detail": "Cannot delete plan. 15 active customer(s) are using this plan"
+}
+```
+
+**Status Code:** `400 Bad Request`
+
+#### Expected Response - Plan Not Found
+```json
+{
+    "detail": "Plan not found"
+}
+```
+
+**Status Code:** `404 Not Found`
+
+**Safety:** Plans with active customers cannot be deleted to prevent service disruption
 
 ---
 
@@ -721,6 +935,7 @@ Expiry extended by another 24 hours
 
 ## 📊 Common Guest Hotspot Plans
 
+### Production Plans
 | Duration | Price | Speed | Use Case |
 |----------|-------|-------|----------|
 | 1 Hour | KES 50 | 1M/2M | Quick browsing |
@@ -728,6 +943,13 @@ Expiry extended by another 24 hours
 | 24 Hours | KES 100 | 2M/3M | Day pass |
 | 3 Days | KES 250 | 2M/3M | Weekend |
 | 7 Days | KES 500 | 3M/5M | Weekly |
+
+### Testing Plans (Short Duration)
+| Duration | Price | Speed | Use Case |
+|----------|-------|-------|----------|
+| 5 Minutes | KES 10 | 1M/2M | Quick testing |
+| 10 Minutes | KES 15 | 1M/2M | Payment flow testing |
+| 20 Minutes | KES 20 | 2M/3M | Expiry testing |
 
 ---
 
@@ -739,6 +961,8 @@ Expiry extended by another 24 hours
 - `POST /api/plans/create` - Create time-based plan
 - `DELETE /api/plans/{id}` - Delete plan
 - `GET /api/plans` - List all plans
+- `GET /api/plans?user_id={id}` - List plans by user
+- `GET /api/plans?connection_type=hotspot` - List plans by type
 
 ### Guest Operations
 - `POST /api/customers/register` - Register guest (MAC + plan)
@@ -1014,10 +1238,13 @@ Remove a plan (only if no active customers using it)
 #### Request
 ```
 Method: DELETE
-URL: http://localhost:8000/api/plans/1
+URL: https://isp.bitwavetechnologies.com/api/plans/1
 Headers: None
 Body: None
 ```
+
+**URL Parameters:**
+- `plan_id` - ID of the plan to delete (e.g., 1, 2, 3)
 
 #### Expected Response - Success
 ```json
@@ -1026,6 +1253,8 @@ Body: None
     "message": "Plan '1 Hour Plan' deleted successfully"
 }
 ```
+
+**Status Code:** `200 OK`
 
 #### Expected Response - Has Active Customers
 ```json
@@ -1036,7 +1265,16 @@ Body: None
 
 **Status Code:** `400 Bad Request`
 
-**Safety:** Cannot delete plans with active users
+#### Expected Response - Plan Not Found
+```json
+{
+    "detail": "Plan not found"
+}
+```
+
+**Status Code:** `404 Not Found`
+
+**Safety:** Cannot delete plans with active users to prevent service disruption
 
 ---
 

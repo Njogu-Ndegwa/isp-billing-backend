@@ -40,6 +40,7 @@ class PaymentMethod(str, enum.Enum):
     OTHER = "other"
 
 class DurationUnit(str, enum.Enum):
+    MINUTES = "MINUTES"
     HOURS = "HOURS"
     DAYS = "DAYS"
 

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Redirecting to Login Portal</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script>
+    (function () {
+      // Replace this URL with your actual captive portal URL
+      var portal = "https://isp-frontend-two.vercel.app/";
+      
+      // Build redirect URL with MikroTik variables
+      // MikroTik automatically replaces these $(...) variables before serving the page
+      var url = portal
+        + "?mac=" + encodeURIComponent("$(mac)")           // Client's MAC address
+        + "&ip=" + encodeURIComponent("$(ip)")             // Client's IP address
+        + "&dst=" + encodeURIComponent("$(link-orig-esc)") // Original URL user tried to access
+        + "&gw=" + encodeURIComponent("$(hostname)")       // MikroTik hostname
+        + "&router=" + encodeURIComponent("$(identity)");  // Router identity/name
+      
+      // Redirect immediately
+      window.location.replace(url);
+    })();
+  </script>
+  
+  <!-- Fallback for browsers with JavaScript disabled -->
+  <noscript>
+    <meta http-equiv="refresh" content="0; url=https://isp-frontend-two.vercel.app/?mac=$(mac)&ip=$(ip)&dst=$(link-orig-esc)&gw=$(hostname)&router=$(identity)">
+  </noscript>
+  
+  <style>
+    body {
+      font-family: system-ui, -apple-system, Arial, sans-serif;
+      padding: 24px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0;
+    }
+    .container {
+      text-align: center;
+      background: rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(10px);
+      padding: 40px;
+      border-radius: 16px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+      max-width: 400px;
+    }
+    h1 {
+      margin: 0 0 16px 0;
+      font-size: 28px;
+    }
+    .spinner {
+      border: 4px solid rgba(255, 255, 255, 0.3);
+      border-top: 4px solid white;
+      border-radius: 50%;
+      width: 50px;
+      height: 50px;
+      animation: spin 1s linear infinite;
+      margin: 20px auto;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    .note {
+      opacity: 0.85;
+      font-size: 14px;
+      margin-top: 20px;
+    }
+    a {
+      color: white;
+      text-decoration: underline;
+      font-weight: bold;
+    }
+    a:hover {
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Welcome to WiFi</h1>
+    <div class="spinner"></div>
+    <p>Redirecting you to the login portal...</p>
+    <p class="note">
+      If you are not redirected automatically, 
+      <a href="https://isp-frontend-two.vercel.app/?mac=$(mac)&ip=$(ip)&dst=$(link-orig-esc)&gw=$(hostname)&router=$(identity)">
+        click here
+      </a>.
+    </p>
+  </div>
+</body>
+</html>
+
