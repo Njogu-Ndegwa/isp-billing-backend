@@ -195,15 +195,74 @@ async def cleanup_expired_users_background():
                     logger.warning(f"[CRON] Customer {customer.id} has no MAC address")
                     continue
                 
-                # Use shared cleanup function
-                result = await remove_user_from_mikrotik(customer.mac_address, db)
-                
-                if result["success"]:
+                try:
+                    normalized_mac = normalize_mac_address(customer.mac_address)
+                    username = normalized_mac.replace(":", "")
+                    
+                    # Update database status first
+                    customer.status = CustomerStatus.INACTIVE
+                    await db.flush()
+                    logger.info(f"[CRON] Customer {customer.id} set to INACTIVE in database")
+                    
+                    # Connect to MikroTik and remove user
+                    api = MikroTikAPI(
+                        settings.MIKROTIK_HOST,
+                        settings.MIKROTIK_USERNAME,
+                        settings.MIKROTIK_PASSWORD,
+                        settings.MIKROTIK_PORT
+                    )
+                    
+                    if not api.connect():
+                        logger.error(f"[CRON] Failed to connect to MikroTik for customer {customer.id}")
+                        failed_count += 1
+                        continue
+                    
+                    removed = {"user": False, "bindings": 0, "queues": 0, "leases": 0}
+                    
+                    # Remove hotspot user
+                    users = api.send_command("/ip/hotspot/user/print")
+                    if users.get("success") and users.get("data"):
+                        for u in users["data"]:
+                            if u.get("name") == username:
+                                api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
+                                removed["user"] = True
+                                break
+                    
+                    # Remove IP bindings
+                    bindings = api.send_command("/ip/hotspot/ip-binding/print")
+                    if bindings.get("success") and bindings.get("data"):
+                        for b in bindings["data"]:
+                            if b.get("mac-address", "").upper() == normalized_mac.upper():
+                                api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                                removed["bindings"] += 1
+                    
+                    # Remove queues
+                    queues = api.send_command("/queue/simple/print")
+                    if queues.get("success") and queues.get("data"):
+                        for q in queues["data"]:
+                            if q.get("name") == f"queue_{username}":
+                                api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                                removed["queues"] += 1
+                    
+                    # Remove DHCP leases
+                    leases = api.send_command("/ip/dhcp-server/lease/print")
+                    if leases.get("success") and leases.get("data"):
+                        for l in leases["data"]:
+                            if l.get("mac-address", "").upper() == normalized_mac.upper():
+                                api.send_command("/ip/dhcp-server/lease/remove", {"numbers": l[".id"]})
+                                removed["leases"] += 1
+                    
+                    api.disconnect()
+                    
                     removed_count += 1
-                    logger.info(f"[CRON] Removed expired customer {customer.name} ({customer.mac_address}) - Expired at {customer.expiry}")
-                else:
+                    logger.info(f"[CRON] Removed expired customer {customer.name} ({normalized_mac}) - Expired at {customer.expiry}. Removed: {removed}")
+                    
+                except Exception as e:
                     failed_count += 1
-                    logger.error(f"[CRON] Failed to remove customer {customer.id}: {result.get('error', 'Unknown error')}")
+                    logger.error(f"[CRON] Failed to remove customer {customer.id}: {e}")
+            
+            # Commit all database changes
+            await db.commit()
             
             duration = (datetime.utcnow() - start_time).total_seconds()
             logger.info(f"[CRON] Cleanup completed in {duration:.2f}s: {removed_count} removed, {failed_count} failed")
