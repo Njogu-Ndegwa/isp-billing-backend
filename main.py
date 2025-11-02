@@ -2,7 +2,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status, Re
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from app.db.database import get_db
+from app.db.database import get_db, async_engine
 from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus, User
 from app.services.auth import verify_token, get_current_user
 from app.services.billing import make_payment
@@ -17,6 +17,9 @@ from datetime import datetime, timedelta
 import hashlib
 from pprint import pformat
 from pydantic import BaseModel
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +36,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize scheduler and cleanup flag
+scheduler = AsyncIOScheduler()
+cleanup_running = False
+
 async def get_router_by_id(
     db: AsyncSession,
     router_id: int,
@@ -44,6 +51,167 @@ async def get_router_by_id(
         stmt = stmt.where(Router.user_id == user_id)
     res = await db.execute(stmt)
     return res.scalar_one_or_none()
+
+# Shared function to remove user from MikroTik
+async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
+    """
+    Remove user from MikroTik router and update database status
+    
+    Removes from these MikroTik locations:
+    1. /ip/hotspot/user (the user account)
+    2. /ip/hotspot/ip-binding (MAC address bindings - for bypassed users)
+    3. /queue/simple (bandwidth limits)
+    4. /ip/dhcp-server/lease (DHCP leases)
+    
+    Returns dict with success status and details
+    """
+    try:
+        normalized_mac = normalize_mac_address(mac_address)
+        username = normalized_mac.replace(":", "")
+        
+        # Update database first
+        customer_stmt = select(Customer).where(Customer.mac_address == normalized_mac)
+        customer_result = await db.execute(customer_stmt)
+        customer = customer_result.scalar_one_or_none()
+        
+        if not customer:
+            return {"success": False, "error": "Customer not found in database"}
+        
+        customer.status = CustomerStatus.INACTIVE
+        await db.commit()
+        logger.info(f"[CLEANUP] Customer {customer.id} set to INACTIVE in database")
+        
+        # Connect to MikroTik
+        api = MikroTikAPI(
+            settings.MIKROTIK_HOST,
+            settings.MIKROTIK_USERNAME,
+            settings.MIKROTIK_PASSWORD,
+            settings.MIKROTIK_PORT
+        )
+        
+        if not api.connect():
+            logger.error(f"[CLEANUP] Failed to connect to MikroTik for {normalized_mac}")
+            return {"success": False, "error": "Failed to connect to MikroTik"}
+        
+        removed = {"user": False, "bindings": 0, "queues": 0, "leases": 0}
+        
+        # 1. Remove hotspot user (from Users tab)
+        users = api.send_command("/ip/hotspot/user/print")
+        if users.get("success") and users.get("data"):
+            for u in users["data"]:
+                if u.get("name") == username:
+                    api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
+                    removed["user"] = True
+                    logger.info(f"[CLEANUP] Removed hotspot user: {username}")
+                    break
+        
+        # 2. Remove IP bindings (from IP Bindings tab - this is where bypassed users are)
+        bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        if bindings.get("success") and bindings.get("data"):
+            for b in bindings["data"]:
+                if b.get("mac-address", "").upper() == normalized_mac.upper():
+                    api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                    removed["bindings"] += 1
+                    logger.info(f"[CLEANUP] Removed IP binding: {normalized_mac}")
+        
+        # 3. Remove queues (from Queues section)
+        queues = api.send_command("/queue/simple/print")
+        if queues.get("success") and queues.get("data"):
+            for q in queues["data"]:
+                if q.get("name") == f"queue_{username}":
+                    api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                    removed["queues"] += 1
+                    logger.info(f"[CLEANUP] Removed queue: queue_{username}")
+        
+        # 4. Remove DHCP leases
+        leases = api.send_command("/ip/dhcp-server/lease/print")
+        if leases.get("success") and leases.get("data"):
+            for l in leases["data"]:
+                if l.get("mac-address", "").upper() == normalized_mac.upper():
+                    api.send_command("/ip/dhcp-server/lease/remove", {"numbers": l[".id"]})
+                    removed["leases"] += 1
+                    logger.info(f"[CLEANUP] Removed DHCP lease: {normalized_mac}")
+        
+        api.disconnect()
+        
+        logger.info(f"[CLEANUP] Successfully cleaned up {normalized_mac}: {removed}")
+        
+        return {
+            "success": True,
+            "customer_id": customer.id,
+            "mac_address": normalized_mac,
+            "removed": removed
+        }
+        
+    except Exception as e:
+        logger.error(f"[CLEANUP] Error removing user {mac_address}: {e}")
+        return {"success": False, "error": str(e)}
+
+# Background cleanup function for expired users
+async def cleanup_expired_users_background():
+    """
+    Background task that runs every 1 minute to remove expired users from MikroTik
+    """
+    global cleanup_running
+    
+    # Prevent overlapping runs
+    if cleanup_running:
+        logger.warning("[CRON] Previous cleanup still running, skipping this run")
+        return
+    
+    cleanup_running = True
+    start_time = datetime.utcnow()
+    
+    try:
+        async with AsyncSession(async_engine) as db:
+            now = datetime.utcnow()
+            
+            # Query expired customers from database
+            stmt = select(Customer).where(
+                Customer.status == CustomerStatus.ACTIVE,
+                Customer.expiry.isnot(None),
+                Customer.expiry <= now,
+                Customer.mac_address.isnot(None)
+            ).options(selectinload(Customer.router))
+            
+            result = await db.execute(stmt)
+            expired_customers = result.scalars().all()
+            
+            if not expired_customers:
+                logger.info("[CRON] No expired customers found")
+                return
+            
+            logger.info(f"[CRON] Found {len(expired_customers)} expired customers to cleanup")
+            
+            removed_count = 0
+            failed_count = 0
+            
+            for customer in expired_customers:
+                if not customer.router:
+                    logger.warning(f"[CRON] Customer {customer.id} has no router assigned")
+                    continue
+                
+                if not customer.mac_address:
+                    logger.warning(f"[CRON] Customer {customer.id} has no MAC address")
+                    continue
+                
+                # Use shared cleanup function
+                result = await remove_user_from_mikrotik(customer.mac_address, db)
+                
+                if result["success"]:
+                    removed_count += 1
+                    logger.info(f"[CRON] Removed expired customer {customer.name} ({customer.mac_address}) - Expired at {customer.expiry}")
+                else:
+                    failed_count += 1
+                    logger.error(f"[CRON] Failed to remove customer {customer.id}: {result.get('error', 'Unknown error')}")
+            
+            duration = (datetime.utcnow() - start_time).total_seconds()
+            logger.info(f"[CRON] Cleanup completed in {duration:.2f}s: {removed_count} removed, {failed_count} failed")
+            
+    except Exception as e:
+        logger.error(f"[CRON] Cleanup job failed: {e}")
+    finally:
+        cleanup_running = False
 
 
 
@@ -1041,77 +1209,34 @@ async def remove_bypassed_user_public(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Fully remove (hotspot user + bindings + queues + dhcp lease)
-    for the given MAC address on the given router.
+    Remove expired user from MikroTik (hotspot user + bindings + queues + dhcp lease)
+    Also updates database status to INACTIVE.
     No JWT required.
     """
+    logger.info(f"[REMOVE-BYPASSED] Endpoint hit! router_id={router_id}, mac={mac_address}")
+    
     if not validate_mac_address(mac_address):
         raise HTTPException(status_code=400, detail="Invalid MAC address format")
 
-    normalized_mac = normalize_mac_address(mac_address)
-    username = normalized_mac.replace(":", "")
-
+    # Verify router exists
     router = await get_router_by_id(db, router_id)
     if not router:
         raise HTTPException(status_code=404, detail="Router not found")
 
-    api = MikroTikAPI(settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, 
-                      settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT)
-    if not api.connect():
-        raise HTTPException(status_code=500, detail="Failed to connect to router")
-
-    try:
-        # Disconnect active sessions
-        active_sessions = api.send_command("/ip/hotspot/active/print")
-        if active_sessions.get("success") and active_sessions.get("data"):
-            for session in active_sessions["data"]:
-                if session.get("user") == username:
-                    sid = session.get(".id")
-                    if sid:
-                        api.send_command("/ip/hotspot/active/remove", {"numbers": sid})
-
-        # Remove hotspot user
-        users = api.send_command("/ip/hotspot/user/print")
-        uid = None
-        if users.get("success") and users.get("data"):
-            for u in users["data"]:
-                if u.get("name") == username:
-                    uid = u.get(".id")
-                    break
-        if uid:
-            api.send_command("/ip/hotspot/user/remove", {"numbers": uid})
-
-        # Clean up IP bindings, queues, DHCP lease
-        bindings = api.send_command("/ip/hotspot/ip-binding/print")
-        if bindings.get("success") and bindings.get("data"):
-            for b in bindings["data"]:
-                if b.get("mac-address", "").upper() == normalized_mac.upper():
-                    api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
-
-        queues = api.send_command("/queue/simple/print")
-        if queues.get("success") and queues.get("data"):
-            for q in queues["data"]:
-                if q.get("name") == f"queue_{username}":
-                    api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
-
-        leases = api.send_command("/ip/dhcp-server/lease/print")
-        if leases.get("success") and leases.get("data"):
-            for l in leases["data"]:
-                if l.get("mac-address", "").upper() == normalized_mac.upper():
-                    api.send_command("/ip/dhcp-server/lease/remove", {"numbers": l[".id"]})
-
-        return {
-            "success": True,
-            "message": f"User with MAC {normalized_mac} removed successfully",
-            "mac_address": normalized_mac,
-            "router_id": router_id
-        }
-
-    except Exception as e:
-        logger.error(f"Error removing bypassed user {normalized_mac}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        api.disconnect()
+    # Use shared cleanup function
+    result = await remove_user_from_mikrotik(mac_address, db)
+    
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Failed to remove user"))
+    
+    return {
+        "success": True,
+        "message": f"User with MAC {result['mac_address']} removed from MikroTik and set to INACTIVE",
+        "customer_id": result.get("customer_id"),
+        "mac_address": result["mac_address"],
+        "router_id": router_id,
+        "removed_items": result.get("removed", {})
+    }
 
 # ============================================
 # REST API ENDPOINTS FOR CRUD OPERATIONS
@@ -1946,7 +2071,52 @@ async def get_mpesa_transactions_summary(
 
 @app.get("/")
 def read_root():
-    return {"message": "ISP Billing SaaS API", "version": "1.0.0"}
+    return {"message": "ISP Billing SaaS API", "version": "1.0.0", "updated": "2025-11-02-v2"}
+
+@app.get("/api/test-remove/{router_id}/{mac_address}")
+def test_remove_endpoint(router_id: int, mac_address: str):
+    """Test endpoint to verify routing works"""
+    return {
+        "endpoint_hit": True,
+        "router_id": router_id,
+        "mac_address": mac_address,
+        "message": "Endpoint is working! Route parameters received correctly."
+    }
+
+@app.api_route("/api/remove-user/{router_id}/{mac_address}", methods=["GET", "POST", "DELETE"])
+async def remove_user_all_methods(
+    router_id: int,
+    mac_address: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Remove expired user from MikroTik and update database status to INACTIVE
+    Supports GET, POST, DELETE methods
+    """
+    logger.info(f"[REMOVE-USER] Endpoint hit! router_id={router_id}, mac={mac_address}")
+    
+    if not validate_mac_address(mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address format")
+
+    # Verify router exists
+    router = await get_router_by_id(db, router_id)
+    if not router:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    # Use shared cleanup function
+    result = await remove_user_from_mikrotik(mac_address, db)
+    
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Failed to remove user"))
+    
+    return {
+        "success": True,
+        "message": f"User with MAC {result['mac_address']} removed from MikroTik and set to INACTIVE",
+        "customer_id": result.get("customer_id"),
+        "mac_address": result["mac_address"],
+        "router_id": router_id,
+        "removed_items": result.get("removed", {})
+    }
 
 # Dashboard Overview Endpoint
 @app.get("/api/dashboard/overview")
@@ -2375,6 +2545,28 @@ async def delete_plan(
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+# Startup event - Start background scheduler
+@app.on_event("startup")
+async def startup_event():
+    """Start the background cleanup scheduler when the app starts"""
+    scheduler.add_job(
+        cleanup_expired_users_background,
+        trigger=IntervalTrigger(minutes=1),  # Run every 1 minute
+        id='cleanup_expired_users',
+        name='Remove expired hotspot users from MikroTik',
+        replace_existing=True,
+        max_instances=1  # Prevents overlapping runs
+    )
+    scheduler.start()
+    logger.info("🔄 Background scheduler started - expired user cleanup runs every 1 minute")
+
+# Shutdown event - Stop background scheduler
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop the background scheduler when the app shuts down"""
+    scheduler.shutdown()
+    logger.info("🛑 Background scheduler stopped")
 
 if __name__ == "__main__":
     import uvicorn

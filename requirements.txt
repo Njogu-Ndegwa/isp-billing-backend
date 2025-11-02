@@ -26,3 +26,6 @@ pydantic-settings
 
 # Utilities and formatting
 python-dateutil
+
+# Background task scheduler
+apscheduler==3.10.4

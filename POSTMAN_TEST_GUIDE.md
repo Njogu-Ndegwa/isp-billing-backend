@@ -673,15 +673,21 @@ Body: (raw JSON)
 
 ## ✅ **STEP 4: Verify Guest Provisioning**
 
-### 4.1: Check Customer Auto-Created
+### 4.1: Get All Guest Users
+
+#### Purpose
+Fetch all guest users (customers) with their details including ID, status, expiry, and plan information
 
 #### Request
 ```
 Method: GET
-URL: http://localhost:8000/api/customers
+URL: https://isp.bitwavetechnologies.com/api/customers
 Headers: None
 Body: None
 ```
+
+**Query Parameters (Optional):**
+- `user_id` - Filter by reseller/owner ID (defaults to 1)
 
 #### Expected Response
 ```json
@@ -691,8 +697,120 @@ Body: None
         "name": "Guest 5678",
         "phone": "+254712345678",
         "mac_address": "AA:BB:CC:DD:EE:FF",
-        "status": "ACTIVE",
-        "expiry": "2025-10-21T10:30:00.000000",
+        "status": "active",
+        "expiry": "2025-11-02T10:30:00.000000",
+        "plan": {
+            "id": 2,
+            "name": "24 Hours Plan",
+            "price": 100
+        },
+        "router": {
+            "id": 1,
+            "name": "Guest Hotspot Router"
+        }
+    },
+    {
+        "id": 2,
+        "name": "Guest 1234",
+        "phone": "+254798765432",
+        "mac_address": "BB:CC:DD:EE:FF:00",
+        "status": "inactive",
+        "expiry": "2025-11-01T15:20:00.000000",
+        "plan": {
+            "id": 1,
+            "name": "1 Hour Plan",
+            "price": 50
+        },
+        "router": {
+            "id": 1,
+            "name": "Guest Hotspot Router"
+        }
+    },
+    {
+        "id": 3,
+        "name": "John Doe",
+        "phone": "+254700123456",
+        "mac_address": "CC:DD:EE:FF:00:11",
+        "status": "pending",
+        "expiry": null,
+        "plan": {
+            "id": 3,
+            "name": "7 Days Plan",
+            "price": 500
+        },
+        "router": {
+            "id": 1,
+            "name": "Guest Hotspot Router"
+        }
+    }
+]
+```
+
+**Status Code:** `200 OK`
+
+**Response Fields Explained:**
+- `id` - Customer unique ID (use this to track/manage customer)
+- `name` - Customer name (auto-generated as "Guest XXXX" or custom)
+- `phone` - Customer phone number (M-Pesa number)
+- `mac_address` - Device MAC address (used for hotspot binding)
+- `status` - Current status: `active`, `inactive`, or `pending`
+- `expiry` - When access expires (ISO datetime format)
+- `plan` - The internet plan customer is using
+- `router` - The router/location customer is connected to
+
+**Use Cases:**
+- Dashboard display of all customers
+- Finding customer ID for manual operations
+- Monitoring customer status
+- Generating reports
+
+---
+
+### 4.2: Get Only Active Guests
+
+#### Purpose
+Fetch only currently active guests (useful for monitoring who's online)
+
+#### Request
+```
+Method: GET
+URL: https://isp.bitwavetechnologies.com/api/customers/active
+Headers: None
+Body: None
+```
+
+**Query Parameters (Optional):**
+- `user_id` - Filter by reseller/owner ID (defaults to 1)
+
+#### Expected Response
+```json
+[
+    {
+        "id": 1,
+        "name": "Guest 5678",
+        "phone": "+254712345678",
+        "mac_address": "AA:BB:CC:DD:EE:FF",
+        "status": "active",
+        "expiry": "2025-11-02T10:30:00.000000",
+        "hours_remaining": 18.5,
+        "plan": {
+            "id": 2,
+            "name": "24 Hours Plan",
+            "price": 100
+        },
+        "router": {
+            "id": 1,
+            "name": "Guest Hotspot Router"
+        }
+    },
+    {
+        "id": 4,
+        "name": "Guest 9876",
+        "phone": "+254722334455",
+        "mac_address": "DD:EE:FF:00:11:22",
+        "status": "active",
+        "expiry": "2025-11-02T14:45:00.000000",
+        "hours_remaining": 22.75,
         "plan": {
             "id": 2,
             "name": "24 Hours Plan",
@@ -706,43 +824,128 @@ Body: None
 ]
 ```
 
-**✅ Customer auto-created:** `Guest 5678` (from phone number)  
-**✅ Status:** `ACTIVE`  
-**✅ Expiry set:** 24 hours from payment time  
-**✅ Assigned to router:** Router ID 1
+**Status Code:** `200 OK`
+
+**Additional Fields:**
+- `hours_remaining` - How many hours until expiry (calculated in real-time)
+
+**Sorted by:** Expiry time (soonest expiry first)
+
+**Use Cases:**
+- Monitor currently active guests
+- See who's about to expire (renewal opportunities)
+- Dashboard "Online Users" widget
+- Capacity planning
 
 ---
 
-### 4.2: Check MAC Registration Status
+### 4.3: Get Specific Customer by ID
 
 #### Purpose
-Verify guest is provisioned on MikroTik
+Fetch details for a specific customer using their ID
 
 #### Request
 ```
 Method: GET
-URL: http://localhost:8000/api/public/mac-status/1/AA:BB:CC:DD:EE:FF
+URL: https://isp.bitwavetechnologies.com/api/customers/1
 Headers: None
 Body: None
 ```
 
-#### Expected Response
+**Note:** This endpoint would need to be added if you need it. Currently you can filter from the list above.
+
+**Workaround:** Fetch all customers and filter by ID in your application:
+```javascript
+// Example in JavaScript
+const customers = await fetch('/api/customers').then(r => r.json());
+const customer = customers.find(c => c.id === 1);
+```
+
+---
+
+### 4.4: Check Customer Auto-Created After Payment
+
+#### Purpose
+Verify that customer was auto-created after payment callback
+
+#### Request
+```
+Method: GET
+URL: https://isp.bitwavetechnologies.com/api/customers
+Headers: None
+Body: None
+```
+
+#### What to Verify
+**✅ Customer auto-created:** `Guest 5678` (from last 4 digits of phone number)  
+**✅ Status:** `active` (changed from `pending` after payment)  
+**✅ Expiry set:** 24 hours from payment time  
+**✅ Assigned to router:** Router ID 1  
+**✅ MAC address stored:** `AA:BB:CC:DD:EE:FF`
+
+---
+
+### 4.5: Check MAC Registration Status
+
+#### Purpose
+Verify guest is provisioned on MikroTik router (checks hotspot user exists)
+
+#### Request
+```
+Method: GET
+URL: https://isp.bitwavetechnologies.com/api/public/mac-status/1/AA:BB:CC:DD:EE:FF
+Headers: None
+Body: None
+```
+
+**URL Parameters:**
+- `router_id` - Router ID (e.g., 1)
+- `mac_address` - MAC address to check (format: AA:BB:CC:DD:EE:FF)
+
+#### Expected Response - User Found
 ```json
 {
     "registered": true,
     "username": "AABBCCDDEEFF",
     "disabled": false,
     "profile": "default",
-    "comment": "MAC: AA:BB:CC:DD:EE:FF | Router: Guest Hotspot Router | Owner: 1 | Expires: 2025-10-21 10:30",
+    "comment": "MAC: AA:BB:CC:DD:EE:FF | Router: Guest Hotspot Router | Owner: 1 | Expires: 2025-11-02 10:30",
     "mac_address": "AA:BB:CC:DD:EE:FF",
     "router_id": 1,
     "active_session": false
 }
 ```
 
+**Status Code:** `200 OK`
+
+#### Expected Response - User Not Found
+```json
+{
+    "registered": false,
+    "mac_address": "AA:BB:CC:DD:EE:FF",
+    "router_id": 1
+}
+```
+
+**Status Code:** `200 OK`
+
+**Response Fields:**
+- `registered` - Whether MAC is registered on router
+- `username` - Hotspot username (MAC without colons)
+- `disabled` - Whether user is disabled
+- `profile` - Hotspot profile name
+- `comment` - Comment containing expiry info
+- `active_session` - Whether user has active session
+
+**Use Cases:**
+- Captive portal status check
+- Verify provisioning was successful
+- Troubleshoot connectivity issues
+- Guest self-service status page
+
 ---
 
-### 4.3: Verify on MikroTik Router
+### 4.6: Verify on MikroTik Router (Manual)
 
 #### Manual Verification Steps:
 
@@ -808,15 +1011,24 @@ Body: None
 ### Test Remove Guest User
 
 #### Purpose
-Completely remove guest from router (after time expires)
+Completely remove guest from router (after time expires). This removes:
+- Hotspot user account
+- IP bindings (bypassed entries)
+- Simple queues (bandwidth limits)
+- DHCP lease assignments
+- Active sessions (disconnects user)
 
 #### Request
 ```
 Method: DELETE
-URL: http://localhost:8000/api/public/remove-bypassed/1/AA:BB:CC:DD:EE:FF
+URL: https://isp.bitwavetechnologies.com/api/public/remove-bypassed/1/AA:BB:CC:DD:EE:FF
 Headers: None
 Body: None
 ```
+
+**URL Parameters:**
+- `router_id` - ID of the router (e.g., 1)
+- `mac_address` - MAC address of guest to remove (format: AA:BB:CC:DD:EE:FF)
 
 #### Expected Response
 ```json
@@ -827,6 +1039,40 @@ Body: None
     "router_id": 1
 }
 ```
+
+#### Status Code
+`200 OK`
+
+#### Error Response - Router Not Found
+```json
+{
+    "detail": "Router not found"
+}
+```
+
+**Status Code:** `404 Not Found`
+
+#### Error Response - Invalid MAC Format
+```json
+{
+    "detail": "Invalid MAC address format"
+}
+```
+
+**Status Code:** `400 Bad Request`
+
+#### What Gets Removed from MikroTik:
+1. **Hotspot User:** `/ip hotspot user remove [find name="AABBCCDDEEFF"]`
+2. **IP Binding:** `/ip hotspot ip-binding remove [find mac-address="AA:BB:CC:DD:EE:FF"]`
+3. **Queue:** `/queue simple remove [find name="queue_AABBCCDDEEFF"]`
+4. **DHCP Lease:** `/ip dhcp-server lease remove [find mac-address="AA:BB:CC:DD:EE:FF"]`
+5. **Active Sessions:** Any active hotspot sessions are disconnected
+
+**Use Cases:**
+- Guest time expired (cleanup after expiry)
+- Guest violated terms (manual removal)
+- Testing cleanup (remove test users)
+- System maintenance (bulk cleanup)
 
 ---
 
@@ -965,11 +1211,21 @@ Expiry extended by another 24 hours
 - `GET /api/plans?connection_type=hotspot` - List plans by type
 
 ### Guest Operations
-- `POST /api/customers/register` - Register guest (MAC + plan)
+- `POST /api/hotspot/register-and-pay` - Register guest & initiate payment (MAC + plan)
 - `POST /api/lipay/callback` - Payment callback (activates guest)
-- `GET /api/public/mac-status/{router_id}/{mac}` - Check status
-- `POST /api/public/disconnect/{router_id}/{mac}` - Disconnect
-- `DELETE /api/public/remove-bypassed/{router_id}/{mac}` - Remove
+- `GET /api/customers` - Get all guest users with IDs, status, expiry, etc.
+- `GET /api/customers/active` - Get only active guests (with hours remaining)
+- `GET /api/public/mac-status/{router_id}/{mac}` - Check guest status on MikroTik
+- `POST /api/public/disconnect/{router_id}/{mac}` - Disconnect guest session
+- `DELETE /api/public/remove-bypassed/{router_id}/{mac}` - Completely remove guest from router
+
+### Background Automation
+- **Auto-Cleanup (Background Job)** - Runs every 1 minute to automatically remove expired users from MikroTik
+  - No endpoint needed - runs automatically when server starts
+  - Queries database for customers where `status=ACTIVE` and `expiry <= now`
+  - Removes hotspot users, IP bindings, queues, DHCP leases
+  - Updates customer status to `INACTIVE` in database
+  - Logs: `[CRON] Found X expired customers to cleanup`
 
 ### Dashboard & Analytics
 - `GET /api/dashboard/overview` - Complete dashboard with revenue & metrics
@@ -1572,6 +1828,97 @@ GET /api/mpesa/transactions?status=failed&start_date=2025-10-01&end_date=2025-10
 GET /api/mpesa/transactions?start_date=2025-10-20T00:00:00&end_date=2025-10-20T23:59:59&status=completed
 ```
 **Use:** Track sales throughout the day
+
+---
+
+## 🤖 **Automatic Expiry Management**
+
+### How It Works
+
+The system includes a **background scheduler** that automatically removes expired users from MikroTik:
+
+**1. Background Job Runs Every 1 Minute**
+- Starts automatically when Docker container starts
+- No manual intervention required
+- Uses APScheduler library
+
+**2. Database Query**
+```sql
+SELECT * FROM customers 
+WHERE status = 'ACTIVE' 
+AND expiry IS NOT NULL 
+AND expiry <= NOW()
+AND mac_address IS NOT NULL
+```
+
+**3. For Each Expired Customer:**
+- ✅ Disconnects active hotspot sessions
+- ✅ Removes hotspot user from `/ip/hotspot/user`
+- ✅ Removes IP binding from `/ip/hotspot/ip-binding`
+- ✅ Removes bandwidth queue from `/queue/simple`
+- ✅ Removes DHCP lease from `/ip/dhcp-server/lease`
+- ✅ Updates customer status to `INACTIVE` in database
+
+**4. Logs Output**
+```
+[CRON] Found 3 expired customers to cleanup
+[CRON] Removed expired customer Guest 5678 (AA:BB:CC:DD:EE:FF) - Expired at 2025-11-02T10:30:00
+[CRON] Removed expired customer Guest 1234 (BB:CC:DD:EE:FF:00) - Expired at 2025-11-02T10:35:00
+[CRON] Removed expired customer Guest 9876 (CC:DD:EE:FF:00:11) - Expired at 2025-11-02T10:40:00
+[CRON] Cleanup completed in 2.34s: 3 removed, 0 failed
+```
+
+### Configuration
+
+**Change Cleanup Interval:**
+Edit `main.py` line 2511:
+```python
+trigger=IntervalTrigger(minutes=1),  # Change to 5, 10, etc.
+```
+
+**Recommended Intervals:**
+- **1 minute** - For short plans (5-20 minutes) - immediate cutoff
+- **5 minutes** - For mixed plans (balanced)
+- **10 minutes** - For long plans (hours/days) - less overhead
+
+### Testing Expiry
+
+**Quick Test with 5-Minute Plan:**
+
+1. Create 5-minute plan
+2. Guest pays and gets provisioned
+3. Wait 5 minutes
+4. Within 1 minute after expiry, background job will:
+   - Remove user from MikroTik
+   - Set status to INACTIVE in database
+5. Guest loses internet access immediately
+
+**Monitor Logs:**
+```bash
+# Docker logs
+docker logs -f isp_billing_app | grep CRON
+
+# Expected output every minute
+[CRON] No expired customers found
+# OR
+[CRON] Found 1 expired customers to cleanup
+[CRON] Removed expired customer Guest 5678 (AA:BB:CC:DD:EE:FF) - Expired at 2025-11-02T10:30:00
+[CRON] Cleanup completed in 1.23s: 1 removed, 0 failed
+```
+
+### Prevent Overlapping Runs
+
+The system includes protection against overlapping cleanup jobs:
+
+```python
+# If previous cleanup is still running
+[CRON] Previous cleanup still running, skipping this run
+```
+
+This ensures:
+- Only one cleanup runs at a time
+- No duplicate removals
+- No MikroTik API overload
 
 ---
 
