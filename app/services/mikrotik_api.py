@@ -34,7 +34,7 @@ class MikroTikAPI:
     def connect(self) -> bool:
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(10)  # 10 second timeout
+            self.sock.settimeout(30)  # 30 second timeout for larger responses
             self.sock.connect((self.host, self.port))
             return self.login()
         except Exception as e:
@@ -96,10 +96,14 @@ class MikroTikAPI:
     def read_sentence(self) -> List[str]:
         sentence = []
         while True:
-            word = self.read_word()
-            if word == "":
+            try:
+                word = self.read_word()
+                if word == "":
+                    break
+                sentence.append(word)
+            except Exception as e:
+                logger.error(f"Error reading word in sentence: {e}")
                 break
-            sentence.append(word)
         return sentence
 
     def login(self) -> bool:
@@ -279,17 +283,20 @@ class MikroTikAPI:
             username = normalized_mac.replace(":", "")
             results = {}
 
-            # 1. Remove IP binding
+            # 1. Remove IP binding - match by MAC or name field
             bindings = self.send_command("/ip/hotspot/ip-binding/print")
-            results["ip_binding_removed"] = False
+            results["ip_binding_removed"] = 0
             if bindings.get("success") and bindings.get("data"):
                 for binding in bindings["data"]:
-                    if binding.get("mac-address", "").upper() == normalized_mac.upper() and \
-                    binding.get("type", "").lower() == "bypassed":
+                    binding_mac = binding.get("mac-address", "").upper()
+                    binding_name = binding.get("name", "").upper()
+                    # Match by MAC address OR by name field
+                    if binding_mac == normalized_mac.upper() or binding_name == username.upper():
                         binding_id = binding.get(".id")
                         if binding_id:
                             self.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
-                            results["ip_binding_removed"] = True
+                            results["ip_binding_removed"] += 1
+                            logger.info(f"Removed IP binding: {binding_name} ({binding_mac})")
 
             # 2. Remove Hotspot user
             users = self.send_command("/ip/hotspot/user/print")
@@ -302,16 +309,22 @@ class MikroTikAPI:
                             self.send_command("/ip/hotspot/user/remove", {"numbers": user_id})
                             results["hotspot_user_removed"] = True
 
-            # 3. Remove simple queue
+            # 3. Remove simple queue - search by name OR MAC in comment
             queues = self.send_command("/queue/simple/print")
-            results["queue_removed"] = False
+            results["queue_removed"] = 0
             if queues.get("success") and queues.get("data"):
                 for queue in queues["data"]:
-                    if queue.get("name") == f"queue_{username}":
+                    queue_name = queue.get("name", "")
+                    queue_comment = queue.get("comment", "")
+                    # Match by queue name OR by MAC address in comment
+                    if (queue_name == f"queue_{username}" or 
+                        normalized_mac.upper() in queue_comment.upper() or
+                        mac_address.upper() in queue_comment.upper()):
                         queue_id = queue.get(".id")
                         if queue_id:
                             self.send_command("/queue/simple/remove", {"numbers": queue_id})
-                            results["queue_removed"] = True
+                            results["queue_removed"] += 1
+                            logger.info(f"Removed queue: {queue_name}")
 
             # 4. Remove DHCP lease
             leases = self.send_command("/ip/dhcp-server/lease/print")

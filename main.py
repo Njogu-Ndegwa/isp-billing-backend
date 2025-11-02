@@ -109,19 +109,27 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
         bindings = api.send_command("/ip/hotspot/ip-binding/print")
         if bindings.get("success") and bindings.get("data"):
             for b in bindings["data"]:
-                if b.get("mac-address", "").upper() == normalized_mac.upper():
+                binding_mac = b.get("mac-address", "").upper()
+                binding_name = b.get("name", "").upper()
+                # Match by MAC address OR by name field (which is set to username for bypassed users)
+                if binding_mac == normalized_mac.upper() or binding_name == username.upper():
                     api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
                     removed["bindings"] += 1
-                    logger.info(f"[CLEANUP] Removed IP binding: {normalized_mac}")
+                    logger.info(f"[CLEANUP] Removed IP binding: {binding_name} ({binding_mac})")
         
-        # 3. Remove queues (from Queues section)
+        # 3. Remove queues (from Queues section) - search by name OR MAC in comment
         queues = api.send_command("/queue/simple/print")
         if queues.get("success") and queues.get("data"):
             for q in queues["data"]:
-                if q.get("name") == f"queue_{username}":
+                queue_name = q.get("name", "")
+                queue_comment = q.get("comment", "")
+                # Match by queue name OR by MAC address in comment
+                if (queue_name == f"queue_{username}" or 
+                    normalized_mac.upper() in queue_comment.upper() or
+                    mac_address.upper() in queue_comment.upper()):
                     api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
                     removed["queues"] += 1
-                    logger.info(f"[CLEANUP] Removed queue: queue_{username}")
+                    logger.info(f"[CLEANUP] Removed queue: {queue_name}")
         
         # 4. Remove DHCP leases
         leases = api.send_command("/ip/dhcp-server/lease/print")
@@ -222,27 +230,45 @@ async def cleanup_expired_users_background():
                     # Remove hotspot user
                     users = api.send_command("/ip/hotspot/user/print")
                     if users.get("success") and users.get("data"):
+                        logger.info(f"[CRON] Searching for hotspot user: {username}")
                         for u in users["data"]:
-                            if u.get("name") == username:
+                            user_name = u.get("name", "")
+                            logger.info(f"[CRON] Found hotspot user: {user_name}")
+                            if user_name == username:
                                 api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
                                 removed["user"] = True
+                                logger.info(f"[CRON] Removed hotspot user: {username}")
                                 break
                     
-                    # Remove IP bindings
+                    # Remove IP bindings - match by MAC or by name field
                     bindings = api.send_command("/ip/hotspot/ip-binding/print")
                     if bindings.get("success") and bindings.get("data"):
+                        logger.info(f"[CRON] Searching for IP bindings. Username: {username}, MAC: {normalized_mac}")
                         for b in bindings["data"]:
-                            if b.get("mac-address", "").upper() == normalized_mac.upper():
+                            binding_mac = b.get("mac-address", "").upper()
+                            binding_name = b.get("name", "").upper()
+                            logger.info(f"[CRON] Found binding - name: {binding_name}, mac: {binding_mac}")
+                            # Match by MAC address OR by name field (which is set to username for bypassed users)
+                            if binding_mac == normalized_mac.upper() or binding_name == username.upper():
                                 api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
                                 removed["bindings"] += 1
+                                logger.info(f"[CRON] Removed IP binding: {binding_name} ({binding_mac})")
                     
-                    # Remove queues
+                    # Remove queues - search by MAC in comment OR by queue name
                     queues = api.send_command("/queue/simple/print")
                     if queues.get("success") and queues.get("data"):
+                        logger.info(f"[CRON] Searching for queues. Username: {username}, MAC: {normalized_mac}")
                         for q in queues["data"]:
-                            if q.get("name") == f"queue_{username}":
+                            queue_name = q.get("name", "")
+                            queue_comment = q.get("comment", "")
+                            logger.info(f"[CRON] Checking queue: {queue_name}, comment: {queue_comment}")
+                            # Match by name OR by MAC in comment
+                            if (queue_name == f"queue_{username}" or 
+                                normalized_mac.upper() in queue_comment.upper() or
+                                mac_address.upper() in queue_comment.upper()):
                                 api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
                                 removed["queues"] += 1
+                                logger.info(f"[CRON] Removed queue: {queue_name}")
                     
                     # Remove DHCP leases
                     leases = api.send_command("/ip/dhcp-server/lease/print")
@@ -1296,6 +1322,122 @@ async def remove_bypassed_user_public(
         "router_id": router_id,
         "removed_items": result.get("removed", {})
     }
+
+@app.post("/api/admin/cleanup-inactive-users")
+async def cleanup_all_inactive_users(
+    user_id: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    One-time cleanup: Remove ALL inactive users from MikroTik
+    (They're already marked inactive in DB but still in MikroTik)
+    """
+    try:
+        # Find all INACTIVE customers with MAC addresses
+        stmt = select(Customer).where(
+            Customer.status == CustomerStatus.INACTIVE,
+            Customer.mac_address.isnot(None),
+            Customer.user_id == user_id
+        )
+        result = await db.execute(stmt)
+        inactive_customers = result.scalars().all()
+        
+        if not inactive_customers:
+            return {
+                "success": True,
+                "message": "No inactive customers found",
+                "removed": 0,
+                "failed": 0
+            }
+        
+        logger.info(f"[CLEANUP-ALL] Found {len(inactive_customers)} inactive customers to remove from MikroTik")
+        
+        removed_count = 0
+        failed_count = 0
+        details = []
+        
+        # Connect once to MikroTik
+        api = MikroTikAPI(
+            settings.MIKROTIK_HOST,
+            settings.MIKROTIK_USERNAME,
+            settings.MIKROTIK_PASSWORD,
+            settings.MIKROTIK_PORT
+        )
+        
+        if not api.connect():
+            raise HTTPException(status_code=500, detail="Failed to connect to MikroTik")
+        
+        for customer in inactive_customers:
+            try:
+                normalized_mac = normalize_mac_address(customer.mac_address)
+                username = normalized_mac.replace(":", "")
+                
+                removed = {"user": False, "bindings": 0, "queues": 0, "leases": 0}
+                
+                # Remove hotspot user
+                users = api.send_command("/ip/hotspot/user/print")
+                if users.get("success") and users.get("data"):
+                    for u in users["data"]:
+                        if u.get("name") == username:
+                            api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
+                            removed["user"] = True
+                            break
+                
+                # Remove IP bindings
+                bindings = api.send_command("/ip/hotspot/ip-binding/print")
+                if bindings.get("success") and bindings.get("data"):
+                    for b in bindings["data"]:
+                        if b.get("mac-address", "").upper() == normalized_mac.upper():
+                            api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                            removed["bindings"] += 1
+                
+                # Remove queues
+                queues = api.send_command("/queue/simple/print")
+                if queues.get("success") and queues.get("data"):
+                    for q in queues["data"]:
+                        if q.get("name") == f"queue_{username}":
+                            api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                            removed["queues"] += 1
+                
+                # Remove DHCP leases
+                leases = api.send_command("/ip/dhcp-server/lease/print")
+                if leases.get("success") and leases.get("data"):
+                    for l in leases["data"]:
+                        if l.get("mac-address", "").upper() == normalized_mac.upper():
+                            api.send_command("/ip/dhcp-server/lease/remove", {"numbers": l[".id"]})
+                            removed["leases"] += 1
+                
+                removed_count += 1
+                details.append({
+                    "customer_id": customer.id,
+                    "mac": normalized_mac,
+                    "removed": removed
+                })
+                logger.info(f"[CLEANUP-ALL] Removed {customer.name} ({normalized_mac}): {removed}")
+                
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"[CLEANUP-ALL] Failed to remove customer {customer.id}: {e}")
+                details.append({
+                    "customer_id": customer.id,
+                    "mac": customer.mac_address,
+                    "error": str(e)
+                })
+        
+        api.disconnect()
+        
+        return {
+            "success": True,
+            "message": f"Cleanup complete: {removed_count} removed, {failed_count} failed",
+            "total_inactive": len(inactive_customers),
+            "removed": removed_count,
+            "failed": failed_count,
+            "details": details
+        }
+        
+    except Exception as e:
+        logger.error(f"[CLEANUP-ALL] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================
 # REST API ENDPOINTS FOR CRUD OPERATIONS
