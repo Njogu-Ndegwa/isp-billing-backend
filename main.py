@@ -62,6 +62,7 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
     2. /ip/hotspot/ip-binding (MAC address bindings - for bypassed users)
     3. /queue/simple (bandwidth limits)
     4. /ip/dhcp-server/lease (DHCP leases)
+    5. /ip/hotspot/active (disconnect active sessions - CRITICAL for re-login)
     
     Returns dict with success status and details
     """
@@ -133,12 +134,48 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
         
         # 4. Remove DHCP leases
         leases = api.send_command("/ip/dhcp-server/lease/print")
+        logger.info(f"[CLEANUP-DHCP] Searching for leases to remove. Target MAC: {normalized_mac}")
         if leases.get("success") and leases.get("data"):
+            logger.info(f"[CLEANUP-DHCP] Found {len(leases['data'])} total DHCP leases")
             for l in leases["data"]:
-                if l.get("mac-address", "").upper() == normalized_mac.upper():
-                    api.send_command("/ip/dhcp-server/lease/remove", {"numbers": l[".id"]})
-                    removed["leases"] += 1
-                    logger.info(f"[CLEANUP] Removed DHCP lease: {normalized_mac}")
+                lease_mac = l.get("mac-address", "")
+                lease_ip = l.get("address", "N/A")
+                lease_id = l.get(".id", "N/A")
+                logger.info(f"[CLEANUP-DHCP] Checking lease: ID={lease_id}, MAC={lease_mac}, IP={lease_ip}")
+                if lease_mac:
+                    # Normalize both MACs to compare without separators
+                    lease_mac_clean = lease_mac.replace(":", "").replace("-", "").upper()
+                    normalized_mac_clean = normalized_mac.replace(":", "").replace("-", "").upper()
+                    logger.info(f"[CLEANUP-DHCP] Comparing: '{lease_mac_clean}' vs '{normalized_mac_clean}'")
+                    if lease_mac_clean == normalized_mac_clean:
+                        remove_result = api.send_command("/ip/dhcp-server/lease/remove", {"numbers": l[".id"]})
+                        removed["leases"] += 1
+                        logger.info(f"[CLEANUP-DHCP] ✓ Removed DHCP lease: {lease_mac} (ID: {lease_id}, IP: {lease_ip})")
+                        if "error" in remove_result:
+                            logger.error(f"[CLEANUP-DHCP] Remove command returned error: {remove_result['error']}")
+                    else:
+                        logger.info(f"[CLEANUP-DHCP] ✗ No match, skipping")
+                else:
+                    logger.warning(f"[CLEANUP-DHCP] Lease {lease_id} has no MAC address")
+        else:
+            logger.warning(f"[CLEANUP-DHCP] Failed to fetch leases or no data returned: {leases}")
+        
+        logger.info(f"[CLEANUP-DHCP] Total leases removed: {removed['leases']}")
+        
+        # 5. Disconnect active hotspot sessions (CRITICAL - prevents re-login issues)
+        active_sessions = api.send_command("/ip/hotspot/active/print")
+        removed["active_sessions"] = 0
+        if active_sessions.get("success") and active_sessions.get("data"):
+            for session in active_sessions["data"]:
+                session_user = session.get("user", "").upper()
+                session_mac = session.get("mac-address", "").upper()
+                # Match by username OR MAC address
+                if session_user == username.upper() or session_mac == normalized_mac.upper():
+                    session_id = session.get(".id")
+                    if session_id:
+                        api.send_command("/ip/hotspot/active/remove", {"numbers": session_id})
+                        removed["active_sessions"] += 1
+                        logger.info(f"[CLEANUP] Disconnected active session: {session_user} ({session_mac})")
         
         api.disconnect()
         
@@ -277,6 +314,24 @@ async def cleanup_expired_users_background():
                             if l.get("mac-address", "").upper() == normalized_mac.upper():
                                 api.send_command("/ip/dhcp-server/lease/remove", {"numbers": l[".id"]})
                                 removed["leases"] += 1
+                                logger.info(f"[CRON] Removed DHCP lease: {normalized_mac}")
+                    
+                    # Disconnect active hotspot sessions (CRITICAL - prevents re-login issues)
+                    active_sessions = api.send_command("/ip/hotspot/active/print")
+                    removed["active_sessions"] = 0
+                    if active_sessions.get("success") and active_sessions.get("data"):
+                        logger.info(f"[CRON] Checking for active sessions for {username} / {normalized_mac}")
+                        for session in active_sessions["data"]:
+                            session_user = session.get("user", "").upper()
+                            session_mac = session.get("mac-address", "").upper()
+                            logger.info(f"[CRON] Active session found: user={session_user}, mac={session_mac}")
+                            # Match by username OR MAC address
+                            if session_user == username.upper() or session_mac == normalized_mac.upper():
+                                session_id = session.get(".id")
+                                if session_id:
+                                    api.send_command("/ip/hotspot/active/remove", {"numbers": session_id})
+                                    removed["active_sessions"] += 1
+                                    logger.info(f"[CRON] Disconnected active session: {session_user} ({session_mac})")
                     
                     api.disconnect()
                     

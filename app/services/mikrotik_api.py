@@ -328,25 +328,51 @@ class MikroTikAPI:
 
             # 4. Remove DHCP lease
             leases = self.send_command("/ip/dhcp-server/lease/print")
-            results["dhcp_lease_removed"] = False
+            results["dhcp_lease_removed"] = 0
+            logger.info(f"[DHCP] Searching for leases to remove. Target MAC: {normalized_mac}")
             if leases.get("success") and leases.get("data"):
+                logger.info(f"[DHCP] Found {len(leases['data'])} total DHCP leases")
                 for lease in leases["data"]:
-                    if lease.get("mac-address", "").upper() == normalized_mac.upper():
-                        lease_id = lease.get(".id")
-                        if lease_id:
-                            self.send_command("/ip/dhcp-server/lease/remove", {"numbers": lease_id})
-                            results["dhcp_lease_removed"] = True
+                    lease_mac = lease.get("mac-address", "")
+                    lease_ip = lease.get("address", "N/A")
+                    lease_id = lease.get(".id", "N/A")
+                    logger.info(f"[DHCP] Checking lease: ID={lease_id}, MAC={lease_mac}, IP={lease_ip}")
+                    if lease_mac:
+                        # Normalize both MACs to compare without separators
+                        lease_mac_clean = re.sub(r'[:-]', '', lease_mac.upper())
+                        normalized_mac_clean = re.sub(r'[:-]', '', normalized_mac.upper())
+                        logger.info(f"[DHCP] Comparing: '{lease_mac_clean}' vs '{normalized_mac_clean}'")
+                        if lease_mac_clean == normalized_mac_clean:
+                            lease_id = lease.get(".id")
+                            if lease_id:
+                                remove_result = self.send_command("/ip/dhcp-server/lease/remove", {"numbers": lease_id})
+                                results["dhcp_lease_removed"] += 1
+                                logger.info(f"[DHCP] ✓ Removed DHCP lease: {lease_mac} (ID: {lease_id}, IP: {lease_ip})")
+                                if "error" in remove_result:
+                                    logger.error(f"[DHCP] Remove command returned error: {remove_result['error']}")
+                        else:
+                            logger.info(f"[DHCP] ✗ No match, skipping")
+                    else:
+                        logger.warning(f"[DHCP] Lease {lease_id} has no MAC address")
+            else:
+                logger.warning(f"[DHCP] Failed to fetch leases or no data returned: {leases}")
+            
+            logger.info(f"[DHCP] Total leases removed: {results['dhcp_lease_removed']}")
 
-            # 5. Disconnect active sessions
+            # 5. Disconnect active sessions (CRITICAL - prevents re-login issues)
             active_sessions = self.send_command("/ip/hotspot/active/print")
             results["sessions_disconnected"] = 0
             if active_sessions.get("success") and active_sessions.get("data"):
                 for session in active_sessions["data"]:
-                    if session.get("user", "").upper() == username.upper():
+                    session_user = session.get("user", "").upper()
+                    session_mac = session.get("mac-address", "").upper()
+                    # Match by username OR MAC address
+                    if session_user == username.upper() or session_mac == normalized_mac.upper():
                         session_id = session.get(".id")
                         if session_id:
                             self.send_command("/ip/hotspot/active/remove", {"numbers": session_id})
                             results["sessions_disconnected"] += 1
+                            logger.info(f"Disconnected active session: {session_user} ({session_mac})")
 
             return {"success": True, "details": results}
         except Exception as e:
