@@ -2019,6 +2019,35 @@ async def register_hotspot_and_pay_api(
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to register and initiate payment: {str(e)}")
 
+@app.get("/api/hotspot/payment-status/{customerId}")
+async def get_payment_status(
+    customerId: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get payment status for a customer"""
+    try:
+        stmt = select(Customer).options(
+            selectinload(Customer.plan)
+        ).where(Customer.id == customerId)
+        result = await db.execute(stmt)
+        customer = result.scalar_one_or_none()
+        
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        
+        return {
+            "customer_id": customer.id,
+            "status": customer.status.value,
+            "expiry": customer.expiry.isoformat() if customer.expiry else None,
+            "plan_id": customer.plan_id,
+            "plan_name": customer.plan.name if customer.plan else None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error getting payment status for customer {customerId}")
+        raise HTTPException(status_code=500, detail=f"Failed to get payment status: {str(e)}")
+
 @app.post("/api/customers/register")
 async def register_customer_api(
     request: CustomerRegisterRequest,
