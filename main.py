@@ -8,6 +8,7 @@ from app.services.auth import verify_token, get_current_user
 from app.services.billing import make_payment
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.mpesa_transactions import update_mpesa_transaction_status
+from app.services.plan_cache import get_plans_cached, invalidate_plan_cache, warm_plan_cache
 from app.config import settings
 import logging
 from sqlalchemy.orm import selectinload
@@ -1714,6 +1715,9 @@ async def create_plan_api(
         await db.commit()
         await db.refresh(plan)
         
+        # Invalidate plan cache after creating new plan
+        await invalidate_plan_cache()
+        
         logger.info(f"Plan created: {plan.id} by user {request.user_id}")
         
         return {
@@ -1741,36 +1745,9 @@ async def get_plans_api(
     connection_type: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all plans with optional filters (user_id, connection_type)"""
+    """Get all plans with optional filters (user_id, connection_type) - CACHED"""
     try:
-        # user = await get_current_user(token, db)  # Temporarily disabled for testing
-        
-        stmt = select(Plan)
-        
-        # Apply filters if provided
-        if user_id is not None:
-            stmt = stmt.where(Plan.user_id == user_id)
-        
-        if connection_type is not None:
-            stmt = stmt.where(Plan.connection_type == connection_type)
-        
-        result = await db.execute(stmt)
-        plans = result.scalars().all()
-        
-        return [
-            {
-                "id": p.id,
-                "name": p.name,
-                "speed": p.speed,
-                "price": p.price,
-                "duration_value": p.duration_value,
-                "duration_unit": p.duration_unit.value,
-                "connection_type": p.connection_type.value,
-                "router_profile": p.router_profile,
-                "user_id": p.user_id
-            }
-            for p in plans
-        ]
+        return await get_plans_cached(db, user_id, connection_type)
     except Exception as e:
         logger.error(f"Error fetching plans: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch plans")
@@ -2815,6 +2792,9 @@ async def delete_plan(
         await db.delete(plan)
         await db.commit()
         
+        # Invalidate plan cache after deletion
+        await invalidate_plan_cache()
+        
         return {
             "success": True,
             "message": f"Plan '{plan.name}' deleted successfully"
@@ -2845,6 +2825,12 @@ async def startup_event():
     )
     scheduler.start()
     logger.info("🔄 Background scheduler started - expired user cleanup runs every 1 minute")
+    
+    # Warm up plan cache on startup
+    async for db in get_db():
+        await warm_plan_cache(db)
+        break
+    logger.info("✅ Plan cache warmed up")
 
 # Shutdown event - Stop background scheduler
 @app.on_event("shutdown")

@@ -5,6 +5,7 @@ from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta
 from app.db.models import Customer, Plan, CustomerPayment, Router, CustomerStatus, ConnectionType, PaymentStatus, PaymentMethod
 # from app.services.mikrotik_api import provision_customer_to_router
+from app.services.plan_cache import get_plans_cached, invalidate_plan_cache
 from fastapi import HTTPException
 import logging
 
@@ -22,13 +23,12 @@ async def get_customers_by_user(db: AsyncSession, user_id: int, role: str):
 
 async def get_plans_by_user(db: AsyncSession, user_id: int, role: str):
     """
-    Fetch plans for a user, filtered by user_id for resellers.
+    Fetch plans for a user, filtered by user_id for resellers. - CACHED
     """
-    stmt = select(Plan)
-    if role != "admin":
-        stmt = stmt.filter(Plan.user_id == user_id)
-    result = await db.execute(stmt)
-    return result.scalars().all()
+    if role == "admin":
+        return await get_plans_cached(db)
+    else:
+        return await get_plans_cached(db, user_id=user_id)
 
 async def create_plan(db: AsyncSession, name: str, speed: str, price: float, duration_days: int, connection_type: ConnectionType, user_id: int, router_profile: str = None):
     """
@@ -47,6 +47,10 @@ async def create_plan(db: AsyncSession, name: str, speed: str, price: float, dur
     db.add(plan)
     await db.commit()
     await db.refresh(plan)
+    
+    # Invalidate plan cache
+    await invalidate_plan_cache()
+    
     return plan
 
 async def register_customer(
