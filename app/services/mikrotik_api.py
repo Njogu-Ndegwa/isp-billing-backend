@@ -281,16 +281,29 @@ class MikroTikAPI:
                     logger.error(f"Hotspot user add error: {result['error']}")
                     return {"error": result["error"]}
 
-            # 3. IP binding (bypassed) - allows auto-login by MAC
+            # 3. IP binding (bypassed with comment tracking for our DB-based expiry)
+            # We use "bypassed" for seamless auto-login, but rely on our cron job to
+            # remove the binding when the DB expiry is reached (not MikroTik's limit-uptime)
             binding_args = {
                 "mac-address": mac_address,
                 "type": "bypassed",
-                "comment": f"Auto-registered (bypassed): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                "comment": f"USER:{username}|EXPIRES:DB_MANAGED|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             }
             binding_result = self.send_command("/ip/hotspot/ip-binding/add", binding_args)
             if "error" in binding_result:
                 if "such client already exists" in binding_result["error"]:
-                    logger.info(f"IP binding already exists for {mac_address}")
+                    # Update existing binding
+                    bindings = self.send_command("/ip/hotspot/ip-binding/print")
+                    if bindings.get("success") and bindings.get("data"):
+                        for b in bindings["data"]:
+                            if normalize_mac_address(b.get("mac-address", "")) == normalize_mac_address(mac_address):
+                                self.send_command("/ip/hotspot/ip-binding/set", {
+                                    "numbers": b[".id"],
+                                    "type": "bypassed",
+                                    "comment": f"USER:{username}|EXPIRES:DB_MANAGED|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                                })
+                                logger.info(f"Updated existing IP binding for {mac_address}")
+                                break
                 else:
                     logger.error(f"IP binding error: {binding_result['error']}")
                     return {"error": binding_result["error"]}
@@ -571,3 +584,82 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error getting system health: {e}")
             return {"error": str(e)}
+
+    def block_mac_address(self, mac_address: str) -> Dict[str, Any]:
+        """Block a MAC address by changing IP binding to 'blocked' type"""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            normalized_mac = normalize_mac_address(mac_address)
+            
+            # Find existing binding
+            bindings = self.send_command("/ip/hotspot/ip-binding/print")
+            if bindings.get("success") and bindings.get("data"):
+                for b in bindings["data"]:
+                    if normalize_mac_address(b.get("mac-address", "")) == normalized_mac:
+                        # Change to blocked type
+                        result = self.send_command("/ip/hotspot/ip-binding/set", {
+                            "numbers": b[".id"],
+                            "type": "blocked",
+                            "comment": f"EXPIRED|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        })
+                        logger.info(f"Blocked MAC {mac_address}")
+                        return {"success": True, "action": "blocked_existing"}
+            
+            # If no binding exists, create a blocked one
+            result = self.send_command("/ip/hotspot/ip-binding/add", {
+                "mac-address": mac_address,
+                "type": "blocked",
+                "comment": f"EXPIRED|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            })
+            if result.get("error"):
+                return {"error": result["error"]}
+            return {"success": True, "action": "created_blocked"}
+        except Exception as e:
+            logger.error(f"Error blocking MAC {mac_address}: {e}")
+            return {"error": str(e)}
+
+    def disconnect_by_ip(self, ip_address: str) -> Dict[str, Any]:
+        """Force disconnect a client by IP address"""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            # Remove from hotspot hosts (this forces immediate disconnect)
+            hosts = self.send_command("/ip/hotspot/host/print")
+            removed = 0
+            if hosts.get("success") and hosts.get("data"):
+                for host in hosts["data"]:
+                    if host.get("address") == ip_address:
+                        self.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
+                        removed += 1
+                        logger.info(f"Removed host entry for IP {ip_address}")
+            return {"success": True, "removed": removed}
+        except Exception as e:
+            logger.error(f"Error disconnecting IP {ip_address}: {e}")
+            return {"error": str(e)}
+
+    def get_client_ip_by_mac(self, mac_address: str) -> Optional[str]:
+        """Get client's current IP address by MAC from ARP or DHCP"""
+        if not self.connected:
+            return None
+        try:
+            normalized_mac = normalize_mac_address(mac_address)
+            
+            # Check ARP table
+            arp = self.send_command("/ip/arp/print")
+            if arp.get("success") and arp.get("data"):
+                for entry in arp["data"]:
+                    if normalize_mac_address(entry.get("mac-address", "")) == normalized_mac:
+                        return entry.get("address")
+            
+            # Check DHCP leases
+            leases = self.send_command("/ip/dhcp-server/lease/print")
+            if leases.get("success") and leases.get("data"):
+                for lease in leases["data"]:
+                    if normalize_mac_address(lease.get("mac-address", "")) == normalized_mac:
+                        return lease.get("address")
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error getting IP for MAC {mac_address}: {e}")
+            return None
