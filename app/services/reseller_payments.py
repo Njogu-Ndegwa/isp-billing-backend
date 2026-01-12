@@ -13,9 +13,16 @@ async def record_customer_payment(
     payment_method: PaymentMethod,
     days_paid_for: int,
     payment_reference: str = None,
-    notes: str = None
+    notes: str = None,
+    duration_value: int = None,
+    duration_unit: str = None
 ) -> CustomerPayment:
-    """Record a payment made by customer to reseller"""
+    """Record a payment made by customer to reseller
+    
+    Args:
+        duration_value: Override plan duration value (for pending plan changes)
+        duration_unit: Override plan duration unit (MINUTES, HOURS, DAYS)
+    """
     
     # Load customer with plan to calculate proper expiry
     stmt = select(Customer).options(joinedload(Customer.plan)).where(
@@ -40,34 +47,36 @@ async def record_customer_payment(
     
     db.add(payment)
     
-    # Calculate expiry based on plan's actual duration unit
+    # Calculate expiry based on provided duration or plan's duration
     now = datetime.utcnow()
-    if customer.plan:
-        duration_value = customer.plan.duration_value
-        duration_unit = customer.plan.duration_unit.value.upper()
-        
-        # Calculate time delta based on unit
-        if duration_unit == "MINUTES":
-            time_delta = timedelta(minutes=duration_value)
-        elif duration_unit == "HOURS":
-            time_delta = timedelta(hours=duration_value)
-        elif duration_unit == "DAYS":
-            time_delta = timedelta(days=duration_value)
-        else:
-            # Fallback to days_paid_for if unit is unknown
-            time_delta = timedelta(days=days_paid_for)
-        
-        # Add to existing expiry or start from now
-        if customer.expiry and customer.expiry > now:
-            customer.expiry = customer.expiry + time_delta
-        else:
-            customer.expiry = now + time_delta
+    
+    # Use explicit duration if provided, otherwise use customer's plan
+    if duration_value is not None and duration_unit is not None:
+        d_value = duration_value
+        d_unit = duration_unit.upper()
+    elif customer.plan:
+        d_value = customer.plan.duration_value
+        d_unit = customer.plan.duration_unit.value.upper()
     else:
-        # Fallback if no plan: use days_paid_for
-        if customer.expiry:
-            customer.expiry = customer.expiry + timedelta(days=days_paid_for)
-        else:
-            customer.expiry = now + timedelta(days=days_paid_for)
+        d_value = days_paid_for
+        d_unit = "DAYS"
+    
+    # Calculate time delta based on unit
+    if d_unit == "MINUTES":
+        time_delta = timedelta(minutes=d_value)
+    elif d_unit == "HOURS":
+        time_delta = timedelta(hours=d_value)
+    elif d_unit == "DAYS":
+        time_delta = timedelta(days=d_value)
+    else:
+        # Fallback to days_paid_for if unit is unknown
+        time_delta = timedelta(days=days_paid_for)
+    
+    # Add to existing expiry or start from now
+    if customer.expiry and customer.expiry > now:
+        customer.expiry = customer.expiry + time_delta
+    else:
+        customer.expiry = now + time_delta
     
     customer.status = CustomerStatus.ACTIVE
     

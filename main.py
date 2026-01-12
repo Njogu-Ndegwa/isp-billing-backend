@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.db.database import get_db, async_engine
-from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus, User
+from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus, User, CustomerPayment
 from app.services.auth import verify_token, get_current_user
 from app.services.billing import make_payment
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
@@ -615,9 +615,36 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             from app.services.reseller_payments import record_customer_payment
             from app.db.models import PaymentMethod
             
-            plan = customer.plan
+            # Check for pending plan change (customer paying for a different plan)
+            pending_data = None
+            if customer.pending_update_data:
+                try:
+                    pending_data = json.loads(customer.pending_update_data) if isinstance(customer.pending_update_data, str) else customer.pending_update_data
+                except (json.JSONDecodeError, TypeError):
+                    pending_data = None
+            
+            # Use pending plan data if available, otherwise use customer's current plan
+            if pending_data and pending_data.get("plan_id"):
+                # Fetch the plan they're actually paying for
+                pending_plan_stmt = select(Plan).where(Plan.id == pending_data["plan_id"])
+                pending_plan_result = await db.execute(pending_plan_stmt)
+                plan = pending_plan_result.scalar_one_or_none() or customer.plan
+                
+                # Update customer's plan_id to the new plan
+                if plan:
+                    customer.plan_id = plan.id
+                    logger.info(f"[PLAN] Updated customer {customer.id} plan_id to {plan.id} ({plan.name})")
+            else:
+                plan = customer.plan
+            
             duration_value = plan.duration_value if plan else 1
             duration_unit = plan.duration_unit.value.upper() if plan else "DAYS"
+            
+            logger.info(f"[PLAN DEBUG] Customer {customer.id} - Plan: {plan.name if plan else 'None'}, "
+                       f"duration_value: {duration_value}, duration_unit: {duration_unit}")
+            
+            # Clear pending_update_data after applying
+            customer.pending_update_data = None
             
             # Calculate days_paid_for for financial tracking (minimum 1 day)
             if duration_unit == "MINUTES":
@@ -635,7 +662,9 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                 payment_method=PaymentMethod.MOBILE_MONEY,
                 days_paid_for=days_paid_for,
                 payment_reference=receipt_number,
-                notes=f"M-Pesa STK Push. TX: {checkout_request_id}"
+                notes=f"M-Pesa STK Push. TX: {checkout_request_id}",
+                duration_value=duration_value,
+                duration_unit=duration_unit
             )
             
             logger.info(f"[AUDIT] Payment recorded: ID {payment.id}, Amount: {amount}, Days: {days_paid_for}")
@@ -1752,6 +1781,76 @@ async def get_plans_api(
         logger.error(f"Error fetching plans: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch plans")
 
+class PlanUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    speed: Optional[str] = None
+    price: Optional[int] = None
+    duration_value: Optional[int] = None
+    duration_unit: Optional[str] = None
+    connection_type: Optional[str] = None
+    router_profile: Optional[str] = None
+
+@app.put("/api/plans/{plan_id}")
+async def update_plan_api(
+    plan_id: int,
+    request: PlanUpdateRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update an existing plan"""
+    try:
+        stmt = select(Plan).where(Plan.id == plan_id)
+        result = await db.execute(stmt)
+        plan = result.scalar_one_or_none()
+        
+        if not plan:
+            raise HTTPException(status_code=404, detail="Plan not found")
+        
+        # Update fields if provided
+        if request.name is not None:
+            plan.name = request.name
+        if request.speed is not None:
+            plan.speed = request.speed
+        if request.price is not None:
+            plan.price = request.price
+        if request.duration_value is not None:
+            plan.duration_value = request.duration_value
+        if request.duration_unit is not None:
+            try:
+                from app.db.models import DurationUnit
+                plan.duration_unit = DurationUnit(request.duration_unit.upper())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid duration_unit. Must be MINUTES, HOURS, or DAYS")
+        if request.connection_type is not None:
+            try:
+                plan.connection_type = ConnectionType(request.connection_type.lower())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid connection_type")
+        if request.router_profile is not None:
+            plan.router_profile = request.router_profile
+        
+        await db.commit()
+        await db.refresh(plan)
+        await invalidate_plan_cache()
+        
+        logger.info(f"Plan {plan_id} updated: duration_value={plan.duration_value}, duration_unit={plan.duration_unit.value}")
+        
+        return {
+            "id": plan.id,
+            "name": plan.name,
+            "speed": plan.speed,
+            "price": plan.price,
+            "duration_value": plan.duration_value,
+            "duration_unit": plan.duration_unit.value,
+            "connection_type": plan.connection_type.value,
+            "router_profile": plan.router_profile
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating plan: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update plan: {str(e)}")
+
 # Customer Management Endpoints
 class CustomerRegisterRequest(BaseModel):
     name: str
@@ -2568,6 +2667,202 @@ async def get_dashboard_overview(
     except Exception as e:
         logger.error(f"Error fetching dashboard overview: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch dashboard: {str(e)}")
+
+@app.get("/api/dashboard/analytics")
+async def get_dashboard_analytics(
+    user_id: int = 1,
+    days: int = 7,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Comprehensive analytics endpoint with historical data for graphs.
+    Returns daily breakdowns, hourly patterns, plan analytics, user behavior metrics.
+    """
+    try:
+        from sqlalchemy import extract, case, distinct
+        from collections import defaultdict
+        
+        now = datetime.utcnow()
+        start_date = now - timedelta(days=days)
+        
+        # Get all payments in date range with customer and plan info
+        payments_stmt = select(
+            CustomerPayment, Customer, Plan
+        ).join(
+            Customer, CustomerPayment.customer_id == Customer.id
+        ).outerjoin(
+            Plan, Customer.plan_id == Plan.id
+        ).where(
+            CustomerPayment.reseller_id == user_id,
+            CustomerPayment.created_at >= start_date
+        ).order_by(CustomerPayment.created_at.desc())
+        
+        payments_result = await db.execute(payments_stmt)
+        all_payments = payments_result.all()
+        
+        # Organize data by day
+        daily_data = defaultdict(lambda: {
+            "transactions": [],
+            "phones": set(),
+            "hourly_activity": defaultdict(int),
+            "hourly_revenue": defaultdict(float),
+            "plan_counts": defaultdict(int),
+            "plan_revenue": defaultdict(float),
+            "hourly_by_plan": defaultdict(lambda: defaultdict(int)),
+            "phone_totals": defaultdict(float)
+        })
+        
+        plan_colors = {
+            0: "#ef4444", 1: "#f97316", 2: "#eab308", 3: "#22c55e",
+            4: "#3b82f6", 5: "#a855f7", 6: "#ec4899", 7: "#14b8a6"
+        }
+        
+        for payment, customer, plan in all_payments:
+            date_key = payment.created_at.strftime("%Y-%m-%d")
+            hour = payment.created_at.hour
+            amount = float(payment.amount)
+            phone = customer.phone[-4:] if customer.phone else "unknown"
+            plan_name = plan.name if plan else "Unknown"
+            
+            day = daily_data[date_key]
+            day["transactions"].append({
+                "time": payment.created_at.strftime("%H:%M:%S"),
+                "amount": amount,
+                "phone": phone,
+                "plan": plan_name
+            })
+            day["phones"].add(customer.phone)
+            day["hourly_activity"][hour] += 1
+            day["hourly_revenue"][hour] += amount
+            day["plan_counts"][plan_name] += 1
+            day["plan_revenue"][plan_name] += amount
+            day["hourly_by_plan"][plan_name][hour] += 1
+            day["phone_totals"][customer.phone] += amount
+        
+        # Build response for each day
+        days_output = {}
+        for date_key in sorted(daily_data.keys(), reverse=True):
+            day = daily_data[date_key]
+            date_obj = datetime.strptime(date_key, "%Y-%m-%d")
+            
+            # Count repeat customers (multiple purchases same day)
+            phone_counts = defaultdict(int)
+            for tx in day["transactions"]:
+                phone_counts[tx["phone"]] += 1
+            repeat_customers = sum(1 for c in phone_counts.values() if c > 1)
+            
+            # User purchase distribution
+            purchase_counts = {"1_purchase": 0, "2_purchases": 0, "3_purchases": 0, "4plus_purchases": 0}
+            for count in phone_counts.values():
+                if count == 1:
+                    purchase_counts["1_purchase"] += 1
+                elif count == 2:
+                    purchase_counts["2_purchases"] += 1
+                elif count == 3:
+                    purchase_counts["3_purchases"] += 1
+                else:
+                    purchase_counts["4plus_purchases"] += 1
+            
+            # Top spenders
+            top_spenders = sorted(
+                [{"phone": p[-4:], "amount": a} for p, a in day["phone_totals"].items()],
+                key=lambda x: x["amount"],
+                reverse=True
+            )[:5]
+            
+            # Build plan breakdown
+            plans_list = []
+            for idx, (plan_name, count) in enumerate(sorted(day["plan_counts"].items(), key=lambda x: x[1], reverse=True)):
+                plans_list.append({
+                    "name": plan_name,
+                    "count": count,
+                    "revenue": day["plan_revenue"][plan_name],
+                    "color": plan_colors.get(idx % 8, "#6b7280")
+                })
+            
+            total_revenue = sum(day["plan_revenue"].values())
+            unique_users = len(day["phones"])
+            
+            days_output[date_key] = {
+                "date": date_key,
+                "dateLabel": date_obj.strftime("%B %d, %Y"),
+                "totalTransactions": len(day["transactions"]),
+                "totalRevenue": total_revenue,
+                "uniqueUsers": unique_users,
+                "avgDailySpendPerUser": round(total_revenue / unique_users, 2) if unique_users > 0 else 0,
+                "repeatCustomers": repeat_customers,
+                "repeatCustomerPercent": round((repeat_customers / unique_users) * 100, 1) if unique_users > 0 else 0,
+                "plans": plans_list,
+                "hourlyActivity": dict(day["hourly_activity"]),
+                "hourlyRevenue": {k: round(v, 2) for k, v in day["hourly_revenue"].items()},
+                "hourlyByPlan": {k: dict(v) for k, v in day["hourly_by_plan"].items()},
+                "topSpenders": top_spenders,
+                "firstTransaction": day["transactions"][-1]["time"] if day["transactions"] else None,
+                "lastTransaction": day["transactions"][0]["time"] if day["transactions"] else None,
+                "userPurchaseCounts": purchase_counts
+            }
+        
+        # Calculate summary/trends
+        total_txns = sum(d["totalTransactions"] for d in days_output.values())
+        total_rev = sum(d["totalRevenue"] for d in days_output.values())
+        total_users = sum(d["uniqueUsers"] for d in days_output.values())
+        
+        # Daily trend for graphs
+        daily_trend = [
+            {
+                "date": d["date"],
+                "label": d["dateLabel"],
+                "transactions": d["totalTransactions"],
+                "revenue": d["totalRevenue"],
+                "users": d["uniqueUsers"]
+            }
+            for d in sorted(days_output.values(), key=lambda x: x["date"])
+        ]
+        
+        # Aggregate hourly patterns across all days
+        hourly_totals = defaultdict(lambda: {"transactions": 0, "revenue": 0.0})
+        for day in days_output.values():
+            for hour, count in day["hourlyActivity"].items():
+                hourly_totals[hour]["transactions"] += count
+            for hour, rev in day["hourlyRevenue"].items():
+                hourly_totals[hour]["revenue"] += rev
+        
+        hourly_pattern = [
+            {"hour": h, "transactions": hourly_totals[h]["transactions"], "revenue": round(hourly_totals[h]["revenue"], 2)}
+            for h in range(24)
+        ]
+        
+        # Aggregate plan performance
+        plan_totals = defaultdict(lambda: {"count": 0, "revenue": 0.0})
+        for day in days_output.values():
+            for plan in day["plans"]:
+                plan_totals[plan["name"]]["count"] += plan["count"]
+                plan_totals[plan["name"]]["revenue"] += plan["revenue"]
+        
+        plan_performance = [
+            {"name": name, "count": data["count"], "revenue": round(data["revenue"], 2)}
+            for name, data in sorted(plan_totals.items(), key=lambda x: x[1]["revenue"], reverse=True)
+        ]
+        
+        return {
+            "extractedAt": now.isoformat(),
+            "periodDays": days,
+            "summary": {
+                "totalTransactions": total_txns,
+                "totalRevenue": round(total_rev, 2),
+                "totalUniqueUsers": total_users,
+                "avgRevenuePerDay": round(total_rev / len(days_output), 2) if days_output else 0,
+                "avgTransactionsPerDay": round(total_txns / len(days_output), 2) if days_output else 0
+            },
+            "dailyTrend": daily_trend,
+            "hourlyPattern": hourly_pattern,
+            "planPerformance": plan_performance,
+            "days": days_output
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching analytics: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch analytics: {str(e)}")
 
 # Get Active Guests Endpoint
 @app.get("/api/customers/active")

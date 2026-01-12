@@ -166,18 +166,86 @@ class MikroTikAPI:
             logger.error(f"Command execution error on {self.host}: {e}")
             return {"error": str(e)}
 
+    def _parse_speed_to_mikrotik(self, speed: str) -> str:
+        """
+        Convert speed string (e.g., '2Mbps', '5 Mbps', '512Kbps') to MikroTik format (e.g., '2M/2M').
+        Returns symmetric upload/download limit.
+        """
+        if not speed:
+            return ""
+        
+        # Already in MikroTik format (contains /)
+        if "/" in speed:
+            return speed
+        
+        # Clean and parse the speed string
+        speed_clean = speed.upper().replace(" ", "")
+        
+        # Extract numeric value and unit
+        match = re.match(r'^(\d+(?:\.\d+)?)\s*(K|M|G)?(?:BPS)?$', speed_clean)
+        if match:
+            value = match.group(1)
+            unit = match.group(2) or "M"  # Default to Mbps
+            mikrotik_speed = f"{value}{unit}"
+            return f"{mikrotik_speed}/{mikrotik_speed}"
+        
+        # Fallback: try to use as-is if it looks like a number
+        if speed_clean.replace(".", "").isdigit():
+            return f"{speed_clean}M/{speed_clean}M"
+        
+        logger.warning(f"Could not parse speed '{speed}', using default 10M/10M")
+        return "10M/10M"
+
+    def _ensure_hotspot_profile(self, profile_name: str, rate_limit: str) -> Dict[str, Any]:
+        """
+        Ensure a hotspot user profile exists with the specified rate limit.
+        Creates or updates the profile.
+        """
+        # Check if profile exists
+        profiles = self.send_command("/ip/hotspot/user/profile/print")
+        profile_exists = False
+        profile_id = None
+        
+        if profiles.get("success") and profiles.get("data"):
+            for profile in profiles["data"]:
+                if profile.get("name") == profile_name:
+                    profile_exists = True
+                    profile_id = profile.get(".id")
+                    break
+        
+        profile_args = {
+            "name": profile_name,
+            "rate-limit": rate_limit,  # Format: upload/download e.g., "2M/2M"
+        }
+        
+        if profile_exists:
+            # Update existing profile
+            profile_args["numbers"] = profile_id
+            result = self.send_command("/ip/hotspot/user/profile/set", profile_args)
+            logger.info(f"Updated hotspot profile '{profile_name}' with rate-limit {rate_limit}")
+        else:
+            # Create new profile
+            result = self.send_command("/ip/hotspot/user/profile/add", profile_args)
+            logger.info(f"Created hotspot profile '{profile_name}' with rate-limit {rate_limit}")
+        
+        return result
+
     def add_customer_bypass_mode(
         self, mac_address: str, username: str, password: str,
         time_limit: str, bandwidth_limit: str, comment: str,
         router_ip: str, router_username: str, router_password: str
     ) -> Dict[str, Any]:
         try:
+            # Convert bandwidth to MikroTik format
+            rate_limit = self._parse_speed_to_mikrotik(bandwidth_limit)
+            
             payload = {
                 'mac_address': mac_address,
                 'username': username,
                 'password': password,
                 'time_limit': time_limit,
                 'bandwidth_limit': bandwidth_limit,
+                'rate_limit_parsed': rate_limit,
                 'comment': comment,
                 'router_ip': router_ip,
                 'router_username': router_username,
@@ -185,30 +253,35 @@ class MikroTikAPI:
             }
             logger.info(f"Sending the following payload to MikroTik: {json.dumps(payload, indent=2)}")
 
-            # 1. Add or update hotspot user
+            # 1. Create/update hotspot user profile with rate limit (this is key for speed enforcement!)
+            profile_name = f"plan_{rate_limit.replace('/', '_')}"
+            profile_result = self._ensure_hotspot_profile(profile_name, rate_limit)
+            
+            # 2. Add or update hotspot user WITH the rate-limited profile
             args = {
                 "name": username,
                 "password": password,
-                "profile": "default",
+                "profile": profile_name,  # Use rate-limited profile instead of "default"
                 "limit-uptime": time_limit,
                 "comment": comment
             }
             result = self.send_command("/ip/hotspot/user/add", args)
             if "error" in result:
                 if "already have user with this name" in result["error"]:
-                    # Update limit/comment if already exists
+                    # Update existing user with new profile and limits
                     update_args = {
                         "numbers": username,
+                        "profile": profile_name,
                         "limit-uptime": time_limit,
                         "comment": comment
                     }
                     update_result = self.send_command("/ip/hotspot/user/set", update_args)
-                    logger.info(f"User {username} exists. Updated: {update_result}")
+                    logger.info(f"User {username} exists. Updated with profile {profile_name}: {update_result}")
                 else:
                     logger.error(f"Hotspot user add error: {result['error']}")
                     return {"error": result["error"]}
 
-            # 2. IP binding (bypassed)
+            # 3. IP binding (bypassed) - allows auto-login by MAC
             binding_args = {
                 "mac-address": mac_address,
                 "type": "bypassed",
@@ -222,51 +295,65 @@ class MikroTikAPI:
                     logger.error(f"IP binding error: {binding_result['error']}")
                     return {"error": binding_result["error"]}
 
-            # 3. Bandwidth control (DHCP + queue)
-            dhcp_lease_result = None
+            # 4. Also create a simple queue as backup (targeting MAC via address-list)
             queue_result = None
-            assigned_ip = None
-            if bandwidth_limit:
-                mac_hash = int(hashlib.md5(mac_address.encode()).hexdigest()[:4], 16)
-                assigned_ip = f"192.168.1.{100 + (mac_hash % 150)}"
-                dhcp_lease_args = {
-                    "mac-address": mac_address,
-                    "address": assigned_ip,
-                    "server": "defconf",
-                    "comment": f"Auto-assigned for bandwidth control: {mac_address}"
-                }
-                dhcp_lease_result = self.send_command("/ip/dhcp-server/lease/add", dhcp_lease_args)
-                if "error" in dhcp_lease_result:
-                    if "already have" in dhcp_lease_result["error"]:
-                        logger.info(f"DHCP lease already exists for {mac_address}")
+            if rate_limit:
+                # Find client's current IP from active connections or ARP
+                client_ip = None
+                
+                # Try to get IP from hotspot active sessions
+                active = self.send_command("/ip/hotspot/active/print")
+                if active.get("success") and active.get("data"):
+                    for session in active["data"]:
+                        session_mac = session.get("mac-address", "").upper()
+                        if normalize_mac_address(session_mac) == normalize_mac_address(mac_address):
+                            client_ip = session.get("address")
+                            break
+                
+                # Fallback: check ARP table
+                if not client_ip:
+                    arp = self.send_command("/ip/arp/print")
+                    if arp.get("success") and arp.get("data"):
+                        for entry in arp["data"]:
+                            entry_mac = entry.get("mac-address", "").upper()
+                            if normalize_mac_address(entry_mac) == normalize_mac_address(mac_address):
+                                client_ip = entry.get("address")
+                                break
+                
+                if client_ip:
+                    queue_args = {
+                        "name": f"queue_{username}",
+                        "target": f"{client_ip}/32",
+                        "max-limit": rate_limit,
+                        "comment": f"Bandwidth limit for MAC: {mac_address} -> IP: {client_ip}"
+                    }
+                    # Try to update existing queue first
+                    queue_set_result = self.send_command("/queue/simple/set", {
+                        "numbers": f"queue_{username}",
+                        "target": f"{client_ip}/32",
+                        "max-limit": rate_limit
+                    })
+                    if "error" in queue_set_result:
+                        queue_result = self.send_command("/queue/simple/add", queue_args)
                     else:
-                        logger.error(f"DHCP lease error: {dhcp_lease_result['error']}")
-                        return {"error": dhcp_lease_result["error"]}
-                # Always try to set queue (idempotent)
-                queue_args = {
-                    "name": f"queue_{username}",
-                    "target": f"{assigned_ip}/32",
-                    "max-limit": bandwidth_limit,
-                    "comment": f"Bandwidth limit for MAC: {mac_address} -> IP: {assigned_ip}"
-                }
-                queue_set_result = self.send_command("/queue/simple/set", queue_args)
-                if "error" in queue_set_result and "no such item" in queue_set_result["error"]:
-                    queue_result = self.send_command("/queue/simple/add", queue_args)
+                        queue_result = queue_set_result
+                    logger.info(f"Created/updated queue for {username} targeting {client_ip} with limit {rate_limit}")
                 else:
-                    queue_result = queue_set_result
+                    logger.info(f"Client {mac_address} not currently connected, queue will be applied via profile")
 
             return {
-                "message": f"MAC address {mac_address} registered/updated successfully with bypassed authentication",
+                "message": f"MAC address {mac_address} registered/updated successfully with rate limit {rate_limit}",
                 "user_details": {
                     "username": username,
                     "mac_address": mac_address,
                     "time_limit": time_limit,
                     "bandwidth_limit": bandwidth_limit,
-                    "assigned_ip": assigned_ip
+                    "rate_limit": rate_limit,
+                    "profile": profile_name
                 },
+                "profile_result": profile_result,
                 "hotspot_user_result": result,
                 "ip_binding_result": binding_result,
-                "dhcp_lease_result": dhcp_lease_result,
                 "queue_result": queue_result
             }
 
