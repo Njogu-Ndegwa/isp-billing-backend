@@ -38,7 +38,7 @@ This guide shows you how to set up a MikroTik Hotspot with an **external captive
 │          └─ Calls MikroTik API to authorize MAC (bypass)            │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │ (MikroTik API call via WireGuard VPN)
-                           ▼
+                           ▼ 
 ┌─────────────────────────────────────────────────────────────────────┐
 │  MikroTik API (Port 8728)                                           │
 │  ├─ /ip/hotspot/user/add                                            │
