@@ -465,3 +465,109 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error removing bypassed user {mac_address}: {e}")
             return {"error": str(e)}
+
+    def get_system_resources(self) -> Dict[str, Any]:
+        """Get MikroTik system resource information (CPU, memory, disk, uptime)"""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/system/resource/print")
+            if result.get("success") and result.get("data"):
+                data = result["data"][0] if result["data"] else {}
+                return {
+                    "success": True,
+                    "data": {
+                        "uptime": data.get("uptime", ""),
+                        "version": data.get("version", ""),
+                        "build_time": data.get("build-time", ""),
+                        "cpu": data.get("cpu", ""),
+                        "cpu_count": int(data.get("cpu-count", 1)),
+                        "cpu_frequency": int(data.get("cpu-frequency", 0)),
+                        "cpu_load": int(data.get("cpu-load", 0)),
+                        "free_memory": int(data.get("free-memory", 0)),
+                        "total_memory": int(data.get("total-memory", 0)),
+                        "free_hdd_space": int(data.get("free-hdd-space", 0)),
+                        "total_hdd_space": int(data.get("total-hdd-space", 0)),
+                        "architecture_name": data.get("architecture-name", ""),
+                        "board_name": data.get("board-name", ""),
+                        "platform": data.get("platform", "")
+                    }
+                }
+            return {"error": "No resource data returned"}
+        except Exception as e:
+            logger.error(f"Error getting system resources: {e}")
+            return {"error": str(e)}
+
+    def get_interface_traffic(self, interface: str = None) -> Dict[str, Any]:
+        """Get interface traffic statistics. If interface is None, gets all interfaces."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/interface/print")
+            if result.get("success") and result.get("data"):
+                interfaces = []
+                for iface in result["data"]:
+                    if interface and iface.get("name") != interface:
+                        continue
+                    interfaces.append({
+                        "name": iface.get("name", ""),
+                        "type": iface.get("type", ""),
+                        "running": iface.get("running") == "true",
+                        "disabled": iface.get("disabled") == "true",
+                        "rx_byte": int(iface.get("rx-byte", 0)),
+                        "tx_byte": int(iface.get("tx-byte", 0)),
+                        "rx_packet": int(iface.get("rx-packet", 0)),
+                        "tx_packet": int(iface.get("tx-packet", 0)),
+                        "rx_error": int(iface.get("rx-error", 0)),
+                        "tx_error": int(iface.get("tx-error", 0))
+                    })
+                return {"success": True, "data": interfaces}
+            return {"error": "No interface data returned"}
+        except Exception as e:
+            logger.error(f"Error getting interface traffic: {e}")
+            return {"error": str(e)}
+
+    def get_active_hotspot_users(self) -> Dict[str, Any]:
+        """Get all active hotspot sessions with traffic stats"""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/hotspot/active/print")
+            if result.get("success"):
+                sessions = []
+                for session in result.get("data", []):
+                    sessions.append({
+                        "user": session.get("user", ""),
+                        "address": session.get("address", ""),
+                        "mac_address": session.get("mac-address", ""),
+                        "uptime": session.get("uptime", ""),
+                        "bytes_in": int(session.get("bytes-in", 0)),
+                        "bytes_out": int(session.get("bytes-out", 0)),
+                        "packets_in": int(session.get("packets-in", 0)),
+                        "packets_out": int(session.get("packets-out", 0)),
+                        "idle_time": session.get("idle-time", "")
+                    })
+                return {"success": True, "data": sessions}
+            return {"error": "Failed to get active sessions"}
+        except Exception as e:
+            logger.error(f"Error getting active hotspot users: {e}")
+            return {"error": str(e)}
+
+    def get_health(self) -> Dict[str, Any]:
+        """Get system health (temperature, voltage if available)"""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/system/health/print")
+            if result.get("success") and result.get("data"):
+                health = {}
+                for item in result["data"]:
+                    name = item.get("name", "")
+                    value = item.get("value", "")
+                    if name and value:
+                        health[name] = value
+                return {"success": True, "data": health}
+            return {"success": True, "data": {}}  # Some devices don't have health sensors
+        except Exception as e:
+            logger.error(f"Error getting system health: {e}")
+            return {"error": str(e)}

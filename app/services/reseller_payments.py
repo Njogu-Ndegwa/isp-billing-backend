@@ -3,7 +3,7 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta
 from fastapi import HTTPException
-from app.db.models import Customer, CustomerPayment, ResellerFinancials, Payment, PaymentMethod, CustomerStatus, PaymentStatus
+from app.db.models import Customer, CustomerPayment, ResellerFinancials, PaymentMethod, CustomerStatus, PaymentStatus
 
 async def record_customer_payment(
     db: AsyncSession,
@@ -80,12 +80,8 @@ async def record_customer_payment(
     
     customer.status = CustomerStatus.ACTIVE
     
-    existing_payment = Payment(
-        customer_id=customer_id,
-        amount=int(amount),
-        days_paid_for=days_paid_for
-    )
-    db.add(existing_payment)
+    # NOTE: Removed duplicate Payment record creation
+    # CustomerPayment is the primary payment record - no need for both
     
     await update_reseller_financials(db, reseller_id)
     
