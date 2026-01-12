@@ -43,6 +43,7 @@ jobs:
           echo "Current directory: $(pwd)"
           
           echo "[2/6] Pulling latest code from GitHub..."
+          git config --global --add safe.directory ~/apps/isp-billing
           git pull origin main || { echo "ERROR: Git pull failed"; exit 1; }
           echo "Git pull successful"
           
