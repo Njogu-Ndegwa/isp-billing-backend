@@ -23,7 +23,7 @@ jobs:
 
       - name: Build and push Docker image
         run: |
-          docker build -t ${{ env.IMAGE_NAME }}:latest .
+          docker build --no-cache -t ${{ env.IMAGE_NAME }}:latest .
           docker push ${{ env.IMAGE_NAME }}:latest
 
       - name: Deploy to AWS EC2
@@ -50,15 +50,20 @@ jobs:
           echo "[3/6] Checking disk space..."
           df -h / | tail -1
           
-          echo "[4/6] Pulling latest Docker image..."
+          echo "[4/6] Pulling latest Docker image from Docker Hub..."
           docker pull njogundegwa/isp-billing:latest || { echo "ERROR: Docker pull failed"; exit 1; }
           echo "Image pulled successfully"
+          echo "Image digest:"
+          docker inspect njogundegwa/isp-billing:latest --format='{{.Id}}'
           
-          echo "[5/6] Restarting containers with new image..."
+          echo "[5/6] Restarting containers with Docker Hub image..."
           docker compose down
           docker rmi isp-billing-web 2>/dev/null || true
           docker tag njogundegwa/isp-billing:latest isp-billing-web:latest
           docker compose up -d --no-build --force-recreate || { echo "ERROR: Docker compose failed"; exit 1; }
+          
+          echo "Verifying deployed image matches Docker Hub:"
+          docker inspect isp_billing_app --format='{{.Image}}'
           
           echo "[6/6] Cleaning up old images..."
           docker image prune -f
