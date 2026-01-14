@@ -572,6 +572,11 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             logger.error(f"Transaction not found for CheckoutRequestID: {checkout_request_id}")
             return {"ResultCode": 1, "ResultDesc": "Transaction not found"}
         
+        # DUPLICATE CALLBACK PROTECTION: Skip if already processed
+        if mpesa_txn.status in (MpesaTransactionStatus.completed, MpesaTransactionStatus.failed):
+            logger.warning(f"Duplicate callback ignored for {checkout_request_id} - status: {mpesa_txn.status.value}")
+            return {"ResultCode": 0, "ResultDesc": "Already processed"}
+        
         # Extract callback metadata
         callback_metadata = stk_callback.get("CallbackMetadata", {})
         items = callback_metadata.get("Item", [])
@@ -3264,9 +3269,18 @@ async def get_dashboard_mikrotik():
             settings.MIKROTIK_USERNAME,
             settings.MIKROTIK_PASSWORD,
             settings.MIKROTIK_PORT,
-            timeout=8
+            timeout=15
         )
-        if not api.connect():
+        # Retry connection up to 3 times for busy routers
+        connected = False
+        for attempt in range(3):
+            if api.connect():
+                connected = True
+                break
+            logger.warning(f"MikroTik connection attempt {attempt + 1}/3 failed, retrying...")
+            await asyncio.sleep(1)
+        
+        if not connected:
             raise HTTPException(status_code=503, detail="Failed to connect to MikroTik router")
         
         resources = api.get_system_resources()
