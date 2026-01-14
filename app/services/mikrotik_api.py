@@ -23,18 +23,19 @@ def normalize_mac_address(mac: str) -> str:
     return ':'.join(clean_mac[i:i+2] for i in range(0, 12, 2))
 
 class MikroTikAPI:
-    def __init__(self, host: str, username: str, password: str, port: int = 8728):
+    def __init__(self, host: str, username: str, password: str, port: int = 8728, timeout: int = 10):
         self.host = host
         self.username = username
         self.password = password
         self.port = port
+        self.timeout = timeout
         self.sock = None
         self.connected = False
 
     def connect(self) -> bool:
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(30)  # 30 second timeout for larger responses
+            self.sock.settimeout(self.timeout)
             self.sock.connect((self.host, self.port))
             return self.login()
         except Exception as e:

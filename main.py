@@ -2688,6 +2688,8 @@ async def get_dashboard_analytics(
     MikroTik health stats, traffic data, and active sessions.
     """
     try:
+        import asyncio
+        import concurrent.futures
         from sqlalchemy import extract, case, distinct, func
         from collections import defaultdict
         
@@ -2695,7 +2697,7 @@ async def get_dashboard_analytics(
         start_date = now - timedelta(days=days)
         today_start = datetime(now.year, now.month, now.day)
         
-        # Get all payments in date range with customer and plan info
+        # Build both DB queries
         payments_stmt = select(
             CustomerPayment, Customer, Plan
         ).join(
@@ -2707,10 +2709,23 @@ async def get_dashboard_analytics(
             CustomerPayment.created_at >= start_date
         ).order_by(CustomerPayment.created_at.desc())
         
-        payments_result = await db.execute(payments_stmt)
-        all_payments = payments_result.all()
+        active_customers_stmt = select(Customer).options(
+            selectinload(Customer.plan)
+        ).where(
+            Customer.user_id == user_id,
+            Customer.status == CustomerStatus.ACTIVE
+        )
         
-        # Organize data by day
+        # Execute both DB queries in parallel
+        payments_result, active_result = await asyncio.gather(
+            db.execute(payments_stmt),
+            db.execute(active_customers_stmt)
+        )
+        
+        all_payments = payments_result.all()
+        active_customers = active_result.scalars().all()
+        
+        # Process payments data
         daily_data = defaultdict(lambda: {
             "transactions": [],
             "phones": set(),
@@ -2752,19 +2767,17 @@ async def get_dashboard_analytics(
             day["hourly_by_plan"][plan_name][hour] += 1
             day["phone_totals"][customer.phone] += amount
         
-        # Build response for each day (with cumulative hourly data)
+        # Build response for each day
         days_output = {}
         for date_key in sorted(daily_data.keys(), reverse=True):
             day = daily_data[date_key]
             date_obj = datetime.strptime(date_key, "%Y-%m-%d")
             
-            # Count repeat customers (multiple purchases same day)
             phone_counts = defaultdict(int)
             for tx in day["transactions"]:
                 phone_counts[tx["phone"]] += 1
             repeat_customers = sum(1 for c in phone_counts.values() if c > 1)
             
-            # User purchase distribution
             purchase_counts = {"1_purchase": 0, "2_purchases": 0, "3_purchases": 0, "4plus_purchases": 0}
             for count in phone_counts.values():
                 if count == 1:
@@ -2776,14 +2789,12 @@ async def get_dashboard_analytics(
                 else:
                     purchase_counts["4plus_purchases"] += 1
             
-            # Top spenders
             top_spenders = sorted(
                 [{"phone": p[-4:], "amount": a} for p, a in day["phone_totals"].items()],
                 key=lambda x: x["amount"],
                 reverse=True
             )[:5]
             
-            # Build plan breakdown
             plans_list = []
             for idx, (plan_name, count) in enumerate(sorted(day["plan_counts"].items(), key=lambda x: x[1], reverse=True)):
                 plans_list.append({
@@ -2796,7 +2807,6 @@ async def get_dashboard_analytics(
             total_revenue = sum(day["plan_revenue"].values())
             unique_users = len(day["phones"])
             
-            # Build cumulative hourly data for this day
             cumulative_rev = 0.0
             cumulative_txn = 0
             hourly_cumulative = []
@@ -2834,13 +2844,12 @@ async def get_dashboard_analytics(
                 "userPurchaseCounts": purchase_counts
             }
         
-        # Calculate summary/trends
+        # Calculate summary
         total_txns = sum(d["totalTransactions"] for d in days_output.values())
         total_rev = sum(d["totalRevenue"] for d in days_output.values())
         total_users = sum(d["uniqueUsers"] for d in days_output.values())
         unique_customers_count = len(unique_customers_set)
         
-        # Daily trend for graphs
         daily_trend = [
             {
                 "date": d["date"],
@@ -2852,7 +2861,6 @@ async def get_dashboard_analytics(
             for d in sorted(days_output.values(), key=lambda x: x["date"])
         ]
         
-        # Aggregate hourly patterns across all days
         hourly_totals = defaultdict(lambda: {"transactions": 0, "revenue": 0.0})
         for day in days_output.values():
             for hour, count in day["hourlyActivity"].items():
@@ -2865,7 +2873,6 @@ async def get_dashboard_analytics(
             for h in range(24)
         ]
         
-        # Aggregate plan performance
         plan_totals = defaultdict(lambda: {"count": 0, "revenue": 0.0})
         for day in days_output.values():
             for plan in day["plans"]:
@@ -2877,29 +2884,18 @@ async def get_dashboard_analytics(
             for name, data in sorted(plan_totals.items(), key=lambda x: x[1]["revenue"], reverse=True)
         ]
         
-        # Today's revenue stats
         today_key = today_start.strftime("%Y-%m-%d")
         today_data = days_output.get(today_key, {})
         today_revenue = today_data.get("totalRevenue", 0)
         today_transactions = today_data.get("totalTransactions", 0)
         
-        # Calculate proper period averages
         days_with_data = len(days_output) if days_output else 1
         avg_daily_revenue = round(total_rev / days, 2) if days > 0 else 0
         avg_daily_transactions = round(total_txns / days, 2) if days > 0 else 0
         avg_transaction_value = round(total_rev / total_txns, 2) if total_txns > 0 else 0
         avg_revenue_per_customer = round(total_rev / unique_customers_count, 2) if unique_customers_count > 0 else 0
         
-        # Get average speeds from active customers' plans
-        active_customers_stmt = select(Customer).options(
-            selectinload(Customer.plan)
-        ).where(
-            Customer.user_id == user_id,
-            Customer.status == CustomerStatus.ACTIVE
-        )
-        active_result = await db.execute(active_customers_stmt)
-        active_customers = active_result.scalars().all()
-        
+        # Calculate speed averages from already-fetched active_customers
         total_download = 0.0
         total_upload = 0.0
         speed_count = 0
@@ -2917,62 +2913,6 @@ async def get_dashboard_analytics(
         
         avg_download_mbps = round(total_download / speed_count, 2) if speed_count > 0 else 0
         avg_upload_mbps = round(total_upload / speed_count, 2) if speed_count > 0 else 0
-        
-        # MikroTik stats (optional, wrapped in try-except)
-        mikrotik_data = None
-        try:
-            api = MikroTikAPI(
-                settings.MIKROTIK_HOST,
-                settings.MIKROTIK_USERNAME,
-                settings.MIKROTIK_PASSWORD,
-                settings.MIKROTIK_PORT
-            )
-            if api.connect():
-                resources = api.get_system_resources()
-                health = api.get_health()
-                active_sessions = api.get_active_hotspot_users()
-                traffic = api.get_interface_traffic()
-                api.disconnect()
-                
-                if resources.get("success"):
-                    res_data = resources.get("data", {})
-                    total_mem = res_data.get("total_memory", 1)
-                    free_mem = res_data.get("free_memory", 0)
-                    total_hdd = res_data.get("total_hdd_space", 1)
-                    free_hdd = res_data.get("free_hdd_space", 0)
-                    
-                    mikrotik_data = {
-                        "system": {
-                            "uptime": res_data.get("uptime", ""),
-                            "version": res_data.get("version", ""),
-                            "platform": res_data.get("platform", ""),
-                            "boardName": res_data.get("board_name", ""),
-                            "architecture": res_data.get("architecture_name", ""),
-                            "cpu": res_data.get("cpu", ""),
-                            "cpuCount": res_data.get("cpu_count", 1),
-                            "cpuFrequencyMhz": res_data.get("cpu_frequency", 0)
-                        },
-                        "cpuLoadPercent": res_data.get("cpu_load", 0),
-                        "memory": {
-                            "totalBytes": total_mem,
-                            "freeBytes": free_mem,
-                            "usedBytes": total_mem - free_mem,
-                            "usedPercent": round(((total_mem - free_mem) / total_mem) * 100, 1) if total_mem > 0 else 0
-                        },
-                        "storage": {
-                            "totalBytes": total_hdd,
-                            "freeBytes": free_hdd,
-                            "usedBytes": total_hdd - free_hdd,
-                            "usedPercent": round(((total_hdd - free_hdd) / total_hdd) * 100, 1) if total_hdd > 0 else 0
-                        },
-                        "healthSensors": health.get("data", {}),
-                        "activeSessions": active_sessions.get("data", []),
-                        "activeSessionCount": len(active_sessions.get("data", [])),
-                        "interfaces": traffic.get("data", [])
-                    }
-        except Exception as mt_err:
-            logger.warning(f"Could not fetch MikroTik data: {mt_err}")
-            mikrotik_data = {"error": str(mt_err)}
         
         return {
             "extractedAt": now.isoformat(),
@@ -3003,8 +2943,7 @@ async def get_dashboard_analytics(
             "dailyTrend": daily_trend,
             "hourlyPattern": hourly_pattern,
             "planPerformance": plan_performance,
-            "days": days_output,
-            "mikrotik": mikrotik_data
+            "days": days_output
         }
         
     except Exception as e:
@@ -3314,6 +3253,71 @@ async def get_mikrotik_health():
         raise
     except Exception as e:
         logger.error(f"Error fetching MikroTik health: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/dashboard/mikrotik")
+async def get_dashboard_mikrotik():
+    """Get all MikroTik data for dashboard (system, health, sessions, traffic)."""
+    try:
+        api = MikroTikAPI(
+            settings.MIKROTIK_HOST,
+            settings.MIKROTIK_USERNAME,
+            settings.MIKROTIK_PASSWORD,
+            settings.MIKROTIK_PORT,
+            timeout=8
+        )
+        if not api.connect():
+            raise HTTPException(status_code=503, detail="Failed to connect to MikroTik router")
+        
+        resources = api.get_system_resources()
+        health = api.get_health()
+        active_sessions = api.get_active_hotspot_users()
+        traffic = api.get_interface_traffic()
+        api.disconnect()
+        
+        if resources.get("error"):
+            raise HTTPException(status_code=500, detail=resources["error"])
+        
+        res_data = resources.get("data", {})
+        total_mem = res_data.get("total_memory", 1)
+        free_mem = res_data.get("free_memory", 0)
+        total_hdd = res_data.get("total_hdd_space", 1)
+        free_hdd = res_data.get("free_hdd_space", 0)
+        
+        return {
+            "system": {
+                "uptime": res_data.get("uptime", ""),
+                "version": res_data.get("version", ""),
+                "platform": res_data.get("platform", ""),
+                "boardName": res_data.get("board_name", ""),
+                "architecture": res_data.get("architecture_name", ""),
+                "cpu": res_data.get("cpu", ""),
+                "cpuCount": res_data.get("cpu_count", 1),
+                "cpuFrequencyMhz": res_data.get("cpu_frequency", 0)
+            },
+            "cpuLoadPercent": res_data.get("cpu_load", 0),
+            "memory": {
+                "totalBytes": total_mem,
+                "freeBytes": free_mem,
+                "usedBytes": total_mem - free_mem,
+                "usedPercent": round(((total_mem - free_mem) / total_mem) * 100, 1) if total_mem > 0 else 0
+            },
+            "storage": {
+                "totalBytes": total_hdd,
+                "freeBytes": free_hdd,
+                "usedBytes": total_hdd - free_hdd,
+                "usedPercent": round(((total_hdd - free_hdd) / total_hdd) * 100, 1) if total_hdd > 0 else 0
+            },
+            "healthSensors": health.get("data", {}),
+            "activeSessions": active_sessions.get("data", []),
+            "activeSessionCount": len(active_sessions.get("data", [])),
+            "interfaces": traffic.get("data", []),
+            "generatedAt": datetime.utcnow().isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching dashboard MikroTik data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/mikrotik/traffic")
