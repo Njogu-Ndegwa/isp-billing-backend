@@ -282,9 +282,7 @@ class MikroTikAPI:
                     logger.error(f"Hotspot user add error: {result['error']}")
                     return {"error": result["error"]}
 
-            # 3. IP binding (bypassed with comment tracking for our DB-based expiry)
-            # We use "bypassed" for seamless auto-login, but rely on our cron job to
-            # remove the binding when the DB expiry is reached (not MikroTik's limit-uptime)
+            # 3. IP binding (bypassed for seamless auto-access after payment)
             binding_args = {
                 "mac-address": mac_address,
                 "type": "bypassed",
@@ -292,7 +290,7 @@ class MikroTikAPI:
             }
             binding_result = self.send_command("/ip/hotspot/ip-binding/add", binding_args)
             if "error" in binding_result:
-                if "such client already exists" in binding_result["error"]:
+                if "already exists" in binding_result.get("error", ""):
                     # Update existing binding
                     bindings = self.send_command("/ip/hotspot/ip-binding/print")
                     if bindings.get("success") and bindings.get("data"):
@@ -307,80 +305,77 @@ class MikroTikAPI:
                                 break
                 else:
                     logger.error(f"IP binding error: {binding_result['error']}")
-                    return {"error": binding_result["error"]}
 
-            # 4. Create simple queue for bandwidth limiting (profile rate-limit doesn't apply to bypassed users!)
-            queue_result = None
+            # 4. Create firewall mangle rules for MAC-based rate limiting (works even when IP changes!)
+            # This is the key fix - mangle marks packets by MAC, queue tree limits by mark
+            mangle_result = None
+            queue_tree_result = None
+            normalized = normalize_mac_address(mac_address)
+            
             if rate_limit:
-                # Find client's current IP from multiple sources
-                client_ip = None
-                normalized = normalize_mac_address(mac_address)
+                # Parse upload/download limits
+                parts = rate_limit.split('/')
+                upload_limit = parts[0] if len(parts) > 0 else "10M"
+                download_limit = parts[1] if len(parts) > 1 else upload_limit
                 
-                # Try 1: DHCP leases (most reliable - client may already have a lease)
-                leases = self.send_command("/ip/dhcp-server/lease/print")
-                if leases.get("success") and leases.get("data"):
-                    for lease in leases["data"]:
-                        lease_mac = lease.get("mac-address", "").upper()
-                        if normalize_mac_address(lease_mac) == normalized:
-                            client_ip = lease.get("address")
-                            logger.info(f"Found IP {client_ip} from DHCP lease for {mac_address}")
-                            break
+                # Remove existing mangle rules for this user
+                mangles = self.send_command("/ip/firewall/mangle/print")
+                if mangles.get("success") and mangles.get("data"):
+                    for m in mangles["data"]:
+                        if m.get("comment", "").startswith(f"RATELIMIT:{username}"):
+                            self.send_command("/ip/firewall/mangle/remove", {"numbers": m[".id"]})
                 
-                # Try 2: Hotspot active sessions
-                if not client_ip:
-                    active = self.send_command("/ip/hotspot/active/print")
-                    if active.get("success") and active.get("data"):
-                        for session in active["data"]:
-                            session_mac = session.get("mac-address", "").upper()
-                            if normalize_mac_address(session_mac) == normalized:
-                                client_ip = session.get("address")
-                                logger.info(f"Found IP {client_ip} from active session for {mac_address}")
-                                break
+                # Create mangle rule for UPLOAD (prerouting, match src-mac)
+                mangle_up = self.send_command("/ip/firewall/mangle/add", {
+                    "chain": "prerouting",
+                    "src-mac-address": mac_address,
+                    "action": "mark-packet",
+                    "new-packet-mark": f"up_{username}",
+                    "passthrough": "yes",
+                    "comment": f"RATELIMIT:{username}:UP"
+                })
                 
-                # Try 3: Hotspot hosts table
-                if not client_ip:
-                    hosts = self.send_command("/ip/hotspot/host/print")
-                    if hosts.get("success") and hosts.get("data"):
-                        for host in hosts["data"]:
-                            host_mac = host.get("mac-address", "").upper()
-                            if normalize_mac_address(host_mac) == normalized:
-                                client_ip = host.get("address")
-                                logger.info(f"Found IP {client_ip} from hotspot host for {mac_address}")
-                                break
+                # Create mangle rule for DOWNLOAD (postrouting, match dst-mac - fully MAC-based!)
+                # dst-mac-address is available in postrouting chain, so we don't need IP
+                mangle_down = self.send_command("/ip/firewall/mangle/add", {
+                    "chain": "postrouting",
+                    "dst-mac-address": mac_address,
+                    "action": "mark-packet",
+                    "new-packet-mark": f"down_{username}",
+                    "passthrough": "yes",
+                    "comment": f"RATELIMIT:{username}:DOWN"
+                })
                 
-                # Try 4: ARP table
-                if not client_ip:
-                    arp = self.send_command("/ip/arp/print")
-                    if arp.get("success") and arp.get("data"):
-                        for entry in arp["data"]:
-                            entry_mac = entry.get("mac-address", "").upper()
-                            if normalize_mac_address(entry_mac) == normalized:
-                                client_ip = entry.get("address")
-                                logger.info(f"Found IP {client_ip} from ARP for {mac_address}")
-                                break
+                mangle_result = {"upload": mangle_up, "download": mangle_down}
+                logger.info(f"Created mangle rules for {username}")
                 
-                if client_ip:
-                    queue_args = {
-                        "name": f"queue_{username}",
-                        "target": f"{client_ip}/32",
-                        "max-limit": rate_limit,
-                        "comment": f"Bandwidth limit for MAC: {mac_address} -> IP: {client_ip}"
-                    }
-                    # Try to update existing queue first
-                    queue_set_result = self.send_command("/queue/simple/set", {
-                        "numbers": f"queue_{username}",
-                        "target": f"{client_ip}/32",
-                        "max-limit": rate_limit
-                    })
-                    if "error" in queue_set_result:
-                        queue_result = self.send_command("/queue/simple/add", queue_args)
-                    else:
-                        queue_result = queue_set_result
-                    logger.info(f"Created/updated queue for {username} targeting {client_ip} with limit {rate_limit}")
-                else:
-                    # Client not connected yet - queue will need to be created when they connect
-                    # The hotspot profile rate-limit is a fallback but may not work for bypassed users
-                    logger.warning(f"Client {mac_address} not currently connected. Queue not created - speed limit may not apply until reconnect!")
+                # Remove existing queue tree rules for this user
+                qtrees = self.send_command("/queue/tree/print")
+                if qtrees.get("success") and qtrees.get("data"):
+                    for qt in qtrees["data"]:
+                        if qt.get("name", "").startswith(f"qt_{username}"):
+                            self.send_command("/queue/tree/remove", {"numbers": qt[".id"]})
+                
+                # Create queue tree for UPLOAD
+                qt_up = self.send_command("/queue/tree/add", {
+                    "name": f"qt_{username}_up",
+                    "parent": "global",
+                    "packet-mark": f"up_{username}",
+                    "max-limit": upload_limit,
+                    "comment": f"Upload limit for {mac_address}"
+                })
+                
+                # Create queue tree for DOWNLOAD
+                qt_down = self.send_command("/queue/tree/add", {
+                    "name": f"qt_{username}_down",
+                    "parent": "global",
+                    "packet-mark": f"down_{username}",
+                    "max-limit": download_limit,
+                    "comment": f"Download limit for {mac_address}"
+                })
+                
+                queue_tree_result = {"upload": qt_up, "download": qt_down}
+                logger.info(f"Created queue tree rules for {username}: up={upload_limit}, down={download_limit}")
 
             return {
                 "message": f"MAC address {mac_address} registered/updated successfully with rate limit {rate_limit}",
@@ -395,7 +390,8 @@ class MikroTikAPI:
                 "profile_result": profile_result,
                 "hotspot_user_result": result,
                 "ip_binding_result": binding_result,
-                "queue_result": queue_result
+                "mangle_result": mangle_result,
+                "queue_tree_result": queue_tree_result
             }
 
         except Exception as e:
@@ -453,6 +449,32 @@ class MikroTikAPI:
                             self.send_command("/queue/simple/remove", {"numbers": queue_id})
                             results["queue_removed"] += 1
                             logger.info(f"Removed queue: {queue_name}")
+
+            # 3b. Remove mangle rules (for MAC-based rate limiting)
+            mangles = self.send_command("/ip/firewall/mangle/print")
+            results["mangle_removed"] = 0
+            if mangles.get("success") and mangles.get("data"):
+                for m in mangles["data"]:
+                    comment = m.get("comment", "")
+                    if comment.startswith(f"RATELIMIT:{username}"):
+                        mangle_id = m.get(".id")
+                        if mangle_id:
+                            self.send_command("/ip/firewall/mangle/remove", {"numbers": mangle_id})
+                            results["mangle_removed"] += 1
+                            logger.info(f"Removed mangle rule: {comment}")
+
+            # 3c. Remove queue tree rules (for MAC-based rate limiting)
+            qtrees = self.send_command("/queue/tree/print")
+            results["queue_tree_removed"] = 0
+            if qtrees.get("success") and qtrees.get("data"):
+                for qt in qtrees["data"]:
+                    qt_name = qt.get("name", "")
+                    if qt_name.startswith(f"qt_{username}"):
+                        qt_id = qt.get(".id")
+                        if qt_id:
+                            self.send_command("/queue/tree/remove", {"numbers": qt_id})
+                            results["queue_tree_removed"] += 1
+                            logger.info(f"Removed queue tree: {qt_name}")
 
             # 4. Remove DHCP lease
             leases = self.send_command("/ip/dhcp-server/lease/print")

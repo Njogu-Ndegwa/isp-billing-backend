@@ -321,7 +321,7 @@ async def cleanup_expired_users_background():
                                 removed["active_sessions"] += 1
                                 logger.info(f"[CRON] Disconnected active session: {session_user}")
                     
-                    # STEP 6: Remove queues
+                    # STEP 6: Remove queues (simple queues)
                     queues = api.send_command("/queue/simple/print")
                     if queues.get("success") and queues.get("data"):
                         for q in queues["data"]:
@@ -331,6 +331,22 @@ async def cleanup_expired_users_background():
                                 normalized_mac.upper() in queue_comment.upper()):
                                 api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
                                 removed["queues"] += 1
+                    
+                    # STEP 6b: Remove mangle rules (for MAC-based rate limiting)
+                    mangles = api.send_command("/ip/firewall/mangle/print")
+                    if mangles.get("success") and mangles.get("data"):
+                        for m in mangles["data"]:
+                            if m.get("comment", "").startswith(f"RATELIMIT:{username}"):
+                                api.send_command("/ip/firewall/mangle/remove", {"numbers": m[".id"]})
+                                logger.info(f"[CRON] Removed mangle rule for {username}")
+                    
+                    # STEP 6c: Remove queue tree rules (for MAC-based rate limiting)
+                    qtrees = api.send_command("/queue/tree/print")
+                    if qtrees.get("success") and qtrees.get("data"):
+                        for qt in qtrees["data"]:
+                            if qt.get("name", "").startswith(f"qt_{username}"):
+                                api.send_command("/queue/tree/remove", {"numbers": qt[".id"]})
+                                logger.info(f"[CRON] Removed queue tree {qt.get('name')} for {username}")
                     
                     # STEP 7: Remove DHCP lease (forces client to re-request IP)
                     leases = api.send_command("/ip/dhcp-server/lease/print")
@@ -755,45 +771,12 @@ async def call_mikrotik_bypass(hotspot_payload: dict):
 
         logger.info(f"MikroTik API Response: {json.dumps(result, indent=2)}")
         
-        # If queue wasn't created (client not connected yet), retry after delay
-        if result.get("queue_result") is None:
-            logger.info(f"Queue not created for {hotspot_payload['mac_address']}, will retry in 5 seconds...")
-            await asyncio.sleep(5)
-            
-            # Reconnect and try to create queue
-            if not api.connected:
-                api.connect()
-            
-            if api.connected:
-                normalized_mac = normalize_mac_address(hotspot_payload["mac_address"])
-                username = normalized_mac.replace(":", "")
-                rate_limit = api._parse_speed_to_mikrotik(hotspot_payload["bandwidth_limit"])
-                
-                # Try to find client IP now
-                client_ip = None
-                for source, cmd in [("DHCP", "/ip/dhcp-server/lease/print"), 
-                                   ("hosts", "/ip/hotspot/host/print"),
-                                   ("ARP", "/ip/arp/print")]:
-                    resp = api.send_command(cmd)
-                    if resp.get("success") and resp.get("data"):
-                        for item in resp["data"]:
-                            if normalize_mac_address(item.get("mac-address", "")) == normalized_mac:
-                                client_ip = item.get("address")
-                                logger.info(f"[RETRY] Found IP {client_ip} from {source}")
-                                break
-                    if client_ip:
-                        break
-                
-                if client_ip:
-                    queue_result = api.send_command("/queue/simple/add", {
-                        "name": f"queue_{username}",
-                        "target": f"{client_ip}/32",
-                        "max-limit": rate_limit,
-                        "comment": f"Bandwidth limit for MAC: {hotspot_payload['mac_address']}"
-                    })
-                    logger.info(f"[RETRY] Queue created for {username}: {queue_result}")
-                else:
-                    logger.warning(f"[RETRY] Still no IP for {hotspot_payload['mac_address']} - user may need to reconnect to WiFi")
+        # Log success - mangle rules are now fully MAC-based, no retry needed
+        mangle_result = result.get("mangle_result", {})
+        if mangle_result:
+            logger.info(f"Rate limiting configured for {hotspot_payload['mac_address']}: "
+                       f"upload={mangle_result.get('upload', {}).get('success', False)}, "
+                       f"download={mangle_result.get('download', {}).get('success', False)}")
         
         api.disconnect()
     except Exception as e:
@@ -849,11 +832,19 @@ async def register_mac_address(
                     logger.warning(f"MAC address {normalized_mac} already registered on router {router.name}")
                     raise HTTPException(status_code=409, detail="MAC address already registered")
 
-        # Prepare user arguments
+        # Prepare user arguments - use rate-limited profile if bandwidth_limit provided
+        bandwidth_limit = registration.get("bandwidth_limit")
+        profile_name = "default"
+        if bandwidth_limit:
+            # Create/update rate-limited profile
+            rate_limit = api._parse_speed_to_mikrotik(bandwidth_limit)
+            profile_name = f"plan_{rate_limit.replace('/', '_')}"
+            api._ensure_hotspot_profile(profile_name, rate_limit)
+        
         args = {
             "name": username,
             "password": username,
-            "profile": "default",
+            "profile": profile_name,
             "disabled": "no"
         }
 
@@ -889,15 +880,26 @@ async def register_mac_address(
             logger.error(f"Failed to create hotspot user: {result['error']}")
             raise HTTPException(status_code=400, detail=result["error"])
 
-        # Add IP binding for the MAC address
+        # Add IP binding for seamless access (bypassed = no login required)
         binding_args = {
             "mac-address": normalized_mac,
             "type": "bypassed",
             "comment": f"Auto-registered: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | Router: {router.name} | Guest"
         }
         binding_result = api.send_command("/ip/hotspot/ip-binding/add", binding_args)
+        if "error" in binding_result and "already exists" in binding_result.get("error", ""):
+            # Update existing binding to bypassed
+            bindings = api.send_command("/ip/hotspot/ip-binding/print")
+            if bindings.get("success") and bindings.get("data"):
+                for b in bindings["data"]:
+                    if normalize_mac_address(b.get("mac-address", "")) == normalized_mac:
+                        api.send_command("/ip/hotspot/ip-binding/set", {
+                            "numbers": b[".id"],
+                            "type": "bypassed"
+                        })
+                        break
 
-        # Handle bandwidth limit and IP assignment if provided
+        # Handle bandwidth limit - use mangle+queue tree for MAC-based limiting
         queue_result = None
         dhcp_lease_result = None
         assigned_ip = None
