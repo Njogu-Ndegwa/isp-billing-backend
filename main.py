@@ -265,7 +265,7 @@ async def cleanup_expired_users_background():
                     
                     removed = {
                         "user": False, 
-                        "binding_blocked": False, 
+                        "binding_removed": False, 
                         "hosts": 0,
                         "queues": 0, 
                         "leases": 0,
@@ -277,12 +277,16 @@ async def cleanup_expired_users_background():
                     if client_ip:
                         logger.info(f"[CRON] Found client IP: {client_ip} for MAC {normalized_mac}")
                     
-                    # STEP 2: Block the MAC address (change binding to 'blocked')
-                    # This prevents reconnection attempts
-                    block_result = api.block_mac_address(normalized_mac)
-                    if block_result.get("success"):
-                        removed["binding_blocked"] = True
-                        logger.info(f"[CRON] Blocked MAC {normalized_mac}")
+                    # STEP 2: REMOVE the IP binding completely (not block!)
+                    # Blocking prevents captive portal redirect. Removing allows redirect.
+                    bindings = api.send_command("/ip/hotspot/ip-binding/print")
+                    if bindings.get("success") and bindings.get("data"):
+                        for b in bindings["data"]:
+                            binding_mac = b.get("mac-address", "").upper()
+                            if normalize_mac_address(binding_mac) == normalized_mac:
+                                api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                                removed["binding_removed"] = True
+                                logger.info(f"[CRON] Removed IP binding for {normalized_mac}")
                     
                     # STEP 3: Remove from hotspot hosts (forces IMMEDIATE disconnect for bypassed users)
                     hosts = api.send_command("/ip/hotspot/host/print")
@@ -737,7 +741,6 @@ async def call_mikrotik_bypass(hotspot_payload: dict):
             logger.error("Failed to connect to MikroTik router via tunnel")
             return
 
-        # 🔴 NO await here!
         result = api.add_customer_bypass_mode(
             hotspot_payload["mac_address"],
             hotspot_payload["username"],
@@ -751,6 +754,47 @@ async def call_mikrotik_bypass(hotspot_payload: dict):
         )
 
         logger.info(f"MikroTik API Response: {json.dumps(result, indent=2)}")
+        
+        # If queue wasn't created (client not connected yet), retry after delay
+        if result.get("queue_result") is None:
+            logger.info(f"Queue not created for {hotspot_payload['mac_address']}, will retry in 5 seconds...")
+            await asyncio.sleep(5)
+            
+            # Reconnect and try to create queue
+            if not api.connected:
+                api.connect()
+            
+            if api.connected:
+                normalized_mac = normalize_mac_address(hotspot_payload["mac_address"])
+                username = normalized_mac.replace(":", "")
+                rate_limit = api._parse_speed_to_mikrotik(hotspot_payload["bandwidth_limit"])
+                
+                # Try to find client IP now
+                client_ip = None
+                for source, cmd in [("DHCP", "/ip/dhcp-server/lease/print"), 
+                                   ("hosts", "/ip/hotspot/host/print"),
+                                   ("ARP", "/ip/arp/print")]:
+                    resp = api.send_command(cmd)
+                    if resp.get("success") and resp.get("data"):
+                        for item in resp["data"]:
+                            if normalize_mac_address(item.get("mac-address", "")) == normalized_mac:
+                                client_ip = item.get("address")
+                                logger.info(f"[RETRY] Found IP {client_ip} from {source}")
+                                break
+                    if client_ip:
+                        break
+                
+                if client_ip:
+                    queue_result = api.send_command("/queue/simple/add", {
+                        "name": f"queue_{username}",
+                        "target": f"{client_ip}/32",
+                        "max-limit": rate_limit,
+                        "comment": f"Bandwidth limit for MAC: {hotspot_payload['mac_address']}"
+                    })
+                    logger.info(f"[RETRY] Queue created for {username}: {queue_result}")
+                else:
+                    logger.warning(f"[RETRY] Still no IP for {hotspot_payload['mac_address']} - user may need to reconnect to WiFi")
+        
         api.disconnect()
     except Exception as e:
         logger.error(f"Error while processing MikroTik bypass: {e}")
@@ -1535,6 +1579,179 @@ async def cleanup_all_inactive_users(
         
     except Exception as e:
         logger.error(f"[CLEANUP-ALL] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/public/cleanup-blocked-bindings")
+async def cleanup_blocked_bindings_public():
+    """
+    Remove all blocked IP bindings from MikroTik (public endpoint).
+    Blocked bindings prevent captive portal redirect - they need to be removed
+    so users can see the login page again.
+    
+    Call this to fix users stuck with blocked status.
+    """
+    
+    try:
+        api = MikroTikAPI(
+            settings.MIKROTIK_HOST,
+            settings.MIKROTIK_USERNAME,
+            settings.MIKROTIK_PASSWORD,
+            settings.MIKROTIK_PORT
+        )
+        
+        if not api.connect():
+            raise HTTPException(status_code=500, detail="Failed to connect to router")
+        
+        try:
+            bindings = api.send_command("/ip/hotspot/ip-binding/print")
+            removed_count = 0
+            removed_macs = []
+            
+            if bindings.get("success") and bindings.get("data"):
+                for b in bindings["data"]:
+                    binding_type = b.get("type", "")
+                    # Remove blocked bindings (type=blocked shows as "B" in Winbox)
+                    if binding_type == "blocked":
+                        mac = b.get("mac-address", "unknown")
+                        api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                        removed_count += 1
+                        removed_macs.append(mac)
+                        logger.info(f"[CLEANUP-BLOCKED] Removed blocked binding for {mac}")
+            
+            return {
+                "success": True,
+                "message": f"Removed {removed_count} blocked bindings",
+                "removed_count": removed_count,
+                "removed_macs": removed_macs
+            }
+        finally:
+            api.disconnect()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[CLEANUP-BLOCKED] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/public/sync-queue/{customer_id}")
+async def sync_customer_queue(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Sync/apply bandwidth queue for a customer.
+    Call this after payment to ensure speed limit is applied.
+    Finds customer's current IP and creates/updates the simple queue.
+    """
+    try:
+        # Get customer with plan
+        stmt = select(Customer).options(
+            selectinload(Customer.plan),
+            selectinload(Customer.router)
+        ).where(Customer.id == customer_id)
+        result = await db.execute(stmt)
+        customer = result.scalar_one_or_none()
+        
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        
+        if not customer.mac_address:
+            raise HTTPException(status_code=400, detail="Customer has no MAC address")
+        
+        if not customer.plan or not customer.plan.speed:
+            raise HTTPException(status_code=400, detail="Customer has no plan with speed limit")
+        
+        # Connect to MikroTik
+        api = MikroTikAPI(
+            settings.MIKROTIK_HOST,
+            settings.MIKROTIK_USERNAME,
+            settings.MIKROTIK_PASSWORD,
+            settings.MIKROTIK_PORT
+        )
+        
+        if not api.connect():
+            raise HTTPException(status_code=500, detail="Failed to connect to router")
+        
+        try:
+            normalized_mac = normalize_mac_address(customer.mac_address)
+            username = normalized_mac.replace(":", "")
+            rate_limit = api._parse_speed_to_mikrotik(customer.plan.speed)
+            
+            # Find client IP from multiple sources
+            client_ip = None
+            
+            # Check DHCP leases
+            leases = api.send_command("/ip/dhcp-server/lease/print")
+            if leases.get("success") and leases.get("data"):
+                for lease in leases["data"]:
+                    if normalize_mac_address(lease.get("mac-address", "")) == normalized_mac:
+                        client_ip = lease.get("address")
+                        break
+            
+            # Check hotspot hosts
+            if not client_ip:
+                hosts = api.send_command("/ip/hotspot/host/print")
+                if hosts.get("success") and hosts.get("data"):
+                    for host in hosts["data"]:
+                        if normalize_mac_address(host.get("mac-address", "")) == normalized_mac:
+                            client_ip = host.get("address")
+                            break
+            
+            # Check ARP
+            if not client_ip:
+                arp = api.send_command("/ip/arp/print")
+                if arp.get("success") and arp.get("data"):
+                    for entry in arp["data"]:
+                        if normalize_mac_address(entry.get("mac-address", "")) == normalized_mac:
+                            client_ip = entry.get("address")
+                            break
+            
+            if not client_ip:
+                api.disconnect()
+                return {
+                    "success": False,
+                    "message": "Client not currently connected. Queue will be applied when they connect.",
+                    "customer_id": customer_id,
+                    "mac_address": customer.mac_address
+                }
+            
+            # Create or update queue
+            queue_args = {
+                "name": f"queue_{username}",
+                "target": f"{client_ip}/32",
+                "max-limit": rate_limit,
+                "comment": f"Bandwidth limit for MAC: {customer.mac_address} -> IP: {client_ip}"
+            }
+            
+            # Try update first, then add
+            queue_result = api.send_command("/queue/simple/set", {
+                "numbers": f"queue_{username}",
+                "target": f"{client_ip}/32",
+                "max-limit": rate_limit
+            })
+            
+            if "error" in queue_result:
+                queue_result = api.send_command("/queue/simple/add", queue_args)
+            
+            api.disconnect()
+            
+            return {
+                "success": True,
+                "message": f"Queue synced for customer {customer.name}",
+                "customer_id": customer_id,
+                "mac_address": customer.mac_address,
+                "client_ip": client_ip,
+                "rate_limit": rate_limit,
+                "queue_result": queue_result
+            }
+            
+        finally:
+            api.disconnect()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[SYNC-QUEUE] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================

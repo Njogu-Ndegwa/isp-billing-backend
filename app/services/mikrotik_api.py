@@ -309,29 +309,54 @@ class MikroTikAPI:
                     logger.error(f"IP binding error: {binding_result['error']}")
                     return {"error": binding_result["error"]}
 
-            # 4. Also create a simple queue as backup (targeting MAC via address-list)
+            # 4. Create simple queue for bandwidth limiting (profile rate-limit doesn't apply to bypassed users!)
             queue_result = None
             if rate_limit:
-                # Find client's current IP from active connections or ARP
+                # Find client's current IP from multiple sources
                 client_ip = None
+                normalized = normalize_mac_address(mac_address)
                 
-                # Try to get IP from hotspot active sessions
-                active = self.send_command("/ip/hotspot/active/print")
-                if active.get("success") and active.get("data"):
-                    for session in active["data"]:
-                        session_mac = session.get("mac-address", "").upper()
-                        if normalize_mac_address(session_mac) == normalize_mac_address(mac_address):
-                            client_ip = session.get("address")
+                # Try 1: DHCP leases (most reliable - client may already have a lease)
+                leases = self.send_command("/ip/dhcp-server/lease/print")
+                if leases.get("success") and leases.get("data"):
+                    for lease in leases["data"]:
+                        lease_mac = lease.get("mac-address", "").upper()
+                        if normalize_mac_address(lease_mac) == normalized:
+                            client_ip = lease.get("address")
+                            logger.info(f"Found IP {client_ip} from DHCP lease for {mac_address}")
                             break
                 
-                # Fallback: check ARP table
+                # Try 2: Hotspot active sessions
+                if not client_ip:
+                    active = self.send_command("/ip/hotspot/active/print")
+                    if active.get("success") and active.get("data"):
+                        for session in active["data"]:
+                            session_mac = session.get("mac-address", "").upper()
+                            if normalize_mac_address(session_mac) == normalized:
+                                client_ip = session.get("address")
+                                logger.info(f"Found IP {client_ip} from active session for {mac_address}")
+                                break
+                
+                # Try 3: Hotspot hosts table
+                if not client_ip:
+                    hosts = self.send_command("/ip/hotspot/host/print")
+                    if hosts.get("success") and hosts.get("data"):
+                        for host in hosts["data"]:
+                            host_mac = host.get("mac-address", "").upper()
+                            if normalize_mac_address(host_mac) == normalized:
+                                client_ip = host.get("address")
+                                logger.info(f"Found IP {client_ip} from hotspot host for {mac_address}")
+                                break
+                
+                # Try 4: ARP table
                 if not client_ip:
                     arp = self.send_command("/ip/arp/print")
                     if arp.get("success") and arp.get("data"):
                         for entry in arp["data"]:
                             entry_mac = entry.get("mac-address", "").upper()
-                            if normalize_mac_address(entry_mac) == normalize_mac_address(mac_address):
+                            if normalize_mac_address(entry_mac) == normalized:
                                 client_ip = entry.get("address")
+                                logger.info(f"Found IP {client_ip} from ARP for {mac_address}")
                                 break
                 
                 if client_ip:
@@ -353,7 +378,9 @@ class MikroTikAPI:
                         queue_result = queue_set_result
                     logger.info(f"Created/updated queue for {username} targeting {client_ip} with limit {rate_limit}")
                 else:
-                    logger.info(f"Client {mac_address} not currently connected, queue will be applied via profile")
+                    # Client not connected yet - queue will need to be created when they connect
+                    # The hotspot profile rate-limit is a fallback but may not work for bypassed users
+                    logger.warning(f"Client {mac_address} not currently connected. Queue not created - speed limit may not apply until reconnect!")
 
             return {
                 "message": f"MAC address {mac_address} registered/updated successfully with rate limit {rate_limit}",
