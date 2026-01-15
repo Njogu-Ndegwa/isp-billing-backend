@@ -430,7 +430,7 @@ async def sync_active_user_queues():
                     
                     if queues.get("success") and queues.get("data"):
                         for q in queues["data"]:
-                            if q.get("name") == f"queue_{username}":
+                            if q.get("name") == f"plan_{username}":
                                 queue_exists = True
                                 if client_ip in q.get("target", ""):
                                     queue_correct = True
@@ -439,6 +439,7 @@ async def sync_active_user_queues():
                                     api.send_command("/queue/simple/set", {
                                         "numbers": q[".id"],
                                         "target": f"{client_ip}/32",
+                                        "interface": "bridge",
                                         "max-limit": rate_limit
                                     })
                                     logger.info(f"[SYNC] Updated queue for {username} -> {client_ip}")
@@ -448,8 +449,9 @@ async def sync_active_user_queues():
                     # Create queue if doesn't exist
                     if not queue_exists:
                         api.send_command("/queue/simple/add", {
-                            "name": f"queue_{username}",
+                            "name": f"plan_{username}",
                             "target": f"{client_ip}/32",
+                            "interface": "bridge",
                             "max-limit": rate_limit,
                             "comment": f"MAC:{customer.mac_address}|Plan rate limit"
                         })
@@ -873,10 +875,11 @@ async def call_mikrotik_bypass(hotspot_payload: dict):
                 client_ip = api.get_client_ip_by_mac(normalized_mac)
                 
                 if client_ip:
-                    # Create simple queue (no interface = all interfaces)
+                    # Create simple queue on bridge interface
                     retry_result = api.send_command("/queue/simple/add", {
-                        "name": f"queue_{username}",
+                        "name": f"plan_{username}",
                         "target": f"{client_ip}/32",
+                        "interface": "bridge",
                         "max-limit": rate_limit,
                         "comment": f"MAC:{hotspot_payload['mac_address']}|Plan rate limit"
                     })
