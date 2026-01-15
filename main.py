@@ -2903,13 +2903,21 @@ async def get_dashboard_overview(
 @app.get("/api/dashboard/analytics")
 async def get_dashboard_analytics(
     user_id: int = 1,
-    days: int = 7,
+    days: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    preset: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Comprehensive analytics endpoint with historical data for graphs.
-    Returns daily breakdowns, hourly patterns, plan analytics, user behavior metrics,
-    MikroTik health stats, traffic data, and active sessions.
+    Comprehensive analytics endpoint with flexible filtering.
+    
+    Query params (priority: start_date/end_date > preset > days):
+    - start_date: YYYY-MM-DD (inclusive)
+    - end_date: YYYY-MM-DD (inclusive, defaults to today)
+    - preset: today, yesterday, this_week, last_week, this_month, last_month, 
+              this_year, last_7_days, last_30_days, last_90_days, all_time
+    - days: Number of days back from today (default 7, kept for backward compatibility)
     """
     try:
         import asyncio
@@ -2918,8 +2926,63 @@ async def get_dashboard_analytics(
         from collections import defaultdict
         
         now = datetime.utcnow()
-        start_date = now - timedelta(days=days)
         today_start = datetime(now.year, now.month, now.day)
+        today_end = today_start + timedelta(days=1)
+        
+        # Determine date range based on params (priority: dates > preset > days)
+        if start_date or end_date:
+            try:
+                filter_start = datetime.strptime(start_date, "%Y-%m-%d") if start_date else today_start
+                filter_end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1) if end_date else today_end
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+            period_label = f"{start_date or 'start'} to {end_date or 'today'}"
+            period_days = (filter_end - filter_start).days
+        elif preset:
+            presets = {
+                "today": (today_start, today_end),
+                "yesterday": (today_start - timedelta(days=1), today_start),
+                "this_week": (today_start - timedelta(days=today_start.weekday()), today_end),
+                "last_week": (
+                    today_start - timedelta(days=today_start.weekday() + 7),
+                    today_start - timedelta(days=today_start.weekday())
+                ),
+                "this_month": (datetime(now.year, now.month, 1), today_end),
+                "last_month": (
+                    datetime(now.year, now.month, 1) - timedelta(days=1),
+                    datetime(now.year, now.month, 1)
+                ),
+                "this_year": (datetime(now.year, 1, 1), today_end),
+                "last_7_days": (today_start - timedelta(days=6), today_end),
+                "last_30_days": (today_start - timedelta(days=29), today_end),
+                "last_90_days": (today_start - timedelta(days=89), today_end),
+                "all_time": (datetime(2020, 1, 1), today_end),
+            }
+            # Fix last_month to get correct range
+            if preset == "last_month":
+                first_of_this_month = datetime(now.year, now.month, 1)
+                last_month_end = first_of_this_month
+                if now.month == 1:
+                    last_month_start = datetime(now.year - 1, 12, 1)
+                else:
+                    last_month_start = datetime(now.year, now.month - 1, 1)
+                presets["last_month"] = (last_month_start, last_month_end)
+            
+            if preset not in presets:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Invalid preset. Choose from: {', '.join(presets.keys())}"
+                )
+            filter_start, filter_end = presets[preset]
+            period_label = preset.replace("_", " ").title()
+            period_days = (filter_end - filter_start).days
+        else:
+            # Default: use days param (default 7)
+            days = days or 7
+            filter_start = today_start - timedelta(days=days - 1)  # Include today
+            filter_end = today_end
+            period_label = f"Last {days} days"
+            period_days = days
         
         # Build both DB queries
         payments_stmt = select(
@@ -2930,7 +2993,8 @@ async def get_dashboard_analytics(
             Plan, Customer.plan_id == Plan.id
         ).where(
             CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= start_date
+            CustomerPayment.created_at >= filter_start,
+            CustomerPayment.created_at < filter_end
         ).order_by(CustomerPayment.created_at.desc())
         
         active_customers_stmt = select(Customer).options(
@@ -3114,8 +3178,8 @@ async def get_dashboard_analytics(
         today_transactions = today_data.get("totalTransactions", 0)
         
         days_with_data = len(days_output) if days_output else 1
-        avg_daily_revenue = round(total_rev / days, 2) if days > 0 else 0
-        avg_daily_transactions = round(total_txns / days, 2) if days > 0 else 0
+        avg_daily_revenue = round(total_rev / period_days, 2) if period_days > 0 else 0
+        avg_daily_transactions = round(total_txns / period_days, 2) if period_days > 0 else 0
         avg_transaction_value = round(total_rev / total_txns, 2) if total_txns > 0 else 0
         avg_revenue_per_customer = round(total_rev / unique_customers_count, 2) if unique_customers_count > 0 else 0
         
@@ -3140,7 +3204,12 @@ async def get_dashboard_analytics(
         
         return {
             "extractedAt": now.isoformat(),
-            "periodDays": days,
+            "period": {
+                "label": period_label,
+                "days": period_days,
+                "startDate": filter_start.strftime("%Y-%m-%d"),
+                "endDate": (filter_end - timedelta(days=1)).strftime("%Y-%m-%d"),
+            },
             "summary": {
                 "totalTransactions": total_txns,
                 "totalRevenue": round(total_rev, 2),
