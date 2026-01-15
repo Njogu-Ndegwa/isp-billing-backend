@@ -316,7 +316,7 @@ class MikroTikAPI:
                 queues = self.send_command("/queue/simple/print")
                 if queues.get("success") and queues.get("data"):
                     for q in queues["data"]:
-                        if q.get("name") == f"plan_{username}" or f"MAC:{mac_address}" in q.get("comment", ""):
+                        if q.get("name") == f"queue_{username}" or f"MAC:{mac_address}" in q.get("comment", ""):
                             self.send_command("/queue/simple/remove", {"numbers": q[".id"]})
                             logger.info(f"Removed existing queue for {username}")
                 
@@ -324,11 +324,10 @@ class MikroTikAPI:
                 client_ip = self.get_client_ip_by_mac(normalized)
                 
                 if client_ip:
-                    # Create simple queue targeting client IP on bridge interface
+                    # Create simple queue targeting client IP (no interface = all interfaces)
                     queue_result = self.send_command("/queue/simple/add", {
-                        "name": f"plan_{username}",
+                        "name": f"queue_{username}",
                         "target": f"{client_ip}/32",
-                        "interface": "bridge",
                         "max-limit": rate_limit,
                         "comment": f"MAC:{mac_address}|Plan rate limit"
                     })
