@@ -306,76 +306,36 @@ class MikroTikAPI:
                 else:
                     logger.error(f"IP binding error: {binding_result['error']}")
 
-            # 4. Create firewall mangle rules for MAC-based rate limiting (works even when IP changes!)
-            # This is the key fix - mangle marks packets by MAC, queue tree limits by mark
-            mangle_result = None
-            queue_tree_result = None
+            # 4. Create Simple Queue for rate limiting (most reliable method in MikroTik)
+            # Simple queues work even with FastTrack and are the standard approach
+            queue_result = None
             normalized = normalize_mac_address(mac_address)
             
             if rate_limit:
-                # Parse upload/download limits
-                parts = rate_limit.split('/')
-                upload_limit = parts[0] if len(parts) > 0 else "10M"
-                download_limit = parts[1] if len(parts) > 1 else upload_limit
+                # Remove existing queue for this user
+                queues = self.send_command("/queue/simple/print")
+                if queues.get("success") and queues.get("data"):
+                    for q in queues["data"]:
+                        if q.get("name") == f"plan_{username}" or f"MAC:{mac_address}" in q.get("comment", ""):
+                            self.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                            logger.info(f"Removed existing queue for {username}")
                 
-                # Remove existing mangle rules for this user
-                mangles = self.send_command("/ip/firewall/mangle/print")
-                if mangles.get("success") and mangles.get("data"):
-                    for m in mangles["data"]:
-                        if m.get("comment", "").startswith(f"RATELIMIT:{username}"):
-                            self.send_command("/ip/firewall/mangle/remove", {"numbers": m[".id"]})
+                # Find client's current IP
+                client_ip = self.get_client_ip_by_mac(normalized)
                 
-                # Create mangle rule for UPLOAD (prerouting, match src-mac)
-                mangle_up = self.send_command("/ip/firewall/mangle/add", {
-                    "chain": "prerouting",
-                    "src-mac-address": mac_address,
-                    "action": "mark-packet",
-                    "new-packet-mark": f"up_{username}",
-                    "passthrough": "yes",
-                    "comment": f"RATELIMIT:{username}:UP"
-                })
-                
-                # Create mangle rule for DOWNLOAD (postrouting, match dst-mac - fully MAC-based!)
-                # dst-mac-address is available in postrouting chain, so we don't need IP
-                mangle_down = self.send_command("/ip/firewall/mangle/add", {
-                    "chain": "postrouting",
-                    "dst-mac-address": mac_address,
-                    "action": "mark-packet",
-                    "new-packet-mark": f"down_{username}",
-                    "passthrough": "yes",
-                    "comment": f"RATELIMIT:{username}:DOWN"
-                })
-                
-                mangle_result = {"upload": mangle_up, "download": mangle_down}
-                logger.info(f"Created mangle rules for {username}")
-                
-                # Remove existing queue tree rules for this user
-                qtrees = self.send_command("/queue/tree/print")
-                if qtrees.get("success") and qtrees.get("data"):
-                    for qt in qtrees["data"]:
-                        if qt.get("name", "").startswith(f"qt_{username}"):
-                            self.send_command("/queue/tree/remove", {"numbers": qt[".id"]})
-                
-                # Create queue tree for UPLOAD
-                qt_up = self.send_command("/queue/tree/add", {
-                    "name": f"qt_{username}_up",
-                    "parent": "global",
-                    "packet-mark": f"up_{username}",
-                    "max-limit": upload_limit,
-                    "comment": f"Upload limit for {mac_address}"
-                })
-                
-                # Create queue tree for DOWNLOAD
-                qt_down = self.send_command("/queue/tree/add", {
-                    "name": f"qt_{username}_down",
-                    "parent": "global",
-                    "packet-mark": f"down_{username}",
-                    "max-limit": download_limit,
-                    "comment": f"Download limit for {mac_address}"
-                })
-                
-                queue_tree_result = {"upload": qt_up, "download": qt_down}
-                logger.info(f"Created queue tree rules for {username}: up={upload_limit}, down={download_limit}")
+                if client_ip:
+                    # Create simple queue targeting client IP
+                    queue_result = self.send_command("/queue/simple/add", {
+                        "name": f"plan_{username}",
+                        "target": client_ip,
+                        "max-limit": rate_limit,
+                        "comment": f"MAC:{mac_address}|Plan rate limit"
+                    })
+                    logger.info(f"Created simple queue for {username} -> {client_ip} with limit {rate_limit}")
+                else:
+                    # Client not connected yet - will be created by sync job
+                    logger.warning(f"Client {mac_address} not connected - queue will be created when they connect")
+                    queue_result = {"pending": True, "message": "Client not connected, queue pending"}
 
             return {
                 "message": f"MAC address {mac_address} registered/updated successfully with rate limit {rate_limit}",
@@ -390,8 +350,7 @@ class MikroTikAPI:
                 "profile_result": profile_result,
                 "hotspot_user_result": result,
                 "ip_binding_result": binding_result,
-                "mangle_result": mangle_result,
-                "queue_tree_result": queue_tree_result
+                "queue_result": queue_result
             }
 
         except Exception as e:
@@ -433,15 +392,17 @@ class MikroTikAPI:
                             self.send_command("/ip/hotspot/user/remove", {"numbers": user_id})
                             results["hotspot_user_removed"] = True
 
-            # 3. Remove simple queue - search by name OR MAC in comment
+            # 3. Remove simple queues - search by name OR MAC in comment
             queues = self.send_command("/queue/simple/print")
             results["queue_removed"] = 0
             if queues.get("success") and queues.get("data"):
                 for queue in queues["data"]:
                     queue_name = queue.get("name", "")
                     queue_comment = queue.get("comment", "")
-                    # Match by queue name OR by MAC address in comment
+                    # Match by queue name (old or new format) OR by MAC address in comment
                     if (queue_name == f"queue_{username}" or 
+                        queue_name == f"plan_{username}" or
+                        f"MAC:{mac_address}" in queue_comment or
                         normalized_mac.upper() in queue_comment.upper() or
                         mac_address.upper() in queue_comment.upper()):
                         queue_id = queue.get(".id")
@@ -449,32 +410,6 @@ class MikroTikAPI:
                             self.send_command("/queue/simple/remove", {"numbers": queue_id})
                             results["queue_removed"] += 1
                             logger.info(f"Removed queue: {queue_name}")
-
-            # 3b. Remove mangle rules (for MAC-based rate limiting)
-            mangles = self.send_command("/ip/firewall/mangle/print")
-            results["mangle_removed"] = 0
-            if mangles.get("success") and mangles.get("data"):
-                for m in mangles["data"]:
-                    comment = m.get("comment", "")
-                    if comment.startswith(f"RATELIMIT:{username}"):
-                        mangle_id = m.get(".id")
-                        if mangle_id:
-                            self.send_command("/ip/firewall/mangle/remove", {"numbers": mangle_id})
-                            results["mangle_removed"] += 1
-                            logger.info(f"Removed mangle rule: {comment}")
-
-            # 3c. Remove queue tree rules (for MAC-based rate limiting)
-            qtrees = self.send_command("/queue/tree/print")
-            results["queue_tree_removed"] = 0
-            if qtrees.get("success") and qtrees.get("data"):
-                for qt in qtrees["data"]:
-                    qt_name = qt.get("name", "")
-                    if qt_name.startswith(f"qt_{username}"):
-                        qt_id = qt.get(".id")
-                        if qt_id:
-                            self.send_command("/queue/tree/remove", {"numbers": qt_id})
-                            results["queue_tree_removed"] += 1
-                            logger.info(f"Removed queue tree: {qt_name}")
 
             # 4. Remove DHCP lease
             leases = self.send_command("/ip/dhcp-server/lease/print")

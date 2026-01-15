@@ -332,21 +332,13 @@ async def cleanup_expired_users_background():
                                 api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
                                 removed["queues"] += 1
                     
-                    # STEP 6b: Remove mangle rules (for MAC-based rate limiting)
-                    mangles = api.send_command("/ip/firewall/mangle/print")
-                    if mangles.get("success") and mangles.get("data"):
-                        for m in mangles["data"]:
-                            if m.get("comment", "").startswith(f"RATELIMIT:{username}"):
-                                api.send_command("/ip/firewall/mangle/remove", {"numbers": m[".id"]})
-                                logger.info(f"[CRON] Removed mangle rule for {username}")
-                    
-                    # STEP 6c: Remove queue tree rules (for MAC-based rate limiting)
-                    qtrees = api.send_command("/queue/tree/print")
-                    if qtrees.get("success") and qtrees.get("data"):
-                        for qt in qtrees["data"]:
-                            if qt.get("name", "").startswith(f"qt_{username}"):
-                                api.send_command("/queue/tree/remove", {"numbers": qt[".id"]})
-                                logger.info(f"[CRON] Removed queue tree {qt.get('name')} for {username}")
+                    # STEP 6b: Remove plan queue (simple queue for rate limiting)
+                    plan_queues = api.send_command("/queue/simple/print")
+                    if plan_queues.get("success") and plan_queues.get("data"):
+                        for pq in plan_queues["data"]:
+                            if pq.get("name") == f"plan_{username}" or f"MAC:{customer.mac_address}" in pq.get("comment", ""):
+                                api.send_command("/queue/simple/remove", {"numbers": pq[".id"]})
+                                logger.info(f"[CRON] Removed plan queue for {username}")
                     
                     # STEP 7: Remove DHCP lease (forces client to re-request IP)
                     leases = api.send_command("/ip/dhcp-server/lease/print")
@@ -382,6 +374,98 @@ async def cleanup_expired_users_background():
     finally:
         cleanup_running = False
 
+
+# Background sync function for active user queues (runs every 60 seconds)
+async def sync_active_user_queues():
+    """
+    Sync queues for active customers - ensures rate limits are applied even if IP changed.
+    """
+    try:
+        async with AsyncSession(async_engine) as db:
+            now = datetime.utcnow()
+            
+            # Query active customers with MAC addresses
+            stmt = select(Customer).where(
+                Customer.status == CustomerStatus.ACTIVE,
+                Customer.mac_address.isnot(None),
+                Customer.expiry > now
+            ).options(selectinload(Customer.plan))
+            
+            result = await db.execute(stmt)
+            active_customers = result.scalars().all()
+            
+            if not active_customers:
+                return
+            
+            # Connect to MikroTik
+            api = MikroTikAPI(
+                settings.MIKROTIK_HOST,
+                settings.MIKROTIK_USERNAME,
+                settings.MIKROTIK_PASSWORD,
+                settings.MIKROTIK_PORT
+            )
+            
+            if not api.connect():
+                return
+            
+            synced = 0
+            for customer in active_customers:
+                if not customer.plan or not customer.mac_address:
+                    continue
+                
+                try:
+                    normalized_mac = normalize_mac_address(customer.mac_address)
+                    username = normalized_mac.replace(":", "")
+                    rate_limit = api._parse_speed_to_mikrotik(customer.plan.speed)
+                    
+                    # Get current IP
+                    client_ip = api.get_client_ip_by_mac(normalized_mac)
+                    if not client_ip:
+                        continue
+                    
+                    # Check if queue exists and targets correct IP
+                    queues = api.send_command("/queue/simple/print")
+                    queue_exists = False
+                    queue_correct = False
+                    
+                    if queues.get("success") and queues.get("data"):
+                        for q in queues["data"]:
+                            if q.get("name") == f"plan_{username}":
+                                queue_exists = True
+                                if client_ip in q.get("target", ""):
+                                    queue_correct = True
+                                else:
+                                    # Update queue with new IP
+                                    api.send_command("/queue/simple/set", {
+                                        "numbers": q[".id"],
+                                        "target": client_ip,
+                                        "max-limit": rate_limit
+                                    })
+                                    logger.info(f"[SYNC] Updated queue for {username} -> {client_ip}")
+                                    synced += 1
+                                break
+                    
+                    # Create queue if doesn't exist
+                    if not queue_exists:
+                        api.send_command("/queue/simple/add", {
+                            "name": f"plan_{username}",
+                            "target": client_ip,
+                            "max-limit": rate_limit,
+                            "comment": f"MAC:{customer.mac_address}|Plan rate limit"
+                        })
+                        logger.info(f"[SYNC] Created queue for {username} -> {client_ip}")
+                        synced += 1
+                        
+                except Exception as e:
+                    logger.error(f"[SYNC] Error syncing customer {customer.id}: {e}")
+            
+            api.disconnect()
+            
+            if synced > 0:
+                logger.info(f"[SYNC] Synced {synced} queues")
+                
+    except Exception as e:
+        logger.error(f"[SYNC] Queue sync failed: {e}")
 
 
 # @app.post("/api/lipay/callback")
@@ -771,12 +855,34 @@ async def call_mikrotik_bypass(hotspot_payload: dict):
 
         logger.info(f"MikroTik API Response: {json.dumps(result, indent=2)}")
         
-        # Log success - mangle rules are now fully MAC-based, no retry needed
-        mangle_result = result.get("mangle_result", {})
-        if mangle_result:
-            logger.info(f"Rate limiting configured for {hotspot_payload['mac_address']}: "
-                       f"upload={mangle_result.get('upload', {}).get('success', False)}, "
-                       f"download={mangle_result.get('download', {}).get('success', False)}")
+        # If queue wasn't created (client not connected), retry after delay
+        queue_result = result.get("queue_result", {})
+        if queue_result and queue_result.get("pending"):
+            logger.info(f"Queue pending for {hotspot_payload['mac_address']}, will retry in 5 seconds...")
+            await asyncio.sleep(5)
+            
+            if not api.connected:
+                api.connect()
+            
+            if api.connected:
+                normalized_mac = normalize_mac_address(hotspot_payload["mac_address"])
+                username = normalized_mac.replace(":", "")
+                rate_limit = api._parse_speed_to_mikrotik(hotspot_payload["bandwidth_limit"])
+                
+                # Try to find client IP now
+                client_ip = api.get_client_ip_by_mac(normalized_mac)
+                
+                if client_ip:
+                    # Create simple queue
+                    retry_result = api.send_command("/queue/simple/add", {
+                        "name": f"plan_{username}",
+                        "target": client_ip,
+                        "max-limit": rate_limit,
+                        "comment": f"MAC:{hotspot_payload['mac_address']}|Plan rate limit"
+                    })
+                    logger.info(f"[RETRY] Queue created for {username} -> {client_ip}: {retry_result}")
+                else:
+                    logger.warning(f"[RETRY] Still no IP for {hotspot_payload['mac_address']} - queue will be synced later")
         
         api.disconnect()
     except Exception as e:
@@ -3917,8 +4023,16 @@ async def startup_event():
         replace_existing=True,
         max_instances=1  # Prevents overlapping runs
     )
+    scheduler.add_job(
+        sync_active_user_queues,
+        trigger=IntervalTrigger(seconds=60),  # Run every 60 seconds to sync queues
+        id='sync_user_queues',
+        name='Sync rate limit queues for active users',
+        replace_existing=True,
+        max_instances=1
+    )
     scheduler.start()
-    logger.info("🔄 Background scheduler started - expired user cleanup runs every 30 seconds")
+    logger.info("🔄 Background scheduler started - cleanup every 30s, queue sync every 60s")
     
     # Warm up plan cache on startup
     async for db in get_db():
