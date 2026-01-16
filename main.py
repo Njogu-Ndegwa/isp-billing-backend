@@ -3681,6 +3681,7 @@ async def get_dashboard_mikrotik():
         health = api.get_health()
         active_sessions = api.get_active_hotspot_users()
         traffic = api.get_interface_traffic()
+        speed_stats = api.get_queue_speed_stats()
         api.disconnect()
         
         if resources.get("error"):
@@ -3691,6 +3692,8 @@ async def get_dashboard_mikrotik():
         free_mem = res_data.get("free_memory", 0)
         total_hdd = res_data.get("total_hdd_space", 1)
         free_hdd = res_data.get("free_hdd_space", 0)
+        
+        speed_data = speed_stats.get("data", {})
         
         return {
             "system": {
@@ -3720,6 +3723,14 @@ async def get_dashboard_mikrotik():
             "activeSessions": active_sessions.get("data", []),
             "activeSessionCount": len(active_sessions.get("data", [])),
             "interfaces": traffic.get("data", []),
+            "speedStats": {
+                "totalUploadMbps": speed_data.get("total_upload_mbps", 0),
+                "totalDownloadMbps": speed_data.get("total_download_mbps", 0),
+                "avgUploadMbps": speed_data.get("avg_upload_mbps", 0),
+                "avgDownloadMbps": speed_data.get("avg_download_mbps", 0),
+                "activeQueues": speed_data.get("active_queues", 0),
+                "totalQueues": speed_data.get("total_queues", 0)
+            },
             "generatedAt": datetime.utcnow().isoformat()
         }
     except HTTPException:

@@ -649,3 +649,91 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error getting IP for MAC {mac_address}: {e}")
             return None
+
+    def _parse_rate_to_bps(self, rate_str: str) -> int:
+        """Parse MikroTik rate string (e.g., '1.5M', '512k', '100') to bits per second"""
+        if not rate_str:
+            return 0
+        rate_str = rate_str.strip().upper()
+        match = re.match(r'^(\d+(?:\.\d+)?)\s*([KMG])?(?:BPS)?$', rate_str)
+        if match:
+            value = float(match.group(1))
+            unit = match.group(2)
+            if unit == 'K':
+                return int(value * 1000)
+            elif unit == 'M':
+                return int(value * 1000000)
+            elif unit == 'G':
+                return int(value * 1000000000)
+            return int(value)
+        return 0
+
+    def get_queue_speed_stats(self) -> Dict[str, Any]:
+        """Get simple queue statistics with current rates for speed analytics"""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/queue/simple/print", {"stats": ""})
+            if result.get("success"):
+                queues = []
+                total_download_bps = 0
+                total_upload_bps = 0
+                active_queues = 0
+                
+                for q in result.get("data", []):
+                    # Rate is in format "upload/download" e.g., "1.5M/2.3M"
+                    rate = q.get("rate", "0/0")
+                    rate_parts = rate.split("/")
+                    upload_rate = rate_parts[0] if len(rate_parts) > 0 else "0"
+                    download_rate = rate_parts[1] if len(rate_parts) > 1 else "0"
+                    
+                    upload_bps = self._parse_rate_to_bps(upload_rate)
+                    download_bps = self._parse_rate_to_bps(download_rate)
+                    
+                    # Max-limit format: "upload/download"
+                    max_limit = q.get("max-limit", "0/0")
+                    max_parts = max_limit.split("/")
+                    max_upload = self._parse_rate_to_bps(max_parts[0] if len(max_parts) > 0 else "0")
+                    max_download = self._parse_rate_to_bps(max_parts[1] if len(max_parts) > 1 else "0")
+                    
+                    queue_data = {
+                        "name": q.get("name", ""),
+                        "target": q.get("target", ""),
+                        "upload_rate_bps": upload_bps,
+                        "download_rate_bps": download_bps,
+                        "max_upload_bps": max_upload,
+                        "max_download_bps": max_download,
+                        "bytes_in": int(q.get("bytes", "0/0").split("/")[0] or 0),
+                        "bytes_out": int(q.get("bytes", "0/0").split("/")[1] if "/" in q.get("bytes", "0") else 0),
+                        "disabled": q.get("disabled") == "true"
+                    }
+                    queues.append(queue_data)
+                    
+                    if not queue_data["disabled"] and (upload_bps > 0 or download_bps > 0):
+                        total_upload_bps += upload_bps
+                        total_download_bps += download_bps
+                        active_queues += 1
+                
+                avg_upload = total_upload_bps / active_queues if active_queues > 0 else 0
+                avg_download = total_download_bps / active_queues if active_queues > 0 else 0
+                
+                return {
+                    "success": True,
+                    "data": {
+                        "queues": queues,
+                        "total_queues": len(queues),
+                        "active_queues": active_queues,
+                        "total_upload_bps": total_upload_bps,
+                        "total_download_bps": total_download_bps,
+                        "avg_upload_bps": round(avg_upload, 2),
+                        "avg_download_bps": round(avg_download, 2),
+                        "total_upload_mbps": round(total_upload_bps / 1000000, 2),
+                        "total_download_mbps": round(total_download_bps / 1000000, 2),
+                        "avg_upload_mbps": round(avg_upload / 1000000, 2),
+                        "avg_download_mbps": round(avg_download / 1000000, 2)
+                    }
+                }
+            return {"error": "Failed to get queue stats"}
+        except Exception as e:
+            logger.error(f"Error getting queue speed stats: {e}")
+            return {"error": str(e)}
