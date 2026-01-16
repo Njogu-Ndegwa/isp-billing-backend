@@ -45,6 +45,34 @@ cleanup_running = False
 _mikrotik_cache = {"data": None, "timestamp": None}
 _mikrotik_cache_ttl = 30  # seconds
 
+
+def _fetch_mikrotik_data_sync():
+    """Synchronous MikroTik fetch - runs in thread pool to not block event loop"""
+    api = MikroTikAPI(
+        settings.MIKROTIK_HOST,
+        settings.MIKROTIK_USERNAME,
+        settings.MIKROTIK_PASSWORD,
+        settings.MIKROTIK_PORT,
+        timeout=20
+    )
+    if not api.connect():
+        return None
+    
+    resources = api.get_system_resources()
+    health = api.get_health()
+    active_sessions = api.get_active_hotspot_users()
+    traffic = api.get_interface_traffic()
+    speed_stats = api.get_queue_speed_stats()
+    api.disconnect()
+    
+    return {
+        "resources": resources,
+        "health": health,
+        "active_sessions": active_sessions,
+        "traffic": traffic,
+        "speed_stats": speed_stats
+    }
+
 async def get_router_by_id(
     db: AsyncSession,
     router_id: int,
@@ -3660,7 +3688,7 @@ async def get_mikrotik_health():
 
 @app.get("/api/dashboard/mikrotik")
 async def get_dashboard_mikrotik():
-    """Get all MikroTik data for dashboard (system, health, sessions, traffic). Cached for 30s."""
+    """Get all MikroTik data for dashboard. Cached 30s, runs in thread to not block."""
     global _mikrotik_cache
     
     # Return cached data if fresh
@@ -3670,26 +3698,15 @@ async def get_dashboard_mikrotik():
             return _mikrotik_cache["data"]
     
     try:
-        api = MikroTikAPI(
-            settings.MIKROTIK_HOST,
-            settings.MIKROTIK_USERNAME,
-            settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT,
-            timeout=30  # Increased for WireGuard latency
-        )
-        if not api.connect():
-            # Return stale cache if available
+        # Run in thread pool to not block async event loop
+        raw = await asyncio.to_thread(_fetch_mikrotik_data_sync)
+        
+        if not raw:
             if _mikrotik_cache["data"]:
                 return _mikrotik_cache["data"]
             raise HTTPException(status_code=503, detail="Failed to connect to MikroTik router")
         
-        resources = api.get_system_resources()
-        health = api.get_health()
-        active_sessions = api.get_active_hotspot_users()
-        traffic = api.get_interface_traffic()
-        speed_stats = api.get_queue_speed_stats()
-        api.disconnect()
-        
+        resources = raw["resources"]
         if resources.get("error"):
             if _mikrotik_cache["data"]:
                 return _mikrotik_cache["data"]
@@ -3701,7 +3718,7 @@ async def get_dashboard_mikrotik():
         total_hdd = res_data.get("total_hdd_space", 1)
         free_hdd = res_data.get("free_hdd_space", 0)
         
-        speed_data = speed_stats.get("data", {})
+        speed_data = raw["speed_stats"].get("data", {})
         
         result = {
             "system": {
@@ -3727,10 +3744,10 @@ async def get_dashboard_mikrotik():
                 "usedBytes": total_hdd - free_hdd,
                 "usedPercent": round(((total_hdd - free_hdd) / total_hdd) * 100, 1) if total_hdd > 0 else 0
             },
-            "healthSensors": health.get("data", {}),
-            "activeSessions": active_sessions.get("data", []),
-            "activeSessionCount": len(active_sessions.get("data", [])),
-            "interfaces": traffic.get("data", []),
+            "healthSensors": raw["health"].get("data", {}),
+            "activeSessions": raw["active_sessions"].get("data", []),
+            "activeSessionCount": len(raw["active_sessions"].get("data", [])),
+            "interfaces": raw["traffic"].get("data", []),
             "speedStats": {
                 "totalUploadMbps": speed_data.get("total_upload_mbps", 0),
                 "totalDownloadMbps": speed_data.get("total_download_mbps", 0),
@@ -4074,24 +4091,35 @@ def _parse_speed_value(speed_str: str) -> float:
     except ValueError:
         return 0.0
 
+def _fetch_bandwidth_data_sync():
+    """Sync helper for bandwidth collection - runs in thread"""
+    api = MikroTikAPI(
+        settings.MIKROTIK_HOST,
+        settings.MIKROTIK_USERNAME,
+        settings.MIKROTIK_PASSWORD,
+        settings.MIKROTIK_PORT,
+        timeout=15
+    )
+    if not api.connect():
+        return None
+    active_sessions = api.get_active_hotspot_users()
+    traffic = api.get_interface_traffic()
+    speed_stats = api.get_queue_speed_stats()
+    api.disconnect()
+    return {"active_sessions": active_sessions, "traffic": traffic, "speed_stats": speed_stats}
+
+
 async def collect_bandwidth_snapshot():
     """Collect bandwidth stats using interface counters for accurate averaging"""
     try:
-        api = MikroTikAPI(
-            settings.MIKROTIK_HOST,
-            settings.MIKROTIK_USERNAME,
-            settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT,
-            timeout=10
-        )
-        if not api.connect():
+        raw = await asyncio.to_thread(_fetch_bandwidth_data_sync)
+        if not raw:
             logger.warning("Failed to connect to MikroTik for bandwidth snapshot")
             return
         
-        active_sessions = api.get_active_hotspot_users()
-        traffic = api.get_interface_traffic()
-        speed_stats = api.get_queue_speed_stats()
-        api.disconnect()
+        active_sessions = raw["active_sessions"]
+        traffic = raw["traffic"]
+        speed_stats = raw["speed_stats"]
         
         # Sum traffic from bridge interface (main LAN) - most accurate for user traffic
         total_rx = 0
