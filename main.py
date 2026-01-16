@@ -41,6 +41,10 @@ app.add_middleware(
 scheduler = AsyncIOScheduler()
 cleanup_running = False
 
+# MikroTik dashboard cache (avoid hammering the router)
+_mikrotik_cache = {"data": None, "timestamp": None}
+_mikrotik_cache_ttl = 30  # seconds
+
 async def get_router_by_id(
     db: AsyncSession,
     router_id: int,
@@ -3656,25 +3660,27 @@ async def get_mikrotik_health():
 
 @app.get("/api/dashboard/mikrotik")
 async def get_dashboard_mikrotik():
-    """Get all MikroTik data for dashboard (system, health, sessions, traffic)."""
+    """Get all MikroTik data for dashboard (system, health, sessions, traffic). Cached for 30s."""
+    global _mikrotik_cache
+    
+    # Return cached data if fresh
+    if _mikrotik_cache["data"] and _mikrotik_cache["timestamp"]:
+        age = (datetime.utcnow() - _mikrotik_cache["timestamp"]).total_seconds()
+        if age < _mikrotik_cache_ttl:
+            return _mikrotik_cache["data"]
+    
     try:
         api = MikroTikAPI(
             settings.MIKROTIK_HOST,
             settings.MIKROTIK_USERNAME,
             settings.MIKROTIK_PASSWORD,
             settings.MIKROTIK_PORT,
-            timeout=15
+            timeout=30  # Increased for WireGuard latency
         )
-        # Retry connection up to 3 times for busy routers
-        connected = False
-        for attempt in range(3):
-            if api.connect():
-                connected = True
-                break
-            logger.warning(f"MikroTik connection attempt {attempt + 1}/3 failed, retrying...")
-            await asyncio.sleep(1)
-        
-        if not connected:
+        if not api.connect():
+            # Return stale cache if available
+            if _mikrotik_cache["data"]:
+                return _mikrotik_cache["data"]
             raise HTTPException(status_code=503, detail="Failed to connect to MikroTik router")
         
         resources = api.get_system_resources()
@@ -3685,6 +3691,8 @@ async def get_dashboard_mikrotik():
         api.disconnect()
         
         if resources.get("error"):
+            if _mikrotik_cache["data"]:
+                return _mikrotik_cache["data"]
             raise HTTPException(status_code=500, detail=resources["error"])
         
         res_data = resources.get("data", {})
@@ -3695,7 +3703,7 @@ async def get_dashboard_mikrotik():
         
         speed_data = speed_stats.get("data", {})
         
-        return {
+        result = {
             "system": {
                 "uptime": res_data.get("uptime", ""),
                 "version": res_data.get("version", ""),
@@ -3733,6 +3741,12 @@ async def get_dashboard_mikrotik():
             },
             "generatedAt": datetime.utcnow().isoformat()
         }
+        
+        # Update cache
+        _mikrotik_cache["data"] = result
+        _mikrotik_cache["timestamp"] = datetime.utcnow()
+        
+        return result
     except HTTPException:
         raise
     except Exception as e:
