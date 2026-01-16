@@ -324,11 +324,10 @@ class MikroTikAPI:
                 client_ip = self.get_client_ip_by_mac(normalized)
                 
                 if client_ip:
-                    # Create simple queue targeting client IP on bridge interface
+                    # Create simple queue targeting client IP (no interface = matches all)
                     queue_result = self.send_command("/queue/simple/add", {
                         "name": f"plan_{username}",
                         "target": f"{client_ip}/32",
-                        "interface": "bridge",
                         "max-limit": rate_limit,
                         "comment": f"MAC:{mac_address}|Plan rate limit"
                     })
