@@ -174,3 +174,15 @@ class MpesaTransaction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+
+class BandwidthSnapshot(Base):
+    __tablename__ = "bandwidth_snapshots"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
+    total_upload_bps = Column(BigInteger, default=0)
+    total_download_bps = Column(BigInteger, default=0)
+    avg_upload_bps = Column(Float, default=0)
+    avg_download_bps = Column(Float, default=0)
+    active_queues = Column(Integer, default=0)
+    active_sessions = Column(Integer, default=0)
+    recorded_at = Column(DateTime, default=datetime.utcnow, index=True)

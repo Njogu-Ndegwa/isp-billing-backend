@@ -1,9 +1,9 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from app.db.database import get_db, async_engine
-from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus, User, CustomerPayment
+from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus, User, CustomerPayment, BandwidthSnapshot
 from app.services.auth import verify_token, get_current_user
 from app.services.billing import make_payment
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
@@ -3798,6 +3798,44 @@ async def get_mikrotik_active_sessions():
         logger.error(f"Error fetching active sessions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/mikrotik/bandwidth-history")
+async def get_bandwidth_history(
+    hours: int = 24,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get historical bandwidth data for graphing. Default last 24 hours."""
+    try:
+        since = datetime.utcnow() - timedelta(hours=hours)
+        result = await db.execute(
+            select(BandwidthSnapshot)
+            .where(BandwidthSnapshot.recorded_at >= since)
+            .order_by(BandwidthSnapshot.recorded_at.asc())
+        )
+        snapshots = result.scalars().all()
+        
+        data = []
+        for s in snapshots:
+            data.append({
+                "timestamp": s.recorded_at.isoformat(),
+                "totalUploadMbps": round(s.total_upload_bps / 1000000, 2),
+                "totalDownloadMbps": round(s.total_download_bps / 1000000, 2),
+                "avgUploadMbps": round(s.avg_upload_bps / 1000000, 2),
+                "avgDownloadMbps": round(s.avg_download_bps / 1000000, 2),
+                "activeQueues": s.active_queues,
+                "activeSessions": s.active_sessions
+            })
+        
+        return {
+            "history": data,
+            "count": len(data),
+            "periodHours": hours,
+            "generatedAt": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error fetching bandwidth history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Daily Revenue Metrics Endpoint (for cumulative plotting)
 @app.get("/api/dashboard/daily-revenue")
 async def get_daily_revenue_metrics(
@@ -4022,6 +4060,52 @@ def _parse_speed_value(speed_str: str) -> float:
     except ValueError:
         return 0.0
 
+async def collect_bandwidth_snapshot():
+    """Collect bandwidth stats, store in database, and cleanup old records (keep 1 day only)"""
+    try:
+        api = MikroTikAPI(
+            settings.MIKROTIK_HOST,
+            settings.MIKROTIK_USERNAME,
+            settings.MIKROTIK_PASSWORD,
+            settings.MIKROTIK_PORT,
+            timeout=10
+        )
+        if not api.connect():
+            logger.warning("Failed to connect to MikroTik for bandwidth snapshot")
+            return
+        
+        speed_stats = api.get_queue_speed_stats()
+        active_sessions = api.get_active_hotspot_users()
+        api.disconnect()
+        
+        if speed_stats.get("error"):
+            logger.warning(f"Failed to get speed stats: {speed_stats['error']}")
+            return
+        
+        data = speed_stats.get("data", {})
+        snapshot = BandwidthSnapshot(
+            total_upload_bps=int(data.get("total_upload_bps", 0)),
+            total_download_bps=int(data.get("total_download_bps", 0)),
+            avg_upload_bps=data.get("avg_upload_bps", 0),
+            avg_download_bps=data.get("avg_download_bps", 0),
+            active_queues=data.get("active_queues", 0),
+            active_sessions=len(active_sessions.get("data", [])),
+            recorded_at=datetime.utcnow()
+        )
+        
+        async for db in get_db():
+            db.add(snapshot)
+            # Cleanup: delete records older than 1 day
+            cutoff = datetime.utcnow() - timedelta(days=1)
+            await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
+            await db.commit()
+            break
+        
+        logger.debug(f"📊 Bandwidth snapshot recorded: ↑{data.get('total_upload_mbps', 0)}Mbps ↓{data.get('total_download_mbps', 0)}Mbps")
+    except Exception as e:
+        logger.error(f"Error collecting bandwidth snapshot: {e}")
+
+
 # Startup event - Start background scheduler
 @app.on_event("startup")
 async def startup_event():
@@ -4042,8 +4126,16 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
+    scheduler.add_job(
+        collect_bandwidth_snapshot,
+        trigger=IntervalTrigger(seconds=60),  # Collect every 1 minute
+        id='bandwidth_snapshot',
+        name='Collect bandwidth statistics',
+        replace_existing=True,
+        max_instances=1
+    )
     scheduler.start()
-    logger.info("🔄 Background scheduler started - cleanup every 30s, queue sync every 60s")
+    logger.info("🔄 Background scheduler started - cleanup every 30s, queue sync every 60s, bandwidth every 1min")
     
     # Warm up plan cache on startup
     async for db in get_db():
