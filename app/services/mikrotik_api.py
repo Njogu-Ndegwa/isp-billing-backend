@@ -9,7 +9,7 @@ import json  # Ensure you import json for serializing logs
 
 # Initialize logger
 logger = logging.getLogger("mikrotik_api")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.WARNING)  # Reduce noise, only warnings/errors
 
 # Helper functions to validate and normalize MAC addresses
 def validate_mac_address(mac: str) -> bool:

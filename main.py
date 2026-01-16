@@ -4145,15 +4145,15 @@ async def startup_event():
     """Start the background cleanup scheduler when the app starts"""
     scheduler.add_job(
         cleanup_expired_users_background,
-        trigger=IntervalTrigger(seconds=30),  # Run every 30 seconds for minute-accurate expiry
+        trigger=IntervalTrigger(seconds=60),  # Run every 60 seconds
         id='cleanup_expired_users',
         name='Remove expired hotspot users from MikroTik',
         replace_existing=True,
-        max_instances=1  # Prevents overlapping runs
+        max_instances=1
     )
     scheduler.add_job(
         sync_active_user_queues,
-        trigger=IntervalTrigger(seconds=60),  # Run every 60 seconds to sync queues
+        trigger=IntervalTrigger(seconds=120),  # Run every 2 minutes
         id='sync_user_queues',
         name='Sync rate limit queues for active users',
         replace_existing=True,
@@ -4161,14 +4161,14 @@ async def startup_event():
     )
     scheduler.add_job(
         collect_bandwidth_snapshot,
-        trigger=IntervalTrigger(seconds=60),  # Collect every 1 minute
+        trigger=IntervalTrigger(seconds=120),  # Collect every 2 minutes
         id='bandwidth_snapshot',
         name='Collect bandwidth statistics',
         replace_existing=True,
         max_instances=1
     )
     scheduler.start()
-    logger.info("🔄 Background scheduler started - cleanup every 30s, queue sync every 60s, bandwidth every 1min")
+    logger.info("🔄 Background scheduler started - cleanup every 60s, queue sync every 2min, bandwidth every 2min")
     
     # Warm up plan cache on startup
     async for db in get_db():
