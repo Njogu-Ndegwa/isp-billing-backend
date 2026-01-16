@@ -73,6 +73,23 @@ def _fetch_mikrotik_data_sync():
         "speed_stats": speed_stats
     }
 
+
+def _fetch_top_users_sync():
+    """Get queue data for top users analysis"""
+    api = MikroTikAPI(
+        settings.MIKROTIK_HOST,
+        settings.MIKROTIK_USERNAME,
+        settings.MIKROTIK_PASSWORD,
+        settings.MIKROTIK_PORT,
+        timeout=20
+    )
+    if not api.connect():
+        return None
+    
+    queues = api.send_command("/queue/simple/print")
+    api.disconnect()
+    return queues
+
 async def get_router_by_id(
     db: AsyncSession,
     router_id: int,
@@ -3865,6 +3882,80 @@ async def get_bandwidth_history(
         }
     except Exception as e:
         logger.error(f"Error fetching bandwidth history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/mikrotik/top-users")
+async def get_top_bandwidth_users(limit: int = 10, db: AsyncSession = Depends(get_db)):
+    """
+    Get top bandwidth users sorted by total download.
+    Returns users with highest data consumption for monitoring abuse.
+    """
+    try:
+        queues = await asyncio.to_thread(_fetch_top_users_sync)
+        
+        if not queues or queues.get("error"):
+            raise HTTPException(status_code=503, detail="Failed to fetch queue data from MikroTik")
+        
+        users = []
+        for q in queues.get("data", []):
+            # bytes format: "upload/download"
+            bytes_str = q.get("bytes", "0/0")
+            bytes_parts = bytes_str.split("/")
+            upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 else 0
+            download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 else 0
+            total_bytes = upload_bytes + download_bytes
+            
+            # Extract MAC from comment if available
+            comment = q.get("comment", "")
+            mac = ""
+            if "MAC:" in comment:
+                mac = comment.split("MAC:")[1].split("|")[0].strip()
+            
+            # Get current rate
+            rate_str = q.get("rate", "0/0")
+            rate_parts = rate_str.split("/")
+            
+            users.append({
+                "name": q.get("name", ""),
+                "target": q.get("target", ""),
+                "mac": mac,
+                "uploadBytes": upload_bytes,
+                "downloadBytes": download_bytes,
+                "totalBytes": total_bytes,
+                "uploadMB": round(upload_bytes / (1024 * 1024), 2),
+                "downloadMB": round(download_bytes / (1024 * 1024), 2),
+                "totalMB": round(total_bytes / (1024 * 1024), 2),
+                "downloadGB": round(download_bytes / (1024 * 1024 * 1024), 2),
+                "maxLimit": q.get("max-limit", ""),
+                "currentRate": rate_str,
+                "disabled": q.get("disabled") == "true"
+            })
+        
+        # Sort by download bytes descending
+        users.sort(key=lambda x: x["downloadBytes"], reverse=True)
+        
+        # Lookup customer names from DB
+        for user in users[:limit]:
+            if user["mac"]:
+                result = await db.execute(
+                    select(Customer).where(Customer.mac_address.ilike(f"%{user['mac']}%"))
+                )
+                customer = result.scalar_one_or_none()
+                if customer:
+                    user["customerName"] = customer.name
+                    user["customerPhone"] = customer.phone
+                    user["customerId"] = customer.id
+        
+        return {
+            "topUsers": users[:limit],
+            "totalQueues": len(users),
+            "generatedAt": datetime.utcnow().isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching top users: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Daily Revenue Metrics Endpoint (for cumulative plotting)
