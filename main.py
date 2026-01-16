@@ -4061,7 +4061,7 @@ def _parse_speed_value(speed_str: str) -> float:
         return 0.0
 
 async def collect_bandwidth_snapshot():
-    """Collect bandwidth stats, store in database, and cleanup old records (keep 1 day only)"""
+    """Collect bandwidth stats using interface counters for accurate averaging"""
     try:
         api = MikroTikAPI(
             settings.MIKROTIK_HOST,
@@ -4074,34 +4074,67 @@ async def collect_bandwidth_snapshot():
             logger.warning("Failed to connect to MikroTik for bandwidth snapshot")
             return
         
-        speed_stats = api.get_queue_speed_stats()
         active_sessions = api.get_active_hotspot_users()
+        traffic = api.get_interface_traffic()
+        speed_stats = api.get_queue_speed_stats()
         api.disconnect()
         
-        if speed_stats.get("error"):
-            logger.warning(f"Failed to get speed stats: {speed_stats['error']}")
-            return
+        # Sum traffic from bridge interface (main LAN) - most accurate for user traffic
+        total_rx = 0
+        total_tx = 0
+        for iface in traffic.get("data", []):
+            # Use bridge interface for aggregate user traffic
+            if iface.get("name") == "bridge" and iface.get("running"):
+                total_rx = iface.get("rx_byte", 0)
+                total_tx = iface.get("tx_byte", 0)
+                break
         
-        data = speed_stats.get("data", {})
-        snapshot = BandwidthSnapshot(
-            total_upload_bps=int(data.get("total_upload_bps", 0)),
-            total_download_bps=int(data.get("total_download_bps", 0)),
-            avg_upload_bps=data.get("avg_upload_bps", 0),
-            avg_download_bps=data.get("avg_download_bps", 0),
-            active_queues=data.get("active_queues", 0),
-            active_sessions=len(active_sessions.get("data", [])),
-            recorded_at=datetime.utcnow()
-        )
+        now = datetime.utcnow()
+        speed_data = speed_stats.get("data", {})
         
         async for db in get_db():
+            # Get previous snapshot to calculate rate
+            prev_result = await db.execute(
+                select(BandwidthSnapshot)
+                .order_by(BandwidthSnapshot.recorded_at.desc())
+                .limit(1)
+            )
+            prev = prev_result.scalar_one_or_none()
+            
+            # Calculate actual average bps from byte counter difference
+            avg_download_bps = 0
+            avg_upload_bps = 0
+            if prev and prev.interface_rx_bytes > 0:
+                time_diff = (now - prev.recorded_at).total_seconds()
+                if time_diff > 0:
+                    # rx = download (from user perspective on bridge), tx = upload
+                    byte_diff_rx = total_rx - prev.interface_rx_bytes
+                    byte_diff_tx = total_tx - prev.interface_tx_bytes
+                    # Handle counter reset
+                    if byte_diff_rx >= 0 and byte_diff_tx >= 0:
+                        avg_download_bps = (byte_diff_rx * 8) / time_diff  # bytes to bits
+                        avg_upload_bps = (byte_diff_tx * 8) / time_diff
+            
+            snapshot = BandwidthSnapshot(
+                total_upload_bps=int(speed_data.get("total_upload_bps", 0)),
+                total_download_bps=int(speed_data.get("total_download_bps", 0)),
+                avg_upload_bps=avg_upload_bps,
+                avg_download_bps=avg_download_bps,
+                active_queues=speed_data.get("active_queues", 0),
+                active_sessions=len(active_sessions.get("data", [])),
+                interface_rx_bytes=total_rx,
+                interface_tx_bytes=total_tx,
+                recorded_at=now
+            )
+            
             db.add(snapshot)
             # Cleanup: delete records older than 1 day
-            cutoff = datetime.utcnow() - timedelta(days=1)
+            cutoff = now - timedelta(days=1)
             await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
             await db.commit()
             break
         
-        logger.debug(f"📊 Bandwidth snapshot recorded: ↑{data.get('total_upload_mbps', 0)}Mbps ↓{data.get('total_download_mbps', 0)}Mbps")
+        logger.debug(f"📊 Bandwidth: ↑{avg_upload_bps/1000000:.2f}Mbps ↓{avg_download_bps/1000000:.2f}Mbps")
     except Exception as e:
         logger.error(f"Error collecting bandwidth snapshot: {e}")
 

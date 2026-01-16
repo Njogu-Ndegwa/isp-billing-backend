@@ -185,4 +185,7 @@ class BandwidthSnapshot(Base):
     avg_download_bps = Column(Float, default=0)
     active_queues = Column(Integer, default=0)
     active_sessions = Column(Integer, default=0)
+    # Interface-based counters for accurate averaging
+    interface_rx_bytes = Column(BigInteger, default=0)
+    interface_tx_bytes = Column(BigInteger, default=0)
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
