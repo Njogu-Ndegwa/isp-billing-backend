@@ -170,14 +170,15 @@ class MikroTikAPI:
     def _parse_speed_to_mikrotik(self, speed: str) -> str:
         """
         Convert speed string (e.g., '2Mbps', '5 Mbps', '512Kbps') to MikroTik format (e.g., '2M/2M').
-        Returns symmetric upload/download limit.
+        Returns symmetric upload/download limit (uses download speed for both).
         """
         if not speed:
             return ""
         
-        # Already in MikroTik format (contains /)
+        # If already in MikroTik format (contains /), make symmetric using download speed
         if "/" in speed:
-            return speed
+            download = speed.split("/")[0].strip()
+            return f"{download}/{download}"
         
         # Clean and parse the speed string
         speed_clean = speed.upper().replace(" ", "")
