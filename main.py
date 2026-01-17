@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from app.db.database import get_db, async_engine
-from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus, User, CustomerPayment, BandwidthSnapshot
+from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus, User, CustomerPayment, BandwidthSnapshot, UserBandwidthUsage, Ad, AdClick, AdImpression, AdClickType, Advertiser, AdBadgeType
 from app.services.auth import verify_token, get_current_user
 from app.services.billing import make_payment
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
@@ -3889,71 +3889,60 @@ async def get_bandwidth_history(
 async def get_top_bandwidth_users(limit: int = 10, db: AsyncSession = Depends(get_db)):
     """
     Get top bandwidth users sorted by total download.
-    Returns users with highest data consumption for monitoring abuse.
+    Reads from cached DB data (updated every 2 min by background job).
     """
     try:
-        queues = await asyncio.to_thread(_fetch_top_users_sync)
-        
-        if not queues or queues.get("error"):
-            raise HTTPException(status_code=503, detail="Failed to fetch queue data from MikroTik")
+        # Read from database instead of hitting MikroTik
+        result = await db.execute(
+            select(UserBandwidthUsage)
+            .order_by(UserBandwidthUsage.download_bytes.desc())
+            .limit(limit)
+        )
+        usage_records = result.scalars().all()
         
         users = []
-        for q in queues.get("data", []):
-            # bytes format: "upload/download"
-            bytes_str = q.get("bytes", "0/0")
-            bytes_parts = bytes_str.split("/")
-            upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 else 0
-            download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 else 0
-            total_bytes = upload_bytes + download_bytes
+        for u in usage_records:
+            total_bytes = u.upload_bytes + u.download_bytes
             
-            # Extract MAC from comment if available
-            comment = q.get("comment", "")
-            mac = ""
-            if "MAC:" in comment:
-                mac = comment.split("MAC:")[1].split("|")[0].strip()
-            
-            # Get current rate
-            rate_str = q.get("rate", "0/0")
-            rate_parts = rate_str.split("/")
+            # Get customer info
+            customer_name = None
+            customer_phone = None
+            if u.customer_id:
+                cust_result = await db.execute(
+                    select(Customer).where(Customer.id == u.customer_id)
+                )
+                customer = cust_result.scalar_one_or_none()
+                if customer:
+                    customer_name = customer.name
+                    customer_phone = customer.phone
             
             users.append({
-                "name": q.get("name", ""),
-                "target": q.get("target", ""),
-                "mac": mac,
-                "uploadBytes": upload_bytes,
-                "downloadBytes": download_bytes,
+                "mac": u.mac_address,
+                "target": u.target_ip,
+                "queueName": u.queue_name,
+                "uploadBytes": u.upload_bytes,
+                "downloadBytes": u.download_bytes,
                 "totalBytes": total_bytes,
-                "uploadMB": round(upload_bytes / (1024 * 1024), 2),
-                "downloadMB": round(download_bytes / (1024 * 1024), 2),
+                "uploadMB": round(u.upload_bytes / (1024 * 1024), 2),
+                "downloadMB": round(u.download_bytes / (1024 * 1024), 2),
                 "totalMB": round(total_bytes / (1024 * 1024), 2),
-                "downloadGB": round(download_bytes / (1024 * 1024 * 1024), 2),
-                "maxLimit": q.get("max-limit", ""),
-                "currentRate": rate_str,
-                "disabled": q.get("disabled") == "true"
+                "downloadGB": round(u.download_bytes / (1024 * 1024 * 1024), 2),
+                "maxLimit": u.max_limit,
+                "lastUpdated": u.last_updated.isoformat() if u.last_updated else None,
+                "customerId": u.customer_id,
+                "customerName": customer_name,
+                "customerPhone": customer_phone
             })
         
-        # Sort by download bytes descending
-        users.sort(key=lambda x: x["downloadBytes"], reverse=True)
-        
-        # Lookup customer names from DB
-        for user in users[:limit]:
-            if user["mac"]:
-                result = await db.execute(
-                    select(Customer).where(Customer.mac_address.ilike(f"%{user['mac']}%"))
-                )
-                customer = result.scalar_one_or_none()
-                if customer:
-                    user["customerName"] = customer.name
-                    user["customerPhone"] = customer.phone
-                    user["customerId"] = customer.id
+        # Get total count
+        count_result = await db.execute(select(UserBandwidthUsage))
+        total_count = len(count_result.scalars().all())
         
         return {
-            "topUsers": users[:limit],
-            "totalQueues": len(users),
+            "topUsers": users,
+            "totalTracked": total_count,
             "generatedAt": datetime.utcnow().isoformat()
         }
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error fetching top users: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -4196,8 +4185,9 @@ def _fetch_bandwidth_data_sync():
     active_sessions = api.get_active_hotspot_users()
     traffic = api.get_interface_traffic()
     speed_stats = api.get_queue_speed_stats()
+    queues = api.send_command("/queue/simple/print")
     api.disconnect()
-    return {"active_sessions": active_sessions, "traffic": traffic, "speed_stats": speed_stats}
+    return {"active_sessions": active_sessions, "traffic": traffic, "speed_stats": speed_stats, "queues": queues}
 
 
 async def collect_bandwidth_snapshot():
@@ -4264,12 +4254,411 @@ async def collect_bandwidth_snapshot():
             # Cleanup: delete records older than 1 day
             cutoff = now - timedelta(days=1)
             await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
+            
+            # Update user bandwidth usage from queues
+            queues = raw.get("queues", {})
+            if queues.get("success") and queues.get("data"):
+                for q in queues["data"]:
+                    # Extract MAC from comment
+                    comment = q.get("comment", "")
+                    mac = ""
+                    if "MAC:" in comment:
+                        mac = comment.split("MAC:")[1].split("|")[0].strip()
+                    
+                    if not mac:
+                        continue
+                    
+                    # Parse bytes
+                    bytes_str = q.get("bytes", "0/0")
+                    bytes_parts = bytes_str.split("/")
+                    upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 and bytes_parts[0].isdigit() else 0
+                    download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 and bytes_parts[1].isdigit() else 0
+                    
+                    # Find customer by MAC
+                    cust_result = await db.execute(
+                        select(Customer).where(Customer.mac_address.ilike(f"%{mac}%"))
+                    )
+                    customer = cust_result.scalar_one_or_none()
+                    
+                    # Upsert usage record
+                    existing = await db.execute(
+                        select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == mac)
+                    )
+                    usage = existing.scalar_one_or_none()
+                    
+                    if usage:
+                        usage.upload_bytes = upload_bytes
+                        usage.download_bytes = download_bytes
+                        usage.target_ip = q.get("target", "")
+                        usage.max_limit = q.get("max-limit", "")
+                        usage.last_updated = now
+                        if customer:
+                            usage.customer_id = customer.id
+                    else:
+                        usage = UserBandwidthUsage(
+                            mac_address=mac,
+                            customer_id=customer.id if customer else None,
+                            queue_name=q.get("name", ""),
+                            target_ip=q.get("target", ""),
+                            upload_bytes=upload_bytes,
+                            download_bytes=download_bytes,
+                            max_limit=q.get("max-limit", ""),
+                            last_updated=now
+                        )
+                        db.add(usage)
+            
             await db.commit()
             break
         
         logger.debug(f"📊 Bandwidth: ↑{avg_upload_bps/1000000:.2f}Mbps ↓{avg_download_bps/1000000:.2f}Mbps")
     except Exception as e:
         logger.error(f"Error collecting bandwidth snapshot: {e}")
+
+
+# ========================================
+# ADS ENDPOINTS
+# ========================================
+
+class AdClickRequest(BaseModel):
+    ad_id: int
+    click_type: str  # "view_details", "call", "whatsapp"
+    device_id: Optional[str] = None
+    user_agent: Optional[str] = None
+    timestamp: Optional[str] = None
+    session_id: Optional[str] = None
+    referrer: Optional[str] = None
+    mac_address: Optional[str] = None
+
+class AdImpressionRequest(BaseModel):
+    ad_ids: list[int]
+    device_id: Optional[str] = None
+    timestamp: Optional[str] = None
+    session_id: Optional[str] = None
+    placement: Optional[str] = None
+
+class AdvertiserCreateRequest(BaseModel):
+    name: str
+    business_name: Optional[str] = None
+    phone_number: str
+    email: Optional[str] = None
+
+class AdCreateRequest(BaseModel):
+    advertiser_id: int
+    title: str
+    description: Optional[str] = None
+    image_url: str
+    seller_name: str
+    seller_location: Optional[str] = None
+    phone_number: str
+    whatsapp_number: Optional[str] = None
+    price: Optional[str] = None
+    price_value: Optional[float] = None
+    badge_type: Optional[str] = None  # "hot", "new", "sale"
+    badge_text: Optional[str] = None
+    category: Optional[str] = None
+    priority: int = 0
+    expires_at: Optional[str] = None  # ISO datetime string
+
+
+@app.post("/api/advertisers")
+async def create_advertiser(
+    request: AdvertiserCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """Create a new advertiser (requires auth)."""
+    try:
+        advertiser = Advertiser(
+            name=request.name,
+            business_name=request.business_name,
+            phone_number=request.phone_number,
+            email=request.email
+        )
+        db.add(advertiser)
+        await db.commit()
+        await db.refresh(advertiser)
+        
+        return {
+            "id": advertiser.id,
+            "name": advertiser.name,
+            "business_name": advertiser.business_name,
+            "phone_number": advertiser.phone_number,
+            "email": advertiser.email,
+            "is_active": advertiser.is_active,
+            "created_at": advertiser.created_at.isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error creating advertiser: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create advertiser")
+
+
+@app.get("/api/advertisers")
+async def get_advertisers(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """List all advertisers (requires auth)."""
+    result = await db.execute(select(Advertiser).order_by(Advertiser.created_at.desc()))
+    advertisers = result.scalars().all()
+    return [
+        {
+            "id": a.id,
+            "name": a.name,
+            "business_name": a.business_name,
+            "phone_number": a.phone_number,
+            "email": a.email,
+            "is_active": a.is_active,
+            "created_at": a.created_at.isoformat()
+        }
+        for a in advertisers
+    ]
+
+
+@app.post("/api/ads")
+async def create_ad(
+    request: AdCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """Create a new ad (requires auth)."""
+    try:
+        # Validate advertiser exists
+        adv_result = await db.execute(select(Advertiser).where(Advertiser.id == request.advertiser_id))
+        if not adv_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Advertiser not found")
+        
+        # Parse badge_type
+        badge_type = None
+        if request.badge_type:
+            badge_map = {"hot": AdBadgeType.HOT, "new": AdBadgeType.NEW, "sale": AdBadgeType.SALE}
+            badge_type = badge_map.get(request.badge_type.lower())
+        
+        # Parse expires_at
+        expires_at = None
+        if request.expires_at:
+            expires_at = datetime.fromisoformat(request.expires_at.replace("Z", "+00:00"))
+        
+        ad = Ad(
+            advertiser_id=request.advertiser_id,
+            title=request.title,
+            description=request.description,
+            image_url=request.image_url,
+            seller_name=request.seller_name,
+            seller_location=request.seller_location,
+            phone_number=request.phone_number,
+            whatsapp_number=request.whatsapp_number,
+            price=request.price,
+            price_value=request.price_value,
+            badge_type=badge_type,
+            badge_text=request.badge_text,
+            category=request.category,
+            priority=request.priority,
+            expires_at=expires_at
+        )
+        db.add(ad)
+        await db.commit()
+        await db.refresh(ad)
+        
+        logger.info(f"Ad created: #{ad.id} - {ad.title}")
+        
+        return {
+            "id": ad.id,
+            "title": ad.title,
+            "advertiser_id": ad.advertiser_id,
+            "created_at": ad.created_at.isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating ad: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create ad")
+
+
+@app.get("/api/ads")
+async def get_ads(
+    page: int = 1,
+    per_page: int = 20,
+    category: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Fetch active ads for captive portal display.
+    Returns paginated ads sorted by priority (highest first), then by created_at.
+    """
+    try:
+        now = datetime.utcnow()
+        
+        # Build query for active, non-expired ads
+        query = select(Ad).where(
+            Ad.is_active == True,
+            (Ad.expires_at == None) | (Ad.expires_at > now)
+        )
+        
+        if category:
+            query = query.where(Ad.category == category)
+        
+        # Order by priority (desc) then created_at (desc)
+        query = query.order_by(Ad.priority.desc(), Ad.created_at.desc())
+        
+        # Count total
+        count_query = select(Ad).where(
+            Ad.is_active == True,
+            (Ad.expires_at == None) | (Ad.expires_at > now)
+        )
+        if category:
+            count_query = count_query.where(Ad.category == category)
+        
+        from sqlalchemy import func
+        count_result = await db.execute(select(func.count()).select_from(count_query.subquery()))
+        total = count_result.scalar() or 0
+        
+        # Paginate
+        offset = (page - 1) * per_page
+        query = query.offset(offset).limit(per_page)
+        
+        result = await db.execute(query)
+        ads = result.scalars().all()
+        
+        # Format response
+        ads_data = []
+        for ad in ads:
+            ads_data.append({
+                "id": ad.id,
+                "title": ad.title,
+                "description": ad.description,
+                "image_url": ad.image_url,
+                "seller_name": ad.seller_name,
+                "seller_location": ad.seller_location,
+                "phone_number": ad.phone_number,
+                "whatsapp_number": ad.whatsapp_number or ad.phone_number,
+                "price": ad.price,
+                "price_value": ad.price_value,
+                "badge_type": ad.badge_type.value if ad.badge_type else None,
+                "badge_text": ad.badge_text,
+                "category": ad.category,
+                "is_active": ad.is_active,
+                "priority": ad.priority,
+                "views_count": ad.views_count,
+                "clicks_count": ad.clicks_count,
+                "created_at": ad.created_at.isoformat() if ad.created_at else None,
+                "expires_at": ad.expires_at.isoformat() if ad.expires_at else None,
+                "advertiser_id": ad.advertiser_id
+            })
+        
+        return {
+            "ads": ads_data,
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "total_pages": (total + per_page - 1) // per_page if per_page > 0 else 0
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error fetching ads: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch ads")
+
+
+@app.post("/api/ads/click")
+async def record_ad_click(
+    request: AdClickRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Record when a user clicks/interacts with an ad.
+    click_type: "view_details", "call", "whatsapp"
+    """
+    try:
+        # Validate ad exists
+        ad_result = await db.execute(select(Ad).where(Ad.id == request.ad_id))
+        ad = ad_result.scalar_one_or_none()
+        
+        if not ad:
+            raise HTTPException(status_code=404, detail="Ad not found")
+        
+        # Map click_type string to enum
+        click_type_map = {
+            "view_details": AdClickType.VIEW_DETAILS,
+            "call": AdClickType.CALL,
+            "whatsapp": AdClickType.WHATSAPP
+        }
+        click_type = click_type_map.get(request.click_type.lower())
+        if not click_type:
+            raise HTTPException(status_code=400, detail="Invalid click_type")
+        
+        # Create click record
+        ad_click = AdClick(
+            ad_id=request.ad_id,
+            click_type=click_type,
+            device_id=request.device_id,
+            user_agent=request.user_agent,
+            session_id=request.session_id,
+            referrer=request.referrer,
+            mac_address=request.mac_address
+        )
+        db.add(ad_click)
+        
+        # Increment ad clicks_count
+        ad.clicks_count = (ad.clicks_count or 0) + 1
+        
+        await db.commit()
+        await db.refresh(ad_click)
+        
+        logger.info(f"📊 Ad click recorded: Ad #{request.ad_id}, Type: {request.click_type}")
+        
+        return {
+            "success": True,
+            "click_id": f"click_{ad_click.id}",
+            "message": "Click recorded"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error recording ad click: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record click")
+
+
+@app.post("/api/ads/impression")
+async def record_ad_impression(
+    request: AdImpressionRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Record when ads are displayed to a user.
+    """
+    try:
+        if not request.ad_ids:
+            raise HTTPException(status_code=400, detail="ad_ids cannot be empty")
+        
+        # Create impression record
+        impression = AdImpression(
+            ad_ids=request.ad_ids,
+            device_id=request.device_id,
+            session_id=request.session_id,
+            placement=request.placement
+        )
+        db.add(impression)
+        
+        # Increment views_count for each ad
+        for ad_id in request.ad_ids:
+            ad_result = await db.execute(select(Ad).where(Ad.id == ad_id))
+            ad = ad_result.scalar_one_or_none()
+            if ad:
+                ad.views_count = (ad.views_count or 0) + 1
+        
+        await db.commit()
+        
+        logger.info(f"📊 Ad impression recorded: {len(request.ad_ids)} ads")
+        
+        return {
+            "success": True,
+            "message": f"Impression recorded for {len(request.ad_ids)} ads"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error recording ad impression: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record impression")
 
 
 # Startup event - Start background scheduler

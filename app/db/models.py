@@ -189,3 +189,89 @@ class BandwidthSnapshot(Base):
     interface_rx_bytes = Column(BigInteger, default=0)
     interface_tx_bytes = Column(BigInteger, default=0)
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class UserBandwidthUsage(Base):
+    """Track cumulative bandwidth usage per user for top downloaders"""
+    __tablename__ = "user_bandwidth_usage"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    mac_address = Column(String(50), index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    queue_name = Column(String(100))
+    target_ip = Column(String(50))
+    upload_bytes = Column(BigInteger, default=0)
+    download_bytes = Column(BigInteger, default=0)
+    max_limit = Column(String(50))
+    last_updated = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+# ========================================
+# ADS MODELS
+# ========================================
+
+class AdBadgeType(str, enum.Enum):
+    HOT = "hot"
+    NEW = "new"
+    SALE = "sale"
+
+class AdClickType(str, enum.Enum):
+    VIEW_DETAILS = "view_details"
+    CALL = "call"
+    WHATSAPP = "whatsapp"
+
+class Advertiser(Base):
+    __tablename__ = "advertisers"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    business_name = Column(String(150), nullable=True)
+    phone_number = Column(String(20), nullable=False)
+    email = Column(String(100), nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    ads = relationship("Ad", back_populates="advertiser")
+
+class Ad(Base):
+    __tablename__ = "ads"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    advertiser_id = Column(Integer, ForeignKey("advertisers.id"), nullable=False)
+    title = Column(String(150), nullable=False)
+    description = Column(String(500), nullable=True)
+    image_url = Column(String(500), nullable=False)
+    seller_name = Column(String(100), nullable=False)
+    seller_location = Column(String(200), nullable=True)
+    phone_number = Column(String(20), nullable=False)
+    whatsapp_number = Column(String(20), nullable=True)
+    price = Column(String(50), nullable=True)
+    price_value = Column(Float, nullable=True)
+    badge_type = Column(Enum(AdBadgeType, name="adbadgetype"), nullable=True)
+    badge_text = Column(String(50), nullable=True)
+    category = Column(String(50), nullable=True)
+    is_active = Column(Boolean, default=True, index=True)
+    priority = Column(Integer, default=0, index=True)
+    views_count = Column(Integer, default=0)
+    clicks_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    advertiser = relationship("Advertiser", back_populates="ads")
+
+class AdClick(Base):
+    __tablename__ = "ad_clicks"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ad_id = Column(Integer, ForeignKey("ads.id"), nullable=False, index=True)
+    click_type = Column(Enum(AdClickType, name="adclicktype"), nullable=False)
+    device_id = Column(String(100), nullable=True)
+    user_agent = Column(String(500), nullable=True)
+    session_id = Column(String(100), nullable=True, index=True)
+    referrer = Column(String(100), nullable=True)
+    mac_address = Column(String(50), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    ad = relationship("Ad")
+
+class AdImpression(Base):
+    __tablename__ = "ad_impressions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_id = Column(String(100), nullable=True)
+    session_id = Column(String(100), nullable=True, index=True)
+    placement = Column(String(100), nullable=True)
+    ad_ids = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
