@@ -4363,10 +4363,9 @@ class AdCreateRequest(BaseModel):
 @app.post("/api/advertisers")
 async def create_advertiser(
     request: AdvertiserCreateRequest,
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(verify_token)
+    db: AsyncSession = Depends(get_db)
 ):
-    """Create a new advertiser (requires auth)."""
+    """Create a new advertiser."""
     try:
         advertiser = Advertiser(
             name=request.name,
@@ -4394,10 +4393,9 @@ async def create_advertiser(
 
 @app.get("/api/advertisers")
 async def get_advertisers(
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(verify_token)
+    db: AsyncSession = Depends(get_db)
 ):
-    """List all advertisers (requires auth)."""
+    """List all advertisers."""
     result = await db.execute(select(Advertiser).order_by(Advertiser.created_at.desc()))
     advertisers = result.scalars().all()
     return [
@@ -4417,10 +4415,9 @@ async def get_advertisers(
 @app.post("/api/ads")
 async def create_ad(
     request: AdCreateRequest,
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(verify_token)
+    db: AsyncSession = Depends(get_db)
 ):
-    """Create a new ad (requires auth)."""
+    """Create a new ad."""
     try:
         # Validate advertiser exists
         adv_result = await db.execute(select(Advertiser).where(Advertiser.id == request.advertiser_id))
