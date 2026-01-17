@@ -4430,10 +4430,11 @@ async def create_ad(
             badge_map = {"hot": AdBadgeType.HOT, "new": AdBadgeType.NEW, "sale": AdBadgeType.SALE}
             badge_type = badge_map.get(request.badge_type.lower())
         
-        # Parse expires_at
+        # Parse expires_at (strip timezone for naive datetime)
         expires_at = None
         if request.expires_at:
-            expires_at = datetime.fromisoformat(request.expires_at.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(request.expires_at.replace("Z", "+00:00"))
+            expires_at = dt.replace(tzinfo=None) if dt.tzinfo else dt
         
         ad = Ad(
             advertiser_id=request.advertiser_id,
@@ -4468,7 +4469,7 @@ async def create_ad(
         raise
     except Exception as e:
         logger.error(f"Error creating ad: {e}")
-        raise HTTPException(status_code=500, detail="Failed to create ad")
+        raise HTTPException(status_code=500, detail=f"Failed to create ad: {str(e)}")
 
 
 @app.get("/api/ads")
