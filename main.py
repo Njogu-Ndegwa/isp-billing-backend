@@ -3606,18 +3606,17 @@ async def delete_plan(
         if not plan:
             raise HTTPException(status_code=404, detail="Plan not found")
         
-        # Check for active customers using this plan
-        active_customers_stmt = select(func.count(Customer.id)).where(
-            Customer.plan_id == plan_id,
-            Customer.status == CustomerStatus.ACTIVE
+        # Check for any customers using this plan
+        customers_stmt = select(func.count(Customer.id)).where(
+            Customer.plan_id == plan_id
         )
-        active_count_result = await db.execute(active_customers_stmt)
-        active_count = active_count_result.scalar()
+        count_result = await db.execute(customers_stmt)
+        customer_count = count_result.scalar()
         
-        if active_count > 0:
+        if customer_count > 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"Cannot delete plan. {active_count} active customer(s) are using this plan"
+                detail=f"Cannot delete plan. {customer_count} customer(s) are using this plan"
             )
         
         await db.delete(plan)
