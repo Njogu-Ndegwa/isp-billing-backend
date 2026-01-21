@@ -3606,18 +3606,25 @@ async def delete_plan(
         if not plan:
             raise HTTPException(status_code=404, detail="Plan not found")
         
-        # Check for any customers using this plan
-        customers_stmt = select(func.count(Customer.id)).where(
-            Customer.plan_id == plan_id
+        # Check for active customers using this plan
+        active_stmt = select(func.count(Customer.id)).where(
+            Customer.plan_id == plan_id,
+            Customer.status == CustomerStatus.ACTIVE
         )
-        count_result = await db.execute(customers_stmt)
-        customer_count = count_result.scalar()
+        active_result = await db.execute(active_stmt)
+        active_count = active_result.scalar()
         
-        if customer_count > 0:
+        if active_count > 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"Cannot delete plan. {customer_count} customer(s) are using this plan"
+                detail=f"Cannot delete plan. {active_count} active customer(s) are using this plan"
             )
+        
+        # Set plan_id to NULL for inactive/expired customers
+        from sqlalchemy import update
+        await db.execute(
+            update(Customer).where(Customer.plan_id == plan_id).values(plan_id=None)
+        )
         
         await db.delete(plan)
         await db.commit()
