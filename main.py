@@ -3596,6 +3596,8 @@ async def delete_plan(
 ):
     """Delete a plan (only if no active customers using it)"""
     try:
+        from sqlalchemy import func
+        
         # Check if plan exists
         plan_stmt = select(Plan).where(Plan.id == plan_id, Plan.user_id == user_id)
         plan_result = await db.execute(plan_stmt)
