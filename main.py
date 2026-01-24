@@ -4667,6 +4667,198 @@ async def record_ad_impression(
         raise HTTPException(status_code=500, detail="Failed to record impression")
 
 
+@app.get("/api/ads/{ad_id}/clicks")
+async def get_ad_clicks(
+    ad_id: int,
+    page: int = 1,
+    per_page: int = 50,
+    click_type: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get click records for a specific ad."""
+    try:
+        # Verify ad exists
+        ad_result = await db.execute(select(Ad).where(Ad.id == ad_id))
+        ad = ad_result.scalar_one_or_none()
+        if not ad:
+            raise HTTPException(status_code=404, detail="Ad not found")
+        
+        query = select(AdClick).where(AdClick.ad_id == ad_id)
+        
+        if click_type:
+            click_type_map = {"view_details": AdClickType.VIEW_DETAILS, "call": AdClickType.CALL, "whatsapp": AdClickType.WHATSAPP}
+            ct = click_type_map.get(click_type.lower())
+            if ct:
+                query = query.where(AdClick.click_type == ct)
+        
+        query = query.order_by(AdClick.created_at.desc())
+        
+        # Count
+        from sqlalchemy import func
+        count_result = await db.execute(select(func.count()).select_from(select(AdClick).where(AdClick.ad_id == ad_id).subquery()))
+        total = count_result.scalar() or 0
+        
+        # Paginate
+        offset = (page - 1) * per_page
+        query = query.offset(offset).limit(per_page)
+        
+        result = await db.execute(query)
+        clicks = result.scalars().all()
+        
+        return {
+            "ad_id": ad_id,
+            "ad_title": ad.title,
+            "clicks": [
+                {
+                    "id": c.id,
+                    "click_type": c.click_type.value if c.click_type else None,
+                    "device_id": c.device_id,
+                    "mac_address": c.mac_address,
+                    "session_id": c.session_id,
+                    "created_at": c.created_at.isoformat() if c.created_at else None
+                }
+                for c in clicks
+            ],
+            "pagination": {"page": page, "per_page": per_page, "total": total}
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching ad clicks: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch clicks")
+
+
+@app.get("/api/ads/{ad_id}/impressions")
+async def get_ad_impressions(
+    ad_id: int,
+    page: int = 1,
+    per_page: int = 50,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get impression records that include this ad."""
+    try:
+        # Verify ad exists
+        ad_result = await db.execute(select(Ad).where(Ad.id == ad_id))
+        ad = ad_result.scalar_one_or_none()
+        if not ad:
+            raise HTTPException(status_code=404, detail="Ad not found")
+        
+        # Query impressions where ad_id is in the ad_ids JSON array
+        from sqlalchemy import cast, String
+        query = select(AdImpression).where(
+            AdImpression.ad_ids.contains([ad_id])
+        ).order_by(AdImpression.created_at.desc())
+        
+        # Count
+        from sqlalchemy import func
+        count_q = select(func.count()).select_from(
+            select(AdImpression).where(AdImpression.ad_ids.contains([ad_id])).subquery()
+        )
+        count_result = await db.execute(count_q)
+        total = count_result.scalar() or 0
+        
+        # Paginate
+        offset = (page - 1) * per_page
+        query = query.offset(offset).limit(per_page)
+        
+        result = await db.execute(query)
+        impressions = result.scalars().all()
+        
+        return {
+            "ad_id": ad_id,
+            "ad_title": ad.title,
+            "impressions": [
+                {
+                    "id": i.id,
+                    "device_id": i.device_id,
+                    "session_id": i.session_id,
+                    "placement": i.placement,
+                    "ad_ids": i.ad_ids,
+                    "created_at": i.created_at.isoformat() if i.created_at else None
+                }
+                for i in impressions
+            ],
+            "pagination": {"page": page, "per_page": per_page, "total": total}
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching ad impressions: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch impressions")
+
+
+@app.get("/api/ads/analytics")
+async def get_ads_analytics(
+    days: int = 30,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get aggregated analytics for all ads."""
+    try:
+        from sqlalchemy import func
+        now = datetime.utcnow()
+        since = now - timedelta(days=days)
+        
+        # Total ads
+        ads_result = await db.execute(select(func.count()).select_from(Ad))
+        total_ads = ads_result.scalar() or 0
+        
+        # Active ads
+        active_result = await db.execute(
+            select(func.count()).select_from(
+                select(Ad).where(Ad.is_active == True, (Ad.expires_at == None) | (Ad.expires_at > now)).subquery()
+            )
+        )
+        active_ads = active_result.scalar() or 0
+        
+        # Total clicks in period
+        clicks_result = await db.execute(
+            select(func.count()).select_from(
+                select(AdClick).where(AdClick.created_at >= since).subquery()
+            )
+        )
+        total_clicks = clicks_result.scalar() or 0
+        
+        # Clicks by type
+        clicks_by_type = {}
+        for ct in AdClickType:
+            ct_result = await db.execute(
+                select(func.count()).select_from(
+                    select(AdClick).where(AdClick.created_at >= since, AdClick.click_type == ct).subquery()
+                )
+            )
+            clicks_by_type[ct.value] = ct_result.scalar() or 0
+        
+        # Total impressions in period
+        impressions_result = await db.execute(
+            select(func.count()).select_from(
+                select(AdImpression).where(AdImpression.created_at >= since).subquery()
+            )
+        )
+        total_impressions = impressions_result.scalar() or 0
+        
+        # Top 5 ads by clicks
+        top_ads_result = await db.execute(
+            select(Ad).order_by(Ad.clicks_count.desc()).limit(5)
+        )
+        top_ads = top_ads_result.scalars().all()
+        
+        return {
+            "period_days": days,
+            "total_ads": total_ads,
+            "active_ads": active_ads,
+            "total_clicks": total_clicks,
+            "clicks_by_type": clicks_by_type,
+            "total_impressions": total_impressions,
+            "top_ads_by_clicks": [
+                {"id": a.id, "title": a.title, "clicks_count": a.clicks_count, "views_count": a.views_count}
+                for a in top_ads
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error fetching ads analytics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch analytics")
+
+
 # Startup event - Start background scheduler
 @app.on_event("startup")
 async def startup_event():
