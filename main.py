@@ -4480,6 +4480,32 @@ async def create_ad(
         raise HTTPException(status_code=500, detail=f"Failed to create ad: {str(e)}")
 
 
+@app.delete("/api/ads/{ad_id}")
+async def delete_ad(
+    ad_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete an ad by ID."""
+    try:
+        result = await db.execute(select(Ad).where(Ad.id == ad_id))
+        ad = result.scalar_one_or_none()
+        
+        if not ad:
+            raise HTTPException(status_code=404, detail="Ad not found")
+        
+        await db.delete(ad)
+        await db.commit()
+        
+        logger.info(f"Ad deleted: #{ad_id}")
+        
+        return {"message": f"Ad #{ad_id} deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting ad: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete ad: {str(e)}")
+
+
 @app.get("/api/ads")
 async def get_ads(
     page: int = 1,
