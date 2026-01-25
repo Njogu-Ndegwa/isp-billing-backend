@@ -4493,9 +4493,8 @@ async def delete_ad(
         if not ad:
             raise HTTPException(status_code=404, detail="Ad not found")
         
-        # Delete related clicks and impressions first
+        # Delete related clicks first
         await db.execute(delete(AdClick).where(AdClick.ad_id == ad_id))
-        await db.execute(delete(AdImpression).where(AdImpression.ad_id == ad_id))
         
         await db.delete(ad)
         await db.commit()
