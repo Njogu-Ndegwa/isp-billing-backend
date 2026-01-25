@@ -4485,13 +4485,17 @@ async def delete_ad(
     ad_id: int,
     db: AsyncSession = Depends(get_db)
 ):
-    """Delete an ad by ID."""
+    """Delete an ad by ID (cascades to clicks and impressions)."""
     try:
         result = await db.execute(select(Ad).where(Ad.id == ad_id))
         ad = result.scalar_one_or_none()
         
         if not ad:
             raise HTTPException(status_code=404, detail="Ad not found")
+        
+        # Delete related clicks and impressions first
+        await db.execute(delete(AdClick).where(AdClick.ad_id == ad_id))
+        await db.execute(delete(AdImpression).where(AdImpression.ad_id == ad_id))
         
         await db.delete(ad)
         await db.commit()
