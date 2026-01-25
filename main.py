@@ -4368,6 +4368,24 @@ class AdCreateRequest(BaseModel):
     expires_at: Optional[str] = None  # ISO datetime string
 
 
+class AdUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    seller_name: Optional[str] = None
+    seller_location: Optional[str] = None
+    phone_number: Optional[str] = None
+    whatsapp_number: Optional[str] = None
+    price: Optional[str] = None
+    price_value: Optional[float] = None
+    badge_type: Optional[str] = None  # "hot", "new", "sale", or null to clear
+    badge_text: Optional[str] = None
+    category: Optional[str] = None
+    priority: Optional[int] = None
+    expires_at: Optional[str] = None  # ISO datetime string
+    is_active: Optional[bool] = None
+
+
 @app.post("/api/advertisers")
 async def create_advertiser(
     request: AdvertiserCreateRequest,
@@ -4507,6 +4525,72 @@ async def delete_ad(
     except Exception as e:
         logger.error(f"Error deleting ad: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete ad: {str(e)}")
+
+
+@app.put("/api/ads/{ad_id}")
+async def update_ad(
+    ad_id: int,
+    request: AdUpdateRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update an ad by ID."""
+    try:
+        result = await db.execute(select(Ad).where(Ad.id == ad_id))
+        ad = result.scalar_one_or_none()
+        
+        if not ad:
+            raise HTTPException(status_code=404, detail="Ad not found")
+        
+        # Update fields if provided
+        if request.title is not None:
+            ad.title = request.title
+        if request.description is not None:
+            ad.description = request.description
+        if request.image_url is not None:
+            ad.image_url = request.image_url
+        if request.seller_name is not None:
+            ad.seller_name = request.seller_name
+        if request.seller_location is not None:
+            ad.seller_location = request.seller_location
+        if request.phone_number is not None:
+            ad.phone_number = request.phone_number
+        if request.whatsapp_number is not None:
+            ad.whatsapp_number = request.whatsapp_number
+        if request.price is not None:
+            ad.price = request.price
+        if request.price_value is not None:
+            ad.price_value = request.price_value
+        if request.badge_type is not None:
+            badge_map = {"hot": AdBadgeType.HOT, "new": AdBadgeType.NEW, "sale": AdBadgeType.SALE}
+            ad.badge_type = badge_map.get(request.badge_type.lower())
+        if request.badge_text is not None:
+            ad.badge_text = request.badge_text
+        if request.category is not None:
+            ad.category = request.category
+        if request.priority is not None:
+            ad.priority = request.priority
+        if request.expires_at is not None:
+            dt = datetime.fromisoformat(request.expires_at.replace("Z", "+00:00"))
+            ad.expires_at = dt.replace(tzinfo=None) if dt.tzinfo else dt
+        if request.is_active is not None:
+            ad.is_active = request.is_active
+        
+        await db.commit()
+        await db.refresh(ad)
+        
+        logger.info(f"Ad updated: #{ad_id}")
+        
+        return {
+            "id": ad.id,
+            "title": ad.title,
+            "is_active": ad.is_active,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating ad: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update ad: {str(e)}")
 
 
 @app.get("/api/ads")
