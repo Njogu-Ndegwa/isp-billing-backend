@@ -40,6 +40,7 @@ app.add_middleware(
 # Initialize scheduler and cleanup flag
 scheduler = AsyncIOScheduler()
 cleanup_running = False
+mikrotik_lock = asyncio.Lock()  # Global lock to prevent concurrent MikroTik API access
 
 # MikroTik dashboard cache (avoid hammering the router)
 _mikrotik_cache = {"data": None, "timestamp": None}
@@ -260,10 +261,16 @@ async def cleanup_expired_users_background():
         logger.warning("[CRON] Previous cleanup still running, skipping this run")
         return
     
+    # Acquire global MikroTik lock to prevent concurrent API access
+    if mikrotik_lock.locked():
+        logger.warning("[CRON] MikroTik busy with another job, skipping cleanup")
+        return
+    
     cleanup_running = True
     start_time = datetime.utcnow()
     
-    try:
+    async with mikrotik_lock:
+        try:
         async with AsyncSession(async_engine) as db:
             now = datetime.utcnow()
             
@@ -418,10 +425,10 @@ async def cleanup_expired_users_background():
             duration = (datetime.utcnow() - start_time).total_seconds()
             logger.info(f"[CRON] Cleanup completed in {duration:.2f}s: {removed_count} removed, {failed_count} failed")
             
-    except Exception as e:
-        logger.error(f"[CRON] Cleanup job failed: {e}")
-    finally:
-        cleanup_running = False
+        except Exception as e:
+            logger.error(f"[CRON] Cleanup job failed: {e}")
+        finally:
+            cleanup_running = False
 
 
 # Background sync function for active user queues (runs every 60 seconds)
@@ -4976,32 +4983,36 @@ async def get_ads_analytics(
 @app.on_event("startup")
 async def startup_event():
     """Start the background cleanup scheduler when the app starts"""
+    # Use prime-number intervals to prevent jobs from ever running simultaneously
+    # LCM of primes = product, so overlap won't happen for ~43 days
     scheduler.add_job(
         cleanup_expired_users_background,
-        trigger=IntervalTrigger(seconds=60),  # Run every 60 seconds
+        trigger=IntervalTrigger(seconds=67),  # ~1 min (prime)
         id='cleanup_expired_users',
         name='Remove expired hotspot users from MikroTik',
         replace_existing=True,
         max_instances=1
     )
-    scheduler.add_job(
-        sync_active_user_queues,
-        trigger=IntervalTrigger(seconds=300),  # Run every 5 minutes
-        id='sync_user_queues',
-        name='Sync rate limit queues for active users',
-        replace_existing=True,
-        max_instances=1
-    )
+    # DISABLED: This job was causing MikroTik overload when running with other jobs
+    # It loops through ALL active customers, each doing 2-3 API calls
+    # scheduler.add_job(
+    #     sync_active_user_queues,
+    #     trigger=IntervalTrigger(seconds=353),  # ~5 min 53s (prime)
+    #     id='sync_user_queues',
+    #     name='Sync rate limit queues for active users',
+    #     replace_existing=True,
+    #     max_instances=1
+    # )
     scheduler.add_job(
         collect_bandwidth_snapshot,
-        trigger=IntervalTrigger(seconds=120),  # Collect every 2 minutes
+        trigger=IntervalTrigger(seconds=157),  # ~2 min 37s (prime)
         id='bandwidth_snapshot',
         name='Collect bandwidth statistics',
         replace_existing=True,
         max_instances=1
     )
     scheduler.start()
-    logger.info("🔄 Background scheduler started - cleanup every 60s, queue sync every 2min, bandwidth every 2min")
+    logger.info("🔄 Background scheduler started - cleanup every 67s, bandwidth every 157s (queue sync disabled)")
     
     # Warm up plan cache on startup
     async for db in get_db():
