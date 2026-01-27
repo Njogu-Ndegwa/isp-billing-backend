@@ -32,6 +32,7 @@ class MikroTikAPI:
         self.sock = None
         self.connected = False
 
+
     def connect(self) -> bool:
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
