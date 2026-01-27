@@ -271,160 +271,160 @@ async def cleanup_expired_users_background():
     
     async with mikrotik_lock:
         try:
-        async with AsyncSession(async_engine) as db:
-            now = datetime.utcnow()
-            
-            # Query expired customers from database
-            stmt = select(Customer).where(
-                Customer.status == CustomerStatus.ACTIVE,
-                Customer.expiry.isnot(None),
-                Customer.expiry <= now,
-                Customer.mac_address.isnot(None)
-            ).options(selectinload(Customer.router))
-            
-            result = await db.execute(stmt)
-            expired_customers = result.scalars().all()
-            
-            if not expired_customers:
-                # Reduced logging - only log if debug needed
-                return
-            
-            logger.info(f"[CRON] Found {len(expired_customers)} expired customers to cleanup")
-            
-            removed_count = 0
-            failed_count = 0
-            
-            # Connect to MikroTik once for all operations
-            api = MikroTikAPI(
-                settings.MIKROTIK_HOST,
-                settings.MIKROTIK_USERNAME,
-                settings.MIKROTIK_PASSWORD,
-                settings.MIKROTIK_PORT
-            )
-            
-            if not api.connect():
-                logger.error("[CRON] Failed to connect to MikroTik router")
-                cleanup_running = False
-                return
-            
-            for customer in expired_customers:
-                if not customer.mac_address:
-                    logger.warning(f"[CRON] Customer {customer.id} has no MAC address, skipping")
-                    customer.status = CustomerStatus.INACTIVE
-                    continue
+            async with AsyncSession(async_engine) as db:
+                now = datetime.utcnow()
                 
-                try:
-                    normalized_mac = normalize_mac_address(customer.mac_address)
-                    username = normalized_mac.replace(":", "")
+                # Query expired customers from database
+                stmt = select(Customer).where(
+                    Customer.status == CustomerStatus.ACTIVE,
+                    Customer.expiry.isnot(None),
+                    Customer.expiry <= now,
+                    Customer.mac_address.isnot(None)
+                ).options(selectinload(Customer.router))
+                
+                result = await db.execute(stmt)
+                expired_customers = result.scalars().all()
+                
+                if not expired_customers:
+                    # Reduced logging - only log if debug needed
+                    return
+                
+                logger.info(f"[CRON] Found {len(expired_customers)} expired customers to cleanup")
+                
+                removed_count = 0
+                failed_count = 0
+                
+                # Connect to MikroTik once for all operations
+                api = MikroTikAPI(
+                    settings.MIKROTIK_HOST,
+                    settings.MIKROTIK_USERNAME,
+                    settings.MIKROTIK_PASSWORD,
+                    settings.MIKROTIK_PORT
+                )
+                
+                if not api.connect():
+                    logger.error("[CRON] Failed to connect to MikroTik router")
+                    cleanup_running = False
+                    return
+                
+                for customer in expired_customers:
+                    if not customer.mac_address:
+                        logger.warning(f"[CRON] Customer {customer.id} has no MAC address, skipping")
+                        customer.status = CustomerStatus.INACTIVE
+                        continue
                     
-                    logger.info(f"[CRON] Processing expired customer {customer.id}: {customer.name} ({normalized_mac}) - Expired at {customer.expiry}")
-                    
-                    removed = {
-                        "user": False, 
-                        "binding_removed": False, 
-                        "hosts": 0,
-                        "queues": 0, 
-                        "leases": 0,
-                        "active_sessions": 0
-                    }
-                    
-                    # STEP 1: Get client's current IP (needed for host removal)
-                    client_ip = api.get_client_ip_by_mac(normalized_mac)
-                    if client_ip:
-                        logger.info(f"[CRON] Found client IP: {client_ip} for MAC {normalized_mac}")
-                    
-                    # STEP 2: REMOVE the IP binding completely (not block!)
-                    # Blocking prevents captive portal redirect. Removing allows redirect.
-                    bindings = api.send_command("/ip/hotspot/ip-binding/print")
-                    if bindings.get("success") and bindings.get("data"):
-                        for b in bindings["data"]:
-                            binding_mac = b.get("mac-address", "").upper()
-                            if normalize_mac_address(binding_mac) == normalized_mac:
-                                api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
-                                removed["binding_removed"] = True
-                                logger.info(f"[CRON] Removed IP binding for {normalized_mac}")
-                    
-                    # STEP 3: Remove from hotspot hosts (forces IMMEDIATE disconnect for bypassed users)
-                    hosts = api.send_command("/ip/hotspot/host/print")
-                    if hosts.get("success") and hosts.get("data"):
-                        for host in hosts["data"]:
-                            host_mac = host.get("mac-address", "").upper()
-                            host_ip = host.get("address", "")
-                            # Match by MAC or by IP
-                            if normalize_mac_address(host_mac) == normalized_mac or host_ip == client_ip:
-                                api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
-                                removed["hosts"] += 1
-                                logger.info(f"[CRON] Removed host entry: {host_mac} / {host_ip}")
-                    
-                    # STEP 4: Remove hotspot user
-                    users = api.send_command("/ip/hotspot/user/print")
-                    if users.get("success") and users.get("data"):
-                        for u in users["data"]:
-                            if u.get("name", "") == username:
-                                api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
-                                removed["user"] = True
-                                logger.info(f"[CRON] Removed hotspot user: {username}")
-                                break
-                    
-                    # STEP 5: Disconnect any active sessions
-                    active_sessions = api.send_command("/ip/hotspot/active/print")
-                    if active_sessions.get("success") and active_sessions.get("data"):
-                        for session in active_sessions["data"]:
-                            session_mac = session.get("mac-address", "").upper()
-                            session_user = session.get("user", "").upper()
-                            if normalize_mac_address(session_mac) == normalized_mac or session_user == username.upper():
-                                api.send_command("/ip/hotspot/active/remove", {"numbers": session[".id"]})
-                                removed["active_sessions"] += 1
-                                logger.info(f"[CRON] Disconnected active session: {session_user}")
-                    
-                    # STEP 6: Remove queues (simple queues)
-                    queues = api.send_command("/queue/simple/print")
-                    if queues.get("success") and queues.get("data"):
-                        for q in queues["data"]:
-                            queue_name = q.get("name", "")
-                            queue_comment = q.get("comment", "")
-                            if (queue_name == f"queue_{username}" or 
-                                normalized_mac.upper() in queue_comment.upper()):
-                                api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
-                                removed["queues"] += 1
-                    
-                    # STEP 6b: Remove plan queue (simple queue for rate limiting)
-                    plan_queues = api.send_command("/queue/simple/print")
-                    if plan_queues.get("success") and plan_queues.get("data"):
-                        for pq in plan_queues["data"]:
-                            if pq.get("name") == f"plan_{username}" or f"MAC:{customer.mac_address}" in pq.get("comment", ""):
-                                api.send_command("/queue/simple/remove", {"numbers": pq[".id"]})
-                                logger.info(f"[CRON] Removed plan queue for {username}")
-                    
-                    # STEP 7: Remove DHCP lease (forces client to re-request IP)
-                    leases = api.send_command("/ip/dhcp-server/lease/print")
-                    if leases.get("success") and leases.get("data"):
-                        for lease in leases["data"]:
-                            if normalize_mac_address(lease.get("mac-address", "")) == normalized_mac:
-                                api.send_command("/ip/dhcp-server/lease/remove", {"numbers": lease[".id"]})
-                                removed["leases"] += 1
-                                logger.info(f"[CRON] Removed DHCP lease for {normalized_mac}")
-                    
-                    # Update database status
-                    customer.status = CustomerStatus.INACTIVE
-                    
-                    removed_count += 1
-                    logger.info(f"[CRON] ✓ Expired customer {customer.name} removed: {removed}")
-                    
-                except Exception as e:
-                    failed_count += 1
-                    logger.error(f"[CRON] Failed to remove customer {customer.id}: {e}")
-                    # Still mark as inactive to prevent repeated attempts
-                    customer.status = CustomerStatus.INACTIVE
-            
-            api.disconnect()
-            
-            # Commit all database changes
-            await db.commit()
-            
-            duration = (datetime.utcnow() - start_time).total_seconds()
-            logger.info(f"[CRON] Cleanup completed in {duration:.2f}s: {removed_count} removed, {failed_count} failed")
-            
+                    try:
+                        normalized_mac = normalize_mac_address(customer.mac_address)
+                        username = normalized_mac.replace(":", "")
+                        
+                        logger.info(f"[CRON] Processing expired customer {customer.id}: {customer.name} ({normalized_mac}) - Expired at {customer.expiry}")
+                        
+                        removed = {
+                            "user": False, 
+                            "binding_removed": False, 
+                            "hosts": 0,
+                            "queues": 0, 
+                            "leases": 0,
+                            "active_sessions": 0
+                        }
+                        
+                        # STEP 1: Get client's current IP (needed for host removal)
+                        client_ip = api.get_client_ip_by_mac(normalized_mac)
+                        if client_ip:
+                            logger.info(f"[CRON] Found client IP: {client_ip} for MAC {normalized_mac}")
+                        
+                        # STEP 2: REMOVE the IP binding completely (not block!)
+                        # Blocking prevents captive portal redirect. Removing allows redirect.
+                        bindings = api.send_command("/ip/hotspot/ip-binding/print")
+                        if bindings.get("success") and bindings.get("data"):
+                            for b in bindings["data"]:
+                                binding_mac = b.get("mac-address", "").upper()
+                                if normalize_mac_address(binding_mac) == normalized_mac:
+                                    api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                                    removed["binding_removed"] = True
+                                    logger.info(f"[CRON] Removed IP binding for {normalized_mac}")
+                        
+                        # STEP 3: Remove from hotspot hosts (forces IMMEDIATE disconnect for bypassed users)
+                        hosts = api.send_command("/ip/hotspot/host/print")
+                        if hosts.get("success") and hosts.get("data"):
+                            for host in hosts["data"]:
+                                host_mac = host.get("mac-address", "").upper()
+                                host_ip = host.get("address", "")
+                                # Match by MAC or by IP
+                                if normalize_mac_address(host_mac) == normalized_mac or host_ip == client_ip:
+                                    api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
+                                    removed["hosts"] += 1
+                                    logger.info(f"[CRON] Removed host entry: {host_mac} / {host_ip}")
+                        
+                        # STEP 4: Remove hotspot user
+                        users = api.send_command("/ip/hotspot/user/print")
+                        if users.get("success") and users.get("data"):
+                            for u in users["data"]:
+                                if u.get("name", "") == username:
+                                    api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
+                                    removed["user"] = True
+                                    logger.info(f"[CRON] Removed hotspot user: {username}")
+                                    break
+                        
+                        # STEP 5: Disconnect any active sessions
+                        active_sessions = api.send_command("/ip/hotspot/active/print")
+                        if active_sessions.get("success") and active_sessions.get("data"):
+                            for session in active_sessions["data"]:
+                                session_mac = session.get("mac-address", "").upper()
+                                session_user = session.get("user", "").upper()
+                                if normalize_mac_address(session_mac) == normalized_mac or session_user == username.upper():
+                                    api.send_command("/ip/hotspot/active/remove", {"numbers": session[".id"]})
+                                    removed["active_sessions"] += 1
+                                    logger.info(f"[CRON] Disconnected active session: {session_user}")
+                        
+                        # STEP 6: Remove queues (simple queues)
+                        queues = api.send_command("/queue/simple/print")
+                        if queues.get("success") and queues.get("data"):
+                            for q in queues["data"]:
+                                queue_name = q.get("name", "")
+                                queue_comment = q.get("comment", "")
+                                if (queue_name == f"queue_{username}" or 
+                                    normalized_mac.upper() in queue_comment.upper()):
+                                    api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                                    removed["queues"] += 1
+                        
+                        # STEP 6b: Remove plan queue (simple queue for rate limiting)
+                        plan_queues = api.send_command("/queue/simple/print")
+                        if plan_queues.get("success") and plan_queues.get("data"):
+                            for pq in plan_queues["data"]:
+                                if pq.get("name") == f"plan_{username}" or f"MAC:{customer.mac_address}" in pq.get("comment", ""):
+                                    api.send_command("/queue/simple/remove", {"numbers": pq[".id"]})
+                                    logger.info(f"[CRON] Removed plan queue for {username}")
+                        
+                        # STEP 7: Remove DHCP lease (forces client to re-request IP)
+                        leases = api.send_command("/ip/dhcp-server/lease/print")
+                        if leases.get("success") and leases.get("data"):
+                            for lease in leases["data"]:
+                                if normalize_mac_address(lease.get("mac-address", "")) == normalized_mac:
+                                    api.send_command("/ip/dhcp-server/lease/remove", {"numbers": lease[".id"]})
+                                    removed["leases"] += 1
+                                    logger.info(f"[CRON] Removed DHCP lease for {normalized_mac}")
+                        
+                        # Update database status
+                        customer.status = CustomerStatus.INACTIVE
+                        
+                        removed_count += 1
+                        logger.info(f"[CRON] ✓ Expired customer {customer.name} removed: {removed}")
+                        
+                    except Exception as e:
+                        failed_count += 1
+                        logger.error(f"[CRON] Failed to remove customer {customer.id}: {e}")
+                        # Still mark as inactive to prevent repeated attempts
+                        customer.status = CustomerStatus.INACTIVE
+                
+                api.disconnect()
+                
+                # Commit all database changes
+                await db.commit()
+                
+                duration = (datetime.utcnow() - start_time).total_seconds()
+                logger.info(f"[CRON] Cleanup completed in {duration:.2f}s: {removed_count} removed, {failed_count} failed")
+                
         except Exception as e:
             logger.error(f"[CRON] Cleanup job failed: {e}")
         finally:
