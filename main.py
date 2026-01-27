@@ -43,7 +43,7 @@ cleanup_running = False
 
 # MikroTik dashboard cache (avoid hammering the router)
 _mikrotik_cache = {"data": None, "timestamp": None}
-_mikrotik_cache_ttl = 30  # seconds
+_mikrotik_cache_ttl = 300  # seconds - limit to once per 5 minutes
 
 
 def _fetch_mikrotik_data_sync():
@@ -4986,7 +4986,7 @@ async def startup_event():
     )
     scheduler.add_job(
         sync_active_user_queues,
-        trigger=IntervalTrigger(seconds=120),  # Run every 2 minutes
+        trigger=IntervalTrigger(seconds=300),  # Run every 5 minutes
         id='sync_user_queues',
         name='Sync rate limit queues for active users',
         replace_existing=True,

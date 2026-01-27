@@ -23,7 +23,7 @@ def normalize_mac_address(mac: str) -> str:
     return ':'.join(clean_mac[i:i+2] for i in range(0, 12, 2))
 
 class MikroTikAPI:
-    def __init__(self, host: str, username: str, password: str, port: int = 8728, timeout: int = 10):
+    def __init__(self, host: str, username: str, password: str, port: int = 8728, timeout: int = 30):
         self.host = host
         self.username = username
         self.password = password
