@@ -2723,6 +2723,8 @@ async def register_hotspot_and_pay_api(
             }
             existing_customer.pending_update_data = json.dumps(pending_data)
             existing_customer.status = CustomerStatus.PENDING if payment_method_enum == PaymentMethod.MOBILE_MONEY else CustomerStatus.ACTIVE
+            existing_customer.router_id = request.router_id  # Update router_id
+            existing_customer.plan_id = request.plan_id      # Update plan_id
             if request.name:
                 existing_customer.name = request.name
             existing_customer.phone = request.phone
