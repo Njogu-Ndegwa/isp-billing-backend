@@ -103,6 +103,16 @@ async def get_router_by_id(
     res = await db.execute(stmt)
     return res.scalar_one_or_none()
 
+def connect_to_router(router: Router) -> MikroTikAPI:
+    """Create MikroTik API connection using router-specific credentials"""
+    api = MikroTikAPI(
+        router.ip_address,
+        router.username,
+        router.password,
+        router.port
+    )
+    return api
+
 # Shared function to remove user from MikroTik
 async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
     """
@@ -121,8 +131,8 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
         normalized_mac = normalize_mac_address(mac_address)
         username = normalized_mac.replace(":", "")
         
-        # Update database first
-        customer_stmt = select(Customer).where(Customer.mac_address == normalized_mac)
+        # Update database first - include router relationship
+        customer_stmt = select(Customer).options(selectinload(Customer.router)).where(Customer.mac_address == normalized_mac)
         customer_result = await db.execute(customer_stmt)
         customer = customer_result.scalar_one_or_none()
         
@@ -133,13 +143,25 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
         await db.commit()
         logger.info(f"[CLEANUP] Customer {customer.id} set to INACTIVE in database")
         
-        # Connect to MikroTik
-        api = MikroTikAPI(
-            settings.MIKROTIK_HOST,
-            settings.MIKROTIK_USERNAME,
-            settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT
-        )
+        # Get router credentials - use customer's assigned router or fallback to settings
+        if customer.router:
+            router = customer.router
+            api = MikroTikAPI(
+                router.ip_address,
+                router.username,
+                router.password,
+                router.port
+            )
+            logger.info(f"[CLEANUP] Connecting to router {router.name} at {router.ip_address}")
+        else:
+            # Fallback to global settings if no router assigned
+            api = MikroTikAPI(
+                settings.MIKROTIK_HOST,
+                settings.MIKROTIK_USERNAME,
+                settings.MIKROTIK_PASSWORD,
+                settings.MIKROTIK_PORT
+            )
+            logger.warning(f"[CLEANUP] Customer {customer.id} has no router assigned, using default settings")
         
         if not api.connect():
             logger.error(f"[CLEANUP] Failed to connect to MikroTik for {normalized_mac}")
@@ -884,8 +906,9 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                     "router_ip": router.ip_address,
                     "router_username": router.username,
                     "router_password": router.password,
+                    "router_port": router.port,
                 }
-                logger.info(f"Prepared MikroTik Payload for customer {customer.id}")
+                logger.info(f"Prepared MikroTik Payload for customer {customer.id} -> Router: {router.ip_address}")
                 background_tasks.add_task(call_mikrotik_bypass, hotspot_payload)
             
             return {"ResultCode": 0, "ResultDesc": "Payment processed successfully"}
@@ -902,16 +925,23 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
 
 async def call_mikrotik_bypass(hotspot_payload: dict):
     try:
-        # Use tunnel endpoint from settings instead of direct router IP
+        # Use router-specific credentials from payload, fallback to global settings
+        router_ip = hotspot_payload.get("router_ip", settings.MIKROTIK_HOST)
+        router_username = hotspot_payload.get("router_username", settings.MIKROTIK_USERNAME)
+        router_password = hotspot_payload.get("router_password", settings.MIKROTIK_PASSWORD)
+        router_port = hotspot_payload.get("router_port", settings.MIKROTIK_PORT)
+        
+        logger.info(f"Connecting to MikroTik router at {router_ip}:{router_port}")
+        
         api = MikroTikAPI(
-            settings.MIKROTIK_HOST,  # localhost via SSH tunnel
-            settings.MIKROTIK_USERNAME,
-            settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT
+            router_ip,
+            router_username,
+            router_password,
+            router_port
         )
 
         if not api.connect():
-            logger.error("Failed to connect to MikroTik router via tunnel")
+            logger.error(f"Failed to connect to MikroTik router at {router_ip}")
             return
 
         result = api.add_customer_bypass_mode(
@@ -921,9 +951,9 @@ async def call_mikrotik_bypass(hotspot_payload: dict):
             hotspot_payload["time_limit"],
             hotspot_payload["bandwidth_limit"],
             hotspot_payload["comment"],
-            settings.MIKROTIK_HOST,  # Pass tunnel endpoint
-            settings.MIKROTIK_USERNAME,
-            settings.MIKROTIK_PASSWORD
+            router_ip,
+            router_username,
+            router_password
         )
 
         logger.info(f"MikroTik API Response: {json.dumps(result, indent=2)}")
@@ -995,11 +1025,10 @@ async def register_mac_address(
     normalized_mac = normalize_mac_address(mac_address)
     username = normalized_mac.replace(":", "")
 
-    # Connect to the router via SSH tunnel
-    api = MikroTikAPI(settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, 
-                      settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT)
+    # Connect to the router using router-specific credentials
+    api = connect_to_router(router)
     if not api.connect():
-        logger.error(f"Failed to connect to router {router.name} via tunnel")
+        logger.error(f"Failed to connect to router {router.name} at {router.ip_address}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
     try:
@@ -1190,9 +1219,9 @@ async def check_mac_registration_status(
     normalized_mac = normalize_mac_address(mac_address)
     username = normalized_mac.replace(":", "")
 
-    api = MikroTikAPI(settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, 
-                      settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT)
+    api = connect_to_router(router)
     if not api.connect():
+        logger.error(f"Failed to connect to router {router.name} at {router.ip_address}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
     try:
@@ -1273,9 +1302,9 @@ async def disconnect_user_session(
     normalized_mac = normalize_mac_address(mac_address)
     username = normalized_mac.replace(":", "")
 
-    api = MikroTikAPI(settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, 
-                      settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT)
+    api = connect_to_router(router)
     if not api.connect():
+        logger.error(f"Failed to connect to router {router.name} at {router.ip_address}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
     try:
@@ -1330,9 +1359,9 @@ async def get_router_users(
     if not router:
         raise HTTPException(status_code=404, detail="Router not found or not accessible")
 
-    api = MikroTikAPI(settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, 
-                      settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT)
+    api = connect_to_router(router)
     if not api.connect():
+        logger.error(f"Failed to connect to router {router.name} at {router.ip_address}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
     try:
@@ -1405,9 +1434,9 @@ async def remove_router_user(
     if not router:
         raise HTTPException(status_code=404, detail="Router not found or not accessible")
 
-    api = MikroTikAPI(settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, 
-                      settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT)
+    api = connect_to_router(router)
     if not api.connect():
+        logger.error(f"Failed to connect to router {router.name} at {router.ip_address}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
     try:
@@ -1489,9 +1518,9 @@ async def get_router_stats(
     if not router:
         raise HTTPException(status_code=404, detail="Router not found or not accessible")
 
-    api = MikroTikAPI(settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, 
-                      settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT)
+    api = connect_to_router(router)
     if not api.connect():
+        logger.error(f"Failed to connect to router {router.name} at {router.ip_address}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
     try:
@@ -1563,9 +1592,9 @@ async def sync_router_users_with_database(
     if not router:
         raise HTTPException(status_code=404, detail="Router not found or not accessible")
 
-    api = MikroTikAPI(settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, 
-                      settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT)
+    api = connect_to_router(router)
     if not api.connect():
+        logger.error(f"Failed to connect to router {router.name} at {router.ip_address}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
     try:
