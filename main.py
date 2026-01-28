@@ -2278,6 +2278,7 @@ async def login_api(
 # Router Management Endpoints
 class RouterCreateRequest(BaseModel):
     name: str
+    identity: Optional[str] = None  # MikroTik system identity (for frontend lookup)
     ip_address: str
     username: str
     password: str
@@ -2304,6 +2305,7 @@ async def create_router_api(
         router = Router(
             user_id=request.user_id,
             name=request.name,
+            identity=request.identity,
             ip_address=request.ip_address,
             username=request.username,
             password=request.password,
@@ -2319,6 +2321,7 @@ async def create_router_api(
         return {
             "id": router.id,
             "name": router.name,
+            "identity": router.identity,
             "ip_address": router.ip_address,
             "username": router.username,
             "port": router.port,
@@ -2331,6 +2334,59 @@ async def create_router_api(
         logger.error(f"Error creating router: {str(e)}")
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to create router: {str(e)}")
+
+@app.get("/api/routers/by-identity/{identity}")
+async def get_router_by_identity(
+    identity: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Lookup router by MikroTik system identity (for frontend captive portal)"""
+    stmt = select(Router).where(Router.identity == identity)
+    result = await db.execute(stmt)
+    router = result.scalar_one_or_none()
+    
+    if not router:
+        raise HTTPException(status_code=404, detail=f"Router with identity '{identity}' not found")
+    
+    return {
+        "router_id": router.id,
+        "name": router.name,
+        "identity": router.identity,
+        "user_id": router.user_id
+    }
+
+class RouterIdentityUpdate(BaseModel):
+    identity: str
+
+@app.put("/api/routers/{router_id}/identity")
+async def update_router_identity(
+    router_id: int,
+    request: RouterIdentityUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update router's MikroTik system identity"""
+    stmt = select(Router).where(Router.id == router_id)
+    result = await db.execute(stmt)
+    router = result.scalar_one_or_none()
+    
+    if not router:
+        raise HTTPException(status_code=404, detail="Router not found")
+    
+    # Check if identity already exists on another router
+    existing_stmt = select(Router).where(Router.identity == request.identity, Router.id != router_id)
+    existing_result = await db.execute(existing_stmt)
+    if existing_result.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Identity already assigned to another router")
+    
+    router.identity = request.identity
+    await db.commit()
+    
+    return {
+        "id": router.id,
+        "name": router.name,
+        "identity": router.identity,
+        "message": "Identity updated successfully"
+    }
 
 # Plan Management Endpoints
 class PlanCreateRequest(BaseModel):

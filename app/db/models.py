@@ -140,6 +140,7 @@ class Router(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     name = Column(String, nullable=False)
+    identity = Column(String, nullable=True, unique=True)  # MikroTik system identity for frontend lookup
     ip_address = Column(String, nullable=False)
     username = Column(String, nullable=False)
     password = Column(String, nullable=False)
