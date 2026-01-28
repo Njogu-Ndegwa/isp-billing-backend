@@ -266,129 +266,147 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
         return {"success": False, "error": str(e)}
 
 # Synchronous MikroTik cleanup - runs in thread pool to not block event loop
-def _cleanup_customer_from_mikrotik_sync(customers_data: list) -> dict:
+def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
     """
     Synchronous function to remove expired customers from MikroTik.
     Runs in a separate thread to avoid blocking the async event loop.
     
     Args:
-        customers_data: List of dicts with {id, name, mac_address, expiry}
+        router_customers_map: Dict mapping router info to customer list
+            {
+                "router_ip:port": {
+                    "router": {ip, username, password, port, name},
+                    "customers": [{id, name, mac_address, expiry}, ...]
+                }
+            }
     
     Returns:
-        Dict with results: {removed: [], failed: [], connected: bool}
+        Dict with results: {removed: [], failed: [], routers_connected: int}
     """
-    results = {"removed": [], "failed": [], "connected": False}
+    results = {"removed": [], "failed": [], "routers_connected": 0}
     
-    if not customers_data:
+    if not router_customers_map:
         return results
     
-    api = MikroTikAPI(
-        settings.MIKROTIK_HOST,
-        settings.MIKROTIK_USERNAME,
-        settings.MIKROTIK_PASSWORD,
-        settings.MIKROTIK_PORT
-    )
+    for router_key, router_data in router_customers_map.items():
+        router_info = router_data["router"]
+        customers_data = router_data["customers"]
+        
+        if not customers_data:
+            continue
+        
+        logger.info(f"[CRON] Processing {len(customers_data)} customers on router {router_info['name']} ({router_info['ip']})")
+        
+        api = MikroTikAPI(
+            router_info["ip"],
+            router_info["username"],
+            router_info["password"],
+            router_info["port"]
+        )
+        
+        if not api.connect():
+            logger.error(f"[CRON] Failed to connect to router {router_info['name']} at {router_info['ip']}")
+            for cust in customers_data:
+                results["failed"].append({"id": cust["id"], "error": f"Failed to connect to router {router_info['name']}"})
+            continue
+        
+        results["routers_connected"] += 1
+        
+        for cust in customers_data:
+            try:
+                normalized_mac = normalize_mac_address(cust["mac_address"])
+                username = normalized_mac.replace(":", "")
+                
+                logger.info(f"[CRON] Processing expired customer {cust['id']}: {cust['name']} ({normalized_mac})")
+                
+                removed = {
+                    "user": False, 
+                    "binding_removed": False, 
+                    "hosts": 0,
+                    "queues": 0, 
+                    "leases": 0,
+                    "active_sessions": 0
+                }
+                
+                # STEP 1: Get client's current IP (needed for host removal)
+                client_ip = api.get_client_ip_by_mac(normalized_mac)
+                if client_ip:
+                    logger.info(f"[CRON] Found client IP: {client_ip} for MAC {normalized_mac}")
+                
+                # STEP 2: REMOVE the IP binding completely (not block!)
+                bindings = api.send_command("/ip/hotspot/ip-binding/print")
+                if bindings.get("success") and bindings.get("data"):
+                    for b in bindings["data"]:
+                        binding_mac = b.get("mac-address", "").upper()
+                        if normalize_mac_address(binding_mac) == normalized_mac:
+                            api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                            removed["binding_removed"] = True
+                            logger.info(f"[CRON] Removed IP binding for {normalized_mac}")
+                
+                # STEP 3: Remove from hotspot hosts (forces IMMEDIATE disconnect)
+                hosts = api.send_command("/ip/hotspot/host/print")
+                if hosts.get("success") and hosts.get("data"):
+                    for host in hosts["data"]:
+                        host_mac = host.get("mac-address", "").upper()
+                        host_ip = host.get("address", "")
+                        if normalize_mac_address(host_mac) == normalized_mac or host_ip == client_ip:
+                            api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
+                            removed["hosts"] += 1
+                            logger.info(f"[CRON] Removed host entry: {host_mac} / {host_ip}")
+                
+                # STEP 4: Remove hotspot user
+                users = api.send_command("/ip/hotspot/user/print")
+                if users.get("success") and users.get("data"):
+                    for u in users["data"]:
+                        if u.get("name", "") == username:
+                            api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
+                            removed["user"] = True
+                            logger.info(f"[CRON] Removed hotspot user: {username}")
+                            break
+                
+                # STEP 5: Disconnect any active sessions
+                active_sessions = api.send_command("/ip/hotspot/active/print")
+                if active_sessions.get("success") and active_sessions.get("data"):
+                    for session in active_sessions["data"]:
+                        session_mac = session.get("mac-address", "").upper()
+                        session_user = session.get("user", "").upper()
+                        if normalize_mac_address(session_mac) == normalized_mac or session_user == username.upper():
+                            api.send_command("/ip/hotspot/active/remove", {"numbers": session[".id"]})
+                            removed["active_sessions"] += 1
+                            logger.info(f"[CRON] Disconnected active session: {session_user}")
+                
+                # STEP 6: Remove queues (simple queues)
+                queues = api.send_command("/queue/simple/print")
+                if queues.get("success") and queues.get("data"):
+                    for q in queues["data"]:
+                        queue_name = q.get("name", "")
+                        queue_comment = q.get("comment", "")
+                        if (queue_name == f"queue_{username}" or 
+                            queue_name == f"plan_{username}" or
+                            normalized_mac.upper() in queue_comment.upper() or
+                            f"MAC:{cust['mac_address']}" in queue_comment):
+                            api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                            removed["queues"] += 1
+                            logger.info(f"[CRON] Removed queue: {queue_name}")
+                
+                # STEP 7: Remove DHCP lease (forces client to re-request IP)
+                leases = api.send_command("/ip/dhcp-server/lease/print")
+                if leases.get("success") and leases.get("data"):
+                    for lease in leases["data"]:
+                        if normalize_mac_address(lease.get("mac-address", "")) == normalized_mac:
+                            api.send_command("/ip/dhcp-server/lease/remove", {"numbers": lease[".id"]})
+                            removed["leases"] += 1
+                            logger.info(f"[CRON] Removed DHCP lease for {normalized_mac}")
+                
+                results["removed"].append({"id": cust["id"], "details": removed})
+                logger.info(f"[CRON] ✓ Expired customer {cust['name']} removed: {removed}")
+                
+            except Exception as e:
+                results["failed"].append({"id": cust["id"], "error": str(e)})
+                logger.error(f"[CRON] Failed to remove customer {cust['id']}: {e}")
+        
+        api.disconnect()
     
-    if not api.connect():
-        logger.error("[CRON] Failed to connect to MikroTik router")
-        return results
-    
-    results["connected"] = True
-    
-    for cust in customers_data:
-        try:
-            normalized_mac = normalize_mac_address(cust["mac_address"])
-            username = normalized_mac.replace(":", "")
-            
-            logger.info(f"[CRON] Processing expired customer {cust['id']}: {cust['name']} ({normalized_mac})")
-            
-            removed = {
-                "user": False, 
-                "binding_removed": False, 
-                "hosts": 0,
-                "queues": 0, 
-                "leases": 0,
-                "active_sessions": 0
-            }
-            
-            # STEP 1: Get client's current IP (needed for host removal)
-            client_ip = api.get_client_ip_by_mac(normalized_mac)
-            if client_ip:
-                logger.info(f"[CRON] Found client IP: {client_ip} for MAC {normalized_mac}")
-            
-            # STEP 2: REMOVE the IP binding completely (not block!)
-            bindings = api.send_command("/ip/hotspot/ip-binding/print")
-            if bindings.get("success") and bindings.get("data"):
-                for b in bindings["data"]:
-                    binding_mac = b.get("mac-address", "").upper()
-                    if normalize_mac_address(binding_mac) == normalized_mac:
-                        api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
-                        removed["binding_removed"] = True
-                        logger.info(f"[CRON] Removed IP binding for {normalized_mac}")
-            
-            # STEP 3: Remove from hotspot hosts (forces IMMEDIATE disconnect)
-            hosts = api.send_command("/ip/hotspot/host/print")
-            if hosts.get("success") and hosts.get("data"):
-                for host in hosts["data"]:
-                    host_mac = host.get("mac-address", "").upper()
-                    host_ip = host.get("address", "")
-                    if normalize_mac_address(host_mac) == normalized_mac or host_ip == client_ip:
-                        api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
-                        removed["hosts"] += 1
-                        logger.info(f"[CRON] Removed host entry: {host_mac} / {host_ip}")
-            
-            # STEP 4: Remove hotspot user
-            users = api.send_command("/ip/hotspot/user/print")
-            if users.get("success") and users.get("data"):
-                for u in users["data"]:
-                    if u.get("name", "") == username:
-                        api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
-                        removed["user"] = True
-                        logger.info(f"[CRON] Removed hotspot user: {username}")
-                        break
-            
-            # STEP 5: Disconnect any active sessions
-            active_sessions = api.send_command("/ip/hotspot/active/print")
-            if active_sessions.get("success") and active_sessions.get("data"):
-                for session in active_sessions["data"]:
-                    session_mac = session.get("mac-address", "").upper()
-                    session_user = session.get("user", "").upper()
-                    if normalize_mac_address(session_mac) == normalized_mac or session_user == username.upper():
-                        api.send_command("/ip/hotspot/active/remove", {"numbers": session[".id"]})
-                        removed["active_sessions"] += 1
-                        logger.info(f"[CRON] Disconnected active session: {session_user}")
-            
-            # STEP 6: Remove queues (simple queues)
-            queues = api.send_command("/queue/simple/print")
-            if queues.get("success") and queues.get("data"):
-                for q in queues["data"]:
-                    queue_name = q.get("name", "")
-                    queue_comment = q.get("comment", "")
-                    if (queue_name == f"queue_{username}" or 
-                        queue_name == f"plan_{username}" or
-                        normalized_mac.upper() in queue_comment.upper() or
-                        f"MAC:{cust['mac_address']}" in queue_comment):
-                        api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
-                        removed["queues"] += 1
-                        logger.info(f"[CRON] Removed queue: {queue_name}")
-            
-            # STEP 7: Remove DHCP lease (forces client to re-request IP)
-            leases = api.send_command("/ip/dhcp-server/lease/print")
-            if leases.get("success") and leases.get("data"):
-                for lease in leases["data"]:
-                    if normalize_mac_address(lease.get("mac-address", "")) == normalized_mac:
-                        api.send_command("/ip/dhcp-server/lease/remove", {"numbers": lease[".id"]})
-                        removed["leases"] += 1
-                        logger.info(f"[CRON] Removed DHCP lease for {normalized_mac}")
-            
-            results["removed"].append({"id": cust["id"], "details": removed})
-            logger.info(f"[CRON] ✓ Expired customer {cust['name']} removed: {removed}")
-            
-        except Exception as e:
-            results["failed"].append({"id": cust["id"], "error": str(e)})
-            logger.error(f"[CRON] Failed to remove customer {cust['id']}: {e}")
-    
-    api.disconnect()
     return results
 
 
@@ -397,6 +415,7 @@ async def cleanup_expired_users_background():
     """
     Background task to remove expired users from MikroTik.
     MikroTik operations run in a thread pool to avoid blocking the event loop.
+    Groups customers by router for multi-router support.
     """
     global cleanup_running
     
@@ -409,11 +428,13 @@ async def cleanup_expired_users_background():
     start_time = datetime.utcnow()
     
     try:
-        # STEP 1: Query expired customers from database (async)
+        # STEP 1: Query expired customers from database with router info (async)
         async with AsyncSession(async_engine) as db:
             now = datetime.utcnow()
             
-            stmt = select(Customer).where(
+            stmt = select(Customer).options(
+                selectinload(Customer.router)
+            ).where(
                 Customer.status == CustomerStatus.ACTIVE,
                 Customer.expiry.isnot(None),
                 Customer.expiry <= now,
@@ -428,24 +449,64 @@ async def cleanup_expired_users_background():
             
             logger.info(f"[CRON] Found {len(expired_customers)} expired customers to cleanup")
             
-            # Prepare data for sync function (can't pass ORM objects to thread)
-            customers_data = [
-                {
+            # Group customers by router (can't pass ORM objects to thread)
+            router_customers_map = {}
+            no_router_customers = []
+            
+            for c in expired_customers:
+                if not c.mac_address:
+                    continue
+                    
+                customer_data = {
                     "id": c.id,
                     "name": c.name,
                     "mac_address": c.mac_address,
                     "expiry": c.expiry
                 }
-                for c in expired_customers if c.mac_address
-            ]
+                
+                if c.router:
+                    router_key = f"{c.router.ip_address}:{c.router.port}"
+                    if router_key not in router_customers_map:
+                        router_customers_map[router_key] = {
+                            "router": {
+                                "ip": c.router.ip_address,
+                                "username": c.router.username,
+                                "password": c.router.password,
+                                "port": c.router.port,
+                                "name": c.router.name
+                            },
+                            "customers": []
+                        }
+                    router_customers_map[router_key]["customers"].append(customer_data)
+                else:
+                    # Fallback to default settings for customers without router
+                    no_router_customers.append(customer_data)
+            
+            # Add no-router customers to default router
+            if no_router_customers:
+                default_key = f"{settings.MIKROTIK_HOST}:{settings.MIKROTIK_PORT}"
+                if default_key not in router_customers_map:
+                    router_customers_map[default_key] = {
+                        "router": {
+                            "ip": settings.MIKROTIK_HOST,
+                            "username": settings.MIKROTIK_USERNAME,
+                            "password": settings.MIKROTIK_PASSWORD,
+                            "port": settings.MIKROTIK_PORT,
+                            "name": "Default Router"
+                        },
+                        "customers": []
+                    }
+                router_customers_map[default_key]["customers"].extend(no_router_customers)
+            
+            logger.info(f"[CRON] Grouped customers across {len(router_customers_map)} router(s)")
             
             # STEP 2: Run MikroTik cleanup in thread pool (non-blocking!)
-            mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, customers_data)
+            mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
             
             # STEP 3: Update database based on results (async)
             # ONLY mark as INACTIVE if MikroTik removal SUCCEEDED
             # Failed removals stay ACTIVE so next cleanup run retries them
-            if mikrotik_results["connected"]:
+            if mikrotik_results["routers_connected"] > 0:
                 successful_ids = [r["id"] for r in mikrotik_results["removed"]]
                 failed_ids = [r["id"] for r in mikrotik_results["failed"]]
                 
@@ -474,17 +535,18 @@ async def cleanup_expired_users_background():
 async def sync_active_user_queues():
     """
     Sync queues for active customers - ensures rate limits are applied even if IP changed.
+    Supports multiple routers by grouping customers by their assigned router.
     """
     try:
         async with AsyncSession(async_engine) as db:
             now = datetime.utcnow()
             
-            # Query active customers with MAC addresses
+            # Query active customers with MAC addresses and router info
             stmt = select(Customer).where(
                 Customer.status == CustomerStatus.ACTIVE,
                 Customer.mac_address.isnot(None),
                 Customer.expiry > now
-            ).options(selectinload(Customer.plan))
+            ).options(selectinload(Customer.plan), selectinload(Customer.router))
             
             result = await db.execute(stmt)
             active_customers = result.scalars().all()
@@ -492,72 +554,108 @@ async def sync_active_user_queues():
             if not active_customers:
                 return
             
-            # Connect to MikroTik
-            api = MikroTikAPI(
-                settings.MIKROTIK_HOST,
-                settings.MIKROTIK_USERNAME,
-                settings.MIKROTIK_PASSWORD,
-                settings.MIKROTIK_PORT
-            )
-            
-            if not api.connect():
-                return
-            
-            synced = 0
+            # Group customers by router
+            router_customers = {}
             for customer in active_customers:
                 if not customer.plan or not customer.mac_address:
                     continue
                 
-                try:
-                    normalized_mac = normalize_mac_address(customer.mac_address)
-                    username = normalized_mac.replace(":", "")
-                    rate_limit = api._parse_speed_to_mikrotik(customer.plan.speed)
-                    
-                    # Get current IP
-                    client_ip = api.get_client_ip_by_mac(normalized_mac)
-                    if not client_ip:
-                        continue
-                    
-                    # Check if queue exists and targets correct IP
-                    queues = api.send_command("/queue/simple/print")
-                    queue_exists = False
-                    queue_correct = False
-                    
-                    if queues.get("success") and queues.get("data"):
-                        for q in queues["data"]:
-                            if q.get("name") == f"plan_{username}":
-                                queue_exists = True
-                                if client_ip in q.get("target", ""):
-                                    queue_correct = True
-                                else:
-                                    # Update queue with new IP
-                                    api.send_command("/queue/simple/set", {
-                                        "numbers": q[".id"],
-                                        "target": f"{client_ip}/32",
-                                        "max-limit": rate_limit
-                                    })
-                                    logger.info(f"[SYNC] Updated queue for {username} -> {client_ip}")
-                                    synced += 1
-                                break
-                    
-                    # Create queue if doesn't exist
-                    if not queue_exists:
-                        api.send_command("/queue/simple/add", {
-                            "name": f"plan_{username}",
-                            "target": f"{client_ip}/32",
-                            "max-limit": rate_limit,
-                            "comment": f"MAC:{customer.mac_address}|Plan rate limit"
-                        })
-                        logger.info(f"[SYNC] Created queue for {username} -> {client_ip}")
-                        synced += 1
+                if customer.router:
+                    router_key = f"{customer.router.ip_address}:{customer.router.port}"
+                    if router_key not in router_customers:
+                        router_customers[router_key] = {
+                            "router": customer.router,
+                            "customers": []
+                        }
+                    router_customers[router_key]["customers"].append(customer)
+                else:
+                    # Fallback to default settings
+                    default_key = f"{settings.MIKROTIK_HOST}:{settings.MIKROTIK_PORT}"
+                    if default_key not in router_customers:
+                        router_customers[default_key] = {
+                            "router": None,  # Will use settings
+                            "customers": []
+                        }
+                    router_customers[default_key]["customers"].append(customer)
+            
+            total_synced = 0
+            
+            # Process each router
+            for router_key, data in router_customers.items():
+                router = data["router"]
+                customers = data["customers"]
+                
+                if router:
+                    api = MikroTikAPI(
+                        router.ip_address,
+                        router.username,
+                        router.password,
+                        router.port
+                    )
+                    router_name = router.name
+                else:
+                    api = MikroTikAPI(
+                        settings.MIKROTIK_HOST,
+                        settings.MIKROTIK_USERNAME,
+                        settings.MIKROTIK_PASSWORD,
+                        settings.MIKROTIK_PORT
+                    )
+                    router_name = "Default Router"
+                
+                if not api.connect():
+                    logger.warning(f"[SYNC] Failed to connect to {router_name}")
+                    continue
+                
+                synced = 0
+                for customer in customers:
+                    try:
+                        normalized_mac = normalize_mac_address(customer.mac_address)
+                        username = normalized_mac.replace(":", "")
+                        rate_limit = api._parse_speed_to_mikrotik(customer.plan.speed)
                         
-                except Exception as e:
-                    logger.error(f"[SYNC] Error syncing customer {customer.id}: {e}")
+                        # Get current IP
+                        client_ip = api.get_client_ip_by_mac(normalized_mac)
+                        if not client_ip:
+                            continue
+                        
+                        # Check if queue exists and targets correct IP
+                        queues = api.send_command("/queue/simple/print")
+                        queue_exists = False
+                        
+                        if queues.get("success") and queues.get("data"):
+                            for q in queues["data"]:
+                                if q.get("name") == f"plan_{username}":
+                                    queue_exists = True
+                                    if client_ip not in q.get("target", ""):
+                                        # Update queue with new IP
+                                        api.send_command("/queue/simple/set", {
+                                            "numbers": q[".id"],
+                                            "target": f"{client_ip}/32",
+                                            "max-limit": rate_limit
+                                        })
+                                        logger.info(f"[SYNC] Updated queue for {username} -> {client_ip} on {router_name}")
+                                        synced += 1
+                                    break
+                        
+                        # Create queue if doesn't exist
+                        if not queue_exists:
+                            api.send_command("/queue/simple/add", {
+                                "name": f"plan_{username}",
+                                "target": f"{client_ip}/32",
+                                "max-limit": rate_limit,
+                                "comment": f"MAC:{customer.mac_address}|Plan rate limit"
+                            })
+                            logger.info(f"[SYNC] Created queue for {username} -> {client_ip} on {router_name}")
+                            synced += 1
+                            
+                    except Exception as e:
+                        logger.error(f"[SYNC] Error syncing customer {customer.id} on {router_name}: {e}")
+                
+                api.disconnect()
+                total_synced += synced
             
-            api.disconnect()
-            
-            if synced > 0:
-                logger.info(f"[SYNC] Synced {synced} queues")
+            if total_synced > 0:
+                logger.info(f"[SYNC] Synced {total_synced} queues across {len(router_customers)} router(s)")
                 
     except Exception as e:
         logger.error(f"[SYNC] Queue sync failed: {e}")
@@ -2417,6 +2515,94 @@ async def update_router_identity(
         "message": "Identity updated successfully"
     }
 
+@app.post("/api/routers/{router_id}/cleanup-expired")
+async def cleanup_expired_customers_for_router(
+    router_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Manually trigger cleanup of expired customers for a specific router.
+    Removes expired users from MikroTik and marks them as INACTIVE in database.
+    """
+    try:
+        # Verify router exists
+        router = await get_router_by_id(db, router_id)
+        if not router:
+            raise HTTPException(status_code=404, detail="Router not found")
+        
+        now = datetime.utcnow()
+        
+        # Find expired customers for this router
+        stmt = select(Customer).where(
+            Customer.router_id == router_id,
+            Customer.status == CustomerStatus.ACTIVE,
+            Customer.expiry.isnot(None),
+            Customer.expiry <= now,
+            Customer.mac_address.isnot(None)
+        )
+        
+        result = await db.execute(stmt)
+        expired_customers = result.scalars().all()
+        
+        if not expired_customers:
+            return {
+                "success": True,
+                "message": "No expired customers found for this router",
+                "router_id": router_id,
+                "router_name": router.name,
+                "cleaned_up": 0
+            }
+        
+        # Prepare data for sync cleanup
+        router_customers_map = {
+            f"{router.ip_address}:{router.port}": {
+                "router": {
+                    "ip": router.ip_address,
+                    "username": router.username,
+                    "password": router.password,
+                    "port": router.port,
+                    "name": router.name
+                },
+                "customers": [
+                    {
+                        "id": c.id,
+                        "name": c.name,
+                        "mac_address": c.mac_address,
+                        "expiry": c.expiry
+                    }
+                    for c in expired_customers
+                ]
+            }
+        }
+        
+        # Run cleanup in thread pool
+        mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
+        
+        # Update database
+        successful_ids = [r["id"] for r in mikrotik_results["removed"]]
+        for customer in expired_customers:
+            if customer.id in successful_ids:
+                customer.status = CustomerStatus.INACTIVE
+        
+        await db.commit()
+        
+        return {
+            "success": True,
+            "message": f"Cleanup completed for router {router.name}",
+            "router_id": router_id,
+            "router_name": router.name,
+            "expired_found": len(expired_customers),
+            "cleaned_up": len(mikrotik_results["removed"]),
+            "failed": len(mikrotik_results["failed"]),
+            "details": mikrotik_results
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cleaning up router {router_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
 # Plan Management Endpoints
 class PlanCreateRequest(BaseModel):
     name: str
@@ -4009,17 +4195,30 @@ def health_check():
 
 # MikroTik Health and Stats Endpoints
 @app.get("/api/mikrotik/health")
-async def get_mikrotik_health():
+async def get_mikrotik_health(
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
     """Get MikroTik router health metrics (CPU, memory, disk, uptime)"""
     try:
-        api = MikroTikAPI(
-            settings.MIKROTIK_HOST,
-            settings.MIKROTIK_USERNAME,
-            settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT
-        )
+        # Get router by ID or use default settings
+        if router_id:
+            router = await get_router_by_id(db, router_id)
+            if not router:
+                raise HTTPException(status_code=404, detail="Router not found")
+            api = connect_to_router(router)
+            router_name = router.name
+        else:
+            api = MikroTikAPI(
+                settings.MIKROTIK_HOST,
+                settings.MIKROTIK_USERNAME,
+                settings.MIKROTIK_PASSWORD,
+                settings.MIKROTIK_PORT
+            )
+            router_name = "Default Router"
+        
         if not api.connect():
-            raise HTTPException(status_code=503, detail="Failed to connect to MikroTik router")
+            raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
         
         resources = api.get_system_resources()
         health = api.get_health()
@@ -4062,6 +4261,8 @@ async def get_mikrotik_health():
             },
             "health_sensors": health.get("data", {}),
             "active_hotspot_sessions": len(active_users.get("data", [])),
+            "router_id": router_id,
+            "router_name": router_name,
             "generated_at": datetime.utcnow().isoformat()
         }
     except HTTPException:
@@ -4155,17 +4356,30 @@ async def get_dashboard_mikrotik():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/mikrotik/traffic")
-async def get_mikrotik_traffic(interface: Optional[str] = None):
+async def get_mikrotik_traffic(
+    interface: Optional[str] = None,
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
     """Get MikroTik interface traffic statistics"""
     try:
-        api = MikroTikAPI(
-            settings.MIKROTIK_HOST,
-            settings.MIKROTIK_USERNAME,
-            settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT
-        )
+        if router_id:
+            router = await get_router_by_id(db, router_id)
+            if not router:
+                raise HTTPException(status_code=404, detail="Router not found")
+            api = connect_to_router(router)
+            router_name = router.name
+        else:
+            api = MikroTikAPI(
+                settings.MIKROTIK_HOST,
+                settings.MIKROTIK_USERNAME,
+                settings.MIKROTIK_PASSWORD,
+                settings.MIKROTIK_PORT
+            )
+            router_name = "Default Router"
+        
         if not api.connect():
-            raise HTTPException(status_code=503, detail="Failed to connect to MikroTik router")
+            raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
         
         traffic = api.get_interface_traffic(interface)
         api.disconnect()
@@ -4175,6 +4389,8 @@ async def get_mikrotik_traffic(interface: Optional[str] = None):
         
         return {
             "interfaces": traffic.get("data", []),
+            "router_id": router_id,
+            "router_name": router_name,
             "generated_at": datetime.utcnow().isoformat()
         }
     except HTTPException:
@@ -4184,17 +4400,29 @@ async def get_mikrotik_traffic(interface: Optional[str] = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/mikrotik/active-sessions")
-async def get_mikrotik_active_sessions():
+async def get_mikrotik_active_sessions(
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
     """Get currently active hotspot sessions with traffic data"""
     try:
-        api = MikroTikAPI(
-            settings.MIKROTIK_HOST,
-            settings.MIKROTIK_USERNAME,
-            settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT
-        )
+        if router_id:
+            router = await get_router_by_id(db, router_id)
+            if not router:
+                raise HTTPException(status_code=404, detail="Router not found")
+            api = connect_to_router(router)
+            router_name = router.name
+        else:
+            api = MikroTikAPI(
+                settings.MIKROTIK_HOST,
+                settings.MIKROTIK_USERNAME,
+                settings.MIKROTIK_PASSWORD,
+                settings.MIKROTIK_PORT
+            )
+            router_name = "Default Router"
+        
         if not api.connect():
-            raise HTTPException(status_code=503, detail="Failed to connect to MikroTik router")
+            raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
         
         sessions = api.get_active_hotspot_users()
         api.disconnect()
@@ -4205,6 +4433,8 @@ async def get_mikrotik_active_sessions():
         return {
             "sessions": sessions.get("data", []),
             "total_sessions": len(sessions.get("data", [])),
+            "router_id": router_id,
+            "router_name": router_name,
             "generated_at": datetime.utcnow().isoformat()
         }
     except HTTPException:
@@ -5345,16 +5575,15 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
-    # DISABLED: This job was causing MikroTik overload when running with other jobs
-    # It loops through ALL active customers, each doing 2-3 API calls
-    # scheduler.add_job(
-    #     sync_active_user_queues,
-    #     trigger=IntervalTrigger(seconds=353),  # ~5 min 53s (prime)
-    #     id='sync_user_queues',
-    #     name='Sync rate limit queues for active users',
-    #     replace_existing=True,
-    #     max_instances=1
-    # )
+    # Queue sync - ensures bandwidth limits apply even if customer IP changes
+    scheduler.add_job(
+        sync_active_user_queues,
+        trigger=IntervalTrigger(seconds=353),  # ~5 min 53s (prime)
+        id='sync_user_queues',
+        name='Sync rate limit queues for active users',
+        replace_existing=True,
+        max_instances=1
+    )
     scheduler.add_job(
         collect_bandwidth_snapshot,
         trigger=IntervalTrigger(seconds=157),  # ~2 min 37s (prime)
@@ -5364,7 +5593,7 @@ async def startup_event():
         max_instances=1
     )
     scheduler.start()
-    logger.info("🔄 Background scheduler started - cleanup every 67s, bandwidth every 157s (queue sync disabled)")
+    logger.info("🔄 Background scheduler started - cleanup every 67s, queue sync every 353s, bandwidth every 157s")
     
     # Warm up plan cache on startup
     async for db in get_db():
