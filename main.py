@@ -421,16 +421,21 @@ async def cleanup_expired_users_background():
             mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, customers_data)
             
             # STEP 3: Update database based on results (async)
+            # ONLY mark as INACTIVE if MikroTik removal SUCCEEDED
+            # Failed removals stay ACTIVE so next cleanup run retries them
             if mikrotik_results["connected"]:
-                # Mark all processed customers as inactive
-                processed_ids = [r["id"] for r in mikrotik_results["removed"]] + \
-                               [r["id"] for r in mikrotik_results["failed"]]
+                successful_ids = [r["id"] for r in mikrotik_results["removed"]]
+                failed_ids = [r["id"] for r in mikrotik_results["failed"]]
                 
                 for customer in expired_customers:
-                    if customer.id in processed_ids:
+                    if customer.id in successful_ids:
                         customer.status = CustomerStatus.INACTIVE
+                    # Keep failed ones as ACTIVE for retry
                 
                 await db.commit()
+                
+                if failed_ids:
+                    logger.warning(f"[CRON] {len(failed_ids)} customers kept ACTIVE for retry: {failed_ids}")
             
             duration = (datetime.utcnow() - start_time).total_seconds()
             removed_count = len(mikrotik_results["removed"])
@@ -1756,6 +1761,254 @@ async def cleanup_all_inactive_users(
     except Exception as e:
         logger.error(f"[CLEANUP-ALL] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _cleanup_recently_expired_sync(customers_data: list, delay_ms: int = 200) -> dict:
+    """
+    Synchronous function to remove recently expired users from MikroTik.
+    Runs in thread pool to avoid blocking. Fetches data once, then processes.
+    
+    Args:
+        customers_data: List of {id, name, mac_address, status, expiry}
+        delay_ms: Delay between removal operations in milliseconds
+    """
+    import time
+    
+    results = {
+        "removed": [],
+        "failed": [],
+        "connected": False,
+        "still_in_mikrotik": 0
+    }
+    
+    if not customers_data:
+        return results
+    
+    delay_sec = delay_ms / 1000.0
+    
+    api = MikroTikAPI(
+        settings.MIKROTIK_HOST,
+        settings.MIKROTIK_USERNAME,
+        settings.MIKROTIK_PASSWORD,
+        settings.MIKROTIK_PORT
+    )
+    
+    if not api.connect():
+        logger.error("[CLEANUP-RECENT] Failed to connect to MikroTik")
+        return results
+    
+    results["connected"] = True
+    
+    try:
+        # FETCH ALL DATA ONCE (reduces API calls significantly)
+        logger.info("[CLEANUP-RECENT] Fetching MikroTik data...")
+        time.sleep(delay_sec)
+        
+        all_bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        time.sleep(delay_sec)
+        
+        all_users = api.send_command("/ip/hotspot/user/print")
+        time.sleep(delay_sec)
+        
+        all_active = api.send_command("/ip/hotspot/active/print")
+        time.sleep(delay_sec)
+        
+        all_hosts = api.send_command("/ip/hotspot/host/print")
+        time.sleep(delay_sec)
+        
+        all_queues = api.send_command("/queue/simple/print")
+        time.sleep(delay_sec)
+        
+        all_leases = api.send_command("/ip/dhcp-server/lease/print")
+        
+        logger.info("[CLEANUP-RECENT] Data fetched, processing customers...")
+        
+        # Build lookup sets for faster matching
+        bindings_data = all_bindings.get("data", []) if all_bindings.get("success") else []
+        users_data = all_users.get("data", []) if all_users.get("success") else []
+        active_data = all_active.get("data", []) if all_active.get("success") else []
+        hosts_data = all_hosts.get("data", []) if all_hosts.get("success") else []
+        queues_data = all_queues.get("data", []) if all_queues.get("success") else []
+        leases_data = all_leases.get("data", []) if all_leases.get("success") else []
+        
+        for cust in customers_data:
+            try:
+                normalized_mac = normalize_mac_address(cust["mac_address"])
+                username = normalized_mac.replace(":", "")
+                
+                removed = {
+                    "user": False,
+                    "bindings": 0,
+                    "queues": 0,
+                    "leases": 0,
+                    "active_sessions": 0,
+                    "hosts": 0,
+                    "was_in_mikrotik": False
+                }
+                
+                # 1. Remove IP bindings
+                for b in bindings_data:
+                    binding_mac = normalize_mac_address(b.get("mac-address", ""))
+                    if binding_mac == normalized_mac:
+                        api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                        removed["bindings"] += 1
+                        removed["was_in_mikrotik"] = True
+                        time.sleep(delay_sec)
+                
+                # 2. Remove hotspot user
+                for u in users_data:
+                    if u.get("name") == username:
+                        api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
+                        removed["user"] = True
+                        removed["was_in_mikrotik"] = True
+                        time.sleep(delay_sec)
+                        break
+                
+                # 3. Disconnect active sessions
+                for session in active_data:
+                    session_mac = normalize_mac_address(session.get("mac-address", ""))
+                    session_user = session.get("user", "")
+                    if session_mac == normalized_mac or session_user == username:
+                        api.send_command("/ip/hotspot/active/remove", {"numbers": session[".id"]})
+                        removed["active_sessions"] += 1
+                        removed["was_in_mikrotik"] = True
+                        time.sleep(delay_sec)
+                
+                # 4. Remove from hosts
+                for host in hosts_data:
+                    host_mac = normalize_mac_address(host.get("mac-address", ""))
+                    if host_mac == normalized_mac:
+                        api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
+                        removed["hosts"] += 1
+                        time.sleep(delay_sec)
+                
+                # 5. Remove queues
+                for q in queues_data:
+                    queue_name = q.get("name", "")
+                    if queue_name == f"queue_{username}" or queue_name == f"plan_{username}":
+                        api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                        removed["queues"] += 1
+                        time.sleep(delay_sec)
+                
+                # 6. Remove DHCP leases
+                for l in leases_data:
+                    lease_mac = normalize_mac_address(l.get("mac-address", ""))
+                    if lease_mac == normalized_mac:
+                        api.send_command("/ip/dhcp-server/lease/remove", {"numbers": l[".id"]})
+                        removed["leases"] += 1
+                        time.sleep(delay_sec)
+                
+                if removed["was_in_mikrotik"]:
+                    results["still_in_mikrotik"] += 1
+                
+                results["removed"].append({
+                    "id": cust["id"],
+                    "name": cust["name"],
+                    "mac": normalized_mac,
+                    "db_status": cust["status"],
+                    "expiry": cust["expiry"],
+                    "details": removed
+                })
+                logger.info(f"[CLEANUP-RECENT] ✓ {cust['name']} ({normalized_mac}): {removed}")
+                
+            except Exception as e:
+                results["failed"].append({
+                    "id": cust["id"],
+                    "name": cust["name"],
+                    "error": str(e)
+                })
+                logger.error(f"[CLEANUP-RECENT] ✗ {cust['name']}: {e}")
+        
+    except Exception as e:
+        logger.error(f"[CLEANUP-RECENT] Error during processing: {e}")
+    finally:
+        api.disconnect()
+    
+    return results
+
+
+@app.post("/api/admin/cleanup-recently-expired")
+async def cleanup_recently_expired_users(
+    hours: int = 12,
+    user_id: int = 1,
+    delay_ms: int = 200,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Remove users expired in the last N hours from MikroTik, regardless of DB status.
+    Non-blocking: runs MikroTik operations in thread pool with delays between requests.
+    
+    Args:
+        hours: Look back period (default 12 hours)
+        user_id: Reseller ID
+        delay_ms: Delay between MikroTik API calls in milliseconds (default 200ms)
+    """
+    try:
+        now = datetime.utcnow()
+        cutoff = now - timedelta(hours=hours)
+        
+        # Find customers expired in the last N hours (ANY status - ACTIVE or INACTIVE)
+        stmt = select(Customer).where(
+            Customer.expiry.isnot(None),
+            Customer.expiry >= cutoff,
+            Customer.expiry <= now,
+            Customer.mac_address.isnot(None),
+            Customer.user_id == user_id
+        )
+        result = await db.execute(stmt)
+        expired_customers = result.scalars().all()
+        
+        if not expired_customers:
+            return {
+                "success": True,
+                "message": f"No customers expired in the last {hours} hours",
+                "total_expired": 0,
+                "processed": 0,
+                "failed": 0,
+                "still_active_in_mikrotik": 0
+            }
+        
+        logger.info(f"[CLEANUP-RECENT] Found {len(expired_customers)} customers expired in last {hours}h")
+        
+        # Prepare data for sync function (can't pass ORM objects to thread)
+        customers_data = [
+            {
+                "id": c.id,
+                "name": c.name,
+                "mac_address": c.mac_address,
+                "status": c.status.value,
+                "expiry": c.expiry.isoformat() if c.expiry else None
+            }
+            for c in expired_customers
+        ]
+        
+        # Run MikroTik operations in thread pool (non-blocking!)
+        mikrotik_results = await asyncio.to_thread(
+            _cleanup_recently_expired_sync,
+            customers_data,
+            delay_ms
+        )
+        
+        if not mikrotik_results["connected"]:
+            raise HTTPException(status_code=500, detail="Failed to connect to MikroTik")
+        
+        return {
+            "success": True,
+            "message": f"Cleanup complete for last {hours} hours",
+            "total_expired": len(expired_customers),
+            "processed": len(mikrotik_results["removed"]),
+            "failed": len(mikrotik_results["failed"]),
+            "still_active_in_mikrotik": mikrotik_results["still_in_mikrotik"],
+            "details": mikrotik_results["removed"],
+            "errors": mikrotik_results["failed"]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[CLEANUP-RECENT] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.delete("/api/public/cleanup-blocked-bindings")
 async def cleanup_blocked_bindings_public():
