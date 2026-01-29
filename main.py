@@ -5178,29 +5178,30 @@ async def collect_bandwidth_snapshot():
                     arp_entries = raw.get("arp_entries", {})
                     
                     # Find best interface for traffic measurement
-                    # Priority: 1) bridge interfaces, 2) ether1 (WAN), 3) any running ether
+                    # Priority: 1) ether1/WAN (most accurate for internet), 2) bridge, 3) any running ether
                     total_rx = 0
                     total_tx = 0
                     selected_interface = None
                     
                     interfaces = traffic.get("data", [])
                     
-                    # First try: find a bridge interface (various naming conventions)
+                    # First try: use ether1 (typically WAN interface - most accurate for internet bandwidth)
                     for iface in interfaces:
                         name = iface.get("name", "").lower()
-                        if iface.get("running") and ("bridge" in name):
+                        if iface.get("running") and (name == "ether1" or "wan" in name or "gateway" in name):
                             total_rx = iface.get("rx_byte", 0)
                             total_tx = iface.get("tx_byte", 0)
                             selected_interface = iface.get("name")
                             break
                     
-                    # Second try: use ether1 (typically WAN interface)
+                    # Second try: find a bridge interface (various naming conventions)
                     if not selected_interface:
                         for iface in interfaces:
-                            if iface.get("name") == "ether1" and iface.get("running"):
+                            name = iface.get("name", "").lower()
+                            if iface.get("running") and ("bridge" in name):
                                 total_rx = iface.get("rx_byte", 0)
                                 total_tx = iface.get("tx_byte", 0)
-                                selected_interface = "ether1"
+                                selected_interface = iface.get("name")
                                 break
                     
                     # Third try: sum all running ether interfaces
@@ -5233,18 +5234,25 @@ async def collect_bandwidth_snapshot():
                     if prev and prev.interface_rx_bytes > 0:
                         time_diff = (now - prev.recorded_at).total_seconds()
                         if time_diff > 0:
-                            # For WAN interface (ether1): rx = download, tx = upload
-                            # For bridge: same perspective
                             byte_diff_rx = total_rx - prev.interface_rx_bytes
                             byte_diff_tx = total_tx - prev.interface_tx_bytes
                             
                             # Handle counter reset (when router reboots, counters reset)
                             if byte_diff_rx >= 0 and byte_diff_tx >= 0:
-                                avg_download_bps = (byte_diff_rx * 8) / time_diff  # bytes to bits
-                                avg_upload_bps = (byte_diff_tx * 8) / time_diff
+                                # Interface perspective depends on which interface we're measuring:
+                                # - For ether1/WAN: rx = from internet = USER DOWNLOAD, tx = to internet = USER UPLOAD
+                                # - For bridge/LAN: rx = from users = USER UPLOAD, tx = to users = USER DOWNLOAD
+                                if selected_interface and ("ether1" in selected_interface or "wan" in selected_interface.lower()):
+                                    # WAN interface: rx = download, tx = upload
+                                    avg_download_bps = (byte_diff_rx * 8) / time_diff
+                                    avg_upload_bps = (byte_diff_tx * 8) / time_diff
+                                else:
+                                    # Bridge/LAN interface: tx = download (to users), rx = upload (from users)
+                                    avg_download_bps = (byte_diff_tx * 8) / time_diff
+                                    avg_upload_bps = (byte_diff_rx * 8) / time_diff
                                 
                                 logger.info(f"[BANDWIDTH] Router {router_id}: time_diff={time_diff:.1f}s, byte_diff_rx={byte_diff_rx}, byte_diff_tx={byte_diff_tx}")
-                                logger.info(f"[BANDWIDTH] Router {router_id}: Calculated avg_download={avg_download_bps/1000000:.2f}Mbps, avg_upload={avg_upload_bps/1000000:.2f}Mbps")
+                                logger.info(f"[BANDWIDTH] Router {router_id}: Using '{selected_interface}' perspective - avg_download={avg_download_bps/1000000:.2f}Mbps, avg_upload={avg_upload_bps/1000000:.2f}Mbps")
                             else:
                                 logger.warning(f"[BANDWIDTH] Router {router_id}: Counter reset detected (negative diff), skipping rate calc")
                     else:
