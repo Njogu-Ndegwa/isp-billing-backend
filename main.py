@@ -5083,18 +5083,42 @@ def _fetch_bandwidth_data_sync_for_router(router_info: dict):
         timeout=15
     )
     if not api.connect():
+        logger.warning(f"[BANDWIDTH] Failed to connect to router ID {router_info['id']} at {router_info['ip_address']}")
         return None
+    
     active_sessions = api.get_active_hotspot_users()
     traffic = api.get_interface_traffic()
     speed_stats = api.get_queue_speed_stats()
     queues = api.send_command("/queue/simple/print")
+    hotspot_hosts = api.get_hotspot_hosts()
+    arp_entries = api.get_arp_entries()
     api.disconnect()
+    
+    # Log what we got from MikroTik for debugging
+    logger.info(f"[BANDWIDTH] Router {router_info['id']} raw data:")
+    logger.info(f"  - Hotspot active sessions: {len(active_sessions.get('data', []))}")
+    logger.info(f"  - Hotspot hosts total: {hotspot_hosts.get('total', 0)}, bypassed: {hotspot_hosts.get('bypassed', 0)}")
+    logger.info(f"  - ARP entries: {arp_entries.get('count', 0)}")
+    logger.info(f"  - Queue stats: active_queues={speed_stats.get('data', {}).get('active_queues', 0)}, total_queues={speed_stats.get('data', {}).get('total_queues', 0)}")
+    
+    # Log all interfaces with their traffic
+    if traffic.get("success"):
+        logger.info(f"  - Interfaces found:")
+        for iface in traffic.get("data", []):
+            rx_mb = round(iface.get("rx_byte", 0) / 1048576, 2)
+            tx_mb = round(iface.get("tx_byte", 0) / 1048576, 2)
+            logger.info(f"    * {iface.get('name')}: running={iface.get('running')}, rx={rx_mb}MB, tx={tx_mb}MB")
+    else:
+        logger.warning(f"  - Interface traffic fetch failed: {traffic.get('error', 'unknown')}")
+    
     return {
         "router_id": router_info["id"],
         "active_sessions": active_sessions, 
         "traffic": traffic, 
         "speed_stats": speed_stats, 
-        "queues": queues
+        "queues": queues,
+        "hotspot_hosts": hotspot_hosts,
+        "arp_entries": arp_entries
     }
 
 def _fetch_bandwidth_data_sync():
@@ -5150,16 +5174,46 @@ async def collect_bandwidth_snapshot():
                     traffic = raw["traffic"]
                     speed_stats = raw["speed_stats"]
                     router_id = raw["router_id"]
+                    hotspot_hosts = raw.get("hotspot_hosts", {})
+                    arp_entries = raw.get("arp_entries", {})
                     
-                    # Sum traffic from bridge interface (main LAN) - most accurate for user traffic
+                    # Find best interface for traffic measurement
+                    # Priority: 1) bridge interfaces, 2) ether1 (WAN), 3) any running ether
                     total_rx = 0
                     total_tx = 0
-                    for iface in traffic.get("data", []):
-                        # Use bridge interface for aggregate user traffic
-                        if iface.get("name") == "bridge" and iface.get("running"):
+                    selected_interface = None
+                    
+                    interfaces = traffic.get("data", [])
+                    
+                    # First try: find a bridge interface (various naming conventions)
+                    for iface in interfaces:
+                        name = iface.get("name", "").lower()
+                        if iface.get("running") and ("bridge" in name):
                             total_rx = iface.get("rx_byte", 0)
                             total_tx = iface.get("tx_byte", 0)
+                            selected_interface = iface.get("name")
                             break
+                    
+                    # Second try: use ether1 (typically WAN interface)
+                    if not selected_interface:
+                        for iface in interfaces:
+                            if iface.get("name") == "ether1" and iface.get("running"):
+                                total_rx = iface.get("rx_byte", 0)
+                                total_tx = iface.get("tx_byte", 0)
+                                selected_interface = "ether1"
+                                break
+                    
+                    # Third try: sum all running ether interfaces
+                    if not selected_interface:
+                        for iface in interfaces:
+                            name = iface.get("name", "")
+                            if name.startswith("ether") and iface.get("running"):
+                                total_rx += iface.get("rx_byte", 0)
+                                total_tx += iface.get("tx_byte", 0)
+                        if total_rx > 0 or total_tx > 0:
+                            selected_interface = "all-ethers-summed"
+                    
+                    logger.info(f"[BANDWIDTH] Router {router_id}: Using interface '{selected_interface}' for traffic - rx={total_rx}, tx={total_tx}")
                     
                     speed_data = speed_stats.get("data", {})
                     
@@ -5173,18 +5227,33 @@ async def collect_bandwidth_snapshot():
                     prev = prev_result.scalar_one_or_none()
                     
                     # Calculate actual average bps from byte counter difference
-                    avg_download_bps = 0
-                    avg_upload_bps = 0
+                    avg_download_bps = 0.0
+                    avg_upload_bps = 0.0
+                    time_diff = 0
                     if prev and prev.interface_rx_bytes > 0:
                         time_diff = (now - prev.recorded_at).total_seconds()
                         if time_diff > 0:
-                            # rx = download (from user perspective on bridge), tx = upload
+                            # For WAN interface (ether1): rx = download, tx = upload
+                            # For bridge: same perspective
                             byte_diff_rx = total_rx - prev.interface_rx_bytes
                             byte_diff_tx = total_tx - prev.interface_tx_bytes
-                            # Handle counter reset
+                            
+                            # Handle counter reset (when router reboots, counters reset)
                             if byte_diff_rx >= 0 and byte_diff_tx >= 0:
                                 avg_download_bps = (byte_diff_rx * 8) / time_diff  # bytes to bits
                                 avg_upload_bps = (byte_diff_tx * 8) / time_diff
+                                
+                                logger.info(f"[BANDWIDTH] Router {router_id}: time_diff={time_diff:.1f}s, byte_diff_rx={byte_diff_rx}, byte_diff_tx={byte_diff_tx}")
+                                logger.info(f"[BANDWIDTH] Router {router_id}: Calculated avg_download={avg_download_bps/1000000:.2f}Mbps, avg_upload={avg_upload_bps/1000000:.2f}Mbps")
+                            else:
+                                logger.warning(f"[BANDWIDTH] Router {router_id}: Counter reset detected (negative diff), skipping rate calc")
+                    else:
+                        logger.info(f"[BANDWIDTH] Router {router_id}: No previous snapshot or rx_bytes=0, first measurement")
+                    
+                    # Use hotspot hosts (bypassed) + ARP as better active device count
+                    active_devices = hotspot_hosts.get("bypassed", 0) + hotspot_hosts.get("authorized", 0)
+                    if active_devices == 0:
+                        active_devices = arp_entries.get("count", 0)
                     
                     snapshot = BandwidthSnapshot(
                         router_id=router_id,
@@ -5192,7 +5261,7 @@ async def collect_bandwidth_snapshot():
                         total_download_bps=int(speed_data.get("total_download_bps", 0)),
                         avg_upload_bps=avg_upload_bps,
                         avg_download_bps=avg_download_bps,
-                        active_queues=speed_data.get("active_queues", 0),
+                        active_queues=active_devices,  # Repurposed: now shows active devices (hotspot hosts + arp)
                         active_sessions=len(active_sessions.get("data", [])),
                         interface_rx_bytes=total_rx,
                         interface_tx_bytes=total_tx,
