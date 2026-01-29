@@ -3786,11 +3786,9 @@ async def get_dashboard_analytics(
         if router_id:
             active_customers_stmt = active_customers_stmt.where(Customer.router_id == router_id)
         
-        # Execute both DB queries in parallel
-        payments_result, active_result = await asyncio.gather(
-            db.execute(payments_stmt),
-            db.execute(active_customers_stmt)
-        )
+        # Execute DB queries sequentially (AsyncSession doesn't support concurrent operations)
+        payments_result = await db.execute(payments_stmt)
+        active_result = await db.execute(active_customers_stmt)
         
         all_payments = payments_result.all()
         active_customers = active_result.scalars().all()
