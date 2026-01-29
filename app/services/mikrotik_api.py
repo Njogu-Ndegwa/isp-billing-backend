@@ -52,6 +52,15 @@ class MikroTikAPI:
             self.sock = None
             self.connected = False
 
+    def _safe_int(self, value, default=0) -> int:
+        """Safely convert a value to int, handling empty strings and None"""
+        if value is None or value == "":
+            return default
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
+
     def encode_length(self, length: int) -> bytes:
         if length < 0x80:
             return struct.pack('B', length)
@@ -482,13 +491,13 @@ class MikroTikAPI:
                         "version": data.get("version", ""),
                         "build_time": data.get("build-time", ""),
                         "cpu": data.get("cpu", ""),
-                        "cpu_count": int(data.get("cpu-count", 1)),
-                        "cpu_frequency": int(data.get("cpu-frequency", 0)),
-                        "cpu_load": int(data.get("cpu-load", 0)),
-                        "free_memory": int(data.get("free-memory", 0)),
-                        "total_memory": int(data.get("total-memory", 0)),
-                        "free_hdd_space": int(data.get("free-hdd-space", 0)),
-                        "total_hdd_space": int(data.get("total-hdd-space", 0)),
+                        "cpu_count": self._safe_int(data.get("cpu-count"), 1),
+                        "cpu_frequency": self._safe_int(data.get("cpu-frequency")),
+                        "cpu_load": self._safe_int(data.get("cpu-load")),
+                        "free_memory": self._safe_int(data.get("free-memory")),
+                        "total_memory": self._safe_int(data.get("total-memory")),
+                        "free_hdd_space": self._safe_int(data.get("free-hdd-space")),
+                        "total_hdd_space": self._safe_int(data.get("total-hdd-space")),
                         "architecture_name": data.get("architecture-name", ""),
                         "board_name": data.get("board-name", ""),
                         "platform": data.get("platform", "")
@@ -515,12 +524,12 @@ class MikroTikAPI:
                         "type": iface.get("type", ""),
                         "running": iface.get("running") == "true",
                         "disabled": iface.get("disabled") == "true",
-                        "rx_byte": int(iface.get("rx-byte", 0)),
-                        "tx_byte": int(iface.get("tx-byte", 0)),
-                        "rx_packet": int(iface.get("rx-packet", 0)),
-                        "tx_packet": int(iface.get("tx-packet", 0)),
-                        "rx_error": int(iface.get("rx-error", 0)),
-                        "tx_error": int(iface.get("tx-error", 0))
+                        "rx_byte": self._safe_int(iface.get("rx-byte")),
+                        "tx_byte": self._safe_int(iface.get("tx-byte")),
+                        "rx_packet": self._safe_int(iface.get("rx-packet")),
+                        "tx_packet": self._safe_int(iface.get("tx-packet")),
+                        "rx_error": self._safe_int(iface.get("rx-error")),
+                        "tx_error": self._safe_int(iface.get("tx-error"))
                     })
                 return {"success": True, "data": interfaces}
             return {"error": "No interface data returned"}
@@ -542,10 +551,10 @@ class MikroTikAPI:
                         "address": session.get("address", ""),
                         "mac_address": session.get("mac-address", ""),
                         "uptime": session.get("uptime", ""),
-                        "bytes_in": int(session.get("bytes-in", 0)),
-                        "bytes_out": int(session.get("bytes-out", 0)),
-                        "packets_in": int(session.get("packets-in", 0)),
-                        "packets_out": int(session.get("packets-out", 0)),
+                        "bytes_in": self._safe_int(session.get("bytes-in")),
+                        "bytes_out": self._safe_int(session.get("bytes-out")),
+                        "packets_in": self._safe_int(session.get("packets-in")),
+                        "packets_out": self._safe_int(session.get("packets-out")),
                         "idle_time": session.get("idle-time", "")
                     })
                 return {"success": True, "data": sessions}
@@ -650,8 +659,8 @@ class MikroTikAPI:
                         "to_address": host.get("to-address", ""),
                         "authorized": is_authorized,
                         "bypassed": is_bypassed,
-                        "bytes_in": int(host.get("bytes-in", 0)),
-                        "bytes_out": int(host.get("bytes-out", 0)),
+                        "bytes_in": self._safe_int(host.get("bytes-in")),
+                        "bytes_out": self._safe_int(host.get("bytes-out")),
                         "idle_time": host.get("idle-time", ""),
                         "uptime": host.get("uptime", "")
                     })
@@ -792,6 +801,12 @@ class MikroTikAPI:
                     max_upload = self._parse_rate_to_bps(max_parts[0] if len(max_parts) > 0 else "0")
                     max_download = self._parse_rate_to_bps(max_parts[1] if len(max_parts) > 1 else "0")
                     
+                    # Parse bytes safely (format: "upload/download")
+                    bytes_str = q.get("bytes", "0/0")
+                    bytes_parts = bytes_str.split("/") if "/" in bytes_str else ["0", "0"]
+                    bytes_in = self._safe_int(bytes_parts[0]) if len(bytes_parts) > 0 else 0
+                    bytes_out = self._safe_int(bytes_parts[1]) if len(bytes_parts) > 1 else 0
+                    
                     queue_data = {
                         "name": q.get("name", ""),
                         "target": q.get("target", ""),
@@ -799,8 +814,8 @@ class MikroTikAPI:
                         "download_rate_bps": download_bps,
                         "max_upload_bps": max_upload,
                         "max_download_bps": max_download,
-                        "bytes_in": int(q.get("bytes", "0/0").split("/")[0] or 0),
-                        "bytes_out": int(q.get("bytes", "0/0").split("/")[1] if "/" in q.get("bytes", "0") else 0),
+                        "bytes_in": bytes_in,
+                        "bytes_out": bytes_out,
                         "disabled": q.get("disabled") == "true"
                     }
                     queues.append(queue_data)
