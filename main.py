@@ -46,6 +46,10 @@ mikrotik_lock = asyncio.Lock()  # Global lock to prevent concurrent MikroTik API
 _mikrotik_cache = {"data": None, "timestamp": None}
 _mikrotik_cache_ttl = 300  # seconds - limit to once per 5 minutes
 
+# MikroTik health cache per router (lighter TTL for real-time feel)
+_health_cache = {}  # router_id -> {"data": ..., "timestamp": ...}
+_health_cache_ttl = 30  # seconds - balance between freshness and load
+
 
 def _fetch_mikrotik_data_sync():
     """Synchronous MikroTik fetch - runs in thread pool to not block event loop"""
@@ -4288,7 +4292,25 @@ async def get_mikrotik_health(
     router_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get MikroTik router health metrics (CPU, memory, disk, uptime)"""
+    """Get MikroTik router health metrics (CPU, memory, disk, uptime, traffic).
+    
+    Cached for 30 seconds per router to prevent overloading MikroTik.
+    """
+    global _health_cache
+    
+    cache_key = router_id if router_id else "default"
+    
+    # Check cache first
+    if cache_key in _health_cache:
+        cached = _health_cache[cache_key]
+        age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
+        if age < _health_cache_ttl:
+            # Return cached data with cache info
+            result = cached["data"].copy()
+            result["cached"] = True
+            result["cache_age_seconds"] = round(age, 1)
+            return result
+    
     try:
         # Get router by ID or use default settings
         if router_id:
@@ -4307,11 +4329,20 @@ async def get_mikrotik_health(
             router_name = "Default Router"
         
         if not api.connect():
+            # Return stale cache if available when router unreachable
+            if cache_key in _health_cache:
+                result = _health_cache[cache_key]["data"].copy()
+                result["cached"] = True
+                result["cache_age_seconds"] = (datetime.utcnow() - _health_cache[cache_key]["timestamp"]).total_seconds()
+                result["stale"] = True
+                return result
             raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
         
         resources = api.get_system_resources()
         health = api.get_health()
         active_users = api.get_active_hotspot_users()
+        queue_stats = api.get_queue_speed_stats()
+        interface_traffic = api.get_interface_traffic()
         
         api.disconnect()
         
@@ -4324,7 +4355,28 @@ async def get_mikrotik_health(
         total_hdd = res_data.get("total_hdd_space", 1)
         free_hdd = res_data.get("free_hdd_space", 0)
         
-        return {
+        # Extract queue statistics for bypassed mode users
+        queue_data = queue_stats.get("data", {})
+        active_queues = queue_data.get("active_queues", 0)
+        total_queues = queue_data.get("total_queues", 0)
+        
+        # Process interface traffic data
+        interfaces = []
+        if interface_traffic.get("success"):
+            for iface in interface_traffic.get("data", []):
+                if iface.get("running") and not iface.get("disabled"):
+                    interfaces.append({
+                        "name": iface.get("name", ""),
+                        "type": iface.get("type", ""),
+                        "rx_bytes": iface.get("rx_byte", 0),
+                        "tx_bytes": iface.get("tx_byte", 0),
+                        "rx_packets": iface.get("rx_packet", 0),
+                        "tx_packets": iface.get("tx_packet", 0),
+                        "rx_errors": iface.get("rx_error", 0),
+                        "tx_errors": iface.get("tx_error", 0)
+                    })
+        
+        result = {
             "system": {
                 "uptime": res_data.get("uptime", ""),
                 "version": res_data.get("version", ""),
@@ -4349,11 +4401,32 @@ async def get_mikrotik_health(
                 "used_percent": round(((total_hdd - free_hdd) / total_hdd) * 100, 1) if total_hdd > 0 else 0
             },
             "health_sensors": health.get("data", {}),
-            "active_hotspot_sessions": len(active_users.get("data", [])),
+            "active_sessions": {
+                "hotspot_users": len(active_users.get("data", [])),
+                "active_queues": active_queues,
+                "total_queues": total_queues,
+                "note": "active_queues shows users with traffic (bypassed mode), hotspot_users shows authenticated hotspot sessions"
+            },
+            "bandwidth": {
+                "total_upload_mbps": queue_data.get("total_upload_mbps", 0),
+                "total_download_mbps": queue_data.get("total_download_mbps", 0),
+                "avg_upload_mbps": queue_data.get("avg_upload_mbps", 0),
+                "avg_download_mbps": queue_data.get("avg_download_mbps", 0)
+            },
+            "interfaces": interfaces,
             "router_id": router_id,
             "router_name": router_name,
             "generated_at": datetime.utcnow().isoformat()
         }
+        
+        # Update cache
+        _health_cache[cache_key] = {
+            "data": result,
+            "timestamp": datetime.utcnow()
+        }
+        
+        result["cached"] = False
+        return result
     except HTTPException:
         raise
     except Exception as e:
