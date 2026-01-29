@@ -4338,15 +4338,19 @@ async def get_mikrotik_health(
                 return result
             raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
         
-        # Fetch all data from router
+        # Fetch essential data from router (minimized API calls)
         resources = api.get_system_resources()
         health = api.get_health()
-        interface_traffic = api.get_interface_traffic()
         hotspot_hosts = api.get_hotspot_hosts()
-        arp_entries = api.get_arp_entries()
-        dhcp_leases = api.get_dhcp_leases()
+        interface_traffic = api.get_interface_traffic()
         
         api.disconnect()
+        
+        # Log any failures for debugging
+        if hotspot_hosts.get("error"):
+            logger.warning(f"[HEALTH] Router {router_id}: get_hotspot_hosts failed: {hotspot_hosts.get('error')}")
+        if interface_traffic.get("error"):
+            logger.warning(f"[HEALTH] Router {router_id}: get_interface_traffic failed: {interface_traffic.get('error')}")
         
         if resources.get("error"):
             raise HTTPException(status_code=500, detail=resources["error"])
@@ -4357,27 +4361,21 @@ async def get_mikrotik_health(
         total_hdd = res_data.get("total_hdd_space", 1)
         free_hdd = res_data.get("free_hdd_space", 0)
         
-        # Process interface traffic data - include ALL interfaces
+        # Process interface traffic data
         interfaces = []
         if interface_traffic.get("success"):
             for iface in interface_traffic.get("data", []):
-                interfaces.append({
-                    "name": iface.get("name", ""),
-                    "type": iface.get("type", ""),
-                    "running": iface.get("running", False),
-                    "disabled": iface.get("disabled", False),
-                    "rx_bytes": iface.get("rx_byte", 0),
-                    "tx_bytes": iface.get("tx_byte", 0),
-                    "rx_packets": iface.get("rx_packet", 0),
-                    "tx_packets": iface.get("tx_packet", 0),
-                    "rx_errors": iface.get("rx_error", 0),
-                    "tx_errors": iface.get("tx_error", 0)
-                })
+                if iface.get("running") and not iface.get("disabled"):
+                    interfaces.append({
+                        "name": iface.get("name", ""),
+                        "type": iface.get("type", ""),
+                        "rx_bytes": iface.get("rx_byte", 0),
+                        "tx_bytes": iface.get("tx_byte", 0)
+                    })
         
-        # Active devices from multiple sources
+        # Active users = hotspot hosts (bypassed + authorized)
         hotspot_data = hotspot_hosts if hotspot_hosts.get("success") else {}
-        arp_data = arp_entries if arp_entries.get("success") else {}
-        dhcp_data = dhcp_leases if dhcp_leases.get("success") else {}
+        active_users = hotspot_data.get("total", 0)
         
         result = {
             "system": {
@@ -4404,26 +4402,31 @@ async def get_mikrotik_health(
                 "used_percent": round(((total_hdd - free_hdd) / total_hdd) * 100, 1) if total_hdd > 0 else 0
             },
             "health_sensors": health.get("data", {}),
-            "active_devices": {
-                "hotspot_hosts_total": hotspot_data.get("total", 0),
-                "hotspot_authorized": hotspot_data.get("authorized", 0),
-                "hotspot_bypassed": hotspot_data.get("bypassed", 0),
-                "arp_entries": arp_data.get("count", 0),
-                "dhcp_leases_total": dhcp_data.get("total", 0),
-                "dhcp_leases_active": dhcp_data.get("active", 0),
-                "note": "hotspot_bypassed shows bypassed users, arp_entries shows all active network devices"
-            },
+            "active_users": active_users,
             "interfaces": interfaces,
             "router_id": router_id,
             "router_name": router_name,
             "generated_at": datetime.utcnow().isoformat()
         }
         
-        # Update cache
-        _health_cache[cache_key] = {
-            "data": result,
-            "timestamp": datetime.utcnow()
-        }
+        # Check if any data fetches failed
+        has_failures = (
+            interface_traffic.get("error") or 
+            hotspot_hosts.get("error")
+        )
+        
+        # Only cache if all data was fetched successfully
+        if not has_failures:
+            _health_cache[cache_key] = {
+                "data": result,
+                "timestamp": datetime.utcnow()
+            }
+        else:
+            result["incomplete"] = True
+            # Clear any existing bad cache
+            if cache_key in _health_cache:
+                del _health_cache[cache_key]
+            logger.warning(f"[HEALTH] Router {router_id}: Data incomplete, cache cleared")
         
         result["cached"] = False
         return result
