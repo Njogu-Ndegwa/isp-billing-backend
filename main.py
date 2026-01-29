@@ -4546,18 +4546,16 @@ async def get_bandwidth_history(
     
     Query params:
     - hours: Number of hours of history (default 24)
-    - router_id: Optional router ID (note: historical data is currently aggregated, 
-                 router_id included for future per-router snapshots)
+    - router_id: Optional router ID to filter bandwidth history for a specific router
     """
     try:
         since = datetime.utcnow() - timedelta(hours=hours)
         
-        # Note: BandwidthSnapshot is currently aggregate data from default router
-        # Future enhancement: add router_id to BandwidthSnapshot for per-router history
         query = select(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at >= since)
         
-        # If router_id provided and BandwidthSnapshot has router_id field, filter by it
-        # Currently BandwidthSnapshot is aggregate, so we just note the router_id in response
+        # Filter by router_id if provided
+        if router_id:
+            query = query.where(BandwidthSnapshot.router_id == router_id)
         
         result = await db.execute(query.order_by(BandwidthSnapshot.recorded_at.asc()))
         snapshots = result.scalars().all()
@@ -4566,6 +4564,7 @@ async def get_bandwidth_history(
         for s in snapshots:
             data.append({
                 "timestamp": s.recorded_at.isoformat(),
+                "routerId": s.router_id,
                 "totalUploadMbps": round(s.total_upload_bps / 1000000, 2),
                 "totalDownloadMbps": round(s.total_download_bps / 1000000, 2),
                 "avgUploadMbps": round(s.avg_upload_bps / 1000000, 2),
@@ -4584,7 +4583,6 @@ async def get_bandwidth_history(
         return {
             "router_id": router_id,
             "router_name": router_name,
-            "note": "Historical bandwidth data is currently aggregated from default router" if router_id else None,
             "history": data,
             "count": len(data),
             "periodHours": hours,
@@ -5004,8 +5002,32 @@ def _parse_speed_value(speed_str: str) -> float:
     except ValueError:
         return 0.0
 
+def _fetch_bandwidth_data_sync_for_router(router_info: dict):
+    """Sync helper for bandwidth collection from a specific router - runs in thread"""
+    api = MikroTikAPI(
+        router_info["ip_address"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=15
+    )
+    if not api.connect():
+        return None
+    active_sessions = api.get_active_hotspot_users()
+    traffic = api.get_interface_traffic()
+    speed_stats = api.get_queue_speed_stats()
+    queues = api.send_command("/queue/simple/print")
+    api.disconnect()
+    return {
+        "router_id": router_info["id"],
+        "active_sessions": active_sessions, 
+        "traffic": traffic, 
+        "speed_stats": speed_stats, 
+        "queues": queues
+    }
+
 def _fetch_bandwidth_data_sync():
-    """Sync helper for bandwidth collection - runs in thread"""
+    """Sync helper for bandwidth collection from default router - runs in thread (legacy)"""
     api = MikroTikAPI(
         settings.MIKROTIK_HOST,
         settings.MIKROTIK_USERNAME,
@@ -5020,130 +5042,159 @@ def _fetch_bandwidth_data_sync():
     speed_stats = api.get_queue_speed_stats()
     queues = api.send_command("/queue/simple/print")
     api.disconnect()
-    return {"active_sessions": active_sessions, "traffic": traffic, "speed_stats": speed_stats, "queues": queues}
+    return {"router_id": None, "active_sessions": active_sessions, "traffic": traffic, "speed_stats": speed_stats, "queues": queues}
 
 
 async def collect_bandwidth_snapshot():
-    """Collect bandwidth stats using interface counters for accurate averaging"""
+    """Collect bandwidth stats from all routers using interface counters for accurate averaging"""
     try:
-        raw = await asyncio.to_thread(_fetch_bandwidth_data_sync)
-        if not raw:
-            logger.warning("Failed to connect to MikroTik for bandwidth snapshot")
-            return
-        
-        active_sessions = raw["active_sessions"]
-        traffic = raw["traffic"]
-        speed_stats = raw["speed_stats"]
-        
-        # Sum traffic from bridge interface (main LAN) - most accurate for user traffic
-        total_rx = 0
-        total_tx = 0
-        for iface in traffic.get("data", []):
-            # Use bridge interface for aggregate user traffic
-            if iface.get("name") == "bridge" and iface.get("running"):
-                total_rx = iface.get("rx_byte", 0)
-                total_tx = iface.get("tx_byte", 0)
-                break
-        
         now = datetime.utcnow()
-        speed_data = speed_stats.get("data", {})
         
         async for db in get_db():
-            # Get previous snapshot to calculate rate
-            prev_result = await db.execute(
-                select(BandwidthSnapshot)
-                .order_by(BandwidthSnapshot.recorded_at.desc())
-                .limit(1)
-            )
-            prev = prev_result.scalar_one_or_none()
+            # Get all routers from database
+            routers_result = await db.execute(select(Router))
+            routers = routers_result.scalars().all()
             
-            # Calculate actual average bps from byte counter difference
-            avg_download_bps = 0
-            avg_upload_bps = 0
-            if prev and prev.interface_rx_bytes > 0:
-                time_diff = (now - prev.recorded_at).total_seconds()
-                if time_diff > 0:
-                    # rx = download (from user perspective on bridge), tx = upload
-                    byte_diff_rx = total_rx - prev.interface_rx_bytes
-                    byte_diff_tx = total_tx - prev.interface_tx_bytes
-                    # Handle counter reset
-                    if byte_diff_rx >= 0 and byte_diff_tx >= 0:
-                        avg_download_bps = (byte_diff_rx * 8) / time_diff  # bytes to bits
-                        avg_upload_bps = (byte_diff_tx * 8) / time_diff
+            if not routers:
+                logger.warning("No routers found in database for bandwidth collection")
+                return
             
-            snapshot = BandwidthSnapshot(
-                total_upload_bps=int(speed_data.get("total_upload_bps", 0)),
-                total_download_bps=int(speed_data.get("total_download_bps", 0)),
-                avg_upload_bps=avg_upload_bps,
-                avg_download_bps=avg_download_bps,
-                active_queues=speed_data.get("active_queues", 0),
-                active_sessions=len(active_sessions.get("data", [])),
-                interface_rx_bytes=total_rx,
-                interface_tx_bytes=total_tx,
-                recorded_at=now
-            )
-            
-            db.add(snapshot)
-            # Cleanup: delete records older than 1 day
-            cutoff = now - timedelta(days=1)
-            await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
-            
-            # Update user bandwidth usage from queues
-            queues = raw.get("queues", {})
-            if queues.get("success") and queues.get("data"):
-                for q in queues["data"]:
-                    # Extract MAC from comment
-                    comment = q.get("comment", "")
-                    mac = ""
-                    if "MAC:" in comment:
-                        mac = comment.split("MAC:")[1].split("|")[0].strip()
+            # Collect from each router
+            for router in routers:
+                try:
+                    router_info = {
+                        "id": router.id,
+                        "ip_address": router.ip_address,
+                        "username": router.username,
+                        "password": router.password,
+                        "port": router.port
+                    }
                     
-                    if not mac:
+                    raw = await asyncio.to_thread(_fetch_bandwidth_data_sync_for_router, router_info)
+                    if not raw:
+                        logger.warning(f"Failed to connect to router {router.name} ({router.ip_address}) for bandwidth snapshot")
                         continue
                     
-                    # Parse bytes
-                    bytes_str = q.get("bytes", "0/0")
-                    bytes_parts = bytes_str.split("/")
-                    upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 and bytes_parts[0].isdigit() else 0
-                    download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 and bytes_parts[1].isdigit() else 0
+                    active_sessions = raw["active_sessions"]
+                    traffic = raw["traffic"]
+                    speed_stats = raw["speed_stats"]
+                    router_id = raw["router_id"]
                     
-                    # Find customer by MAC
-                    cust_result = await db.execute(
-                        select(Customer).where(Customer.mac_address.ilike(f"%{mac}%"))
+                    # Sum traffic from bridge interface (main LAN) - most accurate for user traffic
+                    total_rx = 0
+                    total_tx = 0
+                    for iface in traffic.get("data", []):
+                        # Use bridge interface for aggregate user traffic
+                        if iface.get("name") == "bridge" and iface.get("running"):
+                            total_rx = iface.get("rx_byte", 0)
+                            total_tx = iface.get("tx_byte", 0)
+                            break
+                    
+                    speed_data = speed_stats.get("data", {})
+                    
+                    # Get previous snapshot for THIS router to calculate rate
+                    prev_result = await db.execute(
+                        select(BandwidthSnapshot)
+                        .where(BandwidthSnapshot.router_id == router_id)
+                        .order_by(BandwidthSnapshot.recorded_at.desc())
+                        .limit(1)
                     )
-                    customer = cust_result.scalar_one_or_none()
+                    prev = prev_result.scalar_one_or_none()
                     
-                    # Upsert usage record
-                    existing = await db.execute(
-                        select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == mac)
+                    # Calculate actual average bps from byte counter difference
+                    avg_download_bps = 0
+                    avg_upload_bps = 0
+                    if prev and prev.interface_rx_bytes > 0:
+                        time_diff = (now - prev.recorded_at).total_seconds()
+                        if time_diff > 0:
+                            # rx = download (from user perspective on bridge), tx = upload
+                            byte_diff_rx = total_rx - prev.interface_rx_bytes
+                            byte_diff_tx = total_tx - prev.interface_tx_bytes
+                            # Handle counter reset
+                            if byte_diff_rx >= 0 and byte_diff_tx >= 0:
+                                avg_download_bps = (byte_diff_rx * 8) / time_diff  # bytes to bits
+                                avg_upload_bps = (byte_diff_tx * 8) / time_diff
+                    
+                    snapshot = BandwidthSnapshot(
+                        router_id=router_id,
+                        total_upload_bps=int(speed_data.get("total_upload_bps", 0)),
+                        total_download_bps=int(speed_data.get("total_download_bps", 0)),
+                        avg_upload_bps=avg_upload_bps,
+                        avg_download_bps=avg_download_bps,
+                        active_queues=speed_data.get("active_queues", 0),
+                        active_sessions=len(active_sessions.get("data", [])),
+                        interface_rx_bytes=total_rx,
+                        interface_tx_bytes=total_tx,
+                        recorded_at=now
                     )
-                    usage = existing.scalar_one_or_none()
                     
-                    if usage:
-                        usage.upload_bytes = upload_bytes
-                        usage.download_bytes = download_bytes
-                        usage.target_ip = q.get("target", "")
-                        usage.max_limit = q.get("max-limit", "")
-                        usage.last_updated = now
-                        if customer:
-                            usage.customer_id = customer.id
-                    else:
-                        usage = UserBandwidthUsage(
-                            mac_address=mac,
-                            customer_id=customer.id if customer else None,
-                            queue_name=q.get("name", ""),
-                            target_ip=q.get("target", ""),
-                            upload_bytes=upload_bytes,
-                            download_bytes=download_bytes,
-                            max_limit=q.get("max-limit", ""),
-                            last_updated=now
-                        )
-                        db.add(usage)
+                    db.add(snapshot)
+                    
+                    # Update user bandwidth usage from queues for this router
+                    queues = raw.get("queues", {})
+                    if queues.get("success") and queues.get("data"):
+                        for q in queues["data"]:
+                            # Extract MAC from comment
+                            comment = q.get("comment", "")
+                            mac = ""
+                            if "MAC:" in comment:
+                                mac = comment.split("MAC:")[1].split("|")[0].strip()
+                            
+                            if not mac:
+                                continue
+                            
+                            # Parse bytes
+                            bytes_str = q.get("bytes", "0/0")
+                            bytes_parts = bytes_str.split("/")
+                            upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 and bytes_parts[0].isdigit() else 0
+                            download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 and bytes_parts[1].isdigit() else 0
+                            
+                            # Find customer by MAC
+                            cust_result = await db.execute(
+                                select(Customer).where(Customer.mac_address.ilike(f"%{mac}%"))
+                            )
+                            customer = cust_result.scalar_one_or_none()
+                            
+                            # Upsert usage record
+                            existing = await db.execute(
+                                select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == mac)
+                            )
+                            usage = existing.scalar_one_or_none()
+                            
+                            if usage:
+                                usage.upload_bytes = upload_bytes
+                                usage.download_bytes = download_bytes
+                                usage.max_limit = q.get("max-limit", "")
+                                usage.last_updated = now
+                                if customer:
+                                    usage.customer_id = customer.id
+                            else:
+                                usage = UserBandwidthUsage(
+                                    mac_address=mac,
+                                    customer_id=customer.id if customer else None,
+                                    queue_name=q.get("name", ""),
+                                    target_ip=q.get("target", ""),
+                                    upload_bytes=upload_bytes,
+                                    download_bytes=download_bytes,
+                                    max_limit=q.get("max-limit", ""),
+                                    last_updated=now
+                                )
+                                db.add(usage)
+                    
+                    logger.debug(f"Collected bandwidth snapshot for router {router.name} (ID: {router_id})")
+                    
+                except Exception as router_error:
+                    logger.error(f"Error collecting bandwidth from router {router.name}: {router_error}")
+                    continue
+            
+            # Cleanup: delete records older than 1 day (for all routers)
+            cutoff = now - timedelta(days=1)
+            await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
             
             await db.commit()
             break
         
-        logger.debug(f"📊 Bandwidth: ↑{avg_upload_bps/1000000:.2f}Mbps ↓{avg_download_bps/1000000:.2f}Mbps")
+        logger.info(f"📊 Bandwidth snapshot collected for {len(routers)} router(s)")
     except Exception as e:
         logger.error(f"Error collecting bandwidth snapshot: {e}")
 
