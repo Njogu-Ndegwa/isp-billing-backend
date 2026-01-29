@@ -573,6 +573,100 @@ class MikroTikAPI:
             logger.error(f"Error getting system health: {e}")
             return {"error": str(e)}
 
+    def get_arp_entries(self) -> Dict[str, Any]:
+        """Get ARP table entries - shows all devices that have communicated with router"""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/arp/print")
+            if result.get("success"):
+                entries = []
+                for entry in result.get("data", []):
+                    # Skip incomplete entries (no MAC yet)
+                    if entry.get("complete") == "false" or not entry.get("mac-address"):
+                        continue
+                    entries.append({
+                        "ip_address": entry.get("address", ""),
+                        "mac_address": entry.get("mac-address", ""),
+                        "interface": entry.get("interface", ""),
+                        "dynamic": entry.get("dynamic") == "true",
+                        "complete": entry.get("complete") == "true"
+                    })
+                return {"success": True, "data": entries, "count": len(entries)}
+            return {"error": "Failed to get ARP entries"}
+        except Exception as e:
+            logger.error(f"Error getting ARP entries: {e}")
+            return {"error": str(e)}
+
+    def get_dhcp_leases(self) -> Dict[str, Any]:
+        """Get DHCP server leases - shows devices that received IP via DHCP"""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/dhcp-server/lease/print")
+            if result.get("success"):
+                leases = []
+                active_count = 0
+                for lease in result.get("data", []):
+                    is_active = lease.get("status") == "bound"
+                    if is_active:
+                        active_count += 1
+                    leases.append({
+                        "ip_address": lease.get("address", ""),
+                        "mac_address": lease.get("mac-address", ""),
+                        "hostname": lease.get("host-name", ""),
+                        "server": lease.get("server", ""),
+                        "status": lease.get("status", ""),
+                        "active": is_active,
+                        "expires_after": lease.get("expires-after", ""),
+                        "last_seen": lease.get("last-seen", "")
+                    })
+                return {"success": True, "data": leases, "total": len(leases), "active": active_count}
+            return {"error": "Failed to get DHCP leases"}
+        except Exception as e:
+            logger.error(f"Error getting DHCP leases: {e}")
+            return {"error": str(e)}
+
+    def get_hotspot_hosts(self) -> Dict[str, Any]:
+        """Get hotspot hosts - all devices seen by hotspot (including bypassed)"""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/hotspot/host/print")
+            if result.get("success"):
+                hosts = []
+                authorized_count = 0
+                bypassed_count = 0
+                for host in result.get("data", []):
+                    is_authorized = host.get("authorized") == "true"
+                    is_bypassed = host.get("bypassed") == "true"
+                    if is_authorized:
+                        authorized_count += 1
+                    if is_bypassed:
+                        bypassed_count += 1
+                    hosts.append({
+                        "ip_address": host.get("address", ""),
+                        "mac_address": host.get("mac-address", ""),
+                        "to_address": host.get("to-address", ""),
+                        "authorized": is_authorized,
+                        "bypassed": is_bypassed,
+                        "bytes_in": int(host.get("bytes-in", 0)),
+                        "bytes_out": int(host.get("bytes-out", 0)),
+                        "idle_time": host.get("idle-time", ""),
+                        "uptime": host.get("uptime", "")
+                    })
+                return {
+                    "success": True, 
+                    "data": hosts, 
+                    "total": len(hosts),
+                    "authorized": authorized_count,
+                    "bypassed": bypassed_count
+                }
+            return {"error": "Failed to get hotspot hosts"}
+        except Exception as e:
+            logger.error(f"Error getting hotspot hosts: {e}")
+            return {"error": str(e)}
+
     def block_mac_address(self, mac_address: str) -> Dict[str, Any]:
         """Block a MAC address by changing IP binding to 'blocked' type"""
         if not self.connected:

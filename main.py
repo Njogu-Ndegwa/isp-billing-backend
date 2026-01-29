@@ -4338,11 +4338,13 @@ async def get_mikrotik_health(
                 return result
             raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
         
+        # Fetch all data from router
         resources = api.get_system_resources()
         health = api.get_health()
-        active_users = api.get_active_hotspot_users()
-        queue_stats = api.get_queue_speed_stats()
         interface_traffic = api.get_interface_traffic()
+        hotspot_hosts = api.get_hotspot_hosts()
+        arp_entries = api.get_arp_entries()
+        dhcp_leases = api.get_dhcp_leases()
         
         api.disconnect()
         
@@ -4355,26 +4357,27 @@ async def get_mikrotik_health(
         total_hdd = res_data.get("total_hdd_space", 1)
         free_hdd = res_data.get("free_hdd_space", 0)
         
-        # Extract queue statistics for bypassed mode users
-        queue_data = queue_stats.get("data", {})
-        active_queues = queue_data.get("active_queues", 0)
-        total_queues = queue_data.get("total_queues", 0)
-        
-        # Process interface traffic data
+        # Process interface traffic data - include ALL interfaces
         interfaces = []
         if interface_traffic.get("success"):
             for iface in interface_traffic.get("data", []):
-                if iface.get("running") and not iface.get("disabled"):
-                    interfaces.append({
-                        "name": iface.get("name", ""),
-                        "type": iface.get("type", ""),
-                        "rx_bytes": iface.get("rx_byte", 0),
-                        "tx_bytes": iface.get("tx_byte", 0),
-                        "rx_packets": iface.get("rx_packet", 0),
-                        "tx_packets": iface.get("tx_packet", 0),
-                        "rx_errors": iface.get("rx_error", 0),
-                        "tx_errors": iface.get("tx_error", 0)
-                    })
+                interfaces.append({
+                    "name": iface.get("name", ""),
+                    "type": iface.get("type", ""),
+                    "running": iface.get("running", False),
+                    "disabled": iface.get("disabled", False),
+                    "rx_bytes": iface.get("rx_byte", 0),
+                    "tx_bytes": iface.get("tx_byte", 0),
+                    "rx_packets": iface.get("rx_packet", 0),
+                    "tx_packets": iface.get("tx_packet", 0),
+                    "rx_errors": iface.get("rx_error", 0),
+                    "tx_errors": iface.get("tx_error", 0)
+                })
+        
+        # Active devices from multiple sources
+        hotspot_data = hotspot_hosts if hotspot_hosts.get("success") else {}
+        arp_data = arp_entries if arp_entries.get("success") else {}
+        dhcp_data = dhcp_leases if dhcp_leases.get("success") else {}
         
         result = {
             "system": {
@@ -4401,17 +4404,14 @@ async def get_mikrotik_health(
                 "used_percent": round(((total_hdd - free_hdd) / total_hdd) * 100, 1) if total_hdd > 0 else 0
             },
             "health_sensors": health.get("data", {}),
-            "active_sessions": {
-                "hotspot_users": len(active_users.get("data", [])),
-                "active_queues": active_queues,
-                "total_queues": total_queues,
-                "note": "active_queues shows users with traffic (bypassed mode), hotspot_users shows authenticated hotspot sessions"
-            },
-            "bandwidth": {
-                "total_upload_mbps": queue_data.get("total_upload_mbps", 0),
-                "total_download_mbps": queue_data.get("total_download_mbps", 0),
-                "avg_upload_mbps": queue_data.get("avg_upload_mbps", 0),
-                "avg_download_mbps": queue_data.get("avg_download_mbps", 0)
+            "active_devices": {
+                "hotspot_hosts_total": hotspot_data.get("total", 0),
+                "hotspot_authorized": hotspot_data.get("authorized", 0),
+                "hotspot_bypassed": hotspot_data.get("bypassed", 0),
+                "arp_entries": arp_data.get("count", 0),
+                "dhcp_leases_total": dhcp_data.get("total", 0),
+                "dhcp_leases_active": dhcp_data.get("active", 0),
+                "note": "hotspot_bypassed shows bypassed users, arp_entries shows all active network devices"
             },
             "interfaces": interfaces,
             "router_id": router_id,
