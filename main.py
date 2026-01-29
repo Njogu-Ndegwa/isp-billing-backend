@@ -4292,8 +4292,9 @@ async def get_mikrotik_health(
     router_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get MikroTik router health metrics (CPU, memory, disk, uptime, traffic).
+    """Get MikroTik router health metrics (CPU, memory, disk, uptime).
     
+    Active users and bandwidth come from background job data (more reliable).
     Cached for 30 seconds per router to prevent overloading MikroTik.
     """
     global _health_cache
@@ -4338,19 +4339,11 @@ async def get_mikrotik_health(
                 return result
             raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
         
-        # Fetch essential data from router (minimized API calls)
+        # Only fetch system resources (CPU, memory, uptime) - minimal API calls
         resources = api.get_system_resources()
         health = api.get_health()
-        hotspot_hosts = api.get_hotspot_hosts()
-        interface_traffic = api.get_interface_traffic()
         
         api.disconnect()
-        
-        # Log any failures for debugging
-        if hotspot_hosts.get("error"):
-            logger.warning(f"[HEALTH] Router {router_id}: get_hotspot_hosts failed: {hotspot_hosts.get('error')}")
-        if interface_traffic.get("error"):
-            logger.warning(f"[HEALTH] Router {router_id}: get_interface_traffic failed: {interface_traffic.get('error')}")
         
         if resources.get("error"):
             raise HTTPException(status_code=500, detail=resources["error"])
@@ -4361,21 +4354,24 @@ async def get_mikrotik_health(
         total_hdd = res_data.get("total_hdd_space", 1)
         free_hdd = res_data.get("free_hdd_space", 0)
         
-        # Process interface traffic data
-        interfaces = []
-        if interface_traffic.get("success"):
-            for iface in interface_traffic.get("data", []):
-                if iface.get("running") and not iface.get("disabled"):
-                    interfaces.append({
-                        "name": iface.get("name", ""),
-                        "type": iface.get("type", ""),
-                        "rx_bytes": iface.get("rx_byte", 0),
-                        "tx_bytes": iface.get("tx_byte", 0)
-                    })
+        # Get active users and bandwidth from latest snapshot (collected by background job)
+        active_users = 0
+        current_download_mbps = 0.0
+        current_upload_mbps = 0.0
+        snapshot_age = None
         
-        # Active users = hotspot hosts (bypassed + authorized)
-        hotspot_data = hotspot_hosts if hotspot_hosts.get("success") else {}
-        active_users = hotspot_data.get("total", 0)
+        snapshot_query = select(BandwidthSnapshot).order_by(BandwidthSnapshot.recorded_at.desc()).limit(1)
+        if router_id:
+            snapshot_query = snapshot_query.where(BandwidthSnapshot.router_id == router_id)
+        
+        snapshot_result = await db.execute(snapshot_query)
+        latest_snapshot = snapshot_result.scalar_one_or_none()
+        
+        if latest_snapshot:
+            active_users = latest_snapshot.active_queues  # We store active users here
+            current_download_mbps = round(latest_snapshot.avg_download_bps / 1000000, 2)
+            current_upload_mbps = round(latest_snapshot.avg_upload_bps / 1000000, 2)
+            snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
         
         result = {
             "system": {
@@ -4403,30 +4399,21 @@ async def get_mikrotik_health(
             },
             "health_sensors": health.get("data", {}),
             "active_users": active_users,
-            "interfaces": interfaces,
+            "bandwidth": {
+                "download_mbps": current_download_mbps,
+                "upload_mbps": current_upload_mbps
+            },
+            "snapshot_age_seconds": round(snapshot_age, 1) if snapshot_age else None,
             "router_id": router_id,
             "router_name": router_name,
             "generated_at": datetime.utcnow().isoformat()
         }
         
-        # Check if any data fetches failed
-        has_failures = (
-            interface_traffic.get("error") or 
-            hotspot_hosts.get("error")
-        )
-        
-        # Only cache if all data was fetched successfully
-        if not has_failures:
-            _health_cache[cache_key] = {
-                "data": result,
-                "timestamp": datetime.utcnow()
-            }
-        else:
-            result["incomplete"] = True
-            # Clear any existing bad cache
-            if cache_key in _health_cache:
-                del _health_cache[cache_key]
-            logger.warning(f"[HEALTH] Router {router_id}: Data incomplete, cache cleared")
+        # Always cache - we're using reliable DB data now
+        _health_cache[cache_key] = {
+            "data": result,
+            "timestamp": datetime.utcnow()
+        }
         
         result["cached"] = False
         return result
