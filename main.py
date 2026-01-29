@@ -3415,16 +3415,21 @@ async def remove_user_all_methods(
 @app.get("/api/dashboard/overview")
 async def get_dashboard_overview(
     user_id: int = 1,
+    router_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """
     Get dashboard overview with key business metrics
     
+    Query params:
+    - user_id: Reseller/user ID (default 1)
+    - router_id: Optional router ID to filter metrics for a specific router
+    
     Returns:
     - Total revenue (today, this week, this month, all time)
     - Active guests count
     - Total guests count
-    - Revenue by router
+    - Revenue by router (or single router if router_id specified)
     - Revenue by plan
     - Recent transactions
     """
@@ -3437,8 +3442,10 @@ async def get_dashboard_overview(
         week_start = today_start - timedelta(days=now.weekday())
         month_start = datetime(now.year, now.month, 1)
         
-        # Get all customers for this user
+        # Get all customers for this user (optionally filtered by router)
         customers_stmt = select(Customer).where(Customer.user_id == user_id)
+        if router_id:
+            customers_stmt = customers_stmt.where(Customer.router_id == router_id)
         customers_result = await db.execute(customers_stmt)
         all_customers = customers_result.scalars().all()
         
@@ -3448,36 +3455,83 @@ async def get_dashboard_overview(
         # Get revenue from customer_payments
         from app.db.models import CustomerPayment
         
-        # Total revenue all time
-        total_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
-            CustomerPayment.reseller_id == user_id
-        )
-        total_revenue_result = await db.execute(total_revenue_stmt)
-        total_revenue = float(total_revenue_result.scalar() or 0)
-        
-        # Today's revenue
-        today_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
-            CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= today_start
-        )
-        today_revenue_result = await db.execute(today_revenue_stmt)
-        today_revenue = float(today_revenue_result.scalar() or 0)
-        
-        # This week's revenue
-        week_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
-            CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= week_start
-        )
-        week_revenue_result = await db.execute(week_revenue_stmt)
-        week_revenue = float(week_revenue_result.scalar() or 0)
-        
-        # This month's revenue
-        month_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
-            CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= month_start
-        )
-        month_revenue_result = await db.execute(month_revenue_stmt)
-        month_revenue = float(month_revenue_result.scalar() or 0)
+        # Build base filter conditions for payments (joins through Customer for router filtering)
+        if router_id:
+            # When router_id is specified, join with Customer to filter by router
+            # Total revenue all time
+            total_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                Customer.router_id == router_id
+            )
+            total_revenue_result = await db.execute(total_revenue_stmt)
+            total_revenue = float(total_revenue_result.scalar() or 0)
+            
+            # Today's revenue
+            today_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                Customer.router_id == router_id,
+                CustomerPayment.created_at >= today_start
+            )
+            today_revenue_result = await db.execute(today_revenue_stmt)
+            today_revenue = float(today_revenue_result.scalar() or 0)
+            
+            # This week's revenue
+            week_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                Customer.router_id == router_id,
+                CustomerPayment.created_at >= week_start
+            )
+            week_revenue_result = await db.execute(week_revenue_stmt)
+            week_revenue = float(week_revenue_result.scalar() or 0)
+            
+            # This month's revenue
+            month_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                Customer.router_id == router_id,
+                CustomerPayment.created_at >= month_start
+            )
+            month_revenue_result = await db.execute(month_revenue_stmt)
+            month_revenue = float(month_revenue_result.scalar() or 0)
+        else:
+            # No router filter - original behavior
+            # Total revenue all time
+            total_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+                CustomerPayment.reseller_id == user_id
+            )
+            total_revenue_result = await db.execute(total_revenue_stmt)
+            total_revenue = float(total_revenue_result.scalar() or 0)
+            
+            # Today's revenue
+            today_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= today_start
+            )
+            today_revenue_result = await db.execute(today_revenue_stmt)
+            today_revenue = float(today_revenue_result.scalar() or 0)
+            
+            # This week's revenue
+            week_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= week_start
+            )
+            week_revenue_result = await db.execute(week_revenue_stmt)
+            week_revenue = float(week_revenue_result.scalar() or 0)
+            
+            # This month's revenue
+            month_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= month_start
+            )
+            month_revenue_result = await db.execute(month_revenue_stmt)
+            month_revenue = float(month_revenue_result.scalar() or 0)
         
         # Revenue by router
         router_revenue_stmt = select(
@@ -3491,7 +3545,10 @@ async def get_dashboard_overview(
             CustomerPayment, CustomerPayment.customer_id == Customer.id
         ).where(
             Router.user_id == user_id
-        ).group_by(Router.id, Router.name)
+        )
+        if router_id:
+            router_revenue_stmt = router_revenue_stmt.where(Router.id == router_id)
+        router_revenue_stmt = router_revenue_stmt.group_by(Router.id, Router.name)
         
         router_revenue_result = await db.execute(router_revenue_stmt)
         router_revenue = [
@@ -3504,7 +3561,7 @@ async def get_dashboard_overview(
             for row in router_revenue_result
         ]
         
-        # Revenue by plan
+        # Revenue by plan (filtered by router if specified)
         plan_revenue_stmt = select(
             Plan.id,
             Plan.name,
@@ -3517,7 +3574,10 @@ async def get_dashboard_overview(
             CustomerPayment, CustomerPayment.customer_id == Customer.id
         ).where(
             Plan.user_id == user_id
-        ).group_by(Plan.id, Plan.name, Plan.price)
+        )
+        if router_id:
+            plan_revenue_stmt = plan_revenue_stmt.where(Customer.router_id == router_id)
+        plan_revenue_stmt = plan_revenue_stmt.group_by(Plan.id, Plan.name, Plan.price)
         
         plan_revenue_result = await db.execute(plan_revenue_stmt)
         plan_revenue = [
@@ -3538,7 +3598,10 @@ async def get_dashboard_overview(
             Plan, Customer.plan_id == Plan.id, isouter=True
         ).where(
             CustomerPayment.reseller_id == user_id
-        ).order_by(CustomerPayment.created_at.desc()).limit(10)
+        )
+        if router_id:
+            recent_txn_stmt = recent_txn_stmt.where(Customer.router_id == router_id)
+        recent_txn_stmt = recent_txn_stmt.order_by(CustomerPayment.created_at.desc()).limit(10)
         
         recent_txn_result = await db.execute(recent_txn_stmt)
         recent_transactions = [
@@ -3562,7 +3625,10 @@ async def get_dashboard_overview(
             Customer.expiry.isnot(None),
             Customer.expiry <= expiring_soon_date,
             Customer.expiry > now
-        ).order_by(Customer.expiry)
+        )
+        if router_id:
+            expiring_stmt = expiring_stmt.where(Customer.router_id == router_id)
+        expiring_stmt = expiring_stmt.order_by(Customer.expiry)
         
         expiring_result = await db.execute(expiring_stmt)
         expiring_soon = [
@@ -3577,7 +3643,16 @@ async def get_dashboard_overview(
             for c in expiring_result.scalars().all()
         ]
         
+        # Get router name if filtered
+        router_name = None
+        if router_id:
+            router_result = await db.execute(select(Router).where(Router.id == router_id))
+            router_obj = router_result.scalar_one_or_none()
+            router_name = router_obj.name if router_obj else None
+        
         return {
+            "router_id": router_id,
+            "router_name": router_name,
             "revenue": {
                 "today": today_revenue,
                 "this_week": week_revenue,
@@ -3603,6 +3678,7 @@ async def get_dashboard_overview(
 @app.get("/api/dashboard/analytics")
 async def get_dashboard_analytics(
     user_id: int = 1,
+    router_id: Optional[int] = None,
     days: Optional[int] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -3613,6 +3689,7 @@ async def get_dashboard_analytics(
     Comprehensive analytics endpoint with flexible filtering.
     
     Query params (priority: start_date/end_date > preset > days):
+    - router_id: Optional router ID to filter analytics for a specific router
     - start_date: YYYY-MM-DD (inclusive)
     - end_date: YYYY-MM-DD (inclusive, defaults to today)
     - preset: today, yesterday, this_week, last_week, this_month, last_month, 
@@ -3695,7 +3772,10 @@ async def get_dashboard_analytics(
             CustomerPayment.reseller_id == user_id,
             CustomerPayment.created_at >= filter_start,
             CustomerPayment.created_at < filter_end
-        ).order_by(CustomerPayment.created_at.desc())
+        )
+        if router_id:
+            payments_stmt = payments_stmt.where(Customer.router_id == router_id)
+        payments_stmt = payments_stmt.order_by(CustomerPayment.created_at.desc())
         
         active_customers_stmt = select(Customer).options(
             selectinload(Customer.plan)
@@ -3703,6 +3783,8 @@ async def get_dashboard_analytics(
             Customer.user_id == user_id,
             Customer.status == CustomerStatus.ACTIVE
         )
+        if router_id:
+            active_customers_stmt = active_customers_stmt.where(Customer.router_id == router_id)
         
         # Execute both DB queries in parallel
         payments_result, active_result = await asyncio.gather(
@@ -3902,7 +3984,16 @@ async def get_dashboard_analytics(
         avg_download_mbps = round(total_download / speed_count, 2) if speed_count > 0 else 0
         avg_upload_mbps = round(total_upload / speed_count, 2) if speed_count > 0 else 0
         
+        # Get router name if filtered
+        router_name = None
+        if router_id:
+            router_result = await db.execute(select(Router).where(Router.id == router_id))
+            router_obj = router_result.scalar_one_or_none()
+            router_name = router_obj.name if router_obj else None
+        
         return {
+            "router_id": router_id,
+            "router_name": router_name,
             "extractedAt": now.isoformat(),
             "period": {
                 "label": period_label,
@@ -4447,16 +4538,28 @@ async def get_mikrotik_active_sessions(
 @app.get("/api/mikrotik/bandwidth-history")
 async def get_bandwidth_history(
     hours: int = 24,
+    router_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get historical bandwidth data for graphing. Default last 24 hours."""
+    """
+    Get historical bandwidth data for graphing. Default last 24 hours.
+    
+    Query params:
+    - hours: Number of hours of history (default 24)
+    - router_id: Optional router ID (note: historical data is currently aggregated, 
+                 router_id included for future per-router snapshots)
+    """
     try:
         since = datetime.utcnow() - timedelta(hours=hours)
-        result = await db.execute(
-            select(BandwidthSnapshot)
-            .where(BandwidthSnapshot.recorded_at >= since)
-            .order_by(BandwidthSnapshot.recorded_at.asc())
-        )
+        
+        # Note: BandwidthSnapshot is currently aggregate data from default router
+        # Future enhancement: add router_id to BandwidthSnapshot for per-router history
+        query = select(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at >= since)
+        
+        # If router_id provided and BandwidthSnapshot has router_id field, filter by it
+        # Currently BandwidthSnapshot is aggregate, so we just note the router_id in response
+        
+        result = await db.execute(query.order_by(BandwidthSnapshot.recorded_at.asc()))
         snapshots = result.scalars().all()
         
         data = []
@@ -4471,7 +4574,17 @@ async def get_bandwidth_history(
                 "activeSessions": s.active_sessions
             })
         
+        # Get router name if specified
+        router_name = None
+        if router_id:
+            router_result = await db.execute(select(Router).where(Router.id == router_id))
+            router_obj = router_result.scalar_one_or_none()
+            router_name = router_obj.name if router_obj else None
+        
         return {
+            "router_id": router_id,
+            "router_name": router_name,
+            "note": "Historical bandwidth data is currently aggregated from default router" if router_id else None,
             "history": data,
             "count": len(data),
             "periodHours": hours,
@@ -4483,18 +4596,34 @@ async def get_bandwidth_history(
 
 
 @app.get("/api/mikrotik/top-users")
-async def get_top_bandwidth_users(limit: int = 10, db: AsyncSession = Depends(get_db)):
+async def get_top_bandwidth_users(
+    limit: int = 10, 
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Get top bandwidth users sorted by total download.
     Reads from cached DB data (updated every 2 min by background job).
+    
+    Query params:
+    - limit: Number of top users to return (default 10)
+    - router_id: Optional router ID to filter users for a specific router
     """
     try:
-        # Read from database instead of hitting MikroTik
-        result = await db.execute(
-            select(UserBandwidthUsage)
-            .order_by(UserBandwidthUsage.download_bytes.desc())
-            .limit(limit)
-        )
+        # Build query with optional router filtering
+        if router_id:
+            # Join with Customer to filter by router
+            query = select(UserBandwidthUsage).join(
+                Customer, UserBandwidthUsage.customer_id == Customer.id
+            ).where(
+                Customer.router_id == router_id
+            ).order_by(UserBandwidthUsage.download_bytes.desc()).limit(limit)
+        else:
+            query = select(UserBandwidthUsage).order_by(
+                UserBandwidthUsage.download_bytes.desc()
+            ).limit(limit)
+        
+        result = await db.execute(query)
         usage_records = result.scalars().all()
         
         users = []
@@ -4504,6 +4633,7 @@ async def get_top_bandwidth_users(limit: int = 10, db: AsyncSession = Depends(ge
             # Get customer info
             customer_name = None
             customer_phone = None
+            customer_router_id = None
             if u.customer_id:
                 cust_result = await db.execute(
                     select(Customer).where(Customer.id == u.customer_id)
@@ -4512,6 +4642,7 @@ async def get_top_bandwidth_users(limit: int = 10, db: AsyncSession = Depends(ge
                 if customer:
                     customer_name = customer.name
                     customer_phone = customer.phone
+                    customer_router_id = customer.router_id
             
             users.append({
                 "mac": u.mac_address,
@@ -4528,14 +4659,30 @@ async def get_top_bandwidth_users(limit: int = 10, db: AsyncSession = Depends(ge
                 "lastUpdated": u.last_updated.isoformat() if u.last_updated else None,
                 "customerId": u.customer_id,
                 "customerName": customer_name,
-                "customerPhone": customer_phone
+                "customerPhone": customer_phone,
+                "routerId": customer_router_id
             })
         
-        # Get total count
-        count_result = await db.execute(select(UserBandwidthUsage))
+        # Get total count (with optional router filter)
+        if router_id:
+            count_query = select(UserBandwidthUsage).join(
+                Customer, UserBandwidthUsage.customer_id == Customer.id
+            ).where(Customer.router_id == router_id)
+        else:
+            count_query = select(UserBandwidthUsage)
+        count_result = await db.execute(count_query)
         total_count = len(count_result.scalars().all())
         
+        # Get router name if filtered
+        router_name = None
+        if router_id:
+            router_result = await db.execute(select(Router).where(Router.id == router_id))
+            router_obj = router_result.scalar_one_or_none()
+            router_name = router_obj.name if router_obj else None
+        
         return {
+            "router_id": router_id,
+            "router_name": router_name,
             "topUsers": users,
             "totalTracked": total_count,
             "generatedAt": datetime.utcnow().isoformat()
@@ -4548,6 +4695,7 @@ async def get_top_bandwidth_users(limit: int = 10, db: AsyncSession = Depends(ge
 @app.get("/api/dashboard/daily-revenue")
 async def get_daily_revenue_metrics(
     user_id: int = 1,
+    router_id: Optional[int] = None,
     date: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
@@ -4556,6 +4704,7 @@ async def get_daily_revenue_metrics(
     Returns data suitable for plotting revenue accumulation throughout the day.
     
     Query params:
+    - router_id: Optional router ID to filter revenue for a specific router
     - date: YYYY-MM-DD format (defaults to today)
     """
     try:
@@ -4575,14 +4724,27 @@ async def get_daily_revenue_metrics(
         day_end = day_start + timedelta(days=1)
         
         # Get all payments for the day ordered by time
-        payments_stmt = select(
-            CustomerPayment.amount,
-            CustomerPayment.created_at
-        ).where(
-            CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= day_start,
-            CustomerPayment.created_at < day_end
-        ).order_by(CustomerPayment.created_at)
+        if router_id:
+            payments_stmt = select(
+                CustomerPayment.amount,
+                CustomerPayment.created_at
+            ).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= day_start,
+                CustomerPayment.created_at < day_end,
+                Customer.router_id == router_id
+            ).order_by(CustomerPayment.created_at)
+        else:
+            payments_stmt = select(
+                CustomerPayment.amount,
+                CustomerPayment.created_at
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= day_start,
+                CustomerPayment.created_at < day_end
+            ).order_by(CustomerPayment.created_at)
         
         result = await db.execute(payments_stmt)
         payments = result.all()
@@ -4618,7 +4780,16 @@ async def get_daily_revenue_metrics(
         # Convert to list sorted by hour
         hourly_list = [hourly_data[h] for h in range(24)]
         
+        # Get router name if filtered
+        router_name = None
+        if router_id:
+            router_result = await db.execute(select(Router).where(Router.id == router_id))
+            router_obj = router_result.scalar_one_or_none()
+            router_name = router_obj.name if router_obj else None
+        
         return {
+            "router_id": router_id,
+            "router_name": router_name,
             "date": day_start.strftime("%Y-%m-%d"),
             "date_label": day_start.strftime("%B %d, %Y"),
             "total_revenue": round(cumulative, 2),
@@ -4636,6 +4807,7 @@ async def get_daily_revenue_metrics(
 @app.get("/api/dashboard/stats")
 async def get_dashboard_stats(
     user_id: int = 1,
+    router_id: Optional[int] = None,
     period: int = 30,
     db: AsyncSession = Depends(get_db)
 ):
@@ -4643,6 +4815,7 @@ async def get_dashboard_stats(
     Get dashboard statistics with proper averages based on period.
     
     Query params:
+    - router_id: Optional router ID to filter stats for a specific router
     - period: Number of days to calculate stats for (7, 30, 90, etc.)
     
     Returns averages calculated over the specified period.
@@ -4655,39 +4828,91 @@ async def get_dashboard_stats(
         period_start = now - timedelta(days=period)
         today_start = datetime(now.year, now.month, now.day)
         
-        # Total revenue in period
-        period_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
-            CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= period_start
-        )
-        period_revenue = float((await db.execute(period_revenue_stmt)).scalar() or 0)
-        
-        # Total transactions in period
-        period_txn_stmt = select(func.count(CustomerPayment.id)).where(
-            CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= period_start
-        )
-        period_transactions = (await db.execute(period_txn_stmt)).scalar() or 0
-        
-        # Unique customers in period
-        period_customers_stmt = select(func.count(func.distinct(CustomerPayment.customer_id))).where(
-            CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= period_start
-        )
-        period_unique_customers = (await db.execute(period_customers_stmt)).scalar() or 0
-        
-        # Today's stats
-        today_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
-            CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= today_start
-        )
-        today_revenue = float((await db.execute(today_revenue_stmt)).scalar() or 0)
-        
-        today_txn_stmt = select(func.count(CustomerPayment.id)).where(
-            CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= today_start
-        )
-        today_transactions = (await db.execute(today_txn_stmt)).scalar() or 0
+        # Build queries with optional router filtering
+        if router_id:
+            # Total revenue in period (with router filter)
+            period_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= period_start,
+                Customer.router_id == router_id
+            )
+            period_revenue = float((await db.execute(period_revenue_stmt)).scalar() or 0)
+            
+            # Total transactions in period
+            period_txn_stmt = select(func.count(CustomerPayment.id)).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= period_start,
+                Customer.router_id == router_id
+            )
+            period_transactions = (await db.execute(period_txn_stmt)).scalar() or 0
+            
+            # Unique customers in period
+            period_customers_stmt = select(func.count(func.distinct(CustomerPayment.customer_id))).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= period_start,
+                Customer.router_id == router_id
+            )
+            period_unique_customers = (await db.execute(period_customers_stmt)).scalar() or 0
+            
+            # Today's stats
+            today_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= today_start,
+                Customer.router_id == router_id
+            )
+            today_revenue = float((await db.execute(today_revenue_stmt)).scalar() or 0)
+            
+            today_txn_stmt = select(func.count(CustomerPayment.id)).join(
+                Customer, CustomerPayment.customer_id == Customer.id
+            ).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= today_start,
+                Customer.router_id == router_id
+            )
+            today_transactions = (await db.execute(today_txn_stmt)).scalar() or 0
+        else:
+            # Original queries without router filter
+            # Total revenue in period
+            period_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= period_start
+            )
+            period_revenue = float((await db.execute(period_revenue_stmt)).scalar() or 0)
+            
+            # Total transactions in period
+            period_txn_stmt = select(func.count(CustomerPayment.id)).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= period_start
+            )
+            period_transactions = (await db.execute(period_txn_stmt)).scalar() or 0
+            
+            # Unique customers in period
+            period_customers_stmt = select(func.count(func.distinct(CustomerPayment.customer_id))).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= period_start
+            )
+            period_unique_customers = (await db.execute(period_customers_stmt)).scalar() or 0
+            
+            # Today's stats
+            today_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= today_start
+            )
+            today_revenue = float((await db.execute(today_revenue_stmt)).scalar() or 0)
+            
+            today_txn_stmt = select(func.count(CustomerPayment.id)).where(
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.created_at >= today_start
+            )
+            today_transactions = (await db.execute(today_txn_stmt)).scalar() or 0
         
         # Calculate averages for the period
         avg_daily_revenue = round(period_revenue / period, 2) if period > 0 else 0
@@ -4702,6 +4927,8 @@ async def get_dashboard_stats(
             Customer.user_id == user_id,
             Customer.status == CustomerStatus.ACTIVE
         )
+        if router_id:
+            active_customers_stmt = active_customers_stmt.where(Customer.router_id == router_id)
         active_result = await db.execute(active_customers_stmt)
         active_customers = active_result.scalars().all()
         
@@ -4724,7 +4951,16 @@ async def get_dashboard_stats(
         avg_download_speed = round(total_download / speed_count, 2) if speed_count > 0 else 0
         avg_upload_speed = round(total_upload / speed_count, 2) if speed_count > 0 else 0
         
+        # Get router name if filtered
+        router_name = None
+        if router_id:
+            router_result = await db.execute(select(Router).where(Router.id == router_id))
+            router_obj = router_result.scalar_one_or_none()
+            router_name = router_obj.name if router_obj else None
+        
         return {
+            "router_id": router_id,
+            "router_name": router_name,
             "period_days": period,
             "period_start": period_start.isoformat(),
             "today": {
