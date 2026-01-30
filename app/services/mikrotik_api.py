@@ -319,35 +319,34 @@ class MikroTikAPI:
 
             # 4. Create Simple Queue for rate limiting (most reliable method in MikroTik)
             # Simple queues work even with FastTrack and are the standard approach
-            # TEMPORARILY DISABLED FOR TESTING - uncomment to re-enable queue creation
-            queue_result = {"skipped": True, "message": "Queue creation disabled for testing"}
-            # normalized = normalize_mac_address(mac_address)
-            # 
-            # if rate_limit:
-            #     # Remove existing queue for this user
-            #     queues = self.send_command("/queue/simple/print")
-            #     if queues.get("success") and queues.get("data"):
-            #         for q in queues["data"]:
-            #             if q.get("name") == f"plan_{username}" or f"MAC:{mac_address}" in q.get("comment", ""):
-            #                 self.send_command("/queue/simple/remove", {"numbers": q[".id"]})
-            #                 logger.info(f"Removed existing queue for {username}")
-            #     
-            #     # Find client's current IP
-            #     client_ip = self.get_client_ip_by_mac(normalized)
-            #     
-            #     if client_ip:
-            #         # Create simple queue targeting client IP (no interface = matches all)
-            #         queue_result = self.send_command("/queue/simple/add", {
-            #             "name": f"plan_{username}",
-            #             "target": f"{client_ip}/32",
-            #             "max-limit": rate_limit,
-            #             "comment": f"MAC:{mac_address}|Plan rate limit"
-            #         })
-            #         logger.info(f"Created simple queue for {username} -> {client_ip} with limit {rate_limit}")
-            #     else:
-            #         # Client not connected yet - will be created by sync job
-            #         logger.warning(f"Client {mac_address} not connected - queue will be created when they connect")
-            #         queue_result = {"pending": True, "message": "Client not connected, queue pending"}
+            queue_result = {"skipped": True, "message": "No rate limit specified"}
+            normalized = normalize_mac_address(mac_address)
+            
+            if rate_limit:
+                # Remove existing queue for this user
+                queues = self.send_command("/queue/simple/print")
+                if queues.get("success") and queues.get("data"):
+                    for q in queues["data"]:
+                        if q.get("name") == f"plan_{username}" or f"MAC:{mac_address}" in q.get("comment", ""):
+                            self.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                            logger.info(f"Removed existing queue for {username}")
+                
+                # Find client's current IP
+                client_ip = self.get_client_ip_by_mac(normalized)
+                
+                if client_ip:
+                    # Create simple queue targeting client IP (no interface = matches all)
+                    queue_result = self.send_command("/queue/simple/add", {
+                        "name": f"plan_{username}",
+                        "target": f"{client_ip}/32",
+                        "max-limit": rate_limit,
+                        "comment": f"MAC:{mac_address}|Plan rate limit"
+                    })
+                    logger.info(f"Created simple queue for {username} -> {client_ip} with limit {rate_limit}")
+                else:
+                    # Client not connected yet - will be created by sync job
+                    logger.warning(f"Client {mac_address} not connected - queue will be created when they connect")
+                    queue_result = {"pending": True, "message": "Client not connected, queue pending"}
 
             return {
                 "message": f"MAC address {mac_address} registered/updated successfully with rate limit {rate_limit}",
