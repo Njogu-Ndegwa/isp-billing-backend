@@ -247,6 +247,10 @@ class MikroTikAPI:
         time_limit: str, bandwidth_limit: str, comment: str,
         router_ip: str, router_username: str, router_password: str
     ) -> Dict[str, Any]:
+        import time
+        # Rate limiting: small delays between commands to prevent overwhelming MikroTik
+        CMD_DELAY = 0.1  # 100ms between commands
+        
         try:
             # Convert bandwidth to MikroTik format
             rate_limit = self._parse_speed_to_mikrotik(bandwidth_limit)
@@ -268,6 +272,7 @@ class MikroTikAPI:
             # 1. Create/update hotspot user profile with rate limit (this is key for speed enforcement!)
             profile_name = f"plan_{rate_limit.replace('/', '_')}"
             profile_result = self._ensure_hotspot_profile(profile_name, rate_limit)
+            time.sleep(CMD_DELAY)  # Give router breathing room
             
             # 2. Add or update hotspot user WITH the rate-limited profile
             args = {
@@ -292,6 +297,7 @@ class MikroTikAPI:
                 else:
                     logger.error(f"Hotspot user add error: {result['error']}")
                     return {"error": result["error"]}
+            time.sleep(CMD_DELAY)  # Give router breathing room
 
             # 3. IP binding (bypassed for seamless auto-access after payment)
             binding_args = {
@@ -303,10 +309,12 @@ class MikroTikAPI:
             if "error" in binding_result:
                 if "already exists" in binding_result.get("error", ""):
                     # Update existing binding
+                    time.sleep(CMD_DELAY)
                     bindings = self.send_command("/ip/hotspot/ip-binding/print")
                     if bindings.get("success") and bindings.get("data"):
                         for b in bindings["data"]:
                             if normalize_mac_address(b.get("mac-address", "")) == normalize_mac_address(mac_address):
+                                time.sleep(CMD_DELAY)
                                 self.send_command("/ip/hotspot/ip-binding/set", {
                                     "numbers": b[".id"],
                                     "type": "bypassed",
@@ -316,6 +324,7 @@ class MikroTikAPI:
                                 break
                 else:
                     logger.error(f"IP binding error: {binding_result['error']}")
+            time.sleep(CMD_DELAY)  # Give router breathing room
 
             # 4. Create Simple Queue for rate limiting (most reliable method in MikroTik)
             # Simple queues work even with FastTrack and are the standard approach
@@ -328,13 +337,17 @@ class MikroTikAPI:
                 if queues.get("success") and queues.get("data"):
                     for q in queues["data"]:
                         if q.get("name") == f"plan_{username}" or f"MAC:{mac_address}" in q.get("comment", ""):
+                            time.sleep(CMD_DELAY)
                             self.send_command("/queue/simple/remove", {"numbers": q[".id"]})
                             logger.info(f"Removed existing queue for {username}")
+                
+                time.sleep(CMD_DELAY)  # Give router breathing room
                 
                 # Find client's current IP
                 client_ip = self.get_client_ip_by_mac(normalized)
                 
                 if client_ip:
+                    time.sleep(CMD_DELAY)  # Give router breathing room
                     # Create simple queue targeting client IP (no interface = matches all)
                     queue_result = self.send_command("/queue/simple/add", {
                         "name": f"plan_{username}",

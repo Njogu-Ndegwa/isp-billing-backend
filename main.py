@@ -40,6 +40,7 @@ app.add_middleware(
 # Initialize scheduler and cleanup flag
 scheduler = AsyncIOScheduler()
 cleanup_running = False
+queue_sync_running = False  # Flag to prevent overlapping queue sync runs
 mikrotik_lock = asyncio.Lock()  # Global lock to prevent concurrent MikroTik API access
 
 # MikroTik dashboard cache (avoid hammering the router)
@@ -535,12 +536,246 @@ async def cleanup_expired_users_background():
         cleanup_running = False
 
 
-# Background sync function for active user queues (runs every 60 seconds)
+# Synchronous MikroTik queue sync - runs in thread pool to not block event loop
+# Rate limiting constants to prevent overwhelming MikroTik
+SYNC_DELAY_BETWEEN_COMMANDS = 0.1  # 100ms delay between API commands
+SYNC_DELAY_BETWEEN_CUSTOMERS = 0.05  # 50ms delay between processing customers
+SYNC_MAX_QUEUE_OPERATIONS_PER_RUN = 50  # Max queues to create/update per run (prevents overload)
+
+def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
+    """
+    Synchronous function to sync queues for active customers on MikroTik.
+    Runs in a separate thread to avoid blocking the async event loop.
+    
+    Includes rate limiting to prevent overwhelming the router:
+    - Delays between API commands
+    - Max operations limit per run
+    - Graceful handling of errors
+    
+    Args:
+        router_customers_map: Dict mapping router info to customer list
+            {
+                "router_ip:port": {
+                    "router": {ip, username, password, port, name},
+                    "customers": [{id, mac_address, plan_speed}, ...]
+                }
+            }
+    
+    Returns:
+        Dict with results: {synced: int, errors: int, skipped: int, routers_connected: int}
+    """
+    import time
+    
+    results = {"synced": 0, "errors": 0, "skipped": 0, "routers_connected": 0, "details": []}
+    
+    if not router_customers_map:
+        logger.info("[SYNC] No routers to process")
+        return results
+    
+    total_operations = 0  # Track total queue operations across all routers
+    
+    for router_key, router_data in router_customers_map.items():
+        router_info = router_data["router"]
+        customers_data = router_data["customers"]
+        
+        if not customers_data:
+            continue
+        
+        # Check if we've hit the max operations limit
+        if total_operations >= SYNC_MAX_QUEUE_OPERATIONS_PER_RUN:
+            logger.info(f"[SYNC] Reached max operations limit ({SYNC_MAX_QUEUE_OPERATIONS_PER_RUN}), will continue next run")
+            break
+        
+        router_name = router_info["name"]
+        router_ip = router_info["ip"]
+        
+        logger.info(f"[SYNC] Connecting to {router_name} ({router_ip}) for {len(customers_data)} customers...")
+        
+        api = None
+        try:
+            api = MikroTikAPI(
+                router_info["ip"],
+                router_info["username"],
+                router_info["password"],
+                router_info["port"],
+                timeout=60  # Longer timeout for stability
+            )
+            
+            if not api.connect():
+                logger.error(f"[SYNC] Failed to connect to {router_name} ({router_ip})")
+                results["errors"] += len(customers_data)
+                results["details"].append({"router": router_name, "error": "Connection failed"})
+                continue
+            
+            results["routers_connected"] += 1
+            logger.info(f"[SYNC] Connected to {router_name} successfully")
+            
+            # Fetch all data once per router (more efficient than per-customer)
+            # Add delays between fetches to prevent overwhelming router
+            logger.info(f"[SYNC] Fetching ARP table from {router_name}...")
+            arp_result = api.send_command("/ip/arp/print")
+            if arp_result.get("error"):
+                logger.error(f"[SYNC] Failed to fetch ARP table: {arp_result.get('error')}")
+                arp_entries = []
+            else:
+                arp_entries = arp_result.get("data", [])
+            logger.info(f"[SYNC] Got {len(arp_entries)} ARP entries")
+            
+            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)  # Give router breathing room
+            
+            logger.info(f"[SYNC] Fetching DHCP leases from {router_name}...")
+            dhcp_result = api.send_command("/ip/dhcp-server/lease/print")
+            if dhcp_result.get("error"):
+                logger.error(f"[SYNC] Failed to fetch DHCP leases: {dhcp_result.get('error')}")
+                dhcp_leases = []
+            else:
+                dhcp_leases = dhcp_result.get("data", [])
+            logger.info(f"[SYNC] Got {len(dhcp_leases)} DHCP leases")
+            
+            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)  # Give router breathing room
+            
+            logger.info(f"[SYNC] Fetching existing queues from {router_name}...")
+            queues_result = api.send_command("/queue/simple/print")
+            if queues_result.get("error"):
+                logger.error(f"[SYNC] Failed to fetch queues: {queues_result.get('error')}")
+                existing_queues = []
+            else:
+                existing_queues = queues_result.get("data", [])
+            logger.info(f"[SYNC] Got {len(existing_queues)} existing queues")
+            
+            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)  # Give router breathing room
+            
+            # Build lookup maps for O(1) access
+            mac_to_ip = {}
+            for entry in arp_entries:
+                mac = entry.get("mac-address", "")
+                if mac:
+                    mac_to_ip[normalize_mac_address(mac)] = entry.get("address")
+            for lease in dhcp_leases:
+                mac = lease.get("mac-address", "")
+                if mac and lease.get("address"):
+                    mac_to_ip[normalize_mac_address(mac)] = lease.get("address")
+            
+            queue_by_name = {q.get("name"): q for q in existing_queues}
+            
+            synced = 0
+            skipped_no_ip = 0
+            skipped_already_ok = 0
+            errors = 0
+            
+            for cust in customers_data:
+                # Check if we've hit the max operations limit
+                if total_operations >= SYNC_MAX_QUEUE_OPERATIONS_PER_RUN:
+                    logger.info(f"[SYNC] Reached max operations limit, stopping customer processing")
+                    break
+                
+                try:
+                    normalized_mac = normalize_mac_address(cust["mac_address"])
+                    username = normalized_mac.replace(":", "")
+                    queue_name = f"plan_{username}"
+                    rate_limit = api._parse_speed_to_mikrotik(cust["plan_speed"])
+                    
+                    # Get current IP from cached data
+                    client_ip = mac_to_ip.get(normalized_mac)
+                    if not client_ip:
+                        skipped_no_ip += 1
+                        continue
+                    
+                    # Check if queue exists
+                    existing_queue = queue_by_name.get(queue_name)
+                    
+                    if existing_queue:
+                        # Queue exists - check if IP needs update
+                        current_target = existing_queue.get("target", "")
+                        if client_ip not in current_target:
+                            time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)  # Rate limit
+                            update_result = api.send_command("/queue/simple/set", {
+                                "numbers": existing_queue[".id"],
+                                "target": f"{client_ip}/32",
+                                "max-limit": rate_limit
+                            })
+                            if update_result.get("error"):
+                                logger.error(f"[SYNC] Failed to update queue for {username}: {update_result.get('error')}")
+                                errors += 1
+                            else:
+                                logger.info(f"[SYNC] Updated queue {queue_name} -> {client_ip} on {router_name}")
+                                synced += 1
+                                total_operations += 1
+                        else:
+                            # Queue already has correct IP, skip
+                            skipped_already_ok += 1
+                    else:
+                        # Create new queue
+                        time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)  # Rate limit
+                        add_result = api.send_command("/queue/simple/add", {
+                            "name": queue_name,
+                            "target": f"{client_ip}/32",
+                            "max-limit": rate_limit,
+                            "comment": f"MAC:{cust['mac_address']}|Plan rate limit"
+                        })
+                        if add_result.get("error"):
+                            logger.error(f"[SYNC] Failed to create queue for {username}: {add_result.get('error')}")
+                            errors += 1
+                        else:
+                            logger.info(f"[SYNC] Created queue {queue_name} -> {client_ip} ({rate_limit}) on {router_name}")
+                            synced += 1
+                            total_operations += 1
+                            
+                except Exception as e:
+                    logger.error(f"[SYNC] Error syncing customer {cust['id']} ({cust['mac_address']}): {e}")
+                    errors += 1
+            
+            if skipped_no_ip > 0:
+                logger.info(f"[SYNC] Skipped {skipped_no_ip} customers on {router_name} (not connected/no IP)")
+            if skipped_already_ok > 0:
+                logger.info(f"[SYNC] Skipped {skipped_already_ok} customers on {router_name} (queue already correct)")
+            
+            results["synced"] += synced
+            results["errors"] += errors
+            results["skipped"] += skipped_no_ip + skipped_already_ok
+            results["details"].append({
+                "router": router_name,
+                "synced": synced,
+                "errors": errors,
+                "skipped_no_ip": skipped_no_ip,
+                "skipped_already_ok": skipped_already_ok
+            })
+            
+        except Exception as e:
+            logger.error(f"[SYNC] Error processing router {router_name}: {e}")
+            results["errors"] += len(customers_data)
+            results["details"].append({"router": router_name, "error": str(e)})
+        finally:
+            if api:
+                try:
+                    api.disconnect()
+                    logger.info(f"[SYNC] Disconnected from {router_name}")
+                except Exception as e:
+                    logger.warning(f"[SYNC] Error disconnecting from {router_name}: {e}")
+            
+            # Small delay before processing next router
+            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
+    
+    return results
+
+
+# Background sync function for active user queues (runs every 3 minutes)
 async def sync_active_user_queues():
     """
-    Sync queues for active customers - ensures rate limits are applied even if IP changed.
-    Supports multiple routers by grouping customers by their assigned router.
+    Background task to sync queues for active customers.
+    MikroTik operations run in a thread pool to avoid blocking the event loop.
     """
+    global queue_sync_running
+    
+    # Prevent overlapping runs
+    if queue_sync_running:
+        logger.warning("[SYNC] Previous queue sync still running, skipping this run")
+        return
+    
+    queue_sync_running = True
+    start_time = datetime.utcnow()
+    logger.info("[SYNC] Starting queue sync job...")
+    
     try:
         async with AsyncSession(async_engine) as db:
             now = datetime.utcnow()
@@ -556,113 +791,74 @@ async def sync_active_user_queues():
             active_customers = result.scalars().all()
             
             if not active_customers:
+                logger.info("[SYNC] No active customers to sync")
                 return
             
-            # Group customers by router
-            router_customers = {}
-            for customer in active_customers:
-                if not customer.plan or not customer.mac_address:
+            logger.info(f"[SYNC] Found {len(active_customers)} active customers to check")
+            
+            # Group customers by router (extract plain data - can't pass ORM objects to thread)
+            router_customers_map = {}
+            no_router_customers = []
+            
+            for c in active_customers:
+                if not c.plan or not c.mac_address:
                     continue
                 
-                if customer.router:
-                    router_key = f"{customer.router.ip_address}:{customer.router.port}"
-                    if router_key not in router_customers:
-                        router_customers[router_key] = {
-                            "router": customer.router,
+                customer_data = {
+                    "id": c.id,
+                    "mac_address": c.mac_address,
+                    "plan_speed": c.plan.speed
+                }
+                
+                if c.router:
+                    router_key = f"{c.router.ip_address}:{c.router.port}"
+                    if router_key not in router_customers_map:
+                        router_customers_map[router_key] = {
+                            "router": {
+                                "ip": c.router.ip_address,
+                                "username": c.router.username,
+                                "password": c.router.password,
+                                "port": c.router.port,
+                                "name": c.router.name
+                            },
                             "customers": []
                         }
-                    router_customers[router_key]["customers"].append(customer)
+                    router_customers_map[router_key]["customers"].append(customer_data)
                 else:
-                    # Fallback to default settings
-                    default_key = f"{settings.MIKROTIK_HOST}:{settings.MIKROTIK_PORT}"
-                    if default_key not in router_customers:
-                        router_customers[default_key] = {
-                            "router": None,  # Will use settings
-                            "customers": []
-                        }
-                    router_customers[default_key]["customers"].append(customer)
+                    no_router_customers.append(customer_data)
             
-            total_synced = 0
+            # Add no-router customers to default router
+            if no_router_customers:
+                default_key = f"{settings.MIKROTIK_HOST}:{settings.MIKROTIK_PORT}"
+                if default_key not in router_customers_map:
+                    router_customers_map[default_key] = {
+                        "router": {
+                            "ip": settings.MIKROTIK_HOST,
+                            "username": settings.MIKROTIK_USERNAME,
+                            "password": settings.MIKROTIK_PASSWORD,
+                            "port": settings.MIKROTIK_PORT,
+                            "name": "Default Router"
+                        },
+                        "customers": []
+                    }
+                router_customers_map[default_key]["customers"].extend(no_router_customers)
             
-            # Process each router
-            for router_key, data in router_customers.items():
-                router = data["router"]
-                customers = data["customers"]
-                
-                if router:
-                    api = MikroTikAPI(
-                        router.ip_address,
-                        router.username,
-                        router.password,
-                        router.port
-                    )
-                    router_name = router.name
-                else:
-                    api = MikroTikAPI(
-                        settings.MIKROTIK_HOST,
-                        settings.MIKROTIK_USERNAME,
-                        settings.MIKROTIK_PASSWORD,
-                        settings.MIKROTIK_PORT
-                    )
-                    router_name = "Default Router"
-                
-                if not api.connect():
-                    logger.warning(f"[SYNC] Failed to connect to {router_name}")
-                    continue
-                
-                synced = 0
-                for customer in customers:
-                    try:
-                        normalized_mac = normalize_mac_address(customer.mac_address)
-                        username = normalized_mac.replace(":", "")
-                        rate_limit = api._parse_speed_to_mikrotik(customer.plan.speed)
-                        
-                        # Get current IP
-                        client_ip = api.get_client_ip_by_mac(normalized_mac)
-                        if not client_ip:
-                            continue
-                        
-                        # Check if queue exists and targets correct IP
-                        queues = api.send_command("/queue/simple/print")
-                        queue_exists = False
-                        
-                        if queues.get("success") and queues.get("data"):
-                            for q in queues["data"]:
-                                if q.get("name") == f"plan_{username}":
-                                    queue_exists = True
-                                    if client_ip not in q.get("target", ""):
-                                        # Update queue with new IP
-                                        api.send_command("/queue/simple/set", {
-                                            "numbers": q[".id"],
-                                            "target": f"{client_ip}/32",
-                                            "max-limit": rate_limit
-                                        })
-                                        logger.info(f"[SYNC] Updated queue for {username} -> {client_ip} on {router_name}")
-                                        synced += 1
-                                    break
-                        
-                        # Create queue if doesn't exist
-                        if not queue_exists:
-                            api.send_command("/queue/simple/add", {
-                                "name": f"plan_{username}",
-                                "target": f"{client_ip}/32",
-                                "max-limit": rate_limit,
-                                "comment": f"MAC:{customer.mac_address}|Plan rate limit"
-                            })
-                            logger.info(f"[SYNC] Created queue for {username} -> {client_ip} on {router_name}")
-                            synced += 1
-                            
-                    except Exception as e:
-                        logger.error(f"[SYNC] Error syncing customer {customer.id} on {router_name}: {e}")
-                
-                api.disconnect()
-                total_synced += synced
+            logger.info(f"[SYNC] Grouped customers across {len(router_customers_map)} router(s)")
             
-            if total_synced > 0:
-                logger.info(f"[SYNC] Synced {total_synced} queues across {len(router_customers)} router(s)")
-                
+            # Run MikroTik operations in thread pool (non-blocking!)
+            mikrotik_results = await asyncio.to_thread(_sync_queues_mikrotik_sync, router_customers_map)
+            
+            duration = (datetime.utcnow() - start_time).total_seconds()
+            logger.info(f"[SYNC] Job completed in {duration:.2f}s: "
+                       f"{mikrotik_results['synced']} synced, "
+                       f"{mikrotik_results['errors']} errors, "
+                       f"{mikrotik_results['skipped']} skipped, "
+                       f"{mikrotik_results['routers_connected']} router(s) connected")
+            
     except Exception as e:
-        logger.error(f"[SYNC] Queue sync failed: {e}")
+        logger.error(f"[SYNC] Queue sync job failed: {e}", exc_info=True)
+    finally:
+        queue_sync_running = False
 
 
 # @app.post("/api/lipay/callback")
