@@ -73,6 +73,28 @@ class Customer(Base):
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
     pending_update_data = Column(JSON, nullable=True)
     router = relationship("Router")
+    # Location fields for mapping
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    location_captured_at = Column(DateTime, nullable=True)
+
+class CustomerRating(Base):
+    """Customer ratings/feedback after purchase - identified by phone number"""
+    __tablename__ = "customer_ratings"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    phone = Column(String, nullable=False, index=True)  # For lookup by phone
+    rating = Column(Integer, nullable=False)  # 1-5 stars
+    comment = Column(String(500), nullable=True)
+    service_quality = Column(Integer, nullable=True)  # Optional: 1-5
+    support_rating = Column(Integer, nullable=True)  # Optional: 1-5
+    value_for_money = Column(Integer, nullable=True)  # Optional: 1-5
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    # Store location snapshot at time of rating
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    customer = relationship("Customer", backref="ratings")
+
 
 class Plan(Base):
     __tablename__ = "plans"

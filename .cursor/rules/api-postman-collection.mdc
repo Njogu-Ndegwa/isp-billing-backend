@@ -1,0 +1,54 @@
+---
+description: Create Postman collection file when adding new API endpoints
+globs: main.py
+alwaysApply: false
+---
+
+# API Endpoint Documentation Rule
+
+When adding new API endpoints to this project, **always create or update a Postman collection file**.
+
+## Requirements
+
+1. **Create a `.postman_collection.json` file** in the project root with all new endpoints
+2. **Include for each endpoint:**
+   - Method (GET, POST, PUT, DELETE)
+   - Full URL with `{{baseUrl}}` variable
+   - Headers (Content-Type: application/json for POST/PUT)
+   - Example request body for POST/PUT requests
+   - Query parameters for GET requests
+
+## File Naming
+
+- Use descriptive names: `{feature}-endpoints.postman_collection.json`
+- Examples: `customer-location-ratings.postman_collection.json`, `billing-endpoints.postman_collection.json`
+
+## Postman Collection Format
+
+```json
+{
+    "info": {
+        "name": "Feature Name - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"}
+    ],
+    "item": [
+        {
+            "name": "Endpoint Name",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/endpoint",
+                "header": [{"key": "Content-Type", "value": "application/json"}],
+                "body": {"mode": "raw", "raw": "{\"field\": \"value\"}"}
+            }
+        }
+    ]
+}
+```
+
+## After Adding Endpoints
+
+1. Create/update the Postman collection file
+2. Inform the user they can import it via: **Postman → Import → Upload Files**

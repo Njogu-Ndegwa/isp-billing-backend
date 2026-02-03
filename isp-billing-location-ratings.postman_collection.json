@@ -1,0 +1,66 @@
+{
+    "info": {
+        "name": "ISP Billing - Location & Ratings",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"}
+    ],
+    "item": [
+        {
+            "name": "Update Customer Location",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/customers/5/location",
+                "header": [{"key": "Content-Type", "value": "application/json"}],
+                "body": {"mode": "raw", "raw": "{\"latitude\": -1.2921, \"longitude\": 36.8219}"}
+            }
+        },
+        {
+            "name": "Capture Location by Phone",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/customers/location/by-phone",
+                "header": [{"key": "Content-Type", "value": "application/json"}],
+                "body": {"mode": "raw", "raw": "{\"phone\": \"0712345678\", \"latitude\": -1.2864, \"longitude\": 36.8172}"}
+            }
+        },
+        {
+            "name": "Submit Rating",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/ratings/submit",
+                "header": [{"key": "Content-Type", "value": "application/json"}],
+                "body": {"mode": "raw", "raw": "{\"phone\": \"0712345678\", \"rating\": 5, \"comment\": \"Great service!\"}"}
+            }
+        },
+        {
+            "name": "Get All Ratings",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/ratings?user_id=1&include_location=true"
+            }
+        },
+        {
+            "name": "Get Ratings Summary",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/ratings/summary?user_id=1"
+            }
+        },
+        {
+            "name": "Get Customers Map Data",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/customers/map?user_id=1&with_ratings=true"
+            }
+        },
+        {
+            "name": "Get Ratings by Location",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/ratings/by-location?user_id=1&min_lat=-1.35&max_lat=-1.20&min_lng=36.70&max_lng=36.90"
+            }
+        }
+    ]
+}
