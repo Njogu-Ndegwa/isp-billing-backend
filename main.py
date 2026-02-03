@@ -3034,7 +3034,10 @@ async def check_illegal_connections(
             raise HTTPException(status_code=404, detail="Router not found")
         
         # Get ALL customers with MAC addresses for this router (to check status)
-        stmt = select(Customer).where(
+        # Use selectinload to eagerly load plan to avoid lazy loading errors
+        stmt = select(Customer).options(
+            selectinload(Customer.plan)
+        ).where(
             Customer.router_id == router_id,
             Customer.mac_address.isnot(None)
         )
