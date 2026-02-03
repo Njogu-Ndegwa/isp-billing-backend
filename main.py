@@ -6974,7 +6974,7 @@ async def startup_event():
     # Queue sync - ensures bandwidth limits apply even if customer IP changes
     scheduler.add_job(
         sync_active_user_queues,
-        trigger=IntervalTrigger(seconds=180),  # 3 minutes
+        trigger=IntervalTrigger(seconds=90),  # 90 seconds - faster response to unlimited users
         id='sync_user_queues',
         name='Sync rate limit queues for active users',
         replace_existing=True,
@@ -6989,7 +6989,7 @@ async def startup_event():
         max_instances=1
     )
     scheduler.start()
-    logger.info("🔄 Background scheduler started - cleanup every 67s, queue sync every 180s, bandwidth every 157s")
+    logger.info("🔄 Background scheduler started - cleanup every 67s, queue sync every 90s, bandwidth every 157s")
     
     # Warm up plan cache on startup
     async for db in get_db():
