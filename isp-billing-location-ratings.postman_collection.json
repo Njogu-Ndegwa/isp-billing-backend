@@ -17,12 +17,22 @@
             }
         },
         {
-            "name": "Capture Location by Phone",
+            "name": "Capture Location by Phone (Existing)",
             "request": {
                 "method": "POST",
                 "url": "{{baseUrl}}/api/customers/location/by-phone",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": {"mode": "raw", "raw": "{\"phone\": \"0712345678\", \"latitude\": -1.2864, \"longitude\": 36.8172}"}
+            }
+        },
+        {
+            "name": "Capture Location by Phone (New Number)",
+            "description": "Creates a new customer record if phone doesn't exist",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/customers/location/by-phone",
+                "header": [{"key": "Content-Type", "value": "application/json"}],
+                "body": {"mode": "raw", "raw": "{\"phone\": \"0788888888\", \"latitude\": -1.2950, \"longitude\": 36.8050}"}
             }
         },
         {

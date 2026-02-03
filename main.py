@@ -6249,7 +6249,9 @@ async def capture_location_by_phone(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Capture customer location by phone number - useful when MAC address changes
+    Capture customer location by phone number.
+    Works for both existing customers and new phone numbers.
+    For new numbers, creates a customer record with the location.
     """
     try:
         # Find customer by phone number (get most recent)
@@ -6257,14 +6259,26 @@ async def capture_location_by_phone(
         result = await db.execute(stmt)
         customer = result.scalar_one_or_none()
         
-        if not customer:
-            raise HTTPException(status_code=404, detail="Customer not found with this phone number")
+        is_new_customer = False
         
-        customer.latitude = request.latitude
-        customer.longitude = request.longitude
-        customer.location_captured_at = datetime.utcnow()
+        if not customer:
+            # Create new customer with just phone and location
+            customer = Customer(
+                phone=request.phone,
+                latitude=request.latitude,
+                longitude=request.longitude,
+                location_captured_at=datetime.utcnow()
+            )
+            db.add(customer)
+            is_new_customer = True
+        else:
+            # Update existing customer's location
+            customer.latitude = request.latitude
+            customer.longitude = request.longitude
+            customer.location_captured_at = datetime.utcnow()
         
         await db.commit()
+        await db.refresh(customer)
         
         return {
             "success": True,
@@ -6272,7 +6286,8 @@ async def capture_location_by_phone(
             "customer_id": customer.id,
             "customer_name": customer.name,
             "latitude": request.latitude,
-            "longitude": request.longitude
+            "longitude": request.longitude,
+            "is_new_customer": is_new_customer
         }
     except HTTPException:
         raise
