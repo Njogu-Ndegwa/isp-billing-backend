@@ -6287,8 +6287,9 @@ async def submit_customer_rating(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Submit a rating from a customer - identified by phone number.
-    Call this after customer completes a purchase to collect feedback.
+    Submit a rating from anyone - identified by phone number.
+    Works for both existing customers and new phone numbers.
+    Call this after a purchase or service interaction to collect feedback.
     """
     try:
         # Validate rating values
@@ -6303,21 +6304,22 @@ async def submit_customer_rating(
             if value is not None and not 1 <= value <= 5:
                 raise HTTPException(status_code=400, detail=f"{field_name} must be between 1 and 5")
         
-        # Find customer by phone number
+        # Try to find customer by phone number (optional - ratings work for non-customers too)
         stmt = select(Customer).where(Customer.phone == request.phone).order_by(Customer.created_at.desc())
         result = await db.execute(stmt)
         customer = result.scalar_one_or_none()
         
-        if not customer:
-            raise HTTPException(status_code=404, detail="Customer not found with this phone number")
+        # Use provided location, or fallback to customer's stored location if customer exists
+        lat = request.latitude
+        lng = request.longitude
+        if customer and not lat:
+            lat = customer.latitude
+        if customer and not lng:
+            lng = customer.longitude
         
-        # Use provided location or fallback to customer's stored location
-        lat = request.latitude if request.latitude else customer.latitude
-        lng = request.longitude if request.longitude else customer.longitude
-        
-        # Create rating record
+        # Create rating record (customer_id can be None for non-customers)
         rating = CustomerRating(
-            customer_id=customer.id,
+            customer_id=customer.id if customer else None,
             phone=request.phone,
             rating=request.rating,
             comment=request.comment,
@@ -6336,7 +6338,8 @@ async def submit_customer_rating(
             "success": True,
             "message": "Thank you for your feedback!",
             "rating_id": rating.id,
-            "customer_id": customer.id
+            "customer_id": customer.id if customer else None,
+            "is_existing_customer": customer is not None
         }
     except HTTPException:
         raise

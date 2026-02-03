@@ -82,7 +82,7 @@ class CustomerRating(Base):
     """Customer ratings/feedback after purchase - identified by phone number"""
     __tablename__ = "customer_ratings"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)  # Nullable to allow non-customers
     phone = Column(String, nullable=False, index=True)  # For lookup by phone
     rating = Column(Integer, nullable=False)  # 1-5 stars
     comment = Column(String(500), nullable=True)

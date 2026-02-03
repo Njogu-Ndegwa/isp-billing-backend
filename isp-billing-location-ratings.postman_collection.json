@@ -26,12 +26,22 @@
             }
         },
         {
-            "name": "Submit Rating",
+            "name": "Submit Rating (Existing Customer)",
             "request": {
                 "method": "POST",
                 "url": "{{baseUrl}}/api/ratings/submit",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": {"mode": "raw", "raw": "{\"phone\": \"0712345678\", \"rating\": 5, \"comment\": \"Great service!\"}"}
+            }
+        },
+        {
+            "name": "Submit Rating (New Phone Number)",
+            "description": "Works for any phone number - no existing customer required",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/ratings/submit",
+                "header": [{"key": "Content-Type", "value": "application/json"}],
+                "body": {"mode": "raw", "raw": "{\"phone\": \"0799999999\", \"rating\": 4, \"comment\": \"Good experience!\", \"latitude\": -1.2900, \"longitude\": 36.8100}"}
             }
         },
         {
