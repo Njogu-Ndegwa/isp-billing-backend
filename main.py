@@ -1,7 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, or_
 from app.db.database import get_db, async_engine
 from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus, User, CustomerPayment, BandwidthSnapshot, UserBandwidthUsage, Ad, AdClick, AdImpression, AdClickType, Advertiser, AdBadgeType, CustomerRating
 from app.services.auth import verify_token, get_current_user
@@ -6365,7 +6365,7 @@ async def submit_customer_rating(
 
 @app.get("/api/ratings")
 async def get_ratings(
-    user_id: int = 1,
+    user_id: Optional[int] = None,
     include_location: bool = True,
     min_rating: Optional[int] = None,
     max_rating: Optional[int] = None,
@@ -6376,14 +6376,24 @@ async def get_ratings(
     """
     Get all customer ratings with optional location data.
     Filter by rating range and paginate results.
+    Includes ratings from non-customers (anonymous ratings by phone).
     """
     try:
         stmt = (
             select(CustomerRating)
-            .join(Customer)
-            .where(Customer.user_id == user_id)
+            .outerjoin(Customer, CustomerRating.customer_id == Customer.id)
             .order_by(CustomerRating.created_at.desc())
         )
+        
+        # Filter by user_id if provided (includes ratings with no customer or customer without user_id)
+        if user_id is not None:
+            stmt = stmt.where(
+                or_(
+                    Customer.user_id == user_id,
+                    CustomerRating.customer_id.is_(None),  # Include anonymous ratings
+                    Customer.user_id.is_(None)  # Include ratings from customers without user_id
+                )
+            )
         
         if min_rating:
             stmt = stmt.where(CustomerRating.rating >= min_rating)
@@ -6398,9 +6408,11 @@ async def get_ratings(
         # Get customer details
         response_data = []
         for r in ratings:
-            customer_stmt = select(Customer).where(Customer.id == r.customer_id)
-            customer_result = await db.execute(customer_stmt)
-            customer = customer_result.scalar_one_or_none()
+            customer = None
+            if r.customer_id:
+                customer_stmt = select(Customer).where(Customer.id == r.customer_id)
+                customer_result = await db.execute(customer_stmt)
+                customer = customer_result.scalar_one_or_none()
             
             rating_data = {
                 "id": r.id,
@@ -6412,7 +6424,8 @@ async def get_ratings(
                 "service_quality": r.service_quality,
                 "support_rating": r.support_rating,
                 "value_for_money": r.value_for_money,
-                "created_at": r.created_at.isoformat() if r.created_at else None
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "is_anonymous": r.customer_id is None
             }
             
             if include_location:
@@ -6433,18 +6446,29 @@ async def get_ratings(
 
 @app.get("/api/ratings/summary")
 async def get_ratings_summary(
-    user_id: int = 1,
+    user_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Get ratings summary with averages and distribution
+    Get ratings summary with averages and distribution.
+    Includes ratings from non-customers (anonymous ratings by phone).
     """
     try:
         stmt = (
             select(CustomerRating)
-            .join(Customer)
-            .where(Customer.user_id == user_id)
+            .outerjoin(Customer, CustomerRating.customer_id == Customer.id)
         )
+        
+        # Filter by user_id if provided
+        if user_id is not None:
+            stmt = stmt.where(
+                or_(
+                    Customer.user_id == user_id,
+                    CustomerRating.customer_id.is_(None),
+                    Customer.user_id.is_(None)
+                )
+            )
+        
         result = await db.execute(stmt)
         ratings = result.scalars().all()
         
@@ -6549,7 +6573,7 @@ async def get_customers_map_data(
 
 @app.get("/api/ratings/by-location")
 async def get_ratings_by_location(
-    user_id: int = 1,
+    user_id: Optional[int] = None,
     min_lat: Optional[float] = None,
     max_lat: Optional[float] = None,
     min_lng: Optional[float] = None,
@@ -6559,17 +6583,27 @@ async def get_ratings_by_location(
     """
     Get ratings filtered by geographic area (bounding box).
     Useful for seeing ratings in specific locations/zones.
+    Includes ratings from non-customers (anonymous ratings by phone).
     """
     try:
         stmt = (
             select(CustomerRating)
-            .join(Customer)
+            .outerjoin(Customer, CustomerRating.customer_id == Customer.id)
             .where(
-                Customer.user_id == user_id,
                 CustomerRating.latitude.isnot(None),
                 CustomerRating.longitude.isnot(None)
             )
         )
+        
+        # Filter by user_id if provided
+        if user_id is not None:
+            stmt = stmt.where(
+                or_(
+                    Customer.user_id == user_id,
+                    CustomerRating.customer_id.is_(None),
+                    Customer.user_id.is_(None)
+                )
+            )
         
         if min_lat is not None:
             stmt = stmt.where(CustomerRating.latitude >= min_lat)
@@ -6591,18 +6625,22 @@ async def get_ratings_by_location(
         
         ratings_data = []
         for r in ratings:
-            customer_stmt = select(Customer).where(Customer.id == r.customer_id)
-            customer_result = await db.execute(customer_stmt)
-            customer = customer_result.scalar_one_or_none()
+            customer = None
+            if r.customer_id:
+                customer_stmt = select(Customer).where(Customer.id == r.customer_id)
+                customer_result = await db.execute(customer_stmt)
+                customer = customer_result.scalar_one_or_none()
             
             ratings_data.append({
                 "id": r.id,
                 "customer_name": customer.name if customer else None,
+                "phone": r.phone,
                 "rating": r.rating,
                 "comment": r.comment,
                 "latitude": r.latitude,
                 "longitude": r.longitude,
-                "created_at": r.created_at.isoformat() if r.created_at else None
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "is_anonymous": r.customer_id is None
             })
         
         return {
