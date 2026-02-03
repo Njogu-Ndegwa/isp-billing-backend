@@ -72,9 +72,10 @@
         },
         {
             "name": "Get Customers Map Data",
+            "description": "user_id is optional - omit to get all customers with location",
             "request": {
                 "method": "GET",
-                "url": "{{baseUrl}}/api/customers/map?user_id=1&with_ratings=true"
+                "url": "{{baseUrl}}/api/customers/map?with_ratings=true"
             }
         },
         {

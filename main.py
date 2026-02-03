@@ -6506,7 +6506,7 @@ async def get_ratings_summary(
 
 @app.get("/api/customers/map")
 async def get_customers_map_data(
-    user_id: int = 1,
+    user_id: Optional[int] = None,
     status: Optional[str] = None,
     with_ratings: bool = False,
     db: AsyncSession = Depends(get_db)
@@ -6515,17 +6515,26 @@ async def get_customers_map_data(
     Get all customers with location data for map visualization.
     Returns only customers that have latitude/longitude set.
     Optionally include their average rating.
+    Includes customers without user_id (created via location capture).
     """
     try:
         stmt = (
             select(Customer)
             .options(selectinload(Customer.plan))
             .where(
-                Customer.user_id == user_id,
                 Customer.latitude.isnot(None),
                 Customer.longitude.isnot(None)
             )
         )
+        
+        # Filter by user_id if provided (includes customers without user_id)
+        if user_id is not None:
+            stmt = stmt.where(
+                or_(
+                    Customer.user_id == user_id,
+                    Customer.user_id.is_(None)  # Include customers created via location capture
+                )
+            )
         
         if status:
             stmt = stmt.where(Customer.status == CustomerStatus(status))
@@ -6543,7 +6552,8 @@ async def get_customers_map_data(
                 "plan_name": c.plan.name if c.plan else None,
                 "latitude": c.latitude,
                 "longitude": c.longitude,
-                "location_captured_at": c.location_captured_at.isoformat() if c.location_captured_at else None
+                "location_captured_at": c.location_captured_at.isoformat() if c.location_captured_at else None,
+                "has_user": c.user_id is not None
             }
             
             if with_ratings:
