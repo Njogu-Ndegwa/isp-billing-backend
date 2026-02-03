@@ -3015,14 +3015,17 @@ async def check_illegal_connections(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Find devices that have internet access but are NOT registered paying customers.
+    Find devices currently using internet that are NOT active paying customers.
     
-    Checks for:
-    1. Bypassed IP bindings on router that don't match any ACTIVE customer
-    2. Connected hotspot hosts that aren't registered
-    3. Devices with DHCP leases that aren't in the customer database
+    Compares:
+    - Devices currently connected on MikroTik (ARP + DHCP + active sessions)
+    - vs Active customers in the database
     
-    Returns list of potential illegal connections that should be investigated/blocked.
+    Detects:
+    1. Unknown devices (MAC not in database at all) - UNAUTHORIZED
+    2. Expired/inactive customers still connected - SHOULD BE DISCONNECTED
+    
+    Returns list of illegal connections with details for removal.
     """
     try:
         # Get router
@@ -3030,7 +3033,7 @@ async def check_illegal_connections(
         if not router:
             raise HTTPException(status_code=404, detail="Router not found")
         
-        # Get ALL customers (active and inactive) with MAC addresses for this router
+        # Get ALL customers with MAC addresses for this router (to check status)
         stmt = select(Customer).where(
             Customer.router_id == router_id,
             Customer.mac_address.isnot(None)
@@ -3040,14 +3043,18 @@ async def check_illegal_connections(
         
         # Build lookup of known customer MACs with their status
         known_macs = {}
+        active_macs = set()
         for c in all_customers:
             normalized = normalize_mac_address(c.mac_address)
             known_macs[normalized] = {
                 "id": c.id,
                 "name": c.name,
                 "status": c.status.value if c.status else "unknown",
-                "expiry": c.expiry.isoformat() if c.expiry else None
+                "expiry": c.expiry.isoformat() if c.expiry else None,
+                "plan_name": c.plan.name if c.plan else "No plan"
             }
+            if c.status == CustomerStatus.ACTIVE:
+                active_macs.add(normalized)
         
         # Connect to router
         api = connect_to_router(router)
@@ -3055,103 +3062,145 @@ async def check_illegal_connections(
             raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router.name}")
         
         try:
-            illegal_connections = []
-            expired_still_connected = []
-            unknown_bypassed = []
+            # Collect all currently connected devices from multiple sources
+            connected_devices = {}  # MAC -> device info
             
-            # 1. Check IP bindings (bypassed users)
-            bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
-            bindings = bindings_result.get("data", []) if bindings_result.get("success") else []
+            # SOURCE 1: ARP table - devices that have communicated recently
+            arp_result = api.send_command("/ip/arp/print")
+            arp_entries = arp_result.get("data", []) if arp_result.get("success") else []
             
-            for binding in bindings:
-                binding_type = binding.get("type", "")
-                mac = binding.get("mac-address", "")
-                
-                if binding_type == "bypassed" and mac:
+            for entry in arp_entries:
+                mac = entry.get("mac-address", "")
+                if mac:
                     normalized_mac = normalize_mac_address(mac)
-                    customer_info = known_macs.get(normalized_mac)
-                    
-                    if not customer_info:
-                        # MAC not in database at all - ILLEGAL!
-                        unknown_bypassed.append({
-                            "type": "UNKNOWN_BYPASSED",
-                            "severity": "HIGH",
+                    if normalized_mac not in connected_devices:
+                        connected_devices[normalized_mac] = {
                             "mac_address": mac,
-                            "ip_address": binding.get("address", "N/A"),
-                            "comment": binding.get("comment", ""),
-                            "issue": "Bypassed MAC not found in customer database - possible unauthorized access!"
-                        })
-                    elif customer_info["status"] != "active":
-                        # Customer exists but is INACTIVE/EXPIRED - should not be bypassed
-                        expired_still_connected.append({
-                            "type": "EXPIRED_BYPASSED",
-                            "severity": "MEDIUM",
-                            "mac_address": mac,
-                            "ip_address": binding.get("address", "N/A"),
-                            "customer_id": customer_info["id"],
-                            "customer_name": customer_info["name"],
-                            "customer_status": customer_info["status"],
-                            "expiry": customer_info["expiry"],
-                            "comment": binding.get("comment", ""),
-                            "issue": f"Customer is {customer_info['status']} but still bypassed on router!"
-                        })
+                            "ip_address": entry.get("address", "N/A"),
+                            "interface": entry.get("interface", ""),
+                            "source": "ARP",
+                            "is_complete": entry.get("complete", "") == "true"
+                        }
             
-            # 2. Check hotspot hosts (currently connected devices)
-            hosts_result = api.send_command("/ip/hotspot/host/print")
-            hosts = hosts_result.get("data", []) if hosts_result.get("success") else []
+            # SOURCE 2: DHCP leases - devices that got an IP address
+            dhcp_result = api.send_command("/ip/dhcp-server/lease/print")
+            dhcp_leases = dhcp_result.get("data", []) if dhcp_result.get("success") else []
             
-            for host in hosts:
-                is_bypassed = host.get("bypassed") == "true"
-                is_authorized = host.get("authorized") == "true"
-                mac = host.get("mac-address", "")
-                
-                if (is_bypassed or is_authorized) and mac:
+            for lease in dhcp_leases:
+                mac = lease.get("mac-address", "")
+                if mac:
                     normalized_mac = normalize_mac_address(mac)
-                    customer_info = known_macs.get(normalized_mac)
+                    lease_status = lease.get("status", "")
                     
-                    if not customer_info:
-                        # Connected and bypassed but not in database
-                        bytes_in = int(host.get("bytes-in", 0) or 0)
-                        bytes_out = int(host.get("bytes-out", 0) or 0)
-                        
-                        illegal_connections.append({
-                            "type": "UNKNOWN_CONNECTED",
-                            "severity": "CRITICAL" if bytes_in > 1000000 else "HIGH",  # Critical if >1MB used
+                    if normalized_mac in connected_devices:
+                        # Update existing entry with DHCP info
+                        connected_devices[normalized_mac]["dhcp_status"] = lease_status
+                        connected_devices[normalized_mac]["dhcp_hostname"] = lease.get("host-name", "")
+                        connected_devices[normalized_mac]["source"] += "+DHCP"
+                    else:
+                        connected_devices[normalized_mac] = {
                             "mac_address": mac,
-                            "ip_address": host.get("address", "N/A"),
-                            "bypassed": is_bypassed,
-                            "authorized": is_authorized,
-                            "uptime": host.get("uptime", ""),
-                            "bytes_downloaded": bytes_in,
-                            "bytes_uploaded": bytes_out,
-                            "bytes_total_mb": round((bytes_in + bytes_out) / 1048576, 2),
-                            "issue": "Device is connected with internet access but NOT in customer database!"
-                        })
-                    elif customer_info["status"] != "active" and (is_bypassed or is_authorized):
-                        # Expired customer still getting access
-                        bytes_in = int(host.get("bytes-in", 0) or 0)
-                        bytes_out = int(host.get("bytes-out", 0) or 0)
-                        
-                        expired_still_connected.append({
-                            "type": "EXPIRED_CONNECTED",
-                            "severity": "HIGH",
+                            "ip_address": lease.get("address", "N/A"),
+                            "interface": lease.get("server", ""),
+                            "source": "DHCP",
+                            "dhcp_status": lease_status,
+                            "dhcp_hostname": lease.get("host-name", "")
+                        }
+            
+            # SOURCE 3: Hotspot active sessions - currently authenticated users
+            active_result = api.send_command("/ip/hotspot/active/print")
+            active_sessions = active_result.get("data", []) if active_result.get("success") else []
+            
+            for session in active_sessions:
+                mac = session.get("mac-address", "")
+                if mac:
+                    normalized_mac = normalize_mac_address(mac)
+                    bytes_in = int(session.get("bytes-in", 0) or 0)
+                    bytes_out = int(session.get("bytes-out", 0) or 0)
+                    
+                    if normalized_mac in connected_devices:
+                        connected_devices[normalized_mac]["hotspot_active"] = True
+                        connected_devices[normalized_mac]["uptime"] = session.get("uptime", "")
+                        connected_devices[normalized_mac]["bytes_in"] = bytes_in
+                        connected_devices[normalized_mac]["bytes_out"] = bytes_out
+                        connected_devices[normalized_mac]["source"] += "+HOTSPOT"
+                    else:
+                        connected_devices[normalized_mac] = {
                             "mac_address": mac,
-                            "ip_address": host.get("address", "N/A"),
-                            "customer_id": customer_info["id"],
-                            "customer_name": customer_info["name"],
-                            "customer_status": customer_info["status"],
-                            "expiry": customer_info["expiry"],
-                            "bypassed": is_bypassed,
-                            "uptime": host.get("uptime", ""),
-                            "bytes_downloaded": bytes_in,
-                            "bytes_total_mb": round((bytes_in + bytes_out) / 1048576, 2),
-                            "issue": f"Expired customer still connected and using {round((bytes_in + bytes_out) / 1048576, 2)}MB!"
-                        })
+                            "ip_address": session.get("address", "N/A"),
+                            "source": "HOTSPOT",
+                            "hotspot_active": True,
+                            "uptime": session.get("uptime", ""),
+                            "bytes_in": bytes_in,
+                            "bytes_out": bytes_out
+                        }
+            
+            # SOURCE 4: Simple queues with recent traffic - indicates active usage
+            queues_result = api.send_command("/queue/simple/print")
+            queues = queues_result.get("data", []) if queues_result.get("success") else []
+            
+            for queue in queues:
+                comment = queue.get("comment", "")
+                # Extract MAC from queue comment (format: "MAC:XX:XX:XX:XX:XX:XX")
+                if "MAC:" in comment:
+                    mac_match = comment.split("MAC:")[1].split()[0] if "MAC:" in comment else ""
+                    if mac_match:
+                        normalized_mac = normalize_mac_address(mac_match)
+                        if normalized_mac in connected_devices:
+                            connected_devices[normalized_mac]["has_queue"] = True
+                            connected_devices[normalized_mac]["queue_name"] = queue.get("name", "")
             
             api.disconnect()
             
+            # Now compare: connected devices vs active customers
+            unauthorized_devices = []
+            expired_still_connected = []
+            
+            for mac, device_info in connected_devices.items():
+                customer_info = known_macs.get(mac)
+                
+                if not customer_info:
+                    # MAC not in database at all - UNAUTHORIZED
+                    bytes_total = device_info.get("bytes_in", 0) + device_info.get("bytes_out", 0)
+                    unauthorized_devices.append({
+                        "type": "UNAUTHORIZED",
+                        "severity": "CRITICAL" if bytes_total > 1000000 else "HIGH",
+                        "mac_address": device_info["mac_address"],
+                        "ip_address": device_info["ip_address"],
+                        "source": device_info["source"],
+                        "interface": device_info.get("interface", ""),
+                        "hostname": device_info.get("dhcp_hostname", ""),
+                        "uptime": device_info.get("uptime", ""),
+                        "bytes_downloaded": device_info.get("bytes_in", 0),
+                        "bytes_uploaded": device_info.get("bytes_out", 0),
+                        "bytes_total_mb": round(bytes_total / 1048576, 2),
+                        "has_queue": device_info.get("has_queue", False),
+                        "issue": "Device using internet but NOT registered in customer database!"
+                    })
+                elif customer_info["status"] != "active":
+                    # Customer exists but is NOT ACTIVE - should not have access
+                    bytes_total = device_info.get("bytes_in", 0) + device_info.get("bytes_out", 0)
+                    expired_still_connected.append({
+                        "type": "EXPIRED_CONNECTED",
+                        "severity": "HIGH",
+                        "mac_address": device_info["mac_address"],
+                        "ip_address": device_info["ip_address"],
+                        "source": device_info["source"],
+                        "customer_id": customer_info["id"],
+                        "customer_name": customer_info["name"],
+                        "customer_status": customer_info["status"],
+                        "expiry": customer_info["expiry"],
+                        "plan_name": customer_info.get("plan_name", ""),
+                        "uptime": device_info.get("uptime", ""),
+                        "bytes_downloaded": device_info.get("bytes_in", 0),
+                        "bytes_uploaded": device_info.get("bytes_out", 0),
+                        "bytes_total_mb": round(bytes_total / 1048576, 2),
+                        "has_queue": device_info.get("has_queue", False),
+                        "issue": f"Customer is {customer_info['status']} but still connected to network!"
+                    })
+            
             # Combine all issues
-            all_issues = illegal_connections + expired_still_connected + unknown_bypassed
+            all_issues = unauthorized_devices + expired_still_connected
             
             # Sort by severity
             severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
@@ -3162,16 +3211,16 @@ async def check_illegal_connections(
                 "router_name": router.name,
                 "scan_time": datetime.utcnow().isoformat(),
                 "summary": {
+                    "total_connected_devices": len(connected_devices),
+                    "active_customers": len(active_macs),
                     "total_issues": len(all_issues),
                     "critical": len([i for i in all_issues if i.get("severity") == "CRITICAL"]),
                     "high": len([i for i in all_issues if i.get("severity") == "HIGH"]),
-                    "medium": len([i for i in all_issues if i.get("severity") == "MEDIUM"]),
-                    "unknown_devices_connected": len(illegal_connections),
-                    "expired_customers_still_connected": len(expired_still_connected),
-                    "unknown_bypassed_bindings": len(unknown_bypassed)
+                    "unauthorized_devices": len(unauthorized_devices),
+                    "expired_still_connected": len(expired_still_connected)
                 },
                 "issues": all_issues,
-                "recommendation": "Use DELETE /api/public/remove-bypassed/{router_id}/{mac_address} to remove illegal users" if all_issues else "No illegal connections found"
+                "recommendation": "Use POST /api/routers/{router_id}/remove-illegal-users to remove all, or DELETE /api/routers/{router_id}/remove-illegal-user/{mac_address} for one" if all_issues else "No illegal connections found"
             }
             
         except Exception as e:
@@ -3183,6 +3232,549 @@ async def check_illegal_connections(
     except Exception as e:
         logger.error(f"Error checking illegal connections for router {router_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Check failed: {str(e)}")
+
+
+# Helper function to remove a single illegal user using CACHED data (efficient)
+def _remove_illegal_user_with_cache(
+    api, 
+    mac_address: str, 
+    cached_data: dict,
+    customer_info: dict = None
+) -> dict:
+    """
+    Remove a single illegal/unauthorized user from MikroTik using pre-cached data.
+    This is efficient because it doesn't re-fetch data for each user.
+    
+    Args:
+        api: Connected MikroTikAPI instance
+        mac_address: MAC address to remove
+        cached_data: Dict containing pre-fetched bindings, hosts, users, sessions, queues, leases
+        customer_info: Optional dict with customer details if exists in DB
+    
+    Returns:
+        Dict with removal results
+    """
+    normalized_mac = normalize_mac_address(mac_address)
+    username = normalized_mac.replace(":", "")
+    
+    removed = {
+        "mac_address": mac_address,
+        "binding_removed": False,
+        "hosts_removed": 0,
+        "user_removed": False,
+        "active_sessions_removed": 0,
+        "queues_removed": 0,
+        "leases_removed": 0
+    }
+    
+    if customer_info:
+        removed["customer_id"] = customer_info.get("id")
+        removed["customer_name"] = customer_info.get("name")
+    
+    try:
+        # Get client IP from cached ARP data
+        client_ip = None
+        for arp in cached_data.get("arp", []):
+            if normalize_mac_address(arp.get("mac-address", "")) == normalized_mac:
+                client_ip = arp.get("address", "")
+                break
+        
+        # STEP 1: Remove IP binding (use cached data to find, then remove)
+        for b in cached_data.get("bindings", []):
+            binding_mac = b.get("mac-address", "").upper()
+            if normalize_mac_address(binding_mac) == normalized_mac:
+                api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                removed["binding_removed"] = True
+                logger.info(f"[REMOVE-ILLEGAL] Removed IP binding for {normalized_mac}")
+                break  # Only one binding per MAC
+        
+        # STEP 2: Remove from hotspot hosts
+        for host in cached_data.get("hosts", []):
+            host_mac = host.get("mac-address", "").upper()
+            host_ip = host.get("address", "")
+            if normalize_mac_address(host_mac) == normalized_mac or (client_ip and host_ip == client_ip):
+                api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
+                removed["hosts_removed"] += 1
+                logger.info(f"[REMOVE-ILLEGAL] Removed host entry: {host_mac}")
+        
+        # STEP 3: Remove hotspot user
+        for u in cached_data.get("users", []):
+            if u.get("name", "") == username:
+                api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
+                removed["user_removed"] = True
+                logger.info(f"[REMOVE-ILLEGAL] Removed hotspot user: {username}")
+                break
+        
+        # STEP 4: Disconnect active sessions
+        for session in cached_data.get("active_sessions", []):
+            session_mac = session.get("mac-address", "").upper()
+            session_user = session.get("user", "").upper()
+            if normalize_mac_address(session_mac) == normalized_mac or session_user == username.upper():
+                api.send_command("/ip/hotspot/active/remove", {"numbers": session[".id"]})
+                removed["active_sessions_removed"] += 1
+                logger.info(f"[REMOVE-ILLEGAL] Disconnected active session")
+        
+        # STEP 5: Remove queues
+        for q in cached_data.get("queues", []):
+            queue_name = q.get("name", "")
+            queue_comment = q.get("comment", "")
+            if (queue_name == f"queue_{username}" or 
+                queue_name == f"plan_{username}" or
+                normalized_mac.upper() in queue_comment.upper() or
+                f"MAC:{mac_address}" in queue_comment):
+                api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                removed["queues_removed"] += 1
+                logger.info(f"[REMOVE-ILLEGAL] Removed queue: {queue_name}")
+        
+        # STEP 6: Remove DHCP lease
+        for lease in cached_data.get("leases", []):
+            if normalize_mac_address(lease.get("mac-address", "")) == normalized_mac:
+                api.send_command("/ip/dhcp-server/lease/remove", {"numbers": lease[".id"]})
+                removed["leases_removed"] += 1
+                logger.info(f"[REMOVE-ILLEGAL] Removed DHCP lease for {normalized_mac}")
+                break  # Only one lease per MAC
+        
+        removed["success"] = True
+        return removed
+        
+    except Exception as e:
+        logger.error(f"[REMOVE-ILLEGAL] Failed to remove {mac_address}: {e}")
+        removed["success"] = False
+        removed["error"] = str(e)
+        return removed
+
+
+# Synchronous bulk removal function - runs in thread pool
+def _bulk_remove_illegal_users_sync(
+    router_info: dict,
+    illegal_users: list,
+    known_macs: dict,
+    delay_ms: int = 150
+) -> dict:
+    """
+    Synchronous function to remove illegal users from MikroTik.
+    Runs in thread pool to avoid blocking the event loop.
+    Fetches all data ONCE then processes removals with delays.
+    
+    Args:
+        router_info: Dict with router connection details
+        illegal_users: List of illegal users to remove
+        known_macs: Dict of MAC -> customer info
+        delay_ms: Delay between each removal (default 150ms)
+    
+    Returns:
+        Dict with results
+    """
+    import time
+    
+    results = {"removed": [], "failed": [], "total": len(illegal_users)}
+    
+    if not illegal_users:
+        return results
+    
+    logger.info(f"[REMOVE-ILLEGAL] Starting bulk removal of {len(illegal_users)} users from {router_info['name']}")
+    
+    # Connect with reasonable timeouts
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=15,
+        connect_timeout=5
+    )
+    
+    if not api.connect():
+        logger.error(f"[REMOVE-ILLEGAL] Failed to connect to router {router_info['name']}")
+        for user in illegal_users:
+            results["failed"].append({
+                "mac_address": user["mac_address"],
+                "error": f"Failed to connect to router"
+            })
+        return results
+    
+    try:
+        # FETCH ALL DATA ONCE (efficient - only 7 API calls total)
+        logger.info(f"[REMOVE-ILLEGAL] Caching router data...")
+        cached_data = {
+            "arp": [],
+            "bindings": [],
+            "hosts": [],
+            "users": [],
+            "active_sessions": [],
+            "queues": [],
+            "leases": []
+        }
+        
+        # Fetch with error handling for each
+        arp_result = api.send_command("/ip/arp/print")
+        if arp_result.get("success"):
+            cached_data["arp"] = arp_result.get("data", [])
+        
+        bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
+        if bindings_result.get("success"):
+            cached_data["bindings"] = bindings_result.get("data", [])
+        
+        hosts_result = api.send_command("/ip/hotspot/host/print")
+        if hosts_result.get("success"):
+            cached_data["hosts"] = hosts_result.get("data", [])
+        
+        users_result = api.send_command("/ip/hotspot/user/print")
+        if users_result.get("success"):
+            cached_data["users"] = users_result.get("data", [])
+        
+        active_result = api.send_command("/ip/hotspot/active/print")
+        if active_result.get("success"):
+            cached_data["active_sessions"] = active_result.get("data", [])
+        
+        queues_result = api.send_command("/queue/simple/print")
+        if queues_result.get("success"):
+            cached_data["queues"] = queues_result.get("data", [])
+        
+        leases_result = api.send_command("/ip/dhcp-server/lease/print")
+        if leases_result.get("success"):
+            cached_data["leases"] = leases_result.get("data", [])
+        
+        logger.info(f"[REMOVE-ILLEGAL] Cached: {len(cached_data['bindings'])} bindings, "
+                   f"{len(cached_data['hosts'])} hosts, {len(cached_data['users'])} users, "
+                   f"{len(cached_data['active_sessions'])} active, {len(cached_data['queues'])} queues, "
+                   f"{len(cached_data['leases'])} leases")
+        
+        # Process each illegal user with delay
+        for i, user in enumerate(illegal_users):
+            mac_address = user["mac_address"]
+            normalized_mac = normalize_mac_address(mac_address)
+            customer_info = known_macs.get(normalized_mac)
+            
+            logger.info(f"[REMOVE-ILLEGAL] Processing {i+1}/{len(illegal_users)}: {mac_address}")
+            
+            try:
+                result = _remove_illegal_user_with_cache(api, mac_address, cached_data, customer_info)
+                result["reason"] = user.get("reason", "UNKNOWN")
+                result["ip_address"] = user.get("ip_address", "")
+                
+                if result.get("success"):
+                    results["removed"].append(result)
+                else:
+                    results["failed"].append(result)
+                    
+            except Exception as e:
+                logger.error(f"[REMOVE-ILLEGAL] Error removing {mac_address}: {e}")
+                results["failed"].append({
+                    "mac_address": mac_address,
+                    "error": str(e),
+                    "reason": user.get("reason", "UNKNOWN")
+                })
+            
+            # Delay between removals to prevent overwhelming router
+            if i < len(illegal_users) - 1:  # No delay after last one
+                time.sleep(delay_ms / 1000.0)
+        
+        api.disconnect()
+        logger.info(f"[REMOVE-ILLEGAL] Completed: {len(results['removed'])} removed, {len(results['failed'])} failed")
+        
+    except Exception as e:
+        api.disconnect()
+        logger.error(f"[REMOVE-ILLEGAL] Bulk removal error: {e}")
+        raise
+    
+    return results
+
+
+@app.post("/api/routers/{router_id}/remove-illegal-users")
+async def remove_all_illegal_users(
+    router_id: int,
+    limit: int = 50,
+    delay_ms: int = 150,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Remove illegal/unauthorized users from MikroTik router efficiently.
+    
+    Optimized for performance:
+    - Fetches all router data ONCE (not per-user)
+    - Adds configurable delay between removals to prevent router overload
+    - Runs in thread pool to not block the server
+    - Limits users per request (default 50)
+    
+    Query params:
+    - limit: Max users to remove in one request (default 50, max 100)
+    - delay_ms: Delay between each removal in milliseconds (default 150ms)
+    
+    Returns detailed results for each removed user.
+    """
+    # Validate parameters
+    if limit > 100:
+        limit = 100
+    if limit < 1:
+        limit = 1
+    if delay_ms < 50:
+        delay_ms = 50  # Minimum 50ms delay to protect router
+    if delay_ms > 1000:
+        delay_ms = 1000
+    
+    try:
+        # Get router
+        router = await get_router_by_id(db, router_id)
+        if not router:
+            raise HTTPException(status_code=404, detail="Router not found")
+        
+        # Get all customers with MAC addresses for this router
+        stmt = select(Customer).where(
+            Customer.router_id == router_id,
+            Customer.mac_address.isnot(None)
+        )
+        result = await db.execute(stmt)
+        all_customers = result.scalars().all()
+        
+        # Build lookup of known customer MACs with their status
+        known_macs = {}
+        active_macs = set()
+        for c in all_customers:
+            normalized = normalize_mac_address(c.mac_address)
+            known_macs[normalized] = {
+                "id": c.id,
+                "name": c.name,
+                "status": c.status.value if c.status else "unknown"
+            }
+            if c.status == CustomerStatus.ACTIVE:
+                active_macs.add(normalized)
+        
+        # Quick scan to find illegal users (connect briefly)
+        api = connect_to_router(router)
+        if not api.connect():
+            raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router.name}")
+        
+        try:
+            # Collect connected devices (minimal data fetch)
+            connected_devices = {}
+            
+            arp_result = api.send_command("/ip/arp/print")
+            for entry in (arp_result.get("data", []) if arp_result.get("success") else []):
+                mac = entry.get("mac-address", "")
+                if mac:
+                    normalized_mac = normalize_mac_address(mac)
+                    connected_devices[normalized_mac] = {"mac_address": mac, "ip_address": entry.get("address", "")}
+            
+            dhcp_result = api.send_command("/ip/dhcp-server/lease/print")
+            for lease in (dhcp_result.get("data", []) if dhcp_result.get("success") else []):
+                mac = lease.get("mac-address", "")
+                if mac:
+                    normalized_mac = normalize_mac_address(mac)
+                    if normalized_mac not in connected_devices:
+                        connected_devices[normalized_mac] = {"mac_address": mac, "ip_address": lease.get("address", "")}
+            
+            active_result = api.send_command("/ip/hotspot/active/print")
+            for session in (active_result.get("data", []) if active_result.get("success") else []):
+                mac = session.get("mac-address", "")
+                if mac:
+                    normalized_mac = normalize_mac_address(mac)
+                    if normalized_mac not in connected_devices:
+                        connected_devices[normalized_mac] = {"mac_address": mac, "ip_address": session.get("address", "")}
+            
+            api.disconnect()
+            
+        except Exception as e:
+            api.disconnect()
+            raise e
+        
+        # Find illegal users
+        illegal_users = []
+        for mac, device_info in connected_devices.items():
+            customer_info = known_macs.get(mac)
+            if not customer_info:
+                illegal_users.append({
+                    "mac_address": device_info["mac_address"],
+                    "ip_address": device_info.get("ip_address", ""),
+                    "reason": "UNAUTHORIZED"
+                })
+            elif customer_info["status"] != "active":
+                illegal_users.append({
+                    "mac_address": device_info["mac_address"],
+                    "ip_address": device_info.get("ip_address", ""),
+                    "reason": "EXPIRED"
+                })
+        
+        if not illegal_users:
+            return {
+                "success": True,
+                "router_id": router_id,
+                "router_name": router.name,
+                "message": "No illegal users found",
+                "removed_count": 0,
+                "failed_count": 0,
+                "total_found": 0,
+                "details": []
+            }
+        
+        total_found = len(illegal_users)
+        
+        # Apply limit
+        if len(illegal_users) > limit:
+            logger.info(f"[REMOVE-ILLEGAL] Found {len(illegal_users)} illegal users, limiting to {limit}")
+            illegal_users = illegal_users[:limit]
+        
+        logger.info(f"[REMOVE-ILLEGAL] Processing {len(illegal_users)} illegal users (of {total_found} found)")
+        
+        # Prepare router info for thread
+        router_info = {
+            "ip": router.ip_address,
+            "username": router.username,
+            "password": router.password,
+            "port": router.api_port,
+            "name": router.name
+        }
+        
+        # Run bulk removal in thread pool (non-blocking)
+        loop = asyncio.get_event_loop()
+        removal_results = await loop.run_in_executor(
+            None,
+            _bulk_remove_illegal_users_sync,
+            router_info,
+            illegal_users,
+            known_macs,
+            delay_ms
+        )
+        
+        return {
+            "success": True,
+            "router_id": router_id,
+            "router_name": router.name,
+            "message": f"Removed {len(removal_results['removed'])} illegal users, {len(removal_results['failed'])} failed",
+            "removed_count": len(removal_results["removed"]),
+            "failed_count": len(removal_results["failed"]),
+            "total_found": total_found,
+            "processed": len(illegal_users),
+            "remaining": total_found - len(illegal_users) if total_found > limit else 0,
+            "details": removal_results["removed"] + removal_results["failed"]
+        }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing illegal users from router {router_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Removal failed: {str(e)}")
+
+
+@app.delete("/api/routers/{router_id}/remove-illegal-user/{mac_address}")
+async def remove_single_illegal_user(
+    router_id: int,
+    mac_address: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Remove a single illegal/unauthorized user from MikroTik router by MAC address.
+    
+    Uses the same comprehensive removal algorithm as the expired user cron job:
+    - Removes IP binding
+    - Removes hotspot host entry
+    - Removes hotspot user
+    - Disconnects active sessions
+    - Removes simple queues
+    - Removes DHCP leases
+    
+    If the MAC belongs to a customer in the database, their status is updated to INACTIVE.
+    """
+    logger.info(f"[REMOVE-ILLEGAL] Single removal request: router_id={router_id}, mac={mac_address}")
+    
+    if not validate_mac_address(mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address format")
+    
+    # Get router
+    router = await get_router_by_id(db, router_id)
+    if not router:
+        raise HTTPException(status_code=404, detail="Router not found")
+    
+    # Check if this MAC belongs to a customer
+    normalized_mac = normalize_mac_address(mac_address)
+    stmt = select(Customer).where(
+        Customer.router_id == router_id,
+        Customer.mac_address.isnot(None)
+    )
+    result = await db.execute(stmt)
+    all_customers = result.scalars().all()
+    
+    customer_info = None
+    customer_to_update = None
+    for c in all_customers:
+        if normalize_mac_address(c.mac_address) == normalized_mac:
+            customer_info = {"id": c.id, "name": c.name, "status": c.status.value if c.status else "unknown"}
+            customer_to_update = c
+            break
+    
+    # Connect to router
+    api = connect_to_router(router)
+    if not api.connect():
+        raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router.name}")
+    
+    try:
+        # Fetch all data once for efficient removal (7 API calls)
+        cached_data = {
+            "arp": [],
+            "bindings": [],
+            "hosts": [],
+            "users": [],
+            "active_sessions": [],
+            "queues": [],
+            "leases": []
+        }
+        
+        arp_result = api.send_command("/ip/arp/print")
+        if arp_result.get("success"):
+            cached_data["arp"] = arp_result.get("data", [])
+        
+        bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
+        if bindings_result.get("success"):
+            cached_data["bindings"] = bindings_result.get("data", [])
+        
+        hosts_result = api.send_command("/ip/hotspot/host/print")
+        if hosts_result.get("success"):
+            cached_data["hosts"] = hosts_result.get("data", [])
+        
+        users_result = api.send_command("/ip/hotspot/user/print")
+        if users_result.get("success"):
+            cached_data["users"] = users_result.get("data", [])
+        
+        active_result = api.send_command("/ip/hotspot/active/print")
+        if active_result.get("success"):
+            cached_data["active_sessions"] = active_result.get("data", [])
+        
+        queues_result = api.send_command("/queue/simple/print")
+        if queues_result.get("success"):
+            cached_data["queues"] = queues_result.get("data", [])
+        
+        leases_result = api.send_command("/ip/dhcp-server/lease/print")
+        if leases_result.get("success"):
+            cached_data["leases"] = leases_result.get("data", [])
+        
+        # Remove the user using cached data
+        removal_result = _remove_illegal_user_with_cache(api, mac_address, cached_data, customer_info)
+        api.disconnect()
+        
+        if not removal_result.get("success"):
+            raise HTTPException(status_code=500, detail=removal_result.get("error", "Failed to remove user"))
+        
+        # Update customer status to INACTIVE if they exist in database
+        if customer_to_update:
+            customer_to_update.status = CustomerStatus.INACTIVE
+            await db.commit()
+            removal_result["customer_status_updated"] = True
+            logger.info(f"[REMOVE-ILLEGAL] Updated customer {customer_to_update.id} status to INACTIVE")
+        
+        return {
+            "success": True,
+            "router_id": router_id,
+            "router_name": router.name,
+            "message": f"Successfully removed user with MAC {mac_address}",
+            "removed": removal_result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        api.disconnect()
+        logger.error(f"Error removing illegal user {mac_address} from router {router_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Removal failed: {str(e)}")
 
 
 # Plan Management Endpoints
