@@ -14,10 +14,11 @@ logger.setLevel(logging.WARNING)  # Reduce noise, only warnings/errors
 
 # ============================================================================
 # CIRCUIT BREAKER: Track failed routers to avoid repeated blocking timeouts
+# Only triggers on CONNECTION failures, not read timeouts during operations
 # ============================================================================
 _router_failures: Dict[str, Dict[str, Any]] = {}
-CIRCUIT_BREAKER_THRESHOLD = 2  # Number of failures before circuit opens
-CIRCUIT_BREAKER_RESET_TIME = 120  # Seconds to wait before retrying failed router
+CIRCUIT_BREAKER_THRESHOLD = 3  # Number of connection failures before circuit opens
+CIRCUIT_BREAKER_RESET_TIME = 60  # Seconds to wait before retrying failed router
 
 def _get_router_key(host: str, port: int) -> str:
     """Generate unique key for a router"""
@@ -217,10 +218,10 @@ class MikroTikAPI:
                     break
                 sentence.append(word)
             except socket.timeout:
-                logger.error(f"Timeout reading from {self.host} - connection may be stale")
-                # Mark connection as failed - prevents further blocking reads
+                logger.warning(f"Read timeout from {self.host} - connection stale, will reconnect")
+                # Mark connection as stale - but DON'T trigger circuit breaker
+                # Read timeouts during operation are transient, not connection failures
                 self.connected = False
-                _record_failure(self.host, self.port)
                 break
             except Exception as e:
                 logger.error(f"Error reading word in sentence: {e}")

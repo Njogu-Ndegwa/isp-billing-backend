@@ -505,24 +505,12 @@ async def cleanup_expired_users_background():
                         }
                     router_customers_map[router_key]["customers"].append(customer_data)
                 else:
-                    # Fallback to default settings for customers without router
+                    # Customer has no router assigned - skip them and log warning
                     no_router_customers.append(customer_data)
             
-            # Add no-router customers to default router
+            # Log customers without routers (don't try default - it may not exist)
             if no_router_customers:
-                default_key = f"{settings.MIKROTIK_HOST}:{settings.MIKROTIK_PORT}"
-                if default_key not in router_customers_map:
-                    router_customers_map[default_key] = {
-                        "router": {
-                            "ip": settings.MIKROTIK_HOST,
-                            "username": settings.MIKROTIK_USERNAME,
-                            "password": settings.MIKROTIK_PASSWORD,
-                            "port": settings.MIKROTIK_PORT,
-                            "name": "Default Router"
-                        },
-                        "customers": []
-                    }
-                router_customers_map[default_key]["customers"].extend(no_router_customers)
+                logger.warning(f"[CRON] Skipping {len(no_router_customers)} customer(s) with no router assigned: {[c['id'] for c in no_router_customers]}")
             
             logger.info(f"[CRON] Grouped customers across {len(router_customers_map)} router(s)")
             
@@ -849,21 +837,9 @@ async def sync_active_user_queues():
                 else:
                     no_router_customers.append(customer_data)
             
-            # Add no-router customers to default router
+            # Log customers without routers (don't try default - it may not exist)
             if no_router_customers:
-                default_key = f"{settings.MIKROTIK_HOST}:{settings.MIKROTIK_PORT}"
-                if default_key not in router_customers_map:
-                    router_customers_map[default_key] = {
-                        "router": {
-                            "ip": settings.MIKROTIK_HOST,
-                            "username": settings.MIKROTIK_USERNAME,
-                            "password": settings.MIKROTIK_PASSWORD,
-                            "port": settings.MIKROTIK_PORT,
-                            "name": "Default Router"
-                        },
-                        "customers": []
-                    }
-                router_customers_map[default_key]["customers"].extend(no_router_customers)
+                logger.warning(f"[SYNC] Skipping {len(no_router_customers)} customer(s) with no router assigned")
             
             logger.info(f"[SYNC] Grouped customers across {len(router_customers_map)} router(s)")
             
