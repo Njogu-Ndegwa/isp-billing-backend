@@ -47,9 +47,9 @@ mikrotik_lock = asyncio.Lock()  # Global lock to prevent concurrent MikroTik API
 _mikrotik_cache = {"data": None, "timestamp": None}
 _mikrotik_cache_ttl = 300  # seconds - limit to once per 5 minutes
 
-# MikroTik health cache per router (lighter TTL for real-time feel)
+# MikroTik health cache per router
 _health_cache = {}  # router_id -> {"data": ..., "timestamp": ...}
-_health_cache_ttl = 30  # seconds - balance between freshness and load
+_health_cache_ttl = 300  # 5 minutes - reduces router connection load significantly
 
 
 def _fetch_mikrotik_data_sync():
@@ -672,12 +672,25 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
             skipped_no_ip = 0
             skipped_already_ok = 0
             errors = 0
+            created_queues = []
+            updated_queues = []
+            
+            logger.info(f"[SYNC] 📋 Starting queue processing for {len(customers_data)} customers on {router_name}")
             
             for cust in customers_data:
                 # Check if we've hit the max operations limit
                 if total_operations >= SYNC_MAX_QUEUE_OPERATIONS_PER_RUN:
                     logger.info(f"[SYNC] Reached max operations limit, stopping customer processing")
                     break
+                
+                # Check if connection is still alive - reconnect if needed
+                if not api.connected:
+                    logger.warning(f"[SYNC] ⚠️ Connection to {router_name} lost, attempting reconnect...")
+                    if not api.connect():
+                        logger.error(f"[SYNC] ❌ Reconnect failed, aborting sync for {router_name}")
+                        errors += len(customers_data) - (synced + skipped_no_ip + skipped_already_ok + errors)
+                        break
+                    logger.info(f"[SYNC] ✅ Reconnected to {router_name}")
                 
                 try:
                     normalized_mac = normalize_mac_address(cust["mac_address"])
@@ -695,9 +708,13 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
                     existing_queue = queue_by_name.get(queue_name)
                     
                     if existing_queue:
-                        # Queue exists - check if IP needs update
+                        # Queue exists - check if IP or rate limit needs update
                         current_target = existing_queue.get("target", "")
-                        if client_ip not in current_target:
+                        current_limit = existing_queue.get("max-limit", "")
+                        
+                        needs_update = client_ip not in current_target or rate_limit != current_limit
+                        
+                        if needs_update:
                             time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)  # Rate limit
                             update_result = api.send_command("/queue/simple/set", {
                                 "numbers": existing_queue[".id"],
@@ -705,17 +722,18 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
                                 "max-limit": rate_limit
                             })
                             if update_result.get("error"):
-                                logger.error(f"[SYNC] Failed to update queue for {username}: {update_result.get('error')}")
+                                logger.error(f"[SYNC] ❌ Failed to update queue {queue_name}: {update_result.get('error')}")
                                 errors += 1
                             else:
-                                logger.info(f"[SYNC] Updated queue {queue_name} -> {client_ip} on {router_name}")
+                                logger.info(f"[SYNC] ✅ Updated queue {queue_name} -> {client_ip} ({rate_limit})")
+                                updated_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
                                 synced += 1
                                 total_operations += 1
                         else:
-                            # Queue already has correct IP, skip
+                            # Queue already has correct IP and limit, skip
                             skipped_already_ok += 1
                     else:
-                        # Create new queue
+                        # Create new queue - THIS IS CRITICAL FOR BANDWIDTH LIMITING
                         time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)  # Rate limit
                         add_result = api.send_command("/queue/simple/add", {
                             "name": queue_name,
@@ -724,21 +742,35 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
                             "comment": f"MAC:{cust['mac_address']}|Plan rate limit"
                         })
                         if add_result.get("error"):
-                            logger.error(f"[SYNC] Failed to create queue for {username}: {add_result.get('error')}")
-                            errors += 1
+                            # Check if it's a duplicate error (might have been created by another process)
+                            if "already have" in add_result.get("error", "").lower():
+                                logger.warning(f"[SYNC] ⚠️ Queue {queue_name} already exists (created elsewhere)")
+                                skipped_already_ok += 1
+                            else:
+                                logger.error(f"[SYNC] ❌ Failed to create queue {queue_name}: {add_result.get('error')}")
+                                errors += 1
                         else:
-                            logger.info(f"[SYNC] Created queue {queue_name} -> {client_ip} ({rate_limit}) on {router_name}")
+                            logger.info(f"[SYNC] ✅ CREATED queue {queue_name} -> {client_ip} ({rate_limit}) - BANDWIDTH NOW LIMITED")
+                            created_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
                             synced += 1
                             total_operations += 1
                             
                 except Exception as e:
-                    logger.error(f"[SYNC] Error syncing customer {cust['id']} ({cust['mac_address']}): {e}")
+                    logger.error(f"[SYNC] ❌ Error syncing customer {cust['id']} ({cust['mac_address']}): {e}")
                     errors += 1
             
-            if skipped_no_ip > 0:
-                logger.info(f"[SYNC] Skipped {skipped_no_ip} customers on {router_name} (not connected/no IP)")
-            if skipped_already_ok > 0:
-                logger.info(f"[SYNC] Skipped {skipped_already_ok} customers on {router_name} (queue already correct)")
+            # Detailed summary for this router
+            logger.info(f"[SYNC] 📊 Router {router_name} Summary:")
+            logger.info(f"[SYNC]    - Queues created: {len(created_queues)}")
+            logger.info(f"[SYNC]    - Queues updated: {len(updated_queues)}")
+            logger.info(f"[SYNC]    - Skipped (no IP): {skipped_no_ip}")
+            logger.info(f"[SYNC]    - Skipped (already correct): {skipped_already_ok}")
+            logger.info(f"[SYNC]    - Errors: {errors}")
+            
+            if created_queues:
+                logger.info(f"[SYNC] 🆕 Created queues: {[q['name'] + '=' + q['limit'] for q in created_queues]}")
+            if updated_queues:
+                logger.info(f"[SYNC] 🔄 Updated queues: {[q['name'] + '=' + q['limit'] for q in updated_queues]}")
             
             results["synced"] += synced
             results["errors"] += errors
@@ -2810,6 +2842,171 @@ async def cleanup_expired_customers_for_router(
     except Exception as e:
         logger.error(f"Error cleaning up router {router_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+
+# Diagnostic endpoint to find customers without bandwidth limits
+@app.get("/api/routers/{router_id}/bandwidth-check")
+async def check_bandwidth_limits(
+    router_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Check which active customers have bandwidth queues applied on the router.
+    Helps identify users who might be using unlimited bandwidth.
+    
+    Returns:
+    - customers_with_queues: Customers who have bandwidth limits applied
+    - customers_without_queues: Customers who are MISSING bandwidth limits (potential issue!)
+    - unknown_queues: Queues on router that don't match any customer
+    """
+    try:
+        # Get router
+        router = await get_router_by_id(db, router_id)
+        if not router:
+            raise HTTPException(status_code=404, detail="Router not found")
+        
+        # Get all active customers for this router
+        stmt = select(Customer).options(selectinload(Customer.plan)).where(
+            Customer.router_id == router_id,
+            Customer.status == CustomerStatus.ACTIVE,
+            Customer.mac_address.isnot(None)
+        )
+        result = await db.execute(stmt)
+        active_customers = result.scalars().all()
+        
+        if not active_customers:
+            return {
+                "router_id": router_id,
+                "router_name": router.name,
+                "message": "No active customers found for this router",
+                "customers_with_queues": [],
+                "customers_without_queues": [],
+                "unknown_queues": []
+            }
+        
+        # Connect to router and get current queues
+        api = connect_to_router(router)
+        if not api.connect():
+            raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router.name}")
+        
+        try:
+            # Get all queues
+            queues_result = api.send_command("/queue/simple/print")
+            all_queues = queues_result.get("data", []) if queues_result.get("success") else []
+            
+            # Get ARP/DHCP to find connected customers
+            arp_result = api.send_command("/ip/arp/print")
+            dhcp_result = api.send_command("/ip/dhcp-server/lease/print")
+            
+            arp_entries = arp_result.get("data", []) if arp_result.get("success") else []
+            dhcp_leases = dhcp_result.get("data", []) if dhcp_result.get("success") else []
+            
+            # Build MAC to IP map
+            mac_to_ip = {}
+            for entry in arp_entries:
+                mac = entry.get("mac-address", "")
+                if mac:
+                    mac_to_ip[normalize_mac_address(mac)] = entry.get("address")
+            for lease in dhcp_leases:
+                mac = lease.get("mac-address", "")
+                if mac and lease.get("address"):
+                    mac_to_ip[normalize_mac_address(mac)] = lease.get("address")
+            
+            api.disconnect()
+            
+            # Build queue lookup by target IP
+            queue_by_ip = {}
+            queue_by_name = {}
+            for q in all_queues:
+                target = q.get("target", "")
+                # Extract IP from target (e.g., "192.168.1.100/32" -> "192.168.1.100")
+                if "/" in target:
+                    ip = target.split("/")[0]
+                    queue_by_ip[ip] = q
+                queue_by_name[q.get("name", "")] = q
+            
+            customers_with_queues = []
+            customers_without_queues = []
+            customer_macs = set()
+            
+            for customer in active_customers:
+                normalized_mac = normalize_mac_address(customer.mac_address)
+                customer_macs.add(normalized_mac)
+                username = normalized_mac.replace(":", "")
+                queue_name = f"plan_{username}"
+                
+                client_ip = mac_to_ip.get(normalized_mac)
+                has_queue = False
+                queue_info = None
+                
+                # Check by queue name or by IP
+                if queue_name in queue_by_name:
+                    has_queue = True
+                    queue_info = queue_by_name[queue_name]
+                elif client_ip and client_ip in queue_by_ip:
+                    has_queue = True
+                    queue_info = queue_by_ip[client_ip]
+                
+                customer_data = {
+                    "id": customer.id,
+                    "name": customer.name,
+                    "mac_address": customer.mac_address,
+                    "current_ip": client_ip,
+                    "is_connected": client_ip is not None,
+                    "plan_name": customer.plan.name if customer.plan else None,
+                    "plan_speed": customer.plan.speed if customer.plan else None,
+                    "expiry": customer.expiry.isoformat() if customer.expiry else None
+                }
+                
+                if has_queue:
+                    customer_data["queue_name"] = queue_info.get("name")
+                    customer_data["queue_limit"] = queue_info.get("max-limit")
+                    customer_data["queue_target"] = queue_info.get("target")
+                    customers_with_queues.append(customer_data)
+                else:
+                    customer_data["issue"] = "NO BANDWIDTH LIMIT - USER HAS UNLIMITED SPEED!" if client_ip else "Not connected"
+                    customers_without_queues.append(customer_data)
+            
+            # Find queues that don't belong to any known customer
+            unknown_queues = []
+            for q in all_queues:
+                queue_name = q.get("name", "")
+                # Skip if it's a known customer queue
+                if queue_name.startswith("plan_"):
+                    username = queue_name.replace("plan_", "")
+                    # Convert username back to MAC format
+                    if len(username) == 12:
+                        reconstructed_mac = ":".join(username[i:i+2] for i in range(0, 12, 2))
+                        if reconstructed_mac not in customer_macs:
+                            unknown_queues.append({
+                                "name": queue_name,
+                                "target": q.get("target"),
+                                "limit": q.get("max-limit"),
+                                "comment": q.get("comment", "")
+                            })
+            
+            return {
+                "router_id": router_id,
+                "router_name": router.name,
+                "total_active_customers": len(active_customers),
+                "customers_with_queues": len(customers_with_queues),
+                "customers_without_queues_count": len(customers_without_queues),
+                "has_unlimited_users": any(c.get("is_connected") for c in customers_without_queues),
+                "customers_with_limits": customers_with_queues,
+                "customers_WITHOUT_limits": customers_without_queues,
+                "unknown_queues": unknown_queues
+            }
+            
+        except Exception as e:
+            api.disconnect()
+            raise e
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error checking bandwidth limits for router {router_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Check failed: {str(e)}")
+
 
 # Plan Management Endpoints
 class PlanCreateRequest(BaseModel):
