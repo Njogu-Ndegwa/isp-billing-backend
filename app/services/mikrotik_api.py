@@ -3,6 +3,7 @@ import struct
 import re
 import hashlib
 import logging
+import time
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import json  # Ensure you import json for serializing logs
@@ -10,6 +11,54 @@ import json  # Ensure you import json for serializing logs
 # Initialize logger
 logger = logging.getLogger("mikrotik_api")
 logger.setLevel(logging.WARNING)  # Reduce noise, only warnings/errors
+
+# ============================================================================
+# CIRCUIT BREAKER: Track failed routers to avoid repeated blocking timeouts
+# ============================================================================
+_router_failures: Dict[str, Dict[str, Any]] = {}
+CIRCUIT_BREAKER_THRESHOLD = 2  # Number of failures before circuit opens
+CIRCUIT_BREAKER_RESET_TIME = 120  # Seconds to wait before retrying failed router
+
+def _get_router_key(host: str, port: int) -> str:
+    """Generate unique key for a router"""
+    return f"{host}:{port}"
+
+def _is_circuit_open(host: str, port: int) -> bool:
+    """Check if circuit breaker is open (router should be skipped)"""
+    key = _get_router_key(host, port)
+    if key not in _router_failures:
+        return False
+    
+    failure_info = _router_failures[key]
+    # Check if enough time has passed to retry
+    if time.time() - failure_info["last_failure"] > CIRCUIT_BREAKER_RESET_TIME:
+        # Reset the circuit breaker - allow retry
+        del _router_failures[key]
+        logger.info(f"Circuit breaker reset for {host}:{port} - allowing retry")
+        return False
+    
+    # Circuit is open if we've exceeded threshold
+    return failure_info["count"] >= CIRCUIT_BREAKER_THRESHOLD
+
+def _record_failure(host: str, port: int):
+    """Record a connection failure for circuit breaker"""
+    key = _get_router_key(host, port)
+    if key not in _router_failures:
+        _router_failures[key] = {"count": 0, "last_failure": 0}
+    
+    _router_failures[key]["count"] += 1
+    _router_failures[key]["last_failure"] = time.time()
+    
+    count = _router_failures[key]["count"]
+    if count >= CIRCUIT_BREAKER_THRESHOLD:
+        logger.warning(f"Circuit breaker OPEN for {host}:{port} - will skip for {CIRCUIT_BREAKER_RESET_TIME}s")
+
+def _record_success(host: str, port: int):
+    """Record a successful connection - reset circuit breaker"""
+    key = _get_router_key(host, port)
+    if key in _router_failures:
+        del _router_failures[key]
+        logger.info(f"Circuit breaker cleared for {host}:{port} after successful connection")
 
 # Helper functions to validate and normalize MAC addresses
 def validate_mac_address(mac: str) -> bool:
@@ -23,34 +72,88 @@ def normalize_mac_address(mac: str) -> str:
     return ':'.join(clean_mac[i:i+2] for i in range(0, 12, 2))
 
 class MikroTikAPI:
-    def __init__(self, host: str, username: str, password: str, port: int = 8728, timeout: int = 30):
+    def __init__(self, host: str, username: str, password: str, port: int = 8728, 
+                 timeout: int = 15, connect_timeout: int = 5):
+        """
+        Initialize MikroTik API connection.
+        
+        Args:
+            host: Router IP address
+            username: API username
+            password: API password
+            port: API port (default 8728)
+            timeout: Read/write timeout in seconds (default 15s)
+            connect_timeout: Initial connection timeout in seconds (default 5s)
+        """
         self.host = host
         self.username = username
         self.password = password
         self.port = port
         self.timeout = timeout
+        self.connect_timeout = connect_timeout
         self.sock = None
         self.connected = False
 
-
     def connect(self) -> bool:
+        """
+        Connect to MikroTik router with circuit breaker protection.
+        Uses short connect_timeout for initial connection, then switches to 
+        regular timeout for operations.
+        """
+        # Check circuit breaker first - avoid blocking on known-bad routers
+        if _is_circuit_open(self.host, self.port):
+            logger.warning(f"Circuit breaker OPEN - skipping connection to {self.host}:{self.port}")
+            return False
+        
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(self.timeout)
+            # Use short timeout for initial connection attempt
+            self.sock.settimeout(self.connect_timeout)
             self.sock.connect((self.host, self.port))
-            return self.login()
+            # Switch to regular timeout for read/write operations
+            self.sock.settimeout(self.timeout)
+            
+            if self.login():
+                _record_success(self.host, self.port)
+                return True
+            else:
+                _record_failure(self.host, self.port)
+                return False
+        except socket.timeout:
+            logger.error(f"Connection timed out to {self.host}:{self.port} (timeout: {self.connect_timeout}s)")
+            _record_failure(self.host, self.port)
+            self._cleanup_socket()
+            return False
+        except ConnectionRefusedError:
+            logger.error(f"Connection refused by {self.host}:{self.port}")
+            _record_failure(self.host, self.port)
+            self._cleanup_socket()
+            return False
+        except OSError as e:
+            logger.error(f"Network error connecting to {self.host}:{self.port}: {e}")
+            _record_failure(self.host, self.port)
+            self._cleanup_socket()
+            return False
         except Exception as e:
             logger.error(f"Connection failed to {self.host}: {e}")
+            _record_failure(self.host, self.port)
+            self._cleanup_socket()
             return False
-
-    def disconnect(self):
+    
+    def _cleanup_socket(self):
+        """Clean up socket on error"""
         if self.sock:
             try:
                 self.sock.close()
             except:
                 pass
             self.sock = None
-            self.connected = False
+        self.connected = False
+
+    def disconnect(self):
+        """Disconnect from router and clean up"""
+        self._cleanup_socket()
+        self.connected = False
 
     def _safe_int(self, value, default=0) -> int:
         """Safely convert a value to int, handling empty strings and None"""
@@ -105,6 +208,7 @@ class MikroTikAPI:
         self.send_word("")
 
     def read_sentence(self) -> List[str]:
+        """Read a complete sentence from MikroTik. Handles timeouts gracefully."""
         sentence = []
         while True:
             try:
@@ -112,8 +216,15 @@ class MikroTikAPI:
                 if word == "":
                     break
                 sentence.append(word)
+            except socket.timeout:
+                logger.error(f"Timeout reading from {self.host} - connection may be stale")
+                # Mark connection as failed - prevents further blocking reads
+                self.connected = False
+                _record_failure(self.host, self.port)
+                break
             except Exception as e:
                 logger.error(f"Error reading word in sentence: {e}")
+                self.connected = False
                 break
         return sentence
 

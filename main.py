@@ -1,7 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, or_
+from sqlalchemy import select, delete, or_, update, func
 from app.db.database import get_db, async_engine
 from app.db.models import Router, Customer, Plan, ProvisioningLog, ConnectionType, CustomerStatus, MpesaTransaction, MpesaTransactionStatus, User, CustomerPayment, BandwidthSnapshot, UserBandwidthUsage, Ad, AdClick, AdImpression, AdClickType, Advertiser, AdBadgeType, CustomerRating
 from app.services.auth import verify_token, get_current_user
@@ -59,7 +59,8 @@ def _fetch_mikrotik_data_sync():
         settings.MIKROTIK_USERNAME,
         settings.MIKROTIK_PASSWORD,
         settings.MIKROTIK_PORT,
-        timeout=20
+        timeout=15,
+        connect_timeout=5  # Fast fail if router unreachable
     )
     if not api.connect():
         return None
@@ -87,7 +88,8 @@ def _fetch_top_users_sync():
         settings.MIKROTIK_USERNAME,
         settings.MIKROTIK_PASSWORD,
         settings.MIKROTIK_PORT,
-        timeout=20
+        timeout=15,
+        connect_timeout=5  # Fast fail if router unreachable
     )
     if not api.connect():
         return None
@@ -108,13 +110,25 @@ async def get_router_by_id(
     res = await db.execute(stmt)
     return res.scalar_one_or_none()
 
-def connect_to_router(router: Router) -> MikroTikAPI:
-    """Create MikroTik API connection using router-specific credentials"""
+def connect_to_router(router: Router, connect_timeout: int = 5, timeout: int = 15) -> MikroTikAPI:
+    """
+    Create MikroTik API connection using router-specific credentials.
+    
+    Uses circuit breaker pattern - will skip routers that have recently failed
+    to prevent blocking the server.
+    
+    Args:
+        router: Router model with connection details
+        connect_timeout: Seconds to wait for initial connection (default 5s)
+        timeout: Seconds to wait for read/write operations (default 15s)
+    """
     api = MikroTikAPI(
         router.ip_address,
         router.username,
         router.password,
-        router.port
+        router.port,
+        timeout=timeout,
+        connect_timeout=connect_timeout
     )
     return api
 
@@ -155,7 +169,9 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
                 router.ip_address,
                 router.username,
                 router.password,
-                router.port
+                router.port,
+                timeout=15,
+                connect_timeout=5  # Fast fail if router unreachable
             )
             logger.info(f"[CLEANUP] Connecting to router {router.name} at {router.ip_address}")
         else:
@@ -164,7 +180,9 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
                 settings.MIKROTIK_HOST,
                 settings.MIKROTIK_USERNAME,
                 settings.MIKROTIK_PASSWORD,
-                settings.MIKROTIK_PORT
+                settings.MIKROTIK_PORT,
+                timeout=15,
+                connect_timeout=5  # Fast fail if router unreachable
             )
             logger.warning(f"[CLEANUP] Customer {customer.id} has no router assigned, using default settings")
         
@@ -302,11 +320,14 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
         
         logger.info(f"[CRON] Processing {len(customers_data)} customers on router {router_info['name']} ({router_info['ip']})")
         
+        # Use short connect timeout to fail fast on unreachable routers
         api = MikroTikAPI(
             router_info["ip"],
             router_info["username"],
             router_info["password"],
-            router_info["port"]
+            router_info["port"],
+            timeout=15,  # Read/write timeout
+            connect_timeout=5  # Fast fail on unreachable routers
         )
         
         if not api.connect():
@@ -598,7 +619,8 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
                 router_info["username"],
                 router_info["password"],
                 router_info["port"],
-                timeout=60  # Longer timeout for stability
+                timeout=30,  # Read/write timeout for sync operations
+                connect_timeout=5  # Fast fail on unreachable routers
             )
             
             if not api.connect():
@@ -1235,7 +1257,9 @@ async def call_mikrotik_bypass(hotspot_payload: dict):
             router_ip,
             router_username,
             router_password,
-            router_port
+            router_port,
+            timeout=15,
+            connect_timeout=5  # Fast fail if router unreachable
         )
 
         if not api.connect():
@@ -2011,7 +2035,9 @@ async def cleanup_all_inactive_users(
             settings.MIKROTIK_HOST,
             settings.MIKROTIK_USERNAME,
             settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT
+            settings.MIKROTIK_PORT,
+            timeout=15,
+            connect_timeout=5  # Fast fail if router unreachable
         )
         
         if not api.connect():
@@ -2117,7 +2143,9 @@ def _cleanup_recently_expired_sync(customers_data: list, delay_ms: int = 200) ->
         settings.MIKROTIK_HOST,
         settings.MIKROTIK_USERNAME,
         settings.MIKROTIK_PASSWORD,
-        settings.MIKROTIK_PORT
+        settings.MIKROTIK_PORT,
+        timeout=15,
+        connect_timeout=5  # Fast fail if router unreachable
     )
     
     if not api.connect():
@@ -2352,7 +2380,9 @@ async def cleanup_blocked_bindings_public():
             settings.MIKROTIK_HOST,
             settings.MIKROTIK_USERNAME,
             settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT
+            settings.MIKROTIK_PORT,
+            timeout=15,
+            connect_timeout=5  # Fast fail if router unreachable
         )
         
         if not api.connect():
@@ -2422,7 +2452,9 @@ async def sync_customer_queue(
             settings.MIKROTIK_HOST,
             settings.MIKROTIK_USERNAME,
             settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT
+            settings.MIKROTIK_PORT,
+            timeout=15,
+            connect_timeout=5  # Fast fail if router unreachable
         )
         
         if not api.connect():
@@ -4421,6 +4453,78 @@ async def update_router(
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to update router: {str(e)}")
 
+# Delete Router Endpoint
+@app.delete("/api/routers/{router_id}")
+async def delete_router(
+    router_id: int,
+    force: bool = False,
+    user_id: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Delete a router.
+    
+    Args:
+        router_id: ID of the router to delete
+        force: If True, reassign customers to no router. If False, fail if customers exist.
+        user_id: Owner user ID
+    
+    Returns:
+        Success message with details
+    """
+    try:
+        # Get existing router
+        stmt = select(Router).where(Router.id == router_id, Router.user_id == user_id)
+        result = await db.execute(stmt)
+        router = result.scalar_one_or_none()
+        
+        if not router:
+            raise HTTPException(status_code=404, detail="Router not found")
+        
+        router_name = router.name
+        router_ip = router.ip_address
+        
+        # Check for customers assigned to this router
+        customer_count_stmt = select(func.count(Customer.id)).where(Customer.router_id == router_id)
+        customer_count_result = await db.execute(customer_count_stmt)
+        customer_count = customer_count_result.scalar() or 0
+        
+        if customer_count > 0:
+            if not force:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Router has {customer_count} customer(s) assigned. Use force=true to reassign them to no router."
+                )
+            
+            # Reassign customers to no router
+            update_customers_stmt = (
+                update(Customer)
+                .where(Customer.router_id == router_id)
+                .values(router_id=None)
+            )
+            await db.execute(update_customers_stmt)
+            logger.info(f"Reassigned {customer_count} customers from router {router_name} to no router")
+        
+        # Delete the router
+        await db.delete(router)
+        await db.commit()
+        
+        logger.info(f"Deleted router: {router_name} ({router_ip})")
+        
+        return {
+            "success": True,
+            "message": f"Router '{router_name}' deleted successfully",
+            "router_id": router_id,
+            "customers_reassigned": customer_count if force else 0
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting router: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete router: {str(e)}")
+
 # Delete Plan Endpoint
 @app.delete("/api/plans/{plan_id}")
 async def delete_plan(
@@ -4521,7 +4625,9 @@ async def get_mikrotik_health(
                 settings.MIKROTIK_HOST,
                 settings.MIKROTIK_USERNAME,
                 settings.MIKROTIK_PASSWORD,
-                settings.MIKROTIK_PORT
+                settings.MIKROTIK_PORT,
+                timeout=15,
+                connect_timeout=5  # Fast fail if router unreachable
             )
             router_name = "Default Router"
         
@@ -4722,7 +4828,9 @@ async def get_mikrotik_traffic(
                 settings.MIKROTIK_HOST,
                 settings.MIKROTIK_USERNAME,
                 settings.MIKROTIK_PASSWORD,
-                settings.MIKROTIK_PORT
+                settings.MIKROTIK_PORT,
+                timeout=15,
+                connect_timeout=5  # Fast fail if router unreachable
             )
             router_name = "Default Router"
         
@@ -4765,7 +4873,9 @@ async def get_mikrotik_active_sessions(
                 settings.MIKROTIK_HOST,
                 settings.MIKROTIK_USERNAME,
                 settings.MIKROTIK_PASSWORD,
-                settings.MIKROTIK_PORT
+                settings.MIKROTIK_PORT,
+                timeout=15,
+                connect_timeout=5  # Fast fail if router unreachable
             )
             router_name = "Default Router"
         
@@ -5266,7 +5376,8 @@ def _fetch_bandwidth_data_sync_for_router(router_info: dict):
         router_info["username"],
         router_info["password"],
         router_info["port"],
-        timeout=15
+        timeout=15,
+        connect_timeout=5  # Fast fail if router unreachable
     )
     if not api.connect():
         logger.warning(f"[BANDWIDTH] Failed to connect to router ID {router_info['id']} at {router_info['ip_address']}")
@@ -5314,7 +5425,8 @@ def _fetch_bandwidth_data_sync():
         settings.MIKROTIK_USERNAME,
         settings.MIKROTIK_PASSWORD,
         settings.MIKROTIK_PORT,
-        timeout=15
+        timeout=15,
+        connect_timeout=5  # Fast fail if router unreachable
     )
     if not api.connect():
         return None

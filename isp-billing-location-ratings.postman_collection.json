@@ -8,15 +8,6 @@
     ],
     "item": [
         {
-            "name": "Update Customer Location",
-            "request": {
-                "method": "POST",
-                "url": "{{baseUrl}}/api/customers/5/location",
-                "header": [{"key": "Content-Type", "value": "application/json"}],
-                "body": {"mode": "raw", "raw": "{\"latitude\": -1.2921, \"longitude\": 36.8219}"}
-            }
-        },
-        {
             "name": "Capture Location by Phone (Existing)",
             "request": {
                 "method": "POST",
