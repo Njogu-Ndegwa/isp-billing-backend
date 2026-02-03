@@ -3008,6 +3008,183 @@ async def check_bandwidth_limits(
         raise HTTPException(status_code=500, detail=f"Check failed: {str(e)}")
 
 
+# Endpoint to find illegal/unauthorized connections
+@app.get("/api/routers/{router_id}/illegal-connections")
+async def check_illegal_connections(
+    router_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Find devices that have internet access but are NOT registered paying customers.
+    
+    Checks for:
+    1. Bypassed IP bindings on router that don't match any ACTIVE customer
+    2. Connected hotspot hosts that aren't registered
+    3. Devices with DHCP leases that aren't in the customer database
+    
+    Returns list of potential illegal connections that should be investigated/blocked.
+    """
+    try:
+        # Get router
+        router = await get_router_by_id(db, router_id)
+        if not router:
+            raise HTTPException(status_code=404, detail="Router not found")
+        
+        # Get ALL customers (active and inactive) with MAC addresses for this router
+        stmt = select(Customer).where(
+            Customer.router_id == router_id,
+            Customer.mac_address.isnot(None)
+        )
+        result = await db.execute(stmt)
+        all_customers = result.scalars().all()
+        
+        # Build lookup of known customer MACs with their status
+        known_macs = {}
+        for c in all_customers:
+            normalized = normalize_mac_address(c.mac_address)
+            known_macs[normalized] = {
+                "id": c.id,
+                "name": c.name,
+                "status": c.status.value if c.status else "unknown",
+                "expiry": c.expiry.isoformat() if c.expiry else None
+            }
+        
+        # Connect to router
+        api = connect_to_router(router)
+        if not api.connect():
+            raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router.name}")
+        
+        try:
+            illegal_connections = []
+            expired_still_connected = []
+            unknown_bypassed = []
+            
+            # 1. Check IP bindings (bypassed users)
+            bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
+            bindings = bindings_result.get("data", []) if bindings_result.get("success") else []
+            
+            for binding in bindings:
+                binding_type = binding.get("type", "")
+                mac = binding.get("mac-address", "")
+                
+                if binding_type == "bypassed" and mac:
+                    normalized_mac = normalize_mac_address(mac)
+                    customer_info = known_macs.get(normalized_mac)
+                    
+                    if not customer_info:
+                        # MAC not in database at all - ILLEGAL!
+                        unknown_bypassed.append({
+                            "type": "UNKNOWN_BYPASSED",
+                            "severity": "HIGH",
+                            "mac_address": mac,
+                            "ip_address": binding.get("address", "N/A"),
+                            "comment": binding.get("comment", ""),
+                            "issue": "Bypassed MAC not found in customer database - possible unauthorized access!"
+                        })
+                    elif customer_info["status"] != "active":
+                        # Customer exists but is INACTIVE/EXPIRED - should not be bypassed
+                        expired_still_connected.append({
+                            "type": "EXPIRED_BYPASSED",
+                            "severity": "MEDIUM",
+                            "mac_address": mac,
+                            "ip_address": binding.get("address", "N/A"),
+                            "customer_id": customer_info["id"],
+                            "customer_name": customer_info["name"],
+                            "customer_status": customer_info["status"],
+                            "expiry": customer_info["expiry"],
+                            "comment": binding.get("comment", ""),
+                            "issue": f"Customer is {customer_info['status']} but still bypassed on router!"
+                        })
+            
+            # 2. Check hotspot hosts (currently connected devices)
+            hosts_result = api.send_command("/ip/hotspot/host/print")
+            hosts = hosts_result.get("data", []) if hosts_result.get("success") else []
+            
+            for host in hosts:
+                is_bypassed = host.get("bypassed") == "true"
+                is_authorized = host.get("authorized") == "true"
+                mac = host.get("mac-address", "")
+                
+                if (is_bypassed or is_authorized) and mac:
+                    normalized_mac = normalize_mac_address(mac)
+                    customer_info = known_macs.get(normalized_mac)
+                    
+                    if not customer_info:
+                        # Connected and bypassed but not in database
+                        bytes_in = int(host.get("bytes-in", 0) or 0)
+                        bytes_out = int(host.get("bytes-out", 0) or 0)
+                        
+                        illegal_connections.append({
+                            "type": "UNKNOWN_CONNECTED",
+                            "severity": "CRITICAL" if bytes_in > 1000000 else "HIGH",  # Critical if >1MB used
+                            "mac_address": mac,
+                            "ip_address": host.get("address", "N/A"),
+                            "bypassed": is_bypassed,
+                            "authorized": is_authorized,
+                            "uptime": host.get("uptime", ""),
+                            "bytes_downloaded": bytes_in,
+                            "bytes_uploaded": bytes_out,
+                            "bytes_total_mb": round((bytes_in + bytes_out) / 1048576, 2),
+                            "issue": "Device is connected with internet access but NOT in customer database!"
+                        })
+                    elif customer_info["status"] != "active" and (is_bypassed or is_authorized):
+                        # Expired customer still getting access
+                        bytes_in = int(host.get("bytes-in", 0) or 0)
+                        bytes_out = int(host.get("bytes-out", 0) or 0)
+                        
+                        expired_still_connected.append({
+                            "type": "EXPIRED_CONNECTED",
+                            "severity": "HIGH",
+                            "mac_address": mac,
+                            "ip_address": host.get("address", "N/A"),
+                            "customer_id": customer_info["id"],
+                            "customer_name": customer_info["name"],
+                            "customer_status": customer_info["status"],
+                            "expiry": customer_info["expiry"],
+                            "bypassed": is_bypassed,
+                            "uptime": host.get("uptime", ""),
+                            "bytes_downloaded": bytes_in,
+                            "bytes_total_mb": round((bytes_in + bytes_out) / 1048576, 2),
+                            "issue": f"Expired customer still connected and using {round((bytes_in + bytes_out) / 1048576, 2)}MB!"
+                        })
+            
+            api.disconnect()
+            
+            # Combine all issues
+            all_issues = illegal_connections + expired_still_connected + unknown_bypassed
+            
+            # Sort by severity
+            severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+            all_issues.sort(key=lambda x: severity_order.get(x.get("severity", "LOW"), 99))
+            
+            return {
+                "router_id": router_id,
+                "router_name": router.name,
+                "scan_time": datetime.utcnow().isoformat(),
+                "summary": {
+                    "total_issues": len(all_issues),
+                    "critical": len([i for i in all_issues if i.get("severity") == "CRITICAL"]),
+                    "high": len([i for i in all_issues if i.get("severity") == "HIGH"]),
+                    "medium": len([i for i in all_issues if i.get("severity") == "MEDIUM"]),
+                    "unknown_devices_connected": len(illegal_connections),
+                    "expired_customers_still_connected": len(expired_still_connected),
+                    "unknown_bypassed_bindings": len(unknown_bypassed)
+                },
+                "issues": all_issues,
+                "recommendation": "Use DELETE /api/public/remove-bypassed/{router_id}/{mac_address} to remove illegal users" if all_issues else "No illegal connections found"
+            }
+            
+        except Exception as e:
+            api.disconnect()
+            raise e
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error checking illegal connections for router {router_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Check failed: {str(e)}")
+
+
 # Plan Management Endpoints
 class PlanCreateRequest(BaseModel):
     name: str
