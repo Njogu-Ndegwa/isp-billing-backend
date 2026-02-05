@@ -837,7 +837,7 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
                     "ip": router.ip_address,
                     "username": router.username,
                     "password": router.password,
-                    "port": router.api_port,
+                    "port": router.port,
                     "name": router.name
                 }
                 # Run blocking MikroTik operations in thread pool
@@ -3760,7 +3760,7 @@ async def check_bandwidth_limits(
             "ip": router.ip_address,
             "username": router.username,
             "password": router.password,
-            "port": router.api_port
+            "port": router.port
         }
         router_data = await asyncio.to_thread(_get_bandwidth_check_data_sync, router_info)
         
@@ -3979,7 +3979,7 @@ async def check_illegal_connections(
             "ip": router.ip_address,
             "username": router.username,
             "password": router.password,
-            "port": router.api_port
+            "port": router.port
         }
         router_data = await asyncio.to_thread(_get_illegal_connections_data_sync, router_info)
         
@@ -4639,7 +4639,7 @@ async def remove_all_illegal_users(
             "ip": router.ip_address,
             "username": router.username,
             "password": router.password,
-            "port": router.api_port,
+            "port": router.port,
             "name": router.name
         }
         scan_result = await asyncio.to_thread(_scan_connected_devices_sync, router_info)
@@ -4704,7 +4704,7 @@ async def remove_all_illegal_users(
             "ip": router.ip_address,
             "username": router.username,
             "password": router.password,
-            "port": router.api_port,
+            "port": router.port,
             "name": router.name
         }
         
@@ -4887,7 +4887,7 @@ async def diagnose_mac_address(
         "ip": router.ip_address,
         "username": router.username,
         "password": router.password,
-        "port": router.api_port
+        "port": router.port
     }
     diag_result = await asyncio.to_thread(_diagnose_mac_sync, router_info, normalized_mac, username)
     
@@ -5047,7 +5047,7 @@ async def force_remove_mac_address(
         "ip": router.ip_address,
         "username": router.username,
         "password": router.password,
-        "port": router.api_port
+        "port": router.port
     }
     result = await asyncio.to_thread(_force_remove_mac_sync, router_info, normalized_mac, username)
     
@@ -5238,7 +5238,7 @@ async def cleanup_all_bypassing_users(
         "ip": router.ip_address,
         "username": router.username,
         "password": router.password,
-        "port": router.api_port
+        "port": router.port
     }
     cleanup_result = await asyncio.to_thread(_cleanup_bypassing_sync, router_info, active_macs, customer_by_mac, dry_run)
     
@@ -5393,7 +5393,7 @@ async def remove_single_illegal_user(
         "ip": router.ip_address,
         "username": router.username,
         "password": router.password,
-        "port": router.api_port
+        "port": router.port
     }
     result = await asyncio.to_thread(_remove_single_illegal_user_sync, router_info, mac_address, normalized_mac, customer_info)
     
