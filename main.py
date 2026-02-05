@@ -4455,6 +4455,176 @@ async def force_remove_mac_address(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =============================================================================
+# CLEANUP ALL BYPASSING USERS - Remove all expired/unauthorized IP bindings
+# =============================================================================
+@app.post("/api/routers/{router_id}/cleanup-bypassing")
+async def cleanup_all_bypassing_users(
+    router_id: int,
+    dry_run: bool = True,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Find and remove ALL IP bindings that belong to expired/unauthorized users.
+    
+    This is the preventative cleanup endpoint - it scans the router's IP bindings
+    and removes any that don't belong to active paying customers.
+    
+    Args:
+        router_id: Router to clean up
+        dry_run: If True (default), only report what would be removed. 
+                 Set to False to actually remove.
+    
+    Returns:
+        List of removed (or would-be-removed) bindings with customer info.
+    """
+    logger.info(f"[CLEANUP-BYPASS] Starting cleanup for router {router_id}, dry_run={dry_run}")
+    
+    router = await get_router_by_id(db, router_id)
+    if not router:
+        raise HTTPException(status_code=404, detail="Router not found")
+    
+    # Get ALL customers with MAC addresses (any router, for cross-reference)
+    stmt = select(Customer).where(Customer.mac_address.isnot(None))
+    result = await db.execute(stmt)
+    all_customers = result.scalars().all()
+    
+    # Build lookup: MAC -> customer info
+    customer_by_mac = {}
+    active_macs = set()
+    for c in all_customers:
+        normalized = normalize_mac_address(c.mac_address)
+        customer_by_mac[normalized] = {
+            "id": c.id,
+            "name": c.name,
+            "status": c.status.value if c.status else "unknown",
+            "expiry": c.expiry.isoformat() if c.expiry else None,
+            "router_id": c.router_id
+        }
+        if c.status == CustomerStatus.ACTIVE:
+            active_macs.add(normalized)
+    
+    # Connect to router
+    api = connect_to_router(router)
+    if not api.connect():
+        raise HTTPException(status_code=503, detail=f"Failed to connect to router")
+    
+    try:
+        # Get all IP bindings
+        bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
+        all_bindings = bindings_result.get("data", []) if bindings_result.get("success") else []
+        
+        # Also get active hotspot sessions for reference
+        active_result = api.send_command("/ip/hotspot/active/print")
+        active_sessions = active_result.get("data", []) if active_result.get("success") else []
+        active_session_macs = set()
+        for s in active_sessions:
+            mac = s.get("mac-address", "")
+            if mac:
+                active_session_macs.add(normalize_mac_address(mac))
+        
+        # Analyze each binding
+        to_remove = []
+        kept = []
+        
+        for binding in all_bindings:
+            binding_mac = binding.get("mac-address", "")
+            binding_type = binding.get("type", "")
+            binding_id = binding.get(".id", "")
+            binding_address = binding.get("address", "")
+            binding_comment = binding.get("comment", "")
+            
+            if not binding_mac:
+                continue
+            
+            normalized_mac = normalize_mac_address(binding_mac)
+            customer_info = customer_by_mac.get(normalized_mac)
+            
+            # Determine if this binding should be removed
+            should_remove = False
+            reason = ""
+            
+            if binding_type != "bypassed":
+                # Only care about bypassed bindings (those give internet access)
+                kept.append({
+                    "mac": binding_mac,
+                    "type": binding_type,
+                    "reason": "Not a bypassed binding"
+                })
+                continue
+            
+            if normalized_mac in active_macs:
+                # Customer is ACTIVE - keep the binding
+                kept.append({
+                    "mac": binding_mac,
+                    "type": binding_type,
+                    "customer": customer_info,
+                    "reason": "Customer is active"
+                })
+                continue
+            
+            # If we get here, it's a bypassed binding for non-active customer
+            if customer_info:
+                # Known customer but not active
+                should_remove = True
+                reason = f"Customer {customer_info['name']} is {customer_info['status']} (expired: {customer_info['expiry']})"
+            else:
+                # Unknown MAC - not in database at all
+                should_remove = True
+                reason = "MAC not found in customer database"
+            
+            if should_remove:
+                entry = {
+                    "binding_id": binding_id,
+                    "mac_address": binding_mac,
+                    "ip_address": binding_address,
+                    "type": binding_type,
+                    "comment": binding_comment,
+                    "customer": customer_info,
+                    "reason": reason,
+                    "has_active_session": normalized_mac in active_session_macs
+                }
+                
+                if not dry_run:
+                    # Actually remove it
+                    remove_result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
+                    entry["removed"] = remove_result.get("success", True)  # MikroTik returns empty on success
+                    logger.info(f"[CLEANUP-BYPASS] Removed binding for {binding_mac}: {reason}")
+                    
+                    # Also remove active session if exists
+                    if normalized_mac in active_session_macs:
+                        for s in active_sessions:
+                            if normalize_mac_address(s.get("mac-address", "")) == normalized_mac:
+                                api.send_command("/ip/hotspot/active/remove", {"numbers": s[".id"]})
+                                entry["session_removed"] = True
+                                logger.info(f"[CLEANUP-BYPASS] Disconnected active session for {binding_mac}")
+                                break
+                
+                to_remove.append(entry)
+        
+        api.disconnect()
+        
+        return {
+            "router_id": router_id,
+            "router_name": router.name,
+            "dry_run": dry_run,
+            "summary": {
+                "total_bindings_scanned": len(all_bindings),
+                "active_customers": len(active_macs),
+                "bindings_to_remove": len(to_remove),
+                "bindings_kept": len(kept)
+            },
+            "to_remove": to_remove,
+            "message": f"{'Would remove' if dry_run else 'Removed'} {len(to_remove)} unauthorized IP bindings" if to_remove else "No unauthorized bindings found",
+            "next_step": f"Run with dry_run=false to actually remove these {len(to_remove)} bindings" if dry_run and to_remove else None
+        }
+        
+    except Exception as e:
+        api.disconnect()
+        logger.error(f"[CLEANUP-BYPASS] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/api/routers/{router_id}/remove-illegal-user/{mac_address}")
 async def remove_single_illegal_user(
     router_id: int,
