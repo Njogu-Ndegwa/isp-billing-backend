@@ -2616,40 +2616,32 @@ async def sync_router_users_with_database(
 
     router_users = mikrotik_result.get("router_users", [])
 
-        # Get customers assigned to this router
-        customers_result = await db.execute(
-            select(Customer).where(Customer.router_id == router_id)
-        )
-        db_customers = customers_result.scalars().all()
+    # Get customers assigned to this router
+    customers_result = await db.execute(
+        select(Customer).where(Customer.router_id == router_id)
+    )
+    db_customers = customers_result.scalars().all()
 
-        sync_report = {
-            "router_users": len(router_users),
-            "db_customers": len(db_customers),
-            "synced": 0,
-            "errors": []
-        }
+    sync_report = {
+        "router_users": len(router_users),
+        "db_customers": len(db_customers),
+        "synced": 0,
+        "errors": []
+    }
 
-        # Create sets for comparison
-        router_usernames = {user.get("name", "").lower() for user in router_users}
-        db_usernames = {customer.username.lower() for customer in db_customers if customer.username}
+    # Create sets for comparison
+    router_usernames = {user.get("name", "").lower() for user in router_users}
+    db_usernames = {customer.username.lower() for customer in db_customers if customer.username}
 
-        # Find mismatches
-        only_in_router = router_usernames - db_usernames
-        only_in_db = db_usernames - router_usernames
+    # Find mismatches
+    only_in_router = router_usernames - db_usernames
+    only_in_db = db_usernames - router_usernames
 
-        sync_report["only_in_router"] = list(only_in_router)
-        sync_report["only_in_db"] = list(only_in_db)
-        sync_report["synced"] = len(router_usernames & db_usernames)
+    sync_report["only_in_router"] = list(only_in_router)
+    sync_report["only_in_db"] = list(only_in_db)
+    sync_report["synced"] = len(router_usernames & db_usernames)
 
-        return sync_report
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error syncing router users: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
-    finally:
-        api.disconnect()
+    return sync_report
 
 @app.delete("/api/public/remove-bypassed/{router_id}/{mac_address}")
 async def remove_bypassed_user_public(
