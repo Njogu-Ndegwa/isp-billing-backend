@@ -47,6 +47,67 @@ mikrotik_lock = asyncio.Lock()  # Global lock to prevent concurrent MikroTik API
 _mikrotik_cache = {"data": None, "timestamp": None}
 _mikrotik_cache_ttl = 300  # seconds - limit to once per 5 minutes
 
+# =============================================================================
+# PROTECTED NETWORKS AND DEVICES - DO NOT DISCONNECT THESE
+# =============================================================================
+# These IP ranges and interfaces are protected from being flagged as "illegal"
+# They include system connections like WireGuard VPN, management interfaces, etc.
+
+PROTECTED_IP_PREFIXES = [
+    "10.0.0.",      # WireGuard VPN network (AWS <-> MikroTik)
+    "192.168.88.",  # MikroTik default management network
+    "127.",         # Localhost
+]
+
+# Interfaces that are NOT customer-facing (skip devices on these interfaces)
+PROTECTED_INTERFACES = [
+    "wg-aws",       # WireGuard VPN interface
+    "wg0",          # Alternative WireGuard name
+    "wireguard",    # Generic WireGuard
+    "ether1",       # Usually WAN interface
+    "pppoe-out",    # PPPoE WAN connection
+    "lte1",         # LTE WAN
+    "sfp1",         # SFP WAN port
+]
+
+# Known system hostnames to skip
+PROTECTED_HOSTNAMES = [
+    "aws-server",
+    "billing-server", 
+    "api-server",
+]
+
+def is_protected_device(ip_address: str = None, interface: str = None, hostname: str = None) -> bool:
+    """
+    Check if a device should be protected from being flagged as illegal.
+    
+    Returns True if the device is:
+    - On a protected IP range (WireGuard, management network)
+    - Connected via a protected interface (WAN, VPN)
+    - Has a protected hostname
+    """
+    # Check IP prefix
+    if ip_address:
+        for prefix in PROTECTED_IP_PREFIXES:
+            if ip_address.startswith(prefix):
+                return True
+    
+    # Check interface
+    if interface:
+        interface_lower = interface.lower()
+        for protected in PROTECTED_INTERFACES:
+            if protected.lower() in interface_lower:
+                return True
+    
+    # Check hostname
+    if hostname:
+        hostname_lower = hostname.lower()
+        for protected in PROTECTED_HOSTNAMES:
+            if protected.lower() in hostname_lower:
+                return True
+    
+    return False
+
 # MikroTik health cache per router
 _health_cache = {}  # router_id -> {"data": ..., "timestamp": ...}
 _health_cache_ttl = 300  # 5 minutes - reduces router connection load significantly
@@ -360,14 +421,34 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
                     logger.info(f"[CRON] Found client IP: {client_ip} for MAC {normalized_mac}")
                 
                 # STEP 2: REMOVE the IP binding completely (not block!)
+                # This is CRITICAL - bypassed bindings allow internet without authentication
                 bindings = api.send_command("/ip/hotspot/ip-binding/print")
                 if bindings.get("success") and bindings.get("data"):
+                    binding_found = False
                     for b in bindings["data"]:
                         binding_mac = b.get("mac-address", "").upper()
-                        if normalize_mac_address(binding_mac) == normalized_mac:
-                            api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
-                            removed["binding_removed"] = True
-                            logger.info(f"[CRON] Removed IP binding for {normalized_mac}")
+                        binding_comment = b.get("comment", "")
+                        binding_id = b.get(".id")
+                        
+                        # Match by MAC address OR by username in comment
+                        mac_match = normalize_mac_address(binding_mac) == normalized_mac if binding_mac else False
+                        username_match = f"USER:{username}" in binding_comment.upper()
+                        
+                        if mac_match or username_match:
+                            binding_found = True
+                            logger.info(f"[CRON] Found IP binding to remove: id={binding_id}, mac={binding_mac}, type={b.get('type', 'unknown')}")
+                            
+                            remove_result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
+                            
+                            # Verify removal succeeded
+                            if remove_result.get("success") or "error" not in remove_result:
+                                removed["binding_removed"] = True
+                                logger.info(f"[CRON] ✓ Successfully removed IP binding for {normalized_mac}")
+                            else:
+                                logger.error(f"[CRON] ✗ Failed to remove IP binding: {remove_result.get('error', 'unknown error')}")
+                    
+                    if not binding_found:
+                        logger.info(f"[CRON] No IP binding found for {normalized_mac} (may already be removed)")
                 
                 # STEP 3: Remove from hotspot hosts (forces IMMEDIATE disconnect)
                 hosts = api.send_command("/ip/hotspot/host/print")
@@ -380,26 +461,57 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
                             removed["hosts"] += 1
                             logger.info(f"[CRON] Removed host entry: {host_mac} / {host_ip}")
                 
-                # STEP 4: Remove hotspot user
+                # STEP 4: Remove hotspot user (match by name OR MAC in comment)
                 users = api.send_command("/ip/hotspot/user/print")
                 if users.get("success") and users.get("data"):
+                    user_found = False
                     for u in users["data"]:
-                        if u.get("name", "") == username:
-                            api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
-                            removed["user"] = True
-                            logger.info(f"[CRON] Removed hotspot user: {username}")
+                        user_name = u.get("name", "")
+                        user_comment = u.get("comment", "")
+                        user_id = u.get(".id")
+                        
+                        # Match by username OR MAC address in comment
+                        name_match = user_name == username
+                        mac_in_comment = normalized_mac.upper() in user_comment.upper() or cust['mac_address'].upper() in user_comment.upper()
+                        
+                        if name_match or mac_in_comment:
+                            user_found = True
+                            logger.info(f"[CRON] Found hotspot user to remove: id={user_id}, name={user_name}")
+                            
+                            remove_result = api.send_command("/ip/hotspot/user/remove", {"numbers": user_id})
+                            
+                            if remove_result.get("success") or "error" not in remove_result:
+                                removed["user"] = True
+                                logger.info(f"[CRON] ✓ Successfully removed hotspot user: {user_name}")
+                            else:
+                                logger.error(f"[CRON] ✗ Failed to remove hotspot user: {remove_result.get('error', 'unknown error')}")
                             break
+                    
+                    if not user_found:
+                        logger.info(f"[CRON] No hotspot user found for {username} (may already be removed)")
                 
-                # STEP 5: Disconnect any active sessions
+                # STEP 5: Disconnect any active sessions (immediately kicks the user)
                 active_sessions = api.send_command("/ip/hotspot/active/print")
                 if active_sessions.get("success") and active_sessions.get("data"):
                     for session in active_sessions["data"]:
                         session_mac = session.get("mac-address", "").upper()
                         session_user = session.get("user", "").upper()
-                        if normalize_mac_address(session_mac) == normalized_mac or session_user == username.upper():
-                            api.send_command("/ip/hotspot/active/remove", {"numbers": session[".id"]})
-                            removed["active_sessions"] += 1
-                            logger.info(f"[CRON] Disconnected active session: {session_user}")
+                        session_ip = session.get("address", "")
+                        session_id = session.get(".id")
+                        
+                        mac_match = normalize_mac_address(session_mac) == normalized_mac if session_mac else False
+                        user_match = session_user == username.upper()
+                        
+                        if mac_match or user_match:
+                            logger.info(f"[CRON] Found active session to disconnect: id={session_id}, user={session_user}, ip={session_ip}")
+                            
+                            remove_result = api.send_command("/ip/hotspot/active/remove", {"numbers": session_id})
+                            
+                            if remove_result.get("success") or "error" not in remove_result:
+                                removed["active_sessions"] += 1
+                                logger.info(f"[CRON] ✓ Disconnected active session: {session_user} ({session_ip})")
+                            else:
+                                logger.error(f"[CRON] ✗ Failed to disconnect session: {remove_result.get('error', 'unknown error')}")
                 
                 # STEP 6: Remove queues (simple queues)
                 queues = api.send_command("/queue/simple/print")
@@ -423,6 +535,27 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
                             api.send_command("/ip/dhcp-server/lease/remove", {"numbers": lease[".id"]})
                             removed["leases"] += 1
                             logger.info(f"[CRON] Removed DHCP lease for {normalized_mac}")
+                
+                # STEP 8: VERIFICATION - Re-check that the IP binding was actually removed
+                # This is CRITICAL because if the binding still exists, the user keeps access
+                verify_bindings = api.send_command("/ip/hotspot/ip-binding/print")
+                if verify_bindings.get("success") and verify_bindings.get("data"):
+                    binding_still_exists = False
+                    for b in verify_bindings["data"]:
+                        if normalize_mac_address(b.get("mac-address", "")) == normalized_mac:
+                            binding_still_exists = True
+                            logger.error(f"[CRON] ⚠️ VERIFICATION FAILED: IP binding STILL EXISTS for {normalized_mac}!")
+                            # Try to remove it one more time
+                            retry_result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                            if retry_result.get("success") or "error" not in retry_result:
+                                logger.info(f"[CRON] ✓ Retry removal succeeded for {normalized_mac}")
+                                removed["binding_removed"] = True
+                            else:
+                                logger.error(f"[CRON] ✗ Retry removal FAILED: {retry_result.get('error', 'unknown')}")
+                            break
+                    
+                    if not binding_still_exists and removed.get("binding_removed"):
+                        logger.info(f"[CRON] ✓ VERIFICATION: IP binding successfully removed for {normalized_mac}")
                 
                 results["removed"].append({"id": cust["id"], "details": removed})
                 logger.info(f"[CRON] ✓ Expired customer {cust['name']} removed: {removed}")
@@ -3158,8 +3291,25 @@ async def check_illegal_connections(
             # Now compare: connected devices vs active customers
             unauthorized_devices = []
             expired_still_connected = []
+            skipped_protected = []
             
             for mac, device_info in connected_devices.items():
+                # PROTECTION CHECK: Skip system/infrastructure devices
+                ip_addr = device_info.get("ip_address", "")
+                interface = device_info.get("interface", "")
+                hostname = device_info.get("dhcp_hostname", "")
+                
+                if is_protected_device(ip_address=ip_addr, interface=interface, hostname=hostname):
+                    skipped_protected.append({
+                        "mac_address": device_info["mac_address"],
+                        "ip_address": ip_addr,
+                        "interface": interface,
+                        "hostname": hostname,
+                        "reason": "Protected system/infrastructure device"
+                    })
+                    logger.debug(f"[ILLEGAL-CHECK] Skipping protected device: {ip_addr} on {interface}")
+                    continue
+                
                 customer_info = known_macs.get(mac)
                 
                 if not customer_info:
@@ -3220,9 +3370,11 @@ async def check_illegal_connections(
                     "critical": len([i for i in all_issues if i.get("severity") == "CRITICAL"]),
                     "high": len([i for i in all_issues if i.get("severity") == "HIGH"]),
                     "unauthorized_devices": len(unauthorized_devices),
-                    "expired_still_connected": len(expired_still_connected)
+                    "expired_still_connected": len(expired_still_connected),
+                    "skipped_protected": len(skipped_protected)
                 },
                 "issues": all_issues,
+                "protected_devices": skipped_protected,  # Show what was skipped for transparency
                 "recommendation": "Use POST /api/routers/{router_id}/remove-illegal-users to remove all, or DELETE /api/routers/{router_id}/remove-illegal-user/{mac_address} for one" if all_issues else "No illegal connections found"
             }
             
@@ -3282,14 +3434,32 @@ def _remove_illegal_user_with_cache(
                 client_ip = arp.get("address", "")
                 break
         
-        # STEP 1: Remove IP binding (use cached data to find, then remove)
+        # STEP 1: Remove IP binding (CRITICAL - bypassed bindings allow access without auth)
+        binding_found = False
         for b in cached_data.get("bindings", []):
             binding_mac = b.get("mac-address", "").upper()
-            if normalize_mac_address(binding_mac) == normalized_mac:
-                api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
-                removed["binding_removed"] = True
-                logger.info(f"[REMOVE-ILLEGAL] Removed IP binding for {normalized_mac}")
-                break  # Only one binding per MAC
+            binding_comment = b.get("comment", "")
+            binding_id = b.get(".id")
+            
+            # Match by MAC address OR by username in comment
+            mac_match = normalize_mac_address(binding_mac) == normalized_mac if binding_mac else False
+            username_match = f"USER:{username}" in binding_comment.upper()
+            
+            if mac_match or username_match:
+                binding_found = True
+                logger.info(f"[REMOVE-ILLEGAL] Found IP binding: id={binding_id}, mac={binding_mac}, type={b.get('type', 'unknown')}")
+                
+                remove_result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
+                
+                if remove_result.get("success") or "error" not in remove_result:
+                    removed["binding_removed"] = True
+                    logger.info(f"[REMOVE-ILLEGAL] ✓ Removed IP binding for {normalized_mac}")
+                else:
+                    logger.error(f"[REMOVE-ILLEGAL] ✗ Failed to remove IP binding: {remove_result.get('error', 'unknown')}")
+                break
+        
+        if not binding_found:
+            logger.info(f"[REMOVE-ILLEGAL] No IP binding found for {normalized_mac} in cached data")
         
         # STEP 2: Remove from hotspot hosts
         for host in cached_data.get("hosts", []):
@@ -3300,13 +3470,32 @@ def _remove_illegal_user_with_cache(
                 removed["hosts_removed"] += 1
                 logger.info(f"[REMOVE-ILLEGAL] Removed host entry: {host_mac}")
         
-        # STEP 3: Remove hotspot user
+        # STEP 3: Remove hotspot user (match by name OR MAC in comment)
+        user_found = False
         for u in cached_data.get("users", []):
-            if u.get("name", "") == username:
-                api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
-                removed["user_removed"] = True
-                logger.info(f"[REMOVE-ILLEGAL] Removed hotspot user: {username}")
+            user_name = u.get("name", "")
+            user_comment = u.get("comment", "")
+            user_id = u.get(".id")
+            
+            # Match by username OR MAC address in comment
+            name_match = user_name == username
+            mac_in_comment = normalized_mac.upper() in user_comment.upper() or mac_address.upper() in user_comment.upper()
+            
+            if name_match or mac_in_comment:
+                user_found = True
+                logger.info(f"[REMOVE-ILLEGAL] Found hotspot user: id={user_id}, name={user_name}")
+                
+                remove_result = api.send_command("/ip/hotspot/user/remove", {"numbers": user_id})
+                
+                if remove_result.get("success") or "error" not in remove_result:
+                    removed["user_removed"] = True
+                    logger.info(f"[REMOVE-ILLEGAL] ✓ Removed hotspot user: {user_name}")
+                else:
+                    logger.error(f"[REMOVE-ILLEGAL] ✗ Failed to remove user: {remove_result.get('error', 'unknown')}")
                 break
+        
+        if not user_found:
+            logger.info(f"[REMOVE-ILLEGAL] No hotspot user found for {username}")
         
         # STEP 4: Disconnect active sessions
         for session in cached_data.get("active_sessions", []):
@@ -3336,6 +3525,22 @@ def _remove_illegal_user_with_cache(
                 removed["leases_removed"] += 1
                 logger.info(f"[REMOVE-ILLEGAL] Removed DHCP lease for {normalized_mac}")
                 break  # Only one lease per MAC
+        
+        # STEP 7: VERIFICATION - Re-check that IP binding was removed (most critical item)
+        verify_bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        if verify_bindings.get("success") and verify_bindings.get("data"):
+            for b in verify_bindings["data"]:
+                if normalize_mac_address(b.get("mac-address", "")) == normalized_mac:
+                    logger.error(f"[REMOVE-ILLEGAL] ⚠️ VERIFICATION: IP binding STILL EXISTS for {normalized_mac}!")
+                    # Try one more time with fresh lookup
+                    retry_result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                    if retry_result.get("success") or "error" not in retry_result:
+                        logger.info(f"[REMOVE-ILLEGAL] ✓ Retry removal succeeded for {normalized_mac}")
+                        removed["binding_removed"] = True
+                    else:
+                        logger.error(f"[REMOVE-ILLEGAL] ✗ Retry removal FAILED!")
+                        removed["verification_failed"] = True
+                    break
         
         removed["success"] = True
         return removed
@@ -3555,25 +3760,43 @@ async def remove_all_illegal_users(
             arp_result = api.send_command("/ip/arp/print")
             for entry in (arp_result.get("data", []) if arp_result.get("success") else []):
                 mac = entry.get("mac-address", "")
+                ip_addr = entry.get("address", "")
+                interface = entry.get("interface", "")
                 if mac:
+                    # Skip protected devices (WireGuard, management, etc.)
+                    if is_protected_device(ip_address=ip_addr, interface=interface):
+                        logger.debug(f"[REMOVE-ILLEGAL] Skipping protected ARP entry: {ip_addr} on {interface}")
+                        continue
                     normalized_mac = normalize_mac_address(mac)
-                    connected_devices[normalized_mac] = {"mac_address": mac, "ip_address": entry.get("address", "")}
+                    connected_devices[normalized_mac] = {"mac_address": mac, "ip_address": ip_addr, "interface": interface}
             
             dhcp_result = api.send_command("/ip/dhcp-server/lease/print")
             for lease in (dhcp_result.get("data", []) if dhcp_result.get("success") else []):
                 mac = lease.get("mac-address", "")
+                ip_addr = lease.get("address", "")
+                server = lease.get("server", "")
+                hostname = lease.get("host-name", "")
                 if mac:
+                    # Skip protected devices
+                    if is_protected_device(ip_address=ip_addr, interface=server, hostname=hostname):
+                        logger.debug(f"[REMOVE-ILLEGAL] Skipping protected DHCP lease: {ip_addr}")
+                        continue
                     normalized_mac = normalize_mac_address(mac)
                     if normalized_mac not in connected_devices:
-                        connected_devices[normalized_mac] = {"mac_address": mac, "ip_address": lease.get("address", "")}
+                        connected_devices[normalized_mac] = {"mac_address": mac, "ip_address": ip_addr, "interface": server}
             
             active_result = api.send_command("/ip/hotspot/active/print")
             for session in (active_result.get("data", []) if active_result.get("success") else []):
                 mac = session.get("mac-address", "")
+                ip_addr = session.get("address", "")
                 if mac:
+                    # Skip protected devices
+                    if is_protected_device(ip_address=ip_addr):
+                        logger.debug(f"[REMOVE-ILLEGAL] Skipping protected hotspot session: {ip_addr}")
+                        continue
                     normalized_mac = normalize_mac_address(mac)
                     if normalized_mac not in connected_devices:
-                        connected_devices[normalized_mac] = {"mac_address": mac, "ip_address": session.get("address", "")}
+                        connected_devices[normalized_mac] = {"mac_address": mac, "ip_address": ip_addr}
             
             api.disconnect()
             
@@ -3583,20 +3806,32 @@ async def remove_all_illegal_users(
         
         # Find illegal users
         illegal_users = []
+        skipped_protected_count = 0
         for mac, device_info in connected_devices.items():
+            ip_addr = device_info.get("ip_address", "")
+            interface = device_info.get("interface", "")
+            
+            # Double-check protection (in case device info was incomplete earlier)
+            if is_protected_device(ip_address=ip_addr, interface=interface):
+                skipped_protected_count += 1
+                continue
+                
             customer_info = known_macs.get(mac)
             if not customer_info:
                 illegal_users.append({
                     "mac_address": device_info["mac_address"],
-                    "ip_address": device_info.get("ip_address", ""),
+                    "ip_address": ip_addr,
                     "reason": "UNAUTHORIZED"
                 })
             elif customer_info["status"] != "active":
                 illegal_users.append({
                     "mac_address": device_info["mac_address"],
-                    "ip_address": device_info.get("ip_address", ""),
+                    "ip_address": ip_addr,
                     "reason": "EXPIRED"
                 })
+        
+        if skipped_protected_count > 0:
+            logger.info(f"[REMOVE-ILLEGAL] Skipped {skipped_protected_count} protected devices")
         
         if not illegal_users:
             return {
@@ -3688,7 +3923,8 @@ async def remove_single_illegal_user(
     if not router:
         raise HTTPException(status_code=404, detail="Router not found")
     
-    # Check if this MAC belongs to a customer
+    # First, check if this is a protected device by looking up its IP
+    # We'll do a quick ARP lookup to get the IP for this MAC
     normalized_mac = normalize_mac_address(mac_address)
     stmt = select(Customer).where(
         Customer.router_id == router_id,
@@ -3725,6 +3961,20 @@ async def remove_single_illegal_user(
         arp_result = api.send_command("/ip/arp/print")
         if arp_result.get("success"):
             cached_data["arp"] = arp_result.get("data", [])
+            
+            # PROTECTION CHECK: Verify this MAC is not a protected device
+            for arp_entry in cached_data["arp"]:
+                if normalize_mac_address(arp_entry.get("mac-address", "")) == normalized_mac:
+                    arp_ip = arp_entry.get("address", "")
+                    arp_interface = arp_entry.get("interface", "")
+                    if is_protected_device(ip_address=arp_ip, interface=arp_interface):
+                        api.disconnect()
+                        logger.warning(f"[REMOVE-ILLEGAL] Blocked attempt to remove protected device: {mac_address} ({arp_ip} on {arp_interface})")
+                        raise HTTPException(
+                            status_code=403, 
+                            detail=f"Cannot remove protected device. IP {arp_ip} on interface {arp_interface} is in the protected list (WireGuard/management/infrastructure)."
+                        )
+                    break
         
         bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
         if bindings_result.get("success"):
