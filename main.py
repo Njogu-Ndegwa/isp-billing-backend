@@ -50,21 +50,25 @@ _mikrotik_cache_ttl = 300  # seconds - limit to once per 5 minutes
 # =============================================================================
 # PROTECTED NETWORKS AND DEVICES - DO NOT DISCONNECT THESE
 # =============================================================================
-# These IP ranges and interfaces are protected from being flagged as "illegal"
-# They include system connections like WireGuard VPN, management interfaces, etc.
+# These are SPECIFIC infrastructure IPs and interfaces that should never be
+# flagged as "illegal" or disconnected. Be VERY specific - don't protect entire
+# subnets that customers use!
 
-PROTECTED_IP_PREFIXES = [
-    "10.0.0.",      # WireGuard VPN network (AWS <-> MikroTik)
-    "192.168.88.",  # MikroTik default management network
-    "127.",         # Localhost
+# Specific IPs to protect (NOT entire subnets - customers use those!)
+PROTECTED_SPECIFIC_IPS = [
+    "10.0.0.1",       # AWS WireGuard VPN endpoint
+    "10.0.0.2",       # MikroTik WireGuard VPN endpoint  
+    "10.0.0.3",       # Alternative MikroTik VPN IP
+    "192.168.88.1",   # MikroTik router management IP
+    "127.0.0.1",      # Localhost
 ]
 
 # Interfaces that are NOT customer-facing (skip devices on these interfaces)
+# Only WAN/uplink interfaces - NOT "bridge" which is where customers connect!
 PROTECTED_INTERFACES = [
     "wg-aws",       # WireGuard VPN interface
     "wg0",          # Alternative WireGuard name
-    "wireguard",    # Generic WireGuard
-    "ether1",       # Usually WAN interface
+    "ether1",       # Usually WAN interface (uplink to ISP)
     "pppoe-out",    # PPPoE WAN connection
     "lte1",         # LTE WAN
     "sfp1",         # SFP WAN port
@@ -75,6 +79,8 @@ PROTECTED_HOSTNAMES = [
     "aws-server",
     "billing-server", 
     "api-server",
+    "mikrotik",
+    "router",
 ]
 
 def is_protected_device(ip_address: str = None, interface: str = None, hostname: str = None) -> bool:
@@ -82,19 +88,26 @@ def is_protected_device(ip_address: str = None, interface: str = None, hostname:
     Check if a device should be protected from being flagged as illegal.
     
     Returns True if the device is:
-    - On a protected IP range (WireGuard, management network)
-    - Connected via a protected interface (WAN, VPN)
+    - A specific infrastructure IP (router, VPN endpoints)
+    - Connected via a WAN/uplink interface (NOT bridge/customer interfaces)
     - Has a protected hostname
-    """
-    # Check IP prefix
-    if ip_address:
-        for prefix in PROTECTED_IP_PREFIXES:
-            if ip_address.startswith(prefix):
-                return True
     
-    # Check interface
+    NOTE: We do NOT protect entire IP ranges like 192.168.88.x because
+    those are customer DHCP pools, not infrastructure!
+    """
+    # Check SPECIFIC IPs only (not prefixes!)
+    if ip_address:
+        if ip_address in PROTECTED_SPECIFIC_IPS:
+            return True
+    
+    # Check interface - but ONLY WAN/uplink interfaces
+    # "bridge" is where customers connect, so we DON'T protect it
     if interface:
         interface_lower = interface.lower()
+        # Skip if it's the customer-facing bridge
+        if "bridge" in interface_lower:
+            return False
+        # Check if it's a protected WAN/uplink interface
         for protected in PROTECTED_INTERFACES:
             if protected.lower() in interface_lower:
                 return True
@@ -3352,10 +3365,19 @@ async def check_bandwidth_limits(
 @app.get("/api/routers/{router_id}/illegal-connections")
 async def check_illegal_connections(
     router_id: int,
+    only_bypassing: bool = False,
     db: AsyncSession = Depends(get_db)
 ):
     """
     Find devices currently using internet that are NOT active paying customers.
+    
+    Query params:
+    - only_bypassing: If True, only show devices that are ACTUALLY using internet
+                      (have hotspot session or bypassed IP binding). 
+                      If False (default), show ALL devices in ARP table.
+                      
+    NOTE: Devices in ARP table that don't have hotspot sessions are usually
+    BLOCKED by the captive portal - they're connected to WiFi but can't browse.
     
     Compares:
     - Devices currently connected on MikroTik (ARP + DHCP + active sessions)
@@ -3482,8 +3504,25 @@ async def check_illegal_connections(
                             "bytes_out": bytes_out
                         }
             
-            # SOURCE 4: Simple queues with recent traffic - indicates active usage
-            queues_result = api.send_command("/queue/simple/print")
+            # SOURCE 4: IP Bindings - shows who has bypassed access (can use internet without login)
+            bindings_result = api.get_ip_bindings_minimal()
+            ip_bindings = bindings_result.get("data", []) if bindings_result.get("success") else []
+            
+            # Build a set of MACs that have bypassed bindings
+            bypassed_macs = set()
+            for binding in ip_bindings:
+                if binding.get("type") == "bypassed":
+                    mac = binding.get("mac-address", "")
+                    if mac:
+                        bypassed_macs.add(normalize_mac_address(mac))
+                        # Also mark in connected_devices
+                        normalized_mac = normalize_mac_address(mac)
+                        if normalized_mac in connected_devices:
+                            connected_devices[normalized_mac]["has_bypass"] = True
+                            connected_devices[normalized_mac]["source"] += "+BYPASSED"
+            
+            # SOURCE 5: Simple queues with recent traffic - indicates active usage
+            queues_result = api.get_simple_queues_minimal()
             queues = queues_result.get("data", []) if queues_result.get("success") else []
             
             for queue in queues:
@@ -3499,10 +3538,17 @@ async def check_illegal_connections(
             
             api.disconnect()
             
+            # Build set of MACs that are actually using internet (hotspot active or bypassed)
+            actually_using_internet = set()
+            for mac, device_info in connected_devices.items():
+                if device_info.get("hotspot_active") or device_info.get("has_bypass"):
+                    actually_using_internet.add(mac)
+            
             # Now compare: connected devices vs active customers
             unauthorized_devices = []
             expired_still_connected = []
             skipped_protected = []
+            skipped_not_bypassing = 0  # Count of ARP-only devices (blocked by captive portal)
             
             for mac, device_info in connected_devices.items():
                 # PROTECTION CHECK: Skip system/infrastructure devices
@@ -3521,20 +3567,34 @@ async def check_illegal_connections(
                     logger.debug(f"[ILLEGAL-CHECK] Skipping protected device: {ip_addr} on {interface}")
                     continue
                 
+                # If only_bypassing is True, skip devices that are just in ARP
+                # (they're connected to WiFi but blocked by captive portal)
+                is_actually_using = mac in actually_using_internet
+                if only_bypassing and not is_actually_using:
+                    skipped_not_bypassing += 1
+                    continue
+                
                 customer_info = known_macs.get(mac)
                 
                 if not customer_info:
                     # MAC not in database at all - UNAUTHORIZED
                     bytes_total = device_info.get("bytes_in", 0) + device_info.get("bytes_out", 0)
+                    severity = "CRITICAL" if is_actually_using else "LOW"  # Lower severity if just in ARP
+                    if bytes_total > 1000000:
+                        severity = "CRITICAL"
+                    elif is_actually_using:
+                        severity = "HIGH"
+                    
                     unauthorized_devices.append({
                         "type": "UNAUTHORIZED",
-                        "severity": "CRITICAL" if bytes_total > 1000000 else "HIGH",
+                        "severity": severity,
                         "mac_address": device_info["mac_address"],
                         "ip_address": device_info["ip_address"],
                         "source": device_info["source"],
                         "interface": device_info.get("interface", ""),
                         "hostname": device_info.get("dhcp_hostname", ""),
                         "uptime": device_info.get("uptime", ""),
+                        "is_bypassing": is_actually_using,  # True = actually using internet
                         "bytes_downloaded": device_info.get("bytes_in", 0),
                         "bytes_uploaded": device_info.get("bytes_out", 0),
                         "bytes_total_mb": round(bytes_total / 1048576, 2),
@@ -3544,9 +3604,10 @@ async def check_illegal_connections(
                 elif customer_info["status"] != "active":
                     # Customer exists but is NOT ACTIVE - should not have access
                     bytes_total = device_info.get("bytes_in", 0) + device_info.get("bytes_out", 0)
+                    severity = "CRITICAL" if is_actually_using else "MEDIUM"
                     expired_still_connected.append({
                         "type": "EXPIRED_CONNECTED",
-                        "severity": "HIGH",
+                        "severity": severity,
                         "mac_address": device_info["mac_address"],
                         "ip_address": device_info["ip_address"],
                         "source": device_info["source"],
@@ -3556,11 +3617,12 @@ async def check_illegal_connections(
                         "expiry": customer_info["expiry"],
                         "plan_name": customer_info.get("plan_name", ""),
                         "uptime": device_info.get("uptime", ""),
+                        "is_bypassing": is_actually_using,  # True = actually using internet
                         "bytes_downloaded": device_info.get("bytes_in", 0),
                         "bytes_uploaded": device_info.get("bytes_out", 0),
                         "bytes_total_mb": round(bytes_total / 1048576, 2),
                         "has_queue": device_info.get("has_queue", False),
-                        "issue": f"Customer is {customer_info['status']} but still connected to network!"
+                        "issue": f"Customer is {customer_info['status']} but still {'USING INTERNET!' if is_actually_using else 'in ARP table'}"
                     })
             
             # Combine all issues
@@ -3570,23 +3632,33 @@ async def check_illegal_connections(
             severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
             all_issues.sort(key=lambda x: severity_order.get(x.get("severity", "LOW"), 99))
             
+            # Count how many are actually bypassing vs just in ARP
+            bypassing_unauthorized = len([i for i in unauthorized_devices if i.get("is_bypassing")])
+            bypassing_expired = len([i for i in expired_still_connected if i.get("is_bypassing")])
+            
             return {
                 "router_id": router_id,
                 "router_name": router.name,
                 "scan_time": datetime.utcnow().isoformat(),
+                "filter_mode": "only_bypassing" if only_bypassing else "all_devices",
                 "summary": {
                     "total_connected_devices": len(connected_devices),
+                    "actually_using_internet": len(actually_using_internet),  # Hotspot active or bypassed
                     "active_customers": len(active_macs),
                     "total_issues": len(all_issues),
                     "critical": len([i for i in all_issues if i.get("severity") == "CRITICAL"]),
                     "high": len([i for i in all_issues if i.get("severity") == "HIGH"]),
                     "unauthorized_devices": len(unauthorized_devices),
+                    "unauthorized_bypassing": bypassing_unauthorized,  # Actually using internet!
                     "expired_still_connected": len(expired_still_connected),
-                    "skipped_protected": len(skipped_protected)
+                    "expired_bypassing": bypassing_expired,  # Actually using internet!
+                    "skipped_protected": len(skipped_protected),
+                    "skipped_not_bypassing": skipped_not_bypassing if only_bypassing else 0
                 },
                 "issues": all_issues,
-                "protected_devices": skipped_protected,  # Show what was skipped for transparency
-                "recommendation": "Use POST /api/routers/{router_id}/remove-illegal-users to remove all, or DELETE /api/routers/{router_id}/remove-illegal-user/{mac_address} for one" if all_issues else "No illegal connections found"
+                "protected_devices": skipped_protected,
+                "note": "Devices with is_bypassing=true are ACTUALLY using internet. Others are just in ARP (blocked by captive portal).",
+                "recommendation": f"Focus on {bypassing_unauthorized + bypassing_expired} devices with is_bypassing=true - these are actively using internet without paying!" if (bypassing_unauthorized + bypassing_expired) > 0 else ("Use POST /api/routers/{router_id}/remove-illegal-users to remove all" if all_issues else "No illegal connections found")
             }
             
         except Exception as e:
@@ -4105,6 +4177,282 @@ async def remove_all_illegal_users(
     except Exception as e:
         logger.error(f"Error removing illegal users from router {router_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Removal failed: {str(e)}")
+
+
+# =============================================================================
+# DIAGNOSTIC ENDPOINT - Check what router has for a specific MAC
+# =============================================================================
+@app.get("/api/routers/{router_id}/diagnose/{mac_address}")
+async def diagnose_mac_address(
+    router_id: int,
+    mac_address: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Diagnose a MAC address - shows EXACTLY what the router has for this device.
+    
+    Useful for debugging why a customer can still access internet after expiry.
+    Returns all router entries for this MAC: IP bindings, hotspot users, active sessions, etc.
+    """
+    if not validate_mac_address(mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address format")
+    
+    router = await get_router_by_id(db, router_id)
+    if not router:
+        raise HTTPException(status_code=404, detail="Router not found")
+    
+    normalized_mac = normalize_mac_address(mac_address)
+    username = normalized_mac.replace(":", "")
+    
+    # Check database first
+    stmt = select(Customer).where(Customer.mac_address.isnot(None))
+    result = await db.execute(stmt)
+    all_customers = result.scalars().all()
+    
+    db_info = None
+    for c in all_customers:
+        if normalize_mac_address(c.mac_address) == normalized_mac:
+            db_info = {
+                "customer_id": c.id,
+                "name": c.name,
+                "status": c.status.value if c.status else "unknown",
+                "router_id": c.router_id,
+                "expiry": c.expiry.isoformat() if c.expiry else None,
+                "is_expired": c.expiry < datetime.utcnow() if c.expiry else False
+            }
+            break
+    
+    # Connect to router
+    api = connect_to_router(router)
+    if not api.connect():
+        raise HTTPException(status_code=503, detail=f"Failed to connect to router")
+    
+    try:
+        findings = {
+            "mac_address": mac_address,
+            "normalized": normalized_mac,
+            "username_format": username,
+            "database_info": db_info,
+            "router_entries": {
+                "ip_bindings": [],
+                "hotspot_users": [],
+                "active_sessions": [],
+                "arp_entries": [],
+                "dhcp_leases": [],
+                "queues": [],
+                "hosts": []
+            },
+            "diagnosis": [],
+            "can_access_internet": False
+        }
+        
+        # Check IP bindings (CRITICAL - bypassed = free internet)
+        bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        if bindings.get("success"):
+            for b in bindings.get("data", []):
+                b_mac = normalize_mac_address(b.get("mac-address", "")) if b.get("mac-address") else ""
+                b_comment = b.get("comment", "")
+                if b_mac == normalized_mac or username in b_comment.upper():
+                    findings["router_entries"]["ip_bindings"].append(b)
+                    if b.get("type") == "bypassed":
+                        findings["can_access_internet"] = True
+                        findings["diagnosis"].append(f"⚠️ BYPASSED IP BINDING FOUND - user can access internet without login!")
+        
+        # Check hotspot users
+        users = api.send_command("/ip/hotspot/user/print")
+        if users.get("success"):
+            for u in users.get("data", []):
+                u_name = u.get("name", "")
+                u_comment = u.get("comment", "")
+                if u_name == username or normalized_mac.upper() in u_comment.upper():
+                    findings["router_entries"]["hotspot_users"].append(u)
+        
+        # Check active sessions
+        active = api.send_command("/ip/hotspot/active/print")
+        if active.get("success"):
+            for s in active.get("data", []):
+                s_mac = normalize_mac_address(s.get("mac-address", "")) if s.get("mac-address") else ""
+                s_user = s.get("user", "").upper()
+                if s_mac == normalized_mac or s_user == username.upper():
+                    findings["router_entries"]["active_sessions"].append(s)
+                    findings["can_access_internet"] = True
+                    findings["diagnosis"].append(f"⚠️ ACTIVE HOTSPOT SESSION - user is currently online!")
+        
+        # Check ARP table
+        arp = api.send_command("/ip/arp/print")
+        if arp.get("success"):
+            for a in arp.get("data", []):
+                a_mac = normalize_mac_address(a.get("mac-address", "")) if a.get("mac-address") else ""
+                if a_mac == normalized_mac:
+                    findings["router_entries"]["arp_entries"].append(a)
+        
+        # Check DHCP leases
+        leases = api.send_command("/ip/dhcp-server/lease/print")
+        if leases.get("success"):
+            for l in leases.get("data", []):
+                l_mac = normalize_mac_address(l.get("mac-address", "")) if l.get("mac-address") else ""
+                if l_mac == normalized_mac:
+                    findings["router_entries"]["dhcp_leases"].append(l)
+        
+        # Check queues
+        queues = api.send_command("/queue/simple/print")
+        if queues.get("success"):
+            for q in queues.get("data", []):
+                q_name = q.get("name", "")
+                q_comment = q.get("comment", "")
+                if username in q_name or normalized_mac.upper() in q_comment.upper():
+                    findings["router_entries"]["queues"].append(q)
+        
+        # Check hosts
+        hosts = api.send_command("/ip/hotspot/host/print")
+        if hosts.get("success"):
+            for h in hosts.get("data", []):
+                h_mac = normalize_mac_address(h.get("mac-address", "")) if h.get("mac-address") else ""
+                if h_mac == normalized_mac:
+                    findings["router_entries"]["hosts"].append(h)
+        
+        api.disconnect()
+        
+        # Build diagnosis summary
+        if db_info and db_info.get("is_expired") and findings["can_access_internet"]:
+            findings["diagnosis"].insert(0, "🚨 CRITICAL: Customer is EXPIRED but CAN STILL ACCESS INTERNET!")
+        
+        if not findings["router_entries"]["ip_bindings"] and not findings["router_entries"]["active_sessions"]:
+            findings["diagnosis"].append("✅ No bypass or active session - hotspot should be blocking this device")
+        
+        # Count entries
+        total_entries = sum(len(v) for v in findings["router_entries"].values())
+        findings["total_router_entries"] = total_entries
+        
+        return findings
+        
+    except Exception as e:
+        api.disconnect()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# FORCE REMOVE ENDPOINT - Simple direct removal, no complex logic
+# =============================================================================
+@app.delete("/api/routers/{router_id}/force-remove/{mac_address}")
+async def force_remove_mac_address(
+    router_id: int,
+    mac_address: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    FORCE remove ALL router entries for a MAC address.
+    
+    No protection checks, no database lookups - just removes everything:
+    - All IP bindings with this MAC
+    - All hotspot users matching this MAC
+    - All active sessions  
+    - All hosts entries
+    - All queues
+    - All DHCP leases
+    
+    Use this when normal removal isn't working.
+    """
+    if not validate_mac_address(mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address format")
+    
+    router = await get_router_by_id(db, router_id)
+    if not router:
+        raise HTTPException(status_code=404, detail="Router not found")
+    
+    normalized_mac = normalize_mac_address(mac_address)
+    username = normalized_mac.replace(":", "")
+    
+    api = connect_to_router(router)
+    if not api.connect():
+        raise HTTPException(status_code=503, detail=f"Failed to connect to router")
+    
+    removed = {
+        "ip_bindings": 0,
+        "hotspot_users": 0,
+        "active_sessions": 0,
+        "hosts": 0,
+        "queues": 0,
+        "dhcp_leases": 0
+    }
+    
+    try:
+        # Remove ALL IP bindings for this MAC
+        bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        if bindings.get("success"):
+            for b in bindings.get("data", []):
+                b_mac = normalize_mac_address(b.get("mac-address", "")) if b.get("mac-address") else ""
+                b_comment = b.get("comment", "")
+                if b_mac == normalized_mac or username in b_comment.upper() or normalized_mac.upper() in b_comment.upper():
+                    api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                    removed["ip_bindings"] += 1
+                    logger.info(f"[FORCE-REMOVE] Removed IP binding: {b['.id']}")
+        
+        # Remove ALL hotspot users
+        users = api.send_command("/ip/hotspot/user/print")
+        if users.get("success"):
+            for u in users.get("data", []):
+                u_name = u.get("name", "")
+                u_comment = u.get("comment", "")
+                if u_name == username or normalized_mac.upper() in u_comment.upper():
+                    api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
+                    removed["hotspot_users"] += 1
+                    logger.info(f"[FORCE-REMOVE] Removed hotspot user: {u_name}")
+        
+        # Disconnect ALL active sessions
+        active = api.send_command("/ip/hotspot/active/print")
+        if active.get("success"):
+            for s in active.get("data", []):
+                s_mac = normalize_mac_address(s.get("mac-address", "")) if s.get("mac-address") else ""
+                s_user = s.get("user", "").upper()
+                if s_mac == normalized_mac or s_user == username.upper():
+                    api.send_command("/ip/hotspot/active/remove", {"numbers": s[".id"]})
+                    removed["active_sessions"] += 1
+                    logger.info(f"[FORCE-REMOVE] Disconnected session: {s_user}")
+        
+        # Remove hosts
+        hosts = api.send_command("/ip/hotspot/host/print")
+        if hosts.get("success"):
+            for h in hosts.get("data", []):
+                h_mac = normalize_mac_address(h.get("mac-address", "")) if h.get("mac-address") else ""
+                if h_mac == normalized_mac:
+                    api.send_command("/ip/hotspot/host/remove", {"numbers": h[".id"]})
+                    removed["hosts"] += 1
+        
+        # Remove queues
+        queues = api.send_command("/queue/simple/print")
+        if queues.get("success"):
+            for q in queues.get("data", []):
+                q_name = q.get("name", "")
+                q_comment = q.get("comment", "")
+                if username in q_name or normalized_mac.upper() in q_comment.upper():
+                    api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                    removed["queues"] += 1
+        
+        # Remove DHCP leases
+        leases = api.send_command("/ip/dhcp-server/lease/print")
+        if leases.get("success"):
+            for l in leases.get("data", []):
+                l_mac = normalize_mac_address(l.get("mac-address", "")) if l.get("mac-address") else ""
+                if l_mac == normalized_mac:
+                    api.send_command("/ip/dhcp-server/lease/remove", {"numbers": l[".id"]})
+                    removed["dhcp_leases"] += 1
+        
+        api.disconnect()
+        
+        total_removed = sum(removed.values())
+        
+        return {
+            "success": True,
+            "mac_address": mac_address,
+            "total_removed": total_removed,
+            "details": removed,
+            "message": f"Force removed {total_removed} entries for {mac_address}"
+        }
+        
+    except Exception as e:
+        api.disconnect()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/routers/{router_id}/remove-illegal-user/{mac_address}")
