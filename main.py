@@ -617,8 +617,7 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
     total_removed = 0
     
     try:
-        # Get all routers
-        from app.models.router import Router
+        # Get all routers (Router already imported at top of file)
         stmt = select(Router)
         result = await db.execute(stmt)
         routers = result.scalars().all()
