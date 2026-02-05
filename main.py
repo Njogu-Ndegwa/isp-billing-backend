@@ -620,7 +620,8 @@ async def cleanup_expired_users_background():
                     "id": c.id,
                     "name": c.name,
                     "mac_address": c.mac_address,
-                    "expiry": c.expiry
+                    "expiry": c.expiry,
+                    "router_id": c.router_id  # Track for debugging
                 }
                 
                 if c.router:
@@ -637,6 +638,10 @@ async def cleanup_expired_users_background():
                             "customers": []
                         }
                     router_customers_map[router_key]["customers"].append(customer_data)
+                elif c.router_id:
+                    # Customer has router_id but router was DELETED - this is a data integrity issue
+                    logger.warning(f"[CRON] Customer {c.id} has router_id={c.router_id} but router doesn't exist (deleted?)")
+                    no_router_customers.append(customer_data)
                 else:
                     # Customer has no router assigned - skip them and log warning
                     no_router_customers.append(customer_data)
@@ -753,35 +758,74 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
             results["routers_connected"] += 1
             logger.info(f"[SYNC] Connected to {router_name} successfully")
             
-            # Fetch all data once per router (more efficient than per-customer)
-            # Add delays between fetches to prevent overwhelming router
-            logger.info(f"[SYNC] Fetching ARP table from {router_name}...")
-            arp_result = api.send_command("/ip/arp/print")
+            # Helper function to send command with reconnect-and-retry
+            def send_with_retry(cmd: str, max_retries: int = 2) -> dict:
+                """Send command, reconnect and retry if connection lost."""
+                for attempt in range(max_retries + 1):
+                    result = api.send_command(cmd)
+                    if result.get("error") == "Not connected" and attempt < max_retries:
+                        logger.warning(f"[SYNC] Connection lost during {cmd}, reconnecting (attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(0.5)  # Brief pause before reconnect
+                        if api.connect():
+                            logger.info(f"[SYNC] Reconnected successfully, retrying {cmd}")
+                            continue
+                        else:
+                            logger.error(f"[SYNC] Reconnect failed")
+                            break
+                    return result
+                return {"error": "Failed after retries"}
+            
+            # Fetch all data once per router using OPTIMIZED queries (only essential fields)
+            # This significantly reduces data transfer and prevents timeouts
+            logger.info(f"[SYNC] Fetching ARP table from {router_name} (optimized)...")
+            arp_result = api.get_arp_minimal()  # Only fetches: .id, mac-address, address, interface
             if arp_result.get("error"):
-                logger.error(f"[SYNC] Failed to fetch ARP table: {arp_result.get('error')}")
-                arp_entries = []
+                # Retry with reconnect if failed
+                if arp_result.get("error") == "Not connected":
+                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                    if api.connect():
+                        arp_result = api.get_arp_minimal()
+                if arp_result.get("error"):
+                    logger.error(f"[SYNC] Failed to fetch ARP table: {arp_result.get('error')}")
+                    arp_entries = []
+                else:
+                    arp_entries = arp_result.get("data", [])
             else:
                 arp_entries = arp_result.get("data", [])
             logger.info(f"[SYNC] Got {len(arp_entries)} ARP entries")
             
             time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)  # Give router breathing room
             
-            logger.info(f"[SYNC] Fetching DHCP leases from {router_name}...")
-            dhcp_result = api.send_command("/ip/dhcp-server/lease/print")
+            logger.info(f"[SYNC] Fetching DHCP leases from {router_name} (optimized)...")
+            dhcp_result = api.get_dhcp_leases_minimal()  # Only fetches essential fields
             if dhcp_result.get("error"):
-                logger.error(f"[SYNC] Failed to fetch DHCP leases: {dhcp_result.get('error')}")
-                dhcp_leases = []
+                if dhcp_result.get("error") == "Not connected":
+                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                    if api.connect():
+                        dhcp_result = api.get_dhcp_leases_minimal()
+                if dhcp_result.get("error"):
+                    logger.error(f"[SYNC] Failed to fetch DHCP leases: {dhcp_result.get('error')}")
+                    dhcp_leases = []
+                else:
+                    dhcp_leases = dhcp_result.get("data", [])
             else:
                 dhcp_leases = dhcp_result.get("data", [])
             logger.info(f"[SYNC] Got {len(dhcp_leases)} DHCP leases")
             
             time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)  # Give router breathing room
             
-            logger.info(f"[SYNC] Fetching existing queues from {router_name}...")
-            queues_result = api.send_command("/queue/simple/print")
+            logger.info(f"[SYNC] Fetching existing queues from {router_name} (optimized)...")
+            queues_result = api.get_simple_queues_minimal()  # Only fetches essential fields
             if queues_result.get("error"):
-                logger.error(f"[SYNC] Failed to fetch queues: {queues_result.get('error')}")
-                existing_queues = []
+                if queues_result.get("error") == "Not connected":
+                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                    if api.connect():
+                        queues_result = api.get_simple_queues_minimal()
+                if queues_result.get("error"):
+                    logger.error(f"[SYNC] Failed to fetch queues: {queues_result.get('error')}")
+                    existing_queues = []
+                else:
+                    existing_queues = queues_result.get("data", [])
             else:
                 existing_queues = queues_result.get("data", [])
             logger.info(f"[SYNC] Got {len(existing_queues)} existing queues")
@@ -2257,6 +2301,169 @@ async def cleanup_all_inactive_users(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/admin/orphaned-customers")
+async def get_orphaned_customers(
+    user_id: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Find customers without a router assigned (orphaned from migration).
+    These customers cannot be cleaned up by the cron job because they have no router.
+    
+    Returns list of orphaned customers for review before deletion.
+    """
+    try:
+        # Find customers with no router_id OR router_id pointing to deleted router
+        stmt = select(Customer).options(
+            selectinload(Customer.plan),
+            selectinload(Customer.router)
+        ).where(
+            Customer.user_id == user_id,
+            or_(
+                Customer.router_id == None,
+                Customer.router == None  # router_id exists but router was deleted
+            )
+        )
+        
+        result = await db.execute(stmt)
+        orphaned_customers = result.scalars().all()
+        
+        # Categorize by status
+        active_orphans = []
+        inactive_orphans = []
+        expired_orphans = []
+        
+        now = datetime.utcnow()
+        
+        for c in orphaned_customers:
+            customer_data = {
+                "id": c.id,
+                "name": c.name,
+                "phone": c.phone,
+                "mac_address": c.mac_address,
+                "status": c.status.value if c.status else "unknown",
+                "expiry": c.expiry.isoformat() if c.expiry else None,
+                "router_id": c.router_id,  # Shows if they had a router_id (deleted router)
+                "plan_name": c.plan.name if c.plan else "No plan",
+                "created_at": c.created_at.isoformat() if c.created_at else None
+            }
+            
+            if c.status == CustomerStatus.ACTIVE:
+                if c.expiry and c.expiry <= now:
+                    expired_orphans.append(customer_data)
+                else:
+                    active_orphans.append(customer_data)
+            else:
+                inactive_orphans.append(customer_data)
+        
+        return {
+            "total_orphaned": len(orphaned_customers),
+            "summary": {
+                "active_not_expired": len(active_orphans),
+                "active_but_expired": len(expired_orphans),
+                "inactive": len(inactive_orphans)
+            },
+            "active_not_expired": active_orphans,
+            "active_but_expired": expired_orphans,
+            "inactive": inactive_orphans,
+            "recommendation": "Use DELETE /api/admin/orphaned-customers to remove these. Safe to delete: inactive and expired customers."
+        }
+        
+    except Exception as e:
+        logger.error(f"[ORPHANED] Error finding orphaned customers: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/admin/orphaned-customers")
+async def delete_orphaned_customers(
+    user_id: int = 1,
+    include_expired: bool = True,
+    include_inactive: bool = True,
+    include_active: bool = False,  # Safety: don't delete active by default
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Delete orphaned customers (those without router assignments).
+    
+    Query params:
+    - include_expired: Delete active customers whose subscription has expired (default: True)
+    - include_inactive: Delete inactive customers (default: True)  
+    - include_active: Delete active customers with valid subscriptions (default: False - DANGEROUS)
+    
+    These are legacy customers from before migration who cannot be processed by the cron job.
+    """
+    try:
+        now = datetime.utcnow()
+        
+        # Find orphaned customers
+        stmt = select(Customer).where(
+            Customer.user_id == user_id,
+            or_(
+                Customer.router_id == None,
+                Customer.router == None
+            )
+        )
+        
+        result = await db.execute(stmt)
+        orphaned_customers = result.scalars().all()
+        
+        deleted = []
+        skipped = []
+        
+        for c in orphaned_customers:
+            should_delete = False
+            reason = ""
+            
+            if c.status == CustomerStatus.INACTIVE and include_inactive:
+                should_delete = True
+                reason = "inactive"
+            elif c.status == CustomerStatus.ACTIVE:
+                if c.expiry and c.expiry <= now and include_expired:
+                    should_delete = True
+                    reason = "expired"
+                elif include_active:
+                    should_delete = True
+                    reason = "active (forced)"
+                else:
+                    skipped.append({
+                        "id": c.id,
+                        "name": c.name,
+                        "reason": "active with valid subscription - use include_active=true to force"
+                    })
+            else:
+                # PENDING or other status
+                if include_inactive:
+                    should_delete = True
+                    reason = c.status.value if c.status else "unknown"
+            
+            if should_delete:
+                deleted.append({
+                    "id": c.id,
+                    "name": c.name,
+                    "mac_address": c.mac_address,
+                    "status": c.status.value if c.status else "unknown",
+                    "reason": reason
+                })
+                await db.delete(c)
+        
+        await db.commit()
+        
+        logger.info(f"[ORPHANED] Deleted {len(deleted)} orphaned customers, skipped {len(skipped)}")
+        
+        return {
+            "success": True,
+            "message": f"Deleted {len(deleted)} orphaned customers",
+            "deleted_count": len(deleted),
+            "skipped_count": len(skipped),
+            "deleted": deleted,
+            "skipped": skipped
+        }
+        
+    except Exception as e:
+        logger.error(f"[ORPHANED] Error deleting orphaned customers: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def _cleanup_recently_expired_sync(customers_data: list, delay_ms: int = 200) -> dict:
     """
     Synchronous function to remove recently expired users from MikroTik.
@@ -3199,10 +3406,12 @@ async def check_illegal_connections(
         
         try:
             # Collect all currently connected devices from multiple sources
+            # Using OPTIMIZED queries that only fetch essential fields (faster, less data)
             connected_devices = {}  # MAC -> device info
             
             # SOURCE 1: ARP table - devices that have communicated recently
-            arp_result = api.send_command("/ip/arp/print")
+            # Optimized: only fetches .id, mac-address, address, interface, complete
+            arp_result = api.get_arp_minimal()
             arp_entries = arp_result.get("data", []) if arp_result.get("success") else []
             
             for entry in arp_entries:
@@ -3219,7 +3428,8 @@ async def check_illegal_connections(
                         }
             
             # SOURCE 2: DHCP leases - devices that got an IP address
-            dhcp_result = api.send_command("/ip/dhcp-server/lease/print")
+            # Optimized: only fetches .id, mac-address, address, host-name, server, status
+            dhcp_result = api.get_dhcp_leases_minimal()
             dhcp_leases = dhcp_result.get("data", []) if dhcp_result.get("success") else []
             
             for lease in dhcp_leases:
@@ -3244,7 +3454,8 @@ async def check_illegal_connections(
                         }
             
             # SOURCE 3: Hotspot active sessions - currently authenticated users
-            active_result = api.send_command("/ip/hotspot/active/print")
+            # Optimized: only fetches .id, mac-address, address, user, uptime, bytes-in, bytes-out
+            active_result = api.get_hotspot_active_minimal()
             active_sessions = active_result.get("data", []) if active_result.get("success") else []
             
             for session in active_sessions:
@@ -3602,8 +3813,9 @@ def _bulk_remove_illegal_users_sync(
         return results
     
     try:
-        # FETCH ALL DATA ONCE (efficient - only 7 API calls total)
-        logger.info(f"[REMOVE-ILLEGAL] Caching router data...")
+        # FETCH ALL DATA ONCE using OPTIMIZED queries (only essential fields)
+        # This significantly reduces data transfer and prevents timeouts
+        logger.info(f"[REMOVE-ILLEGAL] Caching router data (optimized)...")
         cached_data = {
             "arp": [],
             "bindings": [],
@@ -3614,32 +3826,33 @@ def _bulk_remove_illegal_users_sync(
             "leases": []
         }
         
-        # Fetch with error handling for each
-        arp_result = api.send_command("/ip/arp/print")
+        # Fetch with error handling for each - using optimized methods
+        arp_result = api.get_arp_minimal()
         if arp_result.get("success"):
             cached_data["arp"] = arp_result.get("data", [])
         
-        bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
+        bindings_result = api.get_ip_bindings_minimal()
         if bindings_result.get("success"):
             cached_data["bindings"] = bindings_result.get("data", [])
         
+        # Hosts don't have a minimal version yet - use full fetch (usually small dataset)
         hosts_result = api.send_command("/ip/hotspot/host/print")
         if hosts_result.get("success"):
             cached_data["hosts"] = hosts_result.get("data", [])
         
-        users_result = api.send_command("/ip/hotspot/user/print")
+        users_result = api.get_hotspot_users_minimal()
         if users_result.get("success"):
             cached_data["users"] = users_result.get("data", [])
         
-        active_result = api.send_command("/ip/hotspot/active/print")
+        active_result = api.get_hotspot_active_minimal()
         if active_result.get("success"):
             cached_data["active_sessions"] = active_result.get("data", [])
         
-        queues_result = api.send_command("/queue/simple/print")
+        queues_result = api.get_simple_queues_minimal()
         if queues_result.get("success"):
             cached_data["queues"] = queues_result.get("data", [])
         
-        leases_result = api.send_command("/ip/dhcp-server/lease/print")
+        leases_result = api.get_dhcp_leases_minimal()
         if leases_result.get("success"):
             cached_data["leases"] = leases_result.get("data", [])
         

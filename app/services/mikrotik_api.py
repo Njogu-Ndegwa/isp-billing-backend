@@ -289,6 +289,114 @@ class MikroTikAPI:
             logger.error(f"Command execution error on {self.host}: {e}")
             return {"error": str(e)}
 
+    def send_command_optimized(self, command: str, proplist: list = None, query: str = None) -> Dict[str, Any]:
+        """
+        Send command with optimization options for large datasets.
+        
+        Args:
+            command: The MikroTik API command (e.g., "/ip/arp/print")
+            proplist: List of properties to fetch (reduces data transfer significantly)
+                      e.g., [".id", "mac-address", "address", "interface"]
+            query: Optional query filter (e.g., "?interface=bridge" to filter server-side)
+        
+        Returns:
+            Dict with success status and data
+        
+        Example:
+            # Instead of fetching ALL ARP properties (slow):
+            api.send_command("/ip/arp/print")
+            
+            # Fetch only what we need (fast):
+            api.send_command_optimized("/ip/arp/print", 
+                proplist=[".id", "mac-address", "address", "interface"])
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        
+        try:
+            words = [command]
+            
+            # Add proplist to limit returned properties (major bandwidth saver)
+            if proplist:
+                words.append(f"=.proplist={','.join(proplist)}")
+            
+            # Add query filter if specified
+            if query:
+                words.append(query)
+            
+            self.send_sentence(words)
+            
+            responses = []
+            while True:
+                sentence = self.read_sentence()
+                if not sentence:
+                    break
+                    
+                if sentence[0] == "!done":
+                    break
+                elif sentence[0] == "!re":
+                    data = {}
+                    for item in sentence[1:]:
+                        if item.startswith("="):
+                            key_value = item[1:].split("=", 1)
+                            if len(key_value) == 2:
+                                data[key_value[0]] = key_value[1]
+                    responses.append(data)
+                elif sentence[0] == "!trap":
+                    error_msg = ""
+                    for item in sentence[1:]:
+                        if item.startswith("=message="):
+                            error_msg = item[9:]
+                    return {"error": error_msg or "Command failed"}
+            
+            return {"success": True, "data": responses}
+        except Exception as e:
+            logger.error(f"Optimized command execution error on {self.host}: {e}")
+            return {"error": str(e)}
+    
+    # Pre-defined optimized fetches for common operations
+    def get_arp_minimal(self) -> Dict[str, Any]:
+        """Fetch ARP table with only essential fields (fast)."""
+        return self.send_command_optimized(
+            "/ip/arp/print",
+            proplist=[".id", "mac-address", "address", "interface", "complete"]
+        )
+    
+    def get_dhcp_leases_minimal(self) -> Dict[str, Any]:
+        """Fetch DHCP leases with only essential fields (fast)."""
+        return self.send_command_optimized(
+            "/ip/dhcp-server/lease/print",
+            proplist=[".id", "mac-address", "address", "host-name", "server", "status"]
+        )
+    
+    def get_hotspot_active_minimal(self) -> Dict[str, Any]:
+        """Fetch active hotspot sessions with essential fields."""
+        return self.send_command_optimized(
+            "/ip/hotspot/active/print",
+            proplist=[".id", "mac-address", "address", "user", "uptime", "bytes-in", "bytes-out"]
+        )
+    
+    def get_ip_bindings_minimal(self) -> Dict[str, Any]:
+        """Fetch IP bindings with essential fields."""
+        return self.send_command_optimized(
+            "/ip/hotspot/ip-binding/print",
+            proplist=[".id", "mac-address", "address", "type", "comment"]
+        )
+    
+    def get_hotspot_users_minimal(self) -> Dict[str, Any]:
+        """Fetch hotspot users with essential fields."""
+        return self.send_command_optimized(
+            "/ip/hotspot/user/print",
+            proplist=[".id", "name", "profile", "comment"]
+        )
+    
+    def get_simple_queues_minimal(self) -> Dict[str, Any]:
+        """Fetch simple queues with essential fields."""
+        return self.send_command_optimized(
+            "/queue/simple/print",
+            proplist=[".id", "name", "target", "max-limit", "comment"]
+        )
+
     def _parse_speed_to_mikrotik(self, speed: str) -> str:
         """
         Convert speed string (e.g., '2Mbps', '5 Mbps', '512Kbps') to MikroTik format (e.g., '2M/2M').
