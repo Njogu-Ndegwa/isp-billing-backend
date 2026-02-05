@@ -435,9 +435,16 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
                 
                 # STEP 2: REMOVE the IP binding completely (not block!)
                 # This is CRITICAL - bypassed bindings allow internet without authentication
+                binding_found = False  # Track if we found a binding to remove
+                binding_fetch_failed = False  # Track if we couldn't even fetch bindings
                 bindings = api.send_command("/ip/hotspot/ip-binding/print")
-                if bindings.get("success") and bindings.get("data"):
-                    binding_found = False
+                
+                if not bindings.get("success"):
+                    # CRITICAL: If we can't fetch bindings, we don't know if user has access
+                    # DO NOT mark as removed - keep for retry
+                    binding_fetch_failed = True
+                    logger.error(f"[CRON] ✗ Failed to fetch IP bindings for {normalized_mac}: {bindings.get('error', 'unknown')}")
+                elif bindings.get("data"):
                     for b in bindings["data"]:
                         binding_mac = b.get("mac-address", "").upper()
                         binding_comment = b.get("comment", "")
@@ -462,6 +469,9 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
                     
                     if not binding_found:
                         logger.info(f"[CRON] No IP binding found for {normalized_mac} (may already be removed)")
+                else:
+                    # Empty data means no bindings exist - that's fine
+                    logger.info(f"[CRON] No IP bindings on router (empty list)")
                 
                 # STEP 3: Remove from hotspot hosts (forces IMMEDIATE disconnect)
                 hosts = api.send_command("/ip/hotspot/host/print")
@@ -570,8 +580,24 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
                     if not binding_still_exists and removed.get("binding_removed"):
                         logger.info(f"[CRON] ✓ VERIFICATION: IP binding successfully removed for {normalized_mac}")
                 
-                results["removed"].append({"id": cust["id"], "details": removed})
-                logger.info(f"[CRON] ✓ Expired customer {cust['name']} removed: {removed}")
+                # CRITICAL: Only mark as "removed" if the IP binding was actually removed
+                # OR if there was no binding to begin with (binding_removed can be False if no binding existed)
+                # The IP binding is what gives users internet access - if it still exists, they still have access!
+                if binding_fetch_failed:
+                    # Couldn't even check bindings - DO NOT mark as removed!
+                    results["failed"].append({"id": cust["id"], "error": "Could not fetch IP bindings - user status unknown"})
+                    logger.error(f"[CRON] ✗ FAILED to check bindings for {cust['name']} - keeping ACTIVE for retry")
+                elif removed.get("binding_removed"):
+                    results["removed"].append({"id": cust["id"], "details": removed})
+                    logger.info(f"[CRON] ✓ Expired customer {cust['name']} FULLY removed: {removed}")
+                elif not binding_found:
+                    # No binding existed - safe to mark as removed
+                    results["removed"].append({"id": cust["id"], "details": removed})
+                    logger.info(f"[CRON] ✓ Expired customer {cust['name']} had no binding (already removed): {removed}")
+                else:
+                    # Binding existed but removal FAILED - DO NOT mark as removed!
+                    results["failed"].append({"id": cust["id"], "error": "IP binding removal failed - user may still have access"})
+                    logger.error(f"[CRON] ✗ FAILED to remove binding for {cust['name']} - keeping ACTIVE for retry")
                 
             except Exception as e:
                 results["failed"].append({"id": cust["id"], "error": str(e)})
@@ -580,6 +606,76 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
         api.disconnect()
     
     return results
+
+
+# Safety net function to clean up orphaned IP bindings
+async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
+    """
+    Safety net cleanup: Scans ALL routers for IP bindings belonging to inactive customers.
+    Returns the number of bindings removed.
+    """
+    total_removed = 0
+    
+    try:
+        # Get all routers
+        from app.models.router import Router
+        stmt = select(Router)
+        result = await db.execute(stmt)
+        routers = result.scalars().all()
+        
+        # Get all customers with MAC addresses
+        stmt = select(Customer).where(Customer.mac_address.isnot(None))
+        result = await db.execute(stmt)
+        all_customers = result.scalars().all()
+        
+        # Build lookup: MAC -> customer info
+        active_macs = set()
+        for c in all_customers:
+            normalized = normalize_mac_address(c.mac_address)
+            if c.status == CustomerStatus.ACTIVE:
+                active_macs.add(normalized)
+        
+        for router in routers:
+            try:
+                api = connect_to_router(router)
+                if not api.connect():
+                    continue
+                
+                # Get all IP bindings
+                bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
+                if not bindings_result.get("success"):
+                    api.disconnect()
+                    continue
+                
+                all_bindings = bindings_result.get("data", [])
+                
+                for binding in all_bindings:
+                    binding_mac = binding.get("mac-address", "")
+                    binding_type = binding.get("type", "")
+                    binding_id = binding.get(".id", "")
+                    
+                    if not binding_mac or binding_type != "bypassed":
+                        continue
+                    
+                    normalized_mac = normalize_mac_address(binding_mac)
+                    
+                    # If this MAC is NOT an active customer, remove the binding
+                    if normalized_mac not in active_macs:
+                        remove_result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
+                        if remove_result.get("success") or "error" not in remove_result:
+                            total_removed += 1
+                            logger.info(f"[SAFETY-NET] Removed orphaned binding for {binding_mac} on {router.name}")
+                
+                api.disconnect()
+                
+            except Exception as router_err:
+                logger.error(f"[SAFETY-NET] Error processing router {router.name}: {router_err}")
+                continue
+    
+    except Exception as e:
+        logger.error(f"[SAFETY-NET] Cleanup failed: {e}")
+    
+    return total_removed
 
 
 # Background cleanup function for expired users
@@ -689,6 +785,16 @@ async def cleanup_expired_users_background():
             removed_count = len(mikrotik_results["removed"])
             failed_count = len(mikrotik_results["failed"])
             logger.info(f"[CRON] Cleanup completed in {duration:.2f}s: {removed_count} removed, {failed_count} failed")
+            
+            # STEP 4: SAFETY NET - Run bypass cleanup to catch any orphaned bindings
+            # This catches bindings for customers that were marked inactive without proper cleanup
+            try:
+                logger.info(f"[CRON] Running safety net bypass cleanup...")
+                bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
+                if bypass_cleaned > 0:
+                    logger.warning(f"[CRON] ⚠️ Safety net removed {bypass_cleaned} orphaned IP bindings!")
+            except Exception as bypass_err:
+                logger.error(f"[CRON] Safety net cleanup failed: {bypass_err}")
             
     except Exception as e:
         logger.error(f"[CRON] Cleanup job failed: {e}")
