@@ -31,6 +31,9 @@ sql {
     # Read clients from database (no - we use clients.conf)
     read_clients = no
 
+    # Map User-Name from request to SQL queries
+    sql_user_name = "%{%{Stripped-User-Name}:-%{User-Name}}"
+
     # Remove stale sessions on startup
     delete_stale_sessions = yes
 

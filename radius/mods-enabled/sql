@@ -23,6 +23,9 @@ sql {
 
     read_clients = no
 
+    # Map User-Name from request to SQL queries
+    sql_user_name = "%{%{Stripped-User-Name}:-%{User-Name}}"
+
     delete_stale_sessions = yes
 
     # Authorization queries - check credentials and get reply attributes

@@ -839,12 +839,16 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
                 active_macs.add(normalized)
         
         for router in routers:
+            # Skip RADIUS-managed routers - they don't use IP bindings
+            if getattr(router, 'auth_method', None) == 'RADIUS':
+                continue
+            
             try:
                 router_info = {
                     "ip": router.ip_address,
                     "username": router.username,
                     "password": router.password,
-                    "port": router.api_port,
+                    "port": router.port,
                     "name": router.name
                 }
                 # Run blocking MikroTik operations in thread pool
@@ -905,6 +909,12 @@ async def cleanup_expired_users_background():
             
             for c in expired_customers:
                 if not c.mac_address:
+                    continue
+                
+                # Skip RADIUS-managed routers - RADIUS handles expiry via Session-Timeout
+                if c.router and getattr(c.router, 'auth_method', None) == 'RADIUS':
+                    # Just mark as inactive, RADIUS handles the actual disconnection
+                    c.status = CustomerStatus.INACTIVE
                     continue
                     
                 customer_data = {
@@ -1322,6 +1332,10 @@ async def sync_active_user_queues():
             
             for c in active_customers:
                 if not c.plan or not c.mac_address:
+                    continue
+                
+                # Skip RADIUS-managed routers - they handle speeds via RADIUS attributes
+                if c.router and getattr(c.router, 'auth_method', None) == 'RADIUS':
                     continue
                 
                 customer_data = {
@@ -8326,6 +8340,10 @@ async def collect_bandwidth_snapshot():
             
             # Collect from each router
             for router in routers:
+                # Skip RADIUS-managed routers - they don't use direct API
+                if getattr(router, 'auth_method', None) == 'RADIUS':
+                    continue
+                
                 try:
                     router_info = {
                         "id": router.id,
