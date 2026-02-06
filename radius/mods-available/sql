@@ -1,0 +1,132 @@
+# FreeRADIUS SQL Module Configuration
+# ====================================
+# Connects to PostgreSQL database for user authentication and accounting.
+# Uses the same database as ISP Billing for seamless integration.
+#
+# Database connection uses Docker network hostnames (service name "db").
+
+sql {
+    driver = "rlm_sql_postgresql"
+    dialect = "postgresql"
+
+    # Database connection settings
+    # "db" is the PostgreSQL service hostname in the Docker network
+    server = "db"
+    port = 5432
+    login = "isp_user"
+    password = "isp_secure_pass_2024"
+    radius_db = "isp_billing_db"
+
+    # Connection pool settings
+    pool {
+        start = 5
+        min = 4
+        max = 32
+        spare = 3
+        uses = 0
+        retry_delay = 30
+        lifetime = 0
+        idle_timeout = 60
+    }
+
+    # Read clients from database (no - we use clients.conf)
+    read_clients = no
+
+    # Table names - custom RADIUS tables in ISP Billing database
+    authcheck_table = "radius_check"
+    authreply_table = "radius_reply"
+    acct_table1 = "radius_accounting"
+    acct_table2 = "radius_accounting"
+    postauth_table = "radius_postauth"
+
+    # Group tables
+    groupcheck_table = "radius_groupcheck"
+    groupreply_table = "radius_groupreply"
+    usergroup_table = "radius_usergroup"
+
+    # Remove stale sessions on startup
+    delete_stale_sessions = yes
+
+    # SQL queries for authentication
+    authorize_check_query = "\
+        SELECT id, username, attribute, value, op \
+        FROM ${authcheck_table} \
+        WHERE username = '%{SQL-User-Name}' \
+        AND (expiry IS NULL OR expiry > NOW()) \
+        ORDER BY id"
+
+    authorize_reply_query = "\
+        SELECT id, username, attribute, value, op \
+        FROM ${authreply_table} \
+        WHERE username = '%{SQL-User-Name}' \
+        AND (expiry IS NULL OR expiry > NOW()) \
+        ORDER BY id"
+
+    # Accounting queries
+    accounting {
+        start {
+            query = "\
+                INSERT INTO ${acct_table1} \
+                    (acctsessionid, acctuniqueid, username, realm, \
+                     nasipaddress, nasportid, nasporttype, \
+                     acctstarttime, acctupdatetime, \
+                     acctstoptime, acctsessiontime, acctauthentic, \
+                     connectinfo_start, acctinputoctets, acctoutputoctets, \
+                     calledstationid, callingstationid, \
+                     servicetype, framedprotocol, framedipaddress) \
+                VALUES \
+                    ('%{Acct-Session-Id}', '%{Acct-Unique-Session-Id}', \
+                     '%{SQL-User-Name}', '%{Realm}', \
+                     '%{NAS-IP-Address}', '%{NAS-Port-Id}', '%{NAS-Port-Type}', \
+                     NOW(), NOW(), \
+                     NULL, 0, '%{Acct-Authentic}', \
+                     '%{Connect-Info}', 0, 0, \
+                     '%{Called-Station-Id}', '%{Calling-Station-Id}', \
+                     '%{Service-Type}', '%{Framed-Protocol}', \
+                     '%{Framed-IP-Address}')"
+        }
+
+        interim-update {
+            query = "\
+                UPDATE ${acct_table1} SET \
+                    acctupdatetime = NOW(), \
+                    acctsessiontime = '%{Acct-Session-Time}', \
+                    acctinputoctets = '%{Acct-Input-Octets}'::bigint + \
+                        '%{Acct-Input-Gigawords}'::bigint * 4294967296, \
+                    acctoutputoctets = '%{Acct-Output-Octets}'::bigint + \
+                        '%{Acct-Output-Gigawords}'::bigint * 4294967296, \
+                    framedipaddress = '%{Framed-IP-Address}' \
+                WHERE acctsessionid = '%{Acct-Session-Id}' \
+                AND username = '%{SQL-User-Name}' \
+                AND nasipaddress = '%{NAS-IP-Address}'"
+        }
+
+        stop {
+            query = "\
+                UPDATE ${acct_table1} SET \
+                    acctstoptime = NOW(), \
+                    acctupdatetime = NOW(), \
+                    acctsessiontime = '%{Acct-Session-Time}', \
+                    acctinputoctets = '%{Acct-Input-Octets}'::bigint + \
+                        '%{Acct-Input-Gigawords}'::bigint * 4294967296, \
+                    acctoutputoctets = '%{Acct-Output-Octets}'::bigint + \
+                        '%{Acct-Output-Gigawords}'::bigint * 4294967296, \
+                    acctterminatecause = '%{Acct-Terminate-Cause}', \
+                    framedipaddress = '%{Framed-IP-Address}' \
+                WHERE acctsessionid = '%{Acct-Session-Id}' \
+                AND username = '%{SQL-User-Name}' \
+                AND nasipaddress = '%{NAS-IP-Address}'"
+        }
+    }
+
+    # Post-authentication logging
+    post-auth {
+        query = "\
+            INSERT INTO ${postauth_table} \
+                (username, pass, reply, authdate, nasipaddress, calledstationid, callingstationid) \
+            VALUES \
+                ('%{SQL-User-Name}', '%{%{User-Password}:-%{Chap-Password}}', \
+                 '%{reply:Packet-Type}', NOW(), '%{NAS-IP-Address}', \
+                 '%{Called-Station-Id}', '%{Calling-Station-Id}')"
+    }
+}

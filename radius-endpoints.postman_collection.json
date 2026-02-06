@@ -1,0 +1,200 @@
+{
+    "info": {
+        "name": "RADIUS Management Endpoints",
+        "description": "API endpoints for managing RADIUS authentication on routers. These endpoints are separate from the direct MikroTik API endpoints and allow you to enable/disable RADIUS on a per-router basis.",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": "your_jwt_token_here"}
+    ],
+    "auth": {
+        "type": "bearer",
+        "bearer": [{"key": "token", "value": "{{token}}"}]
+    },
+    "item": [
+        {
+            "name": "Router Management",
+            "item": [
+                {
+                    "name": "Enable RADIUS for Router",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/radius/routers/1/enable",
+                        "header": [{"key": "Content-Type", "value": "application/json"}],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"radius_secret\": \"your_shared_secret_min_8_chars\",\n    \"nas_identifier\": \"MyRouter\"\n}"
+                        },
+                        "description": "Enable RADIUS authentication for a specific router. After enabling, configure the MikroTik router to use RADIUS."
+                    }
+                },
+                {
+                    "name": "Disable RADIUS for Router",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/radius/routers/1/disable",
+                        "description": "Disable RADIUS for a router and revert to direct API provisioning."
+                    }
+                },
+                {
+                    "name": "Get Router RADIUS Status",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/radius/routers/1/status",
+                        "description": "Get the RADIUS configuration status for a specific router."
+                    }
+                },
+                {
+                    "name": "List All Routers with RADIUS Status",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/radius/routers",
+                        "description": "List all routers and their RADIUS configuration status."
+                    }
+                },
+                {
+                    "name": "Test RADIUS Connectivity",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/radius/test/1",
+                        "description": "Test RADIUS connectivity and table setup for a router."
+                    }
+                }
+            ]
+        },
+        {
+            "name": "User Management",
+            "item": [
+                {
+                    "name": "Create RADIUS User",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/radius/users",
+                        "header": [{"key": "Content-Type", "value": "application/json"}],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"username\": \"AABBCCDDEEFF\",\n    \"password\": \"testpass123\",\n    \"rate_limit\": \"5M/5M\",\n    \"session_timeout_hours\": 24,\n    \"expiry_hours\": 24,\n    \"customer_id\": 1\n}"
+                        },
+                        "description": "Manually create a RADIUS user. Username is typically the MAC address without colons."
+                    }
+                },
+                {
+                    "name": "Get RADIUS User",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/radius/users/AABBCCDDEEFF",
+                        "description": "Get information about a RADIUS user including their attributes."
+                    }
+                },
+                {
+                    "name": "Delete RADIUS User",
+                    "request": {
+                        "method": "DELETE",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/radius/users/AABBCCDDEEFF?disconnect=true&router_id=1",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "radius", "users", "AABBCCDDEEFF"],
+                            "query": [
+                                {"key": "disconnect", "value": "true"},
+                                {"key": "router_id", "value": "1"}
+                            ]
+                        },
+                        "description": "Delete a RADIUS user and optionally disconnect their active session."
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Session Management",
+            "item": [
+                {
+                    "name": "List Active Sessions",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/radius/sessions?router_id=1",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "radius", "sessions"],
+                            "query": [
+                                {"key": "router_id", "value": "1", "description": "Optional: filter by router"},
+                                {"key": "username", "value": "", "disabled": true, "description": "Optional: filter by username"}
+                            ]
+                        },
+                        "description": "List all active RADIUS sessions with optional filtering."
+                    }
+                },
+                {
+                    "name": "Disconnect User Session",
+                    "request": {
+                        "method": "POST",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/radius/sessions/AABBCCDDEEFF/disconnect?router_id=1",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "radius", "sessions", "AABBCCDDEEFF", "disconnect"],
+                            "query": [
+                                {"key": "router_id", "value": "1"}
+                            ]
+                        },
+                        "description": "Disconnect a user's active session via RADIUS CoA (Change of Authorization)."
+                    }
+                },
+                {
+                    "name": "Get User Accounting Stats",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/radius/accounting/AABBCCDDEEFF?days=30",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "radius", "accounting", "AABBCCDDEEFF"],
+                            "query": [
+                                {"key": "days", "value": "30", "description": "Number of days to include"}
+                            ]
+                        },
+                        "description": "Get bandwidth and session statistics for a user."
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Hotspot Flow (Captive Portal)",
+            "description": "Complete captive portal → pay → get internet flow using RADIUS. These endpoints replace the existing /api/hotspot/* endpoints for RADIUS-enabled routers.",
+            "item": [
+                {
+                    "name": "Register and Pay (RADIUS)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/radius/hotspot/register-and-pay",
+                        "header": [{"key": "Content-Type", "value": "application/json"}],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"mac_address\": \"AA:BB:CC:DD:EE:FF\",\n    \"phone\": \"254712345678\",\n    \"plan_id\": 1,\n    \"router_id\": 2,\n    \"name\": \"John Doe\",\n    \"payment_method\": \"mobile_money\"\n}"
+                        },
+                        "description": "Register a hotspot user and initiate payment on a RADIUS-enabled router. For cash payments, RADIUS user is created immediately and credentials returned. For M-Pesa, poll the payment-status endpoint."
+                    }
+                },
+                {
+                    "name": "Payment Status (with RADIUS credentials)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/radius/hotspot/payment-status/1",
+                        "description": "Poll this after register-and-pay. When status=active, response includes radius_username, radius_password, and login_url. Frontend should redirect user to login_url to auto-authenticate."
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Maintenance",
+            "item": [
+                {
+                    "name": "Cleanup Expired Users",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/radius/cleanup",
+                        "description": "Remove expired RADIUS users from the database. Requires admin role."
+                    }
+                }
+            ]
+        }
+    ]
+}
