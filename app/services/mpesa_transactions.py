@@ -2,7 +2,7 @@ from typing import Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from app.db.models import MpesaTransaction, MpesaTransactionStatus
+from app.db.models import MpesaTransaction, MpesaTransactionStatus, FailureSource
 from datetime import datetime
 import logging
 
@@ -65,7 +65,8 @@ async def update_mpesa_transaction_status(
     status: MpesaTransactionStatus, 
     receipt_number: str = None,
     result_code: str = None,
-    result_desc: str = None
+    result_desc: str = None,
+    failure_source: FailureSource = None
 ) -> bool:
     """
     Update the status of an M-Pesa transaction.
@@ -77,6 +78,7 @@ async def update_mpesa_transaction_status(
         receipt_number: M-Pesa receipt number (for successful transactions)
         result_code: Result code from M-Pesa callback
         result_desc: Result description from M-Pesa callback
+        failure_source: Where the failure originated (client, mpesa_api, server, timeout)
     """
     try:
         values = {
@@ -93,6 +95,9 @@ async def update_mpesa_transaction_status(
             
         if result_desc:
             values["result_desc"] = result_desc
+        
+        if failure_source:
+            values["failure_source"] = failure_source
 
         stmt = update(MpesaTransaction).where(
             MpesaTransaction.checkout_request_id == checkout_request_id
@@ -167,7 +172,8 @@ async def mark_transaction_as_expired(
         checkout_request_id=checkout_request_id,
         status=MpesaTransactionStatus.EXPIRED,
         result_code="TIMEOUT",
-        result_desc="Transaction expired due to timeout"
+        result_desc="Transaction expired due to timeout",
+        failure_source=FailureSource.TIMEOUT
     )
 
 async def get_transaction_by_receipt_number(

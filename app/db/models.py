@@ -12,6 +12,12 @@ class MpesaTransactionStatus(enum.Enum):
     failed = "failed"
     expired = "expired"
 
+class FailureSource(str, enum.Enum):
+    CLIENT = "client"          # Customer-side: cancelled, insufficient funds, wrong PIN
+    MPESA_API = "mpesa_api"    # Safaricom API: rejected STK push, auth failure, network error
+    SERVER = "server"          # Our server: crash during callback processing, DB error
+    TIMEOUT = "timeout"        # No response: STK push sent but no callback received
+
 class UserRole(str, enum.Enum):
     ADMIN = "admin"
     RESELLER = "reseller"
@@ -193,6 +199,9 @@ class MpesaTransaction(Base):
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
     merchant_request_id = Column(String(255), nullable=True)
     mpesa_receipt_number = Column(String(255), nullable=True)
+    result_code = Column(String(50), nullable=True)
+    result_desc = Column(String(500), nullable=True)
+    failure_source = Column(Enum(FailureSource, name="failuresource"), nullable=True)
     transaction_date = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

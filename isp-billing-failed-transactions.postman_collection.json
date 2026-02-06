@@ -1,0 +1,51 @@
+{
+    "info": {
+        "name": "ISP Billing - Failed Transactions Tracking",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"}
+    ],
+    "item": [
+        {
+            "name": "Get Failed Transactions (All)",
+            "description": "Get all failed/expired transactions with failure reasons, source breakdown (client vs server vs mpesa_api vs timeout), and summary",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/mpesa/transactions/failed?user_id=1"
+            }
+        },
+        {
+            "name": "Get Failed Transactions (Date Range)",
+            "description": "Filter failed transactions by date range",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/mpesa/transactions/failed?user_id=1&start_date=2025-01-01&end_date=2026-12-31"
+            }
+        },
+        {
+            "name": "Get Failed Transactions (By Router)",
+            "description": "Filter failed transactions by specific router to see if one router has more failures",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/mpesa/transactions/failed?user_id=1&router_id=1"
+            }
+        },
+        {
+            "name": "Get All Transactions (includes failure details)",
+            "description": "Existing endpoint now returns result_code, result_desc, and failure_source for all transactions",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/mpesa/transactions?user_id=1"
+            }
+        },
+        {
+            "name": "Get All Transactions (Failed Status Filter)",
+            "description": "Use status filter to get only failed transactions from the main endpoint",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/mpesa/transactions?user_id=1&status=failed"
+            }
+        }
+    ]
+}

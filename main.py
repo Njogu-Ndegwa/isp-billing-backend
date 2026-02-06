@@ -1592,14 +1592,21 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             elif name == "PhoneNumber":
                 phone_number = item.get("Value")
         
-        # Update transaction status
+        # Update transaction status and always store result details
+        from app.db.models import FailureSource
+        mpesa_txn.result_code = str(result_code) if result_code is not None else None
+        mpesa_txn.result_desc = result_desc
+        
         if result_code == 0:
             mpesa_txn.status = MpesaTransactionStatus.completed
             mpesa_txn.mpesa_receipt_number = receipt_number
+            mpesa_txn.failure_source = None  # Success - no failure
             status = "completed"
         else:
             mpesa_txn.status = MpesaTransactionStatus.failed
+            mpesa_txn.failure_source = FailureSource.CLIENT
             status = "failed"
+            logger.warning(f"Transaction {checkout_request_id} failed (client): code={result_code}, desc={result_desc}")
         
         mpesa_txn.updated_at = datetime.utcnow()
         await db.commit()
@@ -1720,6 +1727,24 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             
     except Exception as e:
         logger.error(f"Error processing M-Pesa callback: {str(e)}")
+        # Try to record the server-side failure on the transaction
+        try:
+            from app.db.models import FailureSource
+            if checkout_request_id:
+                async with db.begin():
+                    fail_stmt = select(MpesaTransaction).where(
+                        MpesaTransaction.checkout_request_id == checkout_request_id
+                    )
+                    fail_result = await db.execute(fail_stmt)
+                    fail_txn = fail_result.scalar_one_or_none()
+                    if fail_txn and fail_txn.status == MpesaTransactionStatus.pending:
+                        fail_txn.status = MpesaTransactionStatus.failed
+                        fail_txn.failure_source = FailureSource.SERVER
+                        fail_txn.result_code = "SERVER_ERROR"
+                        fail_txn.result_desc = f"Server error during callback processing: {str(e)[:450]}"
+                        fail_txn.updated_at = datetime.utcnow()
+        except Exception as inner_e:
+            logger.error(f"Failed to record server error on transaction: {str(inner_e)}")
         return {"ResultCode": 1, "ResultDesc": f"Error: {str(e)}"}
 
 def _call_mikrotik_bypass_sync(hotspot_payload: dict) -> dict:
@@ -5653,13 +5678,35 @@ async def initiate_mpesa_payment_api(
             raise HTTPException(status_code=404, detail="Customer not found")
         
         reference = f"PAYMENT-{request.customer_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-        stk_response = await initiate_stk_push(
-            phone_number=request.phone,
-            amount=request.amount,
-            reference=reference,
-            user_id=customer.user_id,
-            mac_address=customer.mac_address
-        )
+        
+        try:
+            stk_response = await initiate_stk_push(
+                phone_number=request.phone,
+                amount=request.amount,
+                reference=reference,
+                user_id=customer.user_id,
+                mac_address=customer.mac_address
+            )
+        except Exception as stk_error:
+            # STK push failed - record the failure so we can track M-Pesa API issues
+            from app.db.models import FailureSource
+            failed_txn = MpesaTransaction(
+                checkout_request_id=f"FAILED-{reference}",
+                phone_number=request.phone,
+                amount=request.amount,
+                reference=reference,
+                customer_id=request.customer_id,
+                status=MpesaTransactionStatus.failed,
+                failure_source=FailureSource.MPESA_API,
+                result_code="STK_PUSH_FAILED",
+                result_desc=f"STK Push initiation failed: {str(stk_error)[:450]}",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(failed_txn)
+            await db.commit()
+            logger.error(f"STK Push failed for customer {request.customer_id}: {str(stk_error)}")
+            raise HTTPException(status_code=500, detail=f"Failed to initiate payment: {str(stk_error)}")
         
         if not stk_response:
             raise HTTPException(status_code=400, detail="Failed to initiate mobile money payment. Please try again.")
@@ -5691,7 +5738,6 @@ async def initiate_mpesa_payment_api(
         }
         
     except HTTPException:
-        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
@@ -5782,9 +5828,9 @@ async def register_hotspot_and_pay_api(
             await db.flush()
         
         if payment_method_enum == PaymentMethod.MOBILE_MONEY:
+            reference = f"HOTSPOT-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+            
             try:
-                reference = f"HOTSPOT-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-                
                 # Initiate STK push and get response
                 stk_response = await initiate_stk_push(
                     phone_number=request.phone,
@@ -5816,6 +5862,27 @@ async def register_hotspot_and_pay_api(
                 customer_id = getattr(customer, "id", None)
                 await db.rollback()
                 logger.exception("Payment initiation failed for customer %s", customer_id)
+                
+                # Record the STK push failure so we can track M-Pesa API issues
+                try:
+                    from app.db.models import FailureSource
+                    failed_txn = MpesaTransaction(
+                        checkout_request_id=f"FAILED-{reference}",
+                        phone_number=request.phone,
+                        amount=float(plan.price),
+                        reference=reference,
+                        customer_id=customer_id,
+                        status=MpesaTransactionStatus.failed,
+                        failure_source=FailureSource.MPESA_API,
+                        result_code="STK_PUSH_FAILED",
+                        result_desc=f"STK Push initiation failed: {str(e)[:450]}",
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow()
+                    )
+                    db.add(failed_txn)
+                    await db.commit()
+                except Exception as record_err:
+                    logger.error(f"Failed to record STK push failure: {str(record_err)}")
                 
                 raise HTTPException(status_code=400, detail=f"Mobile money payment initiation failed: {str(e)}")
         else:
@@ -6066,6 +6133,9 @@ async def get_mpesa_transactions(
                 "lipay_tx_no": tx.lipay_tx_no,
                 "status": tx.status.value,
                 "mpesa_receipt_number": tx.mpesa_receipt_number,
+                "result_code": tx.result_code,
+                "result_desc": tx.result_desc,
+                "failure_source": tx.failure_source.value if tx.failure_source else None,
                 "transaction_date": tx.transaction_date.isoformat() if tx.transaction_date else None,
                 "created_at": tx.created_at.isoformat(),
                 "customer": {
@@ -6182,6 +6252,155 @@ async def get_mpesa_transactions_summary(
     except Exception as e:
         logger.error(f"Error fetching transaction summary: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch summary: {str(e)}")
+
+
+@app.get("/api/mpesa/transactions/failed")
+async def get_failed_mpesa_transactions(
+    router_id: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_id: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get failed and expired M-Pesa transactions with failure reasons.
+    
+    Helps diagnose why payments are failing so you can take action.
+    
+    Query Parameters:
+    - router_id: Filter by specific router (optional)
+    - start_date: Start date (ISO format: 2025-10-20)
+    - end_date: End date (ISO format: 2025-10-21)
+    - user_id: Owner/reseller ID (defaults to 1)
+    
+    Returns:
+    - List of failed/expired transactions with result_code, result_desc
+    - Summary breakdown of failure reasons
+    """
+    try:
+        from sqlalchemy import func
+        
+        # Build query for failed + expired transactions
+        stmt = select(MpesaTransaction, Customer, Router, Plan).join(
+            Customer, MpesaTransaction.customer_id == Customer.id, isouter=True
+        ).join(
+            Router, Customer.router_id == Router.id, isouter=True
+        ).join(
+            Plan, Customer.plan_id == Plan.id, isouter=True
+        ).where(
+            (Customer.user_id == user_id) | (MpesaTransaction.customer_id == None)
+        ).where(
+            MpesaTransaction.status.in_([MpesaTransactionStatus.failed, MpesaTransactionStatus.expired])
+        )
+        
+        # Apply filters
+        if router_id:
+            stmt = stmt.where(Router.id == router_id)
+        
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                stmt = stmt.where(MpesaTransaction.created_at >= start_dt)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format. Use ISO format (YYYY-MM-DD)")
+        
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                if 'T' not in end_date:
+                    end_dt = end_dt.replace(hour=23, minute=59, second=59)
+                stmt = stmt.where(MpesaTransaction.created_at <= end_dt)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format. Use ISO format (YYYY-MM-DD)")
+        
+        stmt = stmt.order_by(MpesaTransaction.created_at.desc())
+        
+        result = await db.execute(stmt)
+        transactions = result.all()
+        
+        # Build failure source breakdown (client vs server vs mpesa_api vs timeout)
+        source_breakdown = {}
+        for tx, _, _, _ in transactions:
+            source = tx.failure_source.value if tx.failure_source else "unknown"
+            if source not in source_breakdown:
+                source_breakdown[source] = {"count": 0, "total_amount": 0}
+            source_breakdown[source]["count"] += 1
+            source_breakdown[source]["total_amount"] += float(tx.amount)
+        
+        # Build failure reason breakdown
+        failure_reasons = {}
+        for tx, _, _, _ in transactions:
+            reason = tx.result_desc or "Unknown (no failure reason recorded)"
+            if reason not in failure_reasons:
+                failure_reasons[reason] = {
+                    "count": 0, "result_code": tx.result_code, "total_amount": 0,
+                    "failure_source": tx.failure_source.value if tx.failure_source else "unknown"
+                }
+            failure_reasons[reason]["count"] += 1
+            failure_reasons[reason]["total_amount"] += float(tx.amount)
+        
+        # Sort reasons by count descending
+        sorted_reasons = sorted(failure_reasons.items(), key=lambda x: x[1]["count"], reverse=True)
+        failure_summary = [
+            {
+                "reason": reason,
+                "result_code": data["result_code"],
+                "failure_source": data["failure_source"],
+                "count": data["count"],
+                "total_amount_lost": data["total_amount"]
+            }
+            for reason, data in sorted_reasons
+        ]
+        
+        # Build transaction list
+        failed_transactions = [
+            {
+                "transaction_id": tx.id,
+                "checkout_request_id": tx.checkout_request_id,
+                "phone_number": tx.phone_number,
+                "amount": float(tx.amount),
+                "reference": tx.reference,
+                "status": tx.status.value,
+                "failure_source": tx.failure_source.value if tx.failure_source else None,
+                "result_code": tx.result_code,
+                "result_desc": tx.result_desc,
+                "created_at": tx.created_at.isoformat(),
+                "updated_at": tx.updated_at.isoformat() if tx.updated_at else None,
+                "customer": {
+                    "id": customer.id,
+                    "name": customer.name,
+                    "phone": customer.phone,
+                    "mac_address": customer.mac_address,
+                    "status": customer.status.value
+                } if customer else None,
+                "router": {
+                    "id": router.id,
+                    "name": router.name,
+                    "ip_address": router.ip_address
+                } if router else None,
+                "plan": {
+                    "id": plan.id,
+                    "name": plan.name,
+                    "price": plan.price,
+                } if plan else None
+            }
+            for tx, customer, router, plan in transactions
+        ]
+        
+        return {
+            "total_failed": len(transactions),
+            "total_amount_lost": sum(float(tx.amount) for tx, _, _, _ in transactions),
+            "source_breakdown": source_breakdown,
+            "failure_summary": failure_summary,
+            "transactions": failed_transactions
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching failed transactions: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch failed transactions: {str(e)}")
+
 
 @app.get("/")
 def read_root():
