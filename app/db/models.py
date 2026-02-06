@@ -21,6 +21,12 @@ class ConnectionType(str, enum.Enum):
     PPPOE = "pppoe"
     STATIC_IP = "static_ip"
 
+
+class RouterAuthMethod(str, enum.Enum):
+    """Authentication method used by a router for hotspot users"""
+    DIRECT_API = "DIRECT_API"  # Current method - direct MikroTik API calls
+    RADIUS = "RADIUS"          # New method - FreeRADIUS server
+
 class CustomerStatus(str, enum.Enum):
     ACTIVE = "active"
     INACTIVE = "inactive"
@@ -168,6 +174,15 @@ class Router(Base):
     password = Column(String, nullable=False)
     port = Column(Integer, nullable=False, default=8728)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # RADIUS authentication fields (new - does not affect existing routers)
+    auth_method = Column(
+        Enum(RouterAuthMethod, name="routerauthmethod"), 
+        nullable=False, 
+        default=RouterAuthMethod.DIRECT_API,
+        server_default="DIRECT_API"
+    )
+    radius_secret = Column(String(255), nullable=True)  # Shared secret for RADIUS
+    radius_nas_identifier = Column(String(100), nullable=True)  # NAS-Identifier for this router
 
 class ProvisioningLog(Base):
     __tablename__ = "provisioning_logs"

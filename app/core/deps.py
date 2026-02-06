@@ -39,5 +39,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> CurrentUser:
         )
     except JWTError:
         raise credentials_exception
-    
-    
+
+
+async def get_current_active_user(current_user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """Require authenticated user - rejects unauthenticated requests."""
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return current_user

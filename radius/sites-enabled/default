@@ -1,0 +1,101 @@
+# FreeRADIUS Default Site Configuration
+# =====================================
+# This configures authentication and accounting for hotspot users.
+
+server default {
+    listen {
+        type = auth
+        ipaddr = *
+        port = 0
+        limit {
+            max_connections = 256
+            lifetime = 0
+            idle_timeout = 30
+        }
+    }
+    
+    listen {
+        type = acct
+        ipaddr = *
+        port = 0
+        limit {
+            max_connections = 256
+            lifetime = 0
+            idle_timeout = 30
+        }
+    }
+    
+    # Authorization - check if user exists and get attributes
+    authorize {
+        # Log the request for debugging
+        # linelog
+        
+        # Preprocess the request
+        preprocess
+        
+        # Check for Simultaneous-Use limits
+        # If you want to limit concurrent sessions, enable this
+        # and set Simultaneous-Use attribute in radius_check
+        
+        # Get user info from SQL database
+        sql
+        
+        # If not found in SQL, reject
+        if (!ok) {
+            reject
+        }
+        
+        # Set Auth-Type to PAP for plain text password checking
+        # MikroTik hotspot typically uses PAP or CHAP
+        pap
+        chap
+        mschap
+    }
+    
+    # Authentication - verify credentials
+    authenticate {
+        Auth-Type PAP {
+            pap
+        }
+        
+        Auth-Type CHAP {
+            chap
+        }
+        
+        Auth-Type MS-CHAP {
+            mschap
+        }
+    }
+    
+    # Pre-accounting
+    preacct {
+        preprocess
+        acct_unique
+    }
+    
+    # Accounting - log session start/stop/interim
+    accounting {
+        # Store accounting data in SQL
+        sql
+        
+        # Execute scripts on accounting events (optional)
+        # exec
+    }
+    
+    # Post-authentication - runs after successful auth
+    post-auth {
+        # Get reply attributes from SQL (bandwidth limits, session timeout, etc.)
+        sql
+        
+        # Log successful authentications
+        Post-Auth-Type REJECT {
+            sql
+            attr_filter.access_reject
+        }
+    }
+    
+    # Session management
+    session {
+        sql
+    }
+}
