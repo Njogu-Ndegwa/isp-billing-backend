@@ -2,8 +2,7 @@
 # ====================================
 # Connects to PostgreSQL database for user authentication and accounting.
 # Uses the same database as ISP Billing for seamless integration.
-#
-# Database connection uses Docker network hostnames (service name "db").
+# Table names are hardcoded to avoid variable resolution issues.
 
 sql {
     driver = "rlm_sql_postgresql"
@@ -32,32 +31,20 @@ sql {
     # Read clients from database (no - we use clients.conf)
     read_clients = no
 
-    # Table names - custom RADIUS tables in ISP Billing database
-    authcheck_table = "radius_check"
-    authreply_table = "radius_reply"
-    acct_table1 = "radius_accounting"
-    acct_table2 = "radius_accounting"
-    postauth_table = "radius_postauth"
-
-    # Group tables
-    groupcheck_table = "radius_groupcheck"
-    groupreply_table = "radius_groupreply"
-    usergroup_table = "radius_usergroup"
-
     # Remove stale sessions on startup
     delete_stale_sessions = yes
 
     # SQL queries for authentication
     authorize_check_query = "\
         SELECT id, username, attribute, value, op \
-        FROM ${authcheck_table} \
+        FROM radius_check \
         WHERE username = '%{SQL-User-Name}' \
         AND (expiry IS NULL OR expiry > NOW()) \
         ORDER BY id"
 
     authorize_reply_query = "\
         SELECT id, username, attribute, value, op \
-        FROM ${authreply_table} \
+        FROM radius_reply \
         WHERE username = '%{SQL-User-Name}' \
         AND (expiry IS NULL OR expiry > NOW()) \
         ORDER BY id"
@@ -66,7 +53,7 @@ sql {
     accounting {
         start {
             query = "\
-                INSERT INTO ${acct_table1} \
+                INSERT INTO radius_accounting \
                     (acctsessionid, acctuniqueid, username, realm, \
                      nasipaddress, nasportid, nasporttype, \
                      acctstarttime, acctupdatetime, \
@@ -88,7 +75,7 @@ sql {
 
         interim-update {
             query = "\
-                UPDATE ${acct_table1} SET \
+                UPDATE radius_accounting SET \
                     acctupdatetime = NOW(), \
                     acctsessiontime = '%{Acct-Session-Time}', \
                     acctinputoctets = '%{Acct-Input-Octets}'::bigint + \
@@ -103,7 +90,7 @@ sql {
 
         stop {
             query = "\
-                UPDATE ${acct_table1} SET \
+                UPDATE radius_accounting SET \
                     acctstoptime = NOW(), \
                     acctupdatetime = NOW(), \
                     acctsessiontime = '%{Acct-Session-Time}', \
@@ -122,7 +109,7 @@ sql {
     # Post-authentication logging
     post-auth {
         query = "\
-            INSERT INTO ${postauth_table} \
+            INSERT INTO radius_postauth \
                 (username, pass, reply, authdate, nasipaddress, calledstationid, callingstationid) \
             VALUES \
                 ('%{SQL-User-Name}', '%{%{User-Password}:-%{Chap-Password}}', \

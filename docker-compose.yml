@@ -57,12 +57,12 @@ services:
       - "1812:1812/udp"
       - "1813:1813/udp"
     volumes:
-      - ./radius/clients.conf:/etc/raddb/clients.conf:ro
-      - ./radius/mods-enabled/sql:/etc/raddb/mods-enabled/sql:ro
-      - ./radius/mods-available/sql:/etc/raddb/mods-available/sql:ro
-      - ./radius/sites-enabled/default:/etc/raddb/sites-enabled/default:ro
-      - ./radius/dictionary.mikrotik:/etc/raddb/dictionary.mikrotik:ro
-      - ./radius/dictionary:/etc/raddb/dictionary:ro
+      - ./radius/clients.conf:/etc/freeradius/clients.conf:ro
+      - ./radius/mods-enabled/sql:/etc/freeradius/mods-enabled/sql:ro
+      - ./radius/mods-available/sql:/etc/freeradius/mods-available/sql:ro
+      - ./radius/sites-enabled/default:/etc/freeradius/sites-enabled/default:ro
+      - ./radius/dictionary.mikrotik:/etc/freeradius/dictionary.mikrotik:ro
+      - ./radius/dictionary:/etc/freeradius/dictionary:ro
     depends_on:
       db:
         condition: service_healthy
