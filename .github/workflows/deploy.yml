@@ -56,12 +56,12 @@ jobs:
           echo "Image digest:"
           docker inspect njogundegwa/isp-billing:latest --format='{{.Id}}'
           
-          echo "[5/7] Building FreeRADIUS image (if radius/ directory exists)..."
+          echo "[5/7] Building FreeRADIUS image..."
           if [ -d "radius" ]; then
-            docker build -t isp-billing-radius:latest ./radius/ || { echo "WARNING: FreeRADIUS build failed"; }
-            echo "FreeRADIUS image built"
+            docker build -t isp-billing-radius:latest ./radius/ || { echo "ERROR: FreeRADIUS build failed"; exit 1; }
+            echo "FreeRADIUS image built successfully"
           else
-            echo "No radius/ directory found, skipping FreeRADIUS build"
+            echo "ERROR: radius/ directory not found"; exit 1
           fi
           
           echo "[6/7] Restarting containers with Docker Hub image..."
