@@ -3588,7 +3588,8 @@ async def get_router_by_identity(
         "router_id": router.id,
         "name": router.name,
         "identity": router.identity,
-        "user_id": router.user_id
+        "user_id": router.user_id,
+        "auth_method": getattr(router, 'auth_method', 'DIRECT_API') or 'DIRECT_API'
     }
 
 class RouterIdentityUpdate(BaseModel):

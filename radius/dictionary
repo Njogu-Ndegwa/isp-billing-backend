@@ -6,4 +6,4 @@
 $INCLUDE        /usr/share/freeradius/dictionary
 
 # MikroTik vendor-specific attributes
-$INCLUDE        /etc/raddb/dictionary.mikrotik
+$INCLUDE        /etc/freeradius/dictionary.mikrotik
