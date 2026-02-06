@@ -7,6 +7,9 @@ They provide management capabilities for RADIUS-enabled routers.
 
 All endpoints are prefixed with /api/radius/
 
+Authentication is disabled (matching existing /api/routers/create pattern).
+Endpoints that need to identify router ownership accept user_id as a query parameter.
+
 Endpoints:
 - POST   /api/radius/routers/{router_id}/enable      - Enable RADIUS for a router
 - POST   /api/radius/routers/{router_id}/disable     - Disable RADIUS (back to direct API)
@@ -33,7 +36,6 @@ import secrets
 import string
 
 from app.db.database import get_db
-from app.core.deps import get_current_active_user
 from app.services.radius_service import RadiusService, RadiusUserConfig, RadiusCoA
 from app.services.radius_provisioning import RadiusProvisioning, should_use_radius
 
@@ -104,8 +106,7 @@ class ActiveSessionResponse(BaseModel):
 async def enable_radius_for_router(
     router_id: int,
     request: EnableRadiusRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Enable RADIUS authentication for a specific router.
@@ -117,21 +118,17 @@ async def enable_radius_for_router(
     IMPORTANT: You must also configure the MikroTik router to use RADIUS.
     See the RADIUS_SETUP.md guide for MikroTik configuration.
     """
-    # Check router exists and belongs to user
     result = await db.execute(text("""
         SELECT id, name, user_id, auth_method FROM routers WHERE id = :router_id
     """), {'router_id': router_id})
     
-    router = result.fetchone()
+    db_router = result.fetchone()
     
-    if not router:
+    if not db_router:
         raise HTTPException(status_code=404, detail="Router not found")
     
-    if router.user_id != current_user.user_id and current_user.role != 'admin':
-        raise HTTPException(status_code=403, detail="Not authorized to manage this router")
-    
     # Update router to use RADIUS
-    nas_identifier = request.nas_identifier or router.name
+    nas_identifier = request.nas_identifier or db_router.name
     
     await db.execute(text("""
         UPDATE routers SET 
@@ -147,11 +144,11 @@ async def enable_radius_for_router(
     
     await db.commit()
     
-    logger.info(f"RADIUS enabled for router {router_id} by user {current_user.user_id}")
+    logger.info(f"RADIUS enabled for router {router_id}")
     
     return {
         'success': True,
-        'message': f'RADIUS enabled for router "{router.name}"',
+        'message': f'RADIUS enabled for router "{db_router.name}"',
         'router_id': router_id,
         'auth_method': 'RADIUS',
         'nas_identifier': nas_identifier,
@@ -167,8 +164,7 @@ async def enable_radius_for_router(
 @router.post("/routers/{router_id}/disable", response_model=dict)
 async def disable_radius_for_router(
     router_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Disable RADIUS for a router (revert to direct API method).
@@ -176,18 +172,14 @@ async def disable_radius_for_router(
     This is useful if you want to migrate a router back to the original
     direct API provisioning method.
     """
-    # Check router exists and belongs to user
     result = await db.execute(text("""
         SELECT id, name, user_id FROM routers WHERE id = :router_id
     """), {'router_id': router_id})
     
-    router = result.fetchone()
+    db_router = result.fetchone()
     
-    if not router:
+    if not db_router:
         raise HTTPException(status_code=404, detail="Router not found")
-    
-    if router.user_id != current_user.user_id and current_user.role != 'admin':
-        raise HTTPException(status_code=403, detail="Not authorized to manage this router")
     
     # Update router to use direct API
     await db.execute(text("""
@@ -200,11 +192,11 @@ async def disable_radius_for_router(
     
     await db.commit()
     
-    logger.info(f"RADIUS disabled for router {router_id} by user {current_user.user_id}")
+    logger.info(f"RADIUS disabled for router {router_id}")
     
     return {
         'success': True,
-        'message': f'RADIUS disabled for router "{router.name}". Now using direct API.',
+        'message': f'RADIUS disabled for router "{db_router.name}". Now using direct API.',
         'router_id': router_id,
         'auth_method': 'DIRECT_API'
     }
@@ -213,8 +205,7 @@ async def disable_radius_for_router(
 @router.get("/routers/{router_id}/status", response_model=RouterRadiusStatus)
 async def get_router_radius_status(
     router_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """Get RADIUS configuration status for a router"""
     result = await db.execute(text("""
@@ -222,45 +213,42 @@ async def get_router_radius_status(
         FROM routers WHERE id = :router_id
     """), {'router_id': router_id})
     
-    router = result.fetchone()
+    db_router = result.fetchone()
     
-    if not router:
+    if not db_router:
         raise HTTPException(status_code=404, detail="Router not found")
-    
-    if router.user_id != current_user.user_id and current_user.role != 'admin':
-        raise HTTPException(status_code=403, detail="Not authorized to view this router")
     
     # Count active sessions for this router
     active_sessions = 0
-    if router.auth_method == 'RADIUS':
+    if db_router.auth_method == 'RADIUS':
         sessions_result = await db.execute(text("""
             SELECT COUNT(*) as count FROM radius_accounting 
             WHERE nasipaddress = :nas_ip AND acctstoptime IS NULL
-        """), {'nas_ip': router.ip_address})
+        """), {'nas_ip': db_router.ip_address})
         active_sessions = sessions_result.fetchone().count
     
     return RouterRadiusStatus(
-        router_id=router.id,
-        router_name=router.name,
-        auth_method=router.auth_method or 'DIRECT_API',
-        radius_enabled=(router.auth_method == 'RADIUS'),
-        radius_secret_set=bool(router.radius_secret),
-        nas_identifier=router.radius_nas_identifier,
+        router_id=db_router.id,
+        router_name=db_router.name,
+        auth_method=db_router.auth_method or 'DIRECT_API',
+        radius_enabled=(db_router.auth_method == 'RADIUS'),
+        radius_secret_set=bool(db_router.radius_secret),
+        nas_identifier=db_router.radius_nas_identifier,
         active_sessions=active_sessions
     )
 
 
 @router.get("/routers", response_model=List[RouterRadiusStatus])
 async def list_radius_enabled_routers(
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    user_id: int = Query(1, description="User ID to list routers for"),
+    db: AsyncSession = Depends(get_db)
 ):
-    """List all routers with their RADIUS status"""
+    """List all routers with their RADIUS status for a given user"""
     result = await db.execute(text("""
         SELECT id, name, auth_method, radius_secret, radius_nas_identifier, ip_address
         FROM routers WHERE user_id = :user_id
         ORDER BY name
-    """), {'user_id': current_user.user_id})
+    """), {'user_id': user_id})
     
     routers = []
     for row in result.fetchall():
@@ -293,8 +281,7 @@ async def list_radius_enabled_routers(
 @router.post("/users", response_model=RadiusUserResponse)
 async def create_radius_user(
     request: CreateRadiusUserRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Manually create a RADIUS user.
@@ -346,8 +333,7 @@ async def create_radius_user(
 @router.get("/users/{username}", response_model=dict)
 async def get_radius_user(
     username: str,
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """Get RADIUS user information"""
     radius = RadiusService(db)
@@ -364,8 +350,7 @@ async def delete_radius_user(
     username: str,
     disconnect: bool = Query(True, description="Attempt to disconnect active sessions"),
     router_id: Optional[int] = Query(None, description="Router ID for disconnect (optional)"),
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """Delete a RADIUS user and optionally disconnect active sessions"""
     radius = RadiusService(db)
@@ -381,10 +366,10 @@ async def delete_radius_user(
         result = await db.execute(text("""
             SELECT ip_address, radius_secret FROM routers WHERE id = :router_id
         """), {'router_id': router_id})
-        router = result.fetchone()
+        db_router = result.fetchone()
         
-        if router and router.radius_secret:
-            coa = RadiusCoA(router.ip_address, router.radius_secret)
+        if db_router and db_router.radius_secret:
+            coa = RadiusCoA(db_router.ip_address, db_router.radius_secret)
             success, message = coa.disconnect_user(username=username)
             disconnect_result = {'success': success, 'message': message}
     
@@ -407,8 +392,7 @@ async def delete_radius_user(
 async def list_active_sessions(
     router_id: Optional[int] = Query(None, description="Filter by router ID"),
     username: Optional[str] = Query(None, description="Filter by username"),
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """List active RADIUS sessions"""
     radius = RadiusService(db)
@@ -417,11 +401,11 @@ async def list_active_sessions(
     nas_ip = None
     if router_id:
         result = await db.execute(text("""
-            SELECT ip_address FROM routers WHERE id = :router_id AND user_id = :user_id
-        """), {'router_id': router_id, 'user_id': current_user.user_id})
-        router = result.fetchone()
-        if router:
-            nas_ip = router.ip_address
+            SELECT ip_address FROM routers WHERE id = :router_id
+        """), {'router_id': router_id})
+        db_router = result.fetchone()
+        if db_router:
+            nas_ip = db_router.ip_address
     
     sessions = await radius.get_active_sessions(username=username, nas_ip=nas_ip)
     
@@ -445,8 +429,7 @@ async def list_active_sessions(
 async def disconnect_user_session(
     username: str,
     router_id: int = Query(..., description="Router ID to send disconnect to"),
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Disconnect a user's active session via RADIUS CoA.
@@ -456,19 +439,18 @@ async def disconnect_user_session(
     """
     # Get router info
     result = await db.execute(text("""
-        SELECT ip_address, radius_secret FROM routers 
-        WHERE id = :router_id AND user_id = :user_id
-    """), {'router_id': router_id, 'user_id': current_user.user_id})
+        SELECT ip_address, radius_secret FROM routers WHERE id = :router_id
+    """), {'router_id': router_id})
     
-    router = result.fetchone()
+    db_router = result.fetchone()
     
-    if not router:
+    if not db_router:
         raise HTTPException(status_code=404, detail="Router not found")
     
-    if not router.radius_secret:
+    if not db_router.radius_secret:
         raise HTTPException(status_code=400, detail="Router does not have RADIUS configured")
     
-    coa = RadiusCoA(router.ip_address, router.radius_secret)
+    coa = RadiusCoA(db_router.ip_address, db_router.radius_secret)
     success, message = coa.disconnect_user(username=username)
     
     return {
@@ -486,8 +468,7 @@ async def disconnect_user_session(
 async def get_user_accounting(
     username: str,
     days: int = Query(30, description="Number of days to include in stats"),
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """Get accounting statistics for a RADIUS user"""
     radius = RadiusService(db)
@@ -509,8 +490,7 @@ async def get_user_accounting(
 
 @router.post("/cleanup", response_model=dict)
 async def cleanup_expired_users(
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Cleanup expired RADIUS users.
@@ -518,9 +498,6 @@ async def cleanup_expired_users(
     This removes users whose expiry date has passed from the RADIUS tables.
     Active sessions will naturally fail on re-authentication.
     """
-    if current_user.role != 'admin':
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
     radius = RadiusService(db)
     count = await radius.cleanup_expired_users()
     
@@ -534,8 +511,7 @@ async def cleanup_expired_users(
 @router.get("/test/{router_id}", response_model=dict)
 async def test_radius_connectivity(
     router_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_active_user)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Test RADIUS connectivity to a router.
@@ -551,18 +527,18 @@ async def test_radius_connectivity(
     # Get router info
     result = await db.execute(text("""
         SELECT id, name, ip_address, auth_method, radius_secret
-        FROM routers WHERE id = :router_id AND user_id = :user_id
-    """), {'router_id': router_id, 'user_id': current_user.user_id})
+        FROM routers WHERE id = :router_id
+    """), {'router_id': router_id})
     
-    router = result.fetchone()
+    db_router = result.fetchone()
     
-    if not router:
+    if not db_router:
         raise HTTPException(status_code=404, detail="Router not found")
     
     checks = {
         'router_found': True,
-        'radius_enabled': router.auth_method == 'RADIUS',
-        'radius_secret_set': bool(router.radius_secret),
+        'radius_enabled': db_router.auth_method == 'RADIUS',
+        'radius_secret_set': bool(db_router.radius_secret),
         'tables_exist': False,
         'can_create_user': False,
         'can_delete_user': False
@@ -607,8 +583,8 @@ async def test_radius_connectivity(
     
     return {
         'success': all_passed,
-        'router_name': router.name,
-        'router_ip': router.ip_address,
+        'router_name': db_router.name,
+        'router_ip': db_router.ip_address,
         'checks': checks,
         'message': 'All checks passed' if all_passed else 'Some checks failed - see details'
     }

@@ -1,61 +1,27 @@
 {
     "info": {
         "name": "RADIUS - Full Test Flow",
-        "description": "Complete test flow for RADIUS hotspot functionality.\n\nRun requests in order:\n1. Login → auto-captures JWT token\n2. Create Router → auto-captures router_id\n3. Enable RADIUS on router\n4. Test RADIUS connectivity\n5. Register & Pay (RADIUS hotspot flow)\n6. Poll payment status\n7. Manage users, sessions, accounting\n\nVariables are auto-set by test scripts — just run in sequence.",
+        "description": "Complete test flow for RADIUS hotspot functionality.\n\nNo authentication required — matches existing /api/routers/create pattern.\n\nRun requests in order:\n1. Create Router → auto-captures router_id\n2. Enable RADIUS on router\n3. Test RADIUS connectivity\n4. Register & Pay (RADIUS hotspot flow)\n5. Poll payment status\n6. Manage users, sessions, accounting\n\nVariables are auto-set by test scripts — just run in sequence.",
         "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
     },
     "variable": [
         {"key": "baseUrl", "value": "http://localhost:8000"},
-        {"key": "token", "value": ""},
         {"key": "router_id", "value": ""},
         {"key": "customer_id", "value": ""},
         {"key": "radius_username", "value": ""},
         {"key": "plan_id", "value": "1"},
+        {"key": "user_id", "value": "1"},
         {"key": "test_mac", "value": "AA:BB:CC:DD:EE:FF"},
         {"key": "test_phone", "value": "254712345678"},
         {"key": "radius_secret", "value": "testing12345"}
     ],
-    "auth": {
-        "type": "bearer",
-        "bearer": [{"key": "token", "value": "{{token}}"}]
-    },
     "item": [
         {
             "name": "1. Setup",
-            "description": "Authentication and router setup. Run these first.",
+            "description": "Create a router and plan for testing. Run these first.",
             "item": [
                 {
-                    "name": "1.1 Login (get JWT token)",
-                    "event": [
-                        {
-                            "listen": "test",
-                            "script": {
-                                "exec": [
-                                    "if (pm.response.code === 200) {",
-                                    "    var json = pm.response.json();",
-                                    "    pm.collectionVariables.set('token', json.access_token);",
-                                    "    pm.test('Token captured', function() {",
-                                    "        pm.expect(json.access_token).to.be.a('string');",
-                                    "    });",
-                                    "}"
-                                ]
-                            }
-                        }
-                    ],
-                    "request": {
-                        "auth": {"type": "noauth"},
-                        "method": "POST",
-                        "url": "{{baseUrl}}/api/auth/login",
-                        "header": [{"key": "Content-Type", "value": "application/json"}],
-                        "body": {
-                            "mode": "raw",
-                            "raw": "{\n    \"email\": \"your_email@example.com\",\n    \"password\": \"your_password\"\n}"
-                        },
-                        "description": "Login to get JWT token. Token is automatically saved to collection variables for all subsequent requests."
-                    }
-                },
-                {
-                    "name": "1.2 Create Router (for RADIUS testing)",
+                    "name": "1.1 Create Router (for RADIUS testing)",
                     "event": [
                         {
                             "listen": "test",
@@ -78,13 +44,13 @@
                         "header": [{"key": "Content-Type", "value": "application/json"}],
                         "body": {
                             "mode": "raw",
-                            "raw": "{\n    \"name\": \"RADIUS Test Router\",\n    \"identity\": \"radius-test-router\",\n    \"ip_address\": \"10.0.0.100\",\n    \"username\": \"admin\",\n    \"password\": \"routerpass\",\n    \"port\": 8728\n}"
+                            "raw": "{\n    \"name\": \"RADIUS Test Router\",\n    \"identity\": \"radius-test-router\",\n    \"ip_address\": \"192.168.88.1\",\n    \"username\": \"admin\",\n    \"password\": \"routerpass\",\n    \"port\": 8728,\n    \"user_id\": {{user_id}}\n}"
                         },
-                        "description": "Create a new router. The router_id is auto-captured for subsequent RADIUS operations.\n\nChange ip_address to your actual MikroTik router IP."
+                        "description": "Create a new router. The router_id is auto-captured for subsequent RADIUS operations.\n\nChange ip_address to your actual MikroTik router's IP address.\nChange user_id to your actual user ID."
                     }
                 },
                 {
-                    "name": "1.3 Create Plan (if needed)",
+                    "name": "1.2 Create Plan (if needed)",
                     "event": [
                         {
                             "listen": "test",
@@ -109,7 +75,7 @@
                         "header": [{"key": "Content-Type", "value": "application/json"}],
                         "body": {
                             "mode": "raw",
-                            "raw": "{\n    \"name\": \"RADIUS Test Plan - 1 Hour\",\n    \"speed\": \"5M/5M\",\n    \"price\": 10,\n    \"duration_value\": 1,\n    \"duration_unit\": \"hours\"\n}"
+                            "raw": "{\n    \"name\": \"RADIUS Test Plan - 1 Hour\",\n    \"speed\": \"5M/5M\",\n    \"price\": 10,\n    \"duration_value\": 1,\n    \"duration_unit\": \"hours\",\n    \"user_id\": {{user_id}}\n}"
                         },
                         "description": "Create a test plan if you don't have one. Skip if you already have plans.\n\nAdjust speed, price, duration as needed."
                     }
@@ -204,7 +170,14 @@
                     "name": "2.4 List All Routers RADIUS Status",
                     "request": {
                         "method": "GET",
-                        "url": "{{baseUrl}}/api/radius/routers",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/radius/routers?user_id={{user_id}}",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "radius", "routers"],
+                            "query": [
+                                {"key": "user_id", "value": "{{user_id}}", "description": "Your user ID"}
+                            ]
+                        },
                         "description": "List all your routers with their RADIUS configuration status."
                     }
                 }
@@ -234,7 +207,6 @@
                         }
                     ],
                     "request": {
-                        "auth": {"type": "noauth"},
                         "method": "POST",
                         "url": "{{baseUrl}}/api/radius/hotspot/register-and-pay",
                         "header": [{"key": "Content-Type", "value": "application/json"}],
@@ -242,7 +214,7 @@
                             "mode": "raw",
                             "raw": "{\n    \"mac_address\": \"{{test_mac}}\",\n    \"phone\": \"{{test_phone}}\",\n    \"plan_id\": {{plan_id}},\n    \"router_id\": {{router_id}},\n    \"name\": \"Test User\",\n    \"payment_method\": \"mobile_money\"\n}"
                         },
-                        "description": "Register a hotspot user and initiate M-Pesa STK Push.\n\nAfter this, M-Pesa sends an STK push to the phone number.\nThe callback at /api/radius/mpesa/callback provisions the RADIUS user.\n\nPoll payment-status (3.2) to check when payment completes."
+                        "description": "Register a hotspot user and initiate M-Pesa STK Push.\n\nAfter this, M-Pesa sends an STK push to the phone number.\nThe callback at /api/radius/mpesa/callback provisions the RADIUS user.\n\nPoll payment-status (3.3) to check when payment completes."
                     }
                 },
                 {
@@ -269,7 +241,6 @@
                         }
                     ],
                     "request": {
-                        "auth": {"type": "noauth"},
                         "method": "POST",
                         "url": "{{baseUrl}}/api/radius/hotspot/register-and-pay",
                         "header": [{"key": "Content-Type", "value": "application/json"}],
@@ -305,7 +276,6 @@
                         }
                     ],
                     "request": {
-                        "auth": {"type": "noauth"},
                         "method": "GET",
                         "url": "{{baseUrl}}/api/radius/hotspot/payment-status/{{customer_id}}",
                         "description": "Poll this after initiating M-Pesa payment.\n\nWhen status becomes 'active', response includes:\n- radius_username\n- radius_password\n\nFrontend should then redirect to:\nhttp://<gateway>/login?username=<radius_username>&password=<radius_password>\n\nThe gateway address comes from the MikroTik captive portal redirect URL."
@@ -433,7 +403,7 @@
                     "request": {
                         "method": "POST",
                         "url": "{{baseUrl}}/api/radius/cleanup",
-                        "description": "Remove expired RADIUS users from the database. Requires admin role.\n\nExpired users will naturally fail authentication, but this cleans up the DB."
+                        "description": "Remove expired RADIUS users from the database.\n\nExpired users will naturally fail authentication, but this cleans up the DB."
                     }
                 },
                 {
