@@ -9,9 +9,12 @@ from app.services.billing import make_payment
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.mpesa_transactions import update_mpesa_transaction_status
 from app.services.plan_cache import get_plans_cached, invalidate_plan_cache, warm_plan_cache
+from app.api.radius_endpoints import router as radius_router
+from app.api.radius_hotspot import router as radius_hotspot_router
 from app.config import settings
 import logging
 from sqlalchemy.orm import selectinload
+from sqlalchemy import text as sa_text
 import json
 from typing import Dict, Optional, Any
 from datetime import datetime, timedelta
@@ -27,6 +30,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="ISP Billing SaaS API", version="1.0.0")
+
+# RADIUS endpoints (separate from existing endpoints, only active for RADIUS-enabled routers)
+app.include_router(radius_router)
+app.include_router(radius_hotspot_router)
 
 # Add CORS middleware
 app.add_middleware(
@@ -9648,10 +9655,198 @@ async def get_ratings_by_location(
         raise HTTPException(status_code=500, detail="Failed to fetch ratings")
 
 
+# ============================================================================
+# RADIUS Auto-Migration (runs on startup, idempotent)
+# ============================================================================
+async def run_radius_migrations():
+    """
+    Automatically apply RADIUS database migrations on startup.
+    Safe to run every time - only creates columns/tables that don't exist.
+    """
+    async with async_engine.begin() as conn:
+        # --- Migration 1: Add auth_method + RADIUS columns to routers ---
+        result = await conn.execute(sa_text("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'routers' AND column_name = 'auth_method'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                DO $$ BEGIN
+                    CREATE TYPE routerauthmethod AS ENUM ('DIRECT_API', 'RADIUS');
+                EXCEPTION
+                    WHEN duplicate_object THEN null;
+                END $$;
+            """))
+            await conn.execute(sa_text("""
+                ALTER TABLE routers 
+                ADD COLUMN auth_method routerauthmethod NOT NULL DEFAULT 'DIRECT_API'
+            """))
+            await conn.execute(sa_text("""
+                ALTER TABLE routers 
+                ADD COLUMN IF NOT EXISTS radius_secret VARCHAR(255) NULL,
+                ADD COLUMN IF NOT EXISTS radius_nas_identifier VARCHAR(100) NULL
+            """))
+            logger.info("RADIUS migration: Added auth_method, radius_secret, radius_nas_identifier to routers")
+        else:
+            logger.info("RADIUS migration: Router columns already exist, skipping")
+
+        # --- Migration 2: Create RADIUS tables for FreeRADIUS ---
+        result = await conn.execute(sa_text("""
+            SELECT table_name FROM information_schema.tables 
+            WHERE table_name = 'radius_check'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                CREATE TABLE radius_check (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(64) NOT NULL,
+                    attribute VARCHAR(64) NOT NULL,
+                    op CHAR(2) NOT NULL DEFAULT ':=',
+                    value VARCHAR(253) NOT NULL,
+                    expiry TIMESTAMP NULL,
+                    customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_check_username ON radius_check(username)"))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_check_customer ON radius_check(customer_id)"))
+
+            await conn.execute(sa_text("""
+                CREATE TABLE radius_reply (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(64) NOT NULL,
+                    attribute VARCHAR(64) NOT NULL,
+                    op CHAR(2) NOT NULL DEFAULT ':=',
+                    value VARCHAR(253) NOT NULL,
+                    expiry TIMESTAMP NULL,
+                    customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_reply_username ON radius_reply(username)"))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_reply_customer ON radius_reply(customer_id)"))
+
+            await conn.execute(sa_text("""
+                CREATE TABLE radius_groupcheck (
+                    id SERIAL PRIMARY KEY,
+                    groupname VARCHAR(64) NOT NULL,
+                    attribute VARCHAR(64) NOT NULL,
+                    op CHAR(2) NOT NULL DEFAULT ':=',
+                    value VARCHAR(253) NOT NULL
+                )
+            """))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_groupcheck_groupname ON radius_groupcheck(groupname)"))
+
+            await conn.execute(sa_text("""
+                CREATE TABLE radius_groupreply (
+                    id SERIAL PRIMARY KEY,
+                    groupname VARCHAR(64) NOT NULL,
+                    attribute VARCHAR(64) NOT NULL,
+                    op CHAR(2) NOT NULL DEFAULT ':=',
+                    value VARCHAR(253) NOT NULL
+                )
+            """))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_groupreply_groupname ON radius_groupreply(groupname)"))
+
+            await conn.execute(sa_text("""
+                CREATE TABLE radius_usergroup (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(64) NOT NULL,
+                    groupname VARCHAR(64) NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 1
+                )
+            """))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_usergroup_username ON radius_usergroup(username)"))
+
+            await conn.execute(sa_text("""
+                CREATE TABLE radius_accounting (
+                    id BIGSERIAL PRIMARY KEY,
+                    acctsessionid VARCHAR(64) NOT NULL,
+                    acctuniqueid VARCHAR(32) NOT NULL,
+                    username VARCHAR(64) NOT NULL,
+                    realm VARCHAR(64),
+                    nasipaddress VARCHAR(15) NOT NULL,
+                    nasportid VARCHAR(32),
+                    nasporttype VARCHAR(32),
+                    acctstarttime TIMESTAMP,
+                    acctupdatetime TIMESTAMP,
+                    acctstoptime TIMESTAMP,
+                    acctsessiontime INTEGER,
+                    acctauthentic VARCHAR(32),
+                    connectinfo_start VARCHAR(128),
+                    connectinfo_stop VARCHAR(128),
+                    acctinputoctets BIGINT,
+                    acctoutputoctets BIGINT,
+                    calledstationid VARCHAR(50),
+                    callingstationid VARCHAR(50),
+                    acctterminatecause VARCHAR(32),
+                    servicetype VARCHAR(32),
+                    framedprotocol VARCHAR(32),
+                    framedipaddress VARCHAR(15),
+                    framedipv6address VARCHAR(45),
+                    framedipv6prefix VARCHAR(45),
+                    framedinterfaceid VARCHAR(44),
+                    delegatedipv6prefix VARCHAR(45)
+                )
+            """))
+            await conn.execute(sa_text("CREATE UNIQUE INDEX idx_radius_acct_unique ON radius_accounting(acctuniqueid)"))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_acct_username ON radius_accounting(username)"))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_acct_start ON radius_accounting(acctstarttime)"))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_acct_stop ON radius_accounting(acctstoptime)"))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_acct_nasip ON radius_accounting(nasipaddress)"))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_acct_callingstationid ON radius_accounting(callingstationid)"))
+
+            await conn.execute(sa_text("""
+                CREATE TABLE radius_postauth (
+                    id BIGSERIAL PRIMARY KEY,
+                    username VARCHAR(64) NOT NULL,
+                    pass VARCHAR(64),
+                    reply VARCHAR(32),
+                    authdate TIMESTAMP NOT NULL DEFAULT NOW(),
+                    nasipaddress VARCHAR(15),
+                    calledstationid VARCHAR(50),
+                    callingstationid VARCHAR(50)
+                )
+            """))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_postauth_username ON radius_postauth(username)"))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_postauth_date ON radius_postauth(authdate)"))
+
+            await conn.execute(sa_text("""
+                CREATE TABLE radius_nas (
+                    id SERIAL PRIMARY KEY,
+                    nasname VARCHAR(128) NOT NULL,
+                    shortname VARCHAR(32),
+                    type VARCHAR(30) DEFAULT 'other',
+                    ports INTEGER,
+                    secret VARCHAR(60) NOT NULL,
+                    server VARCHAR(64),
+                    community VARCHAR(50),
+                    description VARCHAR(200),
+                    router_id INTEGER REFERENCES routers(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(sa_text("CREATE INDEX idx_radius_nas_nasname ON radius_nas(nasname)"))
+
+            logger.info("RADIUS migration: Created all RADIUS tables (radius_check, radius_reply, radius_groupcheck, radius_groupreply, radius_usergroup, radius_accounting, radius_postauth, radius_nas)")
+        else:
+            logger.info("RADIUS migration: Tables already exist, skipping")
+
+
 # Startup event - Start background scheduler
 @app.on_event("startup")
 async def startup_event():
     """Start the background cleanup scheduler when the app starts"""
+    # Run RADIUS migrations automatically (idempotent - safe every time)
+    try:
+        await run_radius_migrations()
+        logger.info("RADIUS migrations completed successfully")
+    except Exception as e:
+        logger.error(f"RADIUS migration failed (non-fatal): {e}")
+
     # Use prime-number intervals to prevent jobs from ever running simultaneously
     # LCM of primes = product, so overlap won't happen for ~43 days
     scheduler.add_job(

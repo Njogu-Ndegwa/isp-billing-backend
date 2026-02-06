@@ -38,25 +38,33 @@ jobs:
           echo "Starting deployment at $(date)"
           echo "=========================================="
           
-          echo "[1/6] Navigating to project directory..."
+          echo "[1/7] Navigating to project directory..."
           cd ~/apps/isp-billing || { echo "ERROR: Directory not found"; exit 1; }
           echo "Current directory: $(pwd)"
           
-          echo "[2/6] Pulling latest code from GitHub..."
+          echo "[2/7] Pulling latest code from GitHub..."
           git config --global --add safe.directory ~/apps/isp-billing
           git pull origin main || { echo "ERROR: Git pull failed"; exit 1; }
           echo "Git pull successful"
           
-          echo "[3/6] Checking disk space..."
+          echo "[3/7] Checking disk space..."
           df -h / | tail -1
           
-          echo "[4/6] Pulling latest Docker image from Docker Hub..."
+          echo "[4/7] Pulling latest Docker image from Docker Hub..."
           docker pull njogundegwa/isp-billing:latest || { echo "ERROR: Docker pull failed"; exit 1; }
           echo "Image pulled successfully"
           echo "Image digest:"
           docker inspect njogundegwa/isp-billing:latest --format='{{.Id}}'
           
-          echo "[5/6] Restarting containers with Docker Hub image..."
+          echo "[5/7] Building FreeRADIUS image (if radius/ directory exists)..."
+          if [ -d "radius" ]; then
+            docker build -t isp-billing-radius:latest ./radius/ || { echo "WARNING: FreeRADIUS build failed"; }
+            echo "FreeRADIUS image built"
+          else
+            echo "No radius/ directory found, skipping FreeRADIUS build"
+          fi
+          
+          echo "[6/7] Restarting containers with Docker Hub image..."
           docker compose down
           docker rmi isp-billing-web 2>/dev/null || true
           docker tag njogundegwa/isp-billing:latest isp-billing-web:latest
@@ -65,7 +73,7 @@ jobs:
           echo "Verifying deployed image matches Docker Hub:"
           docker inspect isp_billing_app --format='{{.Image}}'
           
-          echo "[6/6] Cleaning up old images..."
+          echo "[7/7] Cleaning up old images..."
           docker image prune -f
           
           echo "=========================================="
@@ -73,8 +81,11 @@ jobs:
           echo "=========================================="
           
           echo "Container status:"
-          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "isp|NAMES"
+          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "isp|radius|NAMES"
           
           echo "Recent app logs:"
           docker logs isp_billing_app --tail 10 2>&1 || true
+          
+          echo "FreeRADIUS status:"
+          docker logs isp_billing_radius --tail 5 2>&1 || true
           ENDSSH

@@ -47,6 +47,29 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  freeradius:
+    build:
+      context: ./radius
+      dockerfile: Dockerfile
+    image: isp-billing-radius:latest
+    container_name: isp_billing_radius
+    ports:
+      - "1812:1812/udp"
+      - "1813:1813/udp"
+    volumes:
+      - ./radius/clients.conf:/etc/raddb/clients.conf:ro
+      - ./radius/mods-enabled/sql:/etc/raddb/mods-enabled/sql:ro
+      - ./radius/mods-available/sql:/etc/raddb/mods-available/sql:ro
+      - ./radius/sites-enabled/default:/etc/raddb/sites-enabled/default:ro
+      - ./radius/dictionary.mikrotik:/etc/raddb/dictionary.mikrotik:ro
+      - ./radius/dictionary:/etc/raddb/dictionary:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - isp-network
+    restart: unless-stopped
+
 volumes:
   postgres_data:
 

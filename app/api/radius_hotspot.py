@@ -77,7 +77,6 @@ class RadiusPaymentStatusResponse(BaseModel):
     auth_method: str = "RADIUS"
     radius_username: Optional[str] = None
     radius_password: Optional[str] = None
-    login_url: Optional[str] = None  # MikroTik hotspot login URL with credentials
     message: Optional[str] = None
 
 
@@ -497,9 +496,15 @@ async def radius_payment_status(
 
     The frontend should:
     1. Poll this endpoint every 2-3 seconds after initiating payment
-    2. When status becomes "active", use the returned credentials
-    3. Redirect the user to the MikroTik login URL:
-       http://<hotspot-gateway>/login?username=<radius_username>&password=<radius_password>
+    2. When status becomes "active", build the MikroTik login URL using
+       the `gw` parameter from the original captive portal redirect AND
+       the returned credentials:
+       http://<gw>/login?username=<radius_username>&password=<radius_password>
+
+    IMPORTANT: The gateway address (`gw`) comes from the initial MikroTik
+    redirect to your captive portal (the $(hostname) variable). Do NOT use
+    the router's management IP from the database - clients can't reach that.
+    The frontend already has the correct gateway from the URL parameters.
     """
     try:
         result = await db.execute(
@@ -531,18 +536,6 @@ async def radius_payment_status(
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Build MikroTik login URL if we have credentials and router info
-        login_url = None
-        if radius_username and radius_password and customer.router:
-            # MikroTik hotspot login URL format
-            # The gateway IP is typically the router's hotspot interface IP
-            # Users are redirected to this URL by the captive portal frontend
-            login_url = (
-                f"http://{customer.router.ip_address}/login"
-                f"?username={radius_username}"
-                f"&password={radius_password}"
-            )
-
         return RadiusPaymentStatusResponse(
             customer_id=customer.id,
             status=customer.status.value,
@@ -551,9 +544,8 @@ async def radius_payment_status(
             auth_method=auth_method,
             radius_username=radius_username if customer.status == CustomerStatus.ACTIVE else None,
             radius_password=radius_password if customer.status == CustomerStatus.ACTIVE else None,
-            login_url=login_url if customer.status == CustomerStatus.ACTIVE else None,
             message=(
-                "Payment confirmed. Use the login_url to authenticate."
+                "Payment confirmed. Use credentials to login."
                 if customer.status == CustomerStatus.ACTIVE and radius_username
                 else "Waiting for payment confirmation..."
                 if customer.status == CustomerStatus.PENDING

@@ -3,7 +3,7 @@ sql {
     dialect = "postgresql"
 
     # Database connection - using Docker network hostnames
-    # These match docker-compose.radius.yml environment variables
+    # These match docker-compose.yml database service credentials
     server = "db"
     port = 5432
     login = "isp_user"

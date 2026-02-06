@@ -1,12 +1,19 @@
 {
     "info": {
-        "name": "RADIUS Management Endpoints",
-        "description": "API endpoints for managing RADIUS authentication on routers. These endpoints are separate from the direct MikroTik API endpoints and allow you to enable/disable RADIUS on a per-router basis.",
+        "name": "RADIUS - Full Test Flow",
+        "description": "Complete test flow for RADIUS hotspot functionality.\n\nRun requests in order:\n1. Login → auto-captures JWT token\n2. Create Router → auto-captures router_id\n3. Enable RADIUS on router\n4. Test RADIUS connectivity\n5. Register & Pay (RADIUS hotspot flow)\n6. Poll payment status\n7. Manage users, sessions, accounting\n\nVariables are auto-set by test scripts — just run in sequence.",
         "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
     },
     "variable": [
         {"key": "baseUrl", "value": "http://localhost:8000"},
-        {"key": "token", "value": "your_jwt_token_here"}
+        {"key": "token", "value": ""},
+        {"key": "router_id", "value": ""},
+        {"key": "customer_id", "value": ""},
+        {"key": "radius_username", "value": ""},
+        {"key": "plan_id", "value": "1"},
+        {"key": "test_mac", "value": "AA:BB:CC:DD:EE:FF"},
+        {"key": "test_phone", "value": "254712345678"},
+        {"key": "radius_secret", "value": "testing12345"}
     ],
     "auth": {
         "type": "bearer",
@@ -14,184 +21,443 @@
     },
     "item": [
         {
-            "name": "Router Management",
+            "name": "1. Setup",
+            "description": "Authentication and router setup. Run these first.",
             "item": [
                 {
-                    "name": "Enable RADIUS for Router",
+                    "name": "1.1 Login (get JWT token)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.collectionVariables.set('token', json.access_token);",
+                                    "    pm.test('Token captured', function() {",
+                                    "        pm.expect(json.access_token).to.be.a('string');",
+                                    "    });",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
                     "request": {
+                        "auth": {"type": "noauth"},
                         "method": "POST",
-                        "url": "{{baseUrl}}/api/radius/routers/1/enable",
+                        "url": "{{baseUrl}}/api/auth/login",
                         "header": [{"key": "Content-Type", "value": "application/json"}],
                         "body": {
                             "mode": "raw",
-                            "raw": "{\n    \"radius_secret\": \"your_shared_secret_min_8_chars\",\n    \"nas_identifier\": \"MyRouter\"\n}"
+                            "raw": "{\n    \"email\": \"your_email@example.com\",\n    \"password\": \"your_password\"\n}"
                         },
-                        "description": "Enable RADIUS authentication for a specific router. After enabling, configure the MikroTik router to use RADIUS."
+                        "description": "Login to get JWT token. Token is automatically saved to collection variables for all subsequent requests."
                     }
                 },
                 {
-                    "name": "Disable RADIUS for Router",
+                    "name": "1.2 Create Router (for RADIUS testing)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.collectionVariables.set('router_id', json.id);",
+                                    "    pm.test('Router created, ID: ' + json.id, function() {",
+                                    "        pm.expect(json.id).to.be.a('number');",
+                                    "    });",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
                     "request": {
                         "method": "POST",
-                        "url": "{{baseUrl}}/api/radius/routers/1/disable",
-                        "description": "Disable RADIUS for a router and revert to direct API provisioning."
+                        "url": "{{baseUrl}}/api/routers/create",
+                        "header": [{"key": "Content-Type", "value": "application/json"}],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"name\": \"RADIUS Test Router\",\n    \"identity\": \"radius-test-router\",\n    \"ip_address\": \"10.0.0.100\",\n    \"username\": \"admin\",\n    \"password\": \"routerpass\",\n    \"port\": 8728\n}"
+                        },
+                        "description": "Create a new router. The router_id is auto-captured for subsequent RADIUS operations.\n\nChange ip_address to your actual MikroTik router IP."
                     }
                 },
                 {
-                    "name": "Get Router RADIUS Status",
+                    "name": "1.3 Create Plan (if needed)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    if (json.id) {",
+                                    "        pm.collectionVariables.set('plan_id', json.id);",
+                                    "        pm.test('Plan created, ID: ' + json.id, function() {",
+                                    "            pm.expect(json.id).to.be.a('number');",
+                                    "        });",
+                                    "    }",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
                     "request": {
-                        "method": "GET",
-                        "url": "{{baseUrl}}/api/radius/routers/1/status",
-                        "description": "Get the RADIUS configuration status for a specific router."
-                    }
-                },
-                {
-                    "name": "List All Routers with RADIUS Status",
-                    "request": {
-                        "method": "GET",
-                        "url": "{{baseUrl}}/api/radius/routers",
-                        "description": "List all routers and their RADIUS configuration status."
-                    }
-                },
-                {
-                    "name": "Test RADIUS Connectivity",
-                    "request": {
-                        "method": "GET",
-                        "url": "{{baseUrl}}/api/radius/test/1",
-                        "description": "Test RADIUS connectivity and table setup for a router."
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/plans/create",
+                        "header": [{"key": "Content-Type", "value": "application/json"}],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"name\": \"RADIUS Test Plan - 1 Hour\",\n    \"speed\": \"5M/5M\",\n    \"price\": 10,\n    \"duration_value\": 1,\n    \"duration_unit\": \"hours\"\n}"
+                        },
+                        "description": "Create a test plan if you don't have one. Skip if you already have plans.\n\nAdjust speed, price, duration as needed."
                     }
                 }
             ]
         },
         {
-            "name": "User Management",
+            "name": "2. Enable RADIUS on Router",
+            "description": "Enable RADIUS authentication for the router, then verify it works.",
             "item": [
                 {
-                    "name": "Create RADIUS User",
+                    "name": "2.1 Enable RADIUS",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.test('RADIUS enabled', function() {",
+                                    "        pm.expect(json.success).to.be.true;",
+                                    "        pm.expect(json.auth_method).to.equal('RADIUS');",
+                                    "    });",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/radius/routers/{{router_id}}/enable",
+                        "header": [{"key": "Content-Type", "value": "application/json"}],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"radius_secret\": \"{{radius_secret}}\",\n    \"nas_identifier\": \"RADIUS Test Router\"\n}"
+                        },
+                        "description": "Enable RADIUS for the router. The radius_secret must match what you configure on the MikroTik router.\n\nMinimum 8 characters."
+                    }
+                },
+                {
+                    "name": "2.2 Get Router RADIUS Status",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.test('RADIUS is enabled', function() {",
+                                    "        pm.expect(json.radius_enabled).to.be.true;",
+                                    "        pm.expect(json.auth_method).to.equal('RADIUS');",
+                                    "    });",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/radius/routers/{{router_id}}/status",
+                        "description": "Verify RADIUS is enabled and check configuration."
+                    }
+                },
+                {
+                    "name": "2.3 Test RADIUS Connectivity",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.test('RADIUS tables exist', function() {",
+                                    "        pm.expect(json.checks.tables_exist).to.be.true;",
+                                    "    });",
+                                    "    pm.test('Can create/delete test user', function() {",
+                                    "        pm.expect(json.checks.can_create_user).to.be.true;",
+                                    "        pm.expect(json.checks.can_delete_user).to.be.true;",
+                                    "    });",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/radius/test/{{router_id}}",
+                        "description": "Run connectivity tests: checks RADIUS tables exist, can create/delete users, etc."
+                    }
+                },
+                {
+                    "name": "2.4 List All Routers RADIUS Status",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/radius/routers",
+                        "description": "List all your routers with their RADIUS configuration status."
+                    }
+                }
+            ]
+        },
+        {
+            "name": "3. Hotspot Flow (Captive Portal → Pay → Internet)",
+            "description": "The main flow: user connects to hotspot → registers → pays → gets internet via RADIUS.\n\nThis replicates your existing captive portal flow but uses RADIUS for authentication.",
+            "item": [
+                {
+                    "name": "3.1 Register and Pay (M-Pesa)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.collectionVariables.set('customer_id', json.id);",
+                                    "    pm.test('Customer registered, ID: ' + json.id, function() {",
+                                    "        pm.expect(json.id).to.be.a('number');",
+                                    "        pm.expect(json.auth_method).to.equal('RADIUS');",
+                                    "    });",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "auth": {"type": "noauth"},
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/radius/hotspot/register-and-pay",
+                        "header": [{"key": "Content-Type", "value": "application/json"}],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"mac_address\": \"{{test_mac}}\",\n    \"phone\": \"{{test_phone}}\",\n    \"plan_id\": {{plan_id}},\n    \"router_id\": {{router_id}},\n    \"name\": \"Test User\",\n    \"payment_method\": \"mobile_money\"\n}"
+                        },
+                        "description": "Register a hotspot user and initiate M-Pesa STK Push.\n\nAfter this, M-Pesa sends an STK push to the phone number.\nThe callback at /api/radius/mpesa/callback provisions the RADIUS user.\n\nPoll payment-status (3.2) to check when payment completes."
+                    }
+                },
+                {
+                    "name": "3.2 Register and Pay (Cash - instant)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.collectionVariables.set('customer_id', json.id);",
+                                    "    if (json.radius_username) {",
+                                    "        pm.collectionVariables.set('radius_username', json.radius_username);",
+                                    "    }",
+                                    "    pm.test('Customer registered with RADIUS credentials', function() {",
+                                    "        pm.expect(json.auth_method).to.equal('RADIUS');",
+                                    "        pm.expect(json.radius_username).to.be.a('string');",
+                                    "        pm.expect(json.radius_password).to.be.a('string');",
+                                    "    });",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "auth": {"type": "noauth"},
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/radius/hotspot/register-and-pay",
+                        "header": [{"key": "Content-Type", "value": "application/json"}],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"mac_address\": \"{{test_mac}}\",\n    \"phone\": \"{{test_phone}}\",\n    \"plan_id\": {{plan_id}},\n    \"router_id\": {{router_id}},\n    \"name\": \"Cash Test User\",\n    \"payment_method\": \"cash\",\n    \"payment_reference\": \"CASH-001\"\n}"
+                        },
+                        "description": "Register and pay with cash — RADIUS user is provisioned immediately.\n\nResponse includes radius_username and radius_password right away.\nUse these to login: http://<gateway>/login?username=X&password=Y"
+                    }
+                },
+                {
+                    "name": "3.3 Poll Payment Status",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.test('Status: ' + json.status, function() {",
+                                    "        pm.expect(json.status).to.be.a('string');",
+                                    "    });",
+                                    "    if (json.status === 'active' && json.radius_username) {",
+                                    "        pm.collectionVariables.set('radius_username', json.radius_username);",
+                                    "        pm.test('RADIUS credentials received', function() {",
+                                    "            pm.expect(json.radius_username).to.be.a('string');",
+                                    "            pm.expect(json.radius_password).to.be.a('string');",
+                                    "        });",
+                                    "    }",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "auth": {"type": "noauth"},
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/radius/hotspot/payment-status/{{customer_id}}",
+                        "description": "Poll this after initiating M-Pesa payment.\n\nWhen status becomes 'active', response includes:\n- radius_username\n- radius_password\n\nFrontend should then redirect to:\nhttp://<gateway>/login?username=<radius_username>&password=<radius_password>\n\nThe gateway address comes from the MikroTik captive portal redirect URL."
+                    }
+                }
+            ]
+        },
+        {
+            "name": "4. RADIUS User Management",
+            "description": "Manually create, view, and delete RADIUS users. Useful for testing without going through the payment flow.",
+            "item": [
+                {
+                    "name": "4.1 Create RADIUS User (manual)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.collectionVariables.set('radius_username', json.username);",
+                                    "    pm.test('User created: ' + json.username, function() {",
+                                    "        pm.expect(json.success).to.be.true;",
+                                    "    });",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
                     "request": {
                         "method": "POST",
                         "url": "{{baseUrl}}/api/radius/users",
                         "header": [{"key": "Content-Type", "value": "application/json"}],
                         "body": {
                             "mode": "raw",
-                            "raw": "{\n    \"username\": \"AABBCCDDEEFF\",\n    \"password\": \"testpass123\",\n    \"rate_limit\": \"5M/5M\",\n    \"session_timeout_hours\": 24,\n    \"expiry_hours\": 24,\n    \"customer_id\": 1\n}"
+                            "raw": "{\n    \"username\": \"AABBCCDDEEFF\",\n    \"password\": \"testpass123\",\n    \"rate_limit\": \"5M/5M\",\n    \"session_timeout_hours\": 24,\n    \"expiry_hours\": 24\n}"
                         },
-                        "description": "Manually create a RADIUS user. Username is typically the MAC address without colons."
+                        "description": "Manually create a RADIUS user for testing.\n\nUsername is typically MAC address without colons.\nPassword is auto-generated if not provided.\n\nYou can then test authentication directly from a MikroTik router."
                     }
                 },
                 {
-                    "name": "Get RADIUS User",
+                    "name": "4.2 Get RADIUS User",
                     "request": {
                         "method": "GET",
-                        "url": "{{baseUrl}}/api/radius/users/AABBCCDDEEFF",
-                        "description": "Get information about a RADIUS user including their attributes."
+                        "url": "{{baseUrl}}/api/radius/users/{{radius_username}}",
+                        "description": "Get RADIUS user details including all check and reply attributes."
                     }
                 },
                 {
-                    "name": "Delete RADIUS User",
+                    "name": "4.3 Delete RADIUS User",
                     "request": {
                         "method": "DELETE",
                         "url": {
-                            "raw": "{{baseUrl}}/api/radius/users/AABBCCDDEEFF?disconnect=true&router_id=1",
+                            "raw": "{{baseUrl}}/api/radius/users/{{radius_username}}?disconnect=true&router_id={{router_id}}",
                             "host": ["{{baseUrl}}"],
-                            "path": ["api", "radius", "users", "AABBCCDDEEFF"],
+                            "path": ["api", "radius", "users", "{{radius_username}}"],
                             "query": [
-                                {"key": "disconnect", "value": "true"},
-                                {"key": "router_id", "value": "1"}
+                                {"key": "disconnect", "value": "true", "description": "Also disconnect active session"},
+                                {"key": "router_id", "value": "{{router_id}}", "description": "Router to send disconnect to"}
                             ]
                         },
-                        "description": "Delete a RADIUS user and optionally disconnect their active session."
+                        "description": "Delete a RADIUS user and optionally disconnect their active session via CoA."
                     }
                 }
             ]
         },
         {
-            "name": "Session Management",
+            "name": "5. Session & Accounting",
+            "description": "Monitor active sessions and view usage statistics.",
             "item": [
                 {
-                    "name": "List Active Sessions",
+                    "name": "5.1 List Active Sessions",
                     "request": {
                         "method": "GET",
                         "url": {
-                            "raw": "{{baseUrl}}/api/radius/sessions?router_id=1",
+                            "raw": "{{baseUrl}}/api/radius/sessions?router_id={{router_id}}",
                             "host": ["{{baseUrl}}"],
                             "path": ["api", "radius", "sessions"],
                             "query": [
-                                {"key": "router_id", "value": "1", "description": "Optional: filter by router"},
-                                {"key": "username", "value": "", "disabled": true, "description": "Optional: filter by username"}
+                                {"key": "router_id", "value": "{{router_id}}", "description": "Filter by router"},
+                                {"key": "username", "value": "", "disabled": true, "description": "Filter by username"}
                             ]
                         },
-                        "description": "List all active RADIUS sessions with optional filtering."
+                        "description": "List all active RADIUS sessions. Filter by router or username."
                     }
                 },
                 {
-                    "name": "Disconnect User Session",
+                    "name": "5.2 Disconnect User Session",
                     "request": {
                         "method": "POST",
                         "url": {
-                            "raw": "{{baseUrl}}/api/radius/sessions/AABBCCDDEEFF/disconnect?router_id=1",
+                            "raw": "{{baseUrl}}/api/radius/sessions/{{radius_username}}/disconnect?router_id={{router_id}}",
                             "host": ["{{baseUrl}}"],
-                            "path": ["api", "radius", "sessions", "AABBCCDDEEFF", "disconnect"],
+                            "path": ["api", "radius", "sessions", "{{radius_username}}", "disconnect"],
                             "query": [
-                                {"key": "router_id", "value": "1"}
+                                {"key": "router_id", "value": "{{router_id}}"}
                             ]
                         },
-                        "description": "Disconnect a user's active session via RADIUS CoA (Change of Authorization)."
+                        "description": "Force-disconnect a user's active session by sending a CoA Disconnect-Request to the MikroTik router."
                     }
                 },
                 {
-                    "name": "Get User Accounting Stats",
+                    "name": "5.3 Get User Accounting Stats",
                     "request": {
                         "method": "GET",
                         "url": {
-                            "raw": "{{baseUrl}}/api/radius/accounting/AABBCCDDEEFF?days=30",
+                            "raw": "{{baseUrl}}/api/radius/accounting/{{radius_username}}?days=30",
                             "host": ["{{baseUrl}}"],
-                            "path": ["api", "radius", "accounting", "AABBCCDDEEFF"],
+                            "path": ["api", "radius", "accounting", "{{radius_username}}"],
                             "query": [
                                 {"key": "days", "value": "30", "description": "Number of days to include"}
                             ]
                         },
-                        "description": "Get bandwidth and session statistics for a user."
+                        "description": "Get bandwidth usage and session statistics for a RADIUS user.\n\nReturns total bytes in/out, session count, total time, etc."
                     }
                 }
             ]
         },
         {
-            "name": "Hotspot Flow (Captive Portal)",
-            "description": "Complete captive portal → pay → get internet flow using RADIUS. These endpoints replace the existing /api/hotspot/* endpoints for RADIUS-enabled routers.",
+            "name": "6. Maintenance",
+            "description": "Admin operations for RADIUS management.",
             "item": [
                 {
-                    "name": "Register and Pay (RADIUS)",
-                    "request": {
-                        "method": "POST",
-                        "url": "{{baseUrl}}/api/radius/hotspot/register-and-pay",
-                        "header": [{"key": "Content-Type", "value": "application/json"}],
-                        "body": {
-                            "mode": "raw",
-                            "raw": "{\n    \"mac_address\": \"AA:BB:CC:DD:EE:FF\",\n    \"phone\": \"254712345678\",\n    \"plan_id\": 1,\n    \"router_id\": 2,\n    \"name\": \"John Doe\",\n    \"payment_method\": \"mobile_money\"\n}"
-                        },
-                        "description": "Register a hotspot user and initiate payment on a RADIUS-enabled router. For cash payments, RADIUS user is created immediately and credentials returned. For M-Pesa, poll the payment-status endpoint."
-                    }
-                },
-                {
-                    "name": "Payment Status (with RADIUS credentials)",
-                    "request": {
-                        "method": "GET",
-                        "url": "{{baseUrl}}/api/radius/hotspot/payment-status/1",
-                        "description": "Poll this after register-and-pay. When status=active, response includes radius_username, radius_password, and login_url. Frontend should redirect user to login_url to auto-authenticate."
-                    }
-                }
-            ]
-        },
-        {
-            "name": "Maintenance",
-            "item": [
-                {
-                    "name": "Cleanup Expired Users",
+                    "name": "6.1 Cleanup Expired Users",
                     "request": {
                         "method": "POST",
                         "url": "{{baseUrl}}/api/radius/cleanup",
-                        "description": "Remove expired RADIUS users from the database. Requires admin role."
+                        "description": "Remove expired RADIUS users from the database. Requires admin role.\n\nExpired users will naturally fail authentication, but this cleans up the DB."
+                    }
+                },
+                {
+                    "name": "6.2 Disable RADIUS (revert to direct API)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 200) {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.test('RADIUS disabled', function() {",
+                                    "        pm.expect(json.success).to.be.true;",
+                                    "        pm.expect(json.auth_method).to.equal('DIRECT_API');",
+                                    "    });",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/radius/routers/{{router_id}}/disable",
+                        "description": "Disable RADIUS for a router and revert to direct MikroTik API provisioning.\n\nExisting RADIUS users on the router will stop working on next re-auth."
                     }
                 }
             ]

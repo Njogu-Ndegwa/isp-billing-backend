@@ -67,15 +67,15 @@ This guide explains how to set up and use RADIUS authentication for your MikroTi
 
 ```bash
 # From the isp-billing directory
-python migrations/add_router_auth_method.py
-python migrations/create_radius_tables.py
+Migrations run automatically on app startup — no manual steps needed.
 ```
 
-### 2. Start FreeRADIUS Container
+### 2. Start All Services (including FreeRADIUS)
+
+FreeRADIUS is included in the main `docker-compose.yml`. Just start normally:
 
 ```bash
-# Start with RADIUS server
-docker-compose -f docker-compose.yml -f docker-compose.radius.yml up -d
+docker compose up -d
 ```
 
 ### 3. Enable RADIUS for a Router (via API)
@@ -113,14 +113,12 @@ curl "http://your-server:8000/api/radius/test/1" \
 
 ### Step 1: Database Migrations
 
-The system requires two migrations:
+The system requires two migrations. These run **automatically on app startup** — no manual steps needed.
 
+If you need to run them manually for some reason:
 ```bash
-# Add auth_method column to routers table
-python migrations/add_router_auth_method.py
-
-# Create RADIUS tables
-python migrations/create_radius_tables.py
+docker exec isp_billing_app python migrations/add_router_auth_method.py
+docker exec isp_billing_app python migrations/create_radius_tables.py
 ```
 
 **Tables created:**
@@ -152,11 +150,13 @@ client router_branch {
 
 **Important:** The `secret` must match what you configure on the MikroTik router.
 
-### Step 3: Start the RADIUS Server
+### Step 3: Start All Services
+
+FreeRADIUS is included in the main `docker-compose.yml` and migrations run automatically on app startup:
 
 ```bash
-# Start all services including RADIUS
-docker-compose -f docker-compose.yml -f docker-compose.radius.yml up -d
+# Start everything (db, web app, freeradius)
+docker compose up -d
 
 # Check RADIUS logs
 docker logs isp_billing_radius -f
@@ -165,16 +165,9 @@ docker logs isp_billing_radius -f
 docker exec isp_billing_radius netstat -tulpn | grep 1812
 ```
 
-### Step 4: Include RADIUS Endpoints in Your App
+### Step 4: RADIUS Endpoints (already included)
 
-Add to your `main.py` (near other router inclusions):
-
-```python
-from app.api.radius_endpoints import router as radius_router
-
-# Add with other app.include_router() calls
-app.include_router(radius_router)
-```
+RADIUS endpoints are already included in `main.py` — no manual changes needed.
 
 ---
 
