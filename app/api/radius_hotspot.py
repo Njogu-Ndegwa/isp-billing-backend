@@ -28,6 +28,8 @@ Key differences from existing flow:
 import json
 import logging
 import base64
+import secrets
+import string
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -41,11 +43,16 @@ from app.db.database import get_db
 from app.db.models import (
     Customer, Plan, Router, CustomerStatus,
     MpesaTransaction, MpesaTransactionStatus,
-    PaymentMethod, CustomerPayment
+    PaymentMethod
 )
 from app.config import settings
 from app.services.radius_provisioning import RadiusProvisioning
-from app.services.radius_service import parse_speed_to_radius_format, calculate_session_timeout
+from app.services.radius_service import (
+    RadiusService,
+    RadiusUserConfig,
+    parse_speed_to_radius_format
+)
+from app.services.mikrotik_api import normalize_mac_address
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +85,119 @@ class RadiusPaymentStatusResponse(BaseModel):
     radius_username: Optional[str] = None
     radius_password: Optional[str] = None
     message: Optional[str] = None
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def _radius_username_from_mac(mac_address: Optional[str]) -> Optional[str]:
+    if not mac_address:
+        return None
+    return mac_address.replace(":", "").replace("-", "").upper()
+
+
+def _is_customer_active(customer: Customer) -> bool:
+    if customer.status != CustomerStatus.ACTIVE:
+        return False
+    if customer.expiry and customer.expiry <= datetime.utcnow():
+        return False
+    return True
+
+
+def _generate_radius_password(length: int = 8) -> str:
+    chars = string.digits + string.ascii_lowercase
+    return ''.join(secrets.choice(chars) for _ in range(length))
+
+
+async def _get_radius_password(db: AsyncSession, username: str) -> Optional[str]:
+    if not username:
+        return None
+    result = await db.execute(text("""
+        SELECT value FROM radius_check
+        WHERE username = :username
+          AND attribute = 'Cleartext-Password'
+          AND (expiry IS NULL OR expiry > NOW())
+        ORDER BY id DESC
+        LIMIT 1
+    """), {'username': username})
+    row = result.fetchone()
+    return row.value if row else None
+
+
+async def _resolve_radius_credentials(
+    db: AsyncSession,
+    customer: Customer
+) -> tuple[Optional[str], Optional[str]]:
+    username = _radius_username_from_mac(customer.mac_address)
+    password = None
+
+    if customer.pending_update_data:
+        try:
+            pending = (
+                json.loads(customer.pending_update_data)
+                if isinstance(customer.pending_update_data, str)
+                else customer.pending_update_data
+            )
+            if pending.get("auth_method") == "RADIUS":
+                password = pending.get("radius_password")
+                if pending.get("radius_username"):
+                    username = pending.get("radius_username")
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if username and not password:
+        password = await _get_radius_password(db, username)
+
+    return username, password
+
+
+async def _restore_radius_user_for_active_customer(
+    db: AsyncSession,
+    customer: Customer,
+    plan: Optional[Plan]
+) -> tuple[Optional[str], Optional[str]]:
+    if not _is_customer_active(customer):
+        return None, None
+
+    username = _radius_username_from_mac(customer.mac_address)
+    if not username:
+        return None, None
+
+    # Use existing password if we can find one; otherwise generate a new one.
+    password = await _get_radius_password(db, username)
+    if not password:
+        password = _generate_radius_password()
+
+    rate_limit = parse_speed_to_radius_format(plan.speed) if plan and plan.speed else None
+
+    session_timeout = None
+    if customer.expiry:
+        remaining_seconds = int((customer.expiry - datetime.utcnow()).total_seconds())
+        if remaining_seconds > 0:
+            session_timeout = remaining_seconds
+
+    radius = RadiusService(db)
+    config = RadiusUserConfig(
+        username=username,
+        password=password,
+        rate_limit=rate_limit,
+        session_timeout=session_timeout,
+        expiry=customer.expiry,
+        customer_id=customer.id,
+        simultaneous_use=1
+    )
+    await radius.create_user(config)
+
+    customer.pending_update_data = json.dumps({
+        "auth_method": "RADIUS",
+        "radius_username": username,
+        "radius_password": password,
+        "restored_at": datetime.utcnow().isoformat()
+    })
+    await db.commit()
+
+    return username, password
 
 
 # ============================================================================
@@ -135,16 +255,52 @@ async def radius_register_and_pay(
         if not request.phone or len(request.phone.strip()) < 10:
             raise HTTPException(status_code=400, detail="Invalid phone number format")
 
+        # Normalize MAC address for consistent lookups
+        normalized_mac = normalize_mac_address(request.mac_address)
+        if len(normalized_mac.replace(":", "")) != 12:
+            raise HTTPException(status_code=400, detail="Invalid MAC address format")
+
         # Check if customer exists by MAC
         customer_result = await db.execute(
             select(Customer).options(
                 selectinload(Customer.plan),
                 selectinload(Customer.router)
-            ).where(Customer.mac_address == request.mac_address)
+            ).where(Customer.mac_address == normalized_mac)
         )
         existing_customer = customer_result.scalar_one_or_none()
 
         if existing_customer:
+            # If customer is already active on this plan/router, return credentials instead of charging again
+            if _is_customer_active(existing_customer):
+                remaining_seconds = None
+                if existing_customer.expiry:
+                    remaining_seconds = int((existing_customer.expiry - datetime.utcnow()).total_seconds())
+                allow_bypass = remaining_seconds is None or remaining_seconds > 300
+                same_plan = existing_customer.plan_id == request.plan_id
+                same_router = existing_customer.router_id == request.router_id
+
+                if allow_bypass and same_plan and same_router:
+                    username, password = await _resolve_radius_credentials(db, existing_customer)
+                    if not password:
+                        username, password = await _restore_radius_user_for_active_customer(
+                            db, existing_customer, plan
+                        )
+                    if username and password:
+                        logger.info(f"[RADIUS] Active subscription found for customer {existing_customer.id}")
+                        return {
+                            "id": existing_customer.id,
+                            "name": existing_customer.name,
+                            "phone": existing_customer.phone,
+                            "mac_address": existing_customer.mac_address,
+                            "status": existing_customer.status.value,
+                            "plan_id": existing_customer.plan_id,
+                            "router_id": existing_customer.router_id,
+                            "auth_method": "RADIUS",
+                            "radius_username": username,
+                            "radius_password": password,
+                            "message": "Active subscription found. Use credentials to login."
+                        }
+
             # Store pending update data with RADIUS flag
             pending_data = {
                 "requested_at": datetime.utcnow().isoformat(),
@@ -178,7 +334,7 @@ async def radius_register_and_pay(
             customer = Customer(
                 name=customer_name,
                 phone=request.phone,
-                mac_address=request.mac_address,
+                mac_address=normalized_mac,
                 status=CustomerStatus.INACTIVE,
                 plan_id=request.plan_id,
                 user_id=user_id,
@@ -518,23 +674,13 @@ async def radius_payment_status(
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
 
-        # Parse stored RADIUS credentials from pending_update_data
-        radius_username = None
-        radius_password = None
         auth_method = "RADIUS"
+        radius_username, radius_password = await _resolve_radius_credentials(db, customer)
 
-        if customer.pending_update_data:
-            try:
-                pending = (
-                    json.loads(customer.pending_update_data)
-                    if isinstance(customer.pending_update_data, str)
-                    else customer.pending_update_data
-                )
-                if pending.get("auth_method") == "RADIUS":
-                    radius_username = pending.get("radius_username")
-                    radius_password = pending.get("radius_password")
-            except (json.JSONDecodeError, TypeError):
-                pass
+        if _is_customer_active(customer) and not radius_password:
+            radius_username, radius_password = await _restore_radius_user_for_active_customer(
+                db, customer, customer.plan
+            )
 
         return RadiusPaymentStatusResponse(
             customer_id=customer.id,
@@ -547,6 +693,8 @@ async def radius_payment_status(
             message=(
                 "Payment confirmed. Use credentials to login."
                 if customer.status == CustomerStatus.ACTIVE and radius_username
+                else "Active subscription found, but credentials are not available yet. Please retry."
+                if customer.status == CustomerStatus.ACTIVE
                 else "Waiting for payment confirmation..."
                 if customer.status == CustomerStatus.PENDING
                 else "Payment not yet initiated"
