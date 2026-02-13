@@ -1,0 +1,431 @@
+{
+    "info": {
+        "name": "Session Monitor",
+        "description": "Test collection for the Session Integrity Monitor endpoints.\n\nThese endpoints are DB-only (never connect to MikroTik routers) and use ~8 batched queries regardless of customer count.\n\nEndpoints:\n- GET /api/session-monitor — overview across all routers\n- GET /api/session-monitor/router/{router_id} — single router\n- GET /api/session-monitor/customer/{customer_id} — single customer deep-dive\n\nAnomaly codes (same for every router type):\n- CUT_OFF_EARLY — customer lost paid time\n- PAYMENT_NOT_ACTIVATED — payment recorded but customer still not active\n- PROVISIONING_FAILED — last provisioning attempt failed\n- CREDENTIALS_MISSING — active customer but auth credentials broken\n- TIME_MISMATCH — configured session time doesn't match plan duration\n- SESSION_SHORTCHANGED — customer got less time than they paid for",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "user_id", "value": "1"},
+        {"key": "router_id", "value": "1"},
+        {"key": "customer_id", "value": "1"}
+    ],
+    "item": [
+        {
+            "name": "1. Overview",
+            "description": "Top-level monitoring across all routers for a reseller.",
+            "item": [
+                {
+                    "name": "1.1 Overview — all routers, all customers",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('Status 200', function() {",
+                                    "    pm.response.to.have.status(200);",
+                                    "});",
+                                    "",
+                                    "var json = pm.response.json();",
+                                    "",
+                                    "pm.test('Has timestamp', function() {",
+                                    "    pm.expect(json.timestamp).to.be.a('string');",
+                                    "});",
+                                    "",
+                                    "pm.test('Has summary counts', function() {",
+                                    "    pm.expect(json).to.have.property('total_routers');",
+                                    "    pm.expect(json).to.have.property('total_active_customers');",
+                                    "    pm.expect(json).to.have.property('total_healthy');",
+                                    "    pm.expect(json).to.have.property('total_warnings');",
+                                    "    pm.expect(json).to.have.property('total_critical');",
+                                    "    pm.expect(json).to.have.property('recently_cut_off_early');",
+                                    "});",
+                                    "",
+                                    "pm.test('Has routers array', function() {",
+                                    "    pm.expect(json.routers).to.be.an('array');",
+                                    "});",
+                                    "",
+                                    "pm.test('Counts add up', function() {",
+                                    "    var h = 0, w = 0, c = 0;",
+                                    "    json.routers.forEach(function(r) {",
+                                    "        h += r.healthy; w += r.warnings; c += r.critical;",
+                                    "    });",
+                                    "    pm.expect(h).to.eql(json.total_healthy);",
+                                    "    pm.expect(w).to.eql(json.total_warnings);",
+                                    "    pm.expect(c).to.eql(json.total_critical);",
+                                    "});",
+                                    "",
+                                    "// Auto-capture first router and customer for downstream tests",
+                                    "if (json.routers && json.routers.length > 0) {",
+                                    "    pm.collectionVariables.set('router_id', json.routers[0].router_id);",
+                                    "    if (json.routers[0].customers && json.routers[0].customers.length > 0) {",
+                                    "        pm.collectionVariables.set('customer_id', json.routers[0].customers[0].customer_id);",
+                                    "    }",
+                                    "}",
+                                    "",
+                                    "console.log('Routers:', json.total_routers,",
+                                    "    '| Active:', json.total_active_customers,",
+                                    "    '| Healthy:', json.total_healthy,",
+                                    "    '| Warn:', json.total_warnings,",
+                                    "    '| Crit:', json.total_critical,",
+                                    "    '| Cut off early:', json.recently_cut_off_early);"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{baseUrl}}/api/session-monitor?user_id={{user_id}}",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "session-monitor"],
+                            "query": [
+                                {"key": "user_id", "value": "{{user_id}}"},
+                                {"key": "include_healthy", "value": "true"}
+                            ]
+                        }
+                    }
+                },
+                {
+                    "name": "1.2 Overview — problems only (exclude healthy)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('Status 200', function() {",
+                                    "    pm.response.to.have.status(200);",
+                                    "});",
+                                    "",
+                                    "var json = pm.response.json();",
+                                    "",
+                                    "pm.test('Only unhealthy customers returned', function() {",
+                                    "    json.routers.forEach(function(r) {",
+                                    "        r.customers.forEach(function(c) {",
+                                    "            pm.expect(c.health).to.not.eql('HEALTHY');",
+                                    "        });",
+                                    "    });",
+                                    "});",
+                                    "",
+                                    "var totalProblems = json.total_warnings + json.total_critical;",
+                                    "console.log('Total problems:', totalProblems);"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{baseUrl}}/api/session-monitor?user_id={{user_id}}&include_healthy=false",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "session-monitor"],
+                            "query": [
+                                {"key": "user_id", "value": "{{user_id}}"},
+                                {"key": "include_healthy", "value": "false"}
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "2. Per Router",
+            "description": "Monitor a specific router. Uses router_id captured from overview.",
+            "item": [
+                {
+                    "name": "2.1 Router detail — all customers",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('Status 200', function() {",
+                                    "    pm.response.to.have.status(200);",
+                                    "});",
+                                    "",
+                                    "var json = pm.response.json();",
+                                    "",
+                                    "pm.test('Has router info', function() {",
+                                    "    pm.expect(json).to.have.property('router_id');",
+                                    "    pm.expect(json).to.have.property('router_name');",
+                                    "    pm.expect(json).to.have.property('router_ip');",
+                                    "});",
+                                    "",
+                                    "pm.test('Has health counts', function() {",
+                                    "    pm.expect(json).to.have.property('healthy');",
+                                    "    pm.expect(json).to.have.property('warnings');",
+                                    "    pm.expect(json).to.have.property('critical');",
+                                    "    pm.expect(json).to.have.property('total_active_customers');",
+                                    "});",
+                                    "",
+                                    "pm.test('Has customers array', function() {",
+                                    "    pm.expect(json.customers).to.be.an('array');",
+                                    "});",
+                                    "",
+                                    "// Auto-capture first customer for deep-dive test",
+                                    "if (json.customers && json.customers.length > 0) {",
+                                    "    pm.collectionVariables.set('customer_id', json.customers[0].customer_id);",
+                                    "}",
+                                    "",
+                                    "console.log('Router:', json.router_name,",
+                                    "    '| Active:', json.total_active_customers,",
+                                    "    '| H:', json.healthy, '| W:', json.warnings, '| C:', json.critical);"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{baseUrl}}/api/session-monitor/router/{{router_id}}",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "session-monitor", "router", "{{router_id}}"]
+                        }
+                    }
+                },
+                {
+                    "name": "2.2 Router detail — problems only",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('Status 200', function() {",
+                                    "    pm.response.to.have.status(200);",
+                                    "});",
+                                    "",
+                                    "var json = pm.response.json();",
+                                    "pm.test('Only unhealthy customers', function() {",
+                                    "    json.customers.forEach(function(c) {",
+                                    "        pm.expect(c.health).to.not.eql('HEALTHY');",
+                                    "    });",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{baseUrl}}/api/session-monitor/router/{{router_id}}?include_healthy=false",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "session-monitor", "router", "{{router_id}}"],
+                            "query": [
+                                {"key": "include_healthy", "value": "false"}
+                            ]
+                        }
+                    }
+                },
+                {
+                    "name": "2.3 Router not found (404)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('Status 404', function() {",
+                                    "    pm.response.to.have.status(404);",
+                                    "});",
+                                    "",
+                                    "pm.test('Error message', function() {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.expect(json.detail).to.eql('Router not found');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{baseUrl}}/api/session-monitor/router/99999",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "session-monitor", "router", "99999"]
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "3. Per Customer",
+            "description": "Deep-dive into a single customer's session integrity.",
+            "item": [
+                {
+                    "name": "3.1 Customer deep-dive",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('Status 200', function() {",
+                                    "    pm.response.to.have.status(200);",
+                                    "});",
+                                    "",
+                                    "var json = pm.response.json();",
+                                    "",
+                                    "pm.test('Has customer identity', function() {",
+                                    "    pm.expect(json).to.have.property('customer_id');",
+                                    "    pm.expect(json).to.have.property('status');",
+                                    "    pm.expect(json).to.have.property('health');",
+                                    "});",
+                                    "",
+                                    "pm.test('Has plan info', function() {",
+                                    "    pm.expect(json).to.have.property('plan_name');",
+                                    "    pm.expect(json).to.have.property('plan_speed');",
+                                    "    pm.expect(json).to.have.property('plan_duration');",
+                                    "});",
+                                    "",
+                                    "pm.test('Has time tracking', function() {",
+                                    "    pm.expect(json).to.have.property('expiry');",
+                                    "    pm.expect(json).to.have.property('time_remaining_seconds');",
+                                    "    pm.expect(json).to.have.property('time_remaining_human');",
+                                    "});",
+                                    "",
+                                    "pm.test('Has health verdict', function() {",
+                                    "    pm.expect(['HEALTHY', 'WARNING', 'CRITICAL']).to.include(json.health);",
+                                    "    pm.expect(json.anomaly_count).to.be.a('number');",
+                                    "    pm.expect(json.anomalies).to.be.an('array');",
+                                    "    pm.expect(json.anomaly_count).to.eql(json.anomalies.length);",
+                                    "});",
+                                    "",
+                                    "pm.test('Anomalies have correct shape', function() {",
+                                    "    var validCodes = ['CUT_OFF_EARLY', 'PAYMENT_NOT_ACTIVATED', 'PROVISIONING_FAILED', 'CREDENTIALS_MISSING', 'TIME_MISMATCH', 'SESSION_SHORTCHANGED'];",
+                                    "    var validSeverities = ['CRITICAL', 'WARNING'];",
+                                    "    json.anomalies.forEach(function(a) {",
+                                    "        pm.expect(validCodes).to.include(a.code);",
+                                    "        pm.expect(validSeverities).to.include(a.severity);",
+                                    "        pm.expect(a.message).to.be.a('string');",
+                                    "    });",
+                                    "});",
+                                    "",
+                                    "// Log the result",
+                                    "console.log('Customer', json.customer_id, ':', json.customer_name);",
+                                    "console.log('  Status:', json.status, '| Health:', json.health);",
+                                    "console.log('  Plan:', json.plan_name, '| Expiry:', json.expiry);",
+                                    "console.log('  Time left:', json.time_remaining_human);",
+                                    "console.log('  Anomalies:', json.anomaly_count);",
+                                    "json.anomalies.forEach(function(a) {",
+                                    "    console.log('    [' + a.severity + '] ' + a.code + ': ' + a.message);",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{baseUrl}}/api/session-monitor/customer/{{customer_id}}",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "session-monitor", "customer", "{{customer_id}}"]
+                        }
+                    }
+                },
+                {
+                    "name": "3.2 Customer not found (404)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('Status 404', function() {",
+                                    "    pm.response.to.have.status(404);",
+                                    "});",
+                                    "",
+                                    "pm.test('Error message', function() {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.expect(json.detail).to.eql('Customer not found');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{baseUrl}}/api/session-monitor/customer/99999",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "session-monitor", "customer", "99999"]
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "4. Edge Cases",
+            "description": "Test boundary conditions and unusual inputs.",
+            "item": [
+                {
+                    "name": "4.1 Overview for non-existent user (empty result)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('Status 200', function() {",
+                                    "    pm.response.to.have.status(200);",
+                                    "});",
+                                    "",
+                                    "var json = pm.response.json();",
+                                    "pm.test('Zero routers and customers', function() {",
+                                    "    pm.expect(json.total_routers).to.eql(0);",
+                                    "    pm.expect(json.total_active_customers).to.eql(0);",
+                                    "    pm.expect(json.routers).to.be.an('array').that.is.empty;",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{baseUrl}}/api/session-monitor?user_id=99999",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "session-monitor"],
+                            "query": [
+                                {"key": "user_id", "value": "99999"}
+                            ]
+                        }
+                    }
+                },
+                {
+                    "name": "4.2 Overview with default user_id",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('Status 200', function() {",
+                                    "    pm.response.to.have.status(200);",
+                                    "});",
+                                    "",
+                                    "pm.test('Returns valid structure', function() {",
+                                    "    var json = pm.response.json();",
+                                    "    pm.expect(json).to.have.property('timestamp');",
+                                    "    pm.expect(json).to.have.property('routers');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{baseUrl}}/api/session-monitor",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "session-monitor"]
+                        }
+                    }
+                }
+            ]
+        }
+    ]
+}
