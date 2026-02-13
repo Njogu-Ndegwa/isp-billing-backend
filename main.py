@@ -11,6 +11,7 @@ from app.services.mpesa_transactions import update_mpesa_transaction_status
 from app.services.plan_cache import get_plans_cached, invalidate_plan_cache, warm_plan_cache
 from app.api.radius_endpoints import router as radius_router
 from app.api.radius_hotspot import router as radius_hotspot_router
+from app.api.session_monitor import router as session_monitor_router
 from app.config import settings
 import logging
 from sqlalchemy.orm import selectinload
@@ -34,6 +35,9 @@ app = FastAPI(title="ISP Billing SaaS API", version="1.0.0")
 # RADIUS endpoints (separate from existing endpoints, only active for RADIUS-enabled routers)
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
+
+# Session integrity monitor (unified, DB-only, supports both RADIUS and DIRECT_API)
+app.include_router(session_monitor_router)
 
 # Add CORS middleware
 app.add_middleware(
