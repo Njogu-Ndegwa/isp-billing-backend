@@ -191,7 +191,7 @@ async def _bulk_load_customers(
         FROM customers c
         LEFT JOIN plans p ON c.plan_id = p.id
         WHERE c.router_id IN ({placeholders})
-          AND c.status IN ('active', 'inactive', 'pending')
+          AND c.status::text IN ('active', 'inactive', 'pending')
           AND (c.expiry IS NULL OR c.expiry > :cutoff)
         ORDER BY c.router_id, c.expiry ASC
     """), params)
