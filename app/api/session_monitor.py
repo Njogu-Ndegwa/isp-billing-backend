@@ -690,7 +690,7 @@ async def session_monitor_overview(
 
     cut_off = await db.execute(text("""
         SELECT COUNT(*) as cnt FROM customers
-        WHERE user_id = :uid AND status = 'inactive' AND expiry > NOW()
+        WHERE user_id = :uid AND status::text = 'inactive' AND expiry > NOW()
     """), {'uid': user_id})
     early_count = cut_off.fetchone().cnt
 
