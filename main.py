@@ -1128,6 +1128,42 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
             logger.info(f"[SYNC] Got {len(dhcp_leases)} DHCP leases")
             
             time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)  # Give router breathing room
+
+            logger.info(f"[SYNC] Fetching hotspot hosts from {router_name} (optimized)...")
+            hosts_result = api.get_hotspot_hosts_minimal()  # Includes bypassed clients
+            if hosts_result.get("error"):
+                if hosts_result.get("error") == "Not connected":
+                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                    if api.connect():
+                        hosts_result = api.get_hotspot_hosts_minimal()
+                if hosts_result.get("error"):
+                    logger.error(f"[SYNC] Failed to fetch hotspot hosts: {hosts_result.get('error')}")
+                    hotspot_hosts = []
+                else:
+                    hotspot_hosts = hosts_result.get("data", [])
+            else:
+                hotspot_hosts = hosts_result.get("data", [])
+            logger.info(f"[SYNC] Got {len(hotspot_hosts)} hotspot hosts")
+
+            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)  # Give router breathing room
+
+            logger.info(f"[SYNC] Fetching hotspot active sessions from {router_name} (optimized)...")
+            active_result = api.get_hotspot_active_minimal()  # Most accurate for connected users
+            if active_result.get("error"):
+                if active_result.get("error") == "Not connected":
+                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                    if api.connect():
+                        active_result = api.get_hotspot_active_minimal()
+                if active_result.get("error"):
+                    logger.error(f"[SYNC] Failed to fetch hotspot active sessions: {active_result.get('error')}")
+                    hotspot_active = []
+                else:
+                    hotspot_active = active_result.get("data", [])
+            else:
+                hotspot_active = active_result.get("data", [])
+            logger.info(f"[SYNC] Got {len(hotspot_active)} hotspot active sessions")
+
+            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)  # Give router breathing room
             
             logger.info(f"[SYNC] Fetching existing queues from {router_name} (optimized)...")
             queues_result = api.get_simple_queues_minimal()  # Only fetches essential fields
@@ -1147,18 +1183,45 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
             
             time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)  # Give router breathing room
             
-            # Build lookup maps for O(1) access
+            # Build lookup maps for O(1) access.
+            # Priority (newest/most reliable): active sessions > hotspot hosts > ARP > DHCP
             mac_to_ip = {}
-            for entry in arp_entries:
-                mac = entry.get("mac-address", "")
-                if mac:
-                    mac_to_ip[normalize_mac_address(mac)] = entry.get("address")
             for lease in dhcp_leases:
                 mac = lease.get("mac-address", "")
                 if mac and lease.get("address"):
                     mac_to_ip[normalize_mac_address(mac)] = lease.get("address")
+            for entry in arp_entries:
+                mac = entry.get("mac-address", "")
+                if mac and entry.get("address"):
+                    mac_to_ip[normalize_mac_address(mac)] = entry.get("address")
+            for host in hotspot_hosts:
+                mac = host.get("mac-address", "")
+                host_ip = host.get("address") or host.get("to-address")
+                if mac and host_ip:
+                    mac_to_ip[normalize_mac_address(mac)] = host_ip
+            for session in hotspot_active:
+                mac = session.get("mac-address", "")
+                if mac and session.get("address"):
+                    mac_to_ip[normalize_mac_address(mac)] = session.get("address")
             
-            queue_by_name = {q.get("name"): q for q in existing_queues}
+            queue_by_name = {
+                str(q.get("name", "")).lower(): q
+                for q in existing_queues
+                if q.get("name")
+            }
+            queue_by_mac = {}
+            for queue in existing_queues:
+                queue_comment = str(queue.get("comment", ""))
+                comment_upper = queue_comment.upper()
+                if "MAC:" not in comment_upper:
+                    continue
+                try:
+                    raw_mac = comment_upper.split("MAC:", 1)[1].split("|", 1)[0].strip().split(" ", 1)[0]
+                    if raw_mac:
+                        queue_by_mac[normalize_mac_address(raw_mac)] = queue
+                except Exception:
+                    continue
+            logger.info(f"[SYNC] Built IP map with {len(mac_to_ip)} MAC->IP entries")
             
             synced = 0
             skipped_no_ip = 0
@@ -1185,6 +1248,10 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
                     logger.info(f"[SYNC] ✅ Reconnected to {router_name}")
                 
                 try:
+                    if not cust.get("plan_speed"):
+                        skipped_already_ok += 1
+                        continue
+
                     normalized_mac = normalize_mac_address(cust["mac_address"])
                     username = normalized_mac.replace(":", "")
                     queue_name = f"plan_{username}"
@@ -1197,22 +1264,43 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
                         continue
                     
                     # Check if queue exists
-                    existing_queue = queue_by_name.get(queue_name)
+                    existing_queue = queue_by_name.get(queue_name.lower())
+                    if not existing_queue:
+                        # Backward compatibility: older queue name format
+                        existing_queue = queue_by_name.get(f"queue_{username}".lower())
+                    if not existing_queue:
+                        # Last-resort fallback: identify queue by MAC in comment
+                        existing_queue = queue_by_mac.get(normalized_mac)
                     
                     if existing_queue:
                         # Queue exists - check if IP or rate limit needs update
                         current_target = existing_queue.get("target", "")
                         current_limit = existing_queue.get("max-limit", "")
+                        current_target_ip = current_target.split("/")[0].strip() if current_target else ""
+                        queue_disabled = str(existing_queue.get("disabled", "false")).lower() == "true"
                         
-                        needs_update = client_ip not in current_target or rate_limit != current_limit
+                        needs_update = (
+                            current_target_ip != client_ip
+                            or rate_limit != current_limit
+                            or queue_disabled
+                        )
                         
                         if needs_update:
+                            queue_id = existing_queue.get(".id")
+                            if not queue_id:
+                                logger.error(f"[SYNC] ❌ Queue {queue_name} has no .id, cannot update")
+                                errors += 1
+                                continue
+
                             time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)  # Rate limit
-                            update_result = api.send_command("/queue/simple/set", {
-                                "numbers": existing_queue[".id"],
+                            update_payload = {
+                                "numbers": queue_id,
                                 "target": f"{client_ip}/32",
                                 "max-limit": rate_limit
-                            })
+                            }
+                            if queue_disabled:
+                                update_payload["disabled"] = "no"
+                            update_result = api.send_command("/queue/simple/set", update_payload)
                             if update_result.get("error"):
                                 logger.error(f"[SYNC] ❌ Failed to update queue {queue_name}: {update_result.get('error')}")
                                 errors += 1
@@ -1335,7 +1423,7 @@ async def sync_active_user_queues():
             no_router_customers = []
             
             for c in active_customers:
-                if not c.plan or not c.mac_address:
+                if not c.plan or not c.plan.speed or not c.mac_address:
                     continue
                 
                 # Skip RADIUS-managed routers - they handle speeds via RADIUS attributes
@@ -3342,12 +3430,17 @@ async def sync_customer_queue(
         if not customer.plan or not customer.plan.speed:
             raise HTTPException(status_code=400, detail="Customer has no plan with speed limit")
         
-        # Connect to MikroTik
+        # Connect to the customer's assigned router (fallback to default settings)
+        router_ip = customer.router.ip_address if customer.router else settings.MIKROTIK_HOST
+        router_username = customer.router.username if customer.router else settings.MIKROTIK_USERNAME
+        router_password = customer.router.password if customer.router else settings.MIKROTIK_PASSWORD
+        router_port = customer.router.port if customer.router else settings.MIKROTIK_PORT
+
         api = MikroTikAPI(
-            settings.MIKROTIK_HOST,
-            settings.MIKROTIK_USERNAME,
-            settings.MIKROTIK_PASSWORD,
-            settings.MIKROTIK_PORT,
+            router_ip,
+            router_username,
+            router_password,
+            router_port,
             timeout=15,
             connect_timeout=5  # Fast fail if router unreachable
         )

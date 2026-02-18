@@ -375,6 +375,13 @@ class MikroTikAPI:
             "/ip/hotspot/active/print",
             proplist=[".id", "mac-address", "address", "user", "uptime", "bytes-in", "bytes-out"]
         )
+
+    def get_hotspot_hosts_minimal(self) -> Dict[str, Any]:
+        """Fetch hotspot hosts with essential fields (includes bypassed clients)."""
+        return self.send_command_optimized(
+            "/ip/hotspot/host/print",
+            proplist=[".id", "mac-address", "address", "to-address", "authorized", "bypassed"]
+        )
     
     def get_ip_bindings_minimal(self) -> Dict[str, Any]:
         """Fetch IP bindings with essential fields."""
@@ -394,7 +401,7 @@ class MikroTikAPI:
         """Fetch simple queues with essential fields."""
         return self.send_command_optimized(
             "/queue/simple/print",
-            proplist=[".id", "name", "target", "max-limit", "comment"]
+            proplist=[".id", "name", "target", "max-limit", "disabled", "comment"]
         )
 
     def _parse_speed_to_mikrotik(self, speed: str) -> str:
@@ -962,11 +969,31 @@ class MikroTikAPI:
             return {"error": str(e)}
 
     def get_client_ip_by_mac(self, mac_address: str) -> Optional[str]:
-        """Get client's current IP address by MAC from ARP or DHCP"""
+        """Get client's current IP by MAC from hotspot sessions/hosts, ARP, or DHCP."""
         if not self.connected:
             return None
         try:
             normalized_mac = normalize_mac_address(mac_address)
+
+            # Hotspot active sessions (best source for currently authenticated clients)
+            active_sessions = self.send_command("/ip/hotspot/active/print")
+            if active_sessions.get("success") and active_sessions.get("data"):
+                for session in active_sessions["data"]:
+                    session_mac = session.get("mac-address", "")
+                    if session_mac and normalize_mac_address(session_mac) == normalized_mac:
+                        session_ip = session.get("address")
+                        if session_ip:
+                            return session_ip
+
+            # Hotspot hosts (includes bypassed users, even if not in active sessions)
+            hosts = self.send_command("/ip/hotspot/host/print")
+            if hosts.get("success") and hosts.get("data"):
+                for host in hosts["data"]:
+                    host_mac = host.get("mac-address", "")
+                    if host_mac and normalize_mac_address(host_mac) == normalized_mac:
+                        host_ip = host.get("address") or host.get("to-address")
+                        if host_ip:
+                            return host_ip
             
             # Check ARP table
             arp = self.send_command("/ip/arp/print")
