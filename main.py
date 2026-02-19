@@ -958,7 +958,9 @@ async def cleanup_expired_users_background():
             logger.info(f"[CRON] Grouped customers across {len(router_customers_map)} router(s)")
             
             # STEP 2: Run MikroTik cleanup in thread pool (non-blocking!)
-            mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
+            # Serialize MikroTik operations to reduce read timeouts under scheduler overlap.
+            async with mikrotik_lock:
+                mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
             
             # STEP 3: Update database based on results (async)
             # ONLY mark as INACTIVE if MikroTik removal SUCCEEDED
@@ -986,7 +988,8 @@ async def cleanup_expired_users_background():
             # This catches bindings for customers that were marked inactive without proper cleanup
             try:
                 logger.info(f"[CRON] Running safety net bypass cleanup...")
-                bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
+                async with mikrotik_lock:
+                    bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
                 if bypass_cleaned > 0:
                     logger.warning(f"[CRON] ⚠️ Safety net removed {bypass_cleaned} orphaned IP bindings!")
             except Exception as bypass_err:
@@ -1203,6 +1206,26 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
                 mac = session.get("mac-address", "")
                 if mac and session.get("address"):
                     mac_to_ip[normalize_mac_address(mac)] = session.get("address")
+
+            connected_customer_ips = []
+            for customer_item in customers_data:
+                customer_mac = normalize_mac_address(customer_item["mac_address"])
+                customer_ip = mac_to_ip.get(customer_mac)
+                if customer_ip:
+                    connected_customer_ips.append(customer_ip)
+
+            if connected_customer_ips:
+                fasttrack_bypass_result = api.ensure_queue_fasttrack_bypass(connected_customer_ips)
+                if fasttrack_bypass_result.get("error"):
+                    logger.warning(
+                        f"[SYNC] FastTrack bypass setup failed on {router_name}: {fasttrack_bypass_result.get('error')}"
+                    )
+                elif fasttrack_bypass_result.get("fasttrack_enabled"):
+                    logger.info(
+                        f"[SYNC] FastTrack bypass active on {router_name} "
+                        f"(list={fasttrack_bypass_result.get('list_name')}, "
+                        f"ips_added={fasttrack_bypass_result.get('ips_added', 0)})"
+                    )
             
             queue_by_name = {
                 str(q.get("name", "")).lower(): q
@@ -1324,8 +1347,33 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
                         if add_result.get("error"):
                             # Check if it's a duplicate error (might have been created by another process)
                             if "already have" in add_result.get("error", "").lower():
-                                logger.warning(f"[SYNC] ⚠️ Queue {queue_name} already exists (created elsewhere)")
-                                skipped_already_ok += 1
+                                logger.warning(f"[SYNC] ⚠️ Queue {queue_name} already exists (created elsewhere), reconciling...")
+                                reconcile_result = api.get_simple_queues_minimal()
+                                duplicate_queue = None
+                                if reconcile_result.get("success") and reconcile_result.get("data"):
+                                    for queue_item in reconcile_result["data"]:
+                                        if str(queue_item.get("name", "")).lower() == queue_name.lower():
+                                            duplicate_queue = queue_item
+                                            break
+
+                                if duplicate_queue and duplicate_queue.get(".id"):
+                                    time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)
+                                    set_result = api.send_command("/queue/simple/set", {
+                                        "numbers": duplicate_queue[".id"],
+                                        "target": f"{client_ip}/32",
+                                        "max-limit": rate_limit,
+                                        "disabled": "no"
+                                    })
+                                    if set_result.get("error"):
+                                        logger.error(f"[SYNC] ❌ Failed to reconcile existing queue {queue_name}: {set_result.get('error')}")
+                                        errors += 1
+                                    else:
+                                        logger.info(f"[SYNC] ✅ Reconciled existing queue {queue_name} -> {client_ip} ({rate_limit})")
+                                        updated_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
+                                        synced += 1
+                                        total_operations += 1
+                                else:
+                                    skipped_already_ok += 1
                             else:
                                 logger.error(f"[SYNC] ❌ Failed to create queue {queue_name}: {add_result.get('error')}")
                                 errors += 1
@@ -1460,7 +1508,9 @@ async def sync_active_user_queues():
             logger.info(f"[SYNC] Grouped customers across {len(router_customers_map)} router(s)")
             
             # Run MikroTik operations in thread pool (non-blocking!)
-            mikrotik_results = await asyncio.to_thread(_sync_queues_mikrotik_sync, router_customers_map)
+            # Serialize MikroTik operations to reduce socket read timeouts under concurrent jobs.
+            async with mikrotik_lock:
+                mikrotik_results = await asyncio.to_thread(_sync_queues_mikrotik_sync, router_customers_map)
             
             duration = (datetime.utcnow() - start_time).total_seconds()
             logger.info(f"[SYNC] Job completed in {duration:.2f}s: "
@@ -1926,6 +1976,23 @@ def _call_mikrotik_bypass_sync(hotspot_payload: dict) -> dict:
                         "max-limit": rate_limit,
                         "comment": f"MAC:{hotspot_payload['mac_address']}|Plan rate limit"
                     })
+                    if retry_result.get("error") and "already have" in retry_result.get("error", "").lower():
+                        queues_result = api.get_simple_queues_minimal()
+                        if queues_result.get("success") and queues_result.get("data"):
+                            for queue_item in queues_result["data"]:
+                                if str(queue_item.get("name", "")).lower() == f"plan_{username}".lower() and queue_item.get(".id"):
+                                    retry_result = api.send_command("/queue/simple/set", {
+                                        "numbers": queue_item[".id"],
+                                        "target": f"{client_ip}/32",
+                                        "max-limit": rate_limit,
+                                        "disabled": "no"
+                                    })
+                                    break
+                    bypass_result = api.ensure_queue_fasttrack_bypass([client_ip])
+                    if bypass_result.get("error"):
+                        logger.warning(
+                            f"[THREAD] Queue exists but FastTrack bypass setup failed for {client_ip}: {bypass_result.get('error')}"
+                        )
                     logger.info(f"[THREAD] Queue created for {username} -> {client_ip}: {retry_result}")
                 else:
                     logger.warning(f"[THREAD] Still no IP for {hotspot_payload['mac_address']} - queue will be synced later")
@@ -1941,7 +2008,8 @@ async def call_mikrotik_bypass(hotspot_payload: dict):
     CRITICAL: Runs in thread pool so it doesn't block payment processing for other customers!
     """
     try:
-        result = await asyncio.to_thread(_call_mikrotik_bypass_sync, hotspot_payload)
+        async with mikrotik_lock:
+            result = await asyncio.to_thread(_call_mikrotik_bypass_sync, hotspot_payload)
         if result and result.get("error"):
             logger.error(f"MikroTik bypass failed: {result['error']}")
     except Exception as e:
@@ -3797,7 +3865,8 @@ async def cleanup_expired_customers_for_router(
         }
         
         # Run cleanup in thread pool
-        mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
+        async with mikrotik_lock:
+            mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
         
         # Update database
         successful_ids = [r["id"] for r in mikrotik_results["removed"]]
@@ -8450,7 +8519,8 @@ async def collect_bandwidth_snapshot():
                         "port": router.port
                     }
                     
-                    raw = await asyncio.to_thread(_fetch_bandwidth_data_sync_for_router, router_info)
+                    async with mikrotik_lock:
+                        raw = await asyncio.to_thread(_fetch_bandwidth_data_sync_for_router, router_info)
                     if not raw:
                         logger.warning(f"Failed to connect to router {router.name} ({router.ip_address}) for bandwidth snapshot")
                         continue

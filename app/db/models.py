@@ -216,7 +216,14 @@ class MpesaTransaction(Base):
     mpesa_receipt_number = Column(String(255), nullable=True)
     result_code = Column(String(50), nullable=True)
     result_desc = Column(String(500), nullable=True)
-    failure_source = Column(Enum(FailureSource, name="failuresource"), nullable=True)
+    failure_source = Column(
+        Enum(
+            FailureSource,
+            name="failuresource",
+            values_callable=lambda enum_cls: [item.value for item in enum_cls]
+        ),
+        nullable=True
+    )
     transaction_date = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

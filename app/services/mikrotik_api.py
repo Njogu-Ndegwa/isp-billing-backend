@@ -12,6 +12,11 @@ import json  # Ensure you import json for serializing logs
 logger = logging.getLogger("mikrotik_api")
 logger.setLevel(logging.WARNING)  # Reduce noise, only warnings/errors
 
+# Address-list and rule comments used to ensure queued clients are excluded from FastTrack.
+QUEUE_FASTTRACK_BYPASS_LIST = "isp_queue_limited_clients"
+QUEUE_FASTTRACK_BYPASS_SRC_COMMENT = "ISP_BILLING_QUEUE_BYPASS_SRC"
+QUEUE_FASTTRACK_BYPASS_DST_COMMENT = "ISP_BILLING_QUEUE_BYPASS_DST"
+
 # ============================================================================
 # CIRCUIT BREAKER: Track failed routers to avoid repeated blocking timeouts
 # Only triggers on CONNECTION failures, not read timeouts during operations
@@ -404,6 +409,110 @@ class MikroTikAPI:
             proplist=[".id", "name", "target", "max-limit", "disabled", "comment"]
         )
 
+    def ensure_queue_fasttrack_bypass(self, client_ips: List[str]) -> Dict[str, Any]:
+        """
+        Ensure queued client IPs are excluded from FastTrack so simple queues can enforce limits.
+        Creates/updates:
+        - Address list: `isp_queue_limited_clients`
+        - Two forward accept rules (src + dst) placed before FastTrack
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+
+        try:
+            normalized_ips = sorted({str(ip).strip() for ip in client_ips if ip and str(ip).strip()})
+            if not normalized_ips:
+                return {"success": True, "fasttrack_enabled": False, "ips_added": 0}
+
+            filters_result = self.send_command_optimized(
+                "/ip/firewall/filter/print",
+                proplist=[
+                    ".id",
+                    "chain",
+                    "action",
+                    "disabled",
+                    "comment",
+                    "src-address-list",
+                    "dst-address-list"
+                ]
+            )
+            if not filters_result.get("success"):
+                return {"error": "Failed to read firewall filter rules"}
+
+            filter_rules = filters_result.get("data", [])
+            fasttrack_rule = None
+            for rule in filter_rules:
+                if (
+                    rule.get("chain") == "forward"
+                    and rule.get("action") == "fasttrack-connection"
+                    and str(rule.get("disabled", "false")).lower() != "true"
+                ):
+                    fasttrack_rule = rule
+                    break
+
+            if not fasttrack_rule:
+                return {"success": True, "fasttrack_enabled": False, "ips_added": 0}
+
+            address_list_result = self.send_command_optimized(
+                "/ip/firewall/address-list/print",
+                proplist=[".id", "list", "address", "comment"]
+            )
+            existing_ips = set()
+            if address_list_result.get("success"):
+                for entry in address_list_result.get("data", []):
+                    if entry.get("list") == QUEUE_FASTTRACK_BYPASS_LIST and entry.get("address"):
+                        existing_ips.add(entry["address"])
+
+            ips_added = 0
+            for ip in normalized_ips:
+                if ip in existing_ips:
+                    continue
+                add_ip_result = self.send_command("/ip/firewall/address-list/add", {
+                    "list": QUEUE_FASTTRACK_BYPASS_LIST,
+                    "address": ip,
+                    "comment": "Managed by ISP Billing queue sync"
+                })
+                if not add_ip_result.get("error"):
+                    ips_added += 1
+
+            for rule in filter_rules:
+                if (
+                    rule.get("chain") == "forward"
+                    and rule.get("comment") in {
+                        QUEUE_FASTTRACK_BYPASS_SRC_COMMENT,
+                        QUEUE_FASTTRACK_BYPASS_DST_COMMENT
+                    }
+                    and rule.get(".id")
+                ):
+                    self.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]})
+
+            fasttrack_id = fasttrack_rule.get(".id")
+            if fasttrack_id:
+                self.send_command("/ip/firewall/filter/add", {
+                    "chain": "forward",
+                    "action": "accept",
+                    "src-address-list": QUEUE_FASTTRACK_BYPASS_LIST,
+                    "comment": QUEUE_FASTTRACK_BYPASS_SRC_COMMENT,
+                    "place-before": fasttrack_id
+                })
+                self.send_command("/ip/firewall/filter/add", {
+                    "chain": "forward",
+                    "action": "accept",
+                    "dst-address-list": QUEUE_FASTTRACK_BYPASS_LIST,
+                    "comment": QUEUE_FASTTRACK_BYPASS_DST_COMMENT,
+                    "place-before": fasttrack_id
+                })
+
+            return {
+                "success": True,
+                "fasttrack_enabled": True,
+                "ips_added": ips_added,
+                "list_name": QUEUE_FASTTRACK_BYPASS_LIST
+            }
+        except Exception as e:
+            logger.error(f"Error ensuring FastTrack bypass for queued clients: {e}")
+            return {"error": str(e)}
+
     def _parse_speed_to_mikrotik(self, speed: str) -> str:
         """
         Convert speed string (e.g., '2Mbps', '5 Mbps', '512Kbps') to MikroTik format (e.g., '2M/2M').
@@ -582,6 +691,12 @@ class MikroTikAPI:
                         "max-limit": rate_limit,
                         "comment": f"MAC:{mac_address}|Plan rate limit"
                     })
+                    if queue_result.get("success"):
+                        bypass_result = self.ensure_queue_fasttrack_bypass([client_ip])
+                        if bypass_result.get("error"):
+                            logger.warning(
+                                f"Queue created but FastTrack bypass setup failed for {client_ip}: {bypass_result.get('error')}"
+                            )
                     logger.info(f"Created simple queue for {username} -> {client_ip} with limit {rate_limit}")
                 else:
                     # Client not connected yet - will be created by sync job
