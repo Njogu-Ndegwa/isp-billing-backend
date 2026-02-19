@@ -265,10 +265,13 @@ class MikroTikAPI:
             
             # Read response
             responses = []
+            connection_lost = False
             while True:
                 sentence = self.read_sentence()
                 logger.info(f"Raw sentence received for command {command}: {sentence}")  # Debug log
                 if not sentence:
+                    if not self.connected:
+                        connection_lost = True
                     break
                     
                 if sentence[0] == "!done":
@@ -288,6 +291,9 @@ class MikroTikAPI:
                         if item.startswith("=message="):
                             error_msg = item[9:]
                     return {"error": error_msg or "Command failed"}
+
+            if connection_lost:
+                return {"error": "Not connected"}
             
             return {"success": True, "data": responses}
         except Exception as e:
@@ -332,9 +338,12 @@ class MikroTikAPI:
             self.send_sentence(words)
             
             responses = []
+            connection_lost = False
             while True:
                 sentence = self.read_sentence()
                 if not sentence:
+                    if not self.connected:
+                        connection_lost = True
                     break
                     
                 if sentence[0] == "!done":
@@ -353,6 +362,9 @@ class MikroTikAPI:
                         if item.startswith("=message="):
                             error_msg = item[9:]
                     return {"error": error_msg or "Command failed"}
+
+            if connection_lost:
+                return {"error": "Not connected"}
             
             return {"success": True, "data": responses}
         except Exception as e:
