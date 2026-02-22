@@ -1234,3 +1234,135 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error getting queue speed stats: {e}")
             return {"error": str(e)}
+
+    # =========================================================================
+    # WALLED GARDEN MANAGEMENT
+    # =========================================================================
+
+    def get_walled_garden(self) -> Dict[str, Any]:
+        """Get all walled garden entries (both domain and IP-based)."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            domain_entries = self.send_command("/ip/hotspot/walled-garden/print")
+            ip_entries = self.send_command("/ip/hotspot/walled-garden/ip/print")
+            return {
+                "success": True,
+                "domain_entries": domain_entries.get("data", []) if domain_entries.get("success") else [],
+                "ip_entries": ip_entries.get("data", []) if ip_entries.get("success") else []
+            }
+        except Exception as e:
+            logger.error(f"Error getting walled garden: {e}")
+            return {"error": str(e)}
+
+    def add_walled_garden_ip(self, dst_address: str, action: str = "accept",
+                              comment: str = "") -> Dict[str, Any]:
+        """Add an IP-based walled garden entry (e.g., allow traffic to a specific IP)."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            if "/" not in dst_address:
+                dst_address = f"{dst_address}/32"
+
+            existing = self.send_command("/ip/hotspot/walled-garden/ip/print")
+            if existing.get("success") and existing.get("data"):
+                for entry in existing["data"]:
+                    if entry.get("dst-address") == dst_address:
+                        return {"success": True, "action": "already_exists", "id": entry.get(".id")}
+
+            params = {"dst-address": dst_address, "action": action}
+            if comment:
+                params["comment"] = comment
+
+            result = self.send_command("/ip/hotspot/walled-garden/ip/add", params)
+            if result.get("error"):
+                return {"error": result["error"]}
+            return {"success": True, "action": "created", "dst_address": dst_address}
+        except Exception as e:
+            logger.error(f"Error adding walled garden IP {dst_address}: {e}")
+            return {"error": str(e)}
+
+    def add_walled_garden_domain(self, dst_host: str, action: str = "allow",
+                                  comment: str = "") -> Dict[str, Any]:
+        """Add a domain-based walled garden entry (e.g., allow access to a domain)."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            existing = self.send_command("/ip/hotspot/walled-garden/print")
+            if existing.get("success") and existing.get("data"):
+                for entry in existing["data"]:
+                    if entry.get("dst-host") == dst_host:
+                        return {"success": True, "action": "already_exists", "id": entry.get(".id")}
+
+            params = {"dst-host": dst_host, "action": action}
+            if comment:
+                params["comment"] = comment
+
+            result = self.send_command("/ip/hotspot/walled-garden/add", params)
+            if result.get("error"):
+                return {"error": result["error"]}
+            return {"success": True, "action": "created", "dst_host": dst_host}
+        except Exception as e:
+            logger.error(f"Error adding walled garden domain {dst_host}: {e}")
+            return {"error": str(e)}
+
+    def remove_walled_garden_ip(self, entry_id: str) -> Dict[str, Any]:
+        """Remove an IP-based walled garden entry by its .id."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/hotspot/walled-garden/ip/remove", {"numbers": entry_id})
+            if result.get("error"):
+                return {"error": result["error"]}
+            return {"success": True, "action": "removed"}
+        except Exception as e:
+            logger.error(f"Error removing walled garden IP entry {entry_id}: {e}")
+            return {"error": str(e)}
+
+    def remove_walled_garden_domain(self, entry_id: str) -> Dict[str, Any]:
+        """Remove a domain-based walled garden entry by its .id."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/hotspot/walled-garden/remove", {"numbers": entry_id})
+            if result.get("error"):
+                return {"error": result["error"]}
+            return {"success": True, "action": "removed"}
+        except Exception as e:
+            logger.error(f"Error removing walled garden domain entry {entry_id}: {e}")
+            return {"error": str(e)}
+
+    def update_wireguard_endpoint(self, new_endpoint: str, interface_name: str = "wg-aws") -> Dict[str, Any]:
+        """Update the WireGuard peer endpoint address (useful when server IP changes)."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            peers = self.send_command("/interface/wireguard/peers/print")
+            if not peers.get("success") or not peers.get("data"):
+                return {"error": "No WireGuard peers found"}
+
+            target_peer = None
+            for peer in peers["data"]:
+                if peer.get("interface") == interface_name:
+                    target_peer = peer
+                    break
+
+            if not target_peer:
+                return {"error": f"No peer found for interface {interface_name}"}
+
+            old_endpoint = target_peer.get("endpoint-address", "unknown")
+            result = self.send_command("/interface/wireguard/peers/set", {
+                "numbers": target_peer[".id"],
+                "endpoint-address": new_endpoint
+            })
+            if result.get("error"):
+                return {"error": result["error"]}
+            return {
+                "success": True,
+                "old_endpoint": old_endpoint,
+                "new_endpoint": new_endpoint,
+                "interface": interface_name
+            }
+        except Exception as e:
+            logger.error(f"Error updating WireGuard endpoint: {e}")
+            return {"error": str(e)}

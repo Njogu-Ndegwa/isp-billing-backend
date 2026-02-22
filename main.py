@@ -7731,6 +7731,198 @@ async def get_mikrotik_health(
         logger.error(f"Error fetching MikroTik health: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ============================================================================
+# WALLED GARDEN MANAGEMENT
+# ============================================================================
+
+@app.get("/api/mikrotik/walled-garden")
+async def get_walled_garden(
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all walled garden entries (domain and IP-based)."""
+    try:
+        if router_id:
+            router = await get_router_by_id(db, router_id)
+            if not router:
+                raise HTTPException(status_code=404, detail="Router not found")
+            host, user, pwd, port = router.ip_address, router.username, router.password, router.port
+        else:
+            host, user, pwd, port = settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT
+
+        def _fetch():
+            api = MikroTikAPI(host, user, pwd, port)
+            if not api.connect():
+                return {"error": "Failed to connect to MikroTik"}
+            try:
+                return api.get_walled_garden()
+            finally:
+                api.disconnect()
+
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting walled garden: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mikrotik/walled-garden/ip")
+async def add_walled_garden_ip_entry(
+    dst_address: str,
+    comment: str = "Added via API",
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """Add an IP address to the walled garden (allows hotspot users to reach it before auth)."""
+    try:
+        if router_id:
+            router = await get_router_by_id(db, router_id)
+            if not router:
+                raise HTTPException(status_code=404, detail="Router not found")
+            host, user, pwd, port = router.ip_address, router.username, router.password, router.port
+        else:
+            host, user, pwd, port = settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT
+
+        def _add():
+            api = MikroTikAPI(host, user, pwd, port)
+            if not api.connect():
+                return {"error": "Failed to connect to MikroTik"}
+            try:
+                return api.add_walled_garden_ip(dst_address, comment=comment)
+            finally:
+                api.disconnect()
+
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(None, _add)
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding walled garden IP: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mikrotik/walled-garden/domain")
+async def add_walled_garden_domain_entry(
+    dst_host: str,
+    comment: str = "Added via API",
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """Add a domain to the walled garden (allows hotspot users to access it before auth)."""
+    try:
+        if router_id:
+            router = await get_router_by_id(db, router_id)
+            if not router:
+                raise HTTPException(status_code=404, detail="Router not found")
+            host, user, pwd, port = router.ip_address, router.username, router.password, router.port
+        else:
+            host, user, pwd, port = settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT
+
+        def _add():
+            api = MikroTikAPI(host, user, pwd, port)
+            if not api.connect():
+                return {"error": "Failed to connect to MikroTik"}
+            try:
+                return api.add_walled_garden_domain(dst_host, comment=comment)
+            finally:
+                api.disconnect()
+
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(None, _add)
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding walled garden domain: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/mikrotik/walled-garden/ip/{entry_id}")
+async def remove_walled_garden_ip_entry(
+    entry_id: str,
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """Remove an IP-based walled garden entry."""
+    try:
+        if router_id:
+            router = await get_router_by_id(db, router_id)
+            if not router:
+                raise HTTPException(status_code=404, detail="Router not found")
+            host, user, pwd, port = router.ip_address, router.username, router.password, router.port
+        else:
+            host, user, pwd, port = settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT
+
+        def _remove():
+            api = MikroTikAPI(host, user, pwd, port)
+            if not api.connect():
+                return {"error": "Failed to connect to MikroTik"}
+            try:
+                return api.remove_walled_garden_ip(entry_id)
+            finally:
+                api.disconnect()
+
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(None, _remove)
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing walled garden IP entry: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mikrotik/wireguard/update-endpoint")
+async def update_wireguard_endpoint(
+    new_endpoint: str,
+    interface_name: str = "wg-aws",
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update WireGuard peer endpoint address (when server IP changes)."""
+    try:
+        if router_id:
+            router = await get_router_by_id(db, router_id)
+            if not router:
+                raise HTTPException(status_code=404, detail="Router not found")
+            host, user, pwd, port = router.ip_address, router.username, router.password, router.port
+        else:
+            host, user, pwd, port = settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT
+
+        def _update():
+            api = MikroTikAPI(host, user, pwd, port)
+            if not api.connect():
+                return {"error": "Failed to connect to MikroTik"}
+            try:
+                return api.update_wireguard_endpoint(new_endpoint, interface_name)
+            finally:
+                api.disconnect()
+
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(None, _update)
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating WireGuard endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/dashboard/mikrotik")
 async def get_dashboard_mikrotik():
     """Get all MikroTik data for dashboard. Cached 30s, runs in thread to not block."""

@@ -1,0 +1,88 @@
+{
+    "info": {
+        "name": "Walled Garden & WireGuard Management",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"}
+    ],
+    "item": [
+        {
+            "name": "Get Walled Garden Entries",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/mikrotik/walled-garden",
+                "header": []
+            }
+        },
+        {
+            "name": "Get Walled Garden (Specific Router)",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/mikrotik/walled-garden?router_id=1",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "mikrotik", "walled-garden"],
+                    "query": [{"key": "router_id", "value": "1"}]
+                },
+                "header": []
+            }
+        },
+        {
+            "name": "Add IP to Walled Garden",
+            "request": {
+                "method": "POST",
+                "url": {
+                    "raw": "{{baseUrl}}/api/mikrotik/walled-garden/ip?dst_address=54.91.202.229&comment=AWS Backend API",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "mikrotik", "walled-garden", "ip"],
+                    "query": [
+                        {"key": "dst_address", "value": "54.91.202.229"},
+                        {"key": "comment", "value": "AWS Backend API"}
+                    ]
+                },
+                "header": []
+            }
+        },
+        {
+            "name": "Add Domain to Walled Garden",
+            "request": {
+                "method": "POST",
+                "url": {
+                    "raw": "{{baseUrl}}/api/mikrotik/walled-garden/domain?dst_host=isp.bitwavetechnologies.com&comment=ISP Portal",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "mikrotik", "walled-garden", "domain"],
+                    "query": [
+                        {"key": "dst_host", "value": "isp.bitwavetechnologies.com"},
+                        {"key": "comment", "value": "ISP Portal"}
+                    ]
+                },
+                "header": []
+            }
+        },
+        {
+            "name": "Remove IP Walled Garden Entry",
+            "request": {
+                "method": "DELETE",
+                "url": "{{baseUrl}}/api/mikrotik/walled-garden/ip/*1",
+                "header": []
+            }
+        },
+        {
+            "name": "Update WireGuard Endpoint",
+            "request": {
+                "method": "POST",
+                "url": {
+                    "raw": "{{baseUrl}}/api/mikrotik/wireguard/update-endpoint?new_endpoint=54.91.202.229&interface_name=wg-aws",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "mikrotik", "wireguard", "update-endpoint"],
+                    "query": [
+                        {"key": "new_endpoint", "value": "54.91.202.229"},
+                        {"key": "interface_name", "value": "wg-aws"}
+                    ]
+                },
+                "header": []
+            }
+        }
+    ]
+}
