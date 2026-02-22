@@ -2006,10 +2006,12 @@ async def call_mikrotik_bypass(hotspot_payload: dict):
     """
     Async wrapper that runs MikroTik bypass provisioning in a thread pool.
     CRITICAL: Runs in thread pool so it doesn't block payment processing for other customers!
+    NOTE: Does NOT use mikrotik_lock -- provisioning creates its own connection and
+    must never be blocked behind slow background sync/cleanup jobs. A paying customer
+    should get internet immediately, not wait 2+ minutes for a sync job to finish.
     """
     try:
-        async with mikrotik_lock:
-            result = await asyncio.to_thread(_call_mikrotik_bypass_sync, hotspot_payload)
+        result = await asyncio.to_thread(_call_mikrotik_bypass_sync, hotspot_payload)
         if result and result.get("error"):
             logger.error(f"MikroTik bypass failed: {result['error']}")
     except Exception as e:
@@ -10240,15 +10242,15 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
-    # Queue sync - ensures bandwidth limits apply even if customer IP changes
-    scheduler.add_job(
-        sync_active_user_queues,
-        trigger=IntervalTrigger(seconds=90),  # 90 seconds - faster response to unlimited users
-        id='sync_user_queues',
-        name='Sync rate limit queues for active users',
-        replace_existing=True,
-        max_instances=1
-    )
+    # Queue sync DISABLED - was blocking payment provisioning with 150s+ lock holds
+    # scheduler.add_job(
+    #     sync_active_user_queues,
+    #     trigger=IntervalTrigger(seconds=90),
+    #     id='sync_user_queues',
+    #     name='Sync rate limit queues for active users',
+    #     replace_existing=True,
+    #     max_instances=1
+    # )
     scheduler.add_job(
         collect_bandwidth_snapshot,
         trigger=IntervalTrigger(seconds=157),  # ~2 min 37s (prime)
@@ -10258,7 +10260,7 @@ async def startup_event():
         max_instances=1
     )
     scheduler.start()
-    logger.info("🔄 Background scheduler started - cleanup every 67s, queue sync every 90s, bandwidth every 157s")
+    logger.info("🔄 Background scheduler started - cleanup every 67s, bandwidth every 157s")
     
     # Warm up plan cache on startup
     async for db in get_db():
