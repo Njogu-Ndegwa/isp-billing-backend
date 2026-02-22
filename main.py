@@ -3658,8 +3658,9 @@ async def login_api(
 ):
     """Login and get JWT token"""
     try:
-        from app.services.auth import authenticate_user
-        from app.core.security import create_access_token
+        from app.services.auth import authenticate_user, create_access_token
+        from datetime import timedelta
+        from app.config import settings
         
         user = await authenticate_user(db, request.email, request.password)
         if not user:
@@ -3667,12 +3668,16 @@ async def login_api(
         
         # Create JWT token
         token_data = {
+            "sub": str(user.id),
             "user_code": user.user_code,
             "user_id": user.id,
             "role": user.role.value,
             "organization_name": user.organization_name
         }
-        access_token = create_access_token(token_data)
+        access_token = create_access_token(
+            data=token_data,
+            expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        )
         
         return {
             "access_token": access_token,

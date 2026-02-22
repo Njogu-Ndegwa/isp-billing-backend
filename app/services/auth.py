@@ -49,21 +49,8 @@ async def authenticate_user(db: AsyncSession, email: str, password: str):
     result = await db.execute(stmt)
     user = result.scalar_one_or_none()
     if not user or not pwd_context.verify(password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    access_token = create_access_token(
-        data={
-            "sub": str(user.id),
-            "user_id": user.id,
-            "user_code": user.user_code,
-            "role": user.role.value,
-            "organization_name": user.organization_name
-        },
-        expires_delta=access_token_expires
-    )
-    return {"access_token": access_token}
+        return None
+    return user
 
 def create_access_token(data: dict, expires_delta: timedelta):
     to_encode = data.copy()
