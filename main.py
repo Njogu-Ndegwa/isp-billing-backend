@@ -8620,6 +8620,18 @@ def _parse_speed_value(speed_str: str) -> float:
     except ValueError:
         return 0.0
 
+def _bandwidth_reconnect(api, router_info: dict) -> bool:
+    """Reconnect to MikroTik if the connection went stale during bandwidth collection."""
+    try:
+        api.disconnect()
+        if api.connect():
+            logger.info(f"[BANDWIDTH] Reconnected to router {router_info['id']} at {router_info['ip_address']}")
+            return True
+    except Exception:
+        pass
+    logger.warning(f"[BANDWIDTH] Reconnect failed for router {router_info['id']}")
+    return False
+
 def _fetch_bandwidth_data_sync_for_router(router_info: dict):
     """Sync helper for bandwidth collection from a specific router - runs in thread"""
     api = MikroTikAPI(
@@ -8628,18 +8640,42 @@ def _fetch_bandwidth_data_sync_for_router(router_info: dict):
         router_info["password"],
         router_info["port"],
         timeout=15,
-        connect_timeout=5  # Fast fail if router unreachable
+        connect_timeout=5
     )
     if not api.connect():
         logger.warning(f"[BANDWIDTH] Failed to connect to router ID {router_info['id']} at {router_info['ip_address']}")
         return None
     
-    active_sessions = api.get_active_hotspot_users()
+    # Priority order: traffic (for bandwidth graph), hotspot_hosts (for active users count),
+    # then the rest. Retry strategy: on stale-connection failure, reconnect ONCE and retry ONCE.
+    # No loops -- bounded to at most 5 reconnects across the whole function.
+    # Each reconnect is capped at connect_timeout (5s) + read timeout (15s) = 20s max.
     traffic = api.get_interface_traffic()
-    speed_stats = api.get_queue_speed_stats()
-    queues = api.send_command("/queue/simple/print")
+    if not traffic.get("success") and not api.connected:
+        if _bandwidth_reconnect(api, router_info):
+            traffic = api.get_interface_traffic()
+
     hotspot_hosts = api.get_hotspot_hosts()
+    if not hotspot_hosts.get("success") and not api.connected:
+        if _bandwidth_reconnect(api, router_info):
+            hotspot_hosts = api.get_hotspot_hosts()
+
     arp_entries = api.get_arp_entries()
+    if not arp_entries.get("success") and not api.connected:
+        if _bandwidth_reconnect(api, router_info):
+            arp_entries = api.get_arp_entries()
+
+    active_sessions = api.get_active_hotspot_users()
+    if not active_sessions.get("success") and not api.connected:
+        if _bandwidth_reconnect(api, router_info):
+            active_sessions = api.get_active_hotspot_users()
+
+    speed_stats = api.get_queue_speed_stats()
+    if not speed_stats.get("success") and not api.connected:
+        if _bandwidth_reconnect(api, router_info):
+            speed_stats = api.get_queue_speed_stats()
+
+    queues = api.send_command("/queue/simple/print")
     api.disconnect()
     
     # Log what we got from MikroTik for debugging
@@ -8781,11 +8817,20 @@ async def collect_bandwidth_snapshot():
                     )
                     prev = prev_result.scalar_one_or_none()
                     
+                    # If interface fetch failed (total_rx/tx are 0 with no interface),
+                    # preserve the previous snapshot's byte counters so the NEXT
+                    # interval can still calculate a rate instead of losing two intervals.
+                    interface_fetch_failed = (selected_interface is None and total_rx == 0 and total_tx == 0)
+                    if interface_fetch_failed and prev and prev.interface_rx_bytes > 0:
+                        logger.warning(f"[BANDWIDTH] Router {router_id}: Interface fetch failed, carrying forward previous byte counters to avoid data gap")
+                        total_rx = prev.interface_rx_bytes
+                        total_tx = prev.interface_tx_bytes
+                    
                     # Calculate actual average bps from byte counter difference
                     avg_download_bps = 0.0
                     avg_upload_bps = 0.0
                     time_diff = 0
-                    if prev and prev.interface_rx_bytes > 0:
+                    if prev and prev.interface_rx_bytes > 0 and not interface_fetch_failed:
                         time_diff = (now - prev.recorded_at).total_seconds()
                         if time_diff > 0:
                             byte_diff_rx = total_rx - prev.interface_rx_bytes
@@ -8797,11 +8842,9 @@ async def collect_bandwidth_snapshot():
                                 # - For ether1/WAN: rx = from internet = USER DOWNLOAD, tx = to internet = USER UPLOAD
                                 # - For bridge/LAN: rx = from users = USER UPLOAD, tx = to users = USER DOWNLOAD
                                 if selected_interface and ("ether1" in selected_interface or "wan" in selected_interface.lower()):
-                                    # WAN interface: rx = download, tx = upload
                                     avg_download_bps = (byte_diff_rx * 8) / time_diff
                                     avg_upload_bps = (byte_diff_tx * 8) / time_diff
                                 else:
-                                    # Bridge/LAN interface: tx = download (to users), rx = upload (from users)
                                     avg_download_bps = (byte_diff_tx * 8) / time_diff
                                     avg_upload_bps = (byte_diff_rx * 8) / time_diff
                                 
@@ -8809,7 +8852,7 @@ async def collect_bandwidth_snapshot():
                                 logger.info(f"[BANDWIDTH] Router {router_id}: Using '{selected_interface}' perspective - avg_download={avg_download_bps/1000000:.2f}Mbps, avg_upload={avg_upload_bps/1000000:.2f}Mbps")
                             else:
                                 logger.warning(f"[BANDWIDTH] Router {router_id}: Counter reset detected (negative diff), skipping rate calc")
-                    else:
+                    elif not interface_fetch_failed:
                         logger.info(f"[BANDWIDTH] Router {router_id}: No previous snapshot or rx_bytes=0, first measurement")
                     
                     # Use hotspot hosts (bypassed) + ARP as better active device count
@@ -8823,7 +8866,7 @@ async def collect_bandwidth_snapshot():
                         total_download_bps=int(speed_data.get("total_download_bps", 0)),
                         avg_upload_bps=avg_upload_bps,
                         avg_download_bps=avg_download_bps,
-                        active_queues=active_devices,  # Repurposed: now shows active devices (hotspot hosts + arp)
+                        active_queues=active_devices,
                         active_sessions=len(active_sessions.get("data", [])),
                         interface_rx_bytes=total_rx,
                         interface_tx_bytes=total_tx,
