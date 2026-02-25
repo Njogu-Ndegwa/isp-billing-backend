@@ -8855,10 +8855,17 @@ async def collect_bandwidth_snapshot():
                     elif not interface_fetch_failed:
                         logger.info(f"[BANDWIDTH] Router {router_id}: No previous snapshot or rx_bytes=0, first measurement")
                     
-                    # Active users = bypassed + authorized hotspot hosts (the real online count).
-                    # ARP table is NOT used -- it includes infrastructure, stale entries, and
-                    # non-customer devices, giving wildly inflated numbers (e.g. 194 vs 8 real).
-                    active_devices = hotspot_hosts.get("bypassed", 0) + hotspot_hosts.get("authorized", 0)
+                    # Active users = bypassed + authorized hotspot hosts.
+                    # If the fetch failed, carry forward the previous good value
+                    # rather than storing 0 (which is misleading on the dashboard).
+                    hotspot_fetch_ok = hotspot_hosts.get("success", False)
+                    if hotspot_fetch_ok:
+                        active_devices = hotspot_hosts.get("bypassed", 0) + hotspot_hosts.get("authorized", 0)
+                    elif prev:
+                        active_devices = prev.active_queues
+                        logger.warning(f"[BANDWIDTH] Router {router_id}: Hotspot hosts fetch failed, carrying forward previous active_users={active_devices}")
+                    else:
+                        active_devices = 0
                     
                     snapshot = BandwidthSnapshot(
                         router_id=router_id,
