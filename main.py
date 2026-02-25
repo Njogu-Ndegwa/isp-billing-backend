@@ -8855,10 +8855,10 @@ async def collect_bandwidth_snapshot():
                     elif not interface_fetch_failed:
                         logger.info(f"[BANDWIDTH] Router {router_id}: No previous snapshot or rx_bytes=0, first measurement")
                     
-                    # Use hotspot hosts (bypassed) + ARP as better active device count
+                    # Active users = bypassed + authorized hotspot hosts (the real online count).
+                    # ARP table is NOT used -- it includes infrastructure, stale entries, and
+                    # non-customer devices, giving wildly inflated numbers (e.g. 194 vs 8 real).
                     active_devices = hotspot_hosts.get("bypassed", 0) + hotspot_hosts.get("authorized", 0)
-                    if active_devices == 0:
-                        active_devices = arp_entries.get("count", 0)
                     
                     snapshot = BandwidthSnapshot(
                         router_id=router_id,
