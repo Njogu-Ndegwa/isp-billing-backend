@@ -86,9 +86,22 @@ server default {
     post-auth {
         # Get reply attributes from SQL (bandwidth limits, session timeout, etc.)
         sql
+
+        # MikroTik can require Message-Authenticator in Access-Accept replies.
+        # If request has Message-Authenticator, add it to reply so router accepts it.
+        if (&request:Message-Authenticator) {
+            update reply {
+                Message-Authenticator := 0x00
+            }
+        }
         
         # Log successful authentications
         Post-Auth-Type REJECT {
+            if (&request:Message-Authenticator) {
+                update reply {
+                    Message-Authenticator := 0x00
+                }
+            }
             sql
             attr_filter.access_reject
         }
