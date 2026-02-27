@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import datetime
 
 from app.db.database import get_db
-from app.db.models import Router, Customer, CustomerStatus
+from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot
 from app.services.auth import verify_token, get_current_user
 import logging
 import asyncio
@@ -290,6 +290,18 @@ async def delete_router(
             )
             await db.execute(update_customers_stmt)
             logger.info(f"Set {customer_count} customers from router {router_name} to INACTIVE")
+        
+        # Clean up related records that reference this router
+        await db.execute(
+            update(ProvisioningLog)
+            .where(ProvisioningLog.router_id == router_id)
+            .values(router_id=None)
+        )
+        await db.execute(
+            update(BandwidthSnapshot)
+            .where(BandwidthSnapshot.router_id == router_id)
+            .values(router_id=None)
+        )
         
         await db.delete(router_obj)
         await db.commit()
