@@ -38,7 +38,7 @@ async def get_routers(
     stmt = select(Router).where(Router.user_id == user.id)
     result = await db.execute(stmt)
     routers = result.scalars().all()
-    return [{"id": r.id, "name": r.name, "ip_address": r.ip_address, "port": r.port} for r in routers]
+    return [{"id": r.id, "name": r.name, "identity": r.identity, "ip_address": r.ip_address, "port": r.port} for r in routers]
 
 
 @router.post("/api/routers/create")
