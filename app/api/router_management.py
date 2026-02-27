@@ -6,9 +6,10 @@ from typing import Optional
 from datetime import datetime
 
 from app.db.database import get_db
-from app.db.models import Router, Customer
+from app.db.models import Router, Customer, CustomerStatus
 from app.services.auth import verify_token, get_current_user
 import logging
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -227,16 +228,68 @@ async def delete_router(
             if not force:
                 raise HTTPException(
                     status_code=400, 
-                    detail=f"Router has {customer_count} customer(s) assigned. Use force=true to reassign them to no router."
+                    detail=f"Router has {customer_count} customer(s) assigned. Use force=true to delete them from the router."
                 )
             
+            # Fetch active customers to clean them off MikroTik
+            active_customers_stmt = select(Customer).where(
+                Customer.router_id == router_id,
+                Customer.status == CustomerStatus.ACTIVE
+            )
+            active_result = await db.execute(active_customers_stmt)
+            active_customers = active_result.scalars().all()
+            
+            # Remove each active customer from MikroTik
+            mikrotik_cleaned = 0
+            if active_customers:
+                from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+                
+                router_info = {
+                    "ip": router_obj.ip_address,
+                    "username": router_obj.username,
+                    "password": router_obj.password,
+                    "port": router_obj.port,
+                    "name": router_obj.name
+                }
+                
+                def _cleanup_router_users(r_info, customers_data):
+                    api = MikroTikAPI(r_info["ip"], r_info["username"], r_info["password"], r_info["port"])
+                    removed = 0
+                    try:
+                        if not api.connected:
+                            return removed
+                        for mac, username in customers_data:
+                            try:
+                                api.remove_hotspot_user(username)
+                                api.remove_ip_binding(mac)
+                                api.remove_simple_queue(mac)
+                                removed += 1
+                            except Exception as e:
+                                logger.warning(f"Failed to clean up {mac} from router: {e}")
+                    finally:
+                        api.disconnect()
+                    return removed
+                
+                customers_data = []
+                for c in active_customers:
+                    if c.mac_address:
+                        normalized = normalize_mac_address(c.mac_address)
+                        customers_data.append((normalized, normalized.replace(":", "")))
+                
+                try:
+                    mikrotik_cleaned = await asyncio.to_thread(_cleanup_router_users, router_info, customers_data)
+                    logger.info(f"Cleaned {mikrotik_cleaned} users from MikroTik router {router_name}")
+                except Exception as e:
+                    logger.warning(f"MikroTik cleanup failed for router {router_name}: {e}. Proceeding with DB cleanup.")
+            
+            # Set all customers on this router to INACTIVE and unassign
             update_customers_stmt = (
                 update(Customer)
                 .where(Customer.router_id == router_id)
-                .values(router_id=None)
+                .values(router_id=None, status=CustomerStatus.INACTIVE)
             )
             await db.execute(update_customers_stmt)
-            logger.info(f"Reassigned {customer_count} customers from router {router_name} to no router")
+            logger.info(f"Set {customer_count} customers from router {router_name} to INACTIVE")
         
         await db.delete(router_obj)
         await db.commit()
@@ -247,7 +300,8 @@ async def delete_router(
             "success": True,
             "message": f"Router '{router_name}' deleted successfully",
             "router_id": router_id,
-            "customers_reassigned": customer_count if force else 0
+            "customers_deactivated": customer_count if force else 0,
+            "mikrotik_cleaned": mikrotik_cleaned if force and customer_count > 0 else 0
         }
         
     except HTTPException:

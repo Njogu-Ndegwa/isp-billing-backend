@@ -54,8 +54,8 @@ async def register_user_api(
             "user_code": user.user_code,
             "role": user.role.value,
             "organization_name": user.organization_name,
-            "business_name": user.business_name,
-            "mpesa_shortcode": user.mpesa_shortcode,
+            "business_name": getattr(user, 'business_name', None),
+            "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None),
             "created_at": user.created_at.isoformat()
         }
     except HTTPException:
@@ -101,8 +101,8 @@ async def login_api(
                 "email": user.email,
                 "role": user.role.value,
                 "organization_name": user.organization_name,
-                "business_name": user.business_name,
-                "mpesa_shortcode": user.mpesa_shortcode
+                "business_name": getattr(user, 'business_name', None),
+                "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None)
             }
         }
     except HTTPException:
