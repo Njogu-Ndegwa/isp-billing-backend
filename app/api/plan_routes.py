@@ -314,7 +314,7 @@ async def get_plan_performance(
         ).join(
             Customer, Customer.plan_id == Plan.id
         ).where(
-            Plan.user_id == user_id,
+            Plan.user_id == user.id,
             Customer.status == CustomerStatus.ACTIVE
         ).group_by(Plan.id)
         
