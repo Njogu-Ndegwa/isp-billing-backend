@@ -81,13 +81,17 @@ async def verify_token(token: str = Depends(oauth2_scheme)) -> dict:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)) -> User:
+async def get_current_user(token = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)) -> User:
     """
     Get current user from JWT token.
     Returns User object from database, ensuring role matches token.
+    Accepts either a raw JWT string or an already-decoded payload dict.
     """
     try:
-        payload = await verify_token(token)
+        if isinstance(token, dict):
+            payload = token
+        else:
+            payload = await verify_token(token)
         user_id = int(payload["user_id"])
         role = payload["role"]
         stmt = select(User).filter(User.id == user_id)
