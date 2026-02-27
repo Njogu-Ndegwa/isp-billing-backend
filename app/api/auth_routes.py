@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
+from typing import Optional
 from datetime import timedelta
 
 from app.db.database import get_db
@@ -20,6 +21,8 @@ class UserRegisterRequest(BaseModel):
     password: str
     role: str
     organization_name: str
+    business_name: Optional[str] = None
+    mpesa_shortcode: Optional[str] = None
 
 
 @router.post("/api/users/register")
@@ -39,7 +42,11 @@ async def register_user_api(
         if existing_result.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="User with this email already exists")
 
-        user = await create_user(db, request.email, request.password, role_enum, request.organization_name)
+        user = await create_user(
+            db, request.email, request.password, role_enum, request.organization_name,
+            business_name=request.business_name,
+            mpesa_shortcode=request.mpesa_shortcode
+        )
 
         return {
             "id": user.id,
@@ -47,6 +54,8 @@ async def register_user_api(
             "user_code": user.user_code,
             "role": user.role.value,
             "organization_name": user.organization_name,
+            "business_name": user.business_name,
+            "mpesa_shortcode": user.mpesa_shortcode,
             "created_at": user.created_at.isoformat()
         }
     except HTTPException:
@@ -91,7 +100,9 @@ async def login_api(
                 "id": user.id,
                 "email": user.email,
                 "role": user.role.value,
-                "organization_name": user.organization_name
+                "organization_name": user.organization_name,
+                "business_name": user.business_name,
+                "mpesa_shortcode": user.mpesa_shortcode
             }
         }
     except HTTPException:

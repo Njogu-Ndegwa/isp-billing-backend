@@ -64,6 +64,8 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     role = Column(Enum(UserRole, name="userrole"), nullable=False)
     organization_name = Column(String, nullable=False)
+    business_name = Column(String(255), nullable=True)
+    mpesa_shortcode = Column(String(20), nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 

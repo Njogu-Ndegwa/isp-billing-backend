@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.db.models import (
     Router, Customer, Plan, MpesaTransaction, MpesaTransactionStatus,
-    CustomerStatus, CustomerPayment, ConnectionType,
+    CustomerStatus, CustomerPayment, ConnectionType, User,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
@@ -375,7 +375,7 @@ async def initiate_mpesa_payment_api(
     token: str = Depends(verify_token)
 ):
     """Initiate M-Pesa payment for existing customer"""
-    await get_current_user(token, db)
+    current_user = await get_current_user(token, db)
     try:
         from app.services.mpesa import initiate_stk_push
         from app.services.mpesa_transactions import save_mpesa_transaction, link_transaction_to_customer
@@ -394,6 +394,12 @@ async def initiate_mpesa_payment_api(
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
         
+        # Get the owner's shortcode for STK push
+        owner_shortcode = None
+        if customer.user_id:
+            owner_result = await db.execute(select(User.mpesa_shortcode).where(User.id == customer.user_id))
+            owner_shortcode = owner_result.scalar_one_or_none()
+        
         reference = f"PAYMENT-{request.customer_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         
         try:
@@ -402,7 +408,8 @@ async def initiate_mpesa_payment_api(
                 amount=request.amount,
                 reference=reference,
                 user_id=customer.user_id,
-                mac_address=customer.mac_address
+                mac_address=customer.mac_address,
+                shortcode=owner_shortcode
             )
         except Exception as stk_error:
             # STK push failed - record the failure so we can track M-Pesa API issues
@@ -490,6 +497,13 @@ async def register_hotspot_and_pay_api(
         if not router:
             raise HTTPException(status_code=404, detail="Router not found")
         user_id = router.user_id
+        
+        # Get the owner's shortcode for STK push
+        owner_shortcode = None
+        if user_id:
+            owner_sc_result = await db.execute(select(User.mpesa_shortcode).where(User.id == user_id))
+            owner_shortcode = owner_sc_result.scalar_one_or_none()
+        
         # Validate plan exists
         plan_stmt = select(Plan).where(Plan.id == request.plan_id)
         plan_result = await db.execute(plan_stmt)
@@ -553,7 +567,8 @@ async def register_hotspot_and_pay_api(
                 stk_response = await initiate_stk_push(
                     phone_number=request.phone,
                     amount=float(plan.price),
-                    reference=reference
+                    reference=reference,
+                    shortcode=owner_shortcode
                 )
                 
                 # Store transaction mapping for callback lookup

@@ -36,20 +36,21 @@ async def get_access_token() -> str:
         logger.error(f"Failed to get M-Pesa access token: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get M-Pesa access token: {str(e)}")
 
-async def initiate_stk_push_direct(phone_number: str, amount: float, reference: str) -> Optional[StkPushResponse]:
+async def initiate_stk_push_direct(phone_number: str, amount: float, reference: str, shortcode: Optional[str] = None) -> Optional[StkPushResponse]:
     try:
         access_token = await get_access_token()
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        password = base64.b64encode(f"{settings.MPESA_SHORTCODE}{settings.MPESA_PASSKEY}{timestamp}".encode()).decode()
+        active_shortcode = shortcode or settings.MPESA_SHORTCODE
+        password = base64.b64encode(f"{active_shortcode}{settings.MPESA_PASSKEY}{timestamp}".encode()).decode()
         
         payload = {
-            "BusinessShortCode": settings.MPESA_SHORTCODE,
+            "BusinessShortCode": active_shortcode,
             "Password": password,
             "Timestamp": timestamp,
             "TransactionType": "CustomerPayBillOnline",
             "Amount": int(amount),
             "PartyA": phone_number,
-            "PartyB": settings.MPESA_SHORTCODE,
+            "PartyB": active_shortcode,
             "PhoneNumber": phone_number,
             "CallBackURL": settings.MPESA_CALLBACK_URL,
             "AccountReference": reference,
@@ -217,11 +218,25 @@ async def initiate_stk_push(
     reference: str,
     user_id: Optional[int] = None,
     mac_address: Optional[str] = None,
-    use_microservice: bool = False
+    use_microservice: bool = False,
+    shortcode: Optional[str] = None
 ):
     """
     Unified STK Push payment initiator.
+    Uses the provided shortcode (user's paybill) if given,
+    falls back to system default on failure.
     """
+    if shortcode and shortcode != settings.MPESA_SHORTCODE:
+        try:
+            return await initiate_stk_push_direct(
+                phone_number=phone_number,
+                amount=amount,
+                reference=reference,
+                shortcode=shortcode
+            )
+        except Exception as e:
+            logger.warning(f"STK Push with user shortcode {shortcode} failed: {e}. Falling back to default.")
+
     return await initiate_stk_push_direct(
         phone_number=phone_number,
         amount=amount,

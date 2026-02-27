@@ -27,15 +27,17 @@ async def generate_unique_user_code(db: AsyncSession) -> int:
         if not result.scalar():
             return user_code
 
-async def create_user(db: AsyncSession, email: str, password: str, role: UserRole, organization_name: str, created_by: int = None):
+async def create_user(db: AsyncSession, email: str, password: str, role: UserRole, organization_name: str, created_by: int = None, business_name: str = None, mpesa_shortcode: str = None):
     hashed_password = pwd_context.hash(password)
     user_code = await generate_unique_user_code(db)
     user = User(
         user_code=user_code,
         email=email,
         password_hash=hashed_password,
-        role=role,  # Enum object handles lowercase
+        role=role,
         organization_name=organization_name,
+        business_name=business_name,
+        mpesa_shortcode=mpesa_shortcode,
         created_by=created_by,
         created_at=datetime.utcnow()
     )
