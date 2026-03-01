@@ -708,14 +708,28 @@ async def get_bandwidth_history(
     - router_id: Optional router ID to filter bandwidth history for a specific router
     """
     try:
-        await get_current_user(token, db)
+        user = await get_current_user(token, db)
         since = datetime.utcnow() - timedelta(hours=hours)
         
-        query = select(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at >= since)
-        
-        # Filter by router_id if provided
+        router_name = None
         if router_id:
-            query = query.where(BandwidthSnapshot.router_id == router_id)
+            router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
+            if not router_obj:
+                raise HTTPException(status_code=404, detail="Router not found or not accessible")
+            router_name = router_obj.name
+            query = select(BandwidthSnapshot).where(
+                BandwidthSnapshot.recorded_at >= since,
+                BandwidthSnapshot.router_id == router_id
+            )
+        else:
+            if user.role.value == "admin":
+                query = select(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at >= since)
+            else:
+                owned_router_ids = select(Router.id).where(Router.user_id == user.id)
+                query = select(BandwidthSnapshot).where(
+                    BandwidthSnapshot.recorded_at >= since,
+                    BandwidthSnapshot.router_id.in_(owned_router_ids)
+                )
         
         result = await db.execute(query.order_by(BandwidthSnapshot.recorded_at.asc()))
         snapshots = result.scalars().all()
@@ -733,13 +747,6 @@ async def get_bandwidth_history(
                 "activeSessions": s.active_sessions
             })
         
-        # Get router name if specified
-        router_name = None
-        if router_id:
-            router_result = await db.execute(select(Router).where(Router.id == router_id))
-            router_obj = router_result.scalar_one_or_none()
-            router_name = router_obj.name if router_obj else None
-        
         return {
             "router_id": router_id,
             "router_name": router_name,
@@ -748,6 +755,8 @@ async def get_bandwidth_history(
             "periodHours": hours,
             "generatedAt": datetime.utcnow().isoformat()
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching bandwidth history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -769,17 +778,35 @@ async def get_top_bandwidth_users(
     - router_id: Optional router ID to filter users for a specific router
     """
     try:
-        await get_current_user(token, db)
-        # Build query with optional router filtering
+        user = await get_current_user(token, db)
+        
+        router_name = None
         if router_id:
-            # Join with Customer to filter by router
-            query = select(UserBandwidthUsage).join(
-                Customer, UserBandwidthUsage.customer_id == Customer.id
-            ).where(
+            router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
+            if not router_obj:
+                raise HTTPException(status_code=404, detail="Router not found or not accessible")
+            router_name = router_obj.name
+
+        if user.role.value == "admin" and not router_id:
+            owned_router_filter = None
+        else:
+            owned_router_ids = select(Router.id).where(Router.user_id == user.id)
+            owned_router_filter = Customer.router_id.in_(owned_router_ids)
+
+        base_join = select(UserBandwidthUsage).join(
+            Customer, UserBandwidthUsage.customer_id == Customer.id
+        )
+
+        if router_id:
+            query = base_join.where(
                 Customer.router_id == router_id
             ).order_by(UserBandwidthUsage.download_bytes.desc()).limit(limit)
+        elif owned_router_filter is not None:
+            query = base_join.where(
+                owned_router_filter
+            ).order_by(UserBandwidthUsage.download_bytes.desc()).limit(limit)
         else:
-            query = select(UserBandwidthUsage).order_by(
+            query = base_join.order_by(
                 UserBandwidthUsage.download_bytes.desc()
             ).limit(limit)
         
@@ -790,7 +817,6 @@ async def get_top_bandwidth_users(
         for u in usage_records:
             total_bytes = u.upload_bytes + u.download_bytes
             
-            # Get customer info
             customer_name = None
             customer_phone = None
             customer_router_id = None
@@ -823,22 +849,18 @@ async def get_top_bandwidth_users(
                 "routerId": customer_router_id
             })
         
-        # Get total count (with optional router filter)
         if router_id:
-            count_query = select(UserBandwidthUsage).join(
+            count_query = select(func.count()).select_from(UserBandwidthUsage).join(
                 Customer, UserBandwidthUsage.customer_id == Customer.id
             ).where(Customer.router_id == router_id)
+        elif owned_router_filter is not None:
+            count_query = select(func.count()).select_from(UserBandwidthUsage).join(
+                Customer, UserBandwidthUsage.customer_id == Customer.id
+            ).where(owned_router_filter)
         else:
-            count_query = select(UserBandwidthUsage)
+            count_query = select(func.count()).select_from(UserBandwidthUsage)
         count_result = await db.execute(count_query)
-        total_count = len(count_result.scalars().all())
-        
-        # Get router name if filtered
-        router_name = None
-        if router_id:
-            router_result = await db.execute(select(Router).where(Router.id == router_id))
-            router_obj = router_result.scalar_one_or_none()
-            router_name = router_obj.name if router_obj else None
+        total_count = count_result.scalar() or 0
         
         return {
             "router_id": router_id,
@@ -847,6 +869,8 @@ async def get_top_bandwidth_users(
             "totalTracked": total_count,
             "generatedAt": datetime.utcnow().isoformat()
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching top users: {e}")
         raise HTTPException(status_code=500, detail=str(e))
