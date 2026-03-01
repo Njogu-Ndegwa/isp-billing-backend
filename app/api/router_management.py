@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import datetime
 
 from app.db.database import get_db
-from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot
+from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User
 from app.services.auth import verify_token, get_current_user
 import logging
 import asyncio
@@ -99,19 +99,25 @@ async def get_router_by_identity(
     db: AsyncSession = Depends(get_db)
 ):
     """Lookup router by MikroTik system identity (for frontend captive portal)"""
-    stmt = select(Router).where(Router.identity == identity)
+    stmt = (
+        select(Router, User.business_name)
+        .join(User, Router.user_id == User.id)
+        .where(Router.identity == identity)
+    )
     result = await db.execute(stmt)
-    router_obj = result.scalar_one_or_none()
+    row = result.one_or_none()
     
-    if not router_obj:
+    if not row:
         raise HTTPException(status_code=404, detail=f"Router with identity '{identity}' not found")
     
+    router_obj, business_name = row
     return {
         "router_id": router_obj.id,
         "name": router_obj.name,
         "identity": router_obj.identity,
         "user_id": router_obj.user_id,
-        "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API'
+        "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API',
+        "business_name": business_name,
     }
 
 
