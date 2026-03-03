@@ -697,6 +697,81 @@ async def sync_customer_queue(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/api/public/portal/{identity}")
+async def get_portal_data(
+    identity: str,
+    connection_type: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Combined endpoint for captive portal landing page.
+    Returns router info, plans, and ads in a single request,
+    eliminating the waterfall of sequential API calls.
+    """
+    from app.db.models import User, Ad
+
+    stmt = (
+        select(Router, User.business_name)
+        .join(User, Router.user_id == User.id)
+        .where(Router.identity == identity)
+    )
+    result = await db.execute(stmt)
+    row = result.one_or_none()
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Router with identity '{identity}' not found")
+
+    router_obj, business_name = row
+
+    plans, ads_data = await asyncio.gather(
+        get_plans_cached(db, router_obj.user_id, connection_type),
+        _fetch_active_ads(db),
+    )
+
+    return {
+        "router": {
+            "router_id": router_obj.id,
+            "name": router_obj.name,
+            "identity": router_obj.identity,
+            "user_id": router_obj.user_id,
+            "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API',
+            "business_name": business_name,
+        },
+        "plans": plans,
+        "ads": ads_data,
+    }
+
+
+async def _fetch_active_ads(db: AsyncSession, limit: int = 20):
+    stmt = (
+        select(Ad)
+        .where(Ad.is_active == True)
+        .where(or_(Ad.expires_at == None, Ad.expires_at > datetime.utcnow()))
+        .order_by(Ad.priority.desc(), Ad.created_at.desc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    ads = result.scalars().all()
+    return [
+        {
+            "id": ad.id,
+            "title": ad.title,
+            "description": ad.description,
+            "image_url": ad.image_url,
+            "seller_name": ad.seller_name,
+            "seller_location": ad.seller_location,
+            "phone_number": ad.phone_number,
+            "whatsapp_number": ad.whatsapp_number,
+            "price": ad.price,
+            "price_value": ad.price_value,
+            "badge_type": ad.badge_type.value if ad.badge_type else None,
+            "badge_text": ad.badge_text,
+            "category": ad.category,
+        }
+        for ad in ads
+    ]
+
+
 @router.get("/api/public/plans/{router_id}")
 async def get_public_plans(
     router_id: int,
