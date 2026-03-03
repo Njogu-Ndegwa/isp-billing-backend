@@ -484,11 +484,16 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
         result = await db.execute(stmt)
         all_customers = result.scalars().all()
 
+        now = datetime.utcnow()
+        grace_period = timedelta(minutes=5)
         active_macs = set()
         for c in all_customers:
             normalized = normalize_mac_address(c.mac_address)
-            if c.status == CustomerStatus.ACTIVE:
+            if c.status in (CustomerStatus.ACTIVE, CustomerStatus.PENDING):
                 active_macs.add(normalized)
+            elif c.expiry and c.expiry > (now - grace_period):
+                active_macs.add(normalized)
+                logger.debug(f"[SAFETY-NET] Grace period: keeping {normalized} (expiry: {c.expiry})")
 
         for router in routers:
             if getattr(router, 'auth_method', None) == 'RADIUS':
