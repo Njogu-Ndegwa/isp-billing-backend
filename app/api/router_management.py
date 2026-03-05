@@ -28,6 +28,43 @@ class RouterCreateRequest(BaseModel):
     port: int = 8728
     payment_methods: Optional[List[str]] = None
 
+    @field_validator("name", "identity", "ip_address", "username", "password", mode="before")
+    @classmethod
+    def strip_and_nullify(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            return v if v else None
+        return v
+
+    @field_validator("payment_methods")
+    @classmethod
+    def validate_payment_methods(cls, v):
+        if v is None:
+            return None
+        if not v:
+            raise ValueError("payment_methods cannot be empty")
+        invalid = set(v) - VALID_PAYMENT_METHODS
+        if invalid:
+            raise ValueError(f"Invalid payment method(s): {invalid}. Must be: {VALID_PAYMENT_METHODS}")
+        return list(set(v))
+
+
+class RouterUpdateRequest(BaseModel):
+    name: str
+    ip_address: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    port: int = 8728
+    payment_methods: Optional[List[str]] = None
+
+    @field_validator("name", "ip_address", "username", "password", mode="before")
+    @classmethod
+    def strip_and_nullify(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            return v if v else None
+        return v
+
     @field_validator("payment_methods")
     @classmethod
     def validate_payment_methods(cls, v):
@@ -175,7 +212,7 @@ async def update_router_identity(
 @router.put("/api/routers/{router_id}")
 async def update_router(
     router_id: int,
-    request: RouterCreateRequest,
+    request: RouterUpdateRequest,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
@@ -191,9 +228,11 @@ async def update_router(
         
         router_obj.name = request.name
         router_obj.ip_address = request.ip_address
-        router_obj.username = request.username
-        router_obj.password = request.password
         router_obj.port = request.port
+        if request.username is not None:
+            router_obj.username = request.username
+        if request.password is not None:
+            router_obj.password = request.password
         if request.payment_methods is not None:
             router_obj.payment_methods = request.payment_methods
         
