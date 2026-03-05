@@ -112,6 +112,7 @@ async def create_router_api(
         if existing_result.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Router with this IP address already exists")
         
+        
         router_obj = Router(
             user_id=user.id,
             name=request.name,
