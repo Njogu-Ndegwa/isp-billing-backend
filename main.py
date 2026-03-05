@@ -37,6 +37,7 @@ from app.api.dashboard_routes import router as dashboard_router
 from app.api.mikrotik_routes import router as mikrotik_router
 from app.api.ads_routes import router as ads_router
 from app.api.ratings_routes import router as ratings_router
+from app.api.voucher_routes import router as voucher_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -53,6 +54,7 @@ app.include_router(dashboard_router)
 app.include_router(mikrotik_router)
 app.include_router(ads_router)
 app.include_router(ratings_router)
+app.include_router(voucher_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -101,6 +103,42 @@ async def run_radius_migrations():
             logger.info("RADIUS migration: Added auth_method, radius_secret, radius_nas_identifier to routers")
         else:
             logger.info("RADIUS migration: Router columns already exist, skipping")
+
+        # --- Voucher table ---
+        result = await conn.execute(sa_text("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_name = 'vouchers'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                DO $$ BEGIN
+                    CREATE TYPE voucherstatus AS ENUM ('available', 'redeemed', 'expired', 'disabled');
+                EXCEPTION
+                    WHEN duplicate_object THEN null;
+                END $$;
+            """))
+            await conn.execute(sa_text("""
+                CREATE TABLE vouchers (
+                    id SERIAL PRIMARY KEY,
+                    code VARCHAR(9) NOT NULL UNIQUE,
+                    plan_id INTEGER NOT NULL REFERENCES plans(id),
+                    router_id INTEGER REFERENCES routers(id),
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    status voucherstatus NOT NULL DEFAULT 'available',
+                    batch_id VARCHAR(36),
+                    redeemed_by INTEGER REFERENCES customers(id),
+                    redeemed_at TIMESTAMP,
+                    expires_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(sa_text("CREATE INDEX idx_vouchers_code ON vouchers(code)"))
+            await conn.execute(sa_text("CREATE INDEX idx_vouchers_status ON vouchers(status)"))
+            await conn.execute(sa_text("CREATE INDEX idx_vouchers_batch ON vouchers(batch_id)"))
+            await conn.execute(sa_text("CREATE INDEX idx_vouchers_user ON vouchers(user_id)"))
+            logger.info("Voucher migration: Created vouchers table")
+        else:
+            logger.info("Voucher migration: Table already exists, skipping")
 
         result = await conn.execute(sa_text("""
             SELECT table_name FROM information_schema.tables 

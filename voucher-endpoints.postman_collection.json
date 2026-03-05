@@ -1,0 +1,135 @@
+{
+    "info": {
+        "name": "Voucher System - Endpoints",
+        "description": "Voucher generation, management, and redemption endpoints for ISP Billing",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        { "key": "baseUrl", "value": "http://localhost:8000" },
+        { "key": "token", "value": "your-jwt-token-here" }
+    ],
+    "item": [
+        {
+            "name": "Admin / Reseller Endpoints",
+            "item": [
+                {
+                    "name": "Generate Vouchers (batch)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/vouchers/generate",
+                        "header": [
+                            { "key": "Content-Type", "value": "application/json" },
+                            { "key": "Authorization", "value": "Bearer {{token}}" }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"plan_id\": 1,\n    \"quantity\": 10,\n    \"router_id\": null,\n    \"expires_at\": null\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Generate Single Voucher (on-demand)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/vouchers/generate",
+                        "header": [
+                            { "key": "Content-Type", "value": "application/json" },
+                            { "key": "Authorization", "value": "Bearer {{token}}" }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"plan_id\": 1,\n    \"quantity\": 1\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "List Vouchers",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/vouchers?status=available&page=1&per_page=50",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "vouchers"],
+                            "query": [
+                                { "key": "status", "value": "available", "description": "Filter: available, redeemed, expired, disabled" },
+                                { "key": "plan_id", "value": "", "disabled": true },
+                                { "key": "batch_id", "value": "", "disabled": true },
+                                { "key": "router_id", "value": "", "disabled": true },
+                                { "key": "page", "value": "1" },
+                                { "key": "per_page", "value": "50" }
+                            ]
+                        },
+                        "header": [
+                            { "key": "Authorization", "value": "Bearer {{token}}" }
+                        ]
+                    }
+                },
+                {
+                    "name": "Voucher Stats",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/vouchers/stats",
+                        "header": [
+                            { "key": "Authorization", "value": "Bearer {{token}}" }
+                        ]
+                    }
+                },
+                {
+                    "name": "Download Vouchers CSV",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/vouchers/download?status=available",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "vouchers", "download"],
+                            "query": [
+                                { "key": "status", "value": "available" },
+                                { "key": "batch_id", "value": "", "disabled": true },
+                                { "key": "plan_id", "value": "", "disabled": true }
+                            ]
+                        },
+                        "header": [
+                            { "key": "Authorization", "value": "Bearer {{token}}" }
+                        ]
+                    }
+                },
+                {
+                    "name": "Disable Voucher",
+                    "request": {
+                        "method": "PATCH",
+                        "url": "{{baseUrl}}/api/vouchers/1/disable",
+                        "header": [
+                            { "key": "Authorization", "value": "Bearer {{token}}" }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Public / Captive Portal Endpoints",
+            "item": [
+                {
+                    "name": "Verify Voucher Code",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/public/voucher/verify/4839-2910"
+                    }
+                },
+                {
+                    "name": "Redeem Voucher Code",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/public/voucher/redeem",
+                        "header": [
+                            { "key": "Content-Type", "value": "application/json" }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"code\": \"4839-2910\",\n    \"mac_address\": \"AA:BB:CC:DD:EE:FF\",\n    \"router_id\": \"1\"\n}"
+                        }
+                    }
+                }
+            ]
+        }
+    ]
+}

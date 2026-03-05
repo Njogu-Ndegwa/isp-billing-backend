@@ -265,6 +265,13 @@ class UserBandwidthUsage(Base):
 # ADS MODELS
 # ========================================
 
+class VoucherStatus(str, enum.Enum):
+    AVAILABLE = "available"
+    REDEEMED = "redeemed"
+    EXPIRED = "expired"
+    DISABLED = "disabled"
+
+
 class AdBadgeType(str, enum.Enum):
     HOT = "hot"
     NEW = "new"
@@ -274,6 +281,25 @@ class AdClickType(str, enum.Enum):
     VIEW_DETAILS = "view_details"
     CALL = "call"
     WHATSAPP = "whatsapp"
+
+class Voucher(Base):
+    __tablename__ = "vouchers"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(9), unique=True, nullable=False, index=True)  # XXXX-XXXX
+    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    status = Column(Enum(VoucherStatus, name="voucherstatus"), nullable=False, default=VoucherStatus.AVAILABLE)
+    batch_id = Column(String(36), nullable=True, index=True)
+    redeemed_by = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    redeemed_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    plan = relationship("Plan")
+    router = relationship("Router")
+    user = relationship("User", backref="vouchers")
+    customer = relationship("Customer", foreign_keys=[redeemed_by])
+
 
 class Advertiser(Base):
     __tablename__ = "advertisers"

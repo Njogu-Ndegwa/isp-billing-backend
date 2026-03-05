@@ -772,6 +772,68 @@ async def _fetch_active_ads(db: AsyncSession, limit: int = 20):
     ]
 
 
+@router.post("/api/public/voucher/redeem")
+async def redeem_voucher_public(
+    payload: Dict[str, str],
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Redeem a voucher code on the captive portal.
+    No auth required -- customer enters code + connects to WiFi.
+
+    Expected payload:
+    {
+        "code": "4839-2910",
+        "mac_address": "AA:BB:CC:DD:EE:FF",
+        "router_id": 1
+    }
+    """
+    code = (payload.get("code") or "").strip()
+    mac_address = payload.get("mac_address", "")
+    router_id_str = payload.get("router_id", "")
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Voucher code is required")
+    if not mac_address:
+        raise HTTPException(status_code=400, detail="MAC address is required")
+    if not router_id_str:
+        raise HTTPException(status_code=400, detail="Router ID is required")
+
+    try:
+        rid = int(router_id_str)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid router ID")
+
+    if not validate_mac_address(mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address format")
+
+    from app.services.voucher_service import redeem_voucher
+    result = await redeem_voucher(db, code, mac_address, rid)
+
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Redemption failed"))
+
+    return result
+
+
+@router.get("/api/public/voucher/verify/{code}")
+async def verify_voucher_public(
+    code: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Check if a voucher code is valid without redeeming it.
+    Returns plan details so the customer knows what they're getting.
+    """
+    from app.services.voucher_service import verify_voucher
+    result = await verify_voucher(db, code)
+
+    if not result.get("valid"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Invalid voucher"))
+
+    return result
+
+
 @router.get("/api/public/plans/{router_id}")
 async def get_public_plans(
     router_id: int,
