@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, field_validator
+from typing import Optional, List
 from datetime import datetime
 
 from app.db.database import get_db
@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["routers"])
 
 
+VALID_PAYMENT_METHODS = {"mpesa", "voucher"}
+
+
 class RouterCreateRequest(BaseModel):
     name: str
     identity: Optional[str] = None
@@ -23,6 +26,19 @@ class RouterCreateRequest(BaseModel):
     username: str
     password: str
     port: int = 8728
+    payment_methods: Optional[List[str]] = None
+
+    @field_validator("payment_methods")
+    @classmethod
+    def validate_payment_methods(cls, v):
+        if v is None:
+            return None
+        if not v:
+            raise ValueError("payment_methods cannot be empty")
+        invalid = set(v) - VALID_PAYMENT_METHODS
+        if invalid:
+            raise ValueError(f"Invalid payment method(s): {invalid}. Must be: {VALID_PAYMENT_METHODS}")
+        return list(set(v))
 
 
 class RouterIdentityUpdate(BaseModel):
@@ -39,7 +55,7 @@ async def get_routers(
     stmt = select(Router).where(Router.user_id == user.id)
     result = await db.execute(stmt)
     routers = result.scalars().all()
-    return [{"id": r.id, "name": r.name, "identity": r.identity, "ip_address": r.ip_address, "port": r.port, "auth_method": getattr(r, 'auth_method', 'DIRECT_API') or 'DIRECT_API'} for r in routers]
+    return [{"id": r.id, "name": r.name, "identity": r.identity, "ip_address": r.ip_address, "port": r.port, "auth_method": getattr(r, 'auth_method', 'DIRECT_API') or 'DIRECT_API', "payment_methods": getattr(r, 'payment_methods', None) or ["mpesa", "voucher"]} for r in routers]
 
 
 @router.post("/api/routers/create")
@@ -66,7 +82,8 @@ async def create_router_api(
             ip_address=request.ip_address,
             username=request.username,
             password=request.password,
-            port=request.port
+            port=request.port,
+            payment_methods=request.payment_methods or ["mpesa", "voucher"],
         )
         
         db.add(router_obj)
@@ -83,6 +100,7 @@ async def create_router_api(
             "username": router_obj.username,
             "port": router_obj.port,
             "user_id": router_obj.user_id,
+            "payment_methods": router_obj.payment_methods,
             "created_at": router_obj.created_at.isoformat()
         }
     except HTTPException:
@@ -118,6 +136,7 @@ async def get_router_by_identity(
         "user_id": router_obj.user_id,
         "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API',
         "business_name": business_name,
+        "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
     }
 
 
@@ -175,6 +194,8 @@ async def update_router(
         router_obj.username = request.username
         router_obj.password = request.password
         router_obj.port = request.port
+        if request.payment_methods is not None:
+            router_obj.payment_methods = request.payment_methods
         
         await db.commit()
         await db.refresh(router_obj)
@@ -186,6 +207,7 @@ async def update_router(
             "username": router_obj.username,
             "port": router_obj.port,
             "user_id": router_obj.user_id,
+            "payment_methods": router_obj.payment_methods,
             "updated_at": datetime.utcnow().isoformat()
         }
         

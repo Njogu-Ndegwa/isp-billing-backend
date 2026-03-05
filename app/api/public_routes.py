@@ -736,6 +736,7 @@ async def get_portal_data(
             "user_id": router_obj.user_id,
             "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API',
             "business_name": business_name,
+            "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
         },
         "plans": plans,
         "ads": ads_data,
