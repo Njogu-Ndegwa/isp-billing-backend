@@ -289,7 +289,10 @@ class Voucher(Base):
     plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    status = Column(Enum(VoucherStatus, name="voucherstatus"), nullable=False, default=VoucherStatus.AVAILABLE)
+    status = Column(
+        Enum(VoucherStatus, name="voucherstatus", values_callable=lambda e: [x.value for x in e]),
+        nullable=False, default=VoucherStatus.AVAILABLE
+    )
     batch_id = Column(String(36), nullable=True, index=True)
     redeemed_by = Column(Integer, ForeignKey("customers.id"), nullable=True)
     redeemed_at = Column(DateTime, nullable=True)
