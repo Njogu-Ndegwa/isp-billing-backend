@@ -22,6 +22,7 @@ class UserRegisterRequest(BaseModel):
     role: str
     organization_name: str
     business_name: Optional[str] = None
+    support_phone: Optional[str] = None
     mpesa_shortcode: Optional[str] = None
 
 
@@ -45,6 +46,7 @@ async def register_user_api(
         user = await create_user(
             db, request.email, request.password, role_enum, request.organization_name,
             business_name=request.business_name,
+            support_phone=request.support_phone,
             mpesa_shortcode=request.mpesa_shortcode
         )
 
@@ -55,6 +57,7 @@ async def register_user_api(
             "role": user.role.value,
             "organization_name": user.organization_name,
             "business_name": getattr(user, 'business_name', None),
+            "support_phone": getattr(user, 'support_phone', None),
             "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None),
             "created_at": user.created_at.isoformat()
         }
@@ -102,6 +105,7 @@ async def login_api(
                 "role": user.role.value,
                 "organization_name": user.organization_name,
                 "business_name": getattr(user, 'business_name', None),
+                "support_phone": getattr(user, 'support_phone', None),
                 "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None)
             }
         }

@@ -27,7 +27,7 @@ async def generate_unique_user_code(db: AsyncSession) -> int:
         if not result.scalar():
             return user_code
 
-async def create_user(db: AsyncSession, email: str, password: str, role: UserRole, organization_name: str, created_by: int = None, business_name: str = None, mpesa_shortcode: str = None):
+async def create_user(db: AsyncSession, email: str, password: str, role: UserRole, organization_name: str, created_by: int = None, business_name: str = None, support_phone: str = None, mpesa_shortcode: str = None):
     hashed_password = pwd_context.hash(password)
     user_code = await generate_unique_user_code(db)
     user = User(
@@ -37,6 +37,7 @@ async def create_user(db: AsyncSession, email: str, password: str, role: UserRol
         role=role,
         organization_name=organization_name,
         business_name=business_name,
+        support_phone=support_phone,
         mpesa_shortcode=mpesa_shortcode,
         created_by=created_by,
         created_at=datetime.utcnow()

@@ -711,7 +711,7 @@ async def get_portal_data(
     from app.db.models import User, Ad
 
     stmt = (
-        select(Router, User.business_name)
+        select(Router, User.business_name, User.support_phone)
         .join(User, Router.user_id == User.id)
         .where(Router.identity == identity)
     )
@@ -721,7 +721,7 @@ async def get_portal_data(
     if not row:
         raise HTTPException(status_code=404, detail=f"Router with identity '{identity}' not found")
 
-    router_obj, business_name = row
+    router_obj, business_name, support_phone = row
 
     plans, ads_data = await asyncio.gather(
         get_plans_cached(db, router_obj.user_id, connection_type),
@@ -737,6 +737,7 @@ async def get_portal_data(
             "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API',
             "business_name": business_name,
             "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
+            "support_phone": support_phone,
         },
         "plans": plans,
         "ads": ads_data,
