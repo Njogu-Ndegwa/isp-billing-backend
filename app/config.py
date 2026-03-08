@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     MPESA_CALLBACK_URL: str
     MPESA_ENVIRONMENT: str
 
+    # Router Auto-Provisioning
+    SERVER_PUBLIC_IP: str = ""
+    WG_MANAGER_URL: str = "http://host.docker.internal:8729"
+    WG_MANAGER_SECRET: str = "change-me-wg-secret"
+    PROVISION_BASE_URL: str = "https://isp.bitwavetechnologies.com"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -362,3 +362,35 @@ class AdImpression(Base):
     placement = Column(String(100), nullable=True)
     ad_ids = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ProvisioningTokenStatus(str, enum.Enum):
+    PENDING = "pending"
+    PROVISIONED = "provisioned"
+    EXPIRED = "expired"
+
+
+class ProvisioningToken(Base):
+    __tablename__ = "provisioning_tokens"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    router_name = Column(String, nullable=False)
+    identity = Column(String, nullable=False)
+    wireguard_ip = Column(String(15), nullable=False)
+    ssid = Column(String(100), nullable=False, default="Bitwave WiFi")
+    router_admin_password = Column(String, nullable=False, default="admin")
+    wg_private_key = Column(String, nullable=False)
+    wg_public_key = Column(String, nullable=False)
+    server_wg_pubkey = Column(String, nullable=False)
+    server_public_ip = Column(String(45), nullable=False)
+    payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
+    status = Column(
+        Enum(ProvisioningTokenStatus, name="provisioningtokenstatus"),
+        nullable=False,
+        default=ProvisioningTokenStatus.PENDING,
+        server_default="pending"
+    )
+    created_at = Column(DateTime, default=datetime.utcnow)
+    provisioned_at = Column(DateTime, nullable=True)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)

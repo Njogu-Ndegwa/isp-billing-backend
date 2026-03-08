@@ -48,7 +48,6 @@ The router will prompt you to **press the physical reset button** within ~60 sec
 /system/device-mode/print
 ```
 
-
 Confirm `hotspot: yes` before proceeding.
 
 > **Why this matters:** Without this step, the hotspot setup wizard will appear to succeed

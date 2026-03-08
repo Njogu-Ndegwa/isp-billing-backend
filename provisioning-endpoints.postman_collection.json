@@ -1,0 +1,62 @@
+{
+    "info": {
+        "name": "Router Provisioning - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "authToken", "value": "YOUR_JWT_TOKEN_HERE"},
+        {"key": "provisionToken", "value": "PROVISION_TOKEN_HERE"}
+    ],
+    "item": [
+        {
+            "name": "Create Provisioning Token",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/provision/create",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{authToken}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"router_name\": \"Westlands-001\",\n    \"identity\": \"Router-0010\",\n    \"ssid\": \"Bitwave WiFi\",\n    \"router_admin_password\": \"SecurePass123\",\n    \"payment_methods\": [\"mpesa\", \"voucher\"]\n}"
+                }
+            }
+        },
+        {
+            "name": "List Provisioning Tokens",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/provision/tokens",
+                "header": [
+                    {"key": "Authorization", "value": "Bearer {{authToken}}"}
+                ]
+            }
+        },
+        {
+            "name": "Get Provisioning Script (.rsc)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/provision/{{provisionToken}}",
+                "header": []
+            }
+        },
+        {
+            "name": "Get Login Page (login.html)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/provision/{{provisionToken}}/login-page",
+                "header": []
+            }
+        },
+        {
+            "name": "Complete Provisioning (Router Callback)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/provision/{{provisionToken}}/complete",
+                "header": []
+            }
+        }
+    ]
+}
