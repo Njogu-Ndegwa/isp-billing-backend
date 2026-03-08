@@ -44,7 +44,7 @@ services:
       - MPESA_PASSKEY=${MPESA_PASSKEY}
       - MPESA_CALLBACK_URL=${MPESA_CALLBACK_URL}
       - MPESA_ENVIRONMENT=${MPESA_ENVIRONMENT}
-      - SERVER_PUBLIC_IP=${SERVER_PUBLIC_IP}
+      - SERVER_PUBLIC_IP=54.91.202.229
       - WG_MANAGER_URL=${WG_MANAGER_URL:-http://host.docker.internal:8729}
       - WG_MANAGER_SECRET=${WG_MANAGER_SECRET:-change-me-wg-secret}
       - PROVISION_BASE_URL=${PROVISION_BASE_URL:-https://isp.bitwavetechnologies.com}
