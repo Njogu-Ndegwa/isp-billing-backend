@@ -64,6 +64,14 @@ jobs:
             echo "ERROR: radius/ directory not found"; exit 1
           fi
           
+          echo "[5.5/7] Building WireGuard Manager image..."
+          if [ -d "wg-manager" ]; then
+            docker build -t isp-billing-wg-manager:latest ./wg-manager/ || { echo "ERROR: WG Manager build failed"; exit 1; }
+            echo "WG Manager image built successfully"
+          else
+            echo "WARNING: wg-manager/ directory not found, skipping"
+          fi
+          
           echo "[6/7] Restarting containers with Docker Hub image..."
           docker compose down
           docker rmi isp-billing-web 2>/dev/null || true
