@@ -20,7 +20,7 @@
                 ],
                 "body": {
                     "mode": "raw",
-                    "raw": "{\n    \"router_name\": \"Westlands-001\",\n    \"identity\": \"Router-0010\",\n    \"ssid\": \"Bitwave WiFi\",\n    \"router_admin_password\": \"SecurePass123\",\n    \"payment_methods\": [\"mpesa\", \"voucher\"]\n}"
+                    "raw": "{\n    \"payment_methods\": [\"mpesa\", \"voucher\"]\n}"
                 }
             }
         },

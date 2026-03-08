@@ -1,5 +1,7 @@
 import base64
 import uuid
+import secrets
+import string
 import ipaddress
 import logging
 import os
@@ -10,9 +12,9 @@ import httpx
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
-from app.db.models import Router, ProvisioningToken, ProvisioningTokenStatus
+from app.db.models import Router, ProvisioningToken, ProvisioningTokenStatus, User
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,14 @@ LOGIN_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
     "captive-portal-login.html"
 )
+
+API_USERNAME = "bitwave-api"
+
+
+def generate_api_password(length: int = 24) -> str:
+    """Generate a secure random password for the MikroTik API service account."""
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
 def generate_wireguard_keypair() -> Tuple[str, str]:
@@ -143,11 +153,7 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 :log info "Provisioning: WAN setup complete, waiting for DHCP lease..."
 :delay 8s
 
-# ---- STEP 2: WIRELESS SETUP ----
-
-:do {{ /interface wireless security-profiles set default mode=none }} on-error={{}}
-:do {{ /interface wireless set wlan1 mode=ap-bridge ssid="{token.ssid}" security-profile=default disabled=no }} on-error={{}}
-:do {{ /interface bridge port add interface=wlan1 bridge=bridge }} on-error={{}}
+# ---- STEP 2: LAN SETUP ----
 
 # Bridge IP (may already exist on factory default)
 :do {{ /ip address add address=192.168.88.1/24 interface=bridge }} on-error={{}}
@@ -157,7 +163,7 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 :do {{ /ip dhcp-server add name=dhcp1 interface=bridge address-pool=dhcp-pool disabled=no }} on-error={{}}
 :do {{ /ip dhcp-server network add address=192.168.88.0/24 gateway=192.168.88.1 dns-server=8.8.8.8,8.8.4.4 }} on-error={{}}
 
-:log info "Provisioning: Wireless and DHCP setup complete"
+:log info "Provisioning: LAN and DHCP setup complete"
 
 # ---- STEP 3: WIREGUARD VPN ----
 
@@ -213,12 +219,12 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 /ip service set api address=10.0.0.1/32 port=8728 disabled=no
 :do {{ /ip firewall filter add chain=input protocol=tcp dst-port=8728 src-address=10.0.0.1 action=accept comment="Allow API from AWS" place-before=0 }} on-error={{}}
 
-# ---- STEP 8: SET ROUTER IDENTITY & ADMIN PASSWORD ----
+# ---- STEP 8: CREATE API SERVICE ACCOUNT & SET IDENTITY ----
 
 /system identity set name={token.identity}
-:do {{ /user set admin password="{token.router_admin_password}" }} on-error={{}}
+:do {{ /user add name={API_USERNAME} password="{token.router_admin_password}" group=full comment="Bitwave backend API account" }} on-error={{}}
 
-:log info "Provisioning: Identity set to {token.identity}"
+:log info "Provisioning: Identity set to {token.identity}, API user created"
 
 # ---- STEP 9: NOTIFY SERVER (register router in database) ----
 
@@ -238,21 +244,59 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 """
 
 
+async def _generate_identity(db: AsyncSession) -> str:
+    """Generate the next unique router identity like Router-0005."""
+    router_count = await db.execute(select(func.count(Router.id)))
+    token_count = await db.execute(select(func.count(ProvisioningToken.id)))
+    next_num = (router_count.scalar() or 0) + (token_count.scalar() or 0) + 1
+
+    for attempt in range(next_num, next_num + 100):
+        candidate = f"Router-{attempt:04d}"
+        r = await db.execute(select(Router).where(Router.identity == candidate))
+        t = await db.execute(
+            select(ProvisioningToken).where(
+                ProvisioningToken.identity == candidate,
+                ProvisioningToken.status == ProvisioningTokenStatus.PENDING,
+            )
+        )
+        if not r.scalar_one_or_none() and not t.scalar_one_or_none():
+            return candidate
+
+    raise ValueError("Could not generate a unique router identity")
+
+
+async def _generate_router_name(db: AsyncSession, user_id: int) -> str:
+    """Generate a router name like 'Bitwave Technologies #3'."""
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalar_one_or_none()
+    base_name = (user.business_name or user.organization_name) if user else "Router"
+
+    router_count_result = await db.execute(
+        select(func.count(Router.id)).where(Router.user_id == user_id)
+    )
+    token_count_result = await db.execute(
+        select(func.count(ProvisioningToken.id)).where(
+            ProvisioningToken.user_id == user_id,
+            ProvisioningToken.status == ProvisioningTokenStatus.PENDING,
+        )
+    )
+    total = (router_count_result.scalar() or 0) + (token_count_result.scalar() or 0)
+    return f"{base_name} #{total + 1}"
+
+
 async def create_provisioning_token(
     db: AsyncSession,
     user_id: int,
-    router_name: str,
-    identity: str,
-    ssid: str = "Bitwave WiFi",
-    router_admin_password: str = "admin",
     payment_methods: Optional[list] = None,
 ) -> ProvisioningToken:
     """
     Full provisioning flow:
-    1. Generate WireGuard keypair
-    2. Allocate next available VPN IP
-    3. Register peer on server's WireGuard via sidecar
-    4. Save token to database
+    1. Auto-generate router name and identity
+    2. Generate WireGuard keypair
+    3. Allocate next available VPN IP
+    4. Register peer on server's WireGuard via sidecar
+    5. Auto-generate API service account password
+    6. Save token to database
     """
     if not settings.SERVER_PUBLIC_IP:
         raise ValueError(
@@ -260,24 +304,12 @@ async def create_provisioning_token(
             "Set it to your AWS server's public IP in .env"
         )
 
-    # Check identity uniqueness across routers and pending tokens
-    existing_router = await db.execute(
-        select(Router).where(Router.identity == identity)
-    )
-    if existing_router.scalar_one_or_none():
-        raise ValueError(f"Identity '{identity}' is already assigned to an existing router")
-
-    existing_token = await db.execute(
-        select(ProvisioningToken).where(
-            ProvisioningToken.identity == identity,
-            ProvisioningToken.status == ProvisioningTokenStatus.PENDING,
-        )
-    )
-    if existing_token.scalar_one_or_none():
-        raise ValueError(f"Identity '{identity}' already has a pending provisioning token")
+    router_name = await _generate_router_name(db, user_id)
+    identity = await _generate_identity(db)
 
     wg_private_key, wg_public_key = generate_wireguard_keypair()
     wg_ip = await allocate_wireguard_ip(db)
+    api_password = generate_api_password()
 
     # Register the peer on the server's WireGuard (only adds — never modifies existing peers)
     await register_wireguard_peer(wg_public_key, wg_ip)
@@ -291,8 +323,8 @@ async def create_provisioning_token(
             router_name=router_name,
             identity=identity,
             wireguard_ip=wg_ip,
-            ssid=ssid,
-            router_admin_password=router_admin_password,
+            ssid="N/A",
+            router_admin_password=api_password,
             wg_private_key=wg_private_key,
             wg_public_key=wg_public_key,
             server_wg_pubkey=server_wg_pubkey,
@@ -340,7 +372,7 @@ async def complete_provisioning(
         name=token.router_name,
         identity=token.identity,
         ip_address=token.wireguard_ip,
-        username="admin",
+        username=API_USERNAME,
         password=token.router_admin_password,
         port=8728,
         payment_methods=token.payment_methods,

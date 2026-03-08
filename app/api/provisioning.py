@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 from typing import Optional, List
 import logging
 
@@ -24,21 +24,7 @@ router = APIRouter(tags=["provisioning"])
 
 
 class ProvisionCreateRequest(BaseModel):
-    router_name: str
-    identity: str
-    ssid: str = "Bitwave WiFi"
-    router_admin_password: str = "admin"
     payment_methods: Optional[List[str]] = None
-
-    @field_validator("router_name", "identity", "ssid", mode="before")
-    @classmethod
-    def strip_whitespace(cls, v):
-        if isinstance(v, str):
-            v = v.strip()
-            if not v:
-                raise ValueError("Field cannot be empty")
-            return v
-        return v
 
 
 # ── Authenticated endpoints ──────────────────────────────────────────────
@@ -59,10 +45,6 @@ async def create_provision_token(
         token_obj = await create_provisioning_token(
             db=db,
             user_id=user.id,
-            router_name=request.router_name,
-            identity=request.identity,
-            ssid=request.ssid,
-            router_admin_password=request.router_admin_password,
             payment_methods=request.payment_methods,
         )
     except ValueError as e:
@@ -78,9 +60,9 @@ async def create_provision_token(
 
     return {
         "token": token_obj.token,
+        "router_name": token_obj.router_name,
         "identity": token_obj.identity,
         "wireguard_ip": token_obj.wireguard_ip,
-        "ssid": token_obj.ssid,
         "command": command,
         "note": (
             "IMPORTANT: Before running this command on the MikroTik, ensure "
@@ -114,7 +96,6 @@ async def list_provision_tokens(
             "router_name": t.router_name,
             "identity": t.identity,
             "wireguard_ip": t.wireguard_ip,
-            "ssid": t.ssid,
             "status": t.status.value if hasattr(t.status, "value") else t.status,
             "expired": is_token_expired(t) and t.status == ProvisioningTokenStatus.PENDING,
             "command": build_provision_command(t) if t.status == ProvisioningTokenStatus.PENDING and not is_token_expired(t) else None,
