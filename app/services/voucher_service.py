@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db.models import (
     Voucher, VoucherStatus, Plan, Router, Customer, CustomerStatus,
-    PaymentMethod, RouterAuthMethod, CustomerPayment
+    PaymentMethod, RouterAuthMethod
 )
 from app.services.reseller_payments import record_customer_payment
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
@@ -217,7 +217,7 @@ async def redeem_voucher(
         customer_id=customer.id,
         reseller_id=voucher.user_id,
         amount=float(plan.price),
-        payment_method=PaymentMethod.VOUCHER,
+        payment_method=PaymentMethod.CASH,
         days_paid_for=days_paid_for,
         payment_reference=f"VOUCHER-{code}",
         notes=f"Voucher redemption. Batch: {voucher.batch_id}",

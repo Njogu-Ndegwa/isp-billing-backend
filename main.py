@@ -155,16 +155,6 @@ async def run_radius_migrations():
         else:
             logger.info("Voucher migration: Table already exists, skipping")
 
-        # --- Add 'voucher' value to paymentmethod enum ---
-        await conn.execute(sa_text("""
-            DO $$ BEGIN
-                ALTER TYPE paymentmethod ADD VALUE IF NOT EXISTS 'voucher';
-            EXCEPTION
-                WHEN duplicate_object THEN null;
-            END $$;
-        """))
-        logger.info("Migration: Ensured 'voucher' value exists in paymentmethod enum")
-
         # --- Indexes on customer_payments for fast transaction queries ---
         await conn.execute(sa_text(
             "CREATE INDEX IF NOT EXISTS idx_cp_reseller_id ON customer_payments(reseller_id)"

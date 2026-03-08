@@ -42,7 +42,6 @@ enum PaymentMethod << (E,#FFDDAA) >> {
     MOBILE_MONEY
     BANK_TRANSFER
     CARD
-    VOUCHER
     OTHER
 }
 

@@ -49,7 +49,6 @@ class PaymentMethod(str, enum.Enum):
     MOBILE_MONEY = "mobile_money"
     BANK_TRANSFER = "bank_transfer"
     CARD = "card"
-    VOUCHER = "voucher"
     OTHER = "other"
 
 class DurationUnit(str, enum.Enum):
