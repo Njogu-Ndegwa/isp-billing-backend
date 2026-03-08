@@ -38,6 +38,7 @@ from app.api.mikrotik_routes import router as mikrotik_router
 from app.api.ads_routes import router as ads_router
 from app.api.ratings_routes import router as ratings_router
 from app.api.voucher_routes import router as voucher_router
+from app.api.provisioning import router as provisioning_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -55,6 +56,7 @@ app.include_router(mikrotik_router)
 app.include_router(ads_router)
 app.include_router(ratings_router)
 app.include_router(voucher_router)
+app.include_router(provisioning_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -172,6 +174,53 @@ async def run_radius_migrations():
             "CREATE INDEX IF NOT EXISTS idx_mpesa_tx_lipay ON mpesa_transactions(lipay_tx_no)"
         ))
         logger.info("Migration: Ensured indexes exist on customer_payments and mpesa_transactions")
+
+        # --- Provisioning tokens table ---
+        result = await conn.execute(sa_text("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_name = 'provisioning_tokens'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                DO $$ BEGIN
+                    CREATE TYPE provisioningtokenstatus AS ENUM ('pending', 'provisioned', 'expired');
+                EXCEPTION
+                    WHEN duplicate_object THEN null;
+                END $$;
+            """))
+            await conn.execute(sa_text("""
+                CREATE TABLE provisioning_tokens (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    token VARCHAR(64) NOT NULL UNIQUE,
+                    router_name VARCHAR(255) NOT NULL,
+                    identity VARCHAR(255) NOT NULL,
+                    wireguard_ip VARCHAR(15) NOT NULL,
+                    ssid VARCHAR(100) NOT NULL DEFAULT 'Bitwave WiFi',
+                    router_admin_password VARCHAR(255) NOT NULL DEFAULT 'admin',
+                    wg_private_key TEXT NOT NULL,
+                    wg_public_key TEXT NOT NULL,
+                    server_wg_pubkey TEXT NOT NULL,
+                    server_public_ip VARCHAR(45) NOT NULL,
+                    payment_methods JSON NOT NULL DEFAULT '["mpesa", "voucher"]',
+                    status provisioningtokenstatus NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    provisioned_at TIMESTAMP,
+                    router_id INTEGER REFERENCES routers(id)
+                )
+            """))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_provisioning_tokens_token ON provisioning_tokens(token)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_provisioning_tokens_user ON provisioning_tokens(user_id)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_provisioning_tokens_status ON provisioning_tokens(status)"
+            ))
+            logger.info("Migration: Created provisioning_tokens table")
+        else:
+            logger.info("Migration: provisioning_tokens table already exists, skipping")
 
         result = await conn.execute(sa_text("""
             SELECT table_name FROM information_schema.tables 
