@@ -386,7 +386,7 @@ class ProvisioningToken(Base):
     server_public_ip = Column(String(45), nullable=False)
     payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
     status = Column(
-        Enum(ProvisioningTokenStatus, name="provisioningtokenstatus"),
+        Enum(ProvisioningTokenStatus, name="provisioningtokenstatus", values_callable=lambda e: [x.value for x in e]),
         nullable=False,
         default=ProvisioningTokenStatus.PENDING,
         server_default="pending"
