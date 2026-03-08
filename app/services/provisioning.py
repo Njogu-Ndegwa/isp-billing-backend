@@ -19,6 +19,16 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+WG_SOCKET_PATH = "/var/run/wg-manager/wg-manager.sock"
+
+
+def _wg_client(timeout: int = 10) -> httpx.AsyncClient:
+    """Get an httpx client for the wg-manager. Uses Unix socket if available, TCP otherwise."""
+    if os.path.exists(WG_SOCKET_PATH):
+        transport = httpx.AsyncHTTPTransport(uds=WG_SOCKET_PATH)
+        return httpx.AsyncClient(transport=transport, base_url="http://localhost", timeout=timeout)
+    return httpx.AsyncClient(base_url=settings.WG_MANAGER_URL, timeout=timeout)
+
 WG_SUBNET = ipaddress.IPv4Network("10.0.0.0/24")
 WG_SERVER_IP = ipaddress.IPv4Address("10.0.0.1")
 TOKEN_EXPIRY_HOURS = 24
@@ -78,9 +88,9 @@ async def allocate_wireguard_ip(db: AsyncSession) -> str:
 
 async def register_wireguard_peer(public_key: str, ip: str):
     """Register a new WireGuard peer via the wg-manager sidecar."""
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with _wg_client() as client:
         response = await client.post(
-            f"{settings.WG_MANAGER_URL}/add-peer",
+            "/add-peer",
             json={"public_key": public_key, "allowed_ips": f"{ip}/32"},
             headers={"X-API-Key": settings.WG_MANAGER_SECRET}
         )
@@ -90,10 +100,10 @@ async def register_wireguard_peer(public_key: str, ip: str):
 
 async def remove_wireguard_peer(public_key: str):
     """Remove a WireGuard peer via the wg-manager sidecar."""
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with _wg_client() as client:
         response = await client.request(
             "DELETE",
-            f"{settings.WG_MANAGER_URL}/remove-peer",
+            "/remove-peer",
             json={"public_key": public_key},
             headers={"X-API-Key": settings.WG_MANAGER_SECRET}
         )
@@ -103,9 +113,9 @@ async def remove_wireguard_peer(public_key: str):
 
 async def get_server_wg_public_key() -> str:
     """Fetch the server's WireGuard public key from the wg-manager sidecar."""
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with _wg_client() as client:
         response = await client.get(
-            f"{settings.WG_MANAGER_URL}/server-info",
+            "/server-info",
             headers={"X-API-Key": settings.WG_MANAGER_SECRET}
         )
         response.raise_for_status()

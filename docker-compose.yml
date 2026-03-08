@@ -48,6 +48,8 @@ services:
       - WG_MANAGER_URL=${WG_MANAGER_URL:-http://host.docker.internal:8729}
       - WG_MANAGER_SECRET=${WG_MANAGER_SECRET:-change-me-wg-secret}
       - PROVISION_BASE_URL=${PROVISION_BASE_URL:-https://isp.bitwavetechnologies.com}
+    volumes:
+      - wg_sock:/var/run/wg-manager
     depends_on:
       db:
         condition: service_healthy
@@ -85,10 +87,13 @@ services:
     environment:
       - WG_MANAGER_SECRET=${WG_MANAGER_SECRET:-change-me-wg-secret}
       - WG_INTERFACE=${WG_INTERFACE:-wg0}
+    volumes:
+      - wg_sock:/var/run/wg-manager
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  wg_sock:
 
 networks:
   isp-network:

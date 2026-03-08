@@ -9,5 +9,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
-EXPOSE 8729
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8729"]
+RUN mkdir -p /var/run/wg-manager
+CMD ["uvicorn", "main:app", "--uds", "/var/run/wg-manager/wg-manager.sock"]

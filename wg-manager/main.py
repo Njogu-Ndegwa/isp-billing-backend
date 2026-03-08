@@ -135,4 +135,9 @@ def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8729)
+    socket_path = os.environ.get("WG_SOCKET_PATH", "/var/run/wg-manager/wg-manager.sock")
+    if os.environ.get("WG_USE_TCP"):
+        uvicorn.run(app, host="0.0.0.0", port=8729)
+    else:
+        os.makedirs(os.path.dirname(socket_path), exist_ok=True)
+        uvicorn.run(app, uds=socket_path)
