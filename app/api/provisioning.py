@@ -50,10 +50,10 @@ async def create_provision_token(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Provisioning token creation failed: {e}")
+        logger.error(f"Provisioning token creation failed: {type(e).__name__}: {repr(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create provisioning token: {e}",
+            detail=f"Failed to create provisioning token: {type(e).__name__}: {e}",
         )
 
     command = build_provision_command(token_obj)

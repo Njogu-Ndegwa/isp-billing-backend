@@ -90,14 +90,30 @@ def list_peers(_=Depends(verify_secret)):
 @app.get("/server-info")
 def server_info(_=Depends(verify_secret)):
     """Return the server's WireGuard public key."""
+    # Try reading from file first, fall back to `wg show`
     try:
         with open(SERVER_PUBLIC_KEY_PATH) as f:
             public_key = f.read().strip()
-        return {"public_key": public_key, "interface": WG_INTERFACE}
+        if public_key:
+            return {"public_key": public_key, "interface": WG_INTERFACE}
+    except FileNotFoundError:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["wg", "show", WG_INTERFACE, "public-key"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return {"public_key": result.stdout.strip(), "interface": WG_INTERFACE}
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not read public key: wg returned '{result.stderr.strip()}'"
+        )
     except FileNotFoundError:
         raise HTTPException(
             status_code=500,
-            detail=f"Server public key not found at {SERVER_PUBLIC_KEY_PATH}"
+            detail="wg command not found — is wireguard-tools installed?"
         )
 
 

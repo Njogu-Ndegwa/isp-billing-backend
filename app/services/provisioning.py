@@ -336,8 +336,8 @@ async def create_provisioning_token(
         db.add(token_obj)
         await db.commit()
         await db.refresh(token_obj)
-    except Exception:
-        # Roll back the WG peer if DB save or key fetch fails
+    except Exception as inner_err:
+        logger.error(f"Provisioning failed after WG peer added: {type(inner_err).__name__}: {repr(inner_err)}", exc_info=True)
         try:
             await remove_wireguard_peer(wg_public_key)
             logger.info(f"Rolled back WG peer for {wg_ip} after failure")
