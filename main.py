@@ -155,6 +155,34 @@ async def run_radius_migrations():
         else:
             logger.info("Voucher migration: Table already exists, skipping")
 
+        # --- Add 'voucher' value to paymentmethod enum ---
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                ALTER TYPE paymentmethod ADD VALUE IF NOT EXISTS 'voucher';
+            EXCEPTION
+                WHEN duplicate_object THEN null;
+            END $$;
+        """))
+        logger.info("Migration: Ensured 'voucher' value exists in paymentmethod enum")
+
+        # --- Indexes on customer_payments for fast transaction queries ---
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_cp_reseller_id ON customer_payments(reseller_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_cp_created_at ON customer_payments(created_at DESC)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_cp_payment_method ON customer_payments(payment_method)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_cp_lipay_tx_no ON customer_payments(lipay_tx_no)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_mpesa_tx_lipay ON mpesa_transactions(lipay_tx_no)"
+        ))
+        logger.info("Migration: Ensured indexes exist on customer_payments and mpesa_transactions")
+
         result = await conn.execute(sa_text("""
             SELECT table_name FROM information_schema.tables 
             WHERE table_name = 'radius_check'

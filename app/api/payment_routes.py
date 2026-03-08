@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.db.models import (
     Router, Customer, Plan, MpesaTransaction, MpesaTransactionStatus,
-    CustomerStatus, CustomerPayment, ConnectionType, User,
+    CustomerStatus, CustomerPayment, ConnectionType, User, PaymentMethod,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
@@ -682,196 +682,365 @@ async def get_payment_status(
 @router.get("/api/mpesa/transactions")
 async def get_mpesa_transactions(
     router_id: Optional[int] = None,
+    payment_method: Optional[str] = None,
+    date: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     status: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
     """
-    Get M-Pesa transactions with filters
-    
+    Get all transactions (M-Pesa, voucher, cash, etc.) with filters.
+
+    Merges two sources:
+    - mpesa_transactions (includes pending/failed M-Pesa)
+    - customer_payments where payment_method != mobile_money (voucher, cash, etc.)
+
     Query Parameters:
     - router_id: Filter by specific router (optional)
-    - start_date: Start date (ISO format: 2025-10-20 or 2025-10-20T10:30:00)
-    - end_date: End date (ISO format: 2025-10-21 or 2025-10-21T23:59:59)
-    - status: Filter by status (pending, completed, failed, expired)
+    - payment_method: Filter by type -- mobile_money, voucher, cash, card, etc. (optional)
+    - date: Exact date filter (YYYY-MM-DD) -- returns transactions for that day only (optional)
+    - start_date: Range start (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) (optional)
+    - end_date: Range end (ISO format) (optional)
+    - status: Filter by status -- completed, pending, failed, expired (optional)
+    - limit: Max results per page (default 200)
+    - offset: Skip first N results for pagination (default 0)
     """
     try:
         user = await get_current_user(token, db)
-        # Build base query joining transactions with customers and routers
-        stmt = select(MpesaTransaction, Customer, Router, Plan).join(
-            Customer, MpesaTransaction.customer_id == Customer.id, isouter=True
-        ).join(
-            Router, Customer.router_id == Router.id, isouter=True
-        ).join(
-            Plan, Customer.plan_id == Plan.id, isouter=True
-        ).where(
-            (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
-        )
-        
-        # Apply router filter
-        if router_id:
-            stmt = stmt.where(Router.id == router_id)
-        
-        # Apply date range filter
-        if start_date:
+
+        # Parse date filters once
+        date_start = None
+        date_end = None
+        if date:
             try:
-                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                stmt = stmt.where(MpesaTransaction.created_at >= start_dt)
+                date_start = datetime.strptime(date, "%Y-%m-%d")
+                date_end = date_start.replace(hour=23, minute=59, second=59)
             except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid start_date format. Use ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)")
-        
-        if end_date:
-            try:
-                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                # If only date provided, set to end of day
-                if 'T' not in end_date:
-                    end_dt = end_dt.replace(hour=23, minute=59, second=59)
-                stmt = stmt.where(MpesaTransaction.created_at <= end_dt)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid end_date format. Use ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)")
-        
-        # Apply status filter
-        if status:
-            try:
-                status_enum = MpesaTransactionStatus(status.lower())
-                stmt = stmt.where(MpesaTransaction.status == status_enum)
-            except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: pending, completed, failed, expired")
-        
-        # Order by most recent first
-        stmt = stmt.order_by(MpesaTransaction.created_at.desc())
-        
-        result = await db.execute(stmt)
-        transactions = result.all()
-        
-        return [
-            {
-                "transaction_id": tx.id,
-                "checkout_request_id": tx.checkout_request_id,
-                "phone_number": tx.phone_number,
-                "amount": float(tx.amount),
-                "reference": tx.reference,
-                "lipay_tx_no": tx.lipay_tx_no,
-                "status": tx.status.value,
-                "mpesa_receipt_number": tx.mpesa_receipt_number,
-                "result_code": tx.result_code,
-                "result_desc": tx.result_desc,
-                "failure_source": tx.failure_source.value if tx.failure_source else None,
-                "transaction_date": tx.transaction_date.isoformat() if tx.transaction_date else None,
-                "created_at": tx.created_at.isoformat(),
-                "customer": {
-                    "id": customer.id,
-                    "name": customer.name,
-                    "phone": customer.phone,
-                    "mac_address": customer.mac_address,
-                    "status": customer.status.value
-                } if customer else None,
-                "router": {
-                    "id": router.id,
-                    "name": router.name,
-                    "ip_address": router.ip_address
-                } if router else None,
-                "plan": {
-                    "id": plan.id,
-                    "name": plan.name,
-                    "price": plan.price,
-                    "duration_value": plan.duration_value,
-                    "duration_unit": plan.duration_unit.value
-                } if plan else None
-            }
-            for tx, customer, router, plan in transactions
-        ]
-        
+                raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        else:
+            if start_date:
+                try:
+                    date_start = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid start_date format")
+            if end_date:
+                try:
+                    date_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    if "T" not in end_date:
+                        date_end = date_end.replace(hour=23, minute=59, second=59)
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid end_date format")
+
+        results = []
+        want_mpesa = payment_method in (None, "mobile_money")
+        want_other = payment_method != "mobile_money"
+
+        # --- Query 1: M-Pesa transactions (preserves pending/failed/expired) ---
+        if want_mpesa:
+            mpesa_stmt = (
+                select(MpesaTransaction, Customer, Router, Plan)
+                .join(Customer, MpesaTransaction.customer_id == Customer.id, isouter=True)
+                .join(Router, Customer.router_id == Router.id, isouter=True)
+                .join(Plan, Customer.plan_id == Plan.id, isouter=True)
+                .where(
+                    (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
+                )
+            )
+            if router_id:
+                mpesa_stmt = mpesa_stmt.where(Router.id == router_id)
+            if date_start:
+                mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at >= date_start)
+            if date_end:
+                mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at <= date_end)
+            if status:
+                try:
+                    mpesa_status = MpesaTransactionStatus(status.lower())
+                    mpesa_stmt = mpesa_stmt.where(MpesaTransaction.status == mpesa_status)
+                except ValueError:
+                    pass
+
+            mpesa_rows = (await db.execute(mpesa_stmt)).all()
+
+            for tx, customer, rtr, plan in mpesa_rows:
+                results.append({
+                    "transaction_id": tx.id,
+                    "checkout_request_id": tx.checkout_request_id,
+                    "phone_number": tx.phone_number,
+                    "amount": float(tx.amount),
+                    "reference": tx.reference,
+                    "lipay_tx_no": tx.lipay_tx_no,
+                    "status": tx.status.value,
+                    "payment_method": "mobile_money",
+                    "payment_reference": tx.mpesa_receipt_number,
+                    "mpesa_receipt_number": tx.mpesa_receipt_number,
+                    "result_code": tx.result_code,
+                    "result_desc": tx.result_desc,
+                    "failure_source": tx.failure_source.value if tx.failure_source else None,
+                    "transaction_date": tx.transaction_date.isoformat() if tx.transaction_date else None,
+                    "created_at": tx.created_at.isoformat(),
+                    "customer": {
+                        "id": customer.id,
+                        "name": customer.name,
+                        "phone": customer.phone,
+                        "mac_address": customer.mac_address,
+                        "status": customer.status.value,
+                    } if customer else None,
+                    "router": {
+                        "id": rtr.id,
+                        "name": rtr.name,
+                        "ip_address": rtr.ip_address,
+                    } if rtr else None,
+                    "plan": {
+                        "id": plan.id,
+                        "name": plan.name,
+                        "price": plan.price,
+                        "duration_value": plan.duration_value,
+                        "duration_unit": plan.duration_unit.value,
+                    } if plan else None,
+                })
+
+        # --- Query 2: Non-M-Pesa payments (voucher, cash, etc.) ---
+        if want_other:
+            cp_stmt = (
+                select(CustomerPayment, Customer, Router, Plan)
+                .join(Customer, CustomerPayment.customer_id == Customer.id)
+                .outerjoin(Router, Customer.router_id == Router.id)
+                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                .where(
+                    CustomerPayment.reseller_id == user.id,
+                    CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
+                )
+            )
+            if payment_method and payment_method != "mobile_money":
+                try:
+                    pm_enum = PaymentMethod(payment_method.lower())
+                    cp_stmt = cp_stmt.where(CustomerPayment.payment_method == pm_enum)
+                except ValueError:
+                    valid = [m.value for m in PaymentMethod]
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid payment_method. Must be one of: {', '.join(valid)}",
+                    )
+            if router_id:
+                cp_stmt = cp_stmt.where(Customer.router_id == router_id)
+            if date_start:
+                cp_stmt = cp_stmt.where(CustomerPayment.created_at >= date_start)
+            if date_end:
+                cp_stmt = cp_stmt.where(CustomerPayment.created_at <= date_end)
+            if status:
+                if status.lower() in ("failed", "expired"):
+                    pass
+                else:
+                    from app.db.models import PaymentStatus
+                    try:
+                        cp_status = PaymentStatus(status.lower())
+                        cp_stmt = cp_stmt.where(CustomerPayment.status == cp_status)
+                    except ValueError:
+                        pass
+
+            cp_rows = (await db.execute(cp_stmt)).all()
+
+            for pay, customer, rtr, plan in cp_rows:
+                results.append({
+                    "transaction_id": pay.id,
+                    "checkout_request_id": None,
+                    "phone_number": customer.phone if customer else None,
+                    "amount": float(pay.amount),
+                    "reference": pay.payment_reference,
+                    "lipay_tx_no": pay.lipay_tx_no,
+                    "status": "completed" if pay.status and pay.status.value == "completed" else (pay.status.value if pay.status else "completed"),
+                    "payment_method": pay.payment_method.value,
+                    "payment_reference": pay.payment_reference,
+                    "mpesa_receipt_number": None,
+                    "result_code": None,
+                    "result_desc": None,
+                    "failure_source": None,
+                    "transaction_date": pay.payment_date.isoformat() if pay.payment_date else None,
+                    "created_at": pay.created_at.isoformat() if pay.created_at else None,
+                    "customer": {
+                        "id": customer.id,
+                        "name": customer.name,
+                        "phone": customer.phone,
+                        "mac_address": customer.mac_address,
+                        "status": customer.status.value,
+                    } if customer else None,
+                    "router": {
+                        "id": rtr.id,
+                        "name": rtr.name,
+                        "ip_address": rtr.ip_address,
+                    } if rtr else None,
+                    "plan": {
+                        "id": plan.id,
+                        "name": plan.name,
+                        "price": plan.price,
+                        "duration_value": plan.duration_value,
+                        "duration_unit": plan.duration_unit.value,
+                    } if plan else None,
+                })
+
+        # Merge and sort by date descending, then paginate
+        results.sort(key=lambda r: r["created_at"] or "", reverse=True)
+        paginated = results[offset: offset + min(limit, 500)]
+
+        return paginated
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching M-Pesa transactions: {str(e)}")
+        logger.error(f"Error fetching transactions: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch transactions: {str(e)}")
 
 
 @router.get("/api/mpesa/transactions/summary")
 async def get_mpesa_transactions_summary(
     router_id: Optional[int] = None,
+    payment_method: Optional[str] = None,
+    date: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
     """
-    Get M-Pesa transactions summary with statistics
-    
+    Get transactions summary with statistics.
+
+    Uses the same two-query merge as the main transactions endpoint so
+    numbers stay consistent.
+
+    Query Parameters:
+    - router_id, payment_method, date, start_date, end_date (same as /transactions)
+
     Returns:
-    - Total transactions
-    - Total amount
-    - Breakdown by status
-    - Breakdown by router (if applicable)
+    - total_transactions, total_amount
+    - status_breakdown (completed / pending / failed / expired)
+    - method_breakdown (mobile_money / voucher / cash / ...)
+    - router_breakdown
     """
     try:
         user = await get_current_user(token, db)
-        from sqlalchemy import func
-        
-        # Build base query
-        stmt = select(MpesaTransaction, Customer, Router).join(
-            Customer, MpesaTransaction.customer_id == Customer.id, isouter=True
-        ).join(
-            Router, Customer.router_id == Router.id, isouter=True
-        ).where(
-            (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
-        )
-        
-        # Apply filters
-        if router_id:
-            stmt = stmt.where(Router.id == router_id)
-        
-        if start_date:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            stmt = stmt.where(MpesaTransaction.created_at >= start_dt)
-        
-        if end_date:
-            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            if 'T' not in end_date:
-                end_dt = end_dt.replace(hour=23, minute=59, second=59)
-            stmt = stmt.where(MpesaTransaction.created_at <= end_dt)
-        
-        result = await db.execute(stmt)
-        transactions = result.all()
-        
-        # Calculate statistics
-        total_transactions = len(transactions)
-        total_amount = sum(float(tx.amount) for tx, _, _ in transactions)
-        
-        # Breakdown by status
-        status_breakdown = {}
-        for tx, _, _ in transactions:
-            status = tx.status.value
-            if status not in status_breakdown:
-                status_breakdown[status] = {"count": 0, "amount": 0}
-            status_breakdown[status]["count"] += 1
-            status_breakdown[status]["amount"] += float(tx.amount)
-        
-        # Breakdown by router
-        router_breakdown = {}
-        for tx, customer, router in transactions:
-            if router:
-                router_name = router.name
-                if router_name not in router_breakdown:
-                    router_breakdown[router_name] = {"count": 0, "amount": 0, "router_id": router.id}
-                router_breakdown[router_name]["count"] += 1
-                router_breakdown[router_name]["amount"] += float(tx.amount)
-        
+
+        date_start = None
+        date_end = None
+        if date:
+            try:
+                date_start = datetime.strptime(date, "%Y-%m-%d")
+                date_end = date_start.replace(hour=23, minute=59, second=59)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        else:
+            if start_date:
+                date_start = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+            if end_date:
+                date_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                if "T" not in end_date:
+                    date_end = date_end.replace(hour=23, minute=59, second=59)
+
+        rows = []
+        want_mpesa = payment_method in (None, "mobile_money")
+        want_other = payment_method != "mobile_money"
+
+        if want_mpesa:
+            mpesa_stmt = (
+                select(MpesaTransaction, Customer, Router)
+                .join(Customer, MpesaTransaction.customer_id == Customer.id, isouter=True)
+                .join(Router, Customer.router_id == Router.id, isouter=True)
+                .where(
+                    (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
+                )
+            )
+            if router_id:
+                mpesa_stmt = mpesa_stmt.where(Router.id == router_id)
+            if date_start:
+                mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at >= date_start)
+            if date_end:
+                mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at <= date_end)
+
+            for tx, customer, rtr in (await db.execute(mpesa_stmt)).all():
+                rows.append({
+                    "amount": float(tx.amount),
+                    "status": tx.status.value,
+                    "method": "mobile_money",
+                    "router_name": rtr.name if rtr else None,
+                    "router_id": rtr.id if rtr else None,
+                })
+
+        if want_other:
+            cp_stmt = (
+                select(CustomerPayment, Customer, Router)
+                .join(Customer, CustomerPayment.customer_id == Customer.id)
+                .outerjoin(Router, Customer.router_id == Router.id)
+                .where(
+                    CustomerPayment.reseller_id == user.id,
+                    CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
+                )
+            )
+            if payment_method and payment_method != "mobile_money":
+                try:
+                    pm_enum = PaymentMethod(payment_method.lower())
+                    cp_stmt = cp_stmt.where(CustomerPayment.payment_method == pm_enum)
+                except ValueError:
+                    pass
+            if router_id:
+                cp_stmt = cp_stmt.where(Customer.router_id == router_id)
+            if date_start:
+                cp_stmt = cp_stmt.where(CustomerPayment.created_at >= date_start)
+            if date_end:
+                cp_stmt = cp_stmt.where(CustomerPayment.created_at <= date_end)
+
+            for pay, customer, rtr in (await db.execute(cp_stmt)).all():
+                rows.append({
+                    "amount": float(pay.amount),
+                    "status": pay.status.value if pay.status else "completed",
+                    "method": pay.payment_method.value,
+                    "router_name": rtr.name if rtr else None,
+                    "router_id": rtr.id if rtr else None,
+                })
+
+        total_transactions = len(rows)
+        total_amount = sum(r["amount"] for r in rows)
+
+        status_breakdown: dict = {}
+        for r in rows:
+            s = r["status"]
+            if s not in status_breakdown:
+                status_breakdown[s] = {"count": 0, "amount": 0}
+            status_breakdown[s]["count"] += 1
+            status_breakdown[s]["amount"] += r["amount"]
+
+        method_breakdown: dict = {}
+        for r in rows:
+            m = r["method"]
+            if m not in method_breakdown:
+                method_breakdown[m] = {"count": 0, "amount": 0}
+            method_breakdown[m]["count"] += 1
+            method_breakdown[m]["amount"] += r["amount"]
+
+        router_breakdown: dict = {}
+        for r in rows:
+            if r["router_name"]:
+                rname = r["router_name"]
+                if rname not in router_breakdown:
+                    router_breakdown[rname] = {"count": 0, "amount": 0, "router_id": r["router_id"]}
+                router_breakdown[rname]["count"] += 1
+                router_breakdown[rname]["amount"] += r["amount"]
+
         return {
             "total_transactions": total_transactions,
             "total_amount": total_amount,
             "status_breakdown": status_breakdown,
+            "method_breakdown": method_breakdown,
             "router_breakdown": router_breakdown,
             "period": {
+                "date": date,
                 "start_date": start_date,
-                "end_date": end_date
-            }
+                "end_date": end_date,
+            },
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -903,8 +1072,7 @@ async def get_failed_mpesa_transactions(
     """
     try:
         user = await get_current_user(token, db)
-        from sqlalchemy import func
-        
+
         # Build query for failed + expired transactions
         stmt = select(MpesaTransaction, Customer, Router, Plan).join(
             Customer, MpesaTransaction.customer_id == Customer.id, isouter=True
@@ -1025,3 +1193,5 @@ async def get_failed_mpesa_transactions(
     except Exception as e:
         logger.error(f"Error fetching failed transactions: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch failed transactions: {str(e)}")
+
+
