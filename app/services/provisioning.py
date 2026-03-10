@@ -144,9 +144,50 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 # Generated: {datetime.utcnow().isoformat()}Z
 # ============================================================
 
+# ---- PRE-FLIGHT: DEVICE-MODE CHECK ----
+# RouterOS v7 device-mode=home blocks hotspot. This CANNOT be fixed
+# by script — it requires a physical button press. Abort early if
+# hotspot is not enabled so the admin knows what to fix.
+{{
+    :local dm [/system/device-mode/get hotspot]
+    :if ($dm != true) do={{
+        :log error "PROVISION ABORTED: device-mode hotspot is disabled. Run: /system/device-mode/update hotspot=yes  then press the physical reset button within 60s. After that, re-run this script."
+        :error "device-mode hotspot not enabled — aborting (see log)"
+    }}
+    :log info "Provisioning: device-mode hotspot=yes confirmed"
+}}
+
 # ---- STEP 1: WAN / INITIAL SETUP ----
 
 :do {{ /interface wireless cap set enabled=no }} on-error={{}}
+
+# Ensure bridge exists (factory-reset may or may not have one)
+:if ([:len [/interface bridge find where name=bridge]] = 0) do={{
+    /interface bridge add name=bridge
+    :log info "Provisioning: created bridge interface"
+}} else={{
+    :log info "Provisioning: bridge interface already exists"
+}}
+
+# Add LAN ethernet ports to bridge (skip ether1 = WAN)
+:foreach iface in={{ether2;ether3;ether4;ether5}} do={{
+    :do {{
+        :if ([:len [/interface find where name=$iface]] > 0) do={{
+            :if ([:len [/interface bridge port find where interface=$iface]] = 0) do={{
+                /interface bridge port add interface=$iface bridge=bridge
+            }}
+        }}
+    }} on-error={{}}
+}}
+
+# Add wlan1 to bridge if it exists
+:do {{
+    :if ([:len [/interface find where name=wlan1]] > 0) do={{
+        :if ([:len [/interface bridge port find where interface=wlan1]] = 0) do={{
+            /interface bridge port add interface=wlan1 bridge=bridge
+        }}
+    }}
+}} on-error={{}}
 
 # Remove ether1 from bridge — WAN port must NOT be in hotspot bridge
 :do {{ /interface bridge port remove [find where interface=ether1] }} on-error={{}}
@@ -190,13 +231,31 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 
 # ---- STEP 4: HOTSPOT SETUP (non-interactive, replaces wizard) ----
 
-:do {{ /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=hotspot }} on-error={{}}
-:do {{ /ip hotspot add name=hotspot1 interface=bridge address-pool=dhcp-pool profile=hsprof1 disabled=no }} on-error={{}}
+# Verify bridge is running before hotspot setup
+:if ([:len [/interface bridge find where name=bridge]] = 0) do={{
+    :log error "PROVISION ABORTED at hotspot step: bridge interface missing"
+    :error "bridge interface does not exist — cannot create hotspot"
+}}
+
+:do {{ /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=hotspot }} on-error={{
+    :log info "Provisioning: hotspot profile hsprof1 already exists, continuing"
+}}
+
+/ip hotspot add name=hotspot1 interface=bridge address-pool=dhcp-pool profile=hsprof1 disabled=no
+
+# Verify hotspot was actually created
+:local hsCount [:len [/ip hotspot find where name=hotspot1]]
+:if ($hsCount = 0) do={{
+    :log error "PROVISION FAILED: hotspot1 was not created"
+    :error "hotspot creation failed — aborting"
+}} else={{
+    :log info "Provisioning: hotspot1 created and running"
+}}
 
 # Safety: ensure ether1 is NOT in bridge after hotspot creation
 :do {{ /interface bridge port remove [find where interface=ether1] }} on-error={{}}
 
-:log info "Provisioning: Hotspot configured"
+:log info "Provisioning: Hotspot step complete"
 
 # ---- STEP 5: DOWNLOAD CUSTOM LOGIN PAGE ----
 
