@@ -1366,3 +1366,162 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error updating WireGuard endpoint: {e}")
             return {"error": str(e)}
+
+    # =========================================================================
+    # PPPoE MANAGEMENT
+    # =========================================================================
+
+    def ensure_pppoe_profile(self, profile_name: str, rate_limit: str,
+                             local_address: str = "", pool_name: str = "") -> Dict[str, Any]:
+        """
+        Ensure a PPPoE profile exists with the specified rate limit.
+        Creates or updates /ppp/profile.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            profiles = self.send_command("/ppp/profile/print")
+            profile_exists = False
+            profile_id = None
+
+            if profiles.get("success") and profiles.get("data"):
+                for profile in profiles["data"]:
+                    if profile.get("name") == profile_name:
+                        profile_exists = True
+                        profile_id = profile.get(".id")
+                        break
+
+            profile_args = {
+                "name": profile_name,
+                "rate-limit": rate_limit,
+            }
+            if local_address:
+                profile_args["local-address"] = local_address
+            if pool_name:
+                profile_args["remote-address"] = pool_name
+
+            if profile_exists:
+                profile_args["numbers"] = profile_id
+                result = self.send_command("/ppp/profile/set", profile_args)
+                logger.info(f"Updated PPPoE profile '{profile_name}' with rate-limit {rate_limit}")
+            else:
+                result = self.send_command("/ppp/profile/add", profile_args)
+                logger.info(f"Created PPPoE profile '{profile_name}' with rate-limit {rate_limit}")
+
+            return result
+        except Exception as e:
+            logger.error(f"Error ensuring PPPoE profile '{profile_name}': {e}")
+            return {"error": str(e)}
+
+    def add_pppoe_secret(self, username: str, password: str, profile: str,
+                         service: str = "pppoe", comment: str = "") -> Dict[str, Any]:
+        """
+        Add a PPPoE secret (customer credentials) on the router.
+        If the secret already exists, update it instead.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            args = {
+                "name": username,
+                "password": password,
+                "profile": profile,
+                "service": service,
+            }
+            if comment:
+                args["comment"] = comment
+
+            result = self.send_command("/ppp/secret/add", args)
+            if "error" in result:
+                if "already have" in result.get("error", ""):
+                    update_args = {
+                        "numbers": username,
+                        "password": password,
+                        "profile": profile,
+                    }
+                    if comment:
+                        update_args["comment"] = comment
+                    result = self.send_command("/ppp/secret/set", update_args)
+                    logger.info(f"Updated existing PPPoE secret for '{username}'")
+                else:
+                    logger.error(f"PPPoE secret add error: {result['error']}")
+                    return result
+            else:
+                logger.info(f"Created PPPoE secret for '{username}' with profile '{profile}'")
+
+            return result
+        except Exception as e:
+            logger.error(f"Error adding PPPoE secret for '{username}': {e}")
+            return {"error": str(e)}
+
+    def remove_pppoe_secret(self, username: str) -> Dict[str, Any]:
+        """Remove a PPPoE secret by username."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            secrets = self.send_command("/ppp/secret/print")
+            if secrets.get("success") and secrets.get("data"):
+                for secret in secrets["data"]:
+                    if secret.get("name") == username:
+                        secret_id = secret.get(".id")
+                        if secret_id:
+                            result = self.send_command("/ppp/secret/remove", {"numbers": secret_id})
+                            logger.info(f"Removed PPPoE secret for '{username}'")
+                            return {"success": True, "action": "removed"}
+
+            return {"success": True, "action": "not_found"}
+        except Exception as e:
+            logger.error(f"Error removing PPPoE secret for '{username}': {e}")
+            return {"error": str(e)}
+
+    def disconnect_pppoe_session(self, username: str) -> Dict[str, Any]:
+        """Disconnect an active PPPoE session by username."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            active = self.send_command("/ppp/active/print")
+            disconnected = 0
+            if active.get("success") and active.get("data"):
+                for session in active["data"]:
+                    if session.get("name") == username:
+                        session_id = session.get(".id")
+                        if session_id:
+                            self.send_command("/ppp/active/remove", {"numbers": session_id})
+                            disconnected += 1
+                            logger.info(f"Disconnected PPPoE session for '{username}'")
+
+            return {"success": True, "disconnected": disconnected}
+        except Exception as e:
+            logger.error(f"Error disconnecting PPPoE session for '{username}': {e}")
+            return {"error": str(e)}
+
+    def get_active_pppoe_sessions(self) -> Dict[str, Any]:
+        """Get all active PPPoE sessions with traffic stats."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ppp/active/print")
+            if result.get("success"):
+                sessions = []
+                for session in result.get("data", []):
+                    sessions.append({
+                        "user": session.get("name", ""),
+                        "service": session.get("service", ""),
+                        "caller_id": session.get("caller-id", ""),
+                        "address": session.get("address", ""),
+                        "uptime": session.get("uptime", ""),
+                        "encoding": session.get("encoding", ""),
+                        "session_id": session.get("session-id", ""),
+                    })
+                return {"success": True, "data": sessions, "count": len(sessions)}
+            return {"error": "Failed to get active PPPoE sessions"}
+        except Exception as e:
+            logger.error(f"Error getting active PPPoE sessions: {e}")
+            return {"error": str(e)}
+
+    def get_pppoe_secrets_minimal(self) -> Dict[str, Any]:
+        """Fetch PPPoE secrets with essential fields."""
+        return self.send_command_optimized(
+            "/ppp/secret/print",
+            proplist=[".id", "name", "profile", "service", "disabled", "comment"]
+        )

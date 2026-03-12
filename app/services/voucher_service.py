@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db.models import (
     Voucher, VoucherStatus, Plan, Router, Customer, CustomerStatus,
-    PaymentMethod, RouterAuthMethod
+    PaymentMethod, RouterAuthMethod, ConnectionType
 )
 from app.services.reseller_payments import record_customer_payment
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
@@ -234,7 +234,10 @@ async def redeem_voucher(
     voucher.redeemed_at = datetime.utcnow()
     await db.commit()
 
-    # Provision based on router auth method
+    # Provision based on connection type and router auth method
+    if plan.connection_type == ConnectionType.PPPOE:
+        return await _provision_pppoe(db, customer, plan, router, code)
+
     auth_method = getattr(router, "auth_method", None)
     use_radius = auth_method == RouterAuthMethod.RADIUS if auth_method else False
 
@@ -336,6 +339,36 @@ async def _provision_direct_api(
         "expiry": customer.expiry.isoformat() if customer.expiry else None,
         "plan_name": plan.name,
         "message": "Voucher redeemed. Internet access is being provisioned.",
+    }
+
+
+async def _provision_pppoe(
+    db: AsyncSession,
+    customer: Customer,
+    plan: Plan,
+    router: Router,
+    code: str,
+) -> Dict[str, Any]:
+    """Provision customer via PPPoE secret on MikroTik."""
+    from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
+
+    if not customer.pppoe_username or not customer.pppoe_password:
+        return {
+            "success": False,
+            "error": "Customer does not have PPPoE credentials. Register with PPPoE username/password first.",
+        }
+
+    pppoe_payload = build_pppoe_payload(customer, router)
+    asyncio.create_task(call_pppoe_provision(pppoe_payload))
+
+    return {
+        "success": True,
+        "customer_id": customer.id,
+        "auth_method": "PPPOE",
+        "pppoe_username": customer.pppoe_username,
+        "expiry": customer.expiry.isoformat() if customer.expiry else None,
+        "plan_name": plan.name,
+        "message": "Voucher redeemed. PPPoE access is being provisioned.",
     }
 
 

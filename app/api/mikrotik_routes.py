@@ -874,3 +874,60 @@ async def get_top_bandwidth_users(
     except Exception as e:
         logger.error(f"Error fetching top users: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# PPPoE MONITORING
+# =============================================================================
+
+def _get_active_pppoe_sync(router_info: dict) -> dict:
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"],
+        router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "Failed to connect to router"}
+    try:
+        return api.get_active_pppoe_sessions()
+    finally:
+        api.disconnect()
+
+
+@router.get("/api/mikrotik/{router_id}/pppoe/active")
+async def get_active_pppoe_sessions(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Get active PPPoE sessions from a router."""
+    try:
+        user = await get_current_user(token, db)
+        router_obj = await get_router_by_id(db, router_id, user.id)
+        if not router_obj:
+            raise HTTPException(status_code=404, detail="Router not found")
+
+        router_info = {
+            "ip": router_obj.ip_address,
+            "username": router_obj.username,
+            "password": router_obj.password,
+            "port": router_obj.port,
+        }
+
+        result = await asyncio.to_thread(_get_active_pppoe_sync, router_info)
+
+        if result.get("error"):
+            raise HTTPException(status_code=502, detail=result["error"])
+
+        return {
+            "router_id": router_id,
+            "router_name": router_obj.name,
+            "sessions": result.get("data", []),
+            "count": result.get("count", 0),
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching PPPoE sessions for router {router_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

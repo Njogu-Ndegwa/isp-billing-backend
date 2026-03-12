@@ -14,6 +14,7 @@ from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.mpesa_transactions import update_mpesa_transaction_status
 from app.services.billing import make_payment
+from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
 from app.config import settings
 import logging
 import json
@@ -307,9 +308,14 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             
             logger.info(f"[AUDIT] Payment recorded: ID {payment.id}, Amount: {amount}, Days: {days_paid_for}")
             
-            # Provision to MikroTik if hotspot
-            if customer.mac_address and customer.router:
-                router = customer.router
+            # Provision based on connection type
+            if customer.plan and customer.plan.connection_type == ConnectionType.PPPOE:
+                if customer.pppoe_username and customer.router:
+                    pppoe_payload = build_pppoe_payload(customer, customer.router)
+                    logger.info(f"Prepared PPPoE Payload for customer {customer.id} -> Router: {customer.router.ip_address}")
+                    background_tasks.add_task(call_pppoe_provision, pppoe_payload)
+            elif customer.mac_address and customer.router:
+                router_obj = customer.router
                 
                 # Convert duration to MikroTik format (m=minutes, h=hours, d=days)
                 duration_unit = plan.duration_unit.value.upper()
@@ -320,7 +326,7 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                 elif duration_unit == "DAYS":
                     time_limit = f"{int(duration_value)}d"
                 else:
-                    time_limit = f"{int(duration_value)}h"  # Default to hours
+                    time_limit = f"{int(duration_value)}h"
                 
                 hotspot_payload = {
                     "mac_address": customer.mac_address,
@@ -329,12 +335,12 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                     "time_limit": time_limit,
                     "bandwidth_limit": f"{plan.speed}",
                     "comment": f"Payment successful for {customer.name}",
-                    "router_ip": router.ip_address,
-                    "router_username": router.username,
-                    "router_password": router.password,
-                    "router_port": router.port,
+                    "router_ip": router_obj.ip_address,
+                    "router_username": router_obj.username,
+                    "router_password": router_obj.password,
+                    "router_port": router_obj.port,
                 }
-                logger.info(f"Prepared MikroTik Payload for customer {customer.id} -> Router: {router.ip_address}")
+                logger.info(f"Prepared MikroTik Payload for customer {customer.id} -> Router: {router_obj.ip_address}")
                 background_tasks.add_task(call_mikrotik_bypass, hotspot_payload)
             
             return {"ResultCode": 0, "ResultDesc": "Payment processed successfully"}

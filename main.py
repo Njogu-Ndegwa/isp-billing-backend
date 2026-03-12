@@ -222,6 +222,36 @@ async def run_radius_migrations():
         else:
             logger.info("Migration: provisioning_tokens table already exists, skipping")
 
+        # --- PPPoE columns on customers table ---
+        result = await conn.execute(sa_text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'customers' AND column_name = 'pppoe_username'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE customers
+                ADD COLUMN pppoe_username VARCHAR NULL,
+                ADD COLUMN pppoe_password VARCHAR NULL
+            """))
+            logger.info("PPPoE migration: Added pppoe_username, pppoe_password to customers")
+        else:
+            logger.info("PPPoE migration: Customer PPPoE columns already exist, skipping")
+
+        # --- ConnectionType enum: ensure 'pppoe' value exists ---
+        result = await conn.execute(sa_text("""
+            SELECT 1 FROM pg_enum
+            WHERE enumlabel = 'pppoe'
+              AND enumtypid = (SELECT oid FROM pg_type WHERE typname = 'connectiontype')
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TYPE connectiontype ADD VALUE IF NOT EXISTS 'pppoe'
+            """))
+            logger.info("PPPoE migration: Added 'pppoe' to connectiontype enum")
+        else:
+            logger.info("PPPoE migration: 'pppoe' value already exists in connectiontype enum, skipping")
+
         result = await conn.execute(sa_text("""
             SELECT table_name FROM information_schema.tables 
             WHERE table_name = 'radius_check'

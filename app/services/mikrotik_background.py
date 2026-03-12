@@ -513,6 +513,65 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
     return total_removed
 
 
+def _cleanup_pppoe_customers_sync(router_pppoe_map: dict) -> dict:
+    """
+    Synchronous PPPoE cleanup -- disconnect sessions and remove secrets
+    for expired PPPoE customers. Mirrors _cleanup_customer_from_mikrotik_sync.
+    """
+    results = {"removed": [], "failed": [], "routers_connected": 0}
+    if not router_pppoe_map:
+        return results
+
+    for router_key, router_data in router_pppoe_map.items():
+        router_info = router_data["router"]
+        customers_data = router_data["customers"]
+        if not customers_data:
+            continue
+
+        logger.info(f"[CRON-PPPoE] Processing {len(customers_data)} PPPoE customers on router {router_info['name']} ({router_info['ip']})")
+
+        api = MikroTikAPI(
+            router_info["ip"], router_info["username"],
+            router_info["password"], router_info["port"],
+            timeout=15, connect_timeout=5,
+        )
+        if not api.connect():
+            logger.error(f"[CRON-PPPoE] Failed to connect to router {router_info['name']}")
+            for cust in customers_data:
+                results["failed"].append({"id": cust["id"], "error": f"Failed to connect to router {router_info['name']}"})
+            continue
+
+        results["routers_connected"] += 1
+
+        for cust in customers_data:
+            try:
+                pppoe_user = cust["pppoe_username"]
+                logger.info(f"[CRON-PPPoE] Removing expired PPPoE user: {pppoe_user} (customer {cust['id']})")
+
+                disconnect_result = api.disconnect_pppoe_session(pppoe_user)
+                remove_result = api.remove_pppoe_secret(pppoe_user)
+
+                if remove_result.get("error"):
+                    results["failed"].append({"id": cust["id"], "error": remove_result["error"]})
+                    logger.error(f"[CRON-PPPoE] Failed to remove secret for {pppoe_user}: {remove_result['error']}")
+                else:
+                    results["removed"].append({
+                        "id": cust["id"],
+                        "details": {
+                            "disconnected": disconnect_result.get("disconnected", 0),
+                            "secret_action": remove_result.get("action", "unknown"),
+                        }
+                    })
+                    logger.info(f"[CRON-PPPoE] Removed PPPoE user {pppoe_user}")
+            except Exception as e:
+                results["failed"].append({"id": cust["id"], "error": str(e)})
+                logger.error(f"[CRON-PPPoE] Error removing customer {cust['id']}: {e}")
+
+        api.disconnect()
+
+    return results
+
+
 async def cleanup_expired_users_background():
     global cleanup_running
     if cleanup_running:
@@ -523,13 +582,18 @@ async def cleanup_expired_users_background():
     try:
         async with AsyncSession(async_engine) as db:
             now = datetime.utcnow()
+            from sqlalchemy import or_
             stmt = select(Customer).options(
-                selectinload(Customer.router)
+                selectinload(Customer.router),
+                selectinload(Customer.plan),
             ).where(
                 Customer.status == CustomerStatus.ACTIVE,
                 Customer.expiry.isnot(None),
                 Customer.expiry <= now,
-                Customer.mac_address.isnot(None)
+                or_(
+                    Customer.mac_address.isnot(None),
+                    Customer.pppoe_username.isnot(None),
+                )
             )
             result = await db.execute(stmt)
             expired_customers = result.scalars().all()
@@ -538,8 +602,34 @@ async def cleanup_expired_users_background():
             logger.info(f"[CRON] Found {len(expired_customers)} expired customers to cleanup")
 
             router_customers_map = {}
+            router_pppoe_map = {}
             no_router_customers = []
+
             for c in expired_customers:
+                is_pppoe = c.pppoe_username and (
+                    not c.mac_address
+                    or (c.plan and c.plan.connection_type and c.plan.connection_type.value == "pppoe")
+                )
+
+                if is_pppoe:
+                    if not c.router:
+                        c.status = CustomerStatus.INACTIVE
+                        continue
+                    router_key = f"{c.router.ip_address}:{c.router.port}"
+                    if router_key not in router_pppoe_map:
+                        router_pppoe_map[router_key] = {
+                            "router": {
+                                "ip": c.router.ip_address, "username": c.router.username,
+                                "password": c.router.password, "port": c.router.port, "name": c.router.name
+                            },
+                            "customers": []
+                        }
+                    router_pppoe_map[router_key]["customers"].append({
+                        "id": c.id, "name": c.name, "pppoe_username": c.pppoe_username,
+                        "expiry": c.expiry, "router_id": c.router_id
+                    })
+                    continue
+
                 if not c.mac_address:
                     continue
                 if c.router and getattr(c.router, 'auth_method', None) == 'RADIUS':
@@ -568,25 +658,47 @@ async def cleanup_expired_users_background():
 
             if no_router_customers:
                 logger.warning(f"[CRON] Skipping {len(no_router_customers)} customer(s) with no router assigned: {[c['id'] for c in no_router_customers]}")
-            logger.info(f"[CRON] Grouped customers across {len(router_customers_map)} router(s)")
 
-            async with mikrotik_lock:
-                mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
+            pppoe_count = sum(len(rd["customers"]) for rd in router_pppoe_map.values())
+            hotspot_count = sum(len(rd["customers"]) for rd in router_customers_map.values())
+            logger.info(f"[CRON] Grouped: {hotspot_count} hotspot across {len(router_customers_map)} router(s), "
+                        f"{pppoe_count} PPPoE across {len(router_pppoe_map)} router(s)")
 
-            if mikrotik_results["routers_connected"] > 0:
-                successful_ids = [r["id"] for r in mikrotik_results["removed"]]
-                failed_ids = [r["id"] for r in mikrotik_results["failed"]]
-                for customer in expired_customers:
-                    if customer.id in successful_ids:
-                        customer.status = CustomerStatus.INACTIVE
-                await db.commit()
-                if failed_ids:
-                    logger.warning(f"[CRON] {len(failed_ids)} customers kept ACTIVE for retry: {failed_ids}")
+            # --- Hotspot cleanup ---
+            mikrotik_results = {"removed": [], "failed": [], "routers_connected": 0}
+            if router_customers_map:
+                async with mikrotik_lock:
+                    mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
+
+            # --- PPPoE cleanup ---
+            pppoe_results = {"removed": [], "failed": [], "routers_connected": 0}
+            if router_pppoe_map:
+                async with mikrotik_lock:
+                    pppoe_results = await asyncio.to_thread(_cleanup_pppoe_customers_sync, router_pppoe_map)
+
+            all_successful_ids = set(
+                [r["id"] for r in mikrotik_results["removed"]] +
+                [r["id"] for r in pppoe_results["removed"]]
+            )
+            all_failed_ids = set(
+                [r["id"] for r in mikrotik_results["failed"]] +
+                [r["id"] for r in pppoe_results["failed"]]
+            )
+
+            for customer in expired_customers:
+                if customer.id in all_successful_ids:
+                    customer.status = CustomerStatus.INACTIVE
+            await db.commit()
+
+            if all_failed_ids:
+                logger.warning(f"[CRON] {len(all_failed_ids)} customers kept ACTIVE for retry: {list(all_failed_ids)}")
 
             duration = (datetime.utcnow() - start_time).total_seconds()
-            removed_count = len(mikrotik_results["removed"])
-            failed_count = len(mikrotik_results["failed"])
-            logger.info(f"[CRON] Cleanup completed in {duration:.2f}s: {removed_count} removed, {failed_count} failed")
+            removed_total = len(mikrotik_results["removed"]) + len(pppoe_results["removed"])
+            failed_total = len(mikrotik_results["failed"]) + len(pppoe_results["failed"])
+            logger.info(f"[CRON] Cleanup completed in {duration:.2f}s: {removed_total} removed "
+                        f"(hotspot={len(mikrotik_results['removed'])}, pppoe={len(pppoe_results['removed'])}), "
+                        f"{failed_total} failed")
 
             try:
                 logger.info(f"[CRON] Running safety net bypass cleanup...")
