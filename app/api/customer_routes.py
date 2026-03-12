@@ -165,7 +165,8 @@ async def get_customers_api(
                 "plan": {
                     "id": c.plan.id,
                     "name": c.plan.name,
-                    "price": c.plan.price
+                    "price": c.plan.price,
+                    "connection_type": c.plan.connection_type.value if c.plan.connection_type else None
                 } if c.plan else None,
                 "router": {
                     "id": c.router.id,
@@ -212,7 +213,8 @@ async def get_active_customers(
                 "plan": {
                     "id": c.plan.id,
                     "name": c.plan.name,
-                    "price": c.plan.price
+                    "price": c.plan.price,
+                    "connection_type": c.plan.connection_type.value if c.plan.connection_type else None
                 } if c.plan else None,
                 "router": {
                     "id": c.router.id,
