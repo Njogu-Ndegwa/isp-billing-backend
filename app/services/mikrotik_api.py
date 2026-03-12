@@ -1609,8 +1609,10 @@ class MikroTikAPI:
         2. Move selected ports from hotspot bridge to bridge-pppoe
         3. Add IP address on bridge-pppoe
         4. Create IP pool for PPPoE clients
-        5. Create PPPoE server on bridge-pppoe
-        6. Add NAT masquerade for PPPoE traffic
+        5. Create default PPPoE profile with pool
+        6. Create PPPoE server on bridge-pppoe
+        7. Add NAT masquerade for PPPoE traffic
+        8. Bypass FastTrack for PPPoE subnet (so PPP rate-limits are enforced)
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -1670,15 +1672,72 @@ class MikroTikAPI:
             time.sleep(0.2)
 
             # 7. Add NAT masquerade for PPPoE subnet (ignore if already exists)
+            pppoe_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
             result = self.send_command("/ip/firewall/nat/add", {
                 "chain": "srcnat",
-                "src-address": pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24",
+                "src-address": pppoe_subnet,
                 "out-interface": "ether1",
                 "action": "masquerade",
                 "comment": "NAT for PPPoE clients",
             })
             if result.get("error") and "already" not in result.get("error", "").lower():
                 errors.append(f"NAT: {result['error']}")
+            time.sleep(0.2)
+
+            # 8. Bypass FastTrack for PPPoE subnet so PPP profile rate-limits are enforced.
+            #    FastTrack skips simple queues (including dynamic ones created by PPP rate-limit),
+            #    so PPPoE traffic must be accepted before the FastTrack rule.
+            PPPOE_FT_SRC_COMMENT = "PPPoE bypass FastTrack (src)"
+            PPPOE_FT_DST_COMMENT = "PPPoE bypass FastTrack (dst)"
+
+            filters_result = self.send_command_optimized(
+                "/ip/firewall/filter/print",
+                proplist=[".id", "chain", "action", "comment", "src-address", "dst-address", "disabled"]
+            )
+            filter_rules = filters_result.get("data", []) if filters_result.get("success") else []
+
+            src_exists = any(
+                r.get("comment") == PPPOE_FT_SRC_COMMENT and r.get("src-address") == pppoe_subnet
+                for r in filter_rules
+            )
+            dst_exists = any(
+                r.get("comment") == PPPOE_FT_DST_COMMENT and r.get("dst-address") == pppoe_subnet
+                for r in filter_rules
+            )
+
+            fasttrack_rule = None
+            for r in filter_rules:
+                if (r.get("chain") == "forward"
+                        and r.get("action") == "fasttrack-connection"
+                        and str(r.get("disabled", "false")).lower() != "true"):
+                    fasttrack_rule = r
+                    break
+
+            if fasttrack_rule:
+                ft_id = fasttrack_rule.get(".id")
+                if not src_exists and ft_id:
+                    result = self.send_command("/ip/firewall/filter/add", {
+                        "chain": "forward",
+                        "src-address": pppoe_subnet,
+                        "action": "accept",
+                        "comment": PPPOE_FT_SRC_COMMENT,
+                        "place-before": ft_id,
+                    })
+                    if result.get("error"):
+                        errors.append(f"FastTrack bypass (src): {result['error']}")
+                if not dst_exists and ft_id:
+                    result = self.send_command("/ip/firewall/filter/add", {
+                        "chain": "forward",
+                        "dst-address": pppoe_subnet,
+                        "action": "accept",
+                        "comment": PPPOE_FT_DST_COMMENT,
+                        "place-before": ft_id,
+                    })
+                    if result.get("error"):
+                        errors.append(f"FastTrack bypass (dst): {result['error']}")
+                logger.info(f"PPPoE FastTrack bypass rules ensured for {pppoe_subnet}")
+            else:
+                logger.info("No FastTrack rule found -- PPPoE rate-limits will work without bypass")
 
             if errors:
                 logger.warning(f"PPPoE infrastructure setup completed with warnings: {errors}")
