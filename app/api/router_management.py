@@ -92,7 +92,7 @@ async def get_routers(
     stmt = select(Router).where(Router.user_id == user.id)
     result = await db.execute(stmt)
     routers = result.scalars().all()
-    return [{"id": r.id, "name": r.name, "identity": r.identity, "ip_address": r.ip_address, "port": r.port, "auth_method": getattr(r, 'auth_method', 'DIRECT_API') or 'DIRECT_API', "payment_methods": getattr(r, 'payment_methods', None) or ["mpesa", "voucher"]} for r in routers]
+    return [{"id": r.id, "name": r.name, "identity": r.identity, "ip_address": r.ip_address, "port": r.port, "auth_method": getattr(r, 'auth_method', 'DIRECT_API') or 'DIRECT_API', "payment_methods": getattr(r, 'payment_methods', None) or ["mpesa", "voucher"], "pppoe_ports": getattr(r, 'pppoe_ports', None)} for r in routers]
 
 
 @router.post("/api/routers/create")
@@ -139,6 +139,7 @@ async def create_router_api(
             "port": router_obj.port,
             "user_id": router_obj.user_id,
             "payment_methods": router_obj.payment_methods,
+            "pppoe_ports": router_obj.pppoe_ports,
             "created_at": router_obj.created_at.isoformat()
         }
     except HTTPException:
@@ -175,6 +176,7 @@ async def get_router_by_identity(
         "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API',
         "business_name": business_name,
         "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
+        "pppoe_ports": getattr(router_obj, 'pppoe_ports', None),
     }
 
 
@@ -248,6 +250,7 @@ async def update_router(
             "port": router_obj.port,
             "user_id": router_obj.user_id,
             "payment_methods": router_obj.payment_methods,
+            "pppoe_ports": router_obj.pppoe_ports,
             "updated_at": datetime.utcnow().isoformat()
         }
         

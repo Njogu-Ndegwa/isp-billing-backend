@@ -1,0 +1,55 @@
+{
+    "info": {
+        "name": "PPPoE Port Configuration - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "routerId", "value": "1"}
+    ],
+    "item": [
+        {
+            "name": "Get Router Ethernet Interfaces",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/interfaces",
+                "header": [
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "description": "Returns all ethernet ports on the router (excluding ether1/WAN) and the currently configured PPPoE ports."
+            }
+        },
+        {
+            "name": "Set PPPoE Ports",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/pppoe-ports",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\"ports\": [\"ether4\", \"ether5\"]}"
+                },
+                "description": "Dedicate selected ethernet ports to PPPoE. Moves them out of the hotspot bridge into a separate PPPoE bridge and sets up the PPPoE server. Pass an empty array to clear PPPoE and restore all ports to hotspot."
+            }
+        },
+        {
+            "name": "Clear PPPoE Ports (restore to hotspot)",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/pppoe-ports",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\"ports\": []}"
+                },
+                "description": "Remove PPPoE configuration and restore all ports back to the hotspot bridge."
+            }
+        }
+    ]
+}

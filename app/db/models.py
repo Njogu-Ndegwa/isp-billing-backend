@@ -193,6 +193,7 @@ class Router(Base):
     radius_secret = Column(String(255), nullable=True)  # Shared secret for RADIUS
     radius_nas_identifier = Column(String(100), nullable=True)  # NAS-Identifier for this router
     payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
+    pppoe_ports = Column(JSON, nullable=True)  # e.g. ["ether4", "ether5"]
 
 class ProvisioningLog(Base):
     __tablename__ = "provisioning_logs"

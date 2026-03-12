@@ -1525,3 +1525,254 @@ class MikroTikAPI:
             "/ppp/secret/print",
             proplist=[".id", "name", "profile", "service", "disabled", "comment"]
         )
+
+    # =========================================================================
+    # PPPoE PORT / BRIDGE MANAGEMENT
+    # =========================================================================
+
+    def get_ethernet_interfaces(self) -> Dict[str, Any]:
+        """Get all ethernet interfaces excluding ether1 (WAN)."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/interface/print")
+            if not result.get("success"):
+                return result
+            interfaces = []
+            for iface in result.get("data", []):
+                if iface.get("type") != "ether":
+                    continue
+                name = iface.get("name", "")
+                if name == "ether1":
+                    continue
+                interfaces.append({
+                    "name": name,
+                    "type": iface.get("type", ""),
+                    "running": iface.get("running") == "true",
+                    "disabled": iface.get("disabled") == "true",
+                })
+            return {"success": True, "data": interfaces}
+        except Exception as e:
+            logger.error(f"Error getting ethernet interfaces: {e}")
+            return {"error": str(e)}
+
+    def remove_bridge_port(self, interface: str) -> Dict[str, Any]:
+        """Remove an interface from whatever bridge it belongs to."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            ports = self.send_command("/interface/bridge/port/print")
+            if ports.get("success") and ports.get("data"):
+                for port in ports["data"]:
+                    if port.get("interface") == interface:
+                        port_id = port.get(".id")
+                        if port_id:
+                            result = self.send_command("/interface/bridge/port/remove", {"numbers": port_id})
+                            logger.info(f"Removed {interface} from bridge")
+                            return {"success": True, "action": "removed"}
+            return {"success": True, "action": "not_found"}
+        except Exception as e:
+            logger.error(f"Error removing bridge port {interface}: {e}")
+            return {"error": str(e)}
+
+    def add_bridge_port(self, interface: str, bridge: str) -> Dict[str, Any]:
+        """Add an interface to a specific bridge."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            self.remove_bridge_port(interface)
+            time.sleep(0.2)
+            result = self.send_command("/interface/bridge/port/add", {
+                "interface": interface,
+                "bridge": bridge,
+            })
+            if result.get("success") or result.get("error", "") == "":
+                logger.info(f"Added {interface} to bridge {bridge}")
+                return {"success": True}
+            return result
+        except Exception as e:
+            logger.error(f"Error adding {interface} to bridge {bridge}: {e}")
+            return {"error": str(e)}
+
+    def setup_pppoe_infrastructure(
+        self,
+        pppoe_ports: List[str],
+        bridge_name: str = "bridge-pppoe",
+        bridge_ip: str = "192.168.89.1/24",
+        pool_name: str = "pppoe-pool",
+        pool_range: str = "192.168.89.2-192.168.89.254",
+        service_name: str = "pppoe-server1",
+    ) -> Dict[str, Any]:
+        """
+        Set up full PPPoE infrastructure on the router:
+        1. Create bridge-pppoe
+        2. Move selected ports from hotspot bridge to bridge-pppoe
+        3. Add IP address on bridge-pppoe
+        4. Create IP pool for PPPoE clients
+        5. Create PPPoE server on bridge-pppoe
+        6. Add NAT masquerade for PPPoE traffic
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        errors = []
+        try:
+            # 1. Create bridge-pppoe (ignore error if already exists)
+            result = self.send_command("/interface/bridge/add", {"name": bridge_name})
+            if result.get("error") and "already" not in result.get("error", "").lower():
+                errors.append(f"Bridge create: {result['error']}")
+            logger.info(f"PPPoE infrastructure: bridge '{bridge_name}' ready")
+            time.sleep(0.2)
+
+            # 2. Move selected ports to bridge-pppoe
+            for port in pppoe_ports:
+                r = self.add_bridge_port(port, bridge_name)
+                if r.get("error"):
+                    errors.append(f"Port {port}: {r['error']}")
+                time.sleep(0.2)
+
+            # 3. Add IP address on bridge-pppoe (ignore if already exists)
+            result = self.send_command("/ip/address/add", {
+                "address": bridge_ip,
+                "interface": bridge_name,
+                "comment": "PPPoE bridge address",
+            })
+            if result.get("error") and "already" not in result.get("error", "").lower():
+                errors.append(f"IP address: {result['error']}")
+            time.sleep(0.2)
+
+            # 4. Create IP pool (ignore if already exists)
+            result = self.send_command("/ip/pool/add", {
+                "name": pool_name,
+                "ranges": pool_range,
+            })
+            if result.get("error") and "already" not in result.get("error", "").lower():
+                errors.append(f"Pool: {result['error']}")
+            time.sleep(0.2)
+
+            # 5. Ensure a default PPPoE profile exists with the pool
+            self.ensure_pppoe_profile(
+                profile_name="default-pppoe",
+                rate_limit="0/0",
+                local_address=bridge_ip.split("/")[0],
+                pool_name=pool_name,
+            )
+            time.sleep(0.2)
+
+            # 6. Create PPPoE server on bridge-pppoe (ignore if already exists)
+            result = self.send_command("/interface/pppoe-server/server/add", {
+                "service-name": service_name,
+                "interface": bridge_name,
+                "default-profile": "default-pppoe",
+                "disabled": "no",
+            })
+            if result.get("error") and "already" not in result.get("error", "").lower():
+                errors.append(f"PPPoE server: {result['error']}")
+            time.sleep(0.2)
+
+            # 7. Add NAT masquerade for PPPoE subnet (ignore if already exists)
+            result = self.send_command("/ip/firewall/nat/add", {
+                "chain": "srcnat",
+                "src-address": pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24",
+                "out-interface": "ether1",
+                "action": "masquerade",
+                "comment": "NAT for PPPoE clients",
+            })
+            if result.get("error") and "already" not in result.get("error", "").lower():
+                errors.append(f"NAT: {result['error']}")
+
+            if errors:
+                logger.warning(f"PPPoE infrastructure setup completed with warnings: {errors}")
+                return {"success": True, "warnings": errors}
+            logger.info("PPPoE infrastructure setup completed successfully")
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Error setting up PPPoE infrastructure: {e}")
+            return {"error": str(e), "partial_errors": errors}
+
+    def teardown_pppoe_infrastructure(
+        self,
+        ports_to_restore: List[str],
+        hotspot_bridge: str = "bridge",
+        bridge_name: str = "bridge-pppoe",
+        pool_name: str = "pppoe-pool",
+        service_name: str = "pppoe-server1",
+    ) -> Dict[str, Any]:
+        """
+        Tear down PPPoE infrastructure and move ports back to hotspot bridge:
+        1. Remove PPPoE server
+        2. Move ports back to hotspot bridge
+        3. Remove bridge-pppoe IP address
+        4. Remove bridge-pppoe
+        5. Remove PPPoE IP pool
+        6. Remove NAT rule for PPPoE
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        errors = []
+        try:
+            # 1. Remove PPPoE server
+            servers = self.send_command("/interface/pppoe-server/server/print")
+            if servers.get("success") and servers.get("data"):
+                for srv in servers["data"]:
+                    if srv.get("service-name") == service_name or srv.get("interface") == bridge_name:
+                        sid = srv.get(".id")
+                        if sid:
+                            self.send_command("/interface/pppoe-server/server/remove", {"numbers": sid})
+                            logger.info(f"Removed PPPoE server '{service_name}'")
+            time.sleep(0.2)
+
+            # 2. Move ports back to hotspot bridge
+            for port in ports_to_restore:
+                r = self.add_bridge_port(port, hotspot_bridge)
+                if r.get("error"):
+                    errors.append(f"Restore port {port}: {r['error']}")
+                time.sleep(0.2)
+
+            # 3. Remove IP addresses on bridge-pppoe
+            addrs = self.send_command("/ip/address/print")
+            if addrs.get("success") and addrs.get("data"):
+                for addr in addrs["data"]:
+                    if addr.get("interface") == bridge_name:
+                        aid = addr.get(".id")
+                        if aid:
+                            self.send_command("/ip/address/remove", {"numbers": aid})
+            time.sleep(0.2)
+
+            # 4. Remove bridge-pppoe
+            bridges = self.send_command("/interface/bridge/print")
+            if bridges.get("success") and bridges.get("data"):
+                for br in bridges["data"]:
+                    if br.get("name") == bridge_name:
+                        bid = br.get(".id")
+                        if bid:
+                            self.send_command("/interface/bridge/remove", {"numbers": bid})
+                            logger.info(f"Removed bridge '{bridge_name}'")
+            time.sleep(0.2)
+
+            # 5. Remove PPPoE pool
+            pools = self.send_command("/ip/pool/print")
+            if pools.get("success") and pools.get("data"):
+                for pool in pools["data"]:
+                    if pool.get("name") == pool_name:
+                        pid = pool.get(".id")
+                        if pid:
+                            self.send_command("/ip/pool/remove", {"numbers": pid})
+                            logger.info(f"Removed IP pool '{pool_name}'")
+            time.sleep(0.2)
+
+            # 6. Remove NAT rule for PPPoE
+            nats = self.send_command("/ip/firewall/nat/print")
+            if nats.get("success") and nats.get("data"):
+                for nat in nats["data"]:
+                    if nat.get("comment") == "NAT for PPPoE clients":
+                        nid = nat.get(".id")
+                        if nid:
+                            self.send_command("/ip/firewall/nat/remove", {"numbers": nid})
+                            logger.info("Removed PPPoE NAT rule")
+
+            if errors:
+                return {"success": True, "warnings": errors}
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Error tearing down PPPoE infrastructure: {e}")
+            return {"error": str(e), "partial_errors": errors}

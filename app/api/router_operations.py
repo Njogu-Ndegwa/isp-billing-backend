@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func
 from sqlalchemy.orm import selectinload
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
@@ -2234,4 +2235,142 @@ async def remove_single_illegal_user(
         "router_name": router_obj.name,
         "message": f"Successfully removed user with MAC {mac_address}",
         "removed": removal_result
+    }
+
+
+# =========================================================================
+# PPPoE PORT CONFIGURATION
+# =========================================================================
+
+def _get_ethernet_interfaces_sync(router_info: dict) -> dict:
+    """Fetch ethernet interfaces from the router (sync, runs in thread pool)."""
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=15,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        return api.get_ethernet_interfaces()
+    finally:
+        api.disconnect()
+
+
+@router.get("/api/routers/{router_id}/interfaces")
+async def get_router_interfaces(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Get available ethernet interfaces from the router (excludes ether1/WAN)."""
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    result = await asyncio.to_thread(_get_ethernet_interfaces_sync, router_info)
+
+    if result.get("error") == "connect_failed":
+        raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    return {
+        "interfaces": result.get("data", []),
+        "pppoe_ports": router_obj.pppoe_ports or [],
+    }
+
+
+class SetPPPoEPortsRequest(BaseModel):
+    ports: List[str]
+
+
+def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list) -> dict:
+    """Apply PPPoE port configuration to the live router (sync, runs in thread pool)."""
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=30,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        # Teardown old config if ports were previously set
+        if old_ports:
+            teardown = api.teardown_pppoe_infrastructure(ports_to_restore=old_ports)
+            if teardown.get("error"):
+                return teardown
+            time.sleep(0.5)
+
+        # Set up new config if ports are selected
+        if new_ports:
+            return api.setup_pppoe_infrastructure(pppoe_ports=new_ports)
+
+        return {"success": True, "message": "PPPoE ports cleared, all ports restored to hotspot bridge"}
+    finally:
+        api.disconnect()
+
+
+@router.put("/api/routers/{router_id}/pppoe-ports")
+async def set_pppoe_ports(
+    router_id: int,
+    request: SetPPPoEPortsRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Configure which ethernet ports are dedicated to PPPoE.
+    Moves selected ports out of the hotspot bridge into a separate PPPoE bridge
+    and sets up the PPPoE server infrastructure.
+    Pass an empty list to remove PPPoE and restore all ports to hotspot.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    # Validate: ether1 cannot be assigned to PPPoE
+    for port in request.ports:
+        if port == "ether1":
+            raise HTTPException(status_code=400, detail="ether1 is the WAN port and cannot be used for PPPoE")
+
+    old_ports = router_obj.pppoe_ports or []
+    new_ports = request.ports
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    result = await asyncio.to_thread(_apply_pppoe_ports_sync, router_info, new_ports, old_ports)
+
+    if result.get("error") == "connect_failed":
+        raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    # Persist to DB
+    router_obj.pppoe_ports = new_ports if new_ports else None
+    await db.commit()
+
+    return {
+        "success": True,
+        "router_id": router_id,
+        "pppoe_ports": new_ports,
+        "warnings": result.get("warnings", []),
+        "message": f"PPPoE ports configured: {', '.join(new_ports)}" if new_ports else "PPPoE ports cleared",
     }
