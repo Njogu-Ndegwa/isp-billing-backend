@@ -353,7 +353,7 @@ Upload `login.html` to the `hotspot` folder on the router. This file redirects u
 ```routeros
 /ip hotspot walled-garden add dst-host=isp-frontend-two.vercel.app action=allow comment="External Portal"
 /ip hotspot walled-garden add dst-host=*.vercel.app action=allow comment="Vercel CDN"
-/ip hotspot walled-garden add dst-host=isp.bitwavetechnologies.com action=allow comment="Backend API"
+/ip hotspot walled-garden add dst-host=isp.bitwavetechnologies.net action=allow comment="Backend API"
 ```
 
 ### 7.2 Allow backend API IP

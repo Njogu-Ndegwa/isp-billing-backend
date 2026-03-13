@@ -21,7 +21,7 @@ This guide focuses **exclusively on guest hotspot users** - customers who pay fo
 ## 🔧 Test Environment Setup
 
 ### Prerequisites
-- ✅ Server running on `https://isp.bitwavetechnologies.com`
+- ✅ Server running on `https://isp.bitwavetechnologies.net`
 - ✅ PostgreSQL database initialized (run `docker exec -it isp_billing_app python init_db.py`)
 - ✅ MikroTik router accessible via WireGuard VPN (10.0.0.2)
 - ✅ Postman installed
@@ -36,7 +36,7 @@ docker exec -it isp_billing_app python init_db.py
 
 **Production:**
 ```
-https://isp.bitwavetechnologies.com
+https://isp.bitwavetechnologies.net
 ```
 
 **Local Testing:**
@@ -70,7 +70,7 @@ Create your admin account (required before creating routers)
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/users/register
+URL: https://isp.bitwavetechnologies.net/api/users/register
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -110,7 +110,7 @@ Authenticate and receive JWT token for protected endpoints
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/auth/login
+URL: https://isp.bitwavetechnologies.net/api/auth/login
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -154,7 +154,7 @@ Add your MikroTik router to the system
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/routers/create
+URL: https://isp.bitwavetechnologies.net/api/routers/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -200,7 +200,7 @@ Create a short-duration guest plan
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/plans/create
+URL: https://isp.bitwavetechnologies.net/api/plans/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -240,7 +240,7 @@ Body: (raw JSON)
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/plans/create
+URL: https://isp.bitwavetechnologies.net/api/plans/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -264,7 +264,7 @@ Body: (raw JSON)
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/plans/create
+URL: https://isp.bitwavetechnologies.net/api/plans/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -292,7 +292,7 @@ Body: (raw JSON)
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/plans/create
+URL: https://isp.bitwavetechnologies.net/api/plans/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -332,7 +332,7 @@ Body: (raw JSON)
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/plans/create
+URL: https://isp.bitwavetechnologies.net/api/plans/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -372,7 +372,7 @@ Body: (raw JSON)
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/plans/create
+URL: https://isp.bitwavetechnologies.net/api/plans/create
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -421,7 +421,7 @@ View all plans with optional filtering by user or connection type
 #### Request - Get All Plans
 ```
 Method: GET
-URL: https://isp.bitwavetechnologies.com/api/plans
+URL: https://isp.bitwavetechnologies.net/api/plans
 Headers: None
 Body: None
 ```
@@ -429,7 +429,7 @@ Body: None
 #### Request - Filter Plans by User
 ```
 Method: GET
-URL: https://isp.bitwavetechnologies.com/api/plans?user_id=1
+URL: https://isp.bitwavetechnologies.net/api/plans?user_id=1
 Headers: None
 Body: None
 ```
@@ -437,7 +437,7 @@ Body: None
 #### Request - Filter Plans by Connection Type
 ```
 Method: GET
-URL: https://isp.bitwavetechnologies.com/api/plans?connection_type=hotspot
+URL: https://isp.bitwavetechnologies.net/api/plans?connection_type=hotspot
 Headers: None
 Body: None
 ```
@@ -445,7 +445,7 @@ Body: None
 #### Request - Combined Filters
 ```
 Method: GET
-URL: https://isp.bitwavetechnologies.com/api/plans?user_id=1&connection_type=hotspot
+URL: https://isp.bitwavetechnologies.net/api/plans?user_id=1&connection_type=hotspot
 Headers: None
 Body: None
 ```
@@ -503,7 +503,7 @@ Delete a specific plan (only if no active customers are using it)
 #### Request
 ```
 Method: DELETE
-URL: https://isp.bitwavetechnologies.com/api/plans/1
+URL: https://isp.bitwavetechnologies.net/api/plans/1
 Headers: None
 Body: None
 ```
@@ -564,7 +564,7 @@ Guest registers and initiates M-Pesa STK Push payment
 #### Request - REST API
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/hotspot/register-and-pay
+URL: https://isp.bitwavetechnologies.net/api/hotspot/register-and-pay
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -623,7 +623,7 @@ Simulate what the payment gateway does after successful payment (for testing wit
 #### Request
 ```
 Method: POST
-URL: https://isp.bitwavetechnologies.com/api/lipay/callback
+URL: https://isp.bitwavetechnologies.net/api/lipay/callback
 Headers: 
     Content-Type: application/json
 Body: (raw JSON)
@@ -681,7 +681,7 @@ Fetch all guest users (customers) with their details including ID, status, expir
 #### Request
 ```
 Method: GET
-URL: https://isp.bitwavetechnologies.com/api/customers
+URL: https://isp.bitwavetechnologies.net/api/customers
 Headers: None
 Body: None
 ```
@@ -774,7 +774,7 @@ Fetch only currently active guests (useful for monitoring who's online)
 #### Request
 ```
 Method: GET
-URL: https://isp.bitwavetechnologies.com/api/customers/active
+URL: https://isp.bitwavetechnologies.net/api/customers/active
 Headers: None
 Body: None
 ```
@@ -847,7 +847,7 @@ Fetch details for a specific customer using their ID
 #### Request
 ```
 Method: GET
-URL: https://isp.bitwavetechnologies.com/api/customers/1
+URL: https://isp.bitwavetechnologies.net/api/customers/1
 Headers: None
 Body: None
 ```
@@ -871,7 +871,7 @@ Verify that customer was auto-created after payment callback
 #### Request
 ```
 Method: GET
-URL: https://isp.bitwavetechnologies.com/api/customers
+URL: https://isp.bitwavetechnologies.net/api/customers
 Headers: None
 Body: None
 ```
@@ -893,7 +893,7 @@ Verify guest is provisioned on MikroTik router (checks hotspot user exists)
 #### Request
 ```
 Method: GET
-URL: https://isp.bitwavetechnologies.com/api/public/mac-status/1/AA:BB:CC:DD:EE:FF
+URL: https://isp.bitwavetechnologies.net/api/public/mac-status/1/AA:BB:CC:DD:EE:FF
 Headers: None
 Body: None
 ```
@@ -1021,7 +1021,7 @@ Completely remove guest from router (after time expires). This removes:
 #### Request
 ```
 Method: DELETE
-URL: https://isp.bitwavetechnologies.com/api/public/remove-bypassed/1/AA:BB:CC:DD:EE:FF
+URL: https://isp.bitwavetechnologies.net/api/public/remove-bypassed/1/AA:BB:CC:DD:EE:FF
 Headers: None
 Body: None
 ```
@@ -1494,7 +1494,7 @@ Remove a plan (only if no active customers using it)
 #### Request
 ```
 Method: DELETE
-URL: https://isp.bitwavetechnologies.com/api/plans/1
+URL: https://isp.bitwavetechnologies.net/api/plans/1
 Headers: None
 Body: None
 ```

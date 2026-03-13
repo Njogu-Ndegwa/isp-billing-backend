@@ -49,11 +49,11 @@
             "request": {
                 "method": "POST",
                 "url": {
-                    "raw": "{{baseUrl}}/api/mikrotik/walled-garden/domain?dst_host=isp.bitwavetechnologies.com&comment=ISP Portal",
+                    "raw": "{{baseUrl}}/api/mikrotik/walled-garden/domain?dst_host=isp.bitwavetechnologies.net&comment=ISP Portal",
                     "host": ["{{baseUrl}}"],
                     "path": ["api", "mikrotik", "walled-garden", "domain"],
                     "query": [
-                        {"key": "dst_host", "value": "isp.bitwavetechnologies.com"},
+                        {"key": "dst_host", "value": "isp.bitwavetechnologies.net"},
                         {"key": "comment", "value": "ISP Portal"}
                     ]
                 },

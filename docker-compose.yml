@@ -47,7 +47,7 @@ services:
       - SERVER_PUBLIC_IP=54.91.202.229
       - WG_MANAGER_URL=${WG_MANAGER_URL:-http://host.docker.internal:8729}
       - WG_MANAGER_SECRET=${WG_MANAGER_SECRET:-change-me-wg-secret}
-      - PROVISION_BASE_URL=${PROVISION_BASE_URL:-https://isp.bitwavetechnologies.com}
+      - PROVISION_BASE_URL=${PROVISION_BASE_URL:-https://isp.bitwavetechnologies.net}
     volumes:
       - wg_sock:/var/run/wg-manager
     depends_on:

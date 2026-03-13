@@ -1,6 +1,6 @@
 # ISP Billing Admin Dashboard API Documentation
 
-**Base URL:** `https://isp.bitwavetechnologies.com/api`
+**Base URL:** `https://isp.bitwavetechnologies.net/api`
 
 ---
 
@@ -17,7 +17,7 @@ Get complete business metrics for dashboard homepage.
 
 **Example Request:**
 ```
-GET https://isp.bitwavetechnologies.com/api/dashboard/overview?user_id=1
+GET https://isp.bitwavetechnologies.net/api/dashboard/overview?user_id=1
 ```
 
 **Example Response:**
