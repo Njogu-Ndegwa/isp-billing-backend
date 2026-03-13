@@ -1,0 +1,101 @@
+{
+    "info": {
+        "name": "Emergency Plans & Special Offers - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        { "key": "baseUrl", "value": "http://localhost:8000" },
+        { "key": "token", "value": "YOUR_JWT_TOKEN" }
+    ],
+    "item": [
+        {
+            "name": "Create Emergency Plan",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/plans/create",
+                "header": [
+                    { "key": "Content-Type", "value": "application/json" },
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"name\": \"Emergency 2Mbps - 24hrs\",\n  \"speed\": \"2M/2M\",\n  \"price\": 20,\n  \"duration_value\": 24,\n  \"duration_unit\": \"HOURS\",\n  \"connection_type\": \"hotspot\",\n  \"plan_type\": \"emergency\",\n  \"is_hidden\": true,\n  \"badge_text\": \"Emergency Deal\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Create Special Offer Plan",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/plans/create",
+                "header": [
+                    { "key": "Content-Type", "value": "application/json" },
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"name\": \"Sorry Deal - 7 Days\",\n  \"speed\": \"10M/5M\",\n  \"price\": 100,\n  \"duration_value\": 7,\n  \"duration_unit\": \"DAYS\",\n  \"connection_type\": \"hotspot\",\n  \"plan_type\": \"special_offer\",\n  \"is_hidden\": false,\n  \"badge_text\": \"50% Off - Compensation\",\n  \"original_price\": 200,\n  \"valid_until\": \"2026-04-01T00:00:00\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Update Plan Type / Visibility",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/plans/1",
+                "header": [
+                    { "key": "Content-Type", "value": "application/json" },
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"plan_type\": \"special_offer\",\n  \"is_hidden\": false,\n  \"badge_text\": \"Limited Time\",\n  \"original_price\": 500,\n  \"valid_until\": \"2026-04-15T23:59:59\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Activate Emergency Mode",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/plans/activate-emergency",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "Deactivate Emergency Mode",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/plans/deactivate-emergency",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "Get All Plans (Admin - includes hidden)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/plans",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "Get Portal Data (Public - with plan_flags)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/public/portal/MyRouter"
+            }
+        },
+        {
+            "name": "Get Public Plans (filtered, no hidden)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/public/plans/1"
+            }
+        }
+    ]
+}

@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment
+from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType
 from app.services.auth import verify_token, get_current_user
 from app.services.plan_cache import get_plans_cached, invalidate_plan_cache
 import logging
@@ -14,6 +14,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["plans"])
+
+VALID_PLAN_TYPES = [pt.value for pt in PlanType]
 
 
 class PlanCreateRequest(BaseModel):
@@ -24,6 +26,11 @@ class PlanCreateRequest(BaseModel):
     duration_unit: str
     connection_type: str
     router_profile: Optional[str] = None
+    plan_type: Optional[str] = "regular"
+    is_hidden: Optional[bool] = False
+    badge_text: Optional[str] = None
+    original_price: Optional[int] = None
+    valid_until: Optional[str] = None
 
 
 class PlanUpdateRequest(BaseModel):
@@ -34,6 +41,11 @@ class PlanUpdateRequest(BaseModel):
     duration_unit: Optional[str] = None
     connection_type: Optional[str] = None
     router_profile: Optional[str] = None
+    plan_type: Optional[str] = None
+    is_hidden: Optional[bool] = None
+    badge_text: Optional[str] = None
+    original_price: Optional[int] = None
+    valid_until: Optional[str] = None
 
 
 @router.post("/api/plans/create")
@@ -71,6 +83,24 @@ async def create_plan_api(
                 detail="Invalid duration unit. Must be 'DAYS' or 'HOURS'"
             )
         
+        # Validate plan_type
+        plan_type_enum = PlanType.REGULAR
+        if request.plan_type:
+            if request.plan_type.lower() not in VALID_PLAN_TYPES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid plan_type. Must be one of: {', '.join(VALID_PLAN_TYPES)}"
+                )
+            plan_type_enum = PlanType(request.plan_type.lower())
+
+        # Parse valid_until if provided
+        valid_until_dt = None
+        if request.valid_until:
+            try:
+                valid_until_dt = datetime.fromisoformat(request.valid_until.replace('Z', '+00:00'))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid valid_until format. Use ISO 8601.")
+
         # Check for duplicate plan name
         existing_plan_stmt = select(Plan).filter(
             Plan.name == request.name,
@@ -80,7 +110,6 @@ async def create_plan_api(
         if existing_result.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Plan with this name already exists")
         
-        # Create new plan
         plan = Plan(
             name=request.name,
             speed=request.speed,
@@ -89,17 +118,21 @@ async def create_plan_api(
             duration_unit=duration_unit_enum,
             connection_type=connection_type_enum,
             user_id=user.id,
-            router_profile=request.router_profile
+            router_profile=request.router_profile,
+            plan_type=plan_type_enum,
+            is_hidden=request.is_hidden or False,
+            badge_text=request.badge_text,
+            original_price=request.original_price,
+            valid_until=valid_until_dt,
         )
         
         db.add(plan)
         await db.commit()
         await db.refresh(plan)
         
-        # Invalidate plan cache after creating new plan
         await invalidate_plan_cache()
         
-        logger.info(f"Plan created: {plan.id} by user {user.id}")
+        logger.info(f"Plan created: {plan.id} (type={plan.plan_type.value}) by user {user.id}")
         
         return {
             "id": plan.id,
@@ -111,6 +144,11 @@ async def create_plan_api(
             "connection_type": plan.connection_type.value,
             "router_profile": plan.router_profile,
             "user_id": plan.user_id,
+            "plan_type": plan.plan_type.value,
+            "is_hidden": plan.is_hidden,
+            "badge_text": plan.badge_text,
+            "original_price": plan.original_price,
+            "valid_until": plan.valid_until.isoformat() if plan.valid_until else None,
             "created_at": plan.created_at.isoformat()
         }
     except HTTPException:
@@ -127,10 +165,11 @@ async def get_plans_api(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Get all plans for the authenticated user with optional connection_type filter - CACHED"""
+    """Get all plans for the authenticated user with optional connection_type filter - CACHED.
+    Admin/reseller sees all plans including hidden ones."""
     try:
         user = await get_current_user(token, db)
-        return await get_plans_cached(db, user.id, connection_type)
+        return await get_plans_cached(db, user.id, connection_type, include_hidden=True)
     except Exception as e:
         logger.error(f"Error fetching plans: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch plans")
@@ -153,7 +192,6 @@ async def update_plan_api(
         if not plan:
             raise HTTPException(status_code=404, detail="Plan not found")
         
-        # Update fields if provided
         if request.name is not None:
             plan.name = request.name
         if request.speed is not None:
@@ -174,12 +212,30 @@ async def update_plan_api(
                 raise HTTPException(status_code=400, detail="Invalid connection_type")
         if request.router_profile is not None:
             plan.router_profile = request.router_profile
+        if request.plan_type is not None:
+            if request.plan_type.lower() not in VALID_PLAN_TYPES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid plan_type. Must be one of: {', '.join(VALID_PLAN_TYPES)}"
+                )
+            plan.plan_type = PlanType(request.plan_type.lower())
+        if request.is_hidden is not None:
+            plan.is_hidden = request.is_hidden
+        if request.badge_text is not None:
+            plan.badge_text = request.badge_text if request.badge_text != "" else None
+        if request.original_price is not None:
+            plan.original_price = request.original_price
+        if request.valid_until is not None:
+            try:
+                plan.valid_until = datetime.fromisoformat(request.valid_until.replace('Z', '+00:00')) if request.valid_until != "" else None
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid valid_until format. Use ISO 8601.")
         
         await db.commit()
         await db.refresh(plan)
         await invalidate_plan_cache()
         
-        logger.info(f"Plan {plan_id} updated: duration_value={plan.duration_value}, duration_unit={plan.duration_unit.value}")
+        logger.info(f"Plan {plan_id} updated: type={plan.plan_type.value}, hidden={plan.is_hidden}")
         
         return {
             "id": plan.id,
@@ -189,7 +245,12 @@ async def update_plan_api(
             "duration_value": plan.duration_value,
             "duration_unit": plan.duration_unit.value,
             "connection_type": plan.connection_type.value,
-            "router_profile": plan.router_profile
+            "router_profile": plan.router_profile,
+            "plan_type": plan.plan_type.value,
+            "is_hidden": plan.is_hidden,
+            "badge_text": plan.badge_text,
+            "original_price": plan.original_price,
+            "valid_until": plan.valid_until.isoformat() if plan.valid_until else None,
         }
     except HTTPException:
         raise
@@ -350,3 +411,81 @@ async def get_plan_performance(
     except Exception as e:
         logger.error(f"Error fetching plan performance: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch plan performance: {str(e)}")
+
+
+@router.post("/api/plans/activate-emergency")
+async def activate_emergency_mode(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """Activate emergency mode: hide all REGULAR plans and show all EMERGENCY plans for this user."""
+    try:
+        user = await get_current_user(token, db)
+
+        hidden_result = await db.execute(
+            update(Plan)
+            .where(Plan.user_id == user.id, Plan.plan_type == PlanType.REGULAR)
+            .values(is_hidden=True)
+        )
+        shown_result = await db.execute(
+            update(Plan)
+            .where(Plan.user_id == user.id, Plan.plan_type == PlanType.EMERGENCY)
+            .values(is_hidden=False)
+        )
+
+        await db.commit()
+        await invalidate_plan_cache()
+
+        logger.info(f"Emergency mode activated by user {user.id}: {hidden_result.rowcount} regular hidden, {shown_result.rowcount} emergency shown")
+
+        return {
+            "success": True,
+            "message": "Emergency mode activated",
+            "regular_plans_hidden": hidden_result.rowcount,
+            "emergency_plans_shown": shown_result.rowcount,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error activating emergency mode: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to activate emergency mode: {str(e)}")
+
+
+@router.post("/api/plans/deactivate-emergency")
+async def deactivate_emergency_mode(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """Deactivate emergency mode: show all REGULAR plans and hide all EMERGENCY plans for this user."""
+    try:
+        user = await get_current_user(token, db)
+
+        shown_result = await db.execute(
+            update(Plan)
+            .where(Plan.user_id == user.id, Plan.plan_type == PlanType.REGULAR)
+            .values(is_hidden=False)
+        )
+        hidden_result = await db.execute(
+            update(Plan)
+            .where(Plan.user_id == user.id, Plan.plan_type == PlanType.EMERGENCY)
+            .values(is_hidden=True)
+        )
+
+        await db.commit()
+        await invalidate_plan_cache()
+
+        logger.info(f"Emergency mode deactivated by user {user.id}: {shown_result.rowcount} regular shown, {hidden_result.rowcount} emergency hidden")
+
+        return {
+            "success": True,
+            "message": "Emergency mode deactivated. Regular plans restored.",
+            "regular_plans_shown": shown_result.rowcount,
+            "emergency_plans_hidden": hidden_result.rowcount,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deactivating emergency mode: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to deactivate emergency mode: {str(e)}")

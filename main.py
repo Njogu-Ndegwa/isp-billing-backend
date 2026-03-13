@@ -267,6 +267,32 @@ async def run_radius_migrations():
         else:
             logger.info("PPPoE migration: 'pppoe' value already exists in connectiontype enum, skipping")
 
+        # --- Plan emergency/special offer columns ---
+        result = await conn.execute(sa_text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'plans' AND column_name = 'plan_type'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                DO $$ BEGIN
+                    CREATE TYPE plantype AS ENUM ('regular', 'emergency', 'special_offer');
+                EXCEPTION
+                    WHEN duplicate_object THEN null;
+                END $$;
+            """))
+            await conn.execute(sa_text("""
+                ALTER TABLE plans
+                ADD COLUMN plan_type plantype NOT NULL DEFAULT 'regular',
+                ADD COLUMN is_hidden BOOLEAN NOT NULL DEFAULT false,
+                ADD COLUMN badge_text VARCHAR(100) NULL,
+                ADD COLUMN original_price INTEGER NULL,
+                ADD COLUMN valid_until TIMESTAMP NULL
+            """))
+            logger.info("Plan migration: Added plan_type, is_hidden, badge_text, original_price, valid_until to plans")
+        else:
+            logger.info("Plan migration: Emergency/special offer columns already exist, skipping")
+
         result = await conn.execute(sa_text("""
             SELECT table_name FROM information_schema.tables 
             WHERE table_name = 'radius_check'

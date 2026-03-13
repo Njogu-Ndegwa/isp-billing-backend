@@ -56,6 +56,11 @@ class DurationUnit(str, enum.Enum):
     HOURS = "HOURS"
     DAYS = "DAYS"
 
+class PlanType(str, enum.Enum):
+    REGULAR = "regular"
+    EMERGENCY = "emergency"
+    SPECIAL_OFFER = "special_offer"
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -122,6 +127,16 @@ class Plan(Base):
     connection_type = Column(Enum(ConnectionType), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     router_profile = Column(String)
+    plan_type = Column(
+        Enum(PlanType, name="plantype", values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=PlanType.REGULAR,
+        server_default="regular"
+    )
+    is_hidden = Column(Boolean, nullable=False, default=False, server_default="false")
+    badge_text = Column(String(100), nullable=True)
+    original_price = Column(Integer, nullable=True)
+    valid_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Payment(Base):

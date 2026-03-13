@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from datetime import datetime
 from app.db.models import Plan
 from app.core.cache import cache
 from typing import Optional, List, Dict
@@ -9,13 +10,19 @@ logger = logging.getLogger(__name__)
 
 PLAN_CACHE_TTL = 300  # 5 minutes
 
-def _build_cache_key(user_id: Optional[int] = None, connection_type: Optional[str] = None) -> str:
+def _build_cache_key(
+    user_id: Optional[int] = None,
+    connection_type: Optional[str] = None,
+    include_hidden: bool = False
+) -> str:
     """Build a consistent cache key for plan queries"""
     parts = ["plans"]
     if user_id is not None:
         parts.append(f"user_{user_id}")
     if connection_type is not None:
         parts.append(f"type_{connection_type}")
+    if include_hidden:
+        parts.append("all")
     return ":".join(parts)
 
 def _serialize_plan(plan: Plan) -> Dict:
@@ -29,16 +36,22 @@ def _serialize_plan(plan: Plan) -> Dict:
         "duration_unit": plan.duration_unit.value,
         "connection_type": plan.connection_type.value,
         "router_profile": plan.router_profile,
-        "user_id": plan.user_id
+        "user_id": plan.user_id,
+        "plan_type": plan.plan_type.value if plan.plan_type else "regular",
+        "is_hidden": plan.is_hidden if plan.is_hidden is not None else False,
+        "badge_text": plan.badge_text,
+        "original_price": plan.original_price,
+        "valid_until": plan.valid_until.isoformat() if plan.valid_until else None,
     }
 
 async def get_plans_cached(
     db: AsyncSession,
     user_id: Optional[int] = None,
-    connection_type: Optional[str] = None
+    connection_type: Optional[str] = None,
+    include_hidden: bool = False
 ) -> List[Dict]:
-    """Get plans with caching"""
-    cache_key = _build_cache_key(user_id, connection_type)
+    """Get plans with caching. Public queries filter out hidden and expired plans."""
+    cache_key = _build_cache_key(user_id, connection_type, include_hidden)
     
     async def fetch_plans():
         stmt = select(Plan)
@@ -48,6 +61,12 @@ async def get_plans_cached(
         
         if connection_type is not None:
             stmt = stmt.where(Plan.connection_type == connection_type)
+        
+        if not include_hidden:
+            stmt = stmt.where(Plan.is_hidden == False)
+            stmt = stmt.where(
+                (Plan.valid_until == None) | (Plan.valid_until > datetime.utcnow())
+            )
         
         result = await db.execute(stmt)
         plans = result.scalars().all()

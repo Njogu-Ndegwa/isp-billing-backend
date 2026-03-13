@@ -6,7 +6,7 @@ from typing import Dict, Optional
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Router, Customer, Plan, Ad, CustomerStatus
+from app.db.models import Router, Customer, Plan, Ad, CustomerStatus, PlanType
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
 from app.services.plan_cache import get_plans_cached
@@ -723,10 +723,17 @@ async def get_portal_data(
 
     router_obj, business_name, support_phone = row
 
-    plans, ads_data = await asyncio.gather(
+    plans, all_plans_for_flags, ads_data = await asyncio.gather(
         get_plans_cached(db, router_obj.user_id, connection_type),
+        get_plans_cached(db, router_obj.user_id, connection_type, include_hidden=True),
         _fetch_active_ads(db),
     )
+
+    has_emergency = any(p.get("plan_type") == "emergency" for p in all_plans_for_flags)
+    has_special = any(p.get("plan_type") == "special_offer" for p in all_plans_for_flags)
+    regular_all_hidden = all(
+        p.get("is_hidden") for p in all_plans_for_flags if p.get("plan_type") == "regular"
+    ) if any(p.get("plan_type") == "regular" for p in all_plans_for_flags) else False
 
     return {
         "router": {
@@ -741,6 +748,11 @@ async def get_portal_data(
         },
         "plans": plans,
         "ads": ads_data,
+        "plan_flags": {
+            "has_emergency_plans": has_emergency,
+            "has_special_offers": has_special,
+            "emergency_mode_active": regular_all_hidden and has_emergency,
+        },
     }
 
 
