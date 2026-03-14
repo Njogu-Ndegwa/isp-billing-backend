@@ -1568,6 +1568,9 @@ class MikroTikAPI:
                         port_id = port.get(".id")
                         if port_id:
                             result = self.send_command("/interface/bridge/port/remove", {"numbers": port_id})
+                            if result.get("error"):
+                                logger.error(f"Failed to remove {interface} from bridge: {result['error']}")
+                                return {"error": f"Failed to remove {interface} from bridge: {result['error']}"}
                             logger.info(f"Removed {interface} from bridge")
                             return {"success": True, "action": "removed"}
             return {"success": True, "action": "not_found"}
@@ -1580,19 +1583,76 @@ class MikroTikAPI:
         if not self.connected:
             return {"error": "Not connected"}
         try:
-            self.remove_bridge_port(interface)
+            remove_result = self.remove_bridge_port(interface)
+            if remove_result.get("error"):
+                return {"error": f"Could not remove {interface} from current bridge: {remove_result['error']}"}
             time.sleep(0.2)
             result = self.send_command("/interface/bridge/port/add", {
                 "interface": interface,
                 "bridge": bridge,
             })
-            if result.get("success") or result.get("error", "") == "":
-                logger.info(f"Added {interface} to bridge {bridge}")
-                return {"success": True}
-            return result
+            if result.get("error"):
+                logger.error(f"Failed to add {interface} to bridge {bridge}: {result['error']}")
+                return {"error": f"Failed to add {interface} to bridge {bridge}: {result['error']}"}
+            logger.info(f"Added {interface} to bridge {bridge}")
+            return {"success": True}
         except Exception as e:
             logger.error(f"Error adding {interface} to bridge {bridge}: {e}")
             return {"error": str(e)}
+
+    def verify_port_bridges(self, expected: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Re-read bridge port assignments from the router and verify each port
+        is in the expected bridge.
+
+        Args:
+            expected: {interface_name: expected_bridge_name}  e.g. {"ether2": "bridge-pppoe"}
+
+        Returns:
+            {"success": True} when all ports match, or
+            {"error": "...", "failed_ports": [...]} with details per port.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            ports_result = self.send_command("/interface/bridge/port/print")
+            if ports_result.get("error"):
+                return {"error": f"Could not read bridge ports for verification: {ports_result['error']}"}
+
+            actual_map: Dict[str, str] = {}
+            for p in ports_result.get("data", []):
+                actual_map[p.get("interface", "")] = p.get("bridge", "")
+
+            failed = []
+            for iface, want_bridge in expected.items():
+                got_bridge = actual_map.get(iface)
+                if got_bridge != want_bridge:
+                    actual_label = f"'{got_bridge}'" if got_bridge else "(not in any bridge)"
+                    failed.append({
+                        "port": iface,
+                        "expected_bridge": want_bridge,
+                        "actual_bridge": got_bridge or "(none)",
+                    })
+                    logger.error(
+                        f"Verification failed: {iface} expected in '{want_bridge}' "
+                        f"but found in {actual_label}"
+                    )
+
+            if failed:
+                summary = "; ".join(
+                    f"{f['port']} is in {f['actual_bridge']} instead of {f['expected_bridge']}"
+                    for f in failed
+                )
+                return {
+                    "error": f"Port move verification failed: {summary}",
+                    "failed_ports": failed,
+                }
+
+            logger.info(f"Verification passed: all ports in expected bridges")
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Error verifying bridge port assignments: {e}")
+            return {"error": f"Verification error: {str(e)}"}
 
     def setup_pppoe_infrastructure(
         self,
@@ -1626,11 +1686,26 @@ class MikroTikAPI:
             time.sleep(0.2)
 
             # 2. Move selected ports to bridge-pppoe
+            port_move_errors = []
             for port in pppoe_ports:
                 r = self.add_bridge_port(port, bridge_name)
                 if r.get("error"):
-                    errors.append(f"Port {port}: {r['error']}")
+                    port_move_errors.append(f"Port {port}: {r['error']}")
                 time.sleep(0.2)
+
+            # 2b. Verify ports actually moved -- hard error if not
+            time.sleep(0.3)
+            verify = self.verify_port_bridges({p: bridge_name for p in pppoe_ports})
+            if verify.get("error"):
+                all_errors = port_move_errors + [verify["error"]]
+                return {
+                    "error": f"Port conversion failed on the router: {verify['error']}",
+                    "failed_ports": verify.get("failed_ports", []),
+                    "partial_errors": all_errors,
+                }
+
+            if port_move_errors:
+                errors.extend(port_move_errors)
 
             # 3. Add IP address on bridge-pppoe (ignore if already exists)
             result = self.send_command("/ip/address/add", {

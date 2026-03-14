@@ -2512,15 +2512,35 @@ async def get_router_port_status(
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
 
+    # Auto-correct DB to match the router reality so retries start clean
+    actual_pppoe = sorted(p["port"] for p in result["ports"] if p["service"] == "pppoe")
+    db_pppoe = sorted(router_obj.pppoe_ports or [])
+    db_corrected = False
+    if actual_pppoe != db_pppoe:
+        router_obj.pppoe_ports = actual_pppoe if actual_pppoe else None
+        await db.commit()
+        db_corrected = True
+        logger.warning(
+            f"Router {router_id}: corrected pppoe_ports from {db_pppoe} to {actual_pppoe} "
+            f"to match router reality"
+        )
+
     response = {
         "router_id": router_id,
         "router_name": router_obj.name,
-        "db_pppoe_ports": router_obj.pppoe_ports or [],
+        "pppoe_ports": actual_pppoe,
         "generated_at": datetime.utcnow().isoformat(),
         "cached": False,
         "ports": result["ports"],
         "bridges": result["bridges"],
     }
+
+    if db_corrected:
+        response["db_corrected"] = True
+        response["correction_detail"] = (
+            f"Database was out of sync with router (had {db_pppoe}, "
+            f"router actually has {actual_pppoe}). Database has been corrected."
+        )
 
     _port_status_cache[router_id] = {
         "data": response,
@@ -2609,7 +2629,38 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
 
         # Set up new config if ports are selected
         if new_ports:
-            return api.setup_pppoe_infrastructure(pppoe_ports=new_ports)
+            setup_result = api.setup_pppoe_infrastructure(pppoe_ports=new_ports)
+            if setup_result.get("error"):
+                return setup_result
+
+            # Final safety-net verification: re-read bridge ports and confirm
+            time.sleep(0.5)
+            verify = api.verify_port_bridges({p: "bridge-pppoe" for p in new_ports})
+            if verify.get("error"):
+                failed = verify.get("failed_ports", [])
+                details = "; ".join(
+                    f"{f['port']} is still in '{f['actual_bridge']}' (expected '{f['expected_bridge']}')"
+                    for f in failed
+                ) if failed else verify["error"]
+                return {
+                    "error": (
+                        f"The router accepted the commands but the ports did not actually move. "
+                        f"{details}. This may indicate the router silently rejected the change."
+                    ),
+                    "failed_ports": failed,
+                }
+
+            return setup_result
+
+        # Clearing PPPoE -- verify ports moved back to hotspot bridge
+        if old_ports:
+            time.sleep(0.5)
+            verify = api.verify_port_bridges({p: "bridge" for p in old_ports})
+            if verify.get("error"):
+                return {
+                    "error": f"PPPoE teardown commands ran but ports may not have restored: {verify['error']}",
+                    "failed_ports": verify.get("failed_ports", []),
+                }
 
         return {"success": True, "message": "PPPoE ports cleared, all ports restored to hotspot bridge"}
     finally:
@@ -2650,12 +2701,21 @@ async def set_pppoe_ports(
     }
     result = await asyncio.to_thread(_apply_pppoe_ports_sync, router_info, new_ports, old_ports)
 
+    # Invalidate port status cache so the next GET reflects reality
+    _port_status_cache.pop(router_id, None)
+
     if result.get("error") == "connect_failed":
         raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
     if result.get("error"):
-        raise HTTPException(status_code=500, detail=result["error"])
+        failed_ports = result.get("failed_ports", [])
+        detail = {
+            "message": result["error"],
+            "failed_ports": failed_ports,
+            "pppoe_ports_unchanged": old_ports,
+        }
+        raise HTTPException(status_code=500, detail=detail)
 
-    # Persist to DB
+    # Only persist to DB after the router confirmed the change
     router_obj.pppoe_ports = new_ports if new_ports else None
     await db.commit()
 
