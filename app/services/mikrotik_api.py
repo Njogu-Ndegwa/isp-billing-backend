@@ -1861,6 +1861,12 @@ class MikroTikAPI:
                     {"numbers": f"[find interface={interface}]"},
                 )
                 if result.get("error"):
+                    if "no such item" in result.get("error", "").lower():
+                        logger.info(
+                            f"{interface} is not present in any bridge port entry; "
+                            "treating it as already detached"
+                        )
+                        return {"success": True, "action": "not_found", "original_bridge": None}
                     return {"error": f"Failed to remove {interface} from bridge: {result['error']}"}
 
                 if not verify:
