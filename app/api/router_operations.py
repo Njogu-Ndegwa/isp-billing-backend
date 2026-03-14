@@ -2645,7 +2645,11 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
                 "current_ports": old_ports,
             }
 
-        current_ports = current_state.get("ports", [])
+        current_ports = set(current_state.get("ports", []))
+        legacy_bridge_ports = api.get_ports_in_bridge("bridge-pppoe")
+        if legacy_bridge_ports.get("success"):
+            current_ports.update(legacy_bridge_ports.get("ports", []))
+        current_ports = sorted(current_ports)
         ports_to_restore = [p for p in current_ports if p not in target_ports]
 
         # Clearing PPPoE entirely: restore actual current PPPoE ports and remove infra.
@@ -2692,75 +2696,96 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
             setup_result["current_ports"] = current_ports
             return setup_result
 
-        # Final safety-net verification: requested ports should be direct PPPoE
-        # interfaces, and removed ports should be back in the hotspot bridge.
+        setup_mode = setup_result.get("mode", "direct")
+
+        # Final safety-net verification depends on the managed PPPoE access mode.
         time.sleep(0.5)
-        final_state = api.get_pppoe_access_state()
-        if final_state.get("error"):
-            return {
-                "error": (
-                    f"The router accepted the commands but the final PPPoE access "
-                    f"state could not be verified. {final_state['error']}"
-                ),
-                "current_ports": current_ports,
-            }
+        if setup_mode == "legacy_bridge":
+            expected_bridges = {p: "bridge-pppoe" for p in target_ports}
+            expected_bridges.update({p: "bridge" for p in ports_to_restore})
+            verify = api.verify_port_bridges(expected_bridges, retries=8, delay=0.5)
+            if verify.get("error"):
+                failed = verify.get("failed_ports", [])
+                details = "; ".join(
+                    f"{f['port']} is still in '{f['actual_bridge']}' (expected '{f['expected_bridge']}')"
+                    for f in failed
+                ) if failed else verify["error"]
+                return {
+                    "error": (
+                        f"The router accepted the commands but the final bridge layout "
+                        f"does not match the requested PPPoE configuration. {details}. "
+                        f"This may indicate the router applied the change slowly or partially."
+                    ),
+                    "failed_ports": failed,
+                    "current_ports": current_ports,
+                }
+        else:
+            final_state = api.get_pppoe_access_state()
+            if final_state.get("error"):
+                return {
+                    "error": (
+                        f"The router accepted the commands but the final PPPoE access "
+                        f"state could not be verified. {final_state['error']}"
+                    ),
+                    "current_ports": current_ports,
+                }
 
-        final_direct_ports = set(final_state.get("direct_ports", []))
-        final_all_ports = set(final_state.get("ports", []))
-        bridge_data = api.get_bridge_ports_status()
-        final_bridge_map = {
-            port.get("interface", ""): port.get("bridge", "")
-            for port in bridge_data.get("ports", [])
-        } if bridge_data.get("success") else {}
-        failed = []
-        for port in target_ports:
-            if port not in final_direct_ports:
-                attachment = final_state.get("attachment_map", {}).get(port, {})
-                failed.append({
-                    "port": port,
-                    "expected_mode": "direct",
-                    "actual_mode": attachment.get("mode", "none"),
-                    "server_interface": attachment.get("server_interface", ""),
-                })
-            actual_bridge = final_bridge_map.get(port)
-            if actual_bridge:
-                failed.append({
-                    "port": port,
-                    "expected_mode": "direct_unbridged",
-                    "actual_mode": f"bridge:{actual_bridge}",
-                    "server_interface": final_state.get("attachment_map", {}).get(port, {}).get("server_interface", ""),
-                })
-        for port in ports_to_restore:
-            if port in final_all_ports:
-                attachment = final_state.get("attachment_map", {}).get(port, {})
-                failed.append({
-                    "port": port,
-                    "expected_mode": "restored_to_bridge",
-                    "actual_mode": attachment.get("mode", "pppoe"),
-                    "server_interface": attachment.get("server_interface", ""),
-                })
+            final_direct_ports = set(final_state.get("direct_ports", []))
+            final_all_ports = set(final_state.get("ports", []))
+            bridge_data = api.get_bridge_ports_status()
+            final_bridge_map = {
+                port.get("interface", ""): port.get("bridge", "")
+                for port in bridge_data.get("ports", [])
+            } if bridge_data.get("success") else {}
+            failed = []
+            for port in target_ports:
+                if port not in final_direct_ports:
+                    attachment = final_state.get("attachment_map", {}).get(port, {})
+                    failed.append({
+                        "port": port,
+                        "expected_mode": "direct",
+                        "actual_mode": attachment.get("mode", "none"),
+                        "server_interface": attachment.get("server_interface", ""),
+                    })
+                actual_bridge = final_bridge_map.get(port)
+                if actual_bridge:
+                    failed.append({
+                        "port": port,
+                        "expected_mode": "direct_unbridged",
+                        "actual_mode": f"bridge:{actual_bridge}",
+                        "server_interface": final_state.get("attachment_map", {}).get(port, {}).get("server_interface", ""),
+                    })
+            for port in ports_to_restore:
+                if port in final_all_ports:
+                    attachment = final_state.get("attachment_map", {}).get(port, {})
+                    failed.append({
+                        "port": port,
+                        "expected_mode": "restored_to_bridge",
+                        "actual_mode": attachment.get("mode", "pppoe"),
+                        "server_interface": attachment.get("server_interface", ""),
+                    })
 
-        bridge_verify = (
-            api.verify_port_bridges({p: "bridge" for p in ports_to_restore}, retries=8, delay=0.5)
-            if ports_to_restore else {"success": True}
-        )
-        if failed or bridge_verify.get("error"):
-            bridge_failed = bridge_verify.get("failed_ports", [])
-            if bridge_failed:
-                failed.extend(bridge_failed)
-            details = "; ".join(
-                f"{f['port']} did not reach expected state"
-                for f in failed
-            ) if failed else bridge_verify.get("error", "verification failed")
-            return {
-                "error": (
-                    f"The router accepted the commands but the final PPPoE/direct-port "
-                    f"layout does not match the requested configuration. {details}. "
-                    f"This may indicate the router applied the change slowly or partially."
-                ),
-                "failed_ports": failed,
-                "current_ports": current_ports,
-            }
+            bridge_verify = (
+                api.verify_port_bridges({p: "bridge" for p in ports_to_restore}, retries=8, delay=0.5)
+                if ports_to_restore else {"success": True}
+            )
+            if failed or bridge_verify.get("error"):
+                bridge_failed = bridge_verify.get("failed_ports", [])
+                if bridge_failed:
+                    failed.extend(bridge_failed)
+                details = "; ".join(
+                    f"{f['port']} did not reach expected state"
+                    for f in failed
+                ) if failed else bridge_verify.get("error", "verification failed")
+                return {
+                    "error": (
+                        f"The router accepted the commands but the final PPPoE/direct-port "
+                        f"layout does not match the requested configuration. {details}. "
+                        f"This may indicate the router applied the change slowly or partially."
+                    ),
+                    "failed_ports": failed,
+                    "current_ports": current_ports,
+                }
 
         setup_result["current_ports"] = current_ports
         return setup_result

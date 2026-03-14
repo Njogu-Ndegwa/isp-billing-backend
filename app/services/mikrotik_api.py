@@ -1430,6 +1430,18 @@ class MikroTikAPI:
                 logger.info(f"Updated PPPoE profile '{profile_name}' with rate-limit {rate_limit}")
             else:
                 result = self.send_command("/ppp/profile/add", profile_args)
+                if result.get("error"):
+                    err_lower = result.get("error", "").lower()
+                    if "already exists" in err_lower or "already have" in err_lower:
+                        refresh = self.send_command("/ppp/profile/print")
+                        if refresh.get("success"):
+                            for profile in refresh.get("data", []):
+                                if profile.get("name") == profile_name:
+                                    profile_id = profile.get(".id")
+                                    if profile_id:
+                                        profile_args["numbers"] = profile_id
+                                        result = self.send_command("/ppp/profile/set", profile_args)
+                                        break
                 logger.info(f"Created PPPoE profile '{profile_name}' with rate-limit {rate_limit}")
 
             return result
@@ -2454,6 +2466,78 @@ class MikroTikAPI:
         4. Remove any legacy bridge-bound PPPoE server
         5. Bypass FastTrack for PPPoE subnet (so PPP rate-limits are enforced)
         """
+        current_state = self.get_pppoe_access_state(legacy_bridge_name=bridge_name)
+        if current_state.get("error"):
+            return current_state
+
+        current_mode = current_state.get("mode", "none")
+        legacy_bridge_ports = self.get_ports_in_bridge(bridge_name)
+        bridge_members = set(legacy_bridge_ports.get("ports", [])) if legacy_bridge_ports.get("success") else set()
+        if current_mode in {"legacy_bridge", "mixed"} or bridge_members.intersection(pppoe_ports or []):
+            logger.warning(
+                f"Router currently uses {current_mode} PPPoE access or still has "
+                f"ports in {bridge_name}; "
+                f"continuing in legacy bridge mode for compatibility"
+            )
+            return self._setup_pppoe_infrastructure_legacy(
+                pppoe_ports=pppoe_ports,
+                hotspot_bridge=hotspot_bridge,
+                bridge_name=bridge_name,
+                bridge_ip=bridge_ip,
+                pool_name=pool_name,
+                pool_range=pool_range,
+                service_name=service_name,
+            )
+
+        direct_result = self._setup_pppoe_infrastructure_direct(
+            pppoe_ports=pppoe_ports,
+            hotspot_bridge=hotspot_bridge,
+            bridge_name=bridge_name,
+            bridge_ip=bridge_ip,
+            pool_name=pool_name,
+            pool_range=pool_range,
+            service_name=service_name,
+        )
+        if not direct_result.get("error"):
+            return direct_result
+
+        logger.warning(
+            "Direct PPPoE setup failed; falling back to legacy bridge mode. "
+            f"Reason: {direct_result.get('error')}"
+        )
+        cleanup = self.remove_pppoe_servers(list(dict.fromkeys(pppoe_ports or [])))
+        if cleanup.get("error"):
+            logger.warning(f"Direct PPPoE cleanup before fallback failed: {cleanup['error']}")
+
+        legacy_result = self._setup_pppoe_infrastructure_legacy(
+            pppoe_ports=pppoe_ports,
+            hotspot_bridge=hotspot_bridge,
+            bridge_name=bridge_name,
+            bridge_ip=bridge_ip,
+            pool_name=pool_name,
+            pool_range=pool_range,
+            service_name=service_name,
+        )
+        if not legacy_result.get("error"):
+            warnings = legacy_result.get("warnings", [])
+            warnings.append(
+                "Direct PPPoE mode was not supported cleanly on this router, so legacy bridge mode was used"
+            )
+            if direct_result.get("partial_errors"):
+                warnings.extend(direct_result.get("partial_errors", []))
+            legacy_result["warnings"] = warnings
+        return legacy_result
+
+    def _setup_pppoe_infrastructure_direct(
+        self,
+        pppoe_ports: List[str],
+        hotspot_bridge: str = "bridge",
+        bridge_name: str = "bridge-pppoe",
+        bridge_ip: str = "192.168.89.1/24",
+        pool_name: str = "pppoe-pool",
+        pool_range: str = "192.168.89.2-192.168.89.254",
+        service_name: str = "pppoe-server1",
+    ) -> Dict[str, Any]:
         if not self.connected:
             return {"error": "Not connected"}
         errors = []
@@ -2488,13 +2572,14 @@ class MikroTikAPI:
                 errors.append(f"Pool: {result['error']}")
             time.sleep(0.2)
 
-            # 5. Ensure a default PPPoE profile exists with the pool
-            self.ensure_pppoe_profile(
+            profile_result = self.ensure_pppoe_profile(
                 profile_name="default-pppoe",
                 rate_limit="0/0",
                 local_address=bridge_ip.split("/")[0],
                 pool_name=pool_name,
             )
+            if profile_result.get("error"):
+                return {"error": f"PPPoE profile: {profile_result['error']}"}
             time.sleep(0.2)
 
             # 5. Remove selected ports from any bridge and bind PPPoE directly.
@@ -2527,12 +2612,7 @@ class MikroTikAPI:
                 errors.append(f"NAT: {result['error']}")
             time.sleep(0.2)
 
-            # 7. Remove the old bridge-bound server if this router is being migrated.
-            cleanup = self.cleanup_legacy_pppoe_server(bridge_name=bridge_name)
-            if cleanup.get("error"):
-                errors.append(f"Legacy PPPoE server cleanup: {cleanup['error']}")
-
-            # 8. Verify the selected ports are directly attached to PPPoE.
+            # 7. Verify the selected ports are directly attached to PPPoE.
             time.sleep(0.3)
             access_state = self.get_pppoe_access_state(legacy_bridge_name=bridge_name)
             if access_state.get("error"):
@@ -2565,6 +2645,11 @@ class MikroTikAPI:
                     "partial_errors": port_setup_errors,
                 }
 
+            # 8. Remove the old bridge-bound server if this router is being migrated.
+            cleanup = self.cleanup_legacy_pppoe_server(bridge_name=bridge_name)
+            if cleanup.get("error"):
+                errors.append(f"Legacy PPPoE server cleanup: {cleanup['error']}")
+
             # 9. Bypass FastTrack for the active PPPoE pool so PPP profile
             #    rate-limits are enforced even when the router already had
             #    custom PPPoE infrastructure.
@@ -2585,11 +2670,123 @@ class MikroTikAPI:
 
             if errors:
                 logger.warning(f"PPPoE infrastructure setup completed with warnings: {errors}")
-                return {"success": True, "warnings": errors}
+                return {"success": True, "warnings": errors, "mode": "direct"}
             logger.info("PPPoE infrastructure setup completed successfully")
-            return {"success": True}
+            return {"success": True, "mode": "direct"}
         except Exception as e:
             logger.error(f"Error setting up PPPoE infrastructure: {e}")
+            return {"error": str(e), "partial_errors": errors}
+
+    def _setup_pppoe_infrastructure_legacy(
+        self,
+        pppoe_ports: List[str],
+        hotspot_bridge: str = "bridge",
+        bridge_name: str = "bridge-pppoe",
+        bridge_ip: str = "192.168.89.1/24",
+        pool_name: str = "pppoe-pool",
+        pool_range: str = "192.168.89.2-192.168.89.254",
+        service_name: str = "pppoe-server1",
+    ) -> Dict[str, Any]:
+        if not self.connected:
+            return {"error": "Not connected"}
+        errors = []
+        try:
+            target_ports = list(dict.fromkeys(pppoe_ports or []))
+
+            result = self.send_command("/interface/bridge/add", {"name": bridge_name})
+            if result.get("error") and "already" not in result.get("error", "").lower():
+                errors.append(f"Bridge create: {result['error']}")
+            time.sleep(0.2)
+
+            direct_cleanup = self.remove_pppoe_servers(target_ports)
+            if direct_cleanup.get("error"):
+                errors.append(f"Direct PPPoE cleanup: {direct_cleanup['error']}")
+
+            port_move_errors = []
+            for port in target_ports:
+                move_result = self.add_bridge_port(port, bridge_name)
+                if move_result.get("error"):
+                    port_move_errors.append(f"Port {port}: {move_result['error']}")
+                time.sleep(0.2)
+
+            time.sleep(0.3)
+            verify = self.verify_port_bridges(
+                {p: bridge_name for p in target_ports},
+                retries=8,
+                delay=0.5,
+            )
+            if verify.get("error"):
+                return {
+                    "error": f"Port conversion failed on the router: {verify['error']}",
+                    "failed_ports": verify.get("failed_ports", []),
+                    "partial_errors": port_move_errors,
+                }
+
+            result = self.send_command("/ip/address/add", {
+                "address": bridge_ip,
+                "interface": bridge_name,
+                "comment": "PPPoE bridge address",
+            })
+            if result.get("error") and "already" not in result.get("error", "").lower():
+                errors.append(f"IP address: {result['error']}")
+            time.sleep(0.2)
+
+            result = self.send_command("/ip/pool/add", {
+                "name": pool_name,
+                "ranges": pool_range,
+            })
+            if result.get("error") and "already" not in result.get("error", "").lower():
+                errors.append(f"Pool: {result['error']}")
+            time.sleep(0.2)
+
+            profile_result = self.ensure_pppoe_profile(
+                profile_name="default-pppoe",
+                rate_limit="0/0",
+                local_address=bridge_ip.split("/")[0],
+                pool_name=pool_name,
+            )
+            if profile_result.get("error"):
+                return {"error": f"PPPoE profile: {profile_result['error']}"}
+            time.sleep(0.2)
+
+            server_result = self.ensure_pppoe_server_on_interface(
+                bridge_name,
+                profile_name="default-pppoe",
+                service_name_prefix=service_name,
+            )
+            if server_result.get("error"):
+                return {"error": f"PPPoE server: {server_result['error']}"}
+            time.sleep(0.2)
+
+            result = self.send_command("/ip/firewall/nat/add", {
+                "chain": "srcnat",
+                "src-address": pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24",
+                "out-interface": "ether1",
+                "action": "masquerade",
+                "comment": "NAT for PPPoE clients",
+            })
+            if result.get("error") and "already" not in result.get("error", "").lower():
+                errors.append(f"NAT: {result['error']}")
+            time.sleep(0.2)
+
+            bypass_result = self.ensure_pppoe_fasttrack_bypass(
+                bridge_name=bridge_name,
+                pool_name=pool_name,
+                fallback_pool_ranges=pool_range,
+            )
+            if bypass_result.get("error"):
+                errors.append(f"FastTrack bypass: {bypass_result['error']}")
+
+            if port_move_errors:
+                errors.extend(port_move_errors)
+
+            if errors:
+                logger.warning(f"Legacy PPPoE infrastructure setup completed with warnings: {errors}")
+                return {"success": True, "warnings": errors, "mode": "legacy_bridge"}
+
+            return {"success": True, "mode": "legacy_bridge"}
+        except Exception as e:
+            logger.error(f"Error setting up legacy PPPoE infrastructure: {e}")
             return {"error": str(e), "partial_errors": errors}
 
     def teardown_pppoe_infrastructure(
