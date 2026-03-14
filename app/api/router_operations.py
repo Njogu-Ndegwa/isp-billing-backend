@@ -2646,9 +2646,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
             }
 
         current_ports = set(current_state.get("ports", []))
-        legacy_bridge_ports = api.get_ports_in_bridge("bridge-pppoe")
-        if legacy_bridge_ports.get("success"):
-            current_ports.update(legacy_bridge_ports.get("ports", []))
+        current_ports.update(current_state.get("legacy_bridge_members", []))
         current_ports = sorted(current_ports)
         ports_to_restore = [p for p in current_ports if p not in target_ports]
 
@@ -2660,7 +2658,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
                     teardown["current_ports"] = current_ports
                     return teardown
 
-                time.sleep(0.5)
+                time.sleep(0.1)
                 verify = api.verify_port_bridges(
                     {p: "bridge" for p in current_ports},
                     retries=8,
@@ -2691,7 +2689,10 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
             }
 
         # Set up or migrate the requested ports to the direct-interface PPPoE layout.
-        setup_result = api.setup_pppoe_infrastructure(pppoe_ports=target_ports)
+        setup_result = api.setup_pppoe_infrastructure(
+            pppoe_ports=target_ports,
+            current_state=current_state,
+        )
         if setup_result.get("error"):
             setup_result["current_ports"] = current_ports
             return setup_result
@@ -2699,7 +2700,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
         setup_mode = setup_result.get("mode", "direct")
 
         # Final safety-net verification depends on the managed PPPoE access mode.
-        time.sleep(0.5)
+        time.sleep(0.1)
         if setup_mode == "legacy_bridge":
             expected_bridges = {p: "bridge-pppoe" for p in target_ports}
             expected_bridges.update({p: "bridge" for p in ports_to_restore})
@@ -2720,7 +2721,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
                     "current_ports": current_ports,
                 }
         else:
-            final_state = api.get_pppoe_access_state()
+            final_state = setup_result.get("access_state") or api.get_pppoe_access_state()
             if final_state.get("error"):
                 return {
                     "error": (
@@ -2732,11 +2733,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
 
             final_direct_ports = set(final_state.get("direct_ports", []))
             final_all_ports = set(final_state.get("ports", []))
-            bridge_data = api.get_bridge_ports_status()
-            final_bridge_map = {
-                port.get("interface", ""): port.get("bridge", "")
-                for port in bridge_data.get("ports", [])
-            } if bridge_data.get("success") else {}
+            final_bridge_map = final_state.get("bridge_map", {})
             failed = []
             for port in target_ports:
                 if port not in final_direct_ports:
@@ -2825,7 +2822,14 @@ async def set_pppoe_ports(
         "password": router_obj.password,
         "port": router_obj.port,
     }
+    started_at = time.perf_counter()
     result = await asyncio.to_thread(_apply_pppoe_ports_sync, router_info, new_ports, old_ports)
+    logger.info(
+        "PPPoE port sync for router %s completed in %.2fs (requested=%s)",
+        router_id,
+        time.perf_counter() - started_at,
+        ",".join(new_ports) if new_ports else "(none)",
+    )
 
     # Invalidate port status cache so the next GET reflects reality
     _port_status_cache.pop(router_id, None)

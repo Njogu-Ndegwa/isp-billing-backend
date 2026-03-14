@@ -1806,7 +1806,13 @@ class MikroTikAPI:
     def _get_bridge_port_entry(self, interface: str) -> Dict[str, Any]:
         """Find the bridge port entry for an interface.
         Returns {"found": True, "id": ..., "bridge": ...} or {"found": False}."""
-        ports = self.send_command("/interface/bridge/port/print")
+        ports = self.send_command_optimized(
+            "/interface/bridge/port/print",
+            proplist=[".id", "interface", "bridge", "hw", "hw-offload"],
+            query=f"?interface={interface}",
+        )
+        if not ports.get("success"):
+            ports = self.send_command("/interface/bridge/port/print")
         if not ports.get("success"):
             return {"error": ports.get("error", "Failed to read bridge ports")}
         for port in ports.get("data", []):
@@ -1820,7 +1826,7 @@ class MikroTikAPI:
                 }
         return {"found": False}
 
-    def remove_bridge_port(self, interface: str) -> Dict[str, Any]:
+    def remove_bridge_port(self, interface: str, verify: bool = True) -> Dict[str, Any]:
         """Remove an interface from whatever bridge it belongs to.
         Returns the original bridge name in 'original_bridge' on success."""
         if not self.connected:
@@ -1847,6 +1853,9 @@ class MikroTikAPI:
                 if result.get("error"):
                     return {"error": f"Failed to remove {interface} from bridge: {result['error']}"}
 
+                if not verify:
+                    return {"success": True, "action": "removed-via-find", "original_bridge": None}
+
                 time.sleep(0.5)
                 verify = self._find_bridge_port_filtered(interface)
                 if verify.get("error"):
@@ -1867,6 +1876,10 @@ class MikroTikAPI:
                 if result.get("error"):
                     logger.error(f"Failed to remove {interface} from bridge: {result['error']}")
                     return {"error": f"Failed to remove {interface} from bridge: {result['error']}"}
+
+                if not verify:
+                    logger.info(f"Removed {interface} from bridge '{original_bridge}' without inline verification")
+                    return {"success": True, "action": "removed", "original_bridge": original_bridge}
 
                 time.sleep(0.5)
                 verify = self._find_bridge_port_filtered(interface)
@@ -1961,7 +1974,7 @@ class MikroTikAPI:
             return {"error": f"Failed to set {interface} to bridge {bridge}: {r['error']}"}
         return {"success": True, "method": "router-find"}
 
-    def add_bridge_port(self, interface: str, bridge: str) -> Dict[str, Any]:
+    def add_bridge_port(self, interface: str, bridge: str, verify: bool = True) -> Dict[str, Any]:
         """Move an interface to a specific bridge.
         Uses in-place 'set' when the port already has a bridge entry (avoids
         remove+add which can silently fail on hardware-offloaded switch chips).
@@ -2023,6 +2036,10 @@ class MikroTikAPI:
                     else:
                         logger.error(f"add bridge port failed for {interface}: {result['error']}")
                         return {"error": f"Failed to add {interface} to bridge {bridge}: {result['error']}"}
+
+            if not verify:
+                logger.info(f"Moved {interface} to bridge {bridge} without inline verification")
+                return {"success": True}
 
             # Verify the port actually landed in the target bridge
             time.sleep(0.5)
@@ -2200,11 +2217,13 @@ class MikroTikAPI:
             bridge_names = set(bridges.keys())
 
             bridge_ports_by_name: Dict[str, List[str]] = {}
+            bridge_map: Dict[str, str] = {}
             for port in bridge_ports:
                 bridge = port.get("bridge", "")
                 interface = port.get("interface", "")
                 if bridge and interface:
                     bridge_ports_by_name.setdefault(bridge, []).append(interface)
+                    bridge_map[interface] = bridge
 
             enabled_servers = [
                 server for server in servers_result.get("data", [])
@@ -2273,6 +2292,8 @@ class MikroTikAPI:
                 "bridge_servers": bridge_servers,
                 "attachment_map": attachment_map,
                 "enabled_servers": enabled_servers,
+                "bridge_map": bridge_map,
+                "legacy_bridge_members": sorted(bridge_ports_by_name.get(legacy_bridge_name, [])),
             }
         except Exception as e:
             logger.error(f"Error getting PPPoE access state: {e}")
@@ -2283,13 +2304,18 @@ class MikroTikAPI:
         interface: str,
         profile_name: str = "default-pppoe",
         service_name_prefix: str = "pppoe-server",
+        verify: bool = True,
     ) -> Dict[str, Any]:
         """Ensure a PPPoE server exists and is enabled on a specific interface."""
         if not self.connected:
             return {"error": "Not connected"}
         try:
             desired_service_name = f"{service_name_prefix}-{interface}".replace("/", "-")
-            servers = self.send_command("/interface/pppoe-server/server/print")
+            servers = self.send_command_optimized(
+                "/interface/pppoe-server/server/print",
+                proplist=[".id", "interface", "disabled", "service-name", "default-profile"],
+                query=f"?interface={interface}",
+            )
             if servers.get("error"):
                 return {"error": f"Could not read PPPoE servers: {servers['error']}"}
 
@@ -2327,18 +2353,19 @@ class MikroTikAPI:
                                 f"{duplicate_remove['error']}"
                             )
 
-                verify = self.get_pppoe_server_status()
-                verified = [
-                    server for server in verify.get("data", [])
-                    if server.get("interface") == interface and not server.get("disabled", False)
-                ] if verify.get("success") else []
-                if not verified:
-                    return {
-                        "error": (
-                            f"Router accepted PPPoE server update on {interface} but no enabled "
-                            f"server was found afterward"
-                        )
-                    }
+                if verify:
+                    verify_result = self.get_pppoe_server_status()
+                    verified = [
+                        server for server in verify_result.get("data", [])
+                        if server.get("interface") == interface and not server.get("disabled", False)
+                    ] if verify_result.get("success") else []
+                    if not verified:
+                        return {
+                            "error": (
+                                f"Router accepted PPPoE server update on {interface} but no enabled "
+                                f"server was found afterward"
+                            )
+                        }
 
                 return {"success": True, "action": "updated", "interface": interface}
 
@@ -2351,18 +2378,19 @@ class MikroTikAPI:
             if result.get("error"):
                 return {"error": f"Failed to create PPPoE server on {interface}: {result['error']}"}
 
-            verify = self.get_pppoe_server_status()
-            verified = [
-                server for server in verify.get("data", [])
-                if server.get("interface") == interface and not server.get("disabled", False)
-            ] if verify.get("success") else []
-            if not verified:
-                return {
-                    "error": (
-                        f"Router accepted PPPoE server create on {interface} but no enabled "
-                        f"server was found afterward"
-                    )
-                }
+            if verify:
+                verify_result = self.get_pppoe_server_status()
+                verified = [
+                    server for server in verify_result.get("data", [])
+                    if server.get("interface") == interface and not server.get("disabled", False)
+                ] if verify_result.get("success") else []
+                if not verified:
+                    return {
+                        "error": (
+                            f"Router accepted PPPoE server create on {interface} but no enabled "
+                            f"server was found afterward"
+                        )
+                    }
 
             return {"success": True, "action": "created", "interface": interface}
         except Exception as e:
@@ -2375,7 +2403,10 @@ class MikroTikAPI:
             return {"error": "Not connected"}
         try:
             interface_filter = {iface for iface in (interfaces or []) if iface}
-            servers = self.send_command("/interface/pppoe-server/server/print")
+            servers = self.send_command_optimized(
+                "/interface/pppoe-server/server/print",
+                proplist=[".id", "interface", "service-name"],
+            )
             if servers.get("error"):
                 return {"error": f"Could not read PPPoE servers: {servers['error']}"}
 
@@ -2422,10 +2453,9 @@ class MikroTikAPI:
 
             errors = []
             for port in unique_ports:
-                restore = self.add_bridge_port(port, hotspot_bridge)
+                restore = self.add_bridge_port(port, hotspot_bridge, verify=False)
                 if restore.get("error"):
                     errors.append(f"{port}: {restore['error']}")
-                time.sleep(0.2)
 
             if errors:
                 return {"error": "Failed to restore PPPoE ports: " + "; ".join(errors)}
@@ -2457,6 +2487,7 @@ class MikroTikAPI:
         pool_name: str = "pppoe-pool",
         pool_range: str = "192.168.89.2-192.168.89.254",
         service_name: str = "pppoe-server1",
+        current_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Set up full PPPoE infrastructure on the router:
@@ -2466,13 +2497,12 @@ class MikroTikAPI:
         4. Remove any legacy bridge-bound PPPoE server
         5. Bypass FastTrack for PPPoE subnet (so PPP rate-limits are enforced)
         """
-        current_state = self.get_pppoe_access_state(legacy_bridge_name=bridge_name)
+        current_state = current_state or self.get_pppoe_access_state(legacy_bridge_name=bridge_name)
         if current_state.get("error"):
             return current_state
 
         current_mode = current_state.get("mode", "none")
-        legacy_bridge_ports = self.get_ports_in_bridge(bridge_name)
-        bridge_members = set(legacy_bridge_ports.get("ports", [])) if legacy_bridge_ports.get("success") else set()
+        bridge_members = set(current_state.get("legacy_bridge_members", []))
         if current_mode in {"legacy_bridge", "mixed"} or bridge_members.intersection(pppoe_ports or []):
             logger.warning(
                 f"Router currently uses {current_mode} PPPoE access or still has "
@@ -2549,7 +2579,6 @@ class MikroTikAPI:
             if result.get("error") and "already" not in result.get("error", "").lower():
                 errors.append(f"Bridge create: {result['error']}")
             logger.info(f"PPPoE infrastructure: bridge '{bridge_name}' ready")
-            time.sleep(0.2)
 
             # 2. Add IP address on bridge-pppoe (ignore if already exists).
             # The bridge remains as shared PPPoE infra, but access ports no longer
@@ -2561,7 +2590,6 @@ class MikroTikAPI:
             })
             if result.get("error") and "already" not in result.get("error", "").lower():
                 errors.append(f"IP address: {result['error']}")
-            time.sleep(0.2)
 
             # 4. Create IP pool (ignore if already exists)
             result = self.send_command("/ip/pool/add", {
@@ -2570,7 +2598,6 @@ class MikroTikAPI:
             })
             if result.get("error") and "already" not in result.get("error", "").lower():
                 errors.append(f"Pool: {result['error']}")
-            time.sleep(0.2)
 
             profile_result = self.ensure_pppoe_profile(
                 profile_name="default-pppoe",
@@ -2580,24 +2607,29 @@ class MikroTikAPI:
             )
             if profile_result.get("error"):
                 return {"error": f"PPPoE profile: {profile_result['error']}"}
-            time.sleep(0.2)
 
             # 5. Remove selected ports from any bridge and bind PPPoE directly.
             port_setup_errors = []
+            detached_ports = []
             for port in target_ports:
-                remove_result = self.remove_bridge_port(port)
+                remove_result = self.remove_bridge_port(port, verify=False)
                 if remove_result.get("error"):
                     port_setup_errors.append(f"Port {port}: {remove_result['error']}")
                     continue
+                detached_ports.append(port)
 
+            if detached_ports:
+                time.sleep(0.1)
+
+            for port in detached_ports:
                 bind_result = self.ensure_pppoe_server_on_interface(
                     port,
                     profile_name="default-pppoe",
                     service_name_prefix=service_name,
+                    verify=False,
                 )
                 if bind_result.get("error"):
                     port_setup_errors.append(f"Port {port}: {bind_result['error']}")
-                time.sleep(0.2)
 
             # 6. Add NAT masquerade for PPPoE subnet (ignore if already exists)
             pppoe_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
@@ -2610,10 +2642,9 @@ class MikroTikAPI:
             })
             if result.get("error") and "already" not in result.get("error", "").lower():
                 errors.append(f"NAT: {result['error']}")
-            time.sleep(0.2)
 
             # 7. Verify the selected ports are directly attached to PPPoE.
-            time.sleep(0.3)
+            time.sleep(0.1)
             access_state = self.get_pppoe_access_state(legacy_bridge_name=bridge_name)
             if access_state.get("error"):
                 return {
@@ -2670,9 +2701,14 @@ class MikroTikAPI:
 
             if errors:
                 logger.warning(f"PPPoE infrastructure setup completed with warnings: {errors}")
-                return {"success": True, "warnings": errors, "mode": "direct"}
+                return {
+                    "success": True,
+                    "warnings": errors,
+                    "mode": "direct",
+                    "access_state": access_state,
+                }
             logger.info("PPPoE infrastructure setup completed successfully")
-            return {"success": True, "mode": "direct"}
+            return {"success": True, "mode": "direct", "access_state": access_state}
         except Exception as e:
             logger.error(f"Error setting up PPPoE infrastructure: {e}")
             return {"error": str(e), "partial_errors": errors}
@@ -2696,7 +2732,6 @@ class MikroTikAPI:
             result = self.send_command("/interface/bridge/add", {"name": bridge_name})
             if result.get("error") and "already" not in result.get("error", "").lower():
                 errors.append(f"Bridge create: {result['error']}")
-            time.sleep(0.2)
 
             direct_cleanup = self.remove_pppoe_servers(target_ports)
             if direct_cleanup.get("error"):
@@ -2704,23 +2739,9 @@ class MikroTikAPI:
 
             port_move_errors = []
             for port in target_ports:
-                move_result = self.add_bridge_port(port, bridge_name)
+                move_result = self.add_bridge_port(port, bridge_name, verify=False)
                 if move_result.get("error"):
                     port_move_errors.append(f"Port {port}: {move_result['error']}")
-                time.sleep(0.2)
-
-            time.sleep(0.3)
-            verify = self.verify_port_bridges(
-                {p: bridge_name for p in target_ports},
-                retries=8,
-                delay=0.5,
-            )
-            if verify.get("error"):
-                return {
-                    "error": f"Port conversion failed on the router: {verify['error']}",
-                    "failed_ports": verify.get("failed_ports", []),
-                    "partial_errors": port_move_errors,
-                }
 
             result = self.send_command("/ip/address/add", {
                 "address": bridge_ip,
@@ -2729,7 +2750,6 @@ class MikroTikAPI:
             })
             if result.get("error") and "already" not in result.get("error", "").lower():
                 errors.append(f"IP address: {result['error']}")
-            time.sleep(0.2)
 
             result = self.send_command("/ip/pool/add", {
                 "name": pool_name,
@@ -2737,7 +2757,6 @@ class MikroTikAPI:
             })
             if result.get("error") and "already" not in result.get("error", "").lower():
                 errors.append(f"Pool: {result['error']}")
-            time.sleep(0.2)
 
             profile_result = self.ensure_pppoe_profile(
                 profile_name="default-pppoe",
@@ -2747,16 +2766,15 @@ class MikroTikAPI:
             )
             if profile_result.get("error"):
                 return {"error": f"PPPoE profile: {profile_result['error']}"}
-            time.sleep(0.2)
 
             server_result = self.ensure_pppoe_server_on_interface(
                 bridge_name,
                 profile_name="default-pppoe",
                 service_name_prefix=service_name,
+                verify=False,
             )
             if server_result.get("error"):
                 return {"error": f"PPPoE server: {server_result['error']}"}
-            time.sleep(0.2)
 
             result = self.send_command("/ip/firewall/nat/add", {
                 "chain": "srcnat",
@@ -2767,7 +2785,6 @@ class MikroTikAPI:
             })
             if result.get("error") and "already" not in result.get("error", "").lower():
                 errors.append(f"NAT: {result['error']}")
-            time.sleep(0.2)
 
             bypass_result = self.ensure_pppoe_fasttrack_bypass(
                 bridge_name=bridge_name,
@@ -2815,14 +2832,15 @@ class MikroTikAPI:
             remove_result = self.remove_pppoe_servers(remove_interfaces)
             if remove_result.get("error"):
                 errors.append(remove_result["error"])
-            time.sleep(0.2)
+
+            if ports_to_restore:
+                time.sleep(0.1)
 
             # 2. Move ports back to hotspot bridge
             for port in ports_to_restore:
-                r = self.add_bridge_port(port, hotspot_bridge)
+                r = self.add_bridge_port(port, hotspot_bridge, verify=False)
                 if r.get("error"):
                     errors.append(f"Restore port {port}: {r['error']}")
-                time.sleep(0.2)
 
             # 3. Remove IP addresses on bridge-pppoe
             addrs = self.send_command("/ip/address/print")
@@ -2832,7 +2850,6 @@ class MikroTikAPI:
                         aid = addr.get(".id")
                         if aid:
                             self.send_command("/ip/address/remove", {"numbers": aid})
-            time.sleep(0.2)
 
             # 4. Remove bridge-pppoe
             bridges = self.send_command("/interface/bridge/print")
@@ -2843,7 +2860,6 @@ class MikroTikAPI:
                         if bid:
                             self.send_command("/interface/bridge/remove", {"numbers": bid})
                             logger.info(f"Removed bridge '{bridge_name}'")
-            time.sleep(0.2)
 
             # 5. Remove PPPoE pool
             pools = self.send_command("/ip/pool/print")
@@ -2854,7 +2870,6 @@ class MikroTikAPI:
                         if pid:
                             self.send_command("/ip/pool/remove", {"numbers": pid})
                             logger.info(f"Removed IP pool '{pool_name}'")
-            time.sleep(0.2)
 
             # 6. Remove NAT rule for PPPoE
             nats = self.send_command("/ip/firewall/nat/print")
@@ -2882,7 +2897,10 @@ class MikroTikAPI:
         if not self.connected:
             return {"error": "Not connected"}
         try:
-            bridges_result = self.send_command("/interface/bridge/print")
+            bridges_result = self.send_command_optimized(
+                "/interface/bridge/print",
+                proplist=["name", "running", "disabled", "mac-address"],
+            )
             bridges = {}
             if bridges_result.get("success"):
                 for br in bridges_result.get("data", []):
@@ -2893,7 +2911,10 @@ class MikroTikAPI:
                         "mac_address": br.get("mac-address", ""),
                     }
 
-            ports_result = self.send_command("/interface/bridge/port/print")
+            ports_result = self.send_command_optimized(
+                "/interface/bridge/port/print",
+                proplist=["interface", "bridge", "disabled", "status"],
+            )
             ports = []
             if ports_result.get("success"):
                 for p in ports_result.get("data", []):
@@ -3090,7 +3111,19 @@ class MikroTikAPI:
         if not self.connected:
             return {"error": "Not connected"}
         try:
-            result = self.send_command("/interface/pppoe-server/server/print")
+            result = self.send_command_optimized(
+                "/interface/pppoe-server/server/print",
+                proplist=[
+                    ".id",
+                    "service-name",
+                    "interface",
+                    "disabled",
+                    "default-profile",
+                    "max-sessions",
+                    "max-mtu",
+                    "max-mru",
+                ],
+            )
             if not result.get("success"):
                 return result
             servers = []
