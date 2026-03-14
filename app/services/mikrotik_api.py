@@ -1556,49 +1556,150 @@ class MikroTikAPI:
             logger.error(f"Error getting ethernet interfaces: {e}")
             return {"error": str(e)}
 
+    def _get_bridge_port_entry(self, interface: str) -> Dict[str, Any]:
+        """Find the bridge port entry for an interface.
+        Returns {"found": True, "id": ..., "bridge": ...} or {"found": False}."""
+        ports = self.send_command("/interface/bridge/port/print")
+        if not ports.get("success"):
+            return {"error": ports.get("error", "Failed to read bridge ports")}
+        for port in ports.get("data", []):
+            if port.get("interface") == interface:
+                return {
+                    "found": True,
+                    "id": port.get(".id"),
+                    "bridge": port.get("bridge", ""),
+                    "hw": port.get("hw", ""),
+                    "hw-offload": port.get("hw-offload", ""),
+                }
+        return {"found": False}
+
     def remove_bridge_port(self, interface: str) -> Dict[str, Any]:
-        """Remove an interface from whatever bridge it belongs to."""
+        """Remove an interface from whatever bridge it belongs to.
+        Returns the original bridge name in 'original_bridge' on success."""
         if not self.connected:
             return {"error": "Not connected"}
         try:
-            ports = self.send_command("/interface/bridge/port/print")
-            if ports.get("success") and ports.get("data"):
-                for port in ports["data"]:
-                    if port.get("interface") == interface:
-                        port_id = port.get(".id")
-                        if port_id:
-                            result = self.send_command("/interface/bridge/port/remove", {"numbers": port_id})
-                            if result.get("error"):
-                                logger.error(f"Failed to remove {interface} from bridge: {result['error']}")
-                                return {"error": f"Failed to remove {interface} from bridge: {result['error']}"}
-                            logger.info(f"Removed {interface} from bridge")
-                            return {"success": True, "action": "removed"}
-            return {"success": True, "action": "not_found"}
+            entry = self._get_bridge_port_entry(interface)
+            if entry.get("error"):
+                return {"error": entry["error"]}
+            if not entry.get("found"):
+                return {"success": True, "action": "not_found", "original_bridge": None}
+
+            port_id = entry["id"]
+            original_bridge = entry["bridge"]
+            if port_id:
+                result = self.send_command("/interface/bridge/port/remove", {"numbers": port_id})
+                if result.get("error"):
+                    logger.error(f"Failed to remove {interface} from bridge: {result['error']}")
+                    return {"error": f"Failed to remove {interface} from bridge: {result['error']}"}
+                logger.info(f"Removed {interface} from bridge '{original_bridge}'")
+                return {"success": True, "action": "removed", "original_bridge": original_bridge}
+            return {"success": True, "action": "not_found", "original_bridge": None}
         except Exception as e:
             logger.error(f"Error removing bridge port {interface}: {e}")
             return {"error": str(e)}
 
     def add_bridge_port(self, interface: str, bridge: str) -> Dict[str, Any]:
-        """Add an interface to a specific bridge."""
+        """Move an interface to a specific bridge.
+        Uses in-place 'set' when the port already has a bridge entry (avoids
+        remove+add which can silently fail on hardware-offloaded switch chips).
+        Falls back to 'add' when no entry exists."""
         if not self.connected:
             return {"error": "Not connected"}
         try:
-            remove_result = self.remove_bridge_port(interface)
-            if remove_result.get("error"):
-                return {"error": f"Could not remove {interface} from current bridge: {remove_result['error']}"}
-            time.sleep(0.2)
-            result = self.send_command("/interface/bridge/port/add", {
-                "interface": interface,
-                "bridge": bridge,
-            })
-            if result.get("error"):
-                logger.error(f"Failed to add {interface} to bridge {bridge}: {result['error']}")
-                return {"error": f"Failed to add {interface} to bridge {bridge}: {result['error']}"}
-            logger.info(f"Added {interface} to bridge {bridge}")
+            entry = self._get_bridge_port_entry(interface)
+            if entry.get("error"):
+                return {"error": entry["error"]}
+
+            if entry.get("found"):
+                current_bridge = entry["bridge"]
+                port_id = entry["id"]
+
+                if current_bridge == bridge:
+                    logger.info(f"{interface} already in bridge {bridge}")
+                    return {"success": True}
+
+                # In-place change: set the bridge on the existing entry
+                logger.info(
+                    f"Moving {interface} from '{current_bridge}' to '{bridge}' "
+                    f"via /set (entry {port_id})"
+                )
+                result = self.send_command("/interface/bridge/port/set", {
+                    "numbers": port_id,
+                    "bridge": bridge,
+                })
+                if result.get("error"):
+                    logger.error(f"set bridge failed for {interface}: {result['error']}")
+                    return {
+                        "error": (
+                            f"Failed to move {interface} from '{current_bridge}' "
+                            f"to '{bridge}': {result['error']}"
+                        )
+                    }
+            else:
+                # No existing entry -- create one
+                logger.info(f"Adding {interface} to bridge {bridge} via /add (no prior entry)")
+                result = self.send_command("/interface/bridge/port/add", {
+                    "interface": interface,
+                    "bridge": bridge,
+                })
+                if result.get("error"):
+                    logger.error(f"add bridge port failed for {interface}: {result['error']}")
+                    return {"error": f"Failed to add {interface} to bridge {bridge}: {result['error']}"}
+
+            # Verify the port actually landed in the target bridge
+            time.sleep(0.5)
+            verify = self.verify_port_bridges({interface: bridge})
+            if verify.get("error"):
+                failed = verify.get("failed_ports", [])
+                actual = failed[0]["actual_bridge"] if failed else "unknown"
+                logger.error(
+                    f"Port {interface} did not end up in {bridge} after command. "
+                    f"Actual: {actual}. Raw set/add result: {result}"
+                )
+                # Try to restore to original bridge if we know it
+                original = entry.get("bridge") if entry.get("found") else None
+                if original and original != bridge:
+                    self._restore_bridge_port(interface, original)
+
+                return {
+                    "error": (
+                        f"Router did not move {interface} to '{bridge}' "
+                        f"(it is in '{actual}'). "
+                        f"Check for hardware offloading (hw-offload) or "
+                        f"switch chip grouping on this port."
+                    )
+                }
+
+            logger.info(f"Verified {interface} is now in bridge {bridge}")
             return {"success": True}
         except Exception as e:
-            logger.error(f"Error adding {interface} to bridge {bridge}: {e}")
+            logger.error(f"Error moving {interface} to bridge {bridge}: {e}")
             return {"error": str(e)}
+
+    def _restore_bridge_port(self, interface: str, original_bridge: str) -> None:
+        """Best-effort restore of a port to its original bridge after a failed move."""
+        if not original_bridge:
+            return
+        try:
+            logger.info(f"Restoring {interface} to original bridge '{original_bridge}'")
+            entry = self._get_bridge_port_entry(interface)
+            if entry.get("found"):
+                result = self.send_command("/interface/bridge/port/set", {
+                    "numbers": entry["id"],
+                    "bridge": original_bridge,
+                })
+            else:
+                result = self.send_command("/interface/bridge/port/add", {
+                    "interface": interface,
+                    "bridge": original_bridge,
+                })
+            if result.get("error"):
+                logger.error(f"Failed to restore {interface} to {original_bridge}: {result['error']}")
+            else:
+                logger.info(f"Restored {interface} to bridge '{original_bridge}'")
+        except Exception as e:
+            logger.error(f"Exception restoring {interface} to {original_bridge}: {e}")
 
     def verify_port_bridges(self, expected: Dict[str, str]) -> Dict[str, Any]:
         """
