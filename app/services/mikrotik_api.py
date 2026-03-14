@@ -279,6 +279,7 @@ class MikroTikAPI:
             # Read response
             responses = []
             connection_lost = False
+            error_msg = ""
             while True:
                 sentence = self.read_sentence()
                 logger.info(f"Raw sentence received for command {command}: {sentence}")  # Debug log
@@ -299,14 +300,18 @@ class MikroTikAPI:
                                 data[key_value[0]] = key_value[1]
                     responses.append(data)
                 elif sentence[0] == "!trap":
-                    error_msg = ""
                     for item in sentence[1:]:
                         if item.startswith("=message="):
                             error_msg = item[9:]
-                    return {"error": error_msg or "Command failed"}
+                elif sentence[0] == "!fatal":
+                    for item in sentence[1:]:
+                        if item.startswith("=message="):
+                            error_msg = item[9:]
 
             if connection_lost:
                 return {"error": "Not connected"}
+            if error_msg:
+                return {"error": error_msg or "Command failed"}
             
             return {"success": True, "data": responses}
         except Exception as e:
@@ -352,6 +357,7 @@ class MikroTikAPI:
             
             responses = []
             connection_lost = False
+            error_msg = ""
             while True:
                 sentence = self.read_sentence()
                 if not sentence:
@@ -370,14 +376,18 @@ class MikroTikAPI:
                                 data[key_value[0]] = key_value[1]
                     responses.append(data)
                 elif sentence[0] == "!trap":
-                    error_msg = ""
                     for item in sentence[1:]:
                         if item.startswith("=message="):
                             error_msg = item[9:]
-                    return {"error": error_msg or "Command failed"}
+                elif sentence[0] == "!fatal":
+                    for item in sentence[1:]:
+                        if item.startswith("=message="):
+                            error_msg = item[9:]
 
             if connection_lost:
                 return {"error": "Not connected"}
+            if error_msg:
+                return {"error": error_msg or "Command failed"}
             
             return {"success": True, "data": responses}
         except Exception as e:
