@@ -186,27 +186,39 @@ class MikroTikAPI:
             return struct.pack('B', 0xF0) + struct.pack('>I', length)
 
     def decode_length(self) -> int:
-        c = struct.unpack('B', self.sock.recv(1))[0]
+        c = struct.unpack('B', self._recv_all(1))[0]
         if (c & 0x80) == 0:
             return c
         elif (c & 0xC0) == 0x80:
-            return ((c & ~0xC0) << 8) + struct.unpack('B', self.sock.recv(1))[0]
+            return ((c & ~0xC0) << 8) + struct.unpack('B', self._recv_all(1))[0]
         elif (c & 0xE0) == 0xC0:
-            return ((c & ~0xE0) << 16) + struct.unpack('>H', self.sock.recv(2))[0]
+            return ((c & ~0xE0) << 16) + struct.unpack('>H', self._recv_all(2))[0]
         elif (c & 0xF0) == 0xE0:
-            return ((c & ~0xF0) << 24) + struct.unpack('>I', b'\x00' + self.sock.recv(3))[0]
+            return ((c & ~0xF0) << 24) + struct.unpack('>I', b'\x00' + self._recv_all(3))[0]
         elif (c & 0xF8) == 0xF0:
-            return struct.unpack('>I', self.sock.recv(4))[0]
+            return struct.unpack('>I', self._recv_all(4))[0]
 
     def send_word(self, word: str):
         encoded_word = word.encode('utf-8')
         self.sock.send(self.encode_length(len(encoded_word)) + encoded_word)
 
+    def _recv_all(self, length: int) -> bytes:
+        """Read exactly *length* bytes from the socket.
+        TCP recv() may return fewer bytes than requested when data spans
+        multiple segments; this loops until every byte is collected."""
+        buf = bytearray()
+        while len(buf) < length:
+            chunk = self.sock.recv(length - len(buf))
+            if not chunk:
+                raise ConnectionError("Socket closed while reading")
+            buf.extend(chunk)
+        return bytes(buf)
+
     def read_word(self) -> str:
         length = self.decode_length()
         if length == 0:
             return ""
-        return self.sock.recv(length).decode('utf-8')
+        return self._recv_all(length).decode('utf-8')
 
     def send_sentence(self, words: List[str]):
         for word in words:
@@ -1621,42 +1633,53 @@ class MikroTikAPI:
             }
         return {"found": False}
 
-    def _force_remove_bridge_port(self, interface: str) -> Dict[str, Any]:
-        """Remove a bridge port that may be invisible to unfiltered print.
-        Strategy:
-          1. Filtered query to locate the entry by .id, then remove it.
-          2. If filtered query finds nothing, ask the router itself to
-             find-and-remove via [find interface=<iface>]."""
-        entry = self._find_bridge_port_filtered(interface)
-        if entry.get("error"):
-            return {"error": entry["error"]}
+    def _set_bridge_port_in_place(self, interface: str, bridge: str) -> Dict[str, Any]:
+        """Change the bridge of an existing bridge port entry in-place.
+        Strategy (ordered by reliability):
+          1. Re-read bridge ports (now that recv is fixed) to find the .id.
+          2. Use filtered query to find the .id.
+          3. Fall back to router-side /set with [find interface=<iface>].
+        In-place /set avoids remove+add which the switch chip can fight."""
 
+        # Strategy 1: re-read with the (now fixed) full recv
+        entry = self._get_bridge_port_entry(interface)
         if entry.get("found") and entry.get("id"):
             port_id = entry["id"]
-            original_bridge = entry["bridge"]
-            rm = self.send_command("/interface/bridge/port/remove", {"numbers": port_id})
-            if rm.get("error"):
-                logger.error(f"Force-remove bridge port {interface} ({port_id}): {rm['error']}")
-                return {"error": f"Failed to force-remove {interface}: {rm['error']}"}
-            logger.info(f"Force-removed {interface} from bridge '{original_bridge}' (id {port_id})")
-            return {"success": True, "action": "removed", "original_bridge": original_bridge}
+            logger.info(f"Found {interface} via re-read (id {port_id}), setting bridge to {bridge}")
+            r = self.send_command("/interface/bridge/port/set", {
+                "numbers": port_id,
+                "bridge": bridge,
+            })
+            if r.get("error"):
+                return {"error": f"set bridge failed for {interface}: {r['error']}"}
+            return {"success": True, "method": "re-read"}
 
+        # Strategy 2: filtered query
+        entry = self._find_bridge_port_filtered(interface)
+        if entry.get("found") and entry.get("id"):
+            port_id = entry["id"]
+            logger.info(f"Found {interface} via filtered query (id {port_id}), setting bridge to {bridge}")
+            r = self.send_command("/interface/bridge/port/set", {
+                "numbers": port_id,
+                "bridge": bridge,
+            })
+            if r.get("error"):
+                return {"error": f"set bridge failed for {interface}: {r['error']}"}
+            return {"success": True, "method": "filtered-query"}
+
+        # Strategy 3: let the router find it
         logger.warning(
-            f"Filtered query did not find {interface} either. "
-            f"Trying router-side find-and-remove."
+            f"Neither re-read nor filtered query found {interface}. "
+            f"Trying router-side /set with [find]."
         )
-        rm = self.send_command(
-            "/interface/bridge/port/remove",
-            {"numbers": f"[find interface={interface}]"},
-        )
-        if rm.get("error"):
-            if "no such item" in rm["error"].lower():
-                logger.info(f"Router confirms {interface} has no bridge port entry to remove")
-                return {"success": True, "action": "not_found", "original_bridge": None}
-            logger.error(f"Router-side find-and-remove failed for {interface}: {rm['error']}")
-            return {"error": f"Failed to force-remove {interface}: {rm['error']}"}
-        logger.info(f"Router-side find-and-remove succeeded for {interface}")
-        return {"success": True, "action": "removed", "original_bridge": None}
+        r = self.send_command("/interface/bridge/port/set", {
+            "numbers": f"[find interface={interface}]",
+            "bridge": bridge,
+        })
+        if r.get("error"):
+            logger.error(f"Router-side set failed for {interface}: {r['error']}")
+            return {"error": f"Failed to set {interface} to bridge {bridge}: {r['error']}"}
+        return {"success": True, "method": "router-find"}
 
     def add_bridge_port(self, interface: str, bridge: str) -> Dict[str, Any]:
         """Move an interface to a specific bridge.
@@ -1709,23 +1732,14 @@ class MikroTikAPI:
                     if "already" in err_lower and "bridge port" in err_lower:
                         logger.warning(
                             f"{interface} invisible to unfiltered print but router "
-                            f"says 'already added'. Trying filtered find + remove + re-add."
+                            f"says 'already added'. Switching to in-place /set."
                         )
-                        fr = self._force_remove_bridge_port(interface)
-                        if fr.get("error"):
-                            logger.error(f"Force-remove fallback failed for {interface}: {fr['error']}")
-                            return {"error": f"Failed to add {interface} to bridge {bridge}: {result['error']}"}
-                        time.sleep(0.3)
-                        result2 = self.send_command("/interface/bridge/port/add", {
-                            "interface": interface,
-                            "bridge": bridge,
-                        })
-                        if result2.get("error"):
-                            logger.error(f"Re-add after force-remove failed for {interface}: {result2['error']}")
-                            if fr.get("original_bridge"):
-                                self._restore_bridge_port(interface, fr["original_bridge"])
-                            return {"error": f"Failed to add {interface} to bridge {bridge}: {result2['error']}"}
-                        result = result2
+                        set_r = self._set_bridge_port_in_place(interface, bridge)
+                        if set_r.get("error"):
+                            logger.error(f"In-place set fallback failed for {interface}: {set_r['error']}")
+                            return {"error": f"Failed to move {interface} to bridge {bridge}: {set_r['error']}"}
+                        logger.info(f"In-place set succeeded for {interface} via {set_r.get('method')}")
+                        result = set_r
                     else:
                         logger.error(f"add bridge port failed for {interface}: {result['error']}")
                         return {"error": f"Failed to add {interface} to bridge {bridge}: {result['error']}"}
