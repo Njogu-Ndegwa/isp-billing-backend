@@ -59,8 +59,13 @@
                 "method": "POST",
                 "url": "{{baseUrl}}/api/plans/activate-emergency",
                 "header": [
+                    { "key": "Content-Type", "value": "application/json" },
                     { "key": "Authorization", "value": "Bearer {{token}}" }
-                ]
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"router_id\": 1,\n  \"message\": \"Sorry for the disruption, enjoy free deals!\"\n}"
+                }
             }
         },
         {
@@ -69,8 +74,13 @@
                 "method": "POST",
                 "url": "{{baseUrl}}/api/plans/deactivate-emergency",
                 "header": [
+                    { "key": "Content-Type", "value": "application/json" },
                     { "key": "Authorization", "value": "Bearer {{token}}" }
-                ]
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"router_id\": 1\n}"
+                }
             }
         },
         {

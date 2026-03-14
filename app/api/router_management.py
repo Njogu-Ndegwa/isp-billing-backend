@@ -105,6 +105,8 @@ async def get_routers(
             "auth_method": getattr(router_obj, "auth_method", "DIRECT_API") or "DIRECT_API",
             "payment_methods": getattr(router_obj, "payment_methods", None) or ["mpesa", "voucher"],
             "pppoe_ports": getattr(router_obj, "pppoe_ports", None),
+            "emergency_active": getattr(router_obj, "emergency_active", False),
+            "emergency_message": getattr(router_obj, "emergency_message", None),
         }
         router_payload.update(build_router_status(router_obj, now=now))
         response.append(router_payload)
@@ -276,6 +278,8 @@ async def get_router_by_identity(
         "business_name": business_name,
         "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
         "pppoe_ports": getattr(router_obj, 'pppoe_ports', None),
+        "emergency_active": getattr(router_obj, 'emergency_active', False),
+        "emergency_message": getattr(router_obj, 'emergency_message', None),
     }
 
 

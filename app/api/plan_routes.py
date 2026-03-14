@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType
+from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router
 from app.services.auth import verify_token, get_current_user
 from app.services.plan_cache import get_plans_cached, invalidate_plan_cache
 import logging
@@ -413,14 +413,34 @@ async def get_plan_performance(
         raise HTTPException(status_code=500, detail=f"Failed to fetch plan performance: {str(e)}")
 
 
+class EmergencyActivateRequest(BaseModel):
+    router_id: int
+    message: Optional[str] = None
+
+
+class EmergencyDeactivateRequest(BaseModel):
+    router_id: int
+
+
 @router.post("/api/plans/activate-emergency")
 async def activate_emergency_mode(
+    request: EmergencyActivateRequest,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Activate emergency mode: hide all REGULAR plans and show all EMERGENCY plans for this user."""
+    """Activate emergency mode on a specific router: persist the flag and message,
+    then hide all REGULAR plans and show all EMERGENCY plans for this user."""
     try:
         user = await get_current_user(token, db)
+
+        stmt = select(Router).where(Router.id == request.router_id, Router.user_id == user.id)
+        result = await db.execute(stmt)
+        router_obj = result.scalar_one_or_none()
+        if not router_obj:
+            raise HTTPException(status_code=404, detail="Router not found or does not belong to you")
+
+        router_obj.emergency_active = True
+        router_obj.emergency_message = request.message
 
         hidden_result = await db.execute(
             update(Plan)
@@ -436,11 +456,13 @@ async def activate_emergency_mode(
         await db.commit()
         await invalidate_plan_cache()
 
-        logger.info(f"Emergency mode activated by user {user.id}: {hidden_result.rowcount} regular hidden, {shown_result.rowcount} emergency shown")
+        logger.info(f"Emergency mode activated on router {request.router_id} by user {user.id}: {hidden_result.rowcount} regular hidden, {shown_result.rowcount} emergency shown")
 
         return {
             "success": True,
             "message": "Emergency mode activated",
+            "router_id": request.router_id,
+            "emergency_message": request.message,
             "regular_plans_hidden": hidden_result.rowcount,
             "emergency_plans_shown": shown_result.rowcount,
         }
@@ -454,12 +476,23 @@ async def activate_emergency_mode(
 
 @router.post("/api/plans/deactivate-emergency")
 async def deactivate_emergency_mode(
+    request: EmergencyDeactivateRequest,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Deactivate emergency mode: show all REGULAR plans and hide all EMERGENCY plans for this user."""
+    """Deactivate emergency mode on a specific router: clear the flag and message,
+    then show all REGULAR plans and hide all EMERGENCY plans for this user."""
     try:
         user = await get_current_user(token, db)
+
+        stmt = select(Router).where(Router.id == request.router_id, Router.user_id == user.id)
+        result = await db.execute(stmt)
+        router_obj = result.scalar_one_or_none()
+        if not router_obj:
+            raise HTTPException(status_code=404, detail="Router not found or does not belong to you")
+
+        router_obj.emergency_active = False
+        router_obj.emergency_message = None
 
         shown_result = await db.execute(
             update(Plan)
@@ -475,11 +508,12 @@ async def deactivate_emergency_mode(
         await db.commit()
         await invalidate_plan_cache()
 
-        logger.info(f"Emergency mode deactivated by user {user.id}: {shown_result.rowcount} regular shown, {hidden_result.rowcount} emergency hidden")
+        logger.info(f"Emergency mode deactivated on router {request.router_id} by user {user.id}: {shown_result.rowcount} regular shown, {hidden_result.rowcount} emergency hidden")
 
         return {
             "success": True,
             "message": "Emergency mode deactivated. Regular plans restored.",
+            "router_id": request.router_id,
             "regular_plans_shown": shown_result.rowcount,
             "emergency_plans_hidden": hidden_result.rowcount,
         }

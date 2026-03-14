@@ -1817,8 +1817,36 @@ class MikroTikAPI:
             entry = self._get_bridge_port_entry(interface)
             if entry.get("error"):
                 return {"error": entry["error"]}
+
             if not entry.get("found"):
-                return {"success": True, "action": "not_found", "original_bridge": None}
+                entry = self._find_bridge_port_filtered(interface)
+                if entry.get("error"):
+                    return {"error": entry["error"]}
+
+            if not entry.get("found"):
+                logger.warning(
+                    f"{interface} not visible in bridge/port print. "
+                    f"Trying router-side remove with [find]."
+                )
+                result = self.send_command(
+                    "/interface/bridge/port/remove",
+                    {"numbers": f"[find interface={interface}]"},
+                )
+                if result.get("error"):
+                    return {"error": f"Failed to remove {interface} from bridge: {result['error']}"}
+
+                time.sleep(0.5)
+                verify = self._find_bridge_port_filtered(interface)
+                if verify.get("error"):
+                    return {"error": verify["error"]}
+                if verify.get("found"):
+                    return {
+                        "error": (
+                            f"Router accepted remove for {interface} but it is still in "
+                            f"bridge '{verify.get('bridge', '(unknown)')}'"
+                        )
+                    }
+                return {"success": True, "action": "removed-via-find", "original_bridge": None}
 
             port_id = entry["id"]
             original_bridge = entry["bridge"]
@@ -1827,6 +1855,23 @@ class MikroTikAPI:
                 if result.get("error"):
                     logger.error(f"Failed to remove {interface} from bridge: {result['error']}")
                     return {"error": f"Failed to remove {interface} from bridge: {result['error']}"}
+
+                time.sleep(0.5)
+                verify = self._find_bridge_port_filtered(interface)
+                if verify.get("error"):
+                    return {"error": verify["error"]}
+                if verify.get("found"):
+                    logger.error(
+                        f"Router accepted remove for {interface} but it is still in "
+                        f"bridge '{verify.get('bridge', '(unknown)')}'"
+                    )
+                    return {
+                        "error": (
+                            f"Router did not detach {interface} from bridge "
+                            f"'{verify.get('bridge', '(unknown)')}'"
+                        )
+                    }
+
                 logger.info(f"Removed {interface} from bridge '{original_bridge}'")
                 return {"success": True, "action": "removed", "original_bridge": original_bridge}
             return {"success": True, "action": "not_found", "original_bridge": None}
@@ -2270,6 +2315,19 @@ class MikroTikAPI:
                                 f"{duplicate_remove['error']}"
                             )
 
+                verify = self.get_pppoe_server_status()
+                verified = [
+                    server for server in verify.get("data", [])
+                    if server.get("interface") == interface and not server.get("disabled", False)
+                ] if verify.get("success") else []
+                if not verified:
+                    return {
+                        "error": (
+                            f"Router accepted PPPoE server update on {interface} but no enabled "
+                            f"server was found afterward"
+                        )
+                    }
+
                 return {"success": True, "action": "updated", "interface": interface}
 
             result = self.send_command("/interface/pppoe-server/server/add", {
@@ -2280,6 +2338,19 @@ class MikroTikAPI:
             })
             if result.get("error"):
                 return {"error": f"Failed to create PPPoE server on {interface}: {result['error']}"}
+
+            verify = self.get_pppoe_server_status()
+            verified = [
+                server for server in verify.get("data", [])
+                if server.get("interface") == interface and not server.get("disabled", False)
+            ] if verify.get("success") else []
+            if not verified:
+                return {
+                    "error": (
+                        f"Router accepted PPPoE server create on {interface} but no enabled "
+                        f"server was found afterward"
+                    )
+                }
 
             return {"success": True, "action": "created", "interface": interface}
         except Exception as e:
@@ -2483,6 +2554,11 @@ class MikroTikAPI:
                     })
 
             if port_setup_errors or failed_ports:
+                if port_setup_errors:
+                    logger.error(
+                        "PPPoE direct-interface setup had port errors: "
+                        + "; ".join(port_setup_errors)
+                    )
                 return {
                     "error": "Port conversion failed on the router: one or more PPPoE ports are not directly bound",
                     "failed_ports": failed_ports,

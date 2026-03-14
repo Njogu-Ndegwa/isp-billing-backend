@@ -2814,6 +2814,8 @@ async def set_pppoe_ports(
             "failed_ports": failed_ports,
             "pppoe_ports_unchanged": result.get("current_ports", old_ports),
         }
+        if result.get("partial_errors"):
+            detail["partial_errors"] = result.get("partial_errors", [])
         raise HTTPException(status_code=500, detail=detail)
 
     # Only persist to DB after the router confirmed the change

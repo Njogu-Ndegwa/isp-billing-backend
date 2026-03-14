@@ -215,6 +215,8 @@ class Router(Base):
     last_status_source = Column(String(50), nullable=True)
     availability_checks = Column(Integer, nullable=False, default=0, server_default="0")
     availability_successes = Column(Integer, nullable=False, default=0, server_default="0")
+    emergency_active = Column(Boolean, nullable=False, default=False, server_default="false")
+    emergency_message = Column(String(500), nullable=True)
 
 class ProvisioningLog(Base):
     __tablename__ = "provisioning_logs"

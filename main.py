@@ -298,6 +298,21 @@ async def run_radius_migrations():
         else:
             logger.info("Plan migration: Emergency/special offer columns already exist, skipping")
 
+        # --- Router emergency mode columns ---
+        result = await conn.execute(sa_text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'routers' AND column_name = 'emergency_active'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE routers
+                ADD COLUMN emergency_active BOOLEAN NOT NULL DEFAULT false,
+                ADD COLUMN emergency_message VARCHAR(500) NULL
+            """))
+            logger.info("Migration: Added emergency_active, emergency_message to routers")
+        else:
+            logger.info("Migration: Router emergency columns already exist, skipping")
+
         result = await conn.execute(sa_text("""
             SELECT table_name FROM information_schema.tables 
             WHERE table_name = 'radius_check'

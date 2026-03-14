@@ -386,6 +386,8 @@ async def get_public_router_info(
         "isp_name": getattr(router_obj, 'isp_name', None),
         "description": getattr(router_obj, 'description', None),
         "contact_info": getattr(router_obj, 'contact_info', None),
+        "emergency_active": getattr(router_obj, 'emergency_active', False),
+        "emergency_message": getattr(router_obj, 'emergency_message', None),
     }
 
 
@@ -751,7 +753,8 @@ async def get_portal_data(
         "plan_flags": {
             "has_emergency_plans": has_emergency,
             "has_special_offers": has_special,
-            "emergency_mode_active": regular_all_hidden and has_emergency,
+            "emergency_mode_active": getattr(router_obj, 'emergency_active', False),
+            "emergency_message": getattr(router_obj, 'emergency_message', None),
         },
     }
 
