@@ -4,6 +4,7 @@ import re
 import hashlib
 import logging
 import time
+import ipaddress
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import json  # Ensure you import json for serializing logs
@@ -1383,8 +1384,14 @@ class MikroTikAPI:
     # PPPoE MANAGEMENT
     # =========================================================================
 
-    def ensure_pppoe_profile(self, profile_name: str, rate_limit: str,
-                             local_address: str = "", pool_name: str = "") -> Dict[str, Any]:
+    def ensure_pppoe_profile(
+        self,
+        profile_name: str,
+        rate_limit: str,
+        local_address: str = "",
+        pool_name: str = "",
+        dns_server: str = "",
+    ) -> Dict[str, Any]:
         """
         Ensure a PPPoE profile exists with the specified rate limit.
         Creates or updates /ppp/profile.
@@ -1411,6 +1418,8 @@ class MikroTikAPI:
                 profile_args["local-address"] = local_address
             if pool_name:
                 profile_args["remote-address"] = pool_name
+            if dns_server:
+                profile_args["dns-server"] = dns_server
 
             if profile_exists:
                 profile_args["numbers"] = profile_id
@@ -1423,6 +1432,216 @@ class MikroTikAPI:
             return result
         except Exception as e:
             logger.error(f"Error ensuring PPPoE profile '{profile_name}': {e}")
+            return {"error": str(e)}
+
+    def get_ppp_profile_detail(self, profile_name: str) -> Dict[str, Any]:
+        """Return a single PPP profile by name with fields relevant to PPPoE."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ppp/profile/print")
+            if not result.get("success"):
+                return result
+
+            for profile in result.get("data", []):
+                if profile.get("name") == profile_name:
+                    return {
+                        "success": True,
+                        "found": True,
+                        "data": {
+                            "name": profile.get("name", ""),
+                            "local_address": profile.get("local-address", ""),
+                            "remote_address": profile.get("remote-address", ""),
+                            "dns_server": profile.get("dns-server", ""),
+                            "rate_limit": profile.get("rate-limit", ""),
+                        },
+                    }
+
+            return {"success": True, "found": False, "data": None}
+        except Exception as e:
+            logger.error(f"Error getting PPP profile detail for {profile_name}: {e}")
+            return {"error": str(e)}
+
+    def get_active_pppoe_profile(self, bridge_name: str = "bridge-pppoe") -> Dict[str, Any]:
+        """Resolve the active PPPoE server profile for a bridge and return its detail."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            servers = self.get_pppoe_server_status()
+            if servers.get("error"):
+                return servers
+
+            enabled_servers = [
+                s for s in servers.get("data", [])
+                if not s.get("disabled", False)
+            ]
+            server = next(
+                (s for s in enabled_servers if s.get("interface") == bridge_name),
+                enabled_servers[0] if enabled_servers else None,
+            )
+            if not server:
+                return {"success": True, "found": False, "data": None}
+
+            profile_name = server.get("default_profile") or "default-pppoe"
+            profile = self.get_ppp_profile_detail(profile_name)
+            if profile.get("error"):
+                return profile
+            if profile.get("found"):
+                profile["server_interface"] = server.get("interface", "")
+                profile["server_name"] = server.get("service_name", "")
+                return profile
+
+            return {"success": True, "found": False, "data": None}
+        except Exception as e:
+            logger.error(f"Error getting active PPPoE profile: {e}")
+            return {"error": str(e)}
+
+    def _pool_ranges_to_cidrs(self, ranges_str: str) -> List[str]:
+        """Convert MikroTik pool ranges into CIDR blocks for firewall matching."""
+        cidrs: List[str] = []
+        seen = set()
+
+        for part in (ranges_str or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                if "-" in part:
+                    start_str, end_str = [p.strip() for p in part.split("-", 1)]
+                    start_ip = ipaddress.ip_address(start_str)
+                    end_ip = ipaddress.ip_address(end_str)
+                    networks = ipaddress.summarize_address_range(start_ip, end_ip)
+                elif "/" in part:
+                    networks = [ipaddress.ip_network(part, strict=False)]
+                else:
+                    ip_obj = ipaddress.ip_address(part)
+                    networks = [ipaddress.ip_network(f"{ip_obj}/32", strict=False)]
+
+                for network in networks:
+                    cidr = str(network)
+                    if cidr not in seen:
+                        seen.add(cidr)
+                        cidrs.append(cidr)
+            except ValueError:
+                logger.warning(f"Could not parse PPPoE pool range '{part}' into CIDR blocks")
+
+        return cidrs
+
+    def ensure_pppoe_fasttrack_bypass(
+        self,
+        bridge_name: str = "bridge-pppoe",
+        pool_name: str = "",
+        fallback_pool_ranges: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Ensure FastTrack bypass rules exist for the active PPPoE address pool.
+        PPP profile rate-limit creates dynamic simple queues, and FastTrack skips them.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            effective_pool = pool_name
+            if not effective_pool:
+                active_profile = self.get_active_pppoe_profile(bridge_name=bridge_name)
+                if active_profile.get("error"):
+                    return active_profile
+                if active_profile.get("found") and active_profile.get("data", {}).get("remote_address"):
+                    effective_pool = active_profile["data"]["remote_address"]
+
+            cidrs: List[str] = []
+            if effective_pool:
+                pool_data = self.get_ip_pool_status(effective_pool)
+                if pool_data.get("error"):
+                    return {"error": f"Could not read PPPoE pool '{effective_pool}': {pool_data['error']}"}
+                pool_ranges = ""
+                pools = pool_data.get("pools", [])
+                if pools:
+                    pool_ranges = pools[0].get("ranges", "")
+                cidrs = self._pool_ranges_to_cidrs(pool_ranges)
+
+            if not cidrs and fallback_pool_ranges:
+                cidrs = self._pool_ranges_to_cidrs(fallback_pool_ranges)
+
+            if not cidrs:
+                return {"error": "Could not determine PPPoE pool subnet for FastTrack bypass"}
+
+            filters_result = self.send_command_optimized(
+                "/ip/firewall/filter/print",
+                proplist=[".id", "chain", "action", "comment", "src-address", "dst-address", "disabled"]
+            )
+            filter_rules = filters_result.get("data", []) if filters_result.get("success") else []
+
+            fasttrack_rule = None
+            for rule in filter_rules:
+                if (
+                    rule.get("chain") == "forward"
+                    and rule.get("action") == "fasttrack-connection"
+                    and str(rule.get("disabled", "false")).lower() != "true"
+                ):
+                    fasttrack_rule = rule
+                    break
+
+            if not fasttrack_rule:
+                return {
+                    "success": True,
+                    "fasttrack_enabled": False,
+                    "pool_name": effective_pool,
+                    "cidrs": cidrs,
+                    "rules_added": 0,
+                }
+
+            ft_id = fasttrack_rule.get(".id")
+            rules_added = 0
+            for cidr in cidrs:
+                src_comment = f"PPPoE bypass FastTrack (src) {cidr}"
+                dst_comment = f"PPPoE bypass FastTrack (dst) {cidr}"
+
+                src_exists = any(
+                    r.get("comment") == src_comment
+                    and r.get("src-address") == cidr
+                    and str(r.get("disabled", "false")).lower() != "true"
+                    for r in filter_rules
+                )
+                dst_exists = any(
+                    r.get("comment") == dst_comment
+                    and r.get("dst-address") == cidr
+                    and str(r.get("disabled", "false")).lower() != "true"
+                    for r in filter_rules
+                )
+
+                if not src_exists and ft_id:
+                    result = self.send_command("/ip/firewall/filter/add", {
+                        "chain": "forward",
+                        "src-address": cidr,
+                        "action": "accept",
+                        "comment": src_comment,
+                        "place-before": ft_id,
+                    })
+                    if result.get("error"):
+                        return {"error": f"FastTrack bypass (src {cidr}): {result['error']}"}
+                    rules_added += 1
+
+                if not dst_exists and ft_id:
+                    result = self.send_command("/ip/firewall/filter/add", {
+                        "chain": "forward",
+                        "dst-address": cidr,
+                        "action": "accept",
+                        "comment": dst_comment,
+                        "place-before": ft_id,
+                    })
+                    if result.get("error"):
+                        return {"error": f"FastTrack bypass (dst {cidr}): {result['error']}"}
+                    rules_added += 1
+
+            return {
+                "success": True,
+                "fasttrack_enabled": True,
+                "pool_name": effective_pool,
+                "cidrs": cidrs,
+                "rules_added": rules_added,
+            }
+        except Exception as e:
+            logger.error(f"Error ensuring PPPoE FastTrack bypass: {e}")
             return {"error": str(e)}
 
     def add_pppoe_secret(self, username: str, password: str, profile: str,
@@ -2007,58 +2226,21 @@ class MikroTikAPI:
                 errors.append(f"NAT: {result['error']}")
             time.sleep(0.2)
 
-            # 8. Bypass FastTrack for PPPoE subnet so PPP profile rate-limits are enforced.
-            #    FastTrack skips simple queues (including dynamic ones created by PPP rate-limit),
-            #    so PPPoE traffic must be accepted before the FastTrack rule.
-            PPPOE_FT_SRC_COMMENT = "PPPoE bypass FastTrack (src)"
-            PPPOE_FT_DST_COMMENT = "PPPoE bypass FastTrack (dst)"
-
-            filters_result = self.send_command_optimized(
-                "/ip/firewall/filter/print",
-                proplist=[".id", "chain", "action", "comment", "src-address", "dst-address", "disabled"]
+            # 8. Bypass FastTrack for the active PPPoE pool so PPP profile
+            #    rate-limits are enforced even when the router already had
+            #    custom PPPoE infrastructure.
+            bypass_result = self.ensure_pppoe_fasttrack_bypass(
+                bridge_name=bridge_name,
+                pool_name=pool_name,
+                fallback_pool_ranges=pool_range,
             )
-            filter_rules = filters_result.get("data", []) if filters_result.get("success") else []
-
-            src_exists = any(
-                r.get("comment") == PPPOE_FT_SRC_COMMENT and r.get("src-address") == pppoe_subnet
-                for r in filter_rules
-            )
-            dst_exists = any(
-                r.get("comment") == PPPOE_FT_DST_COMMENT and r.get("dst-address") == pppoe_subnet
-                for r in filter_rules
-            )
-
-            fasttrack_rule = None
-            for r in filter_rules:
-                if (r.get("chain") == "forward"
-                        and r.get("action") == "fasttrack-connection"
-                        and str(r.get("disabled", "false")).lower() != "true"):
-                    fasttrack_rule = r
-                    break
-
-            if fasttrack_rule:
-                ft_id = fasttrack_rule.get(".id")
-                if not src_exists and ft_id:
-                    result = self.send_command("/ip/firewall/filter/add", {
-                        "chain": "forward",
-                        "src-address": pppoe_subnet,
-                        "action": "accept",
-                        "comment": PPPOE_FT_SRC_COMMENT,
-                        "place-before": ft_id,
-                    })
-                    if result.get("error"):
-                        errors.append(f"FastTrack bypass (src): {result['error']}")
-                if not dst_exists and ft_id:
-                    result = self.send_command("/ip/firewall/filter/add", {
-                        "chain": "forward",
-                        "dst-address": pppoe_subnet,
-                        "action": "accept",
-                        "comment": PPPOE_FT_DST_COMMENT,
-                        "place-before": ft_id,
-                    })
-                    if result.get("error"):
-                        errors.append(f"FastTrack bypass (dst): {result['error']}")
-                logger.info(f"PPPoE FastTrack bypass rules ensured for {pppoe_subnet}")
+            if bypass_result.get("error"):
+                errors.append(f"FastTrack bypass: {bypass_result['error']}")
+            elif bypass_result.get("fasttrack_enabled"):
+                logger.info(
+                    f"PPPoE FastTrack bypass rules ensured for "
+                    f"{', '.join(bypass_result.get('cidrs', []))}"
+                )
             else:
                 logger.info("No FastTrack rule found -- PPPoE rate-limits will work without bypass")
 

@@ -37,7 +37,16 @@ def _provision_pppoe_sync(payload: dict) -> dict:
         rate_limit = api._parse_speed_to_mikrotik(payload["bandwidth_limit"])
         profile_name = f"pppoe_{rate_limit.replace('/', '_')}"
 
-        profile_result = api.ensure_pppoe_profile(profile_name, rate_limit)
+        base_profile = api.get_active_pppoe_profile()
+        base_profile_data = base_profile.get("data") if base_profile.get("found") else {}
+
+        profile_result = api.ensure_pppoe_profile(
+            profile_name,
+            rate_limit,
+            local_address=base_profile_data.get("local_address", ""),
+            pool_name=base_profile_data.get("remote_address", ""),
+            dns_server=base_profile_data.get("dns_server", ""),
+        )
         if profile_result.get("error"):
             logger.error(f"[PPPoE] Profile creation failed: {profile_result['error']}")
             return {"error": f"Profile creation failed: {profile_result['error']}"}
@@ -53,6 +62,13 @@ def _provision_pppoe_sync(payload: dict) -> dict:
             logger.error(f"[PPPoE] Secret creation failed: {secret_result['error']}")
             return {"error": f"Secret creation failed: {secret_result['error']}"}
 
+        bypass_result = api.ensure_pppoe_fasttrack_bypass()
+        if bypass_result.get("error"):
+            logger.warning(f"[PPPoE] FastTrack bypass ensure failed: {bypass_result['error']}")
+
+        # Force the client to reconnect so any profile/rate-limit change applies immediately.
+        disconnect_result = api.disconnect_pppoe_session(payload["pppoe_username"])
+
         logger.info(
             f"[PPPoE] Provisioned {payload['pppoe_username']} "
             f"with profile {profile_name} on {router_ip}"
@@ -65,6 +81,8 @@ def _provision_pppoe_sync(payload: dict) -> dict:
             "rate_limit": rate_limit,
             "profile_result": profile_result,
             "secret_result": secret_result,
+            "fasttrack_bypass_result": bypass_result,
+            "disconnect_result": disconnect_result,
         }
     except Exception as e:
         logger.error(f"[PPPoE] Provisioning error: {e}")
