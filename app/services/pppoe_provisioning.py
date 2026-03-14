@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import json
+import re
 from datetime import datetime
 from typing import Dict, Any, Optional
 
@@ -10,6 +11,43 @@ from app.services.mikrotik_api import MikroTikAPI
 from app.config import settings
 
 logger = logging.getLogger("pppoe_provisioning")
+
+_RATE_SUFFIX_MULTIPLIERS = {
+    "": 1,
+    "K": 1_000,
+    "M": 1_000_000,
+    "G": 1_000_000_000,
+}
+
+
+def _apply_pppoe_headroom(rate_limit: str, factor: float) -> str:
+    """Scale a MikroTik rate-limit string by a compensation factor."""
+    if not rate_limit or factor <= 0:
+        return rate_limit
+    if abs(factor - 1.0) < 0.0001:
+        return rate_limit
+
+    def _scale_part(part: str) -> Optional[str]:
+        match = re.match(r"^(\d+(?:\.\d+)?)([KMG]?)$", part.strip().upper())
+        if not match:
+            return None
+
+        value = float(match.group(1))
+        suffix = match.group(2)
+        bps = int(round(value * _RATE_SUFFIX_MULTIPLIERS[suffix] * factor))
+        return str(bps)
+
+    if "/" not in rate_limit:
+        scaled = _scale_part(rate_limit)
+        return scaled or rate_limit
+
+    upload, download = [p.strip() for p in rate_limit.split("/", 1)]
+    scaled_upload = _scale_part(upload)
+    scaled_download = _scale_part(download)
+    if not scaled_upload or not scaled_download:
+        return rate_limit
+
+    return f"{scaled_upload}/{scaled_download}"
 
 
 def _provision_pppoe_sync(payload: dict) -> dict:
@@ -34,8 +72,10 @@ def _provision_pppoe_sync(payload: dict) -> dict:
         return {"error": "Failed to connect to router"}
 
     try:
-        rate_limit = api._parse_speed_to_mikrotik(payload["bandwidth_limit"])
-        profile_name = f"pppoe_{rate_limit.replace('/', '_')}"
+        base_rate_limit = api._parse_speed_to_mikrotik(payload["bandwidth_limit"])
+        headroom_factor = float(getattr(settings, "PPPOE_RATE_LIMIT_HEADROOM", 1.0) or 1.0)
+        rate_limit = _apply_pppoe_headroom(base_rate_limit, headroom_factor)
+        profile_name = f"pppoe_{base_rate_limit.replace('/', '_')}"
 
         base_profile = api.get_active_pppoe_profile()
         base_profile_data = base_profile.get("data") if base_profile.get("found") else {}
@@ -46,6 +86,7 @@ def _provision_pppoe_sync(payload: dict) -> dict:
             local_address=base_profile_data.get("local_address", ""),
             pool_name=base_profile_data.get("remote_address", ""),
             dns_server=base_profile_data.get("dns_server", ""),
+            change_tcp_mss=base_profile_data.get("change_tcp_mss", ""),
         )
         if profile_result.get("error"):
             logger.error(f"[PPPoE] Profile creation failed: {profile_result['error']}")
@@ -71,14 +112,17 @@ def _provision_pppoe_sync(payload: dict) -> dict:
 
         logger.info(
             f"[PPPoE] Provisioned {payload['pppoe_username']} "
-            f"with profile {profile_name} on {router_ip}"
+            f"with profile {profile_name} on {router_ip} "
+            f"(plan={base_rate_limit}, applied={rate_limit}, headroom={headroom_factor})"
         )
 
         return {
             "success": True,
             "pppoe_username": payload["pppoe_username"],
             "profile": profile_name,
+            "base_rate_limit": base_rate_limit,
             "rate_limit": rate_limit,
+            "headroom_factor": headroom_factor,
             "profile_result": profile_result,
             "secret_result": secret_result,
             "fasttrack_bypass_result": bypass_result,

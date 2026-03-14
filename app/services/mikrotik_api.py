@@ -1391,6 +1391,7 @@ class MikroTikAPI:
         local_address: str = "",
         pool_name: str = "",
         dns_server: str = "",
+        change_tcp_mss: str = "",
     ) -> Dict[str, Any]:
         """
         Ensure a PPPoE profile exists with the specified rate limit.
@@ -1420,6 +1421,8 @@ class MikroTikAPI:
                 profile_args["remote-address"] = pool_name
             if dns_server:
                 profile_args["dns-server"] = dns_server
+            if change_tcp_mss:
+                profile_args["change-tcp-mss"] = change_tcp_mss
 
             if profile_exists:
                 profile_args["numbers"] = profile_id
@@ -1453,6 +1456,7 @@ class MikroTikAPI:
                             "local_address": profile.get("local-address", ""),
                             "remote_address": profile.get("remote-address", ""),
                             "dns_server": profile.get("dns-server", ""),
+                            "change_tcp_mss": profile.get("change-tcp-mss", ""),
                             "rate_limit": profile.get("rate-limit", ""),
                         },
                     }

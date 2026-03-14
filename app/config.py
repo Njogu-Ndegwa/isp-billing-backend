@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     MIKROTIK_PORT: int = 8728
     MIKROTIK_USERNAME: str = "admin"
     MIKROTIK_PASSWORD: str = "mvnm"  # Set in .env file
+    PPPOE_RATE_LIMIT_HEADROOM: float = 1.08
     
     # M-Pesa Configuration
     MPESA_CONSUMER_KEY: str
