@@ -9,6 +9,7 @@ from app.db.models import Router, Customer, BandwidthSnapshot, UserBandwidthUsag
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.router_helpers import get_router_by_id
+from app.services.router_availability import record_router_availability
 from app.config import settings
 import logging
 import asyncio
@@ -202,6 +203,8 @@ async def get_mikrotik_health(
         mikrotik_result = await run_mikrotik_health_async(router_info)
         
         if mikrotik_result.get("error"):
+            if router_id:
+                await record_router_availability(db, router_id, False, "mikrotik_health")
             # Return stale cache if available when router unreachable
             if cache_key in _health_cache:
                 result = _health_cache[cache_key]["data"].copy()
@@ -210,6 +213,9 @@ async def get_mikrotik_health(
                 result["stale"] = True
                 return result
             raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
+
+        if router_id:
+            await record_router_availability(db, router_id, True, "mikrotik_health")
         
         resources = mikrotik_result.get("resources", {})
         health = mikrotik_result.get("health", {})

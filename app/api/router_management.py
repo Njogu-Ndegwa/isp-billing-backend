@@ -1,13 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, func
+from sqlalchemy import select, update, func, case
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User
+from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User, RouterAvailabilityCheck
 from app.services.auth import verify_token, get_current_user
+from app.services.router_availability import build_router_status
 import logging
 import asyncio
 
@@ -92,7 +93,105 @@ async def get_routers(
     stmt = select(Router).where(Router.user_id == user.id)
     result = await db.execute(stmt)
     routers = result.scalars().all()
-    return [{"id": r.id, "name": r.name, "identity": r.identity, "ip_address": r.ip_address, "port": r.port, "auth_method": getattr(r, 'auth_method', 'DIRECT_API') or 'DIRECT_API', "payment_methods": getattr(r, 'payment_methods', None) or ["mpesa", "voucher"], "pppoe_ports": getattr(r, 'pppoe_ports', None)} for r in routers]
+    response = []
+    now = datetime.utcnow()
+    for router_obj in routers:
+        router_payload = {
+            "id": router_obj.id,
+            "name": router_obj.name,
+            "identity": router_obj.identity,
+            "ip_address": router_obj.ip_address,
+            "port": router_obj.port,
+            "auth_method": getattr(router_obj, "auth_method", "DIRECT_API") or "DIRECT_API",
+            "payment_methods": getattr(router_obj, "payment_methods", None) or ["mpesa", "voucher"],
+            "pppoe_ports": getattr(router_obj, "pppoe_ports", None),
+        }
+        router_payload.update(build_router_status(router_obj, now=now))
+        response.append(router_payload)
+    return response
+
+
+@router.get("/api/routers/{router_id}/uptime")
+async def get_router_uptime(
+    router_id: int,
+    hours: int = 24,
+    recent_checks: int = 50,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Get availability and uptime statistics for a router."""
+    user = await get_current_user(token, db)
+    stmt = select(Router).where(Router.id == router_id, Router.user_id == user.id)
+    result = await db.execute(stmt)
+    router_obj = result.scalar_one_or_none()
+
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    hours = max(1, min(hours, 24 * 30))
+    recent_checks = max(1, min(recent_checks, 200))
+    now = datetime.utcnow()
+    since = now - timedelta(hours=hours)
+
+    window_stmt = select(
+        func.count(RouterAvailabilityCheck.id),
+        func.coalesce(
+            func.sum(case((RouterAvailabilityCheck.is_online.is_(True), 1), else_=0)),
+            0,
+        ),
+        func.min(RouterAvailabilityCheck.checked_at),
+        func.max(RouterAvailabilityCheck.checked_at),
+    ).where(
+        RouterAvailabilityCheck.router_id == router_id,
+        RouterAvailabilityCheck.checked_at >= since,
+    )
+    window_result = await db.execute(window_stmt)
+    window_total, window_online, window_first, window_last = window_result.one()
+
+    checks_stmt = (
+        select(RouterAvailabilityCheck)
+        .where(
+            RouterAvailabilityCheck.router_id == router_id,
+            RouterAvailabilityCheck.checked_at >= since,
+        )
+        .order_by(RouterAvailabilityCheck.checked_at.desc())
+        .limit(recent_checks)
+    )
+    checks_result = await db.execute(checks_stmt)
+    checks = checks_result.scalars().all()
+
+    overall_total = int(router_obj.availability_checks or 0)
+    overall_online = int(router_obj.availability_successes or 0)
+
+    return {
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "generated_at": now.isoformat(),
+        "current_status": build_router_status(router_obj, now=now),
+        "overall": {
+            "total_checks": overall_total,
+            "online_checks": overall_online,
+            "uptime_percentage": round((overall_online / overall_total) * 100, 2) if overall_total else None,
+        },
+        "window": {
+            "hours": hours,
+            "from": since.isoformat(),
+            "to": now.isoformat(),
+            "first_check_at": window_first.isoformat() if window_first else None,
+            "last_check_at": window_last.isoformat() if window_last else None,
+            "total_checks": int(window_total or 0),
+            "online_checks": int(window_online or 0),
+            "uptime_percentage": round((window_online / window_total) * 100, 2) if window_total else None,
+        },
+        "recent_checks": [
+            {
+                "checked_at": check.checked_at.isoformat(),
+                "is_online": check.is_online,
+                "source": check.source,
+            }
+            for check in checks
+        ],
+    }
 
 
 @router.post("/api/routers/create")

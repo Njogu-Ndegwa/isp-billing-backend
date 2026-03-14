@@ -12,6 +12,7 @@ from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.router_helpers import get_router_by_id, connect_to_router
 from app.core.protected_devices import is_protected_device
+from app.services.router_availability import record_router_availability
 from app.config import settings
 
 import logging
@@ -2503,6 +2504,7 @@ async def get_router_port_status(
     result = await asyncio.to_thread(_get_port_status_sync, router_info)
 
     if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "router_ports")
         if router_id in _port_status_cache:
             stale = _port_status_cache[router_id]["data"].copy()
             stale["cached"] = True
@@ -2511,6 +2513,8 @@ async def get_router_port_status(
         raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
+
+    await record_router_availability(db, router_id, True, "router_ports")
 
     # Auto-correct DB to match the router reality so retries start clean
     actual_pppoe = sorted(p["port"] for p in result["ports"] if p["service"] == "pppoe")
@@ -2593,9 +2597,12 @@ async def get_router_interfaces(
     result = await asyncio.to_thread(_get_ethernet_interfaces_sync, router_info)
 
     if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "router_interfaces")
         raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
+
+    await record_router_availability(db, router_id, True, "router_interfaces")
 
     return {
         "interfaces": result.get("data", []),

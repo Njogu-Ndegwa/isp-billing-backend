@@ -437,7 +437,7 @@ async def run_radius_migrations():
 # Startup / Shutdown
 # ============================================================================
 async def run_monitoring_migrations():
-    """Create the router_log_entries table and its enum type if they don't exist (idempotent)."""
+    """Create monitoring tables/columns used for router health history."""
     async with async_engine.begin() as conn:
         await conn.execute(sa_text(
             "DO $$ BEGIN "
@@ -445,10 +445,26 @@ async def run_monitoring_migrations():
             "EXCEPTION WHEN duplicate_object THEN NULL; "
             "END $$"
         ))
-        from app.db.models import RouterLogEntry  # noqa: F401
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS last_status BOOLEAN NULL,
+            ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS last_online_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS last_status_source VARCHAR(50) NULL,
+            ADD COLUMN IF NOT EXISTS availability_checks INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS availability_successes INTEGER NOT NULL DEFAULT 0
+        """))
+        from app.db.models import RouterLogEntry, RouterAvailabilityCheck  # noqa: F401
         await conn.run_sync(
             lambda c: RouterLogEntry.__table__.create(c, checkfirst=True)
         )
+        await conn.run_sync(
+            lambda c: RouterAvailabilityCheck.__table__.create(c, checkfirst=True)
+        )
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_router_availability_router_checked "
+            "ON router_availability_checks(router_id, checked_at)"
+        ))
 
 
 @app.on_event("startup")

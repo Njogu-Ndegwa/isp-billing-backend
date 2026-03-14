@@ -9,6 +9,7 @@ from app.services.mikrotik_api import MikroTikAPI
 from app.services.router_helpers import get_router_by_id
 from app.services.log_persistence import persist_notable_logs
 from app.services.router_concurrency import run_with_guard
+from app.services.router_availability import record_router_availability
 
 import asyncio
 import logging
@@ -232,6 +233,7 @@ async def hotspot_overview(
     )
 
     if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "hotspot_overview")
         if router_id in _hotspot_overview_cache:
             stale = _hotspot_overview_cache[router_id]["data"].copy()
             stale["cached"] = True
@@ -240,6 +242,7 @@ async def hotspot_overview(
             return stale
         raise HTTPException(status_code=503, detail="Failed to connect to router")
     if result.get("error") == "timeout":
+        await record_router_availability(db, router_id, False, "hotspot_overview")
         if router_id in _hotspot_overview_cache:
             stale = _hotspot_overview_cache[router_id]["data"].copy()
             stale["cached"] = True
@@ -248,6 +251,8 @@ async def hotspot_overview(
         raise HTTPException(status_code=504, detail=result.get("detail", "Diagnostic timed out"))
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
+
+    await record_router_availability(db, router_id, True, "hotspot_overview")
 
     response = {
         "router_id": router_id,
@@ -286,11 +291,15 @@ async def hotspot_logs(
     result = await run_with_guard(router_id, _hotspot_logs_sync, router_info, search or "", limit)
 
     if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "hotspot_logs")
         raise HTTPException(status_code=503, detail="Failed to connect to router")
     if result.get("error") == "timeout":
+        await record_router_availability(db, router_id, False, "hotspot_logs")
         raise HTTPException(status_code=504, detail=result.get("detail", "Diagnostic timed out"))
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
+
+    await record_router_availability(db, router_id, True, "hotspot_logs")
 
     entries = result.get("data", [])
     persisted = await persist_notable_logs(db, router_id, entries, topic_filter="hotspot,dhcp")

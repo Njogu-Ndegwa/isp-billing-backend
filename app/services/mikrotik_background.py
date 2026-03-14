@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from app.db.database import get_db, async_engine
 from app.db.models import Router, Customer, CustomerStatus, BandwidthSnapshot, UserBandwidthUsage
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.router_availability import record_router_availability, prune_router_availability_history
 from app.core.protected_devices import is_protected_device
 from app.config import settings
 import asyncio
@@ -1237,6 +1238,7 @@ async def collect_bandwidth_snapshot():
                         raw = await asyncio.to_thread(_fetch_bandwidth_data_sync_for_router, router_info)
                     if not raw:
                         logger.warning(f"Failed to connect to router {router.name} ({router.ip_address}) for bandwidth snapshot")
+                        await record_router_availability(db, router.id, False, "bandwidth_snapshot", checked_at=now)
                         continue
 
                     active_sessions = raw["active_sessions"]
@@ -1245,6 +1247,7 @@ async def collect_bandwidth_snapshot():
                     router_id = raw["router_id"]
                     hotspot_hosts = raw.get("hotspot_hosts", {})
                     arp_entries = raw.get("arp_entries", {})
+                    await record_router_availability(db, router_id, True, "bandwidth_snapshot", checked_at=now)
 
                     total_rx = 0
                     total_tx = 0
@@ -1383,6 +1386,7 @@ async def collect_bandwidth_snapshot():
 
             cutoff = now - timedelta(days=1)
             await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
+            await prune_router_availability_history(db, now=now)
             await db.commit()
             break
 

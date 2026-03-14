@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL
+from sqlalchemy import Column, Integer, String, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -209,6 +209,12 @@ class Router(Base):
     radius_nas_identifier = Column(String(100), nullable=True)  # NAS-Identifier for this router
     payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
     pppoe_ports = Column(JSON, nullable=True)  # e.g. ["ether4", "ether5"]
+    last_status = Column(Boolean, nullable=True)
+    last_checked_at = Column(DateTime, nullable=True)
+    last_online_at = Column(DateTime, nullable=True)
+    last_status_source = Column(String(50), nullable=True)
+    availability_checks = Column(Integer, nullable=False, default=0, server_default="0")
+    availability_successes = Column(Integer, nullable=False, default=0, server_default="0")
 
 class ProvisioningLog(Base):
     __tablename__ = "provisioning_logs"
@@ -433,4 +439,20 @@ class RouterLogEntry(Base):
     )
     router_timestamp = Column(String(50), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    router = relationship("Router")
+
+
+class RouterAvailabilityCheck(Base):
+    """Per-poll router reachability history used for uptime reporting."""
+    __tablename__ = "router_availability_checks"
+    __table_args__ = (
+        Index("idx_router_availability_router_checked", "router_id", "checked_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="CASCADE"), nullable=False, index=True)
+    checked_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    is_online = Column(Boolean, nullable=False, index=True)
+    source = Column(String(50), nullable=False, default="unknown")
+
     router = relationship("Router")
