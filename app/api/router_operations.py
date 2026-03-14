@@ -2681,7 +2681,11 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
             }
 
         # Restore ports no longer requested without tearing down the shared PPPoE infra.
-        restore_result = api.restore_ports_from_pppoe(ports_to_restore, hotspot_bridge="bridge")
+        restore_result = api.restore_ports_from_pppoe(
+            ports_to_restore,
+            hotspot_bridge="bridge",
+            current_state=current_state,
+        )
         if restore_result.get("error"):
             return {
                 "error": restore_result["error"],

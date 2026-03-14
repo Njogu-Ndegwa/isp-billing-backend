@@ -18,6 +18,22 @@ QUEUE_FASTTRACK_BYPASS_LIST = "isp_queue_limited_clients"
 QUEUE_FASTTRACK_BYPASS_SRC_COMMENT = "ISP_BILLING_QUEUE_BYPASS_SRC"
 QUEUE_FASTTRACK_BYPASS_DST_COMMENT = "ISP_BILLING_QUEUE_BYPASS_DST"
 
+
+def _router_error_is_duplicate(error: str) -> bool:
+    """Return True when RouterOS is reporting an idempotent duplicate/existing object."""
+    if not error:
+        return False
+    err = error.lower()
+    duplicate_markers = (
+        "already exists",
+        "already have",
+        "such name exists",
+        "such address exists",
+        "already added",
+        "already have such address",
+    )
+    return any(marker in err for marker in duplicate_markers)
+
 # ============================================================================
 # CIRCUIT BREAKER: Track failed routers to avoid repeated blocking timeouts
 # Only triggers on CONNECTION failures, not read timeouts during operations
@@ -2454,6 +2470,7 @@ class MikroTikAPI:
         self,
         ports: List[str],
         hotspot_bridge: str = "bridge",
+        current_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Remove PPPoE access from ports and return them to the hotspot bridge."""
         if not self.connected:
@@ -2463,12 +2480,24 @@ class MikroTikAPI:
             if not unique_ports:
                 return {"success": True}
 
-            remove_result = self.remove_pppoe_servers(unique_ports)
-            if remove_result.get("error"):
-                return remove_result
+            current_state = current_state or self.get_pppoe_access_state()
+            if current_state.get("error"):
+                return current_state
+
+            current_direct_ports = set(current_state.get("direct_ports", []))
+            current_bridge_map = current_state.get("bridge_map", {})
+            servers_to_remove = [port for port in unique_ports if port in current_direct_ports]
+
+            if servers_to_remove:
+                remove_result = self.remove_pppoe_servers(servers_to_remove)
+                if remove_result.get("error"):
+                    return remove_result
 
             errors = []
             for port in unique_ports:
+                if current_bridge_map.get(port) == hotspot_bridge:
+                    logger.info(f"{port} already in hotspot bridge {hotspot_bridge}; skipping restore")
+                    continue
                 restore = self.add_bridge_port(port, hotspot_bridge, verify=False)
                 if restore.get("error"):
                     errors.append(f"{port}: {restore['error']}")
@@ -2543,6 +2572,7 @@ class MikroTikAPI:
             pool_name=pool_name,
             pool_range=pool_range,
             service_name=service_name,
+            current_state=current_state,
         )
         if not direct_result.get("error"):
             return direct_result
@@ -2583,61 +2613,89 @@ class MikroTikAPI:
         pool_name: str = "pppoe-pool",
         pool_range: str = "192.168.89.2-192.168.89.254",
         service_name: str = "pppoe-server1",
+        current_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not self.connected:
             return {"error": "Not connected"}
         errors = []
         try:
             target_ports = list(dict.fromkeys(pppoe_ports or []))
+            current_state = current_state or self.get_pppoe_access_state(legacy_bridge_name=bridge_name)
+            if current_state.get("error"):
+                return current_state
 
-            # 1. Create bridge-pppoe (ignore error if already exists)
-            result = self.send_command("/interface/bridge/add", {"name": bridge_name})
-            if result.get("error") and "already" not in result.get("error", "").lower():
-                errors.append(f"Bridge create: {result['error']}")
-            logger.info(f"PPPoE infrastructure: bridge '{bridge_name}' ready")
-
-            # 2. Add IP address on bridge-pppoe (ignore if already exists).
-            # The bridge remains as shared PPPoE infra, but access ports no longer
-            # forward subscriber traffic through it.
-            result = self.send_command("/ip/address/add", {
-                "address": bridge_ip,
-                "interface": bridge_name,
-                "comment": "PPPoE bridge address",
-            })
-            if result.get("error") and "already" not in result.get("error", "").lower():
-                errors.append(f"IP address: {result['error']}")
-
-            # 4. Create IP pool (ignore if already exists)
-            result = self.send_command("/ip/pool/add", {
-                "name": pool_name,
-                "ranges": pool_range,
-            })
-            if result.get("error") and "already" not in result.get("error", "").lower():
-                errors.append(f"Pool: {result['error']}")
-
-            profile_result = self.ensure_pppoe_profile(
-                profile_name="default-pppoe",
-                rate_limit="0/0",
-                local_address=bridge_ip.split("/")[0],
-                pool_name=pool_name,
+            current_direct_ports = set(current_state.get("direct_ports", []))
+            current_bridge_map = current_state.get("bridge_map", {})
+            current_bridge_servers = current_state.get("bridge_servers", [])
+            direct_mode_established = (
+                current_state.get("mode") == "direct"
+                and bool(current_direct_ports)
+                and not current_bridge_servers
             )
-            if profile_result.get("error"):
-                return {"error": f"PPPoE profile: {profile_result['error']}"}
+
+            if direct_mode_established:
+                logger.info("Existing direct PPPoE infrastructure detected; skipping shared infra re-ensure")
+            else:
+                # 1. Create bridge-pppoe (ignore error if already exists)
+                result = self.send_command("/interface/bridge/add", {"name": bridge_name})
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"Bridge create: {result['error']}")
+                logger.info(f"PPPoE infrastructure: bridge '{bridge_name}' ready")
+
+                # 2. Add IP address on bridge-pppoe (ignore if already exists).
+                # The bridge remains as shared PPPoE infra, but access ports no longer
+                # forward subscriber traffic through it.
+                result = self.send_command("/ip/address/add", {
+                    "address": bridge_ip,
+                    "interface": bridge_name,
+                    "comment": "PPPoE bridge address",
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"IP address: {result['error']}")
+
+                # 4. Create IP pool (ignore if already exists)
+                result = self.send_command("/ip/pool/add", {
+                    "name": pool_name,
+                    "ranges": pool_range,
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"Pool: {result['error']}")
+
+                profile_result = self.ensure_pppoe_profile(
+                    profile_name="default-pppoe",
+                    rate_limit="0/0",
+                    local_address=bridge_ip.split("/")[0],
+                    pool_name=pool_name,
+                )
+                if profile_result.get("error"):
+                    return {"error": f"PPPoE profile: {profile_result['error']}"}
 
             # 5. Remove selected ports from any bridge and bind PPPoE directly.
             port_setup_errors = []
             detached_ports = []
+            ports_to_bind = []
+
             for port in target_ports:
-                remove_result = self.remove_bridge_port(port, verify=False)
-                if remove_result.get("error"):
-                    port_setup_errors.append(f"Port {port}: {remove_result['error']}")
+                current_bridge = current_bridge_map.get(port, "")
+                already_direct = port in current_direct_ports and not current_bridge
+
+                if already_direct:
+                    logger.info(f"{port} already directly bound for PPPoE; skipping reconfiguration")
                     continue
-                detached_ports.append(port)
+
+                if current_bridge:
+                    remove_result = self.remove_bridge_port(port, verify=False)
+                    if remove_result.get("error"):
+                        port_setup_errors.append(f"Port {port}: {remove_result['error']}")
+                        continue
+                    detached_ports.append(port)
+
+                ports_to_bind.append(port)
 
             if detached_ports:
                 time.sleep(0.1)
 
-            for port in detached_ports:
+            for port in ports_to_bind:
                 bind_result = self.ensure_pppoe_server_on_interface(
                     port,
                     profile_name="default-pppoe",
@@ -2647,17 +2705,18 @@ class MikroTikAPI:
                 if bind_result.get("error"):
                     port_setup_errors.append(f"Port {port}: {bind_result['error']}")
 
-            # 6. Add NAT masquerade for PPPoE subnet (ignore if already exists)
-            pppoe_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
-            result = self.send_command("/ip/firewall/nat/add", {
-                "chain": "srcnat",
-                "src-address": pppoe_subnet,
-                "out-interface": "ether1",
-                "action": "masquerade",
-                "comment": "NAT for PPPoE clients",
-            })
-            if result.get("error") and "already" not in result.get("error", "").lower():
-                errors.append(f"NAT: {result['error']}")
+            if not direct_mode_established:
+                # 6. Add NAT masquerade for PPPoE subnet (ignore if already exists)
+                pppoe_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
+                result = self.send_command("/ip/firewall/nat/add", {
+                    "chain": "srcnat",
+                    "src-address": pppoe_subnet,
+                    "out-interface": "ether1",
+                    "action": "masquerade",
+                    "comment": "NAT for PPPoE clients",
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"NAT: {result['error']}")
 
             # 7. Verify the selected ports are directly attached to PPPoE.
             time.sleep(0.1)
@@ -2693,27 +2752,29 @@ class MikroTikAPI:
                 }
 
             # 8. Remove the old bridge-bound server if this router is being migrated.
-            cleanup = self.cleanup_legacy_pppoe_server(bridge_name=bridge_name)
-            if cleanup.get("error"):
-                errors.append(f"Legacy PPPoE server cleanup: {cleanup['error']}")
+            if current_bridge_servers:
+                cleanup = self.cleanup_legacy_pppoe_server(bridge_name=bridge_name)
+                if cleanup.get("error"):
+                    errors.append(f"Legacy PPPoE server cleanup: {cleanup['error']}")
 
-            # 9. Bypass FastTrack for the active PPPoE pool so PPP profile
-            #    rate-limits are enforced even when the router already had
-            #    custom PPPoE infrastructure.
-            bypass_result = self.ensure_pppoe_fasttrack_bypass(
-                bridge_name=bridge_name,
-                pool_name=pool_name,
-                fallback_pool_ranges=pool_range,
-            )
-            if bypass_result.get("error"):
-                errors.append(f"FastTrack bypass: {bypass_result['error']}")
-            elif bypass_result.get("fasttrack_enabled"):
-                logger.info(
-                    f"PPPoE FastTrack bypass rules ensured for "
-                    f"{', '.join(bypass_result.get('cidrs', []))}"
+            if not direct_mode_established:
+                # 9. Bypass FastTrack for the active PPPoE pool so PPP profile
+                #    rate-limits are enforced even when the router already had
+                #    custom PPPoE infrastructure.
+                bypass_result = self.ensure_pppoe_fasttrack_bypass(
+                    bridge_name=bridge_name,
+                    pool_name=pool_name,
+                    fallback_pool_ranges=pool_range,
                 )
-            else:
-                logger.info("No FastTrack rule found -- PPPoE rate-limits will work without bypass")
+                if bypass_result.get("error"):
+                    errors.append(f"FastTrack bypass: {bypass_result['error']}")
+                elif bypass_result.get("fasttrack_enabled"):
+                    logger.info(
+                        f"PPPoE FastTrack bypass rules ensured for "
+                        f"{', '.join(bypass_result.get('cidrs', []))}"
+                    )
+                else:
+                    logger.info("No FastTrack rule found -- PPPoE rate-limits will work without bypass")
 
             if errors:
                 logger.warning(f"PPPoE infrastructure setup completed with warnings: {errors}")
@@ -2746,7 +2807,7 @@ class MikroTikAPI:
             target_ports = list(dict.fromkeys(pppoe_ports or []))
 
             result = self.send_command("/interface/bridge/add", {"name": bridge_name})
-            if result.get("error") and "already" not in result.get("error", "").lower():
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
                 errors.append(f"Bridge create: {result['error']}")
 
             direct_cleanup = self.remove_pppoe_servers(target_ports)
@@ -2764,14 +2825,14 @@ class MikroTikAPI:
                 "interface": bridge_name,
                 "comment": "PPPoE bridge address",
             })
-            if result.get("error") and "already" not in result.get("error", "").lower():
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
                 errors.append(f"IP address: {result['error']}")
 
             result = self.send_command("/ip/pool/add", {
                 "name": pool_name,
                 "ranges": pool_range,
             })
-            if result.get("error") and "already" not in result.get("error", "").lower():
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
                 errors.append(f"Pool: {result['error']}")
 
             profile_result = self.ensure_pppoe_profile(
@@ -2799,7 +2860,7 @@ class MikroTikAPI:
                 "action": "masquerade",
                 "comment": "NAT for PPPoE clients",
             })
-            if result.get("error") and "already" not in result.get("error", "").lower():
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
                 errors.append(f"NAT: {result['error']}")
 
             bypass_result = self.ensure_pppoe_fasttrack_bypass(
