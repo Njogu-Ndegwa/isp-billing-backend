@@ -57,6 +57,8 @@ class RouterUpdateRequest(BaseModel):
     password: Optional[str] = None
     port: int = 8728
     payment_methods: Optional[List[str]] = None
+    emergency_active: Optional[bool] = None
+    emergency_message: Optional[str] = None
 
     @field_validator("name", "ip_address", "username", "password", mode="before")
     @classmethod
@@ -241,6 +243,8 @@ async def create_router_api(
             "user_id": router_obj.user_id,
             "payment_methods": router_obj.payment_methods,
             "pppoe_ports": router_obj.pppoe_ports,
+            "emergency_active": router_obj.emergency_active,
+            "emergency_message": router_obj.emergency_message,
             "created_at": router_obj.created_at.isoformat()
         }
     except HTTPException:
@@ -341,6 +345,12 @@ async def update_router(
             router_obj.password = request.password
         if request.payment_methods is not None:
             router_obj.payment_methods = request.payment_methods
+        if request.emergency_active is not None:
+            router_obj.emergency_active = request.emergency_active
+            if not request.emergency_active:
+                router_obj.emergency_message = None
+        if request.emergency_message is not None:
+            router_obj.emergency_message = request.emergency_message
         
         await db.commit()
         await db.refresh(router_obj)
@@ -354,6 +364,8 @@ async def update_router(
             "user_id": router_obj.user_id,
             "payment_methods": router_obj.payment_methods,
             "pppoe_ports": router_obj.pppoe_ports,
+            "emergency_active": router_obj.emergency_active,
+            "emergency_message": router_obj.emergency_message,
             "updated_at": datetime.utcnow().isoformat()
         }
         
