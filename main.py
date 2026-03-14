@@ -39,6 +39,8 @@ from app.api.ads_routes import router as ads_router
 from app.api.ratings_routes import router as ratings_router
 from app.api.voucher_routes import router as voucher_router
 from app.api.provisioning import router as provisioning_router
+from app.api.pppoe_monitor import router as pppoe_monitor_router
+from app.api.hotspot_monitor import router as hotspot_monitor_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -57,6 +59,8 @@ app.include_router(ads_router)
 app.include_router(ratings_router)
 app.include_router(voucher_router)
 app.include_router(provisioning_router)
+app.include_router(pppoe_monitor_router)
+app.include_router(hotspot_monitor_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -432,6 +436,21 @@ async def run_radius_migrations():
 # ============================================================================
 # Startup / Shutdown
 # ============================================================================
+async def run_monitoring_migrations():
+    """Create the router_log_entries table and its enum type if they don't exist (idempotent)."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE routerlogseverity AS ENUM ('info', 'warning', 'error'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; "
+            "END $$"
+        ))
+        from app.db.models import RouterLogEntry  # noqa: F401
+        await conn.run_sync(
+            lambda c: RouterLogEntry.__table__.create(c, checkfirst=True)
+        )
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -439,6 +458,12 @@ async def startup_event():
         logger.info("RADIUS migrations completed successfully")
     except Exception as e:
         logger.error(f"RADIUS migration failed (non-fatal): {e}")
+
+    try:
+        await run_monitoring_migrations()
+        logger.info("Monitoring table migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Monitoring migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

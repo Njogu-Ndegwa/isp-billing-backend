@@ -1908,7 +1908,115 @@ async def diagnose_mac_address(
             }
             can_access_internet = False
             diagnosis = []
-            
+            infrastructure = {}
+
+            # =================================================================
+            # INFRASTRUCTURE CHECKS (new -- prepended before device checks)
+            # =================================================================
+            infra_issues = []
+
+            # Hotspot server status
+            hs_servers = api.get_hotspot_server_status()
+            hs_list = hs_servers.get("data", []) if hs_servers.get("success") else []
+            hs_enabled = [s for s in hs_list if not s["disabled"]]
+            infrastructure["hotspot_server"] = {
+                "running": len(hs_enabled) > 0,
+                "servers": hs_list,
+            }
+            if not hs_enabled:
+                infra_issues.append({
+                    "severity": "critical",
+                    "check": "hotspot_server",
+                    "message": "Hotspot server is not running or disabled",
+                    "recommendation": "Enable the hotspot server on the router",
+                })
+
+            hs_interface = hs_enabled[0].get("interface", "bridge") if hs_enabled else "bridge"
+
+            # Bridge & ports
+            bridge_data = api.get_bridge_ports_status()
+            bridges = bridge_data.get("bridges", {}) if bridge_data.get("success") else {}
+            bridge_ports_list = bridge_data.get("ports", []) if bridge_data.get("success") else []
+            port_bridge_map = {p["interface"]: p["bridge"] for p in bridge_ports_list}
+
+            hs_bridge = bridges.get(hs_interface)
+            infrastructure["hotspot_bridge"] = {
+                "name": hs_interface,
+                "exists": hs_bridge is not None,
+                "running": hs_bridge.get("running", False) if hs_bridge else False,
+            }
+            if not hs_bridge or not hs_bridge.get("running", False):
+                infra_issues.append({
+                    "severity": "critical",
+                    "check": "hotspot_bridge",
+                    "message": f"Hotspot bridge '{hs_interface}' is missing or not running",
+                    "recommendation": "Check bridge configuration on the router",
+                })
+
+            ifaces_data = api.get_all_interfaces_detail()
+            ifaces = {i["name"]: i for i in ifaces_data.get("data", [])} if ifaces_data.get("success") else {}
+            any_hs_port_up = False
+            for port_name, iface in ifaces.items():
+                if iface.get("type") != "ether" or port_name == "ether1":
+                    continue
+                if port_bridge_map.get(port_name) == hs_interface and iface.get("running", False):
+                    any_hs_port_up = True
+                    break
+            infrastructure["any_hotspot_port_up"] = any_hs_port_up
+            if not any_hs_port_up:
+                infra_issues.append({
+                    "severity": "warning",
+                    "check": "hotspot_ports",
+                    "message": "No hotspot bridge port has link up",
+                    "recommendation": "Check physical cable connections to hotspot ports",
+                })
+
+            # DHCP server
+            dhcp_data = api.get_dhcp_server_status()
+            dhcp_servers = dhcp_data.get("data", []) if dhcp_data.get("success") else []
+            active_dhcp = [d for d in dhcp_servers if not d["disabled"]]
+            infrastructure["dhcp_server"] = {
+                "running": len(active_dhcp) > 0,
+                "servers": dhcp_servers,
+            }
+            if not active_dhcp:
+                infra_issues.append({
+                    "severity": "critical",
+                    "check": "dhcp_server",
+                    "message": "DHCP server is not running -- devices cannot get an IP address",
+                    "recommendation": "Enable the DHCP server on the hotspot bridge",
+                })
+
+            # DHCP pool
+            dhcp_pool_name = active_dhcp[0].get("address_pool", "") if active_dhcp else ""
+            if dhcp_pool_name:
+                pool_data = api.get_ip_pool_status(dhcp_pool_name)
+                pools = pool_data.get("pools", []) if pool_data.get("success") else []
+                infrastructure["dhcp_pool"] = pools
+                if pools and any(p.get("exhausted") for p in pools):
+                    infra_issues.append({
+                        "severity": "critical",
+                        "check": "dhcp_pool",
+                        "message": f"DHCP pool '{dhcp_pool_name}' is exhausted",
+                        "recommendation": "Expand pool range or clean stale DHCP leases",
+                    })
+
+            # Walled garden
+            wg = api.get_walled_garden()
+            wg_count = len(wg.get("domain_entries", [])) + len(wg.get("ip_entries", []))
+            infrastructure["walled_garden_entries"] = wg_count
+            if wg_count == 0:
+                infra_issues.append({
+                    "severity": "warning",
+                    "check": "walled_garden",
+                    "message": "No walled garden entries -- captive portal may not load for unauthenticated users",
+                    "recommendation": "Add walled garden entries for your payment/portal domains",
+                })
+
+            # =================================================================
+            # DEVICE-LEVEL CHECKS (existing logic, preserved)
+            # =================================================================
+
             # Check IP bindings (CRITICAL - bypassed = free internet)
             bindings = api.send_command("/ip/hotspot/ip-binding/print")
             if bindings.get("success"):
@@ -1919,7 +2027,9 @@ async def diagnose_mac_address(
                         router_entries["ip_bindings"].append(b)
                         if b.get("type") == "bypassed":
                             can_access_internet = True
-                            diagnosis.append(f"⚠️ BYPASSED IP BINDING FOUND - user can access internet without login!")
+                            diagnosis.append("BYPASSED IP BINDING FOUND - user can access internet without login!")
+                        elif b.get("type") == "blocked":
+                            diagnosis.append("IP BINDING is BLOCKED - user is deliberately blocked from internet")
             
             # Check hotspot users
             users = api.send_command("/ip/hotspot/user/print")
@@ -1939,7 +2049,7 @@ async def diagnose_mac_address(
                     if s_mac == normalized_mac or s_user == username.upper():
                         router_entries["active_sessions"].append(s)
                         can_access_internet = True
-                        diagnosis.append(f"⚠️ ACTIVE HOTSPOT SESSION - user is currently online!")
+                        diagnosis.append("ACTIVE HOTSPOT SESSION - user is currently online!")
             
             # Check ARP table
             arp = api.send_command("/ip/arp/print")
@@ -1973,11 +2083,52 @@ async def diagnose_mac_address(
                     h_mac = normalize_mac_address(h.get("mac-address", "")) if h.get("mac-address") else ""
                     if h_mac == normalized_mac:
                         router_entries["hosts"].append(h)
-            
+
+            # =================================================================
+            # SMART RECOMMENDATIONS (new -- after device checks)
+            # =================================================================
+            recommendations = []
+
+            if not router_entries["arp_entries"]:
+                recommendations.append({
+                    "severity": "warning",
+                    "message": "Device MAC not found in ARP table -- device may not be physically connected to this router",
+                })
+
+            if router_entries["arp_entries"] and not router_entries["dhcp_leases"]:
+                recommendations.append({
+                    "severity": "warning",
+                    "message": "Device is in ARP but has no DHCP lease -- may have a static IP or DHCP is not working",
+                })
+
+            if router_entries["dhcp_leases"] and not router_entries["hosts"]:
+                recommendations.append({
+                    "severity": "info",
+                    "message": "Device has DHCP lease but no hotspot host entry -- device may not be on the hotspot interface",
+                })
+
+            if router_entries["hosts"] and not router_entries["active_sessions"] and not router_entries["ip_bindings"]:
+                recommendations.append({
+                    "severity": "info",
+                    "message": "Hotspot sees the device but there is no active session or binding -- captive portal should be showing",
+                })
+
+            if router_entries["ip_bindings"] and not router_entries["queues"]:
+                for binding in router_entries["ip_bindings"]:
+                    if binding.get("type") == "bypassed":
+                        recommendations.append({
+                            "severity": "warning",
+                            "message": "User is bypassed but has no bandwidth queue -- user may have unlimited speed",
+                        })
+                        break
+
             return {
                 "router_entries": router_entries,
                 "can_access_internet": can_access_internet,
-                "diagnosis": diagnosis
+                "diagnosis": diagnosis,
+                "infrastructure": infrastructure,
+                "infrastructure_issues": infra_issues,
+                "recommendations": recommendations,
             }
         finally:
             api.disconnect()
@@ -1999,21 +2150,25 @@ async def diagnose_mac_address(
         "normalized": normalized_mac,
         "username_format": username,
         "database_info": db_info,
+        "infrastructure": diag_result.get("infrastructure", {}),
+        "infrastructure_issues": diag_result.get("infrastructure_issues", []),
         "router_entries": diag_result["router_entries"],
         "diagnosis": diag_result["diagnosis"],
+        "recommendations": diag_result.get("recommendations", []),
         "can_access_internet": diag_result["can_access_internet"]
     }
     
     # Build diagnosis summary
     if db_info and db_info.get("is_expired") and findings["can_access_internet"]:
-        findings["diagnosis"].insert(0, "🚨 CRITICAL: Customer is EXPIRED but CAN STILL ACCESS INTERNET!")
+        findings["diagnosis"].insert(0, "CRITICAL: Customer is EXPIRED but CAN STILL ACCESS INTERNET!")
     
     if not findings["router_entries"]["ip_bindings"] and not findings["router_entries"]["active_sessions"]:
-        findings["diagnosis"].append("✅ No bypass or active session - hotspot should be blocking this device")
+        findings["diagnosis"].append("No bypass or active session - hotspot should be blocking this device")
     
     # Count entries
     total_entries = sum(len(v) for v in findings["router_entries"].values())
     findings["total_router_entries"] = total_entries
+    findings["total_issues"] = len(findings["infrastructure_issues"]) + len(findings["recommendations"])
     
     return findings
 
@@ -2236,6 +2391,143 @@ async def remove_single_illegal_user(
         "message": f"Successfully removed user with MAC {mac_address}",
         "removed": removal_result
     }
+
+
+# =========================================================================
+# PORT STATUS & DIAGNOSTICS
+# =========================================================================
+
+_port_status_cache: dict = {}  # router_id -> {"data": ..., "timestamp": datetime}
+_PORT_CACHE_TTL = 30  # 30 seconds -- port status changes infrequently
+
+
+def _get_port_status_sync(router_info: dict) -> dict:
+    """Get all ethernet port statuses with bridge assignments. Runs in thread pool."""
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=15,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        bridge_data = api.get_bridge_ports_status()
+        bridges = bridge_data.get("bridges", {}) if bridge_data.get("success") else {}
+        bridge_ports = bridge_data.get("ports", []) if bridge_data.get("success") else []
+        port_bridge_map = {p["interface"]: p["bridge"] for p in bridge_ports}
+
+        ifaces_data = api.get_all_interfaces_detail()
+        ifaces_list = ifaces_data.get("data", []) if ifaces_data.get("success") else []
+
+        ports = []
+        for iface in ifaces_list:
+            if iface.get("type") != "ether" or iface.get("name") == "ether1":
+                continue
+            name = iface["name"]
+            bridge = port_bridge_map.get(name)
+            if bridge == "bridge-pppoe":
+                service = "pppoe"
+            elif bridge:
+                service = "hotspot"
+            else:
+                service = "unassigned"
+
+            ports.append({
+                "port": name,
+                "bridge": bridge or "(none)",
+                "service": service,
+                "link_up": iface.get("running", False),
+                "disabled": iface.get("disabled", False),
+                "rx_byte": iface.get("rx_byte", 0),
+                "tx_byte": iface.get("tx_byte", 0),
+                "rx_error": iface.get("rx_error", 0),
+                "tx_error": iface.get("tx_error", 0),
+                "rx_drop": iface.get("rx_drop", 0),
+                "tx_drop": iface.get("tx_drop", 0),
+                "link_downs": iface.get("link_downs", 0),
+                "last_link_up_time": iface.get("last_link_up_time", ""),
+                "actual_mtu": iface.get("actual_mtu", 0),
+            })
+
+        bridge_info = []
+        for bname, bdata in bridges.items():
+            bridge_info.append({
+                "name": bname,
+                "running": bdata.get("running", False),
+                "disabled": bdata.get("disabled", False),
+                "port_count": sum(1 for p in bridge_ports if p["bridge"] == bname),
+            })
+
+        return {"success": True, "ports": ports, "bridges": bridge_info}
+    except Exception as e:
+        logger.error(f"Error getting port status: {e}")
+        return {"error": str(e)}
+    finally:
+        api.disconnect()
+
+
+@router.get("/api/routers/{router_id}/ports")
+async def get_router_port_status(
+    router_id: int,
+    refresh: bool = False,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Show every ethernet port with bridge assignment, service mode (hotspot/pppoe/unassigned),
+    link status, speed, and error counters. Cached for 30s unless ?refresh=true.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+
+    if not refresh and router_id in _port_status_cache:
+        cached = _port_status_cache[router_id]
+        age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
+        if age < _PORT_CACHE_TTL:
+            result = cached["data"].copy()
+            result["cached"] = True
+            result["cache_age_seconds"] = round(age, 1)
+            return result
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    result = await asyncio.to_thread(_get_port_status_sync, router_info)
+
+    if result.get("error") == "connect_failed":
+        if router_id in _port_status_cache:
+            stale = _port_status_cache[router_id]["data"].copy()
+            stale["cached"] = True
+            stale["stale"] = True
+            return stale
+        raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    response = {
+        "router_id": router_id,
+        "router_name": router_obj.name,
+        "db_pppoe_ports": router_obj.pppoe_ports or [],
+        "generated_at": datetime.utcnow().isoformat(),
+        "cached": False,
+        "ports": result["ports"],
+        "bridges": result["bridges"],
+    }
+
+    _port_status_cache[router_id] = {
+        "data": response,
+        "timestamp": datetime.utcnow(),
+    }
+
+    return response
 
 
 # =========================================================================

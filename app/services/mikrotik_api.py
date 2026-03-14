@@ -1835,3 +1835,353 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error tearing down PPPoE infrastructure: {e}")
             return {"error": str(e), "partial_errors": errors}
+
+    # =========================================================================
+    # MONITORING & DIAGNOSTICS
+    # =========================================================================
+
+    def get_bridge_ports_status(self) -> Dict[str, Any]:
+        """Get all bridge port assignments and bridge interface statuses."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            bridges_result = self.send_command("/interface/bridge/print")
+            bridges = {}
+            if bridges_result.get("success"):
+                for br in bridges_result.get("data", []):
+                    bridges[br.get("name", "")] = {
+                        "name": br.get("name", ""),
+                        "running": br.get("running") == "true",
+                        "disabled": br.get("disabled") == "true",
+                        "mac_address": br.get("mac-address", ""),
+                    }
+
+            ports_result = self.send_command("/interface/bridge/port/print")
+            ports = []
+            if ports_result.get("success"):
+                for p in ports_result.get("data", []):
+                    ports.append({
+                        "interface": p.get("interface", ""),
+                        "bridge": p.get("bridge", ""),
+                        "disabled": p.get("disabled") == "true",
+                        "status": p.get("status", ""),
+                    })
+
+            return {"success": True, "bridges": bridges, "ports": ports}
+        except Exception as e:
+            logger.error(f"Error getting bridge ports status: {e}")
+            return {"error": str(e)}
+
+    def get_all_interfaces_detail(self) -> Dict[str, Any]:
+        """Get detailed info for all interfaces (link, speed, errors, type)."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/interface/print")
+            if not result.get("success"):
+                return result
+            interfaces = []
+            for iface in result.get("data", []):
+                interfaces.append({
+                    "name": iface.get("name", ""),
+                    "type": iface.get("type", ""),
+                    "running": iface.get("running") == "true",
+                    "disabled": iface.get("disabled") == "true",
+                    "rx_byte": self._safe_int(iface.get("rx-byte")),
+                    "tx_byte": self._safe_int(iface.get("tx-byte")),
+                    "rx_error": self._safe_int(iface.get("rx-error")),
+                    "tx_error": self._safe_int(iface.get("tx-error")),
+                    "rx_drop": self._safe_int(iface.get("rx-drop")),
+                    "tx_drop": self._safe_int(iface.get("tx-drop")),
+                    "link_downs": self._safe_int(iface.get("link-downs")),
+                    "last_link_up_time": iface.get("last-link-up-time", ""),
+                    "actual_mtu": self._safe_int(iface.get("actual-mtu")),
+                })
+            return {"success": True, "data": interfaces}
+        except Exception as e:
+            logger.error(f"Error getting all interfaces detail: {e}")
+            return {"error": str(e)}
+
+    def get_router_logs(self, topics: str = "", limit: int = 50) -> Dict[str, Any]:
+        """
+        Get recent log entries, optionally filtered by topic substring.
+        Uses .proplist to minimize data transfer from router.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command_optimized(
+                "/log/print",
+                proplist=["time", "topics", "message"],
+            )
+            if not result.get("success"):
+                return result
+            entries = []
+            topic_filters = [t.strip().lower() for t in topics.split(",") if t.strip()] if topics else []
+            for entry in result.get("data", []):
+                entry_topics = entry.get("topics", "").lower()
+                if topic_filters and not any(tf in entry_topics for tf in topic_filters):
+                    continue
+                entries.append({
+                    "time": entry.get("time", ""),
+                    "topics": entry.get("topics", ""),
+                    "message": entry.get("message", ""),
+                })
+            entries = entries[-limit:]
+            return {"success": True, "data": entries, "count": len(entries)}
+        except Exception as e:
+            logger.error(f"Error getting router logs: {e}")
+            return {"error": str(e)}
+
+    def get_ip_pool_status(self, pool_name: str = "") -> Dict[str, Any]:
+        """Get IP pool config and usage. If pool_name given, filter to that pool."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            pools_result = self.send_command("/ip/pool/print")
+            pools = []
+            if pools_result.get("success"):
+                for p in pools_result.get("data", []):
+                    if pool_name and p.get("name", "") != pool_name:
+                        continue
+                    pools.append({
+                        "name": p.get("name", ""),
+                        "ranges": p.get("ranges", ""),
+                    })
+
+            used_result = self.send_command("/ip/pool/used/print")
+            used = []
+            if used_result.get("success"):
+                for u in used_result.get("data", []):
+                    if pool_name and u.get("pool", "") != pool_name:
+                        continue
+                    used.append({
+                        "pool": u.get("pool", ""),
+                        "address": u.get("address", ""),
+                        "info": u.get("info", ""),
+                    })
+
+            for pool in pools:
+                pool_used = [u for u in used if u["pool"] == pool["name"]]
+                pool["used_count"] = len(pool_used)
+                ranges_str = pool["ranges"]
+                total = 0
+                for r in ranges_str.split(","):
+                    r = r.strip()
+                    if "-" in r:
+                        parts = r.split("-")
+                        try:
+                            start_parts = parts[0].strip().split(".")
+                            end_parts = parts[1].strip().split(".")
+                            start_last = int(start_parts[-1])
+                            end_last = int(end_parts[-1])
+                            total += end_last - start_last + 1
+                        except (ValueError, IndexError):
+                            pass
+                    elif r:
+                        total += 1
+                pool["total_addresses"] = total
+                pool["available"] = total - len(pool_used)
+                pool["exhausted"] = pool["available"] <= 0
+
+            return {"success": True, "pools": pools, "used": used}
+        except Exception as e:
+            logger.error(f"Error getting IP pool status: {e}")
+            return {"error": str(e)}
+
+    def get_nat_rules(self) -> Dict[str, Any]:
+        """Get all NAT rules (to verify masquerade exists)."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/firewall/nat/print")
+            if not result.get("success"):
+                return result
+            rules = []
+            for r in result.get("data", []):
+                rules.append({
+                    "chain": r.get("chain", ""),
+                    "action": r.get("action", ""),
+                    "src_address": r.get("src-address", ""),
+                    "out_interface": r.get("out-interface", ""),
+                    "disabled": r.get("disabled") == "true",
+                    "comment": r.get("comment", ""),
+                })
+            return {"success": True, "data": rules}
+        except Exception as e:
+            logger.error(f"Error getting NAT rules: {e}")
+            return {"error": str(e)}
+
+    # -- PPPoE-specific monitoring --
+
+    def get_pppoe_server_status(self) -> Dict[str, Any]:
+        """Get PPPoE server(s) status from /interface/pppoe-server/server/print."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/interface/pppoe-server/server/print")
+            if not result.get("success"):
+                return result
+            servers = []
+            for s in result.get("data", []):
+                servers.append({
+                    "service_name": s.get("service-name", ""),
+                    "interface": s.get("interface", ""),
+                    "disabled": s.get("disabled") == "true",
+                    "default_profile": s.get("default-profile", ""),
+                    "max_sessions": self._safe_int(s.get("max-sessions")),
+                    "max_mtu": self._safe_int(s.get("max-mtu")),
+                    "max_mru": self._safe_int(s.get("max-mru")),
+                })
+            return {"success": True, "data": servers}
+        except Exception as e:
+            logger.error(f"Error getting PPPoE server status: {e}")
+            return {"error": str(e)}
+
+    def get_pppoe_secret_detail(self, username: str) -> Dict[str, Any]:
+        """Get full detail for a single PPP secret by username."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ppp/secret/print")
+            if not result.get("success"):
+                return result
+            for s in result.get("data", []):
+                if s.get("name") == username:
+                    return {
+                        "success": True,
+                        "found": True,
+                        "data": {
+                            "name": s.get("name", ""),
+                            "service": s.get("service", ""),
+                            "profile": s.get("profile", ""),
+                            "disabled": s.get("disabled") == "true",
+                            "comment": s.get("comment", ""),
+                            "last_logged_out": s.get("last-logged-out", ""),
+                            "last_disconnect_reason": s.get("last-disconnect-reason", ""),
+                            "last_caller_id": s.get("last-caller-id", ""),
+                        },
+                    }
+            return {"success": True, "found": False, "data": None}
+        except Exception as e:
+            logger.error(f"Error getting PPPoE secret detail for {username}: {e}")
+            return {"error": str(e)}
+
+    def get_ppp_profiles(self) -> Dict[str, Any]:
+        """Get all PPP profiles with rate limits and pool assignments."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ppp/profile/print")
+            if not result.get("success"):
+                return result
+            profiles = []
+            for p in result.get("data", []):
+                profiles.append({
+                    "name": p.get("name", ""),
+                    "local_address": p.get("local-address", ""),
+                    "remote_address": p.get("remote-address", ""),
+                    "rate_limit": p.get("rate-limit", ""),
+                    "dns_server": p.get("dns-server", ""),
+                })
+            return {"success": True, "data": profiles}
+        except Exception as e:
+            logger.error(f"Error getting PPP profiles: {e}")
+            return {"error": str(e)}
+
+    def get_ppp_secrets_full(self) -> Dict[str, Any]:
+        """Get all PPP secrets with full detail (for secrets listing endpoint)."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ppp/secret/print")
+            if not result.get("success"):
+                return result
+            secrets = []
+            for s in result.get("data", []):
+                secrets.append({
+                    "name": s.get("name", ""),
+                    "service": s.get("service", ""),
+                    "profile": s.get("profile", ""),
+                    "disabled": s.get("disabled") == "true",
+                    "comment": s.get("comment", ""),
+                    "last_logged_out": s.get("last-logged-out", ""),
+                    "last_disconnect_reason": s.get("last-disconnect-reason", ""),
+                    "last_caller_id": s.get("last-caller-id", ""),
+                })
+            return {"success": True, "data": secrets}
+        except Exception as e:
+            logger.error(f"Error getting all PPP secrets: {e}")
+            return {"error": str(e)}
+
+    # -- Hotspot-specific monitoring --
+
+    def get_hotspot_server_status(self) -> Dict[str, Any]:
+        """Get hotspot server(s) status from /ip/hotspot/print."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/hotspot/print")
+            if not result.get("success"):
+                return result
+            servers = []
+            for s in result.get("data", []):
+                servers.append({
+                    "name": s.get("name", ""),
+                    "interface": s.get("interface", ""),
+                    "disabled": s.get("disabled") == "true",
+                    "profile": s.get("profile", ""),
+                    "address_pool": s.get("address-pool", ""),
+                    "idle_timeout": s.get("idle-timeout", ""),
+                    "addresses_per_mac": s.get("addresses-per-mac", ""),
+                })
+            return {"success": True, "data": servers}
+        except Exception as e:
+            logger.error(f"Error getting hotspot server status: {e}")
+            return {"error": str(e)}
+
+    def get_hotspot_profiles_detail(self) -> Dict[str, Any]:
+        """Get hotspot server profiles from /ip/hotspot/profile/print."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/hotspot/profile/print")
+            if not result.get("success"):
+                return result
+            profiles = []
+            for p in result.get("data", []):
+                profiles.append({
+                    "name": p.get("name", ""),
+                    "hotspot_address": p.get("hotspot-address", ""),
+                    "dns_name": p.get("dns-name", ""),
+                    "html_directory": p.get("html-directory", ""),
+                    "login_by": p.get("login-by", ""),
+                    "rate_limit": p.get("rate-limit", ""),
+                })
+            return {"success": True, "data": profiles}
+        except Exception as e:
+            logger.error(f"Error getting hotspot profiles: {e}")
+            return {"error": str(e)}
+
+    def get_dhcp_server_status(self) -> Dict[str, Any]:
+        """Get DHCP server(s) status, interface, pool, and lease count."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/dhcp-server/print")
+            if not result.get("success"):
+                return result
+            servers = []
+            for s in result.get("data", []):
+                servers.append({
+                    "name": s.get("name", ""),
+                    "interface": s.get("interface", ""),
+                    "address_pool": s.get("address-pool", ""),
+                    "disabled": s.get("disabled") == "true",
+                    "lease_count": self._safe_int(s.get("lease-count")),
+                    "dynamic_count": self._safe_int(s.get("dynamic-count")),
+                })
+            return {"success": True, "data": servers}
+        except Exception as e:
+            logger.error(f"Error getting DHCP server status: {e}")
+            return {"error": str(e)}

@@ -410,3 +410,27 @@ class ProvisioningToken(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     provisioned_at = Column(DateTime, nullable=True)
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
+
+
+class RouterLogSeverity(str, enum.Enum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+class RouterLogEntry(Base):
+    """Notable router log entries persisted for historical tracking."""
+    __tablename__ = "router_log_entries"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=False, index=True)
+    topic = Column(String(50), nullable=False, index=True)
+    message = Column(String(1000), nullable=False)
+    username = Column(String(255), nullable=True, index=True)
+    severity = Column(
+        Enum(RouterLogSeverity, name="routerlogseverity", values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=RouterLogSeverity.INFO,
+    )
+    router_timestamp = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    router = relationship("Router")

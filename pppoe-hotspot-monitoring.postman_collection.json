@@ -1,0 +1,114 @@
+{
+    "info": {
+        "name": "PPPoE & Hotspot Monitoring - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": "your-auth-token-here"},
+        {"key": "router_id", "value": "1"},
+        {"key": "pppoe_username", "value": "customer1"},
+        {"key": "mac_address", "value": "AA:BB:CC:DD:EE:FF"}
+    ],
+    "auth": {
+        "type": "bearer",
+        "bearer": [{"key": "token", "value": "{{token}}"}]
+    },
+    "item": [
+        {
+            "name": "PPPoE Monitoring",
+            "item": [
+                {
+                    "name": "PPPoE Infrastructure Overview",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/pppoe/{{router_id}}/overview",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "PPPoE Diagnose Username",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/pppoe/{{router_id}}/diagnose/{{pppoe_username}}",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "PPPoE Logs",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/pppoe/{{router_id}}/logs?limit=50",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "pppoe", "{{router_id}}", "logs"],
+                            "query": [
+                                {"key": "limit", "value": "50"},
+                                {"key": "username", "value": "", "disabled": true}
+                            ]
+                        },
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "PPPoE Secrets List",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/pppoe/{{router_id}}/secrets",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Hotspot Monitoring",
+            "item": [
+                {
+                    "name": "Hotspot Infrastructure Overview",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/hotspot/{{router_id}}/overview",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "Hotspot Logs",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/hotspot/{{router_id}}/logs?limit=50",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "hotspot", "{{router_id}}", "logs"],
+                            "query": [
+                                {"key": "limit", "value": "50"},
+                                {"key": "search", "value": "", "disabled": true}
+                            ]
+                        },
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Shared Router Diagnostics",
+            "item": [
+                {
+                    "name": "Port Status & Assignment",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/routers/{{router_id}}/ports",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "Diagnose MAC Address (Enhanced)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/routers/{{router_id}}/diagnose/{{mac_address}}",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                }
+            ]
+        }
+    ]
+}
