@@ -2620,49 +2620,95 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
     if not api.connect():
         return {"error": "connect_failed"}
     try:
-        # Teardown old config if ports were previously set
-        if old_ports:
-            teardown = api.teardown_pppoe_infrastructure(ports_to_restore=old_ports)
-            if teardown.get("error"):
-                return teardown
-            time.sleep(0.5)
+        target_ports = list(dict.fromkeys(new_ports or []))
+
+        current_pppoe = api.get_ports_in_bridge("bridge-pppoe")
+        if current_pppoe.get("error"):
+            return {
+                "error": (
+                    f"Failed to read current PPPoE bridge membership before applying "
+                    f"changes: {current_pppoe['error']}"
+                ),
+                "current_ports": old_ports,
+            }
+
+        current_ports = current_pppoe.get("ports", [])
+        ports_to_restore = [p for p in current_ports if p not in target_ports]
+
+        # Clearing PPPoE entirely: restore actual current PPPoE ports and remove infra.
+        if not target_ports:
+            if current_ports:
+                teardown = api.teardown_pppoe_infrastructure(ports_to_restore=current_ports)
+                if teardown.get("error"):
+                    teardown["current_ports"] = current_ports
+                    return teardown
+
+                time.sleep(0.5)
+                verify = api.verify_port_bridges(
+                    {p: "bridge" for p in current_ports},
+                    retries=8,
+                    delay=0.5,
+                )
+                if verify.get("error"):
+                    return {
+                        "error": (
+                            f"PPPoE teardown commands ran but ports may not have restored: "
+                            f"{verify['error']}"
+                        ),
+                        "failed_ports": verify.get("failed_ports", []),
+                        "current_ports": current_ports,
+                    }
+
+            return {
+                "success": True,
+                "message": "PPPoE ports cleared, all ports restored to hotspot bridge",
+                "current_ports": current_ports,
+            }
+
+        # Restore ports no longer requested without tearing down the shared PPPoE infra.
+        restore_errors = []
+        for port in ports_to_restore:
+            restore = api.add_bridge_port(port, "bridge")
+            if restore.get("error"):
+                restore_errors.append(f"{port}: {restore['error']}")
+            time.sleep(0.2)
+
+        if restore_errors:
+            return {
+                "error": "Failed to restore removed PPPoE ports: " + "; ".join(restore_errors),
+                "current_ports": current_ports,
+            }
 
         # Set up new config if ports are selected
-        if new_ports:
-            setup_result = api.setup_pppoe_infrastructure(pppoe_ports=new_ports)
-            if setup_result.get("error"):
-                return setup_result
-
-            # Final safety-net verification: re-read bridge ports and confirm
-            time.sleep(0.5)
-            verify = api.verify_port_bridges({p: "bridge-pppoe" for p in new_ports})
-            if verify.get("error"):
-                failed = verify.get("failed_ports", [])
-                details = "; ".join(
-                    f"{f['port']} is still in '{f['actual_bridge']}' (expected '{f['expected_bridge']}')"
-                    for f in failed
-                ) if failed else verify["error"]
-                return {
-                    "error": (
-                        f"The router accepted the commands but the ports did not actually move. "
-                        f"{details}. This may indicate the router silently rejected the change."
-                    ),
-                    "failed_ports": failed,
-                }
-
+        setup_result = api.setup_pppoe_infrastructure(pppoe_ports=target_ports)
+        if setup_result.get("error"):
+            setup_result["current_ports"] = current_ports
             return setup_result
 
-        # Clearing PPPoE -- verify ports moved back to hotspot bridge
-        if old_ports:
-            time.sleep(0.5)
-            verify = api.verify_port_bridges({p: "bridge" for p in old_ports})
-            if verify.get("error"):
-                return {
-                    "error": f"PPPoE teardown commands ran but ports may not have restored: {verify['error']}",
-                    "failed_ports": verify.get("failed_ports", []),
-                }
+        # Final safety-net verification: confirm both requested PPPoE ports and restored ports.
+        time.sleep(0.5)
+        expected_bridges = {p: "bridge-pppoe" for p in target_ports}
+        expected_bridges.update({p: "bridge" for p in ports_to_restore})
+        verify = api.verify_port_bridges(expected_bridges, retries=8, delay=0.5)
+        if verify.get("error"):
+            failed = verify.get("failed_ports", [])
+            details = "; ".join(
+                f"{f['port']} is still in '{f['actual_bridge']}' (expected '{f['expected_bridge']}')"
+                for f in failed
+            ) if failed else verify["error"]
+            return {
+                "error": (
+                    f"The router accepted the commands but the final bridge layout "
+                    f"does not match the requested PPPoE configuration. {details}. "
+                    f"This may indicate the router applied the change slowly or "
+                    f"partially."
+                ),
+                "failed_ports": failed,
+                "current_ports": current_ports,
+            }
 
-        return {"success": True, "message": "PPPoE ports cleared, all ports restored to hotspot bridge"}
+        setup_result["current_ports"] = current_ports
+        return setup_result
     finally:
         api.disconnect()
 
@@ -2711,7 +2757,7 @@ async def set_pppoe_ports(
         detail = {
             "message": result["error"],
             "failed_ports": failed_ports,
-            "pppoe_ports_unchanged": old_ports,
+            "pppoe_ports_unchanged": result.get("current_ports", old_ports),
         }
         raise HTTPException(status_code=500, detail=detail)
 

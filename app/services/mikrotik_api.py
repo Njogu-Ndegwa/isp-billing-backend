@@ -1746,7 +1746,7 @@ class MikroTikAPI:
 
             # Verify the port actually landed in the target bridge
             time.sleep(0.5)
-            verify = self.verify_port_bridges({interface: bridge})
+            verify = self.verify_port_bridges({interface: bridge}, retries=8, delay=0.5)
             if verify.get("error"):
                 failed = verify.get("failed_ports", [])
                 actual = failed[0]["actual_bridge"] if failed else "unknown"
@@ -1798,13 +1798,20 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Exception restoring {interface} to {original_bridge}: {e}")
 
-    def verify_port_bridges(self, expected: Dict[str, str]) -> Dict[str, Any]:
+    def verify_port_bridges(
+        self,
+        expected: Dict[str, str],
+        retries: int = 1,
+        delay: float = 0.0,
+    ) -> Dict[str, Any]:
         """
         Re-read bridge port assignments from the router and verify each port
         is in the expected bridge.
 
         Args:
             expected: {interface_name: expected_bridge_name}  e.g. {"ether2": "bridge-pppoe"}
+            retries: Total verification attempts before failing.
+            delay: Seconds to wait between failed verification attempts.
 
         Returns:
             {"success": True} when all ports match, or
@@ -1812,57 +1819,84 @@ class MikroTikAPI:
         """
         if not self.connected:
             return {"error": "Not connected"}
-        try:
-            ports_result = self.send_command("/interface/bridge/port/print")
-            if ports_result.get("error"):
-                return {"error": f"Could not read bridge ports for verification: {ports_result['error']}"}
+        attempts = max(1, retries)
+        last_result: Dict[str, Any] = {"error": "Verification did not run"}
 
-            actual_map: Dict[str, str] = {}
-            for p in ports_result.get("data", []):
-                actual_map[p.get("interface", "")] = p.get("bridge", "")
-
-            failed = []
-            for iface, want_bridge in expected.items():
-                got_bridge = actual_map.get(iface)
-                if got_bridge != want_bridge:
-                    # Fallback: try filtered query for switch-chip-managed ports
-                    filtered = self._find_bridge_port_filtered(iface)
-                    if filtered.get("found") and filtered.get("bridge") == want_bridge:
-                        logger.info(
-                            f"Verification: {iface} not in unfiltered print but "
-                            f"filtered query confirms it is in '{want_bridge}'"
+        for attempt in range(1, attempts + 1):
+            try:
+                ports_result = self.send_command("/interface/bridge/port/print")
+                if ports_result.get("error"):
+                    last_result = {
+                        "error": (
+                            f"Could not read bridge ports for verification: "
+                            f"{ports_result['error']}"
                         )
-                        continue
+                    }
+                else:
+                    actual_map: Dict[str, str] = {}
+                    for p in ports_result.get("data", []):
+                        actual_map[p.get("interface", "")] = p.get("bridge", "")
 
-                    actual_label = f"'{got_bridge}'" if got_bridge else "(not in any bridge)"
-                    if filtered.get("found"):
-                        got_bridge = filtered["bridge"]
-                        actual_label = f"'{got_bridge}' (found via filtered query)"
-                    failed.append({
-                        "port": iface,
-                        "expected_bridge": want_bridge,
-                        "actual_bridge": got_bridge or "(none)",
-                    })
-                    logger.error(
-                        f"Verification failed: {iface} expected in '{want_bridge}' "
-                        f"but found in {actual_label}"
+                    failed = []
+                    for iface, want_bridge in expected.items():
+                        got_bridge = actual_map.get(iface)
+                        if got_bridge != want_bridge:
+                            # Fallback: try filtered query for switch-chip-managed ports
+                            filtered = self._find_bridge_port_filtered(iface)
+                            if filtered.get("found") and filtered.get("bridge") == want_bridge:
+                                logger.info(
+                                    f"Verification: {iface} not in unfiltered print but "
+                                    f"filtered query confirms it is in '{want_bridge}'"
+                                )
+                                continue
+
+                            if filtered.get("found"):
+                                got_bridge = filtered["bridge"]
+                            failed.append({
+                                "port": iface,
+                                "expected_bridge": want_bridge,
+                                "actual_bridge": got_bridge or "(none)",
+                            })
+
+                    if not failed:
+                        if attempt > 1:
+                            logger.info(
+                                f"Verification passed on attempt {attempt}/{attempts}: "
+                                f"all ports in expected bridges"
+                            )
+                        else:
+                            logger.info("Verification passed: all ports in expected bridges")
+                        return {"success": True}
+
+                    summary = "; ".join(
+                        f"{f['port']} is in {f['actual_bridge']} instead of {f['expected_bridge']}"
+                        for f in failed
                     )
+                    last_result = {
+                        "error": f"Port move verification failed: {summary}",
+                        "failed_ports": failed,
+                    }
+            except Exception as e:
+                last_result = {"error": f"Verification error: {str(e)}"}
 
-            if failed:
-                summary = "; ".join(
-                    f"{f['port']} is in {f['actual_bridge']} instead of {f['expected_bridge']}"
-                    for f in failed
+            if attempt < attempts:
+                logger.warning(
+                    f"Bridge verification attempt {attempt}/{attempts} did not match "
+                    f"expected state for {', '.join(expected.keys())}. "
+                    f"Retrying in {delay:.1f}s."
                 )
-                return {
-                    "error": f"Port move verification failed: {summary}",
-                    "failed_ports": failed,
-                }
+                if delay > 0:
+                    time.sleep(delay)
 
-            logger.info(f"Verification passed: all ports in expected bridges")
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"Error verifying bridge port assignments: {e}")
-            return {"error": f"Verification error: {str(e)}"}
+        for failed_port in last_result.get("failed_ports", []):
+            logger.error(
+                f"Verification failed: {failed_port['port']} expected in "
+                f"'{failed_port['expected_bridge']}' but found in "
+                f"'{failed_port['actual_bridge']}'"
+            )
+        if last_result.get("error"):
+            logger.error(last_result["error"])
+        return last_result
 
     def setup_pppoe_infrastructure(
         self,
@@ -1905,7 +1939,11 @@ class MikroTikAPI:
 
             # 2b. Verify ports actually moved -- hard error if not
             time.sleep(0.3)
-            verify = self.verify_port_bridges({p: bridge_name for p in pppoe_ports})
+            verify = self.verify_port_bridges(
+                {p: bridge_name for p in pppoe_ports},
+                retries=8,
+                delay=0.5,
+            )
             if verify.get("error"):
                 all_errors = port_move_errors + [verify["error"]]
                 return {
@@ -2155,6 +2193,40 @@ class MikroTikAPI:
             return {"success": True, "bridges": bridges, "ports": ports}
         except Exception as e:
             logger.error(f"Error getting bridge ports status: {e}")
+            return {"error": str(e)}
+
+    def get_ports_in_bridge(self, bridge_name: str) -> Dict[str, Any]:
+        """Return interface names currently assigned to a bridge."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            # Filtered queries are more reliable on some switch-chip-managed ports
+            # than a full unfiltered print.
+            filtered = self.send_command_optimized(
+                "/interface/bridge/port/print",
+                proplist=["interface", "bridge"],
+                query=f"?bridge={bridge_name}",
+            )
+            if filtered.get("success"):
+                ports = sorted(
+                    p.get("interface", "")
+                    for p in filtered.get("data", [])
+                    if p.get("bridge") == bridge_name and p.get("interface")
+                )
+                return {"success": True, "bridge": bridge_name, "ports": ports}
+
+            ports_result = self.send_command("/interface/bridge/port/print")
+            if ports_result.get("error"):
+                return {"error": f"Could not read bridge ports: {ports_result['error']}"}
+
+            ports = sorted(
+                p.get("interface", "")
+                for p in ports_result.get("data", [])
+                if p.get("bridge") == bridge_name and p.get("interface")
+            )
+            return {"success": True, "bridge": bridge_name, "ports": ports}
+        except Exception as e:
+            logger.error(f"Error reading ports in bridge {bridge_name}: {e}")
             return {"error": str(e)}
 
     def get_all_interfaces_detail(self) -> Dict[str, Any]:
