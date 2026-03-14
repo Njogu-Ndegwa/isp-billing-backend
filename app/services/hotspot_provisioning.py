@@ -23,6 +23,7 @@ HOTSPOT_PROVISIONING_ACTIONS = (
     "hotspot_payment",
     "hotspot_retry",
     "voucher_direct_api",
+    "manual_transaction_provision",
 )
 
 _hotspot_provision_pool = ThreadPoolExecutor(
@@ -275,6 +276,8 @@ async def provision_hotspot_customer(
             router_ip,
             provisioning_error,
         )
+        result["success"] = False
+        result["provisioning_error"] = provisioning_error
     else:
         queue_result = result.get("queue_result", {})
         queue_state = "pending" if queue_result.get("pending") else "ready"
@@ -291,6 +294,8 @@ async def provision_hotspot_customer(
             customer_id,
             router_ip,
         )
+        result["success"] = True
+        result["provisioning_error"] = None
 
     return result
 

@@ -47,6 +47,42 @@ class InitiateMpesaPaymentRequest(BaseModel):
     phone: str
 
 
+def _router_auth_value(router: Optional[Router]) -> Optional[str]:
+    auth_method = getattr(router, "auth_method", None)
+    if auth_method is None:
+        return None
+    return auth_method.value if hasattr(auth_method, "value") else str(auth_method)
+
+
+def _manual_provision_support(
+    payment_method: str,
+    status: str,
+    customer: Optional[Customer],
+    router_obj: Optional[Router],
+    plan: Optional[Plan],
+) -> tuple[bool, Optional[str]]:
+    if payment_method == PaymentMethod.MOBILE_MONEY.value:
+        if status != MpesaTransactionStatus.completed.value:
+            return False, "Only completed mobile money transactions can be manually provisioned"
+    elif status != "completed":
+        return False, "Only completed transactions can be manually provisioned"
+
+    if not customer:
+        return False, "Transaction has no linked customer"
+    if not router_obj:
+        return False, "Customer has no router assigned"
+    if not plan:
+        return False, "Customer has no plan assigned"
+    if _router_auth_value(router_obj) == "RADIUS":
+        return False, "Manual provisioning is disabled for RADIUS routers"
+    if plan.connection_type != ConnectionType.HOTSPOT:
+        return False, "Only direct hotspot transactions are supported"
+    if not customer.mac_address:
+        return False, "Customer has no MAC address"
+
+    return True, None
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -683,6 +719,13 @@ async def get_mpesa_transactions(
             mpesa_rows = (await db.execute(mpesa_stmt)).all()
 
             for tx, customer, rtr, plan in mpesa_rows:
+                manual_supported, manual_reason = _manual_provision_support(
+                    PaymentMethod.MOBILE_MONEY.value,
+                    tx.status.value,
+                    customer,
+                    rtr,
+                    plan,
+                )
                 results.append({
                     "transaction_id": tx.id,
                     "checkout_request_id": tx.checkout_request_id,
@@ -710,6 +753,7 @@ async def get_mpesa_transactions(
                         "id": rtr.id,
                         "name": rtr.name,
                         "ip_address": rtr.ip_address,
+                        "auth_method": _router_auth_value(rtr),
                     } if rtr else None,
                     "plan": {
                         "id": plan.id,
@@ -717,7 +761,10 @@ async def get_mpesa_transactions(
                         "price": plan.price,
                         "duration_value": plan.duration_value,
                         "duration_unit": plan.duration_unit.value,
+                        "connection_type": plan.connection_type.value if plan.connection_type else None,
                     } if plan else None,
+                    "manual_provision_supported": manual_supported,
+                    "manual_provision_reason": manual_reason,
                 })
 
         # --- Query 2: Non-M-Pesa payments (voucher, cash, etc.) ---
@@ -762,6 +809,14 @@ async def get_mpesa_transactions(
             cp_rows = (await db.execute(cp_stmt)).all()
 
             for pay, customer, rtr, plan in cp_rows:
+                payment_status = "completed" if pay.status and pay.status.value == "completed" else (pay.status.value if pay.status else "completed")
+                manual_supported, manual_reason = _manual_provision_support(
+                    pay.payment_method.value,
+                    payment_status,
+                    customer,
+                    rtr,
+                    plan,
+                )
                 results.append({
                     "transaction_id": pay.id,
                     "checkout_request_id": None,
@@ -769,7 +824,7 @@ async def get_mpesa_transactions(
                     "amount": float(pay.amount),
                     "reference": pay.payment_reference,
                     "lipay_tx_no": pay.lipay_tx_no,
-                    "status": "completed" if pay.status and pay.status.value == "completed" else (pay.status.value if pay.status else "completed"),
+                    "status": payment_status,
                     "payment_method": pay.payment_method.value,
                     "payment_reference": pay.payment_reference,
                     "mpesa_receipt_number": None,
@@ -789,6 +844,7 @@ async def get_mpesa_transactions(
                         "id": rtr.id,
                         "name": rtr.name,
                         "ip_address": rtr.ip_address,
+                        "auth_method": _router_auth_value(rtr),
                     } if rtr else None,
                     "plan": {
                         "id": plan.id,
@@ -796,7 +852,10 @@ async def get_mpesa_transactions(
                         "price": plan.price,
                         "duration_value": plan.duration_value,
                         "duration_unit": plan.duration_unit.value,
+                        "connection_type": plan.connection_type.value if plan.connection_type else None,
                     } if plan else None,
+                    "manual_provision_supported": manual_supported,
+                    "manual_provision_reason": manual_reason,
                 })
 
         # Merge and sort by date descending, then paginate
@@ -810,6 +869,120 @@ async def get_mpesa_transactions(
     except Exception as e:
         logger.error(f"Error fetching transactions: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch transactions: {str(e)}")
+
+
+@router.post("/api/transactions/{payment_method}/{transaction_id}/manual-provision")
+async def manual_provision_transaction(
+    payment_method: str,
+    transaction_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Manually re-run direct hotspot provisioning for a specific transaction.
+
+    Intended for use from the transactions table when payment succeeded but
+    router provisioning needs to be replayed.
+    """
+    try:
+        user = await get_current_user(token, db)
+        method = payment_method.lower()
+
+        customer = None
+        router_obj = None
+        plan = None
+        reference = None
+        tx_status = None
+
+        if method == PaymentMethod.MOBILE_MONEY.value:
+            stmt = (
+                select(MpesaTransaction, Customer, Router, Plan)
+                .join(Customer, MpesaTransaction.customer_id == Customer.id)
+                .join(Router, Customer.router_id == Router.id, isouter=True)
+                .join(Plan, Customer.plan_id == Plan.id, isouter=True)
+                .where(
+                    MpesaTransaction.id == transaction_id,
+                    Customer.user_id == user.id,
+                )
+            )
+            row = (await db.execute(stmt)).one_or_none()
+            if not row:
+                raise HTTPException(status_code=404, detail="Transaction not found")
+
+            tx, customer, router_obj, plan = row
+            tx_status = tx.status.value
+            reference = tx.mpesa_receipt_number or tx.reference or tx.checkout_request_id
+        else:
+            try:
+                pm_enum = PaymentMethod(method)
+            except ValueError:
+                valid_methods = [m.value for m in PaymentMethod]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid payment method. Must be one of: {', '.join(valid_methods)}",
+                )
+
+            stmt = (
+                select(CustomerPayment, Customer, Router, Plan)
+                .join(Customer, CustomerPayment.customer_id == Customer.id)
+                .outerjoin(Router, Customer.router_id == Router.id)
+                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                .where(
+                    CustomerPayment.id == transaction_id,
+                    CustomerPayment.reseller_id == user.id,
+                    CustomerPayment.payment_method == pm_enum,
+                )
+            )
+            row = (await db.execute(stmt)).one_or_none()
+            if not row:
+                raise HTTPException(status_code=404, detail="Transaction not found")
+
+            pay, customer, router_obj, plan = row
+            tx_status = pay.status.value if pay.status else "completed"
+            reference = pay.payment_reference or f"{pm_enum.value}-{pay.id}"
+
+        supported, reason = _manual_provision_support(method, tx_status, customer, router_obj, plan)
+        if not supported:
+            raise HTTPException(status_code=400, detail=reason or "Manual provisioning is not supported for this transaction")
+
+        hotspot_payload = build_hotspot_payload(
+            customer,
+            plan,
+            router_obj,
+            comment=f"Manual provisioning for transaction {transaction_id}",
+        )
+        await log_provisioning_event(
+            customer_id=customer.id,
+            router_id=router_obj.id,
+            mac_address=customer.mac_address,
+            action="manual_transaction_provision",
+            status="scheduled",
+            details=f"Manual provisioning requested by user {user.id} for transaction {transaction_id}",
+        )
+        result = await provision_hotspot_customer(
+            customer.id,
+            router_obj.id,
+            hotspot_payload,
+            "manual_transaction_provision",
+        )
+
+        return {
+            "success": result.get("success", False),
+            "payment_method": method,
+            "transaction_id": transaction_id,
+            "reference": reference,
+            "customer_id": customer.id,
+            "router_id": router_obj.id,
+            "router_name": router_obj.name,
+            "provisioning_error": result.get("provisioning_error"),
+            "provisioning_result": result,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error manually provisioning transaction {transaction_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to manually provision transaction: {str(e)}")
 
 
 @router.get("/api/mpesa/transactions/summary")
