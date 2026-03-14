@@ -62,8 +62,11 @@ def _manual_provision_support(
     plan: Optional[Plan],
 ) -> tuple[bool, Optional[str]]:
     if payment_method == PaymentMethod.MOBILE_MONEY.value:
-        if status != MpesaTransactionStatus.completed.value:
-            return False, "Only completed mobile money transactions can be manually provisioned"
+        if status not in (
+            MpesaTransactionStatus.completed.value,
+            MpesaTransactionStatus.pending.value,
+        ):
+            return False, "Only completed or pending mobile money transactions can be manually provisioned"
     elif status != "completed":
         return False, "Only completed transactions can be manually provisioned"
 
@@ -81,6 +84,86 @@ def _manual_provision_support(
         return False, "Customer has no MAC address"
 
     return True, None
+
+
+def _calculate_days_paid_for(duration_value: int, duration_unit: str) -> int:
+    if duration_unit == "MINUTES":
+        return max(1, duration_value // (24 * 60))
+    if duration_unit == "HOURS":
+        return max(1, duration_value // 24)
+    return duration_value
+
+
+async def _resolve_customer_payment_plan(
+    db: AsyncSession,
+    customer: Customer,
+) -> tuple[Optional[Plan], int, str]:
+    pending_data = None
+    if customer.pending_update_data:
+        try:
+            pending_data = (
+                json.loads(customer.pending_update_data)
+                if isinstance(customer.pending_update_data, str)
+                else customer.pending_update_data
+            )
+        except (json.JSONDecodeError, TypeError):
+            pending_data = None
+
+    if pending_data and pending_data.get("plan_id"):
+        pending_plan_stmt = select(Plan).where(Plan.id == pending_data["plan_id"])
+        pending_plan_result = await db.execute(pending_plan_stmt)
+        plan = pending_plan_result.scalar_one_or_none() or customer.plan
+        if plan:
+            customer.plan_id = plan.id
+            customer.plan = plan
+    else:
+        plan = customer.plan
+
+    duration_value = plan.duration_value if plan else 1
+    duration_unit = plan.duration_unit.value.upper() if plan else "DAYS"
+    customer.pending_update_data = None
+    await db.flush()
+    return plan, duration_value, duration_unit
+
+
+async def _finalize_pending_mobile_money_transaction(
+    db: AsyncSession,
+    tx: MpesaTransaction,
+    customer: Customer,
+    actor_user_id: int,
+) -> tuple[Plan, CustomerPayment]:
+    from app.services.reseller_payments import record_customer_payment
+
+    plan, duration_value, duration_unit = await _resolve_customer_payment_plan(db, customer)
+    if not plan:
+        raise HTTPException(status_code=400, detail="Customer has no plan assigned")
+
+    days_paid_for = _calculate_days_paid_for(duration_value, duration_unit)
+    reference = tx.mpesa_receipt_number or tx.checkout_request_id
+
+    tx.status = MpesaTransactionStatus.completed
+    tx.failure_source = None
+    tx.result_code = tx.result_code or "MANUAL_COMPLETED"
+    tx.result_desc = (
+        tx.result_desc
+        or f"Manually marked completed and provisioned by user {actor_user_id}"
+    )
+    tx.updated_at = datetime.utcnow()
+
+    payment = await record_customer_payment(
+        db=db,
+        customer_id=customer.id,
+        reseller_id=customer.user_id,
+        amount=float(tx.amount),
+        payment_method=PaymentMethod.MOBILE_MONEY,
+        days_paid_for=days_paid_for,
+        payment_reference=reference,
+        notes=f"Manual completion from pending M-Pesa TX: {tx.checkout_request_id}",
+        duration_value=duration_value,
+        duration_unit=duration_unit,
+    )
+    await db.refresh(customer)
+    return plan, payment
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +1028,17 @@ async def manual_provision_transaction(
         if not supported:
             raise HTTPException(status_code=400, detail=reason or "Manual provisioning is not supported for this transaction")
 
+        payment_record = None
+        if method == PaymentMethod.MOBILE_MONEY.value and tx_status == MpesaTransactionStatus.pending.value:
+            plan, payment_record = await _finalize_pending_mobile_money_transaction(
+                db,
+                tx,
+                customer,
+                user.id,
+            )
+            tx_status = MpesaTransactionStatus.completed.value
+            reference = tx.mpesa_receipt_number or tx.checkout_request_id
+
         hotspot_payload = build_hotspot_payload(
             customer,
             plan,
@@ -971,9 +1065,11 @@ async def manual_provision_transaction(
             "payment_method": method,
             "transaction_id": transaction_id,
             "reference": reference,
+            "transaction_status": tx_status,
             "customer_id": customer.id,
             "router_id": router_obj.id,
             "router_name": router_obj.name,
+            "payment_id": payment_record.id if payment_record else None,
             "provisioning_error": result.get("provisioning_error"),
             "provisioning_result": result,
         }
