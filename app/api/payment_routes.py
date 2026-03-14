@@ -11,15 +11,16 @@ from app.db.models import (
     CustomerStatus, CustomerPayment, ConnectionType, User, PaymentMethod,
 )
 from app.services.auth import verify_token, get_current_user
-from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.hotspot_provisioning import (
+    build_hotspot_payload,
+    log_provisioning_event,
+    provision_hotspot_customer,
+)
 from app.services.mpesa_transactions import update_mpesa_transaction_status
 from app.services.billing import make_payment
 from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
-from app.config import settings
 import logging
 import json
-import asyncio
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -44,118 +45,6 @@ class InitiateMpesaPaymentRequest(BaseModel):
     customer_id: int
     amount: float
     phone: str
-
-
-# ---------------------------------------------------------------------------
-# MikroTik bypass helpers (used by the callback)
-# ---------------------------------------------------------------------------
-
-def _call_mikrotik_bypass_sync(hotspot_payload: dict) -> dict:
-    """
-    Synchronous function to provision customer on MikroTik.
-    Runs in thread pool to not block async event loop.
-    CRITICAL: This runs after payment - must not block other customers from paying!
-    """
-    import time
-    
-    router_ip = hotspot_payload.get("router_ip", settings.MIKROTIK_HOST)
-    router_username = hotspot_payload.get("router_username", settings.MIKROTIK_USERNAME)
-    router_password = hotspot_payload.get("router_password", settings.MIKROTIK_PASSWORD)
-    router_port = hotspot_payload.get("router_port", settings.MIKROTIK_PORT)
-    
-    logger.info(f"[THREAD] Connecting to MikroTik router at {router_ip}:{router_port}")
-    
-    api = MikroTikAPI(
-        router_ip,
-        router_username,
-        router_password,
-        router_port,
-        timeout=15,
-        connect_timeout=5
-    )
-
-    if not api.connect():
-        logger.error(f"[THREAD] Failed to connect to MikroTik router at {router_ip}")
-        return {"error": "Failed to connect"}
-
-    try:
-        result = api.add_customer_bypass_mode(
-            hotspot_payload["mac_address"],
-            hotspot_payload["username"],
-            hotspot_payload["password"],
-            hotspot_payload["time_limit"],
-            hotspot_payload["bandwidth_limit"],
-            hotspot_payload["comment"],
-            router_ip,
-            router_username,
-            router_password
-        )
-
-        logger.info(f"[THREAD] MikroTik API Response: {json.dumps(result, indent=2)}")
-        
-        # If queue wasn't created (client not connected), retry after delay
-        queue_result = result.get("queue_result", {})
-        if queue_result and queue_result.get("pending"):
-            logger.info(f"[THREAD] Queue pending for {hotspot_payload['mac_address']}, will retry in 5 seconds...")
-            time.sleep(5)  # Sync sleep in thread pool is fine
-            
-            if not api.connected:
-                api.connect()
-            
-            if api.connected:
-                normalized_mac = normalize_mac_address(hotspot_payload["mac_address"])
-                username = normalized_mac.replace(":", "")
-                rate_limit = api._parse_speed_to_mikrotik(hotspot_payload["bandwidth_limit"])
-                
-                client_ip = api.get_client_ip_by_mac(normalized_mac)
-                
-                if client_ip:
-                    retry_result = api.send_command("/queue/simple/add", {
-                        "name": f"plan_{username}",
-                        "target": f"{client_ip}/32",
-                        "max-limit": rate_limit,
-                        "comment": f"MAC:{hotspot_payload['mac_address']}|Plan rate limit"
-                    })
-                    if retry_result.get("error") and "already have" in retry_result.get("error", "").lower():
-                        queues_result = api.get_simple_queues_minimal()
-                        if queues_result.get("success") and queues_result.get("data"):
-                            for queue_item in queues_result["data"]:
-                                if str(queue_item.get("name", "")).lower() == f"plan_{username}".lower() and queue_item.get(".id"):
-                                    retry_result = api.send_command("/queue/simple/set", {
-                                        "numbers": queue_item[".id"],
-                                        "target": f"{client_ip}/32",
-                                        "max-limit": rate_limit,
-                                        "disabled": "no"
-                                    })
-                                    break
-                    bypass_result = api.ensure_queue_fasttrack_bypass([client_ip])
-                    if bypass_result.get("error"):
-                        logger.warning(
-                            f"[THREAD] Queue exists but FastTrack bypass setup failed for {client_ip}: {bypass_result.get('error')}"
-                        )
-                    logger.info(f"[THREAD] Queue created for {username} -> {client_ip}: {retry_result}")
-                else:
-                    logger.warning(f"[THREAD] Still no IP for {hotspot_payload['mac_address']} - queue will be synced later")
-        
-        return result
-    finally:
-        api.disconnect()
-
-
-async def call_mikrotik_bypass(hotspot_payload: dict):
-    """
-    Async wrapper that runs MikroTik bypass provisioning in a thread pool.
-    CRITICAL: Runs in thread pool so it doesn't block payment processing for other customers!
-    NOTE: Does NOT use mikrotik_lock -- provisioning creates its own connection and
-    must never be blocked behind slow background sync/cleanup jobs. A paying customer
-    should get internet immediately, not wait 2+ minutes for a sync job to finish.
-    """
-    try:
-        result = await asyncio.to_thread(_call_mikrotik_bypass_sync, hotspot_payload)
-        if result and result.get("error"):
-            logger.error(f"MikroTik bypass failed: {result['error']}")
-    except Exception as e:
-        logger.error(f"Error while processing MikroTik bypass: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -314,34 +203,46 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                     pppoe_payload = build_pppoe_payload(customer, customer.router)
                     logger.info(f"Prepared PPPoE Payload for customer {customer.id} -> Router: {customer.router.ip_address}")
                     background_tasks.add_task(call_pppoe_provision, pppoe_payload)
+                else:
+                    logger.error(
+                        "[CALLBACK] Skipping PPPoE provisioning for customer %s - "
+                        "missing pppoe_username or router (router_id=%s, username=%s)",
+                        customer.id,
+                        customer.router_id,
+                        customer.pppoe_username,
+                    )
             elif customer.mac_address and customer.router:
                 router_obj = customer.router
-                
-                # Convert duration to MikroTik format (m=minutes, h=hours, d=days)
-                duration_unit = plan.duration_unit.value.upper()
-                if duration_unit == "MINUTES":
-                    time_limit = f"{int(duration_value)}m"
-                elif duration_unit == "HOURS":
-                    time_limit = f"{int(duration_value)}h"
-                elif duration_unit == "DAYS":
-                    time_limit = f"{int(duration_value)}d"
-                else:
-                    time_limit = f"{int(duration_value)}h"
-                
-                hotspot_payload = {
-                    "mac_address": customer.mac_address,
-                    "username": customer.mac_address.replace(":", ""),
-                    "password": customer.mac_address.replace(":", ""),
-                    "time_limit": time_limit,
-                    "bandwidth_limit": f"{plan.speed}",
-                    "comment": f"Payment successful for {customer.name}",
-                    "router_ip": router_obj.ip_address,
-                    "router_username": router_obj.username,
-                    "router_password": router_obj.password,
-                    "router_port": router_obj.port,
-                }
+                hotspot_payload = build_hotspot_payload(
+                    customer,
+                    plan,
+                    router_obj,
+                    comment=f"Payment successful for {customer.name}",
+                )
                 logger.info(f"Prepared MikroTik Payload for customer {customer.id} -> Router: {router_obj.ip_address}")
-                background_tasks.add_task(call_mikrotik_bypass, hotspot_payload)
+                await log_provisioning_event(
+                    customer_id=customer.id,
+                    router_id=router_obj.id,
+                    mac_address=customer.mac_address,
+                    action="hotspot_payment",
+                    status="scheduled",
+                    details=f"Queued after M-Pesa callback for router {router_obj.ip_address}",
+                )
+                background_tasks.add_task(
+                    provision_hotspot_customer,
+                    customer.id,
+                    router_obj.id,
+                    hotspot_payload,
+                    "hotspot_payment",
+                )
+            else:
+                logger.error(
+                    "[CALLBACK] Skipping hotspot provisioning for customer %s - "
+                    "missing mac_address or router (router_id=%s, mac_address=%s)",
+                    customer.id,
+                    customer.router_id,
+                    customer.mac_address,
+                )
             
             return {"ResultCode": 0, "ResultDesc": "Payment processed successfully"}
         
@@ -516,6 +417,16 @@ async def register_hotspot_and_pay_api(
         plan = plan_result.scalar_one_or_none()
         if not plan:
             raise HTTPException(status_code=404, detail="Plan not found")
+        if plan.user_id != user_id:
+            raise HTTPException(status_code=400, detail="Selected plan does not belong to this router")
+        if plan.connection_type != ConnectionType.HOTSPOT:
+            logger.warning(
+                "[HOTSPOT PAY] Rejected non-hotspot plan %s (%s) for router %s",
+                plan.id,
+                plan.connection_type.value if plan.connection_type else None,
+                request.router_id,
+            )
+            raise HTTPException(status_code=400, detail="Selected plan is not a hotspot plan")
         # Validate phone number
         if not request.phone or len(request.phone.strip()) < 10:
             raise HTTPException(status_code=400, detail="Invalid phone number format")

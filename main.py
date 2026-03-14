@@ -71,6 +71,7 @@ from app.services.mikrotik_background import (
     mikrotik_lock,
     _cleanup_customer_from_mikrotik_sync,
 )
+from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 
 scheduler = AsyncIOScheduler()
 
@@ -497,8 +498,19 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
+    scheduler.add_job(
+        retry_pending_hotspot_provisioning_background,
+        trigger=IntervalTrigger(seconds=97),
+        id='retry_pending_hotspot_provisioning',
+        name='Retry stranded hotspot provisioning',
+        replace_existing=True,
+        max_instances=1
+    )
     scheduler.start()
-    logger.info("Background scheduler started - cleanup every 67s, bandwidth every 157s")
+    logger.info(
+        "Background scheduler started - cleanup every 67s, bandwidth every 157s, "
+        "hotspot provisioning retry every 97s"
+    )
 
     async for db in get_db():
         await warm_plan_cache(db)

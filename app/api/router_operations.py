@@ -2641,6 +2641,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
 
         current_ports = current_pppoe.get("ports", [])
         ports_to_restore = [p for p in current_ports if p not in target_ports]
+        ports_to_add = [p for p in target_ports if p not in current_ports]
 
         # Clearing PPPoE entirely: restore actual current PPPoE ports and remove infra.
         if not target_ports:
@@ -2687,7 +2688,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
             }
 
         # Set up new config if ports are selected
-        setup_result = api.setup_pppoe_infrastructure(pppoe_ports=target_ports)
+        setup_result = api.setup_pppoe_infrastructure(pppoe_ports=ports_to_add)
         if setup_result.get("error"):
             setup_result["current_ports"] = current_ports
             return setup_result

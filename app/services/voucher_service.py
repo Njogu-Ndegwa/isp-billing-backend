@@ -14,8 +14,13 @@ from app.db.models import (
     Voucher, VoucherStatus, Plan, Router, Customer, CustomerStatus,
     PaymentMethod, RouterAuthMethod, ConnectionType
 )
+from app.services.hotspot_provisioning import (
+    build_hotspot_payload,
+    log_provisioning_event,
+    provision_hotspot_customer,
+)
 from app.services.reseller_payments import record_customer_payment
-from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.mikrotik_api import normalize_mac_address
 
 logger = logging.getLogger(__name__)
 
@@ -303,34 +308,30 @@ async def _provision_direct_api(
     code: str,
 ) -> Dict[str, Any]:
     """Provision customer via MikroTik direct API (bypass mode)."""
-    from app.api.payment_routes import call_mikrotik_bypass
+    hotspot_payload = build_hotspot_payload(
+        customer,
+        plan,
+        router,
+        comment=f"Voucher {code} redeemed for {customer.name}",
+    )
 
-    duration_unit = plan.duration_unit.value.upper()
-    duration_value = plan.duration_value
-    if duration_unit == "MINUTES":
-        time_limit = f"{duration_value}m"
-    elif duration_unit == "HOURS":
-        time_limit = f"{duration_value}h"
-    elif duration_unit == "DAYS":
-        time_limit = f"{duration_value}d"
-    else:
-        time_limit = f"{duration_value}h"
+    await log_provisioning_event(
+        customer_id=customer.id,
+        router_id=router.id,
+        mac_address=customer.mac_address,
+        action="voucher_direct_api",
+        status="scheduled",
+        details=f"Queued after voucher {code} redemption for router {router.ip_address}",
+    )
 
-    hotspot_payload = {
-        "mac_address": customer.mac_address,
-        "username": customer.mac_address.replace(":", ""),
-        "password": customer.mac_address.replace(":", ""),
-        "time_limit": time_limit,
-        "bandwidth_limit": plan.speed,
-        "comment": f"Voucher {code} redeemed for {customer.name}",
-        "router_ip": router.ip_address,
-        "router_username": router.username,
-        "router_password": router.password,
-        "router_port": router.port,
-    }
-
-    # Fire and forget provisioning (same pattern as payment callback)
-    asyncio.create_task(call_mikrotik_bypass(hotspot_payload))
+    asyncio.create_task(
+        provision_hotspot_customer(
+            customer.id,
+            router.id,
+            hotspot_payload,
+            "voucher_direct_api",
+        )
+    )
 
     return {
         "success": True,
