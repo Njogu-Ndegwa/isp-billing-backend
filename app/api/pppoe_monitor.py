@@ -44,6 +44,8 @@ def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list) -> dict:
         pppoe_servers = api.get_pppoe_server_status()
         servers = pppoe_servers.get("data", []) if pppoe_servers.get("success") else []
         enabled_servers = [s for s in servers if not s["disabled"]]
+        access_state = api.get_pppoe_access_state()
+        attachment_map = access_state.get("attachment_map", {}) if access_state.get("success") else {}
         checks.append({
             "check": "pppoe_server",
             "description": "PPPoE server service running",
@@ -58,9 +60,15 @@ def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list) -> dict:
         pppoe_bridge = bridges.get("bridge-pppoe")
         checks.append({
             "check": "pppoe_bridge",
-            "description": "bridge-pppoe interface exists and running",
-            "passed": pppoe_bridge is not None and pppoe_bridge.get("running", False),
-            "detail": pppoe_bridge if pppoe_bridge else "bridge-pppoe not found",
+            "description": "PPPoE shared infrastructure is available",
+            "passed": (
+                (pppoe_bridge is not None and pppoe_bridge.get("running", False))
+                or bool(enabled_servers)
+            ),
+            "detail": pppoe_bridge if pppoe_bridge else {
+                "mode": access_state.get("mode", "unknown"),
+                "message": "Direct-interface PPPoE mode in use",
+            },
         })
 
         ifaces_data = api.get_all_interfaces_detail()
@@ -70,6 +78,8 @@ def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list) -> dict:
         port_checks = []
         any_port_up = False
         for port_name in (db_pppoe_ports or []):
+            attachment = attachment_map.get(port_name, {})
+            actual_mode = attachment.get("mode", "none")
             actual_bridge = port_bridge_map.get(port_name)
             iface = ifaces.get(port_name, {})
             link_up = iface.get("running", False)
@@ -77,17 +87,20 @@ def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list) -> dict:
                 any_port_up = True
             port_checks.append({
                 "port": port_name,
-                "expected_bridge": "bridge-pppoe",
+                "expected_mode": "direct",
+                "actual_mode": actual_mode,
                 "actual_bridge": actual_bridge or "(none)",
-                "in_correct_bridge": actual_bridge == "bridge-pppoe",
+                "server_interface": attachment.get("server_interface", ""),
+                "attached": port_name in access_state.get("ports", []),
+                "needs_migration": actual_mode == "legacy_bridge",
                 "link_up": link_up,
                 "rx_error": iface.get("rx_error", 0),
                 "tx_error": iface.get("tx_error", 0),
             })
         checks.append({
             "check": "pppoe_ports",
-            "description": "PPPoE ports in correct bridge with link up",
-            "passed": all(p["in_correct_bridge"] and p["link_up"] for p in port_checks) if port_checks else False,
+            "description": "PPPoE ports attached correctly with link up",
+            "passed": all(p["attached"] and p["link_up"] for p in port_checks) if port_checks else False,
             "any_port_up": any_port_up,
             "detail": port_checks if port_checks else "No PPPoE ports configured in DB",
         })
@@ -174,6 +187,8 @@ def _pppoe_diagnose_sync(router_info: dict, username: str, db_pppoe_ports: list)
         bridges = bridge_data.get("bridges", {}) if bridge_data.get("success") else {}
         bridge_ports_list = bridge_data.get("ports", []) if bridge_data.get("success") else []
         port_bridge_map = {p["interface"]: p["bridge"] for p in bridge_ports_list}
+        access_state = api.get_pppoe_access_state()
+        attachment_map = access_state.get("attachment_map", {}) if access_state.get("success") else {}
 
         ifaces_data = api.get_all_interfaces_detail()
         ifaces = {i["name"]: i for i in ifaces_data.get("data", [])} if ifaces_data.get("success") else {}
@@ -181,6 +196,8 @@ def _pppoe_diagnose_sync(router_info: dict, username: str, db_pppoe_ports: list)
         any_link_up = False
         port_details = []
         for port_name in (db_pppoe_ports or []):
+            attachment = attachment_map.get(port_name, {})
+            actual_mode = attachment.get("mode", "none")
             actual_bridge = port_bridge_map.get(port_name)
             iface = ifaces.get(port_name, {})
             link_up = iface.get("running", False)
@@ -188,17 +205,33 @@ def _pppoe_diagnose_sync(router_info: dict, username: str, db_pppoe_ports: list)
                 any_link_up = True
             port_details.append({
                 "port": port_name,
+                "attachment_mode": actual_mode,
+                "server_interface": attachment.get("server_interface", ""),
                 "bridge": actual_bridge or "(none)",
                 "link_up": link_up,
                 "rx_error": iface.get("rx_error", 0),
                 "tx_error": iface.get("tx_error", 0),
             })
-            if actual_bridge != "bridge-pppoe":
+            if port_name not in access_state.get("ports", []):
                 issues.append({
                     "severity": "critical",
-                    "layer": "bridge",
-                    "message": f"Port {port_name} is in '{actual_bridge or 'no bridge'}' instead of 'bridge-pppoe'",
+                    "layer": "access",
+                    "message": f"Port {port_name} is not attached to PPPoE access",
                     "recommendation": "Reconfigure PPPoE ports via PUT /api/routers/{id}/pppoe-ports",
+                })
+            elif actual_mode == "legacy_bridge":
+                issues.append({
+                    "severity": "info",
+                    "layer": "access",
+                    "message": f"Port {port_name} is still using legacy bridge-based PPPoE mode",
+                    "recommendation": "Re-save the PPPoE port configuration to migrate this router to direct-interface mode",
+                })
+            elif actual_bridge:
+                issues.append({
+                    "severity": "critical",
+                    "layer": "access",
+                    "message": f"Port {port_name} is directly attached to PPPoE but still belongs to bridge '{actual_bridge}'",
+                    "recommendation": "Reconfigure PPPoE ports so the port is unbridged in direct PPPoE mode",
                 })
             if iface.get("rx_error", 0) > 0 or iface.get("tx_error", 0) > 0:
                 issues.append({
@@ -218,25 +251,7 @@ def _pppoe_diagnose_sync(router_info: dict, username: str, db_pppoe_ports: list)
                 "recommendation": "Check physical cable connections to PPPoE ports",
             })
 
-        # --- Layer 2: Bridge ---
-        pppoe_bridge = bridges.get("bridge-pppoe")
-        if not pppoe_bridge:
-            issues.append({
-                "severity": "critical",
-                "layer": "bridge",
-                "message": "bridge-pppoe does not exist",
-                "recommendation": "Set up PPPoE infrastructure via PUT /api/routers/{id}/pppoe-ports",
-            })
-        elif not pppoe_bridge.get("running", False):
-            issues.append({
-                "severity": "critical",
-                "layer": "bridge",
-                "message": "bridge-pppoe exists but is not running",
-                "recommendation": "Enable bridge-pppoe on the router",
-            })
-        info["bridge_pppoe"] = pppoe_bridge
-
-        # --- Layer 3: PPPoE service ---
+        # --- Layer 2: PPPoE service ---
         pppoe_servers = api.get_pppoe_server_status()
         servers = pppoe_servers.get("data", []) if pppoe_servers.get("success") else []
         enabled_servers = [s for s in servers if not s["disabled"]]
@@ -245,9 +260,28 @@ def _pppoe_diagnose_sync(router_info: dict, username: str, db_pppoe_ports: list)
                 "severity": "critical",
                 "layer": "service",
                 "message": "PPPoE server is not running or disabled",
-                "recommendation": "Enable PPPoE server on bridge-pppoe",
+                "recommendation": "Enable PPPoE server on the selected PPPoE interface(s)",
             })
         info["pppoe_servers"] = servers
+        info["pppoe_access"] = access_state if access_state.get("success") else {"error": access_state.get("error")}
+
+        # --- Layer 3: Shared bridge infrastructure ---
+        pppoe_bridge = bridges.get("bridge-pppoe")
+        if not pppoe_bridge and not enabled_servers:
+            issues.append({
+                "severity": "critical",
+                "layer": "bridge",
+                "message": "bridge-pppoe does not exist and no PPPoE server is enabled",
+                "recommendation": "Set up PPPoE infrastructure via PUT /api/routers/{id}/pppoe-ports",
+            })
+        elif pppoe_bridge and not pppoe_bridge.get("running", False):
+            issues.append({
+                "severity": "warning",
+                "layer": "bridge",
+                "message": "bridge-pppoe exists but is not running",
+                "recommendation": "Check shared PPPoE infrastructure on the router",
+            })
+        info["bridge_pppoe"] = pppoe_bridge
 
         pool_name = "pppoe-pool"
         profiles = api.get_ppp_profiles()

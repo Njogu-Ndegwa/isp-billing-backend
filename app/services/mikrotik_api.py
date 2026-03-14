@@ -2121,9 +2121,254 @@ class MikroTikAPI:
             logger.error(last_result["error"])
         return last_result
 
+    def get_pppoe_access_state(self, legacy_bridge_name: str = "bridge-pppoe") -> Dict[str, Any]:
+        """
+        Discover how PPPoE access is attached on the router.
+
+        Supported layouts:
+        - direct: PPPoE server bound directly to physical interfaces
+        - legacy_bridge: PPPoE server bound to a bridge such as bridge-pppoe
+        - mixed: a combination of both
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            servers_result = self.get_pppoe_server_status()
+            if servers_result.get("error"):
+                return servers_result
+
+            bridge_data = self.get_bridge_ports_status()
+            bridges = bridge_data.get("bridges", {}) if bridge_data.get("success") else {}
+            bridge_ports = bridge_data.get("ports", []) if bridge_data.get("success") else []
+            bridge_names = set(bridges.keys())
+
+            bridge_ports_by_name: Dict[str, List[str]] = {}
+            for port in bridge_ports:
+                bridge = port.get("bridge", "")
+                interface = port.get("interface", "")
+                if bridge and interface:
+                    bridge_ports_by_name.setdefault(bridge, []).append(interface)
+
+            enabled_servers = [
+                server for server in servers_result.get("data", [])
+                if not server.get("disabled", False)
+            ]
+
+            direct_ports = set()
+            bridge_ports_set = set()
+            direct_servers = []
+            bridge_servers = []
+            attachment_map: Dict[str, Dict[str, Any]] = {}
+
+            for server in enabled_servers:
+                interface = server.get("interface", "")
+                if not interface:
+                    continue
+
+                is_bridge_server = (
+                    interface in bridge_names
+                    or interface == legacy_bridge_name
+                    or interface.startswith("bridge")
+                )
+                if is_bridge_server:
+                    member_ports = bridge_ports_by_name.get(interface)
+                    if member_ports is None:
+                        member_result = self.get_ports_in_bridge(interface)
+                        member_ports = [] if member_result.get("error") else member_result.get("ports", [])
+
+                    bridge_servers.append({
+                        **server,
+                        "ports": sorted(member_ports),
+                    })
+                    for port in member_ports:
+                        bridge_ports_set.add(port)
+                        attachment_map[port] = {
+                            "mode": "legacy_bridge",
+                            "server_interface": interface,
+                            "bridge": interface,
+                        }
+                    continue
+
+                direct_ports.add(interface)
+                direct_servers.append(server)
+                attachment_map[interface] = {
+                    "mode": "direct",
+                    "server_interface": interface,
+                    "bridge": "",
+                }
+
+            if direct_ports and bridge_ports_set:
+                mode = "mixed"
+            elif direct_ports:
+                mode = "direct"
+            elif bridge_ports_set:
+                mode = "legacy_bridge"
+            else:
+                mode = "none"
+
+            return {
+                "success": True,
+                "mode": mode,
+                "ports": sorted(direct_ports | bridge_ports_set),
+                "direct_ports": sorted(direct_ports),
+                "bridge_ports": sorted(bridge_ports_set),
+                "direct_servers": direct_servers,
+                "bridge_servers": bridge_servers,
+                "attachment_map": attachment_map,
+                "enabled_servers": enabled_servers,
+            }
+        except Exception as e:
+            logger.error(f"Error getting PPPoE access state: {e}")
+            return {"error": str(e)}
+
+    def ensure_pppoe_server_on_interface(
+        self,
+        interface: str,
+        profile_name: str = "default-pppoe",
+        service_name_prefix: str = "pppoe-server",
+    ) -> Dict[str, Any]:
+        """Ensure a PPPoE server exists and is enabled on a specific interface."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            desired_service_name = f"{service_name_prefix}-{interface}".replace("/", "-")
+            servers = self.send_command("/interface/pppoe-server/server/print")
+            if servers.get("error"):
+                return {"error": f"Could not read PPPoE servers: {servers['error']}"}
+
+            matches = [
+                server for server in servers.get("data", [])
+                if server.get("interface") == interface
+            ]
+
+            if matches:
+                primary = matches[0]
+                server_id = primary.get(".id")
+                if not server_id:
+                    return {"error": f"PPPoE server on {interface} has no identifier"}
+
+                result = self.send_command("/interface/pppoe-server/server/set", {
+                    "numbers": server_id,
+                    "service-name": desired_service_name,
+                    "interface": interface,
+                    "default-profile": profile_name,
+                    "disabled": "no",
+                })
+                if result.get("error"):
+                    return {"error": f"Failed to update PPPoE server on {interface}: {result['error']}"}
+
+                for duplicate in matches[1:]:
+                    duplicate_id = duplicate.get(".id")
+                    if duplicate_id:
+                        duplicate_remove = self.send_command(
+                            "/interface/pppoe-server/server/remove",
+                            {"numbers": duplicate_id},
+                        )
+                        if duplicate_remove.get("error"):
+                            logger.warning(
+                                f"Failed to remove duplicate PPPoE server on {interface}: "
+                                f"{duplicate_remove['error']}"
+                            )
+
+                return {"success": True, "action": "updated", "interface": interface}
+
+            result = self.send_command("/interface/pppoe-server/server/add", {
+                "service-name": desired_service_name,
+                "interface": interface,
+                "default-profile": profile_name,
+                "disabled": "no",
+            })
+            if result.get("error"):
+                return {"error": f"Failed to create PPPoE server on {interface}: {result['error']}"}
+
+            return {"success": True, "action": "created", "interface": interface}
+        except Exception as e:
+            logger.error(f"Error ensuring PPPoE server on {interface}: {e}")
+            return {"error": str(e)}
+
+    def remove_pppoe_servers(self, interfaces: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Remove PPPoE server entries, optionally filtering by interface."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            interface_filter = {iface for iface in (interfaces or []) if iface}
+            servers = self.send_command("/interface/pppoe-server/server/print")
+            if servers.get("error"):
+                return {"error": f"Could not read PPPoE servers: {servers['error']}"}
+
+            removed = []
+            for server in servers.get("data", []):
+                interface = server.get("interface", "")
+                if interface_filter and interface not in interface_filter:
+                    continue
+
+                server_id = server.get(".id")
+                if not server_id:
+                    continue
+
+                result = self.send_command("/interface/pppoe-server/server/remove", {"numbers": server_id})
+                if result.get("error"):
+                    return {"error": f"Failed to remove PPPoE server on {interface}: {result['error']}"}
+
+                removed.append({
+                    "interface": interface,
+                    "service_name": server.get("service-name", ""),
+                })
+
+            return {"success": True, "removed": removed, "count": len(removed)}
+        except Exception as e:
+            logger.error(f"Error removing PPPoE servers: {e}")
+            return {"error": str(e)}
+
+    def restore_ports_from_pppoe(
+        self,
+        ports: List[str],
+        hotspot_bridge: str = "bridge",
+    ) -> Dict[str, Any]:
+        """Remove PPPoE access from ports and return them to the hotspot bridge."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            unique_ports = list(dict.fromkeys(ports or []))
+            if not unique_ports:
+                return {"success": True}
+
+            remove_result = self.remove_pppoe_servers(unique_ports)
+            if remove_result.get("error"):
+                return remove_result
+
+            errors = []
+            for port in unique_ports:
+                restore = self.add_bridge_port(port, hotspot_bridge)
+                if restore.get("error"):
+                    errors.append(f"{port}: {restore['error']}")
+                time.sleep(0.2)
+
+            if errors:
+                return {"error": "Failed to restore PPPoE ports: " + "; ".join(errors)}
+
+            return {"success": True, "ports": unique_ports}
+        except Exception as e:
+            logger.error(f"Error restoring PPPoE ports: {e}")
+            return {"error": str(e)}
+
+    def cleanup_legacy_pppoe_server(self, bridge_name: str = "bridge-pppoe") -> Dict[str, Any]:
+        """Remove the old bridge-bound PPPoE server while keeping shared infra intact."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            cleanup = self.remove_pppoe_servers([bridge_name])
+            if cleanup.get("error"):
+                return cleanup
+            return {"success": True, "removed": cleanup.get("removed", [])}
+        except Exception as e:
+            logger.error(f"Error cleaning up legacy PPPoE server on {bridge_name}: {e}")
+            return {"error": str(e)}
+
     def setup_pppoe_infrastructure(
         self,
         pppoe_ports: List[str],
+        hotspot_bridge: str = "bridge",
         bridge_name: str = "bridge-pppoe",
         bridge_ip: str = "192.168.89.1/24",
         pool_name: str = "pppoe-pool",
@@ -2132,19 +2377,18 @@ class MikroTikAPI:
     ) -> Dict[str, Any]:
         """
         Set up full PPPoE infrastructure on the router:
-        1. Create bridge-pppoe
-        2. Move selected ports from hotspot bridge to bridge-pppoe
-        3. Add IP address on bridge-pppoe
-        4. Create IP pool for PPPoE clients
-        5. Create default PPPoE profile with pool
-        6. Create PPPoE server on bridge-pppoe
-        7. Add NAT masquerade for PPPoE traffic
-        8. Bypass FastTrack for PPPoE subnet (so PPP rate-limits are enforced)
+        1. Ensure shared PPPoE infrastructure exists
+        2. Remove selected ports from the hotspot/legacy bridge
+        3. Bind PPPoE directly to each selected interface
+        4. Remove any legacy bridge-bound PPPoE server
+        5. Bypass FastTrack for PPPoE subnet (so PPP rate-limits are enforced)
         """
         if not self.connected:
             return {"error": "Not connected"}
         errors = []
         try:
+            target_ports = list(dict.fromkeys(pppoe_ports or []))
+
             # 1. Create bridge-pppoe (ignore error if already exists)
             result = self.send_command("/interface/bridge/add", {"name": bridge_name})
             if result.get("error") and "already" not in result.get("error", "").lower():
@@ -2152,33 +2396,9 @@ class MikroTikAPI:
             logger.info(f"PPPoE infrastructure: bridge '{bridge_name}' ready")
             time.sleep(0.2)
 
-            # 2. Move selected ports to bridge-pppoe
-            port_move_errors = []
-            for port in pppoe_ports:
-                r = self.add_bridge_port(port, bridge_name)
-                if r.get("error"):
-                    port_move_errors.append(f"Port {port}: {r['error']}")
-                time.sleep(0.2)
-
-            # 2b. Verify ports actually moved -- hard error if not
-            time.sleep(0.3)
-            verify = self.verify_port_bridges(
-                {p: bridge_name for p in pppoe_ports},
-                retries=8,
-                delay=0.5,
-            )
-            if verify.get("error"):
-                all_errors = port_move_errors + [verify["error"]]
-                return {
-                    "error": f"Port conversion failed on the router: {verify['error']}",
-                    "failed_ports": verify.get("failed_ports", []),
-                    "partial_errors": all_errors,
-                }
-
-            if port_move_errors:
-                errors.extend(port_move_errors)
-
-            # 3. Add IP address on bridge-pppoe (ignore if already exists)
+            # 2. Add IP address on bridge-pppoe (ignore if already exists).
+            # The bridge remains as shared PPPoE infra, but access ports no longer
+            # forward subscriber traffic through it.
             result = self.send_command("/ip/address/add", {
                 "address": bridge_ip,
                 "interface": bridge_name,
@@ -2206,18 +2426,24 @@ class MikroTikAPI:
             )
             time.sleep(0.2)
 
-            # 6. Create PPPoE server on bridge-pppoe (ignore if already exists)
-            result = self.send_command("/interface/pppoe-server/server/add", {
-                "service-name": service_name,
-                "interface": bridge_name,
-                "default-profile": "default-pppoe",
-                "disabled": "no",
-            })
-            if result.get("error") and "already" not in result.get("error", "").lower():
-                errors.append(f"PPPoE server: {result['error']}")
-            time.sleep(0.2)
+            # 5. Remove selected ports from any bridge and bind PPPoE directly.
+            port_setup_errors = []
+            for port in target_ports:
+                remove_result = self.remove_bridge_port(port)
+                if remove_result.get("error"):
+                    port_setup_errors.append(f"Port {port}: {remove_result['error']}")
+                    continue
 
-            # 7. Add NAT masquerade for PPPoE subnet (ignore if already exists)
+                bind_result = self.ensure_pppoe_server_on_interface(
+                    port,
+                    profile_name="default-pppoe",
+                    service_name_prefix=service_name,
+                )
+                if bind_result.get("error"):
+                    port_setup_errors.append(f"Port {port}: {bind_result['error']}")
+                time.sleep(0.2)
+
+            # 6. Add NAT masquerade for PPPoE subnet (ignore if already exists)
             pppoe_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
             result = self.send_command("/ip/firewall/nat/add", {
                 "chain": "srcnat",
@@ -2230,7 +2456,40 @@ class MikroTikAPI:
                 errors.append(f"NAT: {result['error']}")
             time.sleep(0.2)
 
-            # 8. Bypass FastTrack for the active PPPoE pool so PPP profile
+            # 7. Remove the old bridge-bound server if this router is being migrated.
+            cleanup = self.cleanup_legacy_pppoe_server(bridge_name=bridge_name)
+            if cleanup.get("error"):
+                errors.append(f"Legacy PPPoE server cleanup: {cleanup['error']}")
+
+            # 8. Verify the selected ports are directly attached to PPPoE.
+            time.sleep(0.3)
+            access_state = self.get_pppoe_access_state(legacy_bridge_name=bridge_name)
+            if access_state.get("error"):
+                return {
+                    "error": f"Port conversion failed on the router: {access_state['error']}",
+                    "partial_errors": port_setup_errors,
+                }
+
+            actual_direct_ports = set(access_state.get("direct_ports", []))
+            failed_ports = []
+            for port in target_ports:
+                if port not in actual_direct_ports:
+                    attachment = access_state.get("attachment_map", {}).get(port, {})
+                    failed_ports.append({
+                        "port": port,
+                        "expected_mode": "direct",
+                        "actual_mode": attachment.get("mode", "none"),
+                        "server_interface": attachment.get("server_interface", ""),
+                    })
+
+            if port_setup_errors or failed_ports:
+                return {
+                    "error": "Port conversion failed on the router: one or more PPPoE ports are not directly bound",
+                    "failed_ports": failed_ports,
+                    "partial_errors": port_setup_errors,
+                }
+
+            # 9. Bypass FastTrack for the active PPPoE pool so PPP profile
             #    rate-limits are enforced even when the router already had
             #    custom PPPoE infrastructure.
             bypass_result = self.ensure_pppoe_fasttrack_bypass(
@@ -2267,7 +2526,7 @@ class MikroTikAPI:
     ) -> Dict[str, Any]:
         """
         Tear down PPPoE infrastructure and move ports back to hotspot bridge:
-        1. Remove PPPoE server
+        1. Remove direct PPPoE servers and any legacy bridge-bound PPPoE server
         2. Move ports back to hotspot bridge
         3. Remove bridge-pppoe IP address
         4. Remove bridge-pppoe
@@ -2278,15 +2537,11 @@ class MikroTikAPI:
             return {"error": "Not connected"}
         errors = []
         try:
-            # 1. Remove PPPoE server
-            servers = self.send_command("/interface/pppoe-server/server/print")
-            if servers.get("success") and servers.get("data"):
-                for srv in servers["data"]:
-                    if srv.get("service-name") == service_name or srv.get("interface") == bridge_name:
-                        sid = srv.get(".id")
-                        if sid:
-                            self.send_command("/interface/pppoe-server/server/remove", {"numbers": sid})
-                            logger.info(f"Removed PPPoE server '{service_name}'")
+            # 1. Remove direct PPPoE servers on the managed ports and any legacy bridge server.
+            remove_interfaces = list(dict.fromkeys((ports_to_restore or []) + [bridge_name]))
+            remove_result = self.remove_pppoe_servers(remove_interfaces)
+            if remove_result.get("error"):
+                errors.append(remove_result["error"])
             time.sleep(0.2)
 
             # 2. Move ports back to hotspot bridge
@@ -2568,6 +2823,7 @@ class MikroTikAPI:
             servers = []
             for s in result.get("data", []):
                 servers.append({
+                    "id": s.get(".id", ""),
                     "service_name": s.get("service-name", ""),
                     "interface": s.get("interface", ""),
                     "disabled": s.get("disabled") == "true",
