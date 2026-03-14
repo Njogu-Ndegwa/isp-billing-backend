@@ -1599,11 +1599,72 @@ class MikroTikAPI:
             logger.error(f"Error removing bridge port {interface}: {e}")
             return {"error": str(e)}
 
+    def _find_bridge_port_filtered(self, interface: str) -> Dict[str, Any]:
+        """Find a bridge port entry using a filtered query.
+        Catches switch-chip-managed ports that unfiltered print may miss."""
+        result = self.send_command_optimized(
+            "/interface/bridge/port/print",
+            proplist=[".id", "interface", "bridge", "hw", "hw-offload"],
+            query=f"?interface={interface}",
+        )
+        if result.get("error"):
+            return {"error": result["error"]}
+        entries = result.get("data", [])
+        if entries:
+            e = entries[0]
+            return {
+                "found": True,
+                "id": e.get(".id"),
+                "bridge": e.get("bridge", ""),
+                "hw": e.get("hw", ""),
+                "hw-offload": e.get("hw-offload", ""),
+            }
+        return {"found": False}
+
+    def _force_remove_bridge_port(self, interface: str) -> Dict[str, Any]:
+        """Remove a bridge port that may be invisible to unfiltered print.
+        Strategy:
+          1. Filtered query to locate the entry by .id, then remove it.
+          2. If filtered query finds nothing, ask the router itself to
+             find-and-remove via [find interface=<iface>]."""
+        entry = self._find_bridge_port_filtered(interface)
+        if entry.get("error"):
+            return {"error": entry["error"]}
+
+        if entry.get("found") and entry.get("id"):
+            port_id = entry["id"]
+            original_bridge = entry["bridge"]
+            rm = self.send_command("/interface/bridge/port/remove", {"numbers": port_id})
+            if rm.get("error"):
+                logger.error(f"Force-remove bridge port {interface} ({port_id}): {rm['error']}")
+                return {"error": f"Failed to force-remove {interface}: {rm['error']}"}
+            logger.info(f"Force-removed {interface} from bridge '{original_bridge}' (id {port_id})")
+            return {"success": True, "action": "removed", "original_bridge": original_bridge}
+
+        logger.warning(
+            f"Filtered query did not find {interface} either. "
+            f"Trying router-side find-and-remove."
+        )
+        rm = self.send_command(
+            "/interface/bridge/port/remove",
+            {"numbers": f"[find interface={interface}]"},
+        )
+        if rm.get("error"):
+            if "no such item" in rm["error"].lower():
+                logger.info(f"Router confirms {interface} has no bridge port entry to remove")
+                return {"success": True, "action": "not_found", "original_bridge": None}
+            logger.error(f"Router-side find-and-remove failed for {interface}: {rm['error']}")
+            return {"error": f"Failed to force-remove {interface}: {rm['error']}"}
+        logger.info(f"Router-side find-and-remove succeeded for {interface}")
+        return {"success": True, "action": "removed", "original_bridge": None}
+
     def add_bridge_port(self, interface: str, bridge: str) -> Dict[str, Any]:
         """Move an interface to a specific bridge.
         Uses in-place 'set' when the port already has a bridge entry (avoids
         remove+add which can silently fail on hardware-offloaded switch chips).
-        Falls back to 'add' when no entry exists."""
+        Falls back to 'add' when no entry exists.
+        Handles switch-chip-managed ports that may be invisible to unfiltered
+        bridge/port/print but still block /add with 'already added'."""
         if not self.connected:
             return {"error": "Not connected"}
         try:
@@ -1644,8 +1705,30 @@ class MikroTikAPI:
                     "bridge": bridge,
                 })
                 if result.get("error"):
-                    logger.error(f"add bridge port failed for {interface}: {result['error']}")
-                    return {"error": f"Failed to add {interface} to bridge {bridge}: {result['error']}"}
+                    err_lower = result["error"].lower()
+                    if "already" in err_lower and "bridge port" in err_lower:
+                        logger.warning(
+                            f"{interface} invisible to unfiltered print but router "
+                            f"says 'already added'. Trying filtered find + remove + re-add."
+                        )
+                        fr = self._force_remove_bridge_port(interface)
+                        if fr.get("error"):
+                            logger.error(f"Force-remove fallback failed for {interface}: {fr['error']}")
+                            return {"error": f"Failed to add {interface} to bridge {bridge}: {result['error']}"}
+                        time.sleep(0.3)
+                        result2 = self.send_command("/interface/bridge/port/add", {
+                            "interface": interface,
+                            "bridge": bridge,
+                        })
+                        if result2.get("error"):
+                            logger.error(f"Re-add after force-remove failed for {interface}: {result2['error']}")
+                            if fr.get("original_bridge"):
+                                self._restore_bridge_port(interface, fr["original_bridge"])
+                            return {"error": f"Failed to add {interface} to bridge {bridge}: {result2['error']}"}
+                        result = result2
+                    else:
+                        logger.error(f"add bridge port failed for {interface}: {result['error']}")
+                        return {"error": f"Failed to add {interface} to bridge {bridge}: {result['error']}"}
 
             # Verify the port actually landed in the target bridge
             time.sleep(0.5)
@@ -1728,7 +1811,19 @@ class MikroTikAPI:
             for iface, want_bridge in expected.items():
                 got_bridge = actual_map.get(iface)
                 if got_bridge != want_bridge:
+                    # Fallback: try filtered query for switch-chip-managed ports
+                    filtered = self._find_bridge_port_filtered(iface)
+                    if filtered.get("found") and filtered.get("bridge") == want_bridge:
+                        logger.info(
+                            f"Verification: {iface} not in unfiltered print but "
+                            f"filtered query confirms it is in '{want_bridge}'"
+                        )
+                        continue
+
                     actual_label = f"'{got_bridge}'" if got_bridge else "(not in any bridge)"
+                    if filtered.get("found"):
+                        got_bridge = filtered["bridge"]
+                        actual_label = f"'{got_bridge}' (found via filtered query)"
                     failed.append({
                         "port": iface,
                         "expected_bridge": want_bridge,
