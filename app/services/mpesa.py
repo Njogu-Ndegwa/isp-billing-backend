@@ -244,13 +244,15 @@ async def initiate_stk_push(
     )
 
 
-async def query_stk_push_status(checkout_request_id: str) -> dict:
+async def query_stk_push_status(checkout_request_id: str, access_token: str | None = None) -> dict:
     """
     Query Safaricom's STK Push Query API for the final status of a transaction.
     Returns a dict with keys: result_code (int), result_desc (str).
     Raises on network/auth errors so the caller can retry later.
+    Pass *access_token* to reuse a token across a batch of queries.
     """
-    access_token = await get_access_token()
+    if access_token is None:
+        access_token = await get_access_token()
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     shortcode = settings.MPESA_SHORTCODE
     password = base64.b64encode(

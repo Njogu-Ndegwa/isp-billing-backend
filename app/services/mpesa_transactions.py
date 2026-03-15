@@ -8,6 +8,7 @@ from app.db.models import (
     Customer, Plan, CustomerStatus, ConnectionType, PaymentMethod,
 )
 from datetime import datetime, timedelta
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -215,7 +216,7 @@ async def reconcile_pending_mpesa_transactions():
 
     try:
         from app.db.database import async_session
-        from app.services.mpesa import query_stk_push_status
+        from app.services.mpesa import query_stk_push_status, get_access_token
         from app.services.reseller_payments import record_customer_payment
         from app.services.hotspot_provisioning import (
             build_hotspot_payload,
@@ -226,10 +227,9 @@ async def reconcile_pending_mpesa_transactions():
 
         now = datetime.utcnow()
         query_min_age = timedelta(minutes=2)
-        expire_threshold = timedelta(hours=48)
+        expire_threshold = timedelta(hours=2)
 
         async with async_session() as db:
-            # Fetch all pending transactions (not FAILED- prefixed stub records)
             stmt = (
                 select(MpesaTransaction)
                 .where(
@@ -238,7 +238,7 @@ async def reconcile_pending_mpesa_transactions():
                     ~MpesaTransaction.checkout_request_id.startswith("FAILED-"),
                 )
                 .order_by(MpesaTransaction.created_at.asc())
-                .limit(30)
+                .limit(50)
             )
             result = await db.execute(stmt)
             pending_txns: List[MpesaTransaction] = list(result.scalars().all())
@@ -246,71 +246,102 @@ async def reconcile_pending_mpesa_transactions():
         if not pending_txns:
             return
 
-        logger.info("[RECONCILE] Checking %d pending M-Pesa transactions", len(pending_txns))
-
+        # Phase 1: expire everything older than the threshold (no API calls)
+        to_query: List[MpesaTransaction] = []
+        expired_count = 0
         for txn in pending_txns:
-            try:
-                age = now - txn.created_at
-
-                # --- Auto-expire very old transactions ---
-                if age > expire_threshold:
+            age = now - txn.created_at
+            if age > expire_threshold:
+                try:
                     async with async_session() as db:
                         await mark_transaction_as_expired(db, txn.checkout_request_id)
+                    expired_count += 1
                     logger.info(
                         "[RECONCILE] Expired stale transaction %s (age: %s)",
                         txn.checkout_request_id, age,
                     )
-                    continue
+                except Exception as exp_err:
+                    logger.warning("[RECONCILE] Failed to expire %s: %s", txn.checkout_request_id, exp_err)
+            else:
+                to_query.append(txn)
 
-                # --- Query Safaricom for the real status ---
-                try:
-                    stk_result = await query_stk_push_status(txn.checkout_request_id)
-                except Exception as query_err:
-                    logger.warning(
-                        "[RECONCILE] Could not query Safaricom for %s: %s",
-                        txn.checkout_request_id, query_err,
-                    )
-                    continue
+        if expired_count:
+            logger.info("[RECONCILE] Expired %d stale transactions", expired_count)
 
-                result_code = stk_result["result_code"]
-                result_desc = stk_result["result_desc"]
+        if not to_query:
+            return
 
-                if result_code == 0:
-                    # --- Payment succeeded: update txn, record payment, provision ---
-                    await _handle_successful_reconciliation(
-                        txn, result_desc,
-                        record_customer_payment,
-                        build_hotspot_payload,
-                        log_provisioning_event,
-                        provision_hotspot_customer,
-                        call_pppoe_provision,
-                        build_pppoe_payload,
-                    )
-                elif result_code == -1:
-                    logger.debug(
-                        "[RECONCILE] %s still processing at Safaricom, will retry later",
-                        txn.checkout_request_id,
-                    )
-                else:
-                    # Definitive failure from Safaricom
-                    async with async_session() as db:
-                        await update_mpesa_transaction_status(
-                            db,
-                            txn.checkout_request_id,
-                            MpesaTransactionStatus.failed,
-                            result_code=str(result_code),
-                            result_desc=result_desc,
-                            failure_source=FailureSource.CLIENT,
-                        )
-                    logger.info(
-                        "[RECONCILE] Marked %s as failed (code=%s, desc=%s)",
-                        txn.checkout_request_id, result_code, result_desc,
-                    )
-            except Exception as per_txn_err:
-                logger.exception(
-                    "[RECONCILE] Error processing transaction %s: %s",
-                    txn.checkout_request_id, per_txn_err,
+        # Phase 2: query Safaricom for fresh transactions (newest first)
+        to_query.sort(key=lambda t: t.created_at, reverse=True)
+        to_query = to_query[:15]
+
+        logger.info("[RECONCILE] Querying Safaricom for %d pending transactions", len(to_query))
+
+        # Fetch one OAuth token for the entire batch
+        try:
+            access_token = await get_access_token()
+        except Exception as token_err:
+            logger.warning("[RECONCILE] Cannot get Safaricom token, aborting batch: %s", token_err)
+            return
+
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+
+        for txn in to_query:
+            if consecutive_failures >= max_consecutive_failures:
+                logger.warning(
+                    "[RECONCILE] %d consecutive Safaricom failures, aborting remaining queries",
+                    consecutive_failures,
                 )
+                break
+
+            try:
+                stk_result = await query_stk_push_status(txn.checkout_request_id, access_token=access_token)
+                consecutive_failures = 0
+            except Exception as query_err:
+                consecutive_failures += 1
+                logger.warning(
+                    "[RECONCILE] Could not query Safaricom for %s (%d/%d failures): %s",
+                    txn.checkout_request_id, consecutive_failures, max_consecutive_failures, query_err,
+                )
+                await asyncio.sleep(3)
+                continue
+
+            result_code = stk_result["result_code"]
+            result_desc = stk_result["result_desc"]
+
+            if result_code == 0:
+                await _handle_successful_reconciliation(
+                    txn, result_desc,
+                    record_customer_payment,
+                    build_hotspot_payload,
+                    log_provisioning_event,
+                    provision_hotspot_customer,
+                    call_pppoe_provision,
+                    build_pppoe_payload,
+                )
+            elif result_code == -1:
+                logger.debug(
+                    "[RECONCILE] %s still processing at Safaricom, will retry later",
+                    txn.checkout_request_id,
+                )
+            else:
+                async with async_session() as db:
+                    await update_mpesa_transaction_status(
+                        db,
+                        txn.checkout_request_id,
+                        MpesaTransactionStatus.failed,
+                        result_code=str(result_code),
+                        result_desc=result_desc,
+                        failure_source=FailureSource.CLIENT,
+                    )
+                logger.info(
+                    "[RECONCILE] Marked %s as failed (code=%s, desc=%s)",
+                    txn.checkout_request_id, result_code, result_desc,
+                )
+
+            await asyncio.sleep(2)
+
     except Exception as outer_err:
         logger.exception("[RECONCILE] Reconciliation job failed: %s", outer_err)
     finally:
