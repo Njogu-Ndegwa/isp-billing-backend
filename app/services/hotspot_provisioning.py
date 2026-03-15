@@ -22,6 +22,7 @@ HOTSPOT_RETRY_BATCH_SIZE = 25
 HOTSPOT_PROVISIONING_ACTIONS = (
     "hotspot_payment",
     "hotspot_retry",
+    "hotspot_reconciliation",
     "voucher_direct_api",
     "manual_transaction_provision",
 )
@@ -323,12 +324,21 @@ async def retry_pending_hotspot_provisioning_background():
     Retry direct API hotspot provisioning that was scheduled or failed previously.
     This repairs payments that succeeded while the router was briefly unreachable
     or while the web worker was restarted before the background task finished.
+
+    Two paths:
+      1. Provisioning-log based: latest log is "scheduled" or "failed".
+      2. Safety net: ACTIVE customer with a completed M-Pesa transaction in the
+         last 4 hours but NO "success" provisioning log (covers cases where the
+         provisioning log was never written, e.g. server restart mid-callback).
     """
     try:
+        from app.db.models import MpesaTransaction, MpesaTransactionStatus
+
         now = datetime.utcnow()
         stale_cutoff = now - timedelta(seconds=HOTSPOT_RETRY_COOLDOWN_SECONDS)
 
         async with async_session() as db:
+            # --- Path 1: provisioning-log based retry ---
             latest_logs = (
                 select(
                     ProvisioningLog.customer_id.label("customer_id"),
@@ -343,7 +353,7 @@ async def retry_pending_hotspot_provisioning_background():
                 .subquery()
             )
 
-            stmt = (
+            log_stmt = (
                 select(Customer)
                 .options(selectinload(Customer.plan), selectinload(Customer.router))
                 .join(Plan, Customer.plan_id == Plan.id)
@@ -363,15 +373,67 @@ async def retry_pending_hotspot_provisioning_background():
                 .limit(HOTSPOT_RETRY_BATCH_SIZE)
             )
 
-            customers = (await db.execute(stmt)).scalars().unique().all()
+            log_customers = list((await db.execute(log_stmt)).scalars().unique().all())
+            found_ids = {c.id for c in log_customers}
 
-        if not customers:
+            # --- Path 2: safety net (no provisioning log, but payment completed) ---
+            payment_cutoff = now - timedelta(hours=4)
+
+            success_log_cids = (
+                select(ProvisioningLog.customer_id)
+                .where(
+                    ProvisioningLog.status == "success",
+                    ProvisioningLog.log_date >= payment_cutoff,
+                )
+                .distinct()
+                .subquery()
+            )
+
+            paid_cids = (
+                select(MpesaTransaction.customer_id)
+                .where(
+                    MpesaTransaction.status == MpesaTransactionStatus.completed,
+                    MpesaTransaction.created_at >= payment_cutoff,
+                    MpesaTransaction.customer_id.isnot(None),
+                )
+                .distinct()
+                .subquery()
+            )
+
+            safety_stmt = (
+                select(Customer)
+                .options(selectinload(Customer.plan), selectinload(Customer.router))
+                .join(Plan, Customer.plan_id == Plan.id)
+                .join(paid_cids, paid_cids.c.customer_id == Customer.id)
+                .outerjoin(success_log_cids, success_log_cids.c.customer_id == Customer.id)
+                .where(
+                    success_log_cids.c.customer_id == None,
+                    Customer.status == CustomerStatus.ACTIVE,
+                    Customer.mac_address.isnot(None),
+                    Customer.router_id.isnot(None),
+                    Customer.expiry.isnot(None),
+                    Customer.expiry > now,
+                    Plan.connection_type == ConnectionType.HOTSPOT,
+                )
+                .limit(HOTSPOT_RETRY_BATCH_SIZE)
+            )
+
+            safety_customers = list((await db.execute(safety_stmt)).scalars().unique().all())
+
+        all_customers = log_customers + [c for c in safety_customers if c.id not in found_ids]
+
+        if not all_customers:
             logger.debug("[PROVISION-RETRY] No stranded hotspot provisions found")
             return
 
-        logger.warning("[PROVISION-RETRY] Retrying %s stranded hotspot provision(s)", len(customers))
+        if log_customers:
+            logger.warning("[PROVISION-RETRY] Retrying %d stranded hotspot provision(s) (log-based)", len(log_customers))
+        if safety_customers:
+            net_new = len([c for c in safety_customers if c.id not in found_ids])
+            if net_new:
+                logger.warning("[PROVISION-RETRY] Safety net found %d additional unprov customer(s)", net_new)
 
-        for customer in customers:
+        for customer in all_customers:
             if not customer.router or not customer.plan or not customer.mac_address:
                 continue
 
