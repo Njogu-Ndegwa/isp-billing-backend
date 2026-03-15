@@ -242,3 +242,48 @@ async def initiate_stk_push(
         amount=amount,
         reference=reference
     )
+
+
+async def query_stk_push_status(checkout_request_id: str) -> dict:
+    """
+    Query Safaricom's STK Push Query API for the final status of a transaction.
+    Returns a dict with keys: result_code (int), result_desc (str).
+    Raises on network/auth errors so the caller can retry later.
+    """
+    access_token = await get_access_token()
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    shortcode = settings.MPESA_SHORTCODE
+    password = base64.b64encode(
+        f"{shortcode}{settings.MPESA_PASSKEY}{timestamp}".encode()
+    ).decode()
+
+    base_url = (
+        "https://api.safaricom.co.ke"
+        if settings.MPESA_ENVIRONMENT == "production"
+        else "https://sandbox.safaricom.co.ke"
+    )
+
+    payload = {
+        "BusinessShortCode": shortcode,
+        "Password": password,
+        "Timestamp": timestamp,
+        "CheckoutRequestID": checkout_request_id,
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post(
+            f"{base_url}/mpesa/stkpushquery/v1/query",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"STK Query result for {checkout_request_id}: {data}")
+
+    return {
+        "result_code": int(data.get("ResultCode", -1)),
+        "result_desc": data.get("ResultDesc", ""),
+    }

@@ -175,6 +175,9 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
     """Handle standard M-Pesa STK Push callback"""
     logger.info(f"--- M-Pesa Direct Callback Received: {json.dumps(payload, indent=2)}")
     
+    from app.db.models import MpesaTransaction, MpesaTransactionStatus, FailureSource
+    checkout_request_id = None
+    
     try:
         # Extract M-Pesa callback data
         body = payload.get("Body", {})
@@ -190,7 +193,6 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             return {"ResultCode": 1, "ResultDesc": "Missing CheckoutRequestID"}
         
         # Look up transaction
-        from app.db.models import MpesaTransaction, MpesaTransactionStatus
         stmt = select(MpesaTransaction).where(MpesaTransaction.checkout_request_id == checkout_request_id)
         result = await db.execute(stmt)
         mpesa_txn = result.scalar_one_or_none()
@@ -222,7 +224,6 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                 phone_number = item.get("Value")
         
         # Update transaction status and always store result details
-        from app.db.models import FailureSource
         mpesa_txn.result_code = str(result_code) if result_code is not None else None
         mpesa_txn.result_desc = result_desc
         
@@ -375,7 +376,6 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
         logger.error(f"Error processing M-Pesa callback: {str(e)}")
         # Try to record the server-side failure on the transaction
         try:
-            from app.db.models import FailureSource
             if checkout_request_id:
                 async with db.begin():
                     fail_stmt = select(MpesaTransaction).where(
@@ -501,6 +501,7 @@ async def register_hotspot_and_pay_api(
     db: AsyncSession = Depends(get_db)
 ):
     """Register guest hotspot user and initiate payment"""
+    from app.db.models import MpesaTransaction, MpesaTransactionStatus, FailureSource
     try:
         from app.services.mpesa import initiate_stk_push
         from app.services.reseller_payments import record_customer_payment
@@ -608,7 +609,6 @@ async def register_hotspot_and_pay_api(
                 )
                 
                 # Store transaction mapping for callback lookup
-                from app.db.models import MpesaTransaction, MpesaTransactionStatus
                 mpesa_txn = MpesaTransaction(
                     checkout_request_id=stk_response.checkout_request_id,
                     merchant_request_id=stk_response.merchant_request_id,
@@ -634,7 +634,6 @@ async def register_hotspot_and_pay_api(
                 
                 # Record the STK push failure so we can track M-Pesa API issues
                 try:
-                    from app.db.models import FailureSource
                     failed_txn = MpesaTransaction(
                         checkout_request_id=f"FAILED-{reference}",
                         phone_number=request.phone,

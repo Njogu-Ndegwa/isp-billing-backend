@@ -72,6 +72,7 @@ from app.services.mikrotik_background import (
     _cleanup_customer_from_mikrotik_sync,
 )
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
+from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
 
 scheduler = AsyncIOScheduler()
 
@@ -521,10 +522,18 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
+    scheduler.add_job(
+        reconcile_pending_mpesa_transactions,
+        trigger=IntervalTrigger(seconds=90),
+        id='reconcile_pending_mpesa',
+        name='Reconcile pending M-Pesa transactions via STK Query',
+        replace_existing=True,
+        max_instances=1
+    )
     scheduler.start()
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "
-        "hotspot provisioning retry every 97s"
+        "hotspot provisioning retry every 97s, M-Pesa reconciliation every 90s"
     )
 
     async for db in get_db():
