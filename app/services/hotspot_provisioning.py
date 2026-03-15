@@ -67,8 +67,26 @@ def _truncate(value: Any, limit: int = 255) -> str | None:
     return text_value[:limit]
 
 
+_IDEMPOTENT_MIKROTIK_ERRORS = (
+    "already have user with this name",
+    "such client already exists",
+)
+
+
+def _is_idempotent_success(error_msg: str | None) -> bool:
+    """Return True if MikroTik error means the resource already exists (desired state)."""
+    if not error_msg:
+        return False
+    msg = error_msg.lower()
+    return any(phrase in msg for phrase in _IDEMPOTENT_MIKROTIK_ERRORS)
+
+
 def _extract_provisioning_error(result: Dict[str, Any]) -> str | None:
-    """Promote partial MikroTik failures to a retryable top-level error."""
+    """Promote partial MikroTik failures to a retryable top-level error.
+
+    "Already exists" responses from MikroTik are treated as idempotent
+    success — the customer IS provisioned, so we don't flag an error.
+    """
     if not result:
         return "Empty provisioning result"
 
@@ -80,11 +98,11 @@ def _extract_provisioning_error(result: Dict[str, Any]) -> str | None:
         return f"profile_error: {profile_error}"
 
     user_error = (result.get("hotspot_user_result") or {}).get("error")
-    if user_error:
+    if user_error and not _is_idempotent_success(user_error):
         return f"user_error: {user_error}"
 
     binding_error = (result.get("ip_binding_result") or {}).get("error")
-    if binding_error:
+    if binding_error and not _is_idempotent_success(binding_error):
         return f"binding_error: {binding_error}"
 
     return None
