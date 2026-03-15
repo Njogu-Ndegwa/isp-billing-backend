@@ -551,11 +551,14 @@ async def register_hotspot_and_pay_api(
         if not request.phone or len(request.phone.strip()) < 10:
             raise HTTPException(status_code=400, detail="Invalid phone number format")
 
-        # Check if customer exists by MAC
+        # Check if customer exists by MAC under this reseller
         customer_stmt = select(Customer).options(
             selectinload(Customer.plan),
             selectinload(Customer.router)
-        ).where(Customer.mac_address == request.mac_address)
+        ).where(
+            Customer.mac_address == request.mac_address,
+            Customer.user_id == user_id,
+        )
         customer_result = await db.execute(customer_stmt)
         existing_customer = customer_result.scalar_one_or_none()
         if existing_customer:

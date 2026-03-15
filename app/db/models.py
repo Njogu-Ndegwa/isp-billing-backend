@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index
+from sqlalchemy import Column, Integer, String, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -77,10 +77,13 @@ class User(Base):
 
 class Customer(Base):
     __tablename__ = "customers"
+    __table_args__ = (
+        UniqueConstraint("mac_address", "user_id", name="uq_customer_mac_per_reseller"),
+    )
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=True)
     phone = Column(String, nullable=False)
-    mac_address = Column(String, unique=True)
+    mac_address = Column(String)
     pppoe_username = Column(String)
     pppoe_password = Column(String)
     static_ip = Column(String)
