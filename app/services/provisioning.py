@@ -159,7 +159,8 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 # a missing command skips the check while hotspot=false still aborts.
 :local deviceModeOk true
 :do {{
-    :local dm [/system/device-mode/get hotspot]
+    :local checkDM [:parse ":return \\5B/system/device-mode/get hotspot\\5D"]
+    :local dm [$checkDM]
     :if ($dm != true) do={{
         :set deviceModeOk false
     }}
@@ -256,13 +257,15 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     :log info "Provisioning: hotspot profile hsprof1 already exists, continuing"
 }}
 
-/ip hotspot add name=hotspot1 interface=bridge address-pool=dhcp-pool profile=hsprof1 disabled=no
+:do {{ /ip hotspot add name=hotspot1 interface=bridge address-pool=dhcp-pool profile=hsprof1 disabled=no }} on-error={{
+    :log warning "Provisioning: hotspot add command failed (may already exist or device-mode blocks it)"
+}}
 
 # Verify hotspot was actually created
 :local hsCount [:len [/ip hotspot find where name=hotspot1]]
 :if ($hsCount = 0) do={{
-    :log error "PROVISION FAILED: hotspot1 was not created"
-    :error "hotspot creation failed — aborting"
+    :log error "PROVISION FAILED: hotspot1 was not created. If on RouterOS v7, check: /system/device-mode/update hotspot=yes"
+    :error "hotspot creation failed — if device-mode blocks it, enable hotspot in device-mode and retry"
 }} else={{
     :log info "Provisioning: hotspot1 created and running"
 }}
