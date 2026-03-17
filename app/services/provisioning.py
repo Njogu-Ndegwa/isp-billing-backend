@@ -145,21 +145,24 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 # ============================================================
 
 # ---- PRE-FLIGHT: VERSION CHECK ----
-# WireGuard requires RouterOS v7+. Abort early on v6 with a clear message.
+# /import validates command paths at parse time, so unknown paths like
+# /interface wireguard cause a parse error before :do/on-error can help.
+# Using :parse defers command resolution to runtime.
 :do {{
-    /interface wireguard print count-only
+    :local f [:parse "/interface wireguard print count-only"]
+    [$f]
 }} on-error={{
     :log error "PROVISION ABORTED: WireGuard not available. This script requires RouterOS v7+."
     :error "RouterOS v7+ required (WireGuard not available)"
 }}
 
 # ---- PRE-FLIGHT: DEVICE-MODE CHECK ----
-# RouterOS v7 device-mode=home blocks hotspot. /system/device-mode may not
-# exist on all v7 builds or hardware (e.g. CHR, early 7.x). Use a flag so
-# a missing command skips the check while hotspot=false still aborts.
+# /system/device-mode may not exist on all v7 builds or hardware (CHR, x86).
+# Same :parse trick to avoid parse-time failure on routers without it.
 :local deviceModeOk true
 :do {{
-    :local dm [/system/device-mode/get hotspot]
+    :local f [:parse ":return [/system/device-mode/get hotspot]"]
+    :local dm [$f]
     :if ($dm != true) do={{
         :set deviceModeOk false
     }}
