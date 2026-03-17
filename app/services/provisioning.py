@@ -144,18 +144,33 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 # Generated: {datetime.utcnow().isoformat()}Z
 # ============================================================
 
+# ---- PRE-FLIGHT: VERSION CHECK ----
+# WireGuard requires RouterOS v7+. Abort early on v6 with a clear message.
+:do {{
+    /interface wireguard print count-only
+}} on-error={{
+    :log error "PROVISION ABORTED: WireGuard not available. This script requires RouterOS v7+."
+    :error "RouterOS v7+ required (WireGuard not available)"
+}}
+
 # ---- PRE-FLIGHT: DEVICE-MODE CHECK ----
-# RouterOS v7 device-mode=home blocks hotspot. This CANNOT be fixed
-# by script — it requires a physical button press. Abort early if
-# hotspot is not enabled so the admin knows what to fix.
-{{
+# RouterOS v7 device-mode=home blocks hotspot. /system/device-mode may not
+# exist on all v7 builds or hardware (e.g. CHR, early 7.x). Use a flag so
+# a missing command skips the check while hotspot=false still aborts.
+:local deviceModeOk true
+:do {{
     :local dm [/system/device-mode/get hotspot]
     :if ($dm != true) do={{
-        :log error "PROVISION ABORTED: device-mode hotspot is disabled. Run: /system/device-mode/update hotspot=yes  then press the physical reset button within 60s. After that, re-run this script."
-        :error "device-mode hotspot not enabled — aborting (see log)"
+        :set deviceModeOk false
     }}
-    :log info "Provisioning: device-mode hotspot=yes confirmed"
+}} on-error={{
+    :log warning "Provisioning: /system/device-mode not available on this router, skipping check"
 }}
+:if (!$deviceModeOk) do={{
+    :log error "PROVISION ABORTED: device-mode hotspot is disabled. Run: /system/device-mode/update hotspot=yes then press the physical reset button within 60s. Re-run this script after."
+    :error "device-mode hotspot not enabled — aborting (see log)"
+}}
+:log info "Provisioning: pre-flight checks passed"
 
 # ---- STEP 1: WAN / INITIAL SETUP ----
 
