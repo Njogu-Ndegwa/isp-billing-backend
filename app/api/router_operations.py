@@ -2830,14 +2830,31 @@ async def set_pppoe_ports(
         if port == "ether1":
             raise HTTPException(status_code=400, detail="ether1 is the WAN port and cannot be used for PPPoE")
 
-    # Overlap check: PPPoE ports must not overlap with plain ports
-    current_plain = set(router_obj.plain_ports or [])
-    overlap = current_plain.intersection(request.ports)
-    if overlap:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Ports already assigned to plain (no-auth) mode: {', '.join(sorted(overlap))}. "
-                   f"Remove them from plain mode first.",
+    # Auto-migrate ports that are currently in plain mode
+    current_plain = list(router_obj.plain_ports or [])
+    plain_overlap = set(current_plain).intersection(request.ports)
+    updated_plain = None
+    if plain_overlap:
+        remaining_plain = [p for p in current_plain if p not in plain_overlap]
+        router_info_pre = {
+            "ip": router_obj.ip_address, "username": router_obj.username,
+            "password": router_obj.password, "port": router_obj.port,
+        }
+        pre_result = await asyncio.to_thread(
+            _apply_plain_ports_sync, router_info_pre, remaining_plain, current_plain,
+        )
+        if pre_result.get("error"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to remove ports {sorted(plain_overlap)} from plain mode "
+                       f"before assigning to PPPoE: {pre_result['error']}",
+            )
+        updated_plain = remaining_plain if remaining_plain else None
+        router_obj.plain_ports = updated_plain
+        await db.commit()
+        logger.info(
+            "Router %s: auto-migrated ports %s from plain to PPPoE",
+            router_id, sorted(plain_overlap),
         )
 
     old_ports = router_obj.pppoe_ports or []
@@ -2878,13 +2895,17 @@ async def set_pppoe_ports(
     router_obj.pppoe_ports = new_ports if new_ports else None
     await db.commit()
 
-    return {
+    resp = {
         "success": True,
         "router_id": router_id,
         "pppoe_ports": new_ports,
         "warnings": result.get("warnings", []),
         "message": f"PPPoE ports configured: {', '.join(new_ports)}" if new_ports else "PPPoE ports cleared",
     }
+    if plain_overlap:
+        resp["migrated_from_plain"] = sorted(plain_overlap)
+        resp["plain_ports"] = updated_plain
+    return resp
 
 
 # =========================================================================
@@ -3009,14 +3030,31 @@ async def set_plain_ports(
         if port == "ether1":
             raise HTTPException(status_code=400, detail="ether1 is the WAN port and cannot be used for plain mode")
 
-    # Overlap check: plain ports must not overlap with PPPoE ports
-    current_pppoe = set(router_obj.pppoe_ports or [])
-    overlap = current_pppoe.intersection(request.ports)
-    if overlap:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Ports already assigned to PPPoE: {', '.join(sorted(overlap))}. "
-                   f"Remove them from PPPoE first.",
+    # Auto-migrate ports that are currently in PPPoE mode
+    current_pppoe = list(router_obj.pppoe_ports or [])
+    pppoe_overlap = set(current_pppoe).intersection(request.ports)
+    updated_pppoe = None
+    if pppoe_overlap:
+        remaining_pppoe = [p for p in current_pppoe if p not in pppoe_overlap]
+        router_info_pre = {
+            "ip": router_obj.ip_address, "username": router_obj.username,
+            "password": router_obj.password, "port": router_obj.port,
+        }
+        pre_result = await asyncio.to_thread(
+            _apply_pppoe_ports_sync, router_info_pre, remaining_pppoe, current_pppoe,
+        )
+        if pre_result.get("error"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to remove ports {sorted(pppoe_overlap)} from PPPoE "
+                       f"before assigning to plain mode: {pre_result['error']}",
+            )
+        updated_pppoe = remaining_pppoe if remaining_pppoe else None
+        router_obj.pppoe_ports = updated_pppoe
+        await db.commit()
+        logger.info(
+            "Router %s: auto-migrated ports %s from PPPoE to plain",
+            router_id, sorted(pppoe_overlap),
         )
 
     old_ports = router_obj.plain_ports or []
@@ -3055,10 +3093,14 @@ async def set_plain_ports(
     router_obj.plain_ports = new_ports if new_ports else None
     await db.commit()
 
-    return {
+    resp = {
         "success": True,
         "router_id": router_id,
         "plain_ports": new_ports,
         "warnings": result.get("warnings", []),
         "message": f"Plain ports configured: {', '.join(new_ports)}" if new_ports else "Plain ports cleared",
     }
+    if pppoe_overlap:
+        resp["migrated_from_pppoe"] = sorted(pppoe_overlap)
+        resp["pppoe_ports"] = updated_pppoe
+    return resp
