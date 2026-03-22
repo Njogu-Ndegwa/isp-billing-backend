@@ -2633,8 +2633,16 @@ class SetPPPoEPortsRequest(BaseModel):
     ports: List[str]
 
 
-def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list) -> dict:
-    """Apply PPPoE port configuration to the live router (sync, runs in thread pool)."""
+def _apply_pppoe_ports_sync(
+    router_info: dict,
+    new_ports: list,
+    old_ports: list,
+    plain_ports_to_remove: list = None,
+    current_plain_ports: list = None,
+) -> dict:
+    """Apply PPPoE port configuration to the live router (sync, runs in thread pool).
+    When plain_ports_to_remove is provided, tears down those plain ports first
+    within the same connection to avoid a second connect/disconnect cycle."""
     api = MikroTikAPI(
         router_info["ip"],
         router_info["username"],
@@ -2647,6 +2655,15 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
         return {"error": "connect_failed"}
     try:
         target_ports = list(dict.fromkeys(new_ports or []))
+
+        # Cross-mode migration: tear down plain on overlapping ports first.
+        if plain_ports_to_remove:
+            remaining_plain = [p for p in (current_plain_ports or []) if p not in plain_ports_to_remove]
+            restore_result = api.restore_ports_from_plain(plain_ports_to_remove, hotspot_bridge="bridge")
+            if restore_result.get("error"):
+                return {"error": f"Failed to remove plain before PPPoE setup: {restore_result['error']}"}
+            if not remaining_plain:
+                api.teardown_plain_infrastructure(ports_to_restore=[])
 
         current_state = api.get_pppoe_access_state()
         if current_state.get("error"):
@@ -2671,11 +2688,8 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
                     teardown["current_ports"] = current_ports
                     return teardown
 
-                time.sleep(0.1)
                 verify = api.verify_port_bridges(
-                    {p: "bridge" for p in current_ports},
-                    retries=8,
-                    delay=0.5,
+                    {p: "bridge" for p in current_ports}, retries=3, delay=0.3,
                 )
                 if verify.get("error"):
                     return {
@@ -2691,6 +2705,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
                 "success": True,
                 "message": "PPPoE ports cleared, all ports restored to hotspot bridge",
                 "current_ports": current_ports,
+                "plain_migrated": bool(plain_ports_to_remove),
             }
 
         # Restore ports no longer requested without tearing down the shared PPPoE infra.
@@ -2716,12 +2731,10 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
 
         setup_mode = setup_result.get("mode", "direct")
 
-        # Final safety-net verification depends on the managed PPPoE access mode.
-        time.sleep(0.1)
         if setup_mode == "legacy_bridge":
             expected_bridges = {p: "bridge-pppoe" for p in target_ports}
             expected_bridges.update({p: "bridge" for p in ports_to_restore})
-            verify = api.verify_port_bridges(expected_bridges, retries=8, delay=0.5)
+            verify = api.verify_port_bridges(expected_bridges, retries=3, delay=0.3)
             if verify.get("error"):
                 failed = verify.get("failed_ports", [])
                 details = "; ".join(
@@ -2780,7 +2793,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
                     })
 
             bridge_verify = (
-                api.verify_port_bridges({p: "bridge" for p in ports_to_restore}, retries=8, delay=0.5)
+                api.verify_port_bridges({p: "bridge" for p in ports_to_restore}, retries=3, delay=0.3)
                 if ports_to_restore else {"success": True}
             )
             if failed or bridge_verify.get("error"):
@@ -2802,6 +2815,7 @@ def _apply_pppoe_ports_sync(router_info: dict, new_ports: list, old_ports: list)
                 }
 
         setup_result["current_ports"] = current_ports
+        setup_result["plain_migrated"] = bool(plain_ports_to_remove)
         return setup_result
     finally:
         api.disconnect()
@@ -2830,32 +2844,10 @@ async def set_pppoe_ports(
         if port == "ether1":
             raise HTTPException(status_code=400, detail="ether1 is the WAN port and cannot be used for PPPoE")
 
-    # Auto-migrate ports that are currently in plain mode
+    # Detect plain overlap so we can auto-migrate in a single connection
     current_plain = list(router_obj.plain_ports or [])
     plain_overlap = set(current_plain).intersection(request.ports)
-    updated_plain = None
-    if plain_overlap:
-        remaining_plain = [p for p in current_plain if p not in plain_overlap]
-        router_info_pre = {
-            "ip": router_obj.ip_address, "username": router_obj.username,
-            "password": router_obj.password, "port": router_obj.port,
-        }
-        pre_result = await asyncio.to_thread(
-            _apply_plain_ports_sync, router_info_pre, remaining_plain, current_plain,
-        )
-        if pre_result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to remove ports {sorted(plain_overlap)} from plain mode "
-                       f"before assigning to PPPoE: {pre_result['error']}",
-            )
-        updated_plain = remaining_plain if remaining_plain else None
-        router_obj.plain_ports = updated_plain
-        await db.commit()
-        logger.info(
-            "Router %s: auto-migrated ports %s from plain to PPPoE",
-            router_id, sorted(plain_overlap),
-        )
+    plain_ports_to_remove = sorted(plain_overlap) if plain_overlap else None
 
     old_ports = router_obj.pppoe_ports or []
     new_ports = request.ports
@@ -2867,13 +2859,31 @@ async def set_pppoe_ports(
         "port": router_obj.port,
     }
     started_at = time.perf_counter()
-    result = await asyncio.to_thread(_apply_pppoe_ports_sync, router_info, new_ports, old_ports)
+    result = await asyncio.to_thread(
+        _apply_pppoe_ports_sync,
+        router_info,
+        new_ports,
+        old_ports,
+        plain_ports_to_remove=plain_ports_to_remove,
+        current_plain_ports=current_plain,
+    )
     logger.info(
         "PPPoE port sync for router %s completed in %.2fs (requested=%s)",
         router_id,
         time.perf_counter() - started_at,
         ",".join(new_ports) if new_ports else "(none)",
     )
+
+    # Update plain_ports in DB if cross-migration happened
+    updated_plain = None
+    if plain_overlap and not result.get("error"):
+        remaining_plain = [p for p in current_plain if p not in plain_overlap]
+        updated_plain = remaining_plain if remaining_plain else None
+        router_obj.plain_ports = updated_plain
+        logger.info(
+            "Router %s: auto-migrated ports %s from plain to PPPoE",
+            router_id, sorted(plain_overlap),
+        )
 
     # Invalidate port status cache so the next GET reflects reality
     _port_status_cache.pop(router_id, None)
@@ -2916,8 +2926,16 @@ class SetPlainPortsRequest(BaseModel):
     ports: List[str]
 
 
-def _apply_plain_ports_sync(router_info: dict, new_ports: list, old_ports: list) -> dict:
-    """Apply plain port configuration to the live router (sync, runs in thread pool)."""
+def _apply_plain_ports_sync(
+    router_info: dict,
+    new_ports: list,
+    old_ports: list,
+    pppoe_ports_to_remove: list = None,
+    current_pppoe_ports: list = None,
+) -> dict:
+    """Apply plain port configuration to the live router (sync, runs in thread pool).
+    When pppoe_ports_to_remove is provided, tears down those PPPoE ports first
+    within the same connection to avoid a second connect/disconnect cycle."""
     api = MikroTikAPI(
         router_info["ip"],
         router_info["username"],
@@ -2931,6 +2949,21 @@ def _apply_plain_ports_sync(router_info: dict, new_ports: list, old_ports: list)
     try:
         target_ports = list(dict.fromkeys(new_ports or []))
 
+        # Cross-mode migration: tear down PPPoE on overlapping ports first.
+        if pppoe_ports_to_remove:
+            remaining_pppoe = [p for p in (current_pppoe_ports or []) if p not in pppoe_ports_to_remove]
+            current_state = api.get_pppoe_access_state()
+            if not current_state.get("error"):
+                restore = api.restore_ports_from_pppoe(
+                    pppoe_ports_to_remove, hotspot_bridge="bridge", current_state=current_state,
+                )
+                if restore.get("error"):
+                    return {"error": f"Failed to remove PPPoE before plain setup: {restore['error']}"}
+                if not remaining_pppoe:
+                    api.teardown_pppoe_infrastructure(ports_to_restore=[])
+            else:
+                return {"error": f"Failed to read PPPoE state: {current_state['error']}"}
+
         # Clearing plain ports entirely: restore and tear down infra.
         if not target_ports:
             if old_ports:
@@ -2939,11 +2972,8 @@ def _apply_plain_ports_sync(router_info: dict, new_ports: list, old_ports: list)
                     teardown["current_ports"] = old_ports
                     return teardown
 
-                time.sleep(0.1)
                 verify = api.verify_port_bridges(
-                    {p: "bridge" for p in old_ports},
-                    retries=8,
-                    delay=0.5,
+                    {p: "bridge" for p in old_ports}, retries=3, delay=0.3,
                 )
                 if verify.get("error"):
                     return {
@@ -2959,6 +2989,7 @@ def _apply_plain_ports_sync(router_info: dict, new_ports: list, old_ports: list)
                 "success": True,
                 "message": "Plain ports cleared, all ports restored to hotspot bridge",
                 "current_ports": old_ports,
+                "pppoe_migrated": bool(pppoe_ports_to_remove),
             }
 
         # Restore ports no longer requested back to hotspot bridge.
@@ -2966,10 +2997,7 @@ def _apply_plain_ports_sync(router_info: dict, new_ports: list, old_ports: list)
         if ports_to_restore:
             restore_result = api.restore_ports_from_plain(ports_to_restore, hotspot_bridge="bridge")
             if restore_result.get("error"):
-                return {
-                    "error": restore_result["error"],
-                    "current_ports": old_ports,
-                }
+                return {"error": restore_result["error"], "current_ports": old_ports}
 
         # Set up or extend plain infrastructure for the requested ports.
         setup_result = api.setup_plain_infrastructure(plain_ports=target_ports)
@@ -2978,11 +3006,10 @@ def _apply_plain_ports_sync(router_info: dict, new_ports: list, old_ports: list)
             return setup_result
 
         # Verify ports landed in the correct bridge.
-        time.sleep(0.1)
         expected = {p: "bridge-plain" for p in target_ports}
         if ports_to_restore:
             expected.update({p: "bridge" for p in ports_to_restore})
-        verify = api.verify_port_bridges(expected, retries=8, delay=0.5)
+        verify = api.verify_port_bridges(expected, retries=3, delay=0.3)
         if verify.get("error"):
             failed = verify.get("failed_ports", [])
             details = "; ".join(
@@ -3003,6 +3030,7 @@ def _apply_plain_ports_sync(router_info: dict, new_ports: list, old_ports: list)
             "message": f"Plain ports configured: {', '.join(target_ports)}",
             "current_ports": target_ports,
             "warnings": setup_result.get("warnings", []),
+            "pppoe_migrated": bool(pppoe_ports_to_remove),
         }
     finally:
         api.disconnect()
@@ -3030,32 +3058,10 @@ async def set_plain_ports(
         if port == "ether1":
             raise HTTPException(status_code=400, detail="ether1 is the WAN port and cannot be used for plain mode")
 
-    # Auto-migrate ports that are currently in PPPoE mode
+    # Detect PPPoE overlap so we can auto-migrate in a single connection
     current_pppoe = list(router_obj.pppoe_ports or [])
     pppoe_overlap = set(current_pppoe).intersection(request.ports)
-    updated_pppoe = None
-    if pppoe_overlap:
-        remaining_pppoe = [p for p in current_pppoe if p not in pppoe_overlap]
-        router_info_pre = {
-            "ip": router_obj.ip_address, "username": router_obj.username,
-            "password": router_obj.password, "port": router_obj.port,
-        }
-        pre_result = await asyncio.to_thread(
-            _apply_pppoe_ports_sync, router_info_pre, remaining_pppoe, current_pppoe,
-        )
-        if pre_result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to remove ports {sorted(pppoe_overlap)} from PPPoE "
-                       f"before assigning to plain mode: {pre_result['error']}",
-            )
-        updated_pppoe = remaining_pppoe if remaining_pppoe else None
-        router_obj.pppoe_ports = updated_pppoe
-        await db.commit()
-        logger.info(
-            "Router %s: auto-migrated ports %s from PPPoE to plain",
-            router_id, sorted(pppoe_overlap),
-        )
+    pppoe_ports_to_remove = sorted(pppoe_overlap) if pppoe_overlap else None
 
     old_ports = router_obj.plain_ports or []
     new_ports = request.ports
@@ -3067,13 +3073,31 @@ async def set_plain_ports(
         "port": router_obj.port,
     }
     started_at = time.perf_counter()
-    result = await asyncio.to_thread(_apply_plain_ports_sync, router_info, new_ports, old_ports)
+    result = await asyncio.to_thread(
+        _apply_plain_ports_sync,
+        router_info,
+        new_ports,
+        old_ports,
+        pppoe_ports_to_remove=pppoe_ports_to_remove,
+        current_pppoe_ports=current_pppoe,
+    )
     logger.info(
         "Plain port sync for router %s completed in %.2fs (requested=%s)",
         router_id,
         time.perf_counter() - started_at,
         ",".join(new_ports) if new_ports else "(none)",
     )
+
+    # Update PPPoE in DB if cross-migration happened
+    updated_pppoe = None
+    if pppoe_overlap and not result.get("error"):
+        remaining_pppoe = [p for p in current_pppoe if p not in pppoe_overlap]
+        updated_pppoe = remaining_pppoe if remaining_pppoe else None
+        router_obj.pppoe_ports = updated_pppoe
+        logger.info(
+            "Router %s: auto-migrated ports %s from PPPoE to plain",
+            router_id, sorted(pppoe_overlap),
+        )
 
     _port_status_cache.pop(router_id, None)
 

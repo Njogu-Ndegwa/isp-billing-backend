@@ -2692,9 +2692,6 @@ class MikroTikAPI:
 
                 ports_to_bind.append(port)
 
-            if detached_ports:
-                time.sleep(0.1)
-
             for port in ports_to_bind:
                 bind_result = self.ensure_pppoe_server_on_interface(
                     port,
@@ -2719,7 +2716,6 @@ class MikroTikAPI:
                     errors.append(f"NAT: {result['error']}")
 
             # 7. Verify the selected ports are directly attached to PPPoE.
-            time.sleep(0.1)
             access_state = self.get_pppoe_access_state(legacy_bridge_name=bridge_name)
             if access_state.get("error"):
                 return {
@@ -2910,9 +2906,6 @@ class MikroTikAPI:
             if remove_result.get("error"):
                 errors.append(remove_result["error"])
 
-            if ports_to_restore:
-                time.sleep(0.1)
-
             # 2. Move ports back to hotspot bridge
             for port in ports_to_restore:
                 r = self.add_bridge_port(port, hotspot_bridge, verify=False)
@@ -3000,64 +2993,46 @@ class MikroTikAPI:
                 for bp in bp_result.get("data", []):
                     bridge_map[bp.get("interface", "")] = bp.get("bridge", "")
 
-            already_setup = False
-            bridges = self.send_command("/interface/bridge/print")
-            if bridges.get("success"):
-                for br in bridges.get("data", []):
-                    if br.get("name") == bridge_name:
-                        already_setup = True
-                        break
+            # Try to create bridge; if it already exists the duplicate error is harmless.
+            br_result = self.send_command("/interface/bridge/add", {"name": bridge_name})
+            already_setup = bool(
+                br_result.get("error") and _router_error_is_duplicate(br_result.get("error", ""))
+            )
+            if br_result.get("error") and not already_setup:
+                return {"error": f"Failed to create bridge '{bridge_name}': {br_result['error']}"}
 
             if already_setup:
                 logger.info(f"Plain infrastructure: bridge '{bridge_name}' already exists")
             else:
-                result = self.send_command("/interface/bridge/add", {"name": bridge_name})
-                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                    return {"error": f"Failed to create bridge '{bridge_name}': {result['error']}"}
                 logger.info(f"Plain infrastructure: created bridge '{bridge_name}'")
 
-                result = self.send_command("/ip/address/add", {
-                    "address": bridge_ip,
-                    "interface": bridge_name,
-                    "comment": "Plain bridge address",
-                })
-                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                    errors.append(f"IP address: {result['error']}")
-
-                result = self.send_command("/ip/pool/add", {
-                    "name": pool_name,
-                    "ranges": pool_range,
-                })
-                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                    errors.append(f"Pool: {result['error']}")
-
-                result = self.send_command("/ip/dhcp-server/add", {
-                    "name": "dhcp-plain",
-                    "interface": bridge_name,
-                    "address-pool": pool_name,
-                    "disabled": "no",
-                })
-                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                    errors.append(f"DHCP server: {result['error']}")
-
+            if not already_setup:
                 plain_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
-                result = self.send_command("/ip/dhcp-server/network/add", {
-                    "address": plain_subnet,
-                    "gateway": bridge_ip.split("/")[0],
-                    "dns-server": "8.8.8.8,8.8.4.4",
-                })
-                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                    errors.append(f"DHCP network: {result['error']}")
-
-                result = self.send_command("/ip/firewall/nat/add", {
-                    "chain": "srcnat",
-                    "src-address": plain_subnet,
-                    "out-interface": "ether1",
-                    "action": "masquerade",
-                    "comment": "NAT for plain clients",
-                })
-                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                    errors.append(f"NAT: {result['error']}")
+                infra_cmds = [
+                    ("/ip/address/add", {
+                        "address": bridge_ip, "interface": bridge_name,
+                        "comment": "Plain bridge address",
+                    }, "IP address"),
+                    ("/ip/pool/add", {"name": pool_name, "ranges": pool_range}, "Pool"),
+                    ("/ip/dhcp-server/add", {
+                        "name": "dhcp-plain", "interface": bridge_name,
+                        "address-pool": pool_name, "disabled": "no",
+                    }, "DHCP server"),
+                    ("/ip/dhcp-server/network/add", {
+                        "address": plain_subnet,
+                        "gateway": bridge_ip.split("/")[0],
+                        "dns-server": "8.8.8.8,8.8.4.4",
+                    }, "DHCP network"),
+                    ("/ip/firewall/nat/add", {
+                        "chain": "srcnat", "src-address": plain_subnet,
+                        "out-interface": "ether1", "action": "masquerade",
+                        "comment": "NAT for plain clients",
+                    }, "NAT"),
+                ]
+                for cmd, args, label in infra_cmds:
+                    result = self.send_command(cmd, args)
+                    if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                        errors.append(f"{label}: {result['error']}")
 
             port_errors = []
             for port in target_ports:
