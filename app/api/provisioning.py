@@ -65,12 +65,10 @@ async def create_provision_token(
         "wireguard_ip": token_obj.wireguard_ip,
         "command": command,
         "note": (
-            "IMPORTANT: This script requires RouterOS v7+. "
-            "If your router has device-mode (most retail hardware), ensure "
-            "hotspot is enabled: /system/device-mode/update hotspot=yes "
-            "then tap the physical reset button (quick tap, do NOT hold). "
-            "The script will auto-detect and skip this check on models "
-            "that do not support device-mode (e.g. CHR, x86)."
+            "IMPORTANT: Before running this command on the MikroTik, ensure "
+            "device-mode hotspot is enabled. Run: "
+            "/system/device-mode/update hotspot=yes  "
+            "then tap the physical reset button on the router (quick tap, do NOT hold)."
         ),
         "created_at": token_obj.created_at.isoformat(),
         "expires_in_hours": 24,
