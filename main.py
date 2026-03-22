@@ -142,6 +142,21 @@ async def run_radius_migrations():
         else:
             logger.info("Migration: pppoe_ports column already exists, skipping")
 
+        # --- Router plain_ports column (no-auth port mode) ---
+        result = await conn.execute(sa_text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'routers' AND column_name = 'plain_ports'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE routers
+                ADD COLUMN plain_ports JSON NULL
+            """))
+            logger.info("Migration: Added plain_ports column to routers")
+        else:
+            logger.info("Migration: plain_ports column already exists, skipping")
+
         # --- Voucher table ---
         result = await conn.execute(sa_text("""
             SELECT table_name FROM information_schema.tables
