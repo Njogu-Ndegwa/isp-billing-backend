@@ -41,6 +41,7 @@ from app.api.voucher_routes import router as voucher_router
 from app.api.provisioning import router as provisioning_router
 from app.api.pppoe_monitor import router as pppoe_monitor_router
 from app.api.hotspot_monitor import router as hotspot_monitor_router
+from app.api.admin_reseller_routes import router as admin_reseller_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -61,6 +62,7 @@ app.include_router(voucher_router)
 app.include_router(provisioning_router)
 app.include_router(pppoe_monitor_router)
 app.include_router(hotspot_monitor_router)
+app.include_router(admin_reseller_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -328,6 +330,40 @@ async def run_radius_migrations():
             logger.info("Migration: Added emergency_active, emergency_message to routers")
         else:
             logger.info("Migration: Router emergency columns already exist, skipping")
+
+        # --- User last_login_at column ---
+        await conn.execute(sa_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP NULL"
+        ))
+
+        # --- Reseller payouts table ---
+        result = await conn.execute(sa_text("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_name = 'reseller_payouts'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                CREATE TABLE reseller_payouts (
+                    id SERIAL PRIMARY KEY,
+                    reseller_id INTEGER NOT NULL REFERENCES users(id),
+                    amount FLOAT NOT NULL,
+                    payment_method VARCHAR(50) NOT NULL,
+                    reference VARCHAR(255),
+                    notes VARCHAR(500),
+                    period_start TIMESTAMP,
+                    period_end TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_reseller_payouts_reseller ON reseller_payouts(reseller_id)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_reseller_payouts_created ON reseller_payouts(created_at DESC)"
+            ))
+            logger.info("Migration: Created reseller_payouts table")
+        else:
+            logger.info("Migration: reseller_payouts table already exists, skipping")
 
         result = await conn.execute(sa_text("""
             SELECT table_name FROM information_schema.tables 

@@ -74,6 +74,7 @@ class User(Base):
     mpesa_shortcode = Column(String(20), nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    last_login_at = Column(DateTime, nullable=True)
 
 class Customer(Base):
     __tablename__ = "customers"
@@ -179,6 +180,20 @@ class ResellerFinancials(Base):
     last_payment_date = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     user = relationship("User", backref="financials")
+
+class ResellerPayout(Base):
+    __tablename__ = "reseller_payouts"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    amount = Column(Float, nullable=False)
+    payment_method = Column(String(50), nullable=False)
+    reference = Column(String(255), nullable=True)
+    notes = Column(String(500), nullable=True)
+    period_start = Column(DateTime, nullable=True)
+    period_end = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    reseller = relationship("User", backref="payouts_received")
+
 
 class Subscription(Base):
     __tablename__ = "subscriptions"

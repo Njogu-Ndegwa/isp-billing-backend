@@ -1,0 +1,124 @@
+{
+    "info": {
+        "name": "Admin Reseller Management - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": "your-jwt-token-here"}
+    ],
+    "auth": {
+        "type": "bearer",
+        "bearer": [{"key": "token", "value": "{{token}}"}]
+    },
+    "item": [
+        {
+            "name": "List All Resellers",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/resellers?sort_by=revenue&search=",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "resellers"],
+                    "query": [
+                        {"key": "sort_by", "value": "revenue", "description": "Sort by: revenue, customers, created_at, last_login"},
+                        {"key": "search", "value": "", "description": "Search by email or organization name"}
+                    ]
+                },
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
+            }
+        },
+        {
+            "name": "Get Reseller Detail",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/resellers/1",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "resellers", "1"]
+                },
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
+            }
+        },
+        {
+            "name": "Get Reseller Customer Payments",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/resellers/1/payments?page=1&per_page=50&date=2026-03-22",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "resellers", "1", "payments"],
+                    "query": [
+                        {"key": "page", "value": "1"},
+                        {"key": "per_page", "value": "50"},
+                        {"key": "date", "value": "2026-03-22", "description": "Single day filter (YYYY-MM-DD)"},
+                        {"key": "start_date", "value": "", "description": "Range start (YYYY-MM-DD)", "disabled": true},
+                        {"key": "end_date", "value": "", "description": "Range end (YYYY-MM-DD)", "disabled": true}
+                    ]
+                },
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
+            }
+        },
+        {
+            "name": "Get Reseller Routers",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/resellers/1/routers",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "resellers", "1", "routers"]
+                },
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
+            }
+        },
+        {
+            "name": "Admin Aggregate Dashboard",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/dashboard",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "dashboard"]
+                },
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
+            }
+        },
+        {
+            "name": "Record Payout to Reseller",
+            "request": {
+                "method": "POST",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/resellers/1/payouts",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "resellers", "1", "payouts"]
+                },
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"amount\": 5000,\n    \"payment_method\": \"mpesa\",\n    \"reference\": \"SH43K2EXAMPLE\",\n    \"notes\": \"March week 3 payout\",\n    \"period_start\": \"2026-03-15\",\n    \"period_end\": \"2026-03-21\"\n}"
+                },
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
+            }
+        },
+        {
+            "name": "Get Reseller Payout History",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/resellers/1/payouts?page=1&per_page=50",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "resellers", "1", "payouts"],
+                    "query": [
+                        {"key": "page", "value": "1"},
+                        {"key": "per_page", "value": "50"},
+                        {"key": "start_date", "value": "", "description": "Filter start (YYYY-MM-DD)", "disabled": true},
+                        {"key": "end_date", "value": "", "description": "Filter end (YYYY-MM-DD)", "disabled": true}
+                    ]
+                },
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
+            }
+        }
+    ]
+}
