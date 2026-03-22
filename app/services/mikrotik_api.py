@@ -2966,6 +2966,255 @@ class MikroTikAPI:
             return {"error": str(e), "partial_errors": errors}
 
     # =========================================================================
+    # PLAIN (NO-AUTH) PORT INFRASTRUCTURE
+    # =========================================================================
+
+    def setup_plain_infrastructure(
+        self,
+        plain_ports: List[str],
+        hotspot_bridge: str = "bridge",
+        bridge_name: str = "bridge-plain",
+        bridge_ip: str = "192.168.90.1/24",
+        pool_name: str = "plain-pool",
+        pool_range: str = "192.168.90.2-192.168.90.254",
+    ) -> Dict[str, Any]:
+        """
+        Set up plain (no-auth) infrastructure on the router:
+        1. Create bridge-plain if it doesn't exist
+        2. Assign IP address to bridge-plain
+        3. Create DHCP pool, server, and network for bridge-plain
+        4. Add masquerade NAT for the plain subnet
+        5. Move selected ports from their current bridge into bridge-plain
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        errors = []
+        try:
+            target_ports = list(dict.fromkeys(plain_ports or []))
+            if not target_ports:
+                return {"success": True}
+
+            bridge_map = {}
+            bp_result = self.send_command("/interface/bridge/port/print")
+            if bp_result.get("success"):
+                for bp in bp_result.get("data", []):
+                    bridge_map[bp.get("interface", "")] = bp.get("bridge", "")
+
+            already_setup = False
+            bridges = self.send_command("/interface/bridge/print")
+            if bridges.get("success"):
+                for br in bridges.get("data", []):
+                    if br.get("name") == bridge_name:
+                        already_setup = True
+                        break
+
+            if already_setup:
+                logger.info(f"Plain infrastructure: bridge '{bridge_name}' already exists")
+            else:
+                result = self.send_command("/interface/bridge/add", {"name": bridge_name})
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    return {"error": f"Failed to create bridge '{bridge_name}': {result['error']}"}
+                logger.info(f"Plain infrastructure: created bridge '{bridge_name}'")
+
+                result = self.send_command("/ip/address/add", {
+                    "address": bridge_ip,
+                    "interface": bridge_name,
+                    "comment": "Plain bridge address",
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"IP address: {result['error']}")
+
+                result = self.send_command("/ip/pool/add", {
+                    "name": pool_name,
+                    "ranges": pool_range,
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"Pool: {result['error']}")
+
+                result = self.send_command("/ip/dhcp-server/add", {
+                    "name": "dhcp-plain",
+                    "interface": bridge_name,
+                    "address-pool": pool_name,
+                    "disabled": "no",
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"DHCP server: {result['error']}")
+
+                plain_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
+                result = self.send_command("/ip/dhcp-server/network/add", {
+                    "address": plain_subnet,
+                    "gateway": bridge_ip.split("/")[0],
+                    "dns-server": "8.8.8.8,8.8.4.4",
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"DHCP network: {result['error']}")
+
+                result = self.send_command("/ip/firewall/nat/add", {
+                    "chain": "srcnat",
+                    "src-address": plain_subnet,
+                    "out-interface": "ether1",
+                    "action": "masquerade",
+                    "comment": "NAT for plain clients",
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"NAT: {result['error']}")
+
+            port_errors = []
+            for port in target_ports:
+                current_bridge = bridge_map.get(port, "")
+                if current_bridge == bridge_name:
+                    logger.info(f"{port} already in '{bridge_name}'; skipping")
+                    continue
+
+                if current_bridge:
+                    remove_result = self.remove_bridge_port(port, verify=False)
+                    if remove_result.get("error"):
+                        port_errors.append(f"{port}: remove from {current_bridge}: {remove_result['error']}")
+                        continue
+
+                add_result = self.add_bridge_port(port, bridge_name, verify=False)
+                if add_result.get("error"):
+                    port_errors.append(f"{port}: add to {bridge_name}: {add_result['error']}")
+
+            if port_errors:
+                return {
+                    "error": "Some ports failed during plain infrastructure setup",
+                    "partial_errors": port_errors + errors,
+                }
+
+            if errors:
+                logger.warning(f"Plain infrastructure setup completed with warnings: {errors}")
+                return {"success": True, "warnings": errors}
+            logger.info("Plain infrastructure setup completed successfully")
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Error setting up plain infrastructure: {e}")
+            return {"error": str(e), "partial_errors": errors}
+
+    def teardown_plain_infrastructure(
+        self,
+        ports_to_restore: List[str],
+        hotspot_bridge: str = "bridge",
+        bridge_name: str = "bridge-plain",
+        pool_name: str = "plain-pool",
+    ) -> Dict[str, Any]:
+        """
+        Tear down plain infrastructure and move ports back to hotspot bridge:
+        1. Move ports back to hotspot bridge
+        2. Remove DHCP server and network for bridge-plain
+        3. Remove IP address on bridge-plain
+        4. Remove bridge-plain
+        5. Remove plain IP pool
+        6. Remove NAT rule for plain clients
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        errors = []
+        try:
+            for port in (ports_to_restore or []):
+                r = self.add_bridge_port(port, hotspot_bridge, verify=False)
+                if r.get("error"):
+                    errors.append(f"Restore port {port}: {r['error']}")
+
+            dhcp_servers = self.send_command("/ip/dhcp-server/print")
+            if dhcp_servers.get("success") and dhcp_servers.get("data"):
+                for srv in dhcp_servers["data"]:
+                    if srv.get("name") == "dhcp-plain":
+                        sid = srv.get(".id")
+                        if sid:
+                            self.send_command("/ip/dhcp-server/remove", {"numbers": sid})
+                            logger.info("Removed DHCP server 'dhcp-plain'")
+
+            dhcp_networks = self.send_command("/ip/dhcp-server/network/print")
+            if dhcp_networks.get("success") and dhcp_networks.get("data"):
+                for net in dhcp_networks["data"]:
+                    if net.get("gateway") == "192.168.90.1":
+                        nid = net.get(".id")
+                        if nid:
+                            self.send_command("/ip/dhcp-server/network/remove", {"numbers": nid})
+                            logger.info("Removed DHCP network for plain bridge")
+
+            addrs = self.send_command("/ip/address/print")
+            if addrs.get("success") and addrs.get("data"):
+                for addr in addrs["data"]:
+                    if addr.get("interface") == bridge_name:
+                        aid = addr.get(".id")
+                        if aid:
+                            self.send_command("/ip/address/remove", {"numbers": aid})
+
+            bridges = self.send_command("/interface/bridge/print")
+            if bridges.get("success") and bridges.get("data"):
+                for br in bridges["data"]:
+                    if br.get("name") == bridge_name:
+                        bid = br.get(".id")
+                        if bid:
+                            self.send_command("/interface/bridge/remove", {"numbers": bid})
+                            logger.info(f"Removed bridge '{bridge_name}'")
+
+            pools = self.send_command("/ip/pool/print")
+            if pools.get("success") and pools.get("data"):
+                for pool in pools["data"]:
+                    if pool.get("name") == pool_name:
+                        pid = pool.get(".id")
+                        if pid:
+                            self.send_command("/ip/pool/remove", {"numbers": pid})
+                            logger.info(f"Removed IP pool '{pool_name}'")
+
+            nats = self.send_command("/ip/firewall/nat/print")
+            if nats.get("success") and nats.get("data"):
+                for nat in nats["data"]:
+                    if nat.get("comment") == "NAT for plain clients":
+                        nid = nat.get(".id")
+                        if nid:
+                            self.send_command("/ip/firewall/nat/remove", {"numbers": nid})
+                            logger.info("Removed plain NAT rule")
+
+            if errors:
+                return {"success": True, "warnings": errors}
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Error tearing down plain infrastructure: {e}")
+            return {"error": str(e), "partial_errors": errors}
+
+    def restore_ports_from_plain(
+        self,
+        ports: List[str],
+        hotspot_bridge: str = "bridge",
+        bridge_name: str = "bridge-plain",
+    ) -> Dict[str, Any]:
+        """Move specific ports from bridge-plain back to the hotspot bridge
+        without destroying the shared plain infrastructure."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            unique_ports = list(dict.fromkeys(ports or []))
+            if not unique_ports:
+                return {"success": True}
+
+            bridge_map = {}
+            bp_result = self.send_command("/interface/bridge/port/print")
+            if bp_result.get("success"):
+                for bp in bp_result.get("data", []):
+                    bridge_map[bp.get("interface", "")] = bp.get("bridge", "")
+
+            errors = []
+            for port in unique_ports:
+                current = bridge_map.get(port, "")
+                if current == hotspot_bridge:
+                    logger.info(f"{port} already in hotspot bridge '{hotspot_bridge}'; skipping restore")
+                    continue
+                restore = self.add_bridge_port(port, hotspot_bridge, verify=False)
+                if restore.get("error"):
+                    errors.append(f"{port}: {restore['error']}")
+
+            if errors:
+                return {"error": "Failed to restore plain ports: " + "; ".join(errors)}
+            return {"success": True, "ports": unique_ports}
+        except Exception as e:
+            logger.error(f"Error restoring plain ports: {e}")
+            return {"error": str(e)}
+
+    # =========================================================================
     # MONITORING & DIAGNOSTICS
     # =========================================================================
 

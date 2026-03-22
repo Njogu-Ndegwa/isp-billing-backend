@@ -27,7 +27,7 @@ _OVERVIEW_CACHE_TTL = 60  # 60 seconds
 # Sync helpers (run in thread pool)
 # ---------------------------------------------------------------------------
 
-def _hotspot_overview_sync(router_info: dict, db_pppoe_ports: list) -> dict:
+def _hotspot_overview_sync(router_info: dict, db_pppoe_ports: list, db_plain_ports: list = None) -> dict:
     """Gather all hotspot infrastructure data in one connection."""
     api = MikroTikAPI(
         router_info["ip"], router_info["username"],
@@ -67,13 +67,13 @@ def _hotspot_overview_sync(router_info: dict, db_pppoe_ports: list) -> dict:
         ifaces = {i["name"]: i for i in ifaces_data.get("data", [])} if ifaces_data.get("success") else {}
 
         port_bridge_map = {p["interface"]: p["bridge"] for p in bridge_ports}
-        pppoe_port_set = set(db_pppoe_ports or [])
+        excluded_ports = set(db_pppoe_ports or []) | set(db_plain_ports or [])
         hotspot_ports = []
         any_port_up = False
         for port_name, iface in ifaces.items():
             if iface.get("type") != "ether" or port_name == "ether1":
                 continue
-            if port_name in pppoe_port_set:
+            if port_name in excluded_ports:
                 continue
             actual_bridge = port_bridge_map.get(port_name)
             link_up = iface.get("running", False)
@@ -230,7 +230,8 @@ async def hotspot_overview(
         "password": router_obj.password, "port": router_obj.port,
     }
     result = await run_with_guard(
-        router_id, _hotspot_overview_sync, router_info, router_obj.pppoe_ports or [],
+        router_id, _hotspot_overview_sync, router_info,
+        router_obj.pppoe_ports or [], router_obj.plain_ports or [],
     )
 
     if result.get("error") == "connect_failed":

@@ -2435,6 +2435,8 @@ def _get_port_status_sync(router_info: dict) -> dict:
             attachment = attachment_map.get(name, {})
             if name in pppoe_ports:
                 service = "pppoe"
+            elif bridge == "bridge-plain":
+                service = "plain"
             elif bridge:
                 service = "hotspot"
             else:
@@ -2484,8 +2486,9 @@ async def get_router_port_status(
     token: str = Depends(verify_token),
 ):
     """
-    Show every ethernet port with bridge assignment, service mode (hotspot/pppoe/unassigned),
-    link status, speed, and error counters. Cached for 30s unless ?refresh=true.
+    Show every ethernet port with bridge assignment, service mode
+    (hotspot/pppoe/plain/unassigned), link status, speed, and error counters.
+    Cached for 30s unless ?refresh=true.
     """
     user = await get_current_user(token, db)
     router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
@@ -2524,21 +2527,31 @@ async def get_router_port_status(
 
     # Auto-correct DB to match the router reality so retries start clean
     actual_pppoe = sorted(p["port"] for p in result["ports"] if p["service"] == "pppoe")
+    actual_plain = sorted(p["port"] for p in result["ports"] if p["service"] == "plain")
     db_pppoe = sorted(router_obj.pppoe_ports or [])
+    db_plain = sorted(router_obj.plain_ports or [])
     db_corrected = False
+    corrections = []
     if actual_pppoe != db_pppoe:
         router_obj.pppoe_ports = actual_pppoe if actual_pppoe else None
-        await db.commit()
         db_corrected = True
+        corrections.append(f"pppoe_ports: {db_pppoe} -> {actual_pppoe}")
+    if actual_plain != db_plain:
+        router_obj.plain_ports = actual_plain if actual_plain else None
+        db_corrected = True
+        corrections.append(f"plain_ports: {db_plain} -> {actual_plain}")
+    if db_corrected:
+        await db.commit()
         logger.warning(
-            f"Router {router_id}: corrected pppoe_ports from {db_pppoe} to {actual_pppoe} "
-            f"to match router reality"
+            f"Router {router_id}: corrected port config to match router reality: "
+            + "; ".join(corrections)
         )
 
     response = {
         "router_id": router_id,
         "router_name": router_obj.name,
         "pppoe_ports": actual_pppoe,
+        "plain_ports": actual_plain,
         "generated_at": datetime.utcnow().isoformat(),
         "cached": False,
         "ports": result["ports"],
@@ -2548,8 +2561,7 @@ async def get_router_port_status(
     if db_corrected:
         response["db_corrected"] = True
         response["correction_detail"] = (
-            f"Database was out of sync with router (had {db_pppoe}, "
-            f"router actually has {actual_pppoe}). Database has been corrected."
+            f"Database was out of sync with router. Corrections: {'; '.join(corrections)}"
         )
 
     _port_status_cache[router_id] = {
@@ -2613,6 +2625,7 @@ async def get_router_interfaces(
     return {
         "interfaces": result.get("data", []),
         "pppoe_ports": router_obj.pppoe_ports or [],
+        "plain_ports": router_obj.plain_ports or [],
     }
 
 
@@ -2817,6 +2830,16 @@ async def set_pppoe_ports(
         if port == "ether1":
             raise HTTPException(status_code=400, detail="ether1 is the WAN port and cannot be used for PPPoE")
 
+    # Overlap check: PPPoE ports must not overlap with plain ports
+    current_plain = set(router_obj.plain_ports or [])
+    overlap = current_plain.intersection(request.ports)
+    if overlap:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ports already assigned to plain (no-auth) mode: {', '.join(sorted(overlap))}. "
+                   f"Remove them from plain mode first.",
+        )
+
     old_ports = router_obj.pppoe_ports or []
     new_ports = request.ports
 
@@ -2861,4 +2884,181 @@ async def set_pppoe_ports(
         "pppoe_ports": new_ports,
         "warnings": result.get("warnings", []),
         "message": f"PPPoE ports configured: {', '.join(new_ports)}" if new_ports else "PPPoE ports cleared",
+    }
+
+
+# =========================================================================
+# PLAIN (NO-AUTH) PORT CONFIGURATION
+# =========================================================================
+
+class SetPlainPortsRequest(BaseModel):
+    ports: List[str]
+
+
+def _apply_plain_ports_sync(router_info: dict, new_ports: list, old_ports: list) -> dict:
+    """Apply plain port configuration to the live router (sync, runs in thread pool)."""
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=30,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        target_ports = list(dict.fromkeys(new_ports or []))
+
+        # Clearing plain ports entirely: restore and tear down infra.
+        if not target_ports:
+            if old_ports:
+                teardown = api.teardown_plain_infrastructure(ports_to_restore=old_ports)
+                if teardown.get("error"):
+                    teardown["current_ports"] = old_ports
+                    return teardown
+
+                time.sleep(0.1)
+                verify = api.verify_port_bridges(
+                    {p: "bridge" for p in old_ports},
+                    retries=8,
+                    delay=0.5,
+                )
+                if verify.get("error"):
+                    return {
+                        "error": (
+                            f"Plain teardown commands ran but ports may not have restored: "
+                            f"{verify['error']}"
+                        ),
+                        "failed_ports": verify.get("failed_ports", []),
+                        "current_ports": old_ports,
+                    }
+
+            return {
+                "success": True,
+                "message": "Plain ports cleared, all ports restored to hotspot bridge",
+                "current_ports": old_ports,
+            }
+
+        # Restore ports no longer requested back to hotspot bridge.
+        ports_to_restore = [p for p in (old_ports or []) if p not in target_ports]
+        if ports_to_restore:
+            restore_result = api.restore_ports_from_plain(ports_to_restore, hotspot_bridge="bridge")
+            if restore_result.get("error"):
+                return {
+                    "error": restore_result["error"],
+                    "current_ports": old_ports,
+                }
+
+        # Set up or extend plain infrastructure for the requested ports.
+        setup_result = api.setup_plain_infrastructure(plain_ports=target_ports)
+        if setup_result.get("error"):
+            setup_result["current_ports"] = old_ports
+            return setup_result
+
+        # Verify ports landed in the correct bridge.
+        time.sleep(0.1)
+        expected = {p: "bridge-plain" for p in target_ports}
+        if ports_to_restore:
+            expected.update({p: "bridge" for p in ports_to_restore})
+        verify = api.verify_port_bridges(expected, retries=8, delay=0.5)
+        if verify.get("error"):
+            failed = verify.get("failed_ports", [])
+            details = "; ".join(
+                f"{f['port']} is in '{f['actual_bridge']}' (expected '{f['expected_bridge']}')"
+                for f in failed
+            ) if failed else verify["error"]
+            return {
+                "error": (
+                    f"Plain port commands ran but bridge layout doesn't match: {details}. "
+                    f"The router may have applied the change slowly or partially."
+                ),
+                "failed_ports": failed,
+                "current_ports": old_ports,
+            }
+
+        return {
+            "success": True,
+            "message": f"Plain ports configured: {', '.join(target_ports)}",
+            "current_ports": target_ports,
+            "warnings": setup_result.get("warnings", []),
+        }
+    finally:
+        api.disconnect()
+
+
+@router.put("/api/routers/{router_id}/plain-ports")
+async def set_plain_ports(
+    router_id: int,
+    request: SetPlainPortsRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Configure which ethernet ports run in plain (no-auth) mode.
+    Ports are moved to a dedicated bridge with DHCP and NAT but no hotspot
+    or PPPoE, so clients get internet immediately without authentication.
+    Pass an empty list to remove plain mode and restore all ports to hotspot.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    for port in request.ports:
+        if port == "ether1":
+            raise HTTPException(status_code=400, detail="ether1 is the WAN port and cannot be used for plain mode")
+
+    # Overlap check: plain ports must not overlap with PPPoE ports
+    current_pppoe = set(router_obj.pppoe_ports or [])
+    overlap = current_pppoe.intersection(request.ports)
+    if overlap:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ports already assigned to PPPoE: {', '.join(sorted(overlap))}. "
+                   f"Remove them from PPPoE first.",
+        )
+
+    old_ports = router_obj.plain_ports or []
+    new_ports = request.ports
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    started_at = time.perf_counter()
+    result = await asyncio.to_thread(_apply_plain_ports_sync, router_info, new_ports, old_ports)
+    logger.info(
+        "Plain port sync for router %s completed in %.2fs (requested=%s)",
+        router_id,
+        time.perf_counter() - started_at,
+        ",".join(new_ports) if new_ports else "(none)",
+    )
+
+    _port_status_cache.pop(router_id, None)
+
+    if result.get("error") == "connect_failed":
+        raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
+    if result.get("error"):
+        failed_ports = result.get("failed_ports", [])
+        detail = {
+            "message": result["error"],
+            "failed_ports": failed_ports,
+            "plain_ports_unchanged": result.get("current_ports", old_ports),
+        }
+        if result.get("partial_errors"):
+            detail["partial_errors"] = result.get("partial_errors", [])
+        raise HTTPException(status_code=500, detail=detail)
+
+    router_obj.plain_ports = new_ports if new_ports else None
+    await db.commit()
+
+    return {
+        "success": True,
+        "router_id": router_id,
+        "plain_ports": new_ports,
+        "warnings": result.get("warnings", []),
+        "message": f"Plain ports configured: {', '.join(new_ports)}" if new_ports else "Plain ports cleared",
     }

@@ -58,7 +58,21 @@ async def migrate_db():
                 "ALTER TABLE mpesa_transactions ADD COLUMN failure_source failuresource"
             ))
             print("  Added column: mpesa_transactions.failure_source")
-    
+
+        # Check which columns already exist on routers
+        def get_router_columns(connection):
+            insp = inspect(connection)
+            return [col["name"] for col in insp.get_columns("routers")]
+
+        router_columns = await conn.run_sync(get_router_columns)
+
+        # Add plain_ports column if missing (no-auth port mode)
+        if "plain_ports" not in router_columns:
+            await conn.execute(text(
+                "ALTER TABLE routers ADD COLUMN plain_ports JSON NULL"
+            ))
+            print("  Added column: routers.plain_ports")
+
     print("Database migration completed!")
 
 
