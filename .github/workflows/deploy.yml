@@ -44,7 +44,8 @@ jobs:
           
           echo "[2/7] Pulling latest code from GitHub..."
           git config --global --add safe.directory ~/apps/isp-billing
-          git pull origin main || { echo "ERROR: Git pull failed"; exit 1; }
+          git fetch origin main || { echo "ERROR: Git fetch failed"; exit 1; }
+          git reset --hard origin/main || { echo "ERROR: Git reset failed"; exit 1; }
           echo "Git pull successful"
           
           echo "[3/7] Checking disk space..."
