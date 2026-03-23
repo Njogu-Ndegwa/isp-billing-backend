@@ -6,7 +6,7 @@ from typing import Optional, List
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User, RouterAvailabilityCheck
+from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User, RouterAvailabilityCheck, ProvisioningToken, Voucher, RouterLogEntry
 from app.services.auth import verify_token, get_current_user
 from app.services.router_availability import build_router_status
 import logging
@@ -491,6 +491,21 @@ async def delete_router(
             update(BandwidthSnapshot)
             .where(BandwidthSnapshot.router_id == router_id)
             .values(router_id=None)
+        )
+        await db.execute(
+            update(ProvisioningToken)
+            .where(ProvisioningToken.router_id == router_id)
+            .values(router_id=None)
+        )
+        await db.execute(
+            update(Voucher)
+            .where(Voucher.router_id == router_id)
+            .values(router_id=None)
+        )
+        from sqlalchemy import delete as sql_delete
+        await db.execute(
+            sql_delete(RouterLogEntry)
+            .where(RouterLogEntry.router_id == router_id)
         )
         
         await db.delete(router_obj)
