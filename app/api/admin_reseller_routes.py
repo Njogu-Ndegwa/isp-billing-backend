@@ -9,6 +9,7 @@ from app.db.database import get_db
 from app.db.models import (
     User, UserRole, Router, Customer, CustomerStatus,
     CustomerPayment, Plan, ResellerFinancials, ResellerPayout,
+    PaymentMethod,
 )
 from app.services.auth import verify_token, get_current_user
 
@@ -17,6 +18,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["admin-resellers"])
+
+# Only mobile_money payments flow through the admin's M-Pesa shortcode.
+# Cash and voucher payments are collected directly by the reseller.
+MPESA_FILTER = CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY
+
+
+def _parse_date(value: str, param_name: str = "date") -> datetime:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid {param_name} format, use YYYY-MM-DD")
 
 
 async def _require_admin(token: str, db: AsyncSession) -> User:
@@ -36,12 +48,19 @@ async def _get_reseller_or_404(db: AsyncSession, reseller_id: int) -> User:
     return reseller
 
 
-async def _unpaid_balance(db: AsyncSession, reseller_id: int, total_revenue: float) -> float:
-    payout_stmt = select(func.coalesce(func.sum(ResellerPayout.amount), 0)).where(
+async def _total_payouts(db: AsyncSession, reseller_id: int) -> float:
+    stmt = select(func.coalesce(func.sum(ResellerPayout.amount), 0)).where(
         ResellerPayout.reseller_id == reseller_id
     )
-    total_paid = float((await db.execute(payout_stmt)).scalar())
-    return round(total_revenue - total_paid, 2)
+    return float((await db.execute(stmt)).scalar())
+
+
+async def _mpesa_revenue(db: AsyncSession, reseller_id: int) -> float:
+    """Revenue that landed in admin's M-Pesa (excludes cash/voucher)."""
+    stmt = select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+        CustomerPayment.reseller_id == reseller_id, MPESA_FILTER
+    )
+    return float((await db.execute(stmt)).scalar())
 
 
 # ---------------------------------------------------------------------------
@@ -51,10 +70,31 @@ async def _unpaid_balance(db: AsyncSession, reseller_id: int, total_revenue: flo
 async def list_resellers(
     sort_by: Optional[str] = Query(None, regex="^(revenue|customers|created_at|last_login)$"),
     search: Optional[str] = None,
+    date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
+    """
+    List all resellers with summary stats.
+    Optional date filtering for revenue figures:
+      ?date=2026-03-22           -- single day
+      ?start_date=...&end_date=  -- range
+    Without date params, shows all-time figures.
+    """
     await _require_admin(token, db)
+
+    # Build optional date window for revenue queries
+    date_filters = []
+    if date:
+        d = _parse_date(date)
+        date_filters = [CustomerPayment.created_at >= d, CustomerPayment.created_at < d + timedelta(days=1)]
+    else:
+        if start_date:
+            date_filters.append(CustomerPayment.created_at >= _parse_date(start_date, "start_date"))
+        if end_date:
+            date_filters.append(CustomerPayment.created_at < _parse_date(end_date, "end_date") + timedelta(days=1))
 
     stmt = select(User).where(User.role == UserRole.RESELLER)
     if search:
@@ -77,8 +117,20 @@ async def list_resellers(
             select(func.count(Router.id)).where(Router.user_id == r.id)
         )).scalar() or 0
 
-        total_revenue = float(fin.total_revenue) if fin else 0.0
-        balance = await _unpaid_balance(db, r.id, total_revenue)
+        # Revenue in the requested period (all methods)
+        rev_filters = [CustomerPayment.reseller_id == r.id] + date_filters
+        total_revenue = float((await db.execute(
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*rev_filters)
+        )).scalar())
+
+        # M-Pesa-only revenue in the requested period (what admin collected)
+        mpesa_rev = float((await db.execute(
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*rev_filters, MPESA_FILTER)
+        )).scalar())
+
+        # Unpaid balance is always all-time M-Pesa revenue minus total payouts
+        all_time_mpesa = await _mpesa_revenue(db, r.id)
+        paid = await _total_payouts(db, r.id)
 
         items.append({
             "id": r.id,
@@ -90,11 +142,12 @@ async def list_resellers(
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "last_login_at": r.last_login_at.isoformat() if r.last_login_at else None,
             "total_revenue": total_revenue,
+            "mpesa_revenue": mpesa_rev,
             "total_customers": fin.total_customers if fin else 0,
             "active_customers": fin.active_customers if fin else 0,
             "last_payment_date": fin.last_payment_date.isoformat() if fin and fin.last_payment_date else None,
             "router_count": router_count,
-            "unpaid_balance": balance,
+            "unpaid_balance": round(all_time_mpesa - paid, 2),
         })
 
     if sort_by == "revenue":
@@ -113,9 +166,17 @@ async def list_resellers(
 @router.get("/api/admin/resellers/{reseller_id}")
 async def get_reseller_detail(
     reseller_id: int,
+    date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
+    """
+    Reseller detail with revenue breakdown.
+    Optional ?date=YYYY-MM-DD or ?start_date=&end_date= to see a specific period.
+    Without date params you get the standard today/week/month/all_time breakdown.
+    """
     await _require_admin(token, db)
     r = await _get_reseller_or_404(db, reseller_id)
 
@@ -124,24 +185,47 @@ async def get_reseller_detail(
     week_start = today_start - timedelta(days=now.weekday())
     month_start = datetime(now.year, now.month, 1)
 
-    async def _revenue_since(since: datetime) -> float:
-        s = select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
-            CustomerPayment.reseller_id == reseller_id,
-            CustomerPayment.created_at >= since,
-        )
-        return float((await db.execute(s)).scalar())
+    base = [CustomerPayment.reseller_id == reseller_id]
 
-    all_time_stmt = select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
-        CustomerPayment.reseller_id == reseller_id
-    )
-    all_time_revenue = float((await db.execute(all_time_stmt)).scalar())
+    async def _rev(extra_filters=None) -> dict:
+        """Return {total, mpesa} revenue for given filters."""
+        f = base + (extra_filters or [])
+        total = float((await db.execute(
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*f)
+        )).scalar())
+        mpesa = float((await db.execute(
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*f, MPESA_FILTER)
+        )).scalar())
+        return {"total": total, "mpesa": mpesa}
 
-    revenue = {
-        "today": await _revenue_since(today_start),
-        "this_week": await _revenue_since(week_start),
-        "this_month": await _revenue_since(month_start),
-        "all_time": all_time_revenue,
-    }
+    # If a specific date/range is requested, return that instead of the standard breakdown
+    if date or start_date or end_date:
+        date_filters = []
+        if date:
+            d = _parse_date(date)
+            date_filters = [CustomerPayment.created_at >= d, CustomerPayment.created_at < d + timedelta(days=1)]
+        else:
+            if start_date:
+                date_filters.append(CustomerPayment.created_at >= _parse_date(start_date, "start_date"))
+            if end_date:
+                date_filters.append(CustomerPayment.created_at < _parse_date(end_date, "end_date") + timedelta(days=1))
+        period_rev = await _rev(date_filters)
+        revenue = {"period": period_rev["total"], "period_mpesa": period_rev["mpesa"]}
+    else:
+        today_rev = await _rev([CustomerPayment.created_at >= today_start])
+        week_rev = await _rev([CustomerPayment.created_at >= week_start])
+        month_rev = await _rev([CustomerPayment.created_at >= month_start])
+        all_rev = await _rev()
+        revenue = {
+            "today": today_rev["total"],
+            "today_mpesa": today_rev["mpesa"],
+            "this_week": week_rev["total"],
+            "this_week_mpesa": week_rev["mpesa"],
+            "this_month": month_rev["total"],
+            "this_month_mpesa": month_rev["mpesa"],
+            "all_time": all_rev["total"],
+            "all_time_mpesa": all_rev["mpesa"],
+        }
 
     # Customer counts by status
     cust_stmt = select(
@@ -189,11 +273,9 @@ async def get_reseller_detail(
         for p, c, pl in recent_result
     ]
 
-    # Payout summary
-    total_paid_stmt = select(func.coalesce(func.sum(ResellerPayout.amount), 0)).where(
-        ResellerPayout.reseller_id == reseller_id
-    )
-    total_paid = float((await db.execute(total_paid_stmt)).scalar())
+    # Payout summary (always all-time, based on M-Pesa revenue only)
+    all_time_mpesa = await _mpesa_revenue(db, reseller_id)
+    total_paid = await _total_payouts(db, reseller_id)
 
     last_payout_stmt = select(func.max(ResellerPayout.created_at)).where(
         ResellerPayout.reseller_id == reseller_id
@@ -221,7 +303,7 @@ async def get_reseller_detail(
         "payouts": {
             "total_paid": total_paid,
             "last_payout_date": last_payout_date.isoformat() if last_payout_date else None,
-            "unpaid_balance": round(all_time_revenue - total_paid, 2),
+            "unpaid_balance": round(all_time_mpesa - total_paid, 2),
         },
     }
 
@@ -274,6 +356,11 @@ async def get_reseller_payments(
     summary = (await db.execute(summary_stmt)).one()
     total_count, total_amount = int(summary[0]), float(summary[1])
 
+    # M-Pesa only total (what admin collected, excludes cash/voucher)
+    mpesa_amount = float((await db.execute(
+        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*base_filter, MPESA_FILTER)
+    )).scalar())
+
     # Paginated results
     offset = (page - 1) * per_page
     payments_stmt = (
@@ -310,6 +397,7 @@ async def get_reseller_payments(
         "summary": {
             "total_transactions": total_count,
             "total_amount": round(total_amount, 2),
+            "mpesa_amount": round(mpesa_amount, 2),
         },
         "payments": payments,
     }
@@ -388,14 +476,21 @@ async def admin_dashboard(
     )).scalar() or 0
 
     # Revenue across all resellers
-    async def _total_revenue_since(since: datetime) -> float:
-        s = select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
-            CustomerPayment.created_at >= since
-        )
-        return float((await db.execute(s)).scalar())
+    async def _total_revenue_since(since: datetime) -> dict:
+        f = [CustomerPayment.created_at >= since]
+        total = float((await db.execute(
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*f)
+        )).scalar())
+        mpesa = float((await db.execute(
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*f, MPESA_FILTER)
+        )).scalar())
+        return {"total": total, "mpesa": mpesa}
 
     all_time_revenue = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0))
+    )).scalar())
+    all_time_mpesa_revenue = float((await db.execute(
+        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(MPESA_FILTER)
     )).scalar())
 
     # Customer counts
@@ -440,7 +535,7 @@ async def admin_dashboard(
         select(func.coalesce(func.sum(ResellerPayout.amount), 0))
     )).scalar())
 
-    total_unpaid = round(all_time_revenue - total_payouts, 2)
+    total_unpaid = round(all_time_mpesa_revenue - total_payouts, 2)
 
     # Recent 10 reseller sign-ups
     recent_stmt = (
@@ -461,16 +556,24 @@ async def admin_dashboard(
         for u in recent_result.scalars().all()
     ]
 
+    today_rev = await _total_revenue_since(today_start)
+    week_rev = await _total_revenue_since(week_start)
+    month_rev = await _total_revenue_since(month_start)
+
     return {
         "resellers": {
             "total": total_resellers,
             "active_last_30_days": active_resellers,
         },
         "revenue": {
-            "today": await _total_revenue_since(today_start),
-            "this_week": await _total_revenue_since(week_start),
-            "this_month": await _total_revenue_since(month_start),
+            "today": today_rev["total"],
+            "today_mpesa": today_rev["mpesa"],
+            "this_week": week_rev["total"],
+            "this_week_mpesa": week_rev["mpesa"],
+            "this_month": month_rev["total"],
+            "this_month_mpesa": month_rev["mpesa"],
             "all_time": all_time_revenue,
+            "all_time_mpesa": all_time_mpesa_revenue,
         },
         "customers": {
             "total": total_customers,
@@ -543,13 +646,10 @@ async def record_payout(
     await db.commit()
     await db.refresh(payout)
 
-    # Compute updated unpaid balance
-    total_revenue = float((await db.execute(
-        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
-            CustomerPayment.reseller_id == reseller_id
-        )
-    )).scalar())
-    balance = await _unpaid_balance(db, reseller_id, total_revenue)
+    # Compute updated unpaid balance (M-Pesa revenue only)
+    mpesa_rev = await _mpesa_revenue(db, reseller_id)
+    paid = await _total_payouts(db, reseller_id)
+    balance = round(mpesa_rev - paid, 2)
 
     return {
         "payout": {
