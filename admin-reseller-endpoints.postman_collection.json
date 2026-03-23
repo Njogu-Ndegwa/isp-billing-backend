@@ -119,6 +119,36 @@
                 },
                 "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
             }
+        },
+        {
+            "name": "Delete Reseller (Dry Run)",
+            "request": {
+                "method": "DELETE",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/resellers/1",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "resellers", "1"],
+                    "query": [
+                        {"key": "confirm", "value": "false", "description": "Set to true to actually delete"}
+                    ]
+                },
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
+            }
+        },
+        {
+            "name": "Delete Reseller (Confirm)",
+            "request": {
+                "method": "DELETE",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/resellers/1?confirm=true",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "resellers", "1"],
+                    "query": [
+                        {"key": "confirm", "value": "true", "description": "DANGER: Actually deletes the reseller and all data"}
+                    ]
+                },
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}
+            }
         }
     ]
 }

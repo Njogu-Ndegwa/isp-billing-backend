@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text, delete, update
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
@@ -9,9 +9,13 @@ from app.db.database import get_db
 from app.db.models import (
     User, UserRole, Router, Customer, CustomerStatus,
     CustomerPayment, Plan, ResellerFinancials, ResellerPayout,
-    PaymentMethod,
+    PaymentMethod, Payment, ProvisioningToken, Voucher,
+    Subscription, CustomerRating, UserBandwidthUsage,
+    MpesaTransaction, ProvisioningLog, BandwidthSnapshot,
+    RouterLogEntry, RouterAvailabilityCheck,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services.provisioning import remove_wireguard_peer
 
 import logging
 
@@ -66,9 +70,27 @@ async def _mpesa_revenue(db: AsyncSession, reseller_id: int) -> float:
 # ---------------------------------------------------------------------------
 # 1. GET /api/admin/resellers -- List All Resellers
 # ---------------------------------------------------------------------------
+VALID_SORT_FIELDS = {
+    "revenue", "mpesa_revenue", "customers", "created_at",
+    "last_login", "unpaid_balance", "router_count",
+}
+VALID_FILTERS = {
+    "unpaid",       # unpaid_balance > 0
+    "paid_up",      # unpaid_balance <= 0
+    "active",       # logged in within 30 days
+    "inactive",     # never logged in or >30 days ago
+    "has_routers",  # owns at least 1 router
+    "no_routers",   # owns 0 routers
+    "has_revenue",  # has revenue in the selected period
+    "no_revenue",   # zero revenue in the selected period
+}
+
+
 @router.get("/api/admin/resellers")
 async def list_resellers(
-    sort_by: Optional[str] = Query(None, regex="^(revenue|customers|created_at|last_login)$"),
+    sort_by: Optional[str] = Query(None, description="Sort field: revenue, mpesa_revenue, customers, created_at, last_login, unpaid_balance, router_count"),
+    sort_order: Optional[str] = Query("desc", regex="^(asc|desc)$"),
+    filter: Optional[str] = Query(None, description="Filter: unpaid, paid_up, active, inactive, has_routers, no_routers, has_revenue, no_revenue"),
     search: Optional[str] = None,
     date: Optional[str] = None,
     start_date: Optional[str] = None,
@@ -78,12 +100,44 @@ async def list_resellers(
 ):
     """
     List all resellers with summary stats.
-    Optional date filtering for revenue figures:
+
+    Filtering:
+      ?filter=unpaid            -- only resellers you owe money to
+      ?filter=paid_up           -- fully paid resellers
+      ?filter=active            -- logged in within last 30 days
+      ?filter=inactive          -- not logged in for 30+ days
+      ?filter=has_routers       -- has at least one router
+      ?filter=no_routers        -- no routers yet
+      ?filter=has_revenue       -- has revenue in selected period
+      ?filter=no_revenue        -- zero revenue in selected period
+
+    Sorting:
+      ?sort_by=unpaid_balance&sort_order=desc  -- who you owe the most
+      ?sort_by=revenue&sort_order=desc         -- top earners
+      ?sort_by=mpesa_revenue                   -- by M-Pesa revenue
+      ?sort_by=customers                       -- by active customer count
+      ?sort_by=router_count                    -- by number of routers
+      ?sort_by=created_at&sort_order=asc       -- oldest first
+      ?sort_by=last_login                      -- most recent login first
+
+    Date filtering for revenue figures:
       ?date=2026-03-22           -- single day
       ?start_date=...&end_date=  -- range
-    Without date params, shows all-time figures.
     """
     await _require_admin(token, db)
+
+    if sort_by and sort_by not in VALID_SORT_FIELDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sort_by. Choose from: {', '.join(sorted(VALID_SORT_FIELDS))}"
+        )
+    if filter and filter not in VALID_FILTERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid filter. Choose from: {', '.join(sorted(VALID_FILTERS))}"
+        )
+
+    descending = sort_order != "asc"
 
     # Build optional date window for revenue queries
     date_filters = []
@@ -102,6 +156,15 @@ async def list_resellers(
         stmt = stmt.where(
             User.email.ilike(pattern) | User.organization_name.ilike(pattern)
         )
+
+    # Pre-filter at DB level for login-based filters
+    now = datetime.utcnow()
+    active_cutoff = now - timedelta(days=30)
+    if filter == "active":
+        stmt = stmt.where(User.last_login_at >= active_cutoff)
+    elif filter == "inactive":
+        stmt = stmt.where((User.last_login_at == None) | (User.last_login_at < active_cutoff))
+
     stmt = stmt.order_by(User.created_at.desc())
     result = await db.execute(stmt)
     resellers = result.scalars().all()
@@ -131,8 +194,9 @@ async def list_resellers(
         # Unpaid balance is always all-time M-Pesa revenue minus total payouts
         all_time_mpesa = await _mpesa_revenue(db, r.id)
         paid = await _total_payouts(db, r.id)
+        unpaid = round(all_time_mpesa - paid, 2)
 
-        items.append({
+        item = {
             "id": r.id,
             "email": r.email,
             "organization_name": r.organization_name,
@@ -147,17 +211,43 @@ async def list_resellers(
             "active_customers": fin.active_customers if fin else 0,
             "last_payment_date": fin.last_payment_date.isoformat() if fin and fin.last_payment_date else None,
             "router_count": router_count,
-            "unpaid_balance": round(all_time_mpesa - paid, 2),
-        })
+            "unpaid_balance": unpaid,
+        }
 
-    if sort_by == "revenue":
-        items.sort(key=lambda x: x["total_revenue"], reverse=True)
-    elif sort_by == "customers":
-        items.sort(key=lambda x: x["active_customers"], reverse=True)
-    elif sort_by == "last_login":
-        items.sort(key=lambda x: x["last_login_at"] or "", reverse=True)
+        # Apply post-query filters that depend on computed values
+        if filter == "unpaid" and unpaid <= 0:
+            continue
+        if filter == "paid_up" and unpaid > 0:
+            continue
+        if filter == "has_routers" and router_count == 0:
+            continue
+        if filter == "no_routers" and router_count > 0:
+            continue
+        if filter == "has_revenue" and total_revenue == 0:
+            continue
+        if filter == "no_revenue" and total_revenue > 0:
+            continue
 
-    return {"total": len(items), "resellers": items}
+        items.append(item)
+
+    # Sort
+    sort_key_map = {
+        "revenue": lambda x: x["total_revenue"],
+        "mpesa_revenue": lambda x: x["mpesa_revenue"],
+        "customers": lambda x: x["active_customers"],
+        "created_at": lambda x: x["created_at"] or "",
+        "last_login": lambda x: x["last_login_at"] or "",
+        "unpaid_balance": lambda x: x["unpaid_balance"],
+        "router_count": lambda x: x["router_count"],
+    }
+    if sort_by and sort_by in sort_key_map:
+        items.sort(key=sort_key_map[sort_by], reverse=descending)
+
+    return {
+        "total": len(items),
+        "filters_applied": {"sort_by": sort_by, "sort_order": sort_order, "filter": filter, "search": search},
+        "resellers": items,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -741,4 +831,222 @@ async def get_payout_history(
             "total_amount": round(total_amount, 2),
         },
         "payouts": payouts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. DELETE /api/admin/resellers/{reseller_id} -- Delete Reseller
+# ---------------------------------------------------------------------------
+async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict:
+    """Collect counts of everything that would be deleted for a reseller."""
+    customer_ids_stmt = select(Customer.id).where(Customer.user_id == reseller_id)
+    router_ids_stmt = select(Router.id).where(Router.user_id == reseller_id)
+
+    async def _count(model, col, sub):
+        return (await db.execute(select(func.count(model.id)).where(col.in_(sub)))).scalar() or 0
+
+    customers = (await db.execute(
+        select(func.count(Customer.id)).where(Customer.user_id == reseller_id)
+    )).scalar() or 0
+    routers = (await db.execute(
+        select(func.count(Router.id)).where(Router.user_id == reseller_id)
+    )).scalar() or 0
+    plans = (await db.execute(
+        select(func.count(Plan.id)).where(Plan.user_id == reseller_id)
+    )).scalar() or 0
+    vouchers = (await db.execute(
+        select(func.count(Voucher.id)).where(Voucher.user_id == reseller_id)
+    )).scalar() or 0
+    customer_payments = (await db.execute(
+        select(func.count(CustomerPayment.id)).where(CustomerPayment.reseller_id == reseller_id)
+    )).scalar() or 0
+    provisioning_tokens = (await db.execute(
+        select(func.count(ProvisioningToken.id)).where(ProvisioningToken.user_id == reseller_id)
+    )).scalar() or 0
+    payouts = (await db.execute(
+        select(func.count(ResellerPayout.id)).where(ResellerPayout.reseller_id == reseller_id)
+    )).scalar() or 0
+
+    payments = await _count(Payment, Payment.customer_id, customer_ids_stmt)
+    mpesa_transactions = await _count(MpesaTransaction, MpesaTransaction.customer_id, customer_ids_stmt)
+    provisioning_logs_c = await _count(ProvisioningLog, ProvisioningLog.customer_id, customer_ids_stmt)
+    provisioning_logs_r = await _count(ProvisioningLog, ProvisioningLog.router_id, router_ids_stmt)
+    customer_ratings = await _count(CustomerRating, CustomerRating.customer_id, customer_ids_stmt)
+    bandwidth_usage = await _count(UserBandwidthUsage, UserBandwidthUsage.customer_id, customer_ids_stmt)
+    bandwidth_snapshots = await _count(BandwidthSnapshot, BandwidthSnapshot.router_id, router_ids_stmt)
+    router_logs = await _count(RouterLogEntry, RouterLogEntry.router_id, router_ids_stmt)
+    availability_checks = await _count(RouterAvailabilityCheck, RouterAvailabilityCheck.router_id, router_ids_stmt)
+
+    # WG peers to remove
+    wg_tokens = (await db.execute(
+        select(func.count(ProvisioningToken.id)).where(
+            ProvisioningToken.user_id == reseller_id,
+            ProvisioningToken.wg_public_key.isnot(None),
+        )
+    )).scalar() or 0
+
+    return {
+        "customers": customers,
+        "routers": routers,
+        "plans": plans,
+        "vouchers": vouchers,
+        "customer_payments": customer_payments,
+        "payments": payments,
+        "mpesa_transactions": mpesa_transactions,
+        "provisioning_tokens": provisioning_tokens,
+        "provisioning_logs": provisioning_logs_c + provisioning_logs_r,
+        "customer_ratings": customer_ratings,
+        "bandwidth_usage": bandwidth_usage,
+        "bandwidth_snapshots": bandwidth_snapshots,
+        "router_logs": router_logs,
+        "availability_checks": availability_checks,
+        "reseller_payouts": payouts,
+        "wireguard_peers": wg_tokens,
+    }
+
+
+@router.delete("/api/admin/resellers/{reseller_id}")
+async def delete_reseller(
+    reseller_id: int,
+    confirm: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Delete a reseller and ALL associated data.
+
+    Without ?confirm=true, returns a dry-run summary of what would be deleted.
+    With ?confirm=true, performs the actual deletion.
+    """
+    await _require_admin(token, db)
+    reseller = await _get_reseller_or_404(db, reseller_id)
+
+    summary = await _reseller_deletion_summary(db, reseller_id)
+
+    if not confirm:
+        return {
+            "dry_run": True,
+            "reseller": {
+                "id": reseller.id,
+                "email": reseller.email,
+                "organization_name": reseller.organization_name,
+            },
+            "will_delete": summary,
+            "message": "Add ?confirm=true to actually delete this reseller and all associated data.",
+        }
+
+    # ── Phase 1: WireGuard cleanup (best-effort) ──
+    wg_failures = []
+    tokens_result = await db.execute(
+        select(ProvisioningToken).where(
+            ProvisioningToken.user_id == reseller_id,
+            ProvisioningToken.wg_public_key.isnot(None),
+        )
+    )
+    for tk in tokens_result.scalars().all():
+        try:
+            await remove_wireguard_peer(tk.wg_public_key)
+        except Exception as e:
+            wg_failures.append({"token_id": tk.id, "public_key": tk.wg_public_key, "error": str(e)})
+            logger.warning(f"[DELETE-RESELLER] WG peer removal failed for token {tk.id}: {e}")
+
+    # ── Phase 2: DB cascade deletion (bottom-up) ──
+    customer_ids = select(Customer.id).where(Customer.user_id == reseller_id)
+    router_ids = select(Router.id).where(Router.user_id == reseller_id)
+
+    # 1. Null out vouchers.redeemed_by pointing to this reseller's customers
+    await db.execute(
+        update(Voucher).where(Voucher.redeemed_by.in_(customer_ids)).values(redeemed_by=None)
+    )
+
+    # 2-3. RADIUS tables (raw SQL since no ORM models)
+    await db.execute(text(
+        "DELETE FROM radius_check WHERE customer_id IN (SELECT id FROM customers WHERE user_id = :uid)"
+    ).bindparams(uid=reseller_id))
+    await db.execute(text(
+        "DELETE FROM radius_reply WHERE customer_id IN (SELECT id FROM customers WHERE user_id = :uid)"
+    ).bindparams(uid=reseller_id))
+
+    # 4. Customer ratings
+    await db.execute(delete(CustomerRating).where(CustomerRating.customer_id.in_(customer_ids)))
+
+    # 5. User bandwidth usage
+    await db.execute(delete(UserBandwidthUsage).where(UserBandwidthUsage.customer_id.in_(customer_ids)))
+
+    # 6. Provisioning logs (customer-side + router-side)
+    await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id.in_(customer_ids)))
+    await db.execute(delete(ProvisioningLog).where(ProvisioningLog.router_id.in_(router_ids)))
+
+    # 7. M-Pesa transactions
+    await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id.in_(customer_ids)))
+
+    # 8. Payments (old table)
+    await db.execute(delete(Payment).where(Payment.customer_id.in_(customer_ids)))
+
+    # 9. Customer payments
+    await db.execute(delete(CustomerPayment).where(CustomerPayment.reseller_id == reseller_id))
+
+    # 10. Customers
+    await db.execute(delete(Customer).where(Customer.user_id == reseller_id))
+
+    # 11. Bandwidth snapshots
+    await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.router_id.in_(router_ids)))
+
+    # 12. Router log entries
+    await db.execute(delete(RouterLogEntry).where(RouterLogEntry.router_id.in_(router_ids)))
+
+    # 13. Router availability checks
+    await db.execute(delete(RouterAvailabilityCheck).where(RouterAvailabilityCheck.router_id.in_(router_ids)))
+
+    # 14. RADIUS NAS (raw SQL, no ORM model)
+    await db.execute(text(
+        "DELETE FROM radius_nas WHERE router_id IN (SELECT id FROM routers WHERE user_id = :uid)"
+    ).bindparams(uid=reseller_id))
+
+    # 15. Provisioning tokens (unlink router_id first, then delete)
+    await db.execute(
+        update(ProvisioningToken)
+        .where(ProvisioningToken.router_id.in_(router_ids))
+        .values(router_id=None)
+    )
+    await db.execute(delete(ProvisioningToken).where(ProvisioningToken.user_id == reseller_id))
+
+    # 16. Vouchers
+    await db.execute(delete(Voucher).where(Voucher.user_id == reseller_id))
+
+    # 17. Routers
+    await db.execute(delete(Router).where(Router.user_id == reseller_id))
+
+    # 18. Plans
+    await db.execute(delete(Plan).where(Plan.user_id == reseller_id))
+
+    # 19. Reseller financials
+    await db.execute(delete(ResellerFinancials).where(ResellerFinancials.user_id == reseller_id))
+
+    # 20. Reseller payouts
+    await db.execute(delete(ResellerPayout).where(ResellerPayout.reseller_id == reseller_id))
+
+    # 21. Subscriptions
+    await db.execute(delete(Subscription).where(Subscription.user_id == reseller_id))
+
+    # 22. Null out created_by references from other users
+    await db.execute(update(User).where(User.created_by == reseller_id).values(created_by=None))
+
+    # 23. Delete the user row
+    await db.execute(delete(User).where(User.id == reseller_id))
+
+    await db.commit()
+
+    logger.info(f"[DELETE-RESELLER] Deleted reseller {reseller_id} ({reseller.email}): {summary}")
+
+    return {
+        "dry_run": False,
+        "reseller": {
+            "id": reseller.id,
+            "email": reseller.email,
+            "organization_name": reseller.organization_name,
+        },
+        "deleted": summary,
+        "wireguard_failures": wg_failures,
+        "message": "Reseller and all associated data deleted successfully.",
     }
