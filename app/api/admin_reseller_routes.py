@@ -496,45 +496,215 @@ async def get_reseller_payments(
 # ---------------------------------------------------------------------------
 # 4. GET /api/admin/resellers/{reseller_id}/routers -- Reseller's Routers
 # ---------------------------------------------------------------------------
+ROUTER_SORT_FIELDS = {
+    "revenue", "mpesa_revenue", "customers", "active_customers",
+    "name", "created_at", "last_checked", "uptime",
+}
+ROUTER_FILTERS = {
+    "online",          # currently reachable
+    "offline",         # not reachable or never checked
+    "has_customers",   # at least 1 customer
+    "no_customers",    # zero customers
+    "active_customers",  # at least 1 active (non-expired) customer
+    "has_revenue",     # revenue > 0 in period
+    "no_revenue",      # zero revenue in period
+    "emergency",       # emergency mode is on
+}
+
+
 @router.get("/api/admin/resellers/{reseller_id}/routers")
 async def get_reseller_routers(
     reseller_id: int,
+    sort_by: Optional[str] = Query(None, description="Sort field: revenue, mpesa_revenue, customers, active_customers, name, created_at, last_checked, uptime"),
+    sort_order: Optional[str] = Query("desc", regex="^(asc|desc)$"),
+    filter: Optional[str] = Query(None, description="Filter: online, offline, has_customers, no_customers, active_customers, has_revenue, no_revenue, emergency"),
+    search: Optional[str] = Query(None, description="Search by router name, identity, or IP"),
+    date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
+    """
+    List routers for a reseller with rich detail for troubleshooting.
+
+    Filtering:
+      ?filter=online             -- only routers currently reachable
+      ?filter=offline            -- routers that are down or never checked
+      ?filter=has_customers      -- routers with at least 1 customer
+      ?filter=no_customers       -- routers with 0 customers
+      ?filter=active_customers   -- routers with at least 1 active customer
+      ?filter=has_revenue        -- routers with revenue in selected period
+      ?filter=no_revenue         -- routers with zero revenue in period
+      ?filter=emergency          -- routers in emergency mode
+
+    Sorting:
+      ?sort_by=revenue&sort_order=desc
+      ?sort_by=customers
+      ?sort_by=uptime
+
+    Date filtering (for revenue figures):
+      ?date=2026-03-22
+      ?start_date=...&end_date=...
+    """
     await _require_admin(token, db)
     await _get_reseller_or_404(db, reseller_id)
 
-    routers_result = await db.execute(
-        select(Router).where(Router.user_id == reseller_id)
-    )
-    routers = routers_result.scalars().all()
+    if sort_by and sort_by not in ROUTER_SORT_FIELDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sort_by. Choose from: {', '.join(sorted(ROUTER_SORT_FIELDS))}"
+        )
+    if filter and filter not in ROUTER_FILTERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid filter. Choose from: {', '.join(sorted(ROUTER_FILTERS))}"
+        )
+
+    descending = sort_order != "asc"
+
+    date_filters: list = []
+    if date:
+        d = _parse_date(date)
+        date_filters = [CustomerPayment.created_at >= d, CustomerPayment.created_at < d + timedelta(days=1)]
+    else:
+        if start_date:
+            date_filters.append(CustomerPayment.created_at >= _parse_date(start_date, "start_date"))
+        if end_date:
+            date_filters.append(CustomerPayment.created_at < _parse_date(end_date, "end_date") + timedelta(days=1))
+
+    now = datetime.utcnow()
+    today_start = datetime(now.year, now.month, now.day)
+
+    stmt = select(Router).where(Router.user_id == reseller_id)
+    if search:
+        pattern = f"%{search}%"
+        stmt = stmt.where(
+            Router.name.ilike(pattern)
+            | Router.identity.ilike(pattern)
+            | Router.ip_address.ilike(pattern)
+        )
+    if filter == "online":
+        stmt = stmt.where(Router.last_status == True)
+    elif filter == "offline":
+        stmt = stmt.where((Router.last_status == False) | (Router.last_status == None))
+    elif filter == "emergency":
+        stmt = stmt.where(Router.emergency_active == True)
+
+    stmt = stmt.order_by(Router.created_at.desc())
+    routers = (await db.execute(stmt)).scalars().all()
 
     items = []
     for rt in routers:
-        cust_count = (await db.execute(
+        total_customers = (await db.execute(
             select(func.count(Customer.id)).where(Customer.router_id == rt.id)
         )).scalar() or 0
 
-        revenue = float((await db.execute(
-            select(func.coalesce(func.sum(CustomerPayment.amount), 0))
-            .join(Customer, CustomerPayment.customer_id == Customer.id)
-            .where(Customer.router_id == rt.id, CustomerPayment.reseller_id == reseller_id)
+        active_count = (await db.execute(
+            select(func.count(Customer.id)).where(
+                Customer.router_id == rt.id,
+                Customer.status == CustomerStatus.ACTIVE,
+            )
+        )).scalar() or 0
+
+        # Period revenue (all methods)
+        rev_base = [
+            CustomerPayment.reseller_id == reseller_id,
+            Customer.router_id == rt.id,
+        ]
+        rev_join = select(func.coalesce(func.sum(CustomerPayment.amount), 0)).join(
+            Customer, CustomerPayment.customer_id == Customer.id
+        )
+        period_revenue = float((await db.execute(
+            rev_join.where(*rev_base, *date_filters)
         )).scalar())
 
-        items.append({
+        # Period M-Pesa revenue
+        period_mpesa = float((await db.execute(
+            rev_join.where(*rev_base, *date_filters, MPESA_FILTER)
+        )).scalar())
+
+        # Today's revenue
+        today_revenue = float((await db.execute(
+            rev_join.where(*rev_base, CustomerPayment.created_at >= today_start)
+        )).scalar())
+
+        # All-time revenue
+        alltime_revenue = float((await db.execute(
+            rev_join.where(*rev_base)
+        )).scalar())
+
+        # Uptime percentage from availability fields on the router
+        uptime_pct = None
+        if rt.availability_checks and rt.availability_checks > 0:
+            uptime_pct = round((rt.availability_successes / rt.availability_checks) * 100, 1)
+
+        item = {
             "id": rt.id,
             "name": rt.name,
             "identity": rt.identity,
             "ip_address": rt.ip_address,
+            "port": rt.port,
             "auth_method": rt.auth_method.value if rt.auth_method else None,
+            "payment_methods": rt.payment_methods,
             "is_online": rt.last_status,
             "last_checked_at": rt.last_checked_at.isoformat() if rt.last_checked_at else None,
-            "customer_count": cust_count,
-            "total_revenue": round(revenue, 2),
-        })
+            "last_online_at": rt.last_online_at.isoformat() if rt.last_online_at else None,
+            "uptime_pct": uptime_pct,
+            "emergency_active": rt.emergency_active,
+            "emergency_message": rt.emergency_message,
+            "created_at": rt.created_at.isoformat() if rt.created_at else None,
+            "total_customers": total_customers,
+            "active_customers": active_count,
+            "revenue": {
+                "today": round(today_revenue, 2),
+                "period": round(period_revenue, 2),
+                "period_mpesa": round(period_mpesa, 2),
+                "all_time": round(alltime_revenue, 2),
+            },
+        }
 
-    return {"reseller_id": reseller_id, "total": len(items), "routers": items}
+        # Post-query filters on computed values
+        if filter == "has_customers" and total_customers == 0:
+            continue
+        if filter == "no_customers" and total_customers > 0:
+            continue
+        if filter == "active_customers" and active_count == 0:
+            continue
+        if filter == "has_revenue" and period_revenue == 0:
+            continue
+        if filter == "no_revenue" and period_revenue > 0:
+            continue
+
+        items.append(item)
+
+    # Sort
+    router_sort_map = {
+        "revenue": lambda x: x["revenue"]["period"],
+        "mpesa_revenue": lambda x: x["revenue"]["period_mpesa"],
+        "customers": lambda x: x["total_customers"],
+        "active_customers": lambda x: x["active_customers"],
+        "name": lambda x: (x["name"] or "").lower(),
+        "created_at": lambda x: x["created_at"] or "",
+        "last_checked": lambda x: x["last_checked_at"] or "",
+        "uptime": lambda x: x["uptime_pct"] if x["uptime_pct"] is not None else -1,
+    }
+    if sort_by and sort_by in router_sort_map:
+        items.sort(key=router_sort_map[sort_by], reverse=descending)
+
+    summary = {
+        "total": len(items),
+        "online": sum(1 for i in items if i["is_online"]),
+        "offline": sum(1 for i in items if not i["is_online"]),
+        "with_active_customers": sum(1 for i in items if i["active_customers"] > 0),
+    }
+
+    return {
+        "reseller_id": reseller_id,
+        "summary": summary,
+        "filters_applied": {"sort_by": sort_by, "sort_order": sort_order, "filter": filter, "search": search},
+        "routers": items,
+    }
 
 
 # ---------------------------------------------------------------------------
