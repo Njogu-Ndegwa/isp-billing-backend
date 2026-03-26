@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, case
+from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -92,12 +93,17 @@ async def get_routers(
 ):
     """Get all routers for a user"""
     user = await get_current_user(token, db)
-    stmt = select(Router).where(Router.user_id == user.id)
+    stmt = (
+        select(Router)
+        .where(Router.user_id == user.id)
+        .options(selectinload(Router.assigned_payment_method))
+    )
     result = await db.execute(stmt)
     routers = result.scalars().all()
     response = []
     now = datetime.utcnow()
     for router_obj in routers:
+        pm = router_obj.assigned_payment_method
         router_payload = {
             "id": router_obj.id,
             "name": router_obj.name,
@@ -107,6 +113,12 @@ async def get_routers(
             "auth_method": getattr(router_obj, "auth_method", "DIRECT_API") or "DIRECT_API",
             "payment_methods": getattr(router_obj, "payment_methods", None) or ["mpesa", "voucher"],
             "payment_method_id": router_obj.payment_method_id,
+            "assigned_payment_method": {
+                "id": pm.id,
+                "label": pm.label,
+                "method_type": pm.method_type.value if hasattr(pm.method_type, "value") else pm.method_type,
+                "is_active": pm.is_active,
+            } if pm else None,
             "pppoe_ports": getattr(router_obj, "pppoe_ports", None),
             "plain_ports": getattr(router_obj, "plain_ports", None),
             "emergency_active": getattr(router_obj, "emergency_active", False),
@@ -277,6 +289,8 @@ async def get_router_by_identity(
         raise HTTPException(status_code=404, detail=f"Router with identity '{identity}' not found")
     
     router_obj, business_name = row
+    await db.refresh(router_obj, ["assigned_payment_method"])
+    pm = router_obj.assigned_payment_method
     return {
         "router_id": router_obj.id,
         "name": router_obj.name,
@@ -286,6 +300,12 @@ async def get_router_by_identity(
         "business_name": business_name,
         "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
         "payment_method_id": router_obj.payment_method_id,
+        "assigned_payment_method": {
+            "id": pm.id,
+            "label": pm.label,
+            "method_type": pm.method_type.value if hasattr(pm.method_type, "value") else pm.method_type,
+            "is_active": pm.is_active,
+        } if pm else None,
         "pppoe_ports": getattr(router_obj, 'pppoe_ports', None),
         "plain_ports": getattr(router_obj, 'plain_ports', None),
         "emergency_active": getattr(router_obj, 'emergency_active', False),
