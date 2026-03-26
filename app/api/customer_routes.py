@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete, update, text
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
@@ -12,6 +12,8 @@ from app.db.database import get_db
 from app.db.models import (
     Router, Customer, Plan, CustomerStatus, ConnectionType,
     CustomerPayment, PaymentMethod, PaymentStatus, DurationUnit,
+    Payment, CustomerRating, ProvisioningLog, MpesaTransaction,
+    UserBandwidthUsage, Voucher,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.pppoe_provisioning import (
@@ -136,6 +138,210 @@ async def register_customer_api(
         logger.error(f"Error registering customer: {str(e)}")
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to register customer: {str(e)}")
+
+
+class CustomerEditRequest(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    plan_id: Optional[int] = None
+    router_id: Optional[int] = None
+    mac_address: Optional[str] = None
+    pppoe_username: Optional[str] = None
+    pppoe_password: Optional[str] = None
+    static_ip: Optional[str] = None
+
+
+@router.put("/api/customers/{customer_id}")
+async def edit_customer(
+    customer_id: int,
+    request: CustomerEditRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Edit an existing customer's details including hotspot/PPPoE fields."""
+    try:
+        user = await get_current_user(token, db)
+
+        stmt = (
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(Customer.id == customer_id, Customer.user_id == user.id)
+        )
+        result = await db.execute(stmt)
+        customer = result.scalar_one_or_none()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        if request.plan_id is not None:
+            plan_stmt = select(Plan).where(Plan.id == request.plan_id, Plan.user_id == user.id)
+            plan_result = await db.execute(plan_stmt)
+            if not plan_result.scalar_one_or_none():
+                raise HTTPException(status_code=404, detail="Plan not found")
+
+        if request.router_id is not None:
+            router_stmt = select(Router).where(Router.id == request.router_id, Router.user_id == user.id)
+            router_result = await db.execute(router_stmt)
+            if not router_result.scalar_one_or_none():
+                raise HTTPException(status_code=404, detail="Router not found")
+
+        if request.mac_address is not None and request.mac_address != customer.mac_address:
+            mac_stmt = select(Customer).where(
+                Customer.mac_address == request.mac_address,
+                Customer.user_id == user.id,
+                Customer.id != customer_id,
+            )
+            mac_result = await db.execute(mac_stmt)
+            if mac_result.scalar_one_or_none():
+                raise HTTPException(status_code=409, detail="Another customer with this MAC address already exists")
+
+        if request.pppoe_username is not None and request.pppoe_username != customer.pppoe_username:
+            pppoe_stmt = select(Customer).where(
+                Customer.pppoe_username == request.pppoe_username,
+                Customer.id != customer_id,
+            )
+            pppoe_result = await db.execute(pppoe_stmt)
+            if pppoe_result.scalar_one_or_none():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"PPPoE username '{request.pppoe_username}' already exists",
+                )
+
+        old_pppoe_username = customer.pppoe_username
+        old_pppoe_password = customer.pppoe_password
+        old_router_id = customer.router_id
+        pppoe_changed = False
+
+        update_fields = request.model_dump(exclude_none=True)
+        for field, value in update_fields.items():
+            setattr(customer, field, value)
+
+        if customer.pppoe_username and customer.status == CustomerStatus.ACTIVE:
+            pppoe_changed = (
+                customer.pppoe_username != old_pppoe_username
+                or customer.pppoe_password != old_pppoe_password
+                or customer.router_id != old_router_id
+            )
+
+        await db.commit()
+        await db.refresh(customer, attribute_names=["plan", "router"])
+
+        provision_status = None
+        if pppoe_changed and customer.router and customer.plan:
+            if old_pppoe_username and old_router_id:
+                try:
+                    old_router_stmt = select(Router).where(Router.id == old_router_id)
+                    old_router_result = await db.execute(old_router_stmt)
+                    old_router_obj = old_router_result.scalar_one_or_none()
+                    if old_router_obj:
+                        remove_payload = build_pppoe_remove_payload(customer, old_router_obj)
+                        remove_payload["pppoe_username"] = old_pppoe_username
+                        await call_pppoe_remove(remove_payload)
+                except Exception as e:
+                    logger.warning(f"Failed to remove old PPPoE secret during edit: {e}")
+
+            pppoe_payload = build_pppoe_payload(customer, customer.router)
+            provision_result = await call_pppoe_provision(pppoe_payload)
+            provision_status = "ok" if provision_result and provision_result.get("success") else "failed"
+
+        return {
+            "success": True,
+            "customer": {
+                "id": customer.id,
+                "name": customer.name,
+                "phone": customer.phone,
+                "mac_address": customer.mac_address,
+                "pppoe_username": customer.pppoe_username,
+                "static_ip": customer.static_ip,
+                "status": customer.status.value,
+                "plan_id": customer.plan_id,
+                "router_id": customer.router_id,
+                "expiry": customer.expiry.isoformat() if customer.expiry else None,
+                "plan": {
+                    "id": customer.plan.id,
+                    "name": customer.plan.name,
+                    "price": customer.plan.price,
+                    "connection_type": customer.plan.connection_type.value if customer.plan.connection_type else None,
+                } if customer.plan else None,
+                "router": {
+                    "id": customer.router.id,
+                    "name": customer.router.name,
+                } if customer.router else None,
+            },
+            "pppoe_reprovisioned": provision_status,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error editing customer {customer_id}: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to edit customer: {str(e)}")
+
+
+@router.delete("/api/customers/{customer_id}")
+async def delete_customer(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Delete a customer and all related data. Removes PPPoE secret from router if active."""
+    try:
+        user = await get_current_user(token, db)
+
+        stmt = (
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(Customer.id == customer_id, Customer.user_id == user.id)
+        )
+        result = await db.execute(stmt)
+        customer = result.scalar_one_or_none()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        customer_name = customer.name
+        deprovision_result = None
+
+        if customer.status == CustomerStatus.ACTIVE and customer.pppoe_username and customer.router:
+            try:
+                payload = build_pppoe_remove_payload(customer, customer.router)
+                remove_result = await call_pppoe_remove(payload)
+                deprovision_result = "ok" if remove_result and remove_result.get("success") else "failed"
+            except Exception as e:
+                logger.warning(f"Failed to remove PPPoE secret for customer {customer_id} during delete: {e}")
+                deprovision_result = "failed"
+
+        await db.execute(
+            update(Voucher).where(Voucher.redeemed_by == customer_id).values(redeemed_by=None)
+        )
+        await db.execute(text(
+            "DELETE FROM radius_check WHERE customer_id = :cid"
+        ).bindparams(cid=customer_id))
+        await db.execute(text(
+            "DELETE FROM radius_reply WHERE customer_id = :cid"
+        ).bindparams(cid=customer_id))
+        await db.execute(delete(CustomerRating).where(CustomerRating.customer_id == customer_id))
+        await db.execute(delete(UserBandwidthUsage).where(UserBandwidthUsage.customer_id == customer_id))
+        await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id == customer_id))
+        await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id == customer_id))
+        await db.execute(delete(Payment).where(Payment.customer_id == customer_id))
+        await db.execute(delete(CustomerPayment).where(CustomerPayment.customer_id == customer_id))
+
+        await db.delete(customer)
+        await db.commit()
+
+        logger.info(f"Customer {customer_id} ({customer_name}) deleted by user {user.id}")
+
+        return {
+            "success": True,
+            "message": f"Customer '{customer_name}' deleted successfully",
+            "customer_id": customer_id,
+            "pppoe_deprovisioned": deprovision_result,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting customer {customer_id}: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete customer: {str(e)}")
 
 
 @router.get("/api/customers")

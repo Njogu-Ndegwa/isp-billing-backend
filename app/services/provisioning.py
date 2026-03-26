@@ -145,16 +145,25 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 # ============================================================
 
 # ---- PRE-FLIGHT: DEVICE-MODE CHECK ----
-# RouterOS v7 device-mode=home blocks hotspot. This CANNOT be fixed
-# by script — it requires a physical button press. Abort early if
-# hotspot is not enabled so the admin knows what to fix.
+# RouterOS v7 device-mode: "enterprise" has all features unlocked,
+# "home" requires individual feature toggles (hotspot=yes).
+# Abort early if hotspot is blocked so the admin knows what to fix.
 {{
-    :local dm [/system/device-mode/get hotspot]
-    :if ($dm != true) do={{
-        :log error "PROVISION ABORTED: device-mode hotspot is disabled. Run: /system/device-mode/update hotspot=yes  then press the physical reset button within 60s. After that, re-run this script."
-        :error "device-mode hotspot not enabled — aborting (see log)"
+    :local mode [/system/device-mode/get mode]
+    :if ($mode = "enterprise") do={{
+        :log info "Provisioning: device-mode=enterprise, hotspot permitted"
+    }} else={{
+        :do {{
+            :local dm [/system/device-mode/get hotspot]
+            :if ($dm != true) do={{
+                :log error "PROVISION ABORTED: device-mode hotspot is disabled. Run: /system/device-mode/update hotspot=yes  then press the physical reset button within 60s. After that, re-run this script."
+                :error "device-mode hotspot not enabled — aborting (see log)"
+            }}
+            :log info "Provisioning: device-mode hotspot=yes confirmed"
+        }} on-error={{
+            :log warning "Provisioning: could not read device-mode hotspot flag, proceeding anyway (mode=$mode)"
+        }}
     }}
-    :log info "Provisioning: device-mode hotspot=yes confirmed"
 }}
 
 # ---- STEP 1: WAN / INITIAL SETUP ----
