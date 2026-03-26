@@ -55,7 +55,6 @@ class PaymentMethodCreate(BaseModel):
 
     # ZenoPay
     zenopay_api_key: Optional[str] = None
-    zenopay_account_id: Optional[str] = None
 
 
 class PaymentMethodUpdate(BaseModel):
@@ -70,7 +69,6 @@ class PaymentMethodUpdate(BaseModel):
     mpesa_consumer_key: Optional[str] = None
     mpesa_consumer_secret: Optional[str] = None
     zenopay_api_key: Optional[str] = None
-    zenopay_account_id: Optional[str] = None
 
 
 class AssignPaymentMethodRequest(BaseModel):
@@ -166,7 +164,7 @@ def _serialize_payment_method(pm: ResellerPaymentMethod) -> dict:
             decrypt_credential(pm.zenopay_api_key_encrypted)
             if pm.zenopay_api_key_encrypted else None
         )
-        result["zenopay_account_id"] = pm.zenopay_account_id
+        result["zenopay_account_id"] = pm.zenopay_account_id  # kept for backward compat with existing DB rows
 
     return result
 
@@ -216,7 +214,7 @@ async def create_payment_method(
         zenopay_api_key_encrypted=(
             encrypt_credential(request.zenopay_api_key) if request.zenopay_api_key else None
         ),
-        zenopay_account_id=request.zenopay_account_id,
+        zenopay_account_id=None,
     )
     db.add(pm)
     await db.commit()
@@ -307,8 +305,6 @@ async def update_payment_method(
         pm.mpesa_consumer_secret_encrypted = encrypt_credential(request.mpesa_consumer_secret)
     if request.zenopay_api_key is not None:
         pm.zenopay_api_key_encrypted = encrypt_credential(request.zenopay_api_key)
-    if request.zenopay_account_id is not None:
-        pm.zenopay_account_id = request.zenopay_account_id
 
     await db.commit()
     await db.refresh(pm)

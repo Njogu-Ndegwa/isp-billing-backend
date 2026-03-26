@@ -43,8 +43,12 @@ async def zenopay_webhook(
     """
     Handle ZenoPay payment webhook.
 
+    Per ZenoPay docs, webhooks are **only triggered when payment_status
+    changes to COMPLETED**.  FAILED payments do NOT trigger a webhook —
+    those are detected via the order-status polling endpoint instead.
+
     ZenoPay sends a POST with x-api-key header and a JSON body containing
-    order_id, payment_status, and reference when a payment completes.
+    order_id, payment_status, and reference.
     The reseller_id in the URL lets us look up the correct API key for verification.
     """
     payload = await request.json()
@@ -239,8 +243,12 @@ async def get_zenopay_order_status(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Check the status of a ZenoPay transaction. Used by frontends polling
+    Check the status of a ZenoPay transaction.  Used by frontends polling
     for payment completion (similar to /api/hotspot/payment-status).
+
+    Because ZenoPay webhooks only fire on COMPLETED, this endpoint actively
+    polls the ZenoPay order-status API when our local record is still
+    PENDING so the frontend can discover FAILED payments too.
     """
     result = await db.execute(
         select(ZenoPayTransaction).where(ZenoPayTransaction.order_id == order_id)
@@ -248,6 +256,10 @@ async def get_zenopay_order_status(
     txn = result.scalar_one_or_none()
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
+
+    # If still pending, ask ZenoPay for the latest status
+    if txn.status == ZenoPayTransactionStatus.PENDING:
+        await _sync_zenopay_status(db, txn)
 
     customer = None
     if txn.customer_id:
@@ -270,3 +282,53 @@ async def get_zenopay_order_status(
         "expiry": customer.expiry.isoformat() if customer and customer.expiry else None,
         "created_at": txn.created_at.isoformat() if txn.created_at else None,
     }
+
+
+async def _sync_zenopay_status(db: AsyncSession, txn: ZenoPayTransaction):
+    """Poll ZenoPay's order-status API and update our local record if changed."""
+    pm_result = await db.execute(
+        select(ResellerPaymentMethod).where(
+            ResellerPaymentMethod.user_id == txn.reseller_id,
+            ResellerPaymentMethod.method_type == ResellerPaymentMethodType.ZENOPAY,
+            ResellerPaymentMethod.is_active == True,
+        )
+    )
+    pm = pm_result.scalar_one_or_none()
+    if not pm or not pm.zenopay_api_key_encrypted:
+        return
+
+    try:
+        from app.services.zenopay import check_zenopay_order_status
+
+        api_key = decrypt_credential(pm.zenopay_api_key_encrypted)
+        order_data = await check_zenopay_order_status(api_key, txn.order_id)
+
+        remote_status = (order_data.get("payment_status") or "").upper()
+        if not remote_status:
+            return
+
+        if remote_status == "COMPLETED" and txn.status == ZenoPayTransactionStatus.PENDING:
+            txn.status = ZenoPayTransactionStatus.COMPLETED
+            txn.reference = order_data.get("reference") or txn.reference
+            txn.channel = order_data.get("channel") or txn.channel
+            txn.updated_at = datetime.utcnow()
+            await db.commit()
+            logger.info("[ZENOPAY POLL] Order %s now COMPLETED", txn.order_id)
+
+        elif remote_status == "FAILED" and txn.status == ZenoPayTransactionStatus.PENDING:
+            txn.status = ZenoPayTransactionStatus.FAILED
+            txn.updated_at = datetime.utcnow()
+
+            if txn.customer_id:
+                cust_result = await db.execute(
+                    select(Customer).where(Customer.id == txn.customer_id)
+                )
+                cust = cust_result.scalar_one_or_none()
+                if cust and cust.status == CustomerStatus.PENDING:
+                    cust.status = CustomerStatus.INACTIVE
+
+            await db.commit()
+            logger.info("[ZENOPAY POLL] Order %s now FAILED", txn.order_id)
+
+    except Exception as e:
+        logger.warning("[ZENOPAY POLL] Failed to check status for %s: %s", txn.order_id, e)

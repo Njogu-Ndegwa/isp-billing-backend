@@ -249,6 +249,31 @@ async def run_radius_migrations():
         else:
             logger.info("Migration: provisioning_tokens table already exists, skipping")
 
+        # --- Provisioning tokens: add vpn_type + L2TP columns, relax WG NOT NULL ---
+        result = await conn.execute(sa_text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'provisioning_tokens' AND column_name = 'vpn_type'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE provisioning_tokens
+                ADD COLUMN vpn_type VARCHAR(20) NOT NULL DEFAULT 'wireguard'
+            """))
+            await conn.execute(sa_text("""
+                ALTER TABLE provisioning_tokens
+                ADD COLUMN IF NOT EXISTS l2tp_username VARCHAR NULL,
+                ADD COLUMN IF NOT EXISTS l2tp_password VARCHAR NULL
+            """))
+            for col in ("wg_private_key", "wg_public_key", "server_wg_pubkey"):
+                await conn.execute(sa_text(f"""
+                    ALTER TABLE provisioning_tokens
+                    ALTER COLUMN {col} DROP NOT NULL
+                """))
+            logger.info("Migration: Added vpn_type, l2tp columns to provisioning_tokens; relaxed WG NOT NULL")
+        else:
+            logger.info("Migration: provisioning_tokens vpn_type column already exists, skipping")
+
         # --- PPPoE columns on customers table ---
         result = await conn.execute(sa_text("""
             SELECT column_name

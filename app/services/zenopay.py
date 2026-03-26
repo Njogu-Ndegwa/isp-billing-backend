@@ -73,7 +73,15 @@ async def check_zenopay_order_status(api_key: str, order_id: str) -> dict:
     """
     Query ZenoPay for the current status of a payment order.
 
-    Returns the full response including payment_status, reference, channel, etc.
+    ZenoPay returns::
+
+        {
+          "result": "SUCCESS",
+          "data": [{ "order_id": "...", "payment_status": "COMPLETED", ... }]
+        }
+
+    This function returns the first item from ``data[]`` with top-level
+    fields merged in, or the raw response if parsing fails.
     """
     headers = {"x-api-key": api_key}
 
@@ -84,9 +92,17 @@ async def check_zenopay_order_status(api_key: str, order_id: str) -> dict:
             headers=headers,
         )
         response.raise_for_status()
-        data = response.json()
-        logger.info("ZenoPay order status for %s: %s", order_id, data.get("result"))
-        return data
+        raw = response.json()
+        logger.info("ZenoPay order status for %s: %s", order_id, raw.get("result"))
+
+        data_list = raw.get("data")
+        if isinstance(data_list, list) and data_list:
+            order_data = data_list[0]
+            order_data["api_result"] = raw.get("result")
+            order_data["api_message"] = raw.get("message")
+            return order_data
+
+        return raw
 
 
 def validate_zenopay_webhook(headers: dict, expected_api_key: str) -> bool:

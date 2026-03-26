@@ -265,13 +265,18 @@ async def _initiate_zenopay(
         f"/api/zenopay/webhook/{pm.user_id}"
     )
 
+    reseller_result = await db.execute(
+        select(User.email).where(User.id == pm.user_id)
+    )
+    reseller_email = reseller_result.scalar_one_or_none() or "noreply@example.com"
+
     result = await initiate_zenopay_payment(
         api_key=api_key,
         order_id=order_id,
         phone=phone,
         amount=amount,
         name=customer.name or f"Customer {customer.id}",
-        email=f"customer-{customer.id}@placeholder.local",
+        email=reseller_email,
         webhook_url=webhook_url,
     )
 
