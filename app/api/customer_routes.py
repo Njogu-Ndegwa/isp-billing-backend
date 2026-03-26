@@ -149,6 +149,7 @@ class CustomerEditRequest(BaseModel):
     pppoe_username: Optional[str] = None
     pppoe_password: Optional[str] = None
     static_ip: Optional[str] = None
+    expiry: Optional[datetime] = None
 
 
 @router.put("/api/customers/{customer_id}")
