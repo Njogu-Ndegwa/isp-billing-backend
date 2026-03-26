@@ -43,7 +43,7 @@ from app.db.database import get_db
 from app.db.models import (
     Customer, Plan, Router, CustomerStatus,
     MpesaTransaction, MpesaTransactionStatus,
-    PaymentMethod
+    PaymentMethod, User,
 )
 from app.config import settings
 from app.services.radius_provisioning import RadiusProvisioning
@@ -243,6 +243,16 @@ async def radius_register_and_pay(
 
         user_id = db_router.user_id
 
+        # Look up the reseller's display name for the STK push prompt
+        account_reference = None
+        if user_id:
+            owner_name_result = await db.execute(
+                select(User.business_name, User.organization_name).where(User.id == user_id)
+            )
+            owner_row = owner_name_result.one_or_none()
+            if owner_row:
+                account_reference = owner_row.business_name or owner_row.organization_name
+
         # Validate plan exists
         plan_result = await db.execute(
             select(Plan).where(Plan.id == request.plan_id)
@@ -361,6 +371,7 @@ async def radius_register_and_pay(
                         amount=float(plan.price),
                         reference=reference,
                         plan_name=plan.name,
+                        account_reference=account_reference,
                     )
                     customer.status = CustomerStatus.PENDING
                     await db.commit()
@@ -382,7 +393,8 @@ async def radius_register_and_pay(
                     stk_response = await _initiate_radius_stk_push(
                         phone_number=request.phone,
                         amount=float(plan.price),
-                        reference=reference
+                        reference=reference,
+                        account_reference=account_reference,
                     )
 
                     mpesa_txn = MpesaTransaction(
@@ -745,7 +757,8 @@ async def radius_payment_status(
 async def _initiate_radius_stk_push(
     phone_number: str,
     amount: float,
-    reference: str
+    reference: str,
+    account_reference: str | None = None,
 ) -> dict:
     """
     Initiate M-Pesa STK Push with RADIUS-specific callback URL.
@@ -806,7 +819,7 @@ async def _initiate_radius_stk_push(
             "PartyB": settings.MPESA_SHORTCODE,
             "PhoneNumber": phone_number,
             "CallBackURL": radius_callback_url,
-            "AccountReference": reference,
+            "AccountReference": account_reference or reference,
             "TransactionDesc": "RADIUS Hotspot Payment"
         }
 

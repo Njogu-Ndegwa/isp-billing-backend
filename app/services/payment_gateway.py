@@ -119,6 +119,7 @@ async def initiate_customer_payment(
     amount: float,
     reference: str,
     plan_name: str = "",
+    account_reference: Optional[str] = None,
 ) -> dict:
     """
     Dispatch payment to the correct gateway based on the router's payment method.
@@ -135,6 +136,7 @@ async def initiate_customer_payment(
     if method_type == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS:
         return await _initiate_mpesa_with_reseller_keys(
             db, payment_method, customer, phone, amount, reference,
+            account_reference=account_reference,
         )
 
     if method_type in (
@@ -143,6 +145,7 @@ async def initiate_customer_payment(
     ):
         return await _initiate_mpesa_system_collected(
             db, payment_method, customer, phone, amount, reference,
+            account_reference=account_reference,
         )
 
     if method_type == ResellerPaymentMethodType.ZENOPAY:
@@ -164,6 +167,7 @@ async def _initiate_mpesa_with_reseller_keys(
     phone: str,
     amount: float,
     reference: str,
+    account_reference: Optional[str] = None,
 ) -> dict:
     from app.services.mpesa import initiate_stk_push_direct
 
@@ -180,6 +184,7 @@ async def _initiate_mpesa_with_reseller_keys(
         passkey=passkey,
         consumer_key=consumer_key,
         consumer_secret=consumer_secret,
+        account_reference=account_reference,
     )
 
     mpesa_txn = MpesaTransaction(
@@ -213,6 +218,7 @@ async def _initiate_mpesa_system_collected(
     phone: str,
     amount: float,
     reference: str,
+    account_reference: Optional[str] = None,
 ) -> dict:
     from app.services.mpesa import initiate_stk_push_direct
 
@@ -220,6 +226,7 @@ async def _initiate_mpesa_system_collected(
         phone_number=phone,
         amount=amount,
         reference=reference,
+        account_reference=account_reference,
     )
 
     mpesa_txn = MpesaTransaction(

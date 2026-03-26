@@ -424,6 +424,16 @@ async def initiate_mpesa_payment_api(
         
         reference = f"PAYMENT-{request.customer_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
+        # Look up the reseller's display name for the STK push prompt
+        account_reference = None
+        if customer.user_id:
+            owner_name_result = await db.execute(
+                select(User.business_name, User.organization_name).where(User.id == customer.user_id)
+            )
+            owner_row = owner_name_result.one_or_none()
+            if owner_row:
+                account_reference = owner_row.business_name or owner_row.organization_name
+
         # Check if the customer's router has a configured payment method
         payment_method = None
         if customer.router_id:
@@ -441,6 +451,7 @@ async def initiate_mpesa_payment_api(
                     amount=request.amount,
                     reference=reference,
                     plan_name=customer.plan.name if customer.plan else "",
+                    account_reference=account_reference,
                 )
             except Exception as gw_error:
                 logger.error(f"Payment gateway failed for customer {request.customer_id}: {gw_error}")
@@ -474,7 +485,8 @@ async def initiate_mpesa_payment_api(
                 reference=reference,
                 user_id=customer.user_id,
                 mac_address=customer.mac_address,
-                shortcode=owner_shortcode
+                shortcode=owner_shortcode,
+                account_reference=account_reference,
             )
         except Exception as stk_error:
             from app.db.models import FailureSource
@@ -561,11 +573,18 @@ async def register_hotspot_and_pay_api(
             raise HTTPException(status_code=404, detail="Router not found")
         user_id = router.user_id
         
-        # Get the owner's shortcode for STK push
+        # Get the owner's shortcode and display name for STK push
         owner_shortcode = None
+        account_reference = None
         if user_id:
-            owner_sc_result = await db.execute(select(User.mpesa_shortcode).where(User.id == user_id))
-            owner_shortcode = owner_sc_result.scalar_one_or_none()
+            owner_info_result = await db.execute(
+                select(User.mpesa_shortcode, User.business_name, User.organization_name)
+                .where(User.id == user_id)
+            )
+            owner_info = owner_info_result.one_or_none()
+            if owner_info:
+                owner_shortcode = owner_info.mpesa_shortcode
+                account_reference = owner_info.business_name or owner_info.organization_name
         
         # Validate plan exists
         plan_stmt = select(Plan).where(Plan.id == request.plan_id)
@@ -654,6 +673,7 @@ async def register_hotspot_and_pay_api(
                         amount=float(plan.price),
                         reference=reference,
                         plan_name=plan.name,
+                        account_reference=account_reference,
                     )
                     customer.status = CustomerStatus.PENDING
                     await db.commit()
@@ -677,7 +697,8 @@ async def register_hotspot_and_pay_api(
                         phone_number=request.phone,
                         amount=float(plan.price),
                         reference=reference,
-                        shortcode=owner_shortcode
+                        shortcode=owner_shortcode,
+                        account_reference=account_reference,
                     )
                     
                     mpesa_txn = MpesaTransaction(

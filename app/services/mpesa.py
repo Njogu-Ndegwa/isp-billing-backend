@@ -48,6 +48,7 @@ async def initiate_stk_push_direct(
     consumer_key: Optional[str] = None,
     consumer_secret: Optional[str] = None,
     callback_url: Optional[str] = None,
+    account_reference: Optional[str] = None,
 ) -> Optional[StkPushResponse]:
     try:
         access_token = await get_access_token(
@@ -72,7 +73,7 @@ async def initiate_stk_push_direct(
             "PartyB": active_shortcode,
             "PhoneNumber": phone_number,
             "CallBackURL": active_callback,
-            "AccountReference": reference,
+            "AccountReference": account_reference or reference,
             "TransactionDesc": "Payment via STK Push"
         }
 
@@ -241,6 +242,7 @@ async def initiate_stk_push(
     consumer_key: Optional[str] = None,
     consumer_secret: Optional[str] = None,
     callback_url: Optional[str] = None,
+    account_reference: Optional[str] = None,
 ):
     """
     Unified STK Push payment initiator.
@@ -259,6 +261,7 @@ async def initiate_stk_push(
                 consumer_key=consumer_key,
                 consumer_secret=consumer_secret,
                 callback_url=callback_url,
+                account_reference=account_reference,
             )
         except Exception as e:
             logger.warning(f"STK Push with user shortcode {shortcode} failed: {e}. Falling back to default.")
@@ -267,6 +270,7 @@ async def initiate_stk_push(
         phone_number=phone_number,
         amount=amount,
         reference=reference,
+        account_reference=account_reference,
     )
 
 

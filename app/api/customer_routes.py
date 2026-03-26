@@ -213,6 +213,8 @@ async def edit_customer(
         pppoe_changed = False
 
         update_fields = request.model_dump(exclude_none=True)
+        if "expiry" in update_fields and update_fields["expiry"] is not None:
+            update_fields["expiry"] = update_fields["expiry"].replace(tzinfo=None)
         for field, value in update_fields.items():
             setattr(customer, field, value)
 
