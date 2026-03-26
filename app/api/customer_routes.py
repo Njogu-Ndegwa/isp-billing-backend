@@ -252,11 +252,13 @@ async def edit_customer(
                 "phone": customer.phone,
                 "mac_address": customer.mac_address,
                 "pppoe_username": customer.pppoe_username,
+                "pppoe_password": customer.pppoe_password,
                 "static_ip": customer.static_ip,
                 "status": customer.status.value,
                 "plan_id": customer.plan_id,
                 "router_id": customer.router_id,
                 "expiry": customer.expiry.isoformat() if customer.expiry else None,
+                "created_at": customer.created_at.isoformat() if customer.created_at else None,
                 "plan": {
                     "id": customer.plan.id,
                     "name": customer.plan.name,
@@ -367,8 +369,14 @@ async def get_customers_api(
                 "name": c.name,
                 "phone": c.phone,
                 "mac_address": c.mac_address,
+                "pppoe_username": c.pppoe_username,
+                "pppoe_password": c.pppoe_password,
+                "static_ip": c.static_ip,
                 "status": c.status.value,
                 "expiry": c.expiry.isoformat() if c.expiry else None,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "plan_id": c.plan_id,
+                "router_id": c.router_id,
                 "plan": {
                     "id": c.plan.id,
                     "name": c.plan.name,
@@ -385,6 +393,57 @@ async def get_customers_api(
     except Exception as e:
         logger.error(f"Error fetching customers: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch customers")
+
+
+@router.get("/api/customers/{customer_id}")
+async def get_customer_detail(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Get a single customer by ID."""
+    try:
+        user = await get_current_user(token, db)
+
+        stmt = (
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(Customer.id == customer_id, Customer.user_id == user.id)
+        )
+        result = await db.execute(stmt)
+        customer = result.scalar_one_or_none()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        return {
+            "id": customer.id,
+            "name": customer.name,
+            "phone": customer.phone,
+            "mac_address": customer.mac_address,
+            "pppoe_username": customer.pppoe_username,
+            "pppoe_password": customer.pppoe_password,
+            "static_ip": customer.static_ip,
+            "status": customer.status.value,
+            "expiry": customer.expiry.isoformat() if customer.expiry else None,
+            "created_at": customer.created_at.isoformat() if customer.created_at else None,
+            "plan_id": customer.plan_id,
+            "router_id": customer.router_id,
+            "plan": {
+                "id": customer.plan.id,
+                "name": customer.plan.name,
+                "price": customer.plan.price,
+                "connection_type": customer.plan.connection_type.value if customer.plan.connection_type else None,
+            } if customer.plan else None,
+            "router": {
+                "id": customer.router.id,
+                "name": customer.router.name,
+            } if customer.router else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching customer {customer_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch customer")
 
 
 @router.get("/api/customers/active")
@@ -414,9 +473,15 @@ async def get_active_customers(
                 "name": c.name,
                 "phone": c.phone,
                 "mac_address": c.mac_address,
+                "pppoe_username": c.pppoe_username,
+                "pppoe_password": c.pppoe_password,
+                "static_ip": c.static_ip,
                 "status": c.status.value,
                 "expiry": c.expiry.isoformat() if c.expiry else None,
                 "hours_remaining": (c.expiry - now).total_seconds() / 3600 if c.expiry and c.expiry > now else 0,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "plan_id": c.plan_id,
+                "router_id": c.router_id,
                 "plan": {
                     "id": c.plan.id,
                     "name": c.plan.name,
