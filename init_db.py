@@ -73,6 +73,19 @@ async def migrate_db():
             ))
             print("  Added column: routers.plain_ports")
 
+        # Check which columns already exist on users
+        def get_user_columns(connection):
+            insp = inspect(connection)
+            return [col["name"] for col in insp.get_columns("users")]
+
+        user_columns = await conn.run_sync(get_user_columns)
+
+        if "last_login_at" not in user_columns:
+            await conn.execute(text(
+                "ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP NULL"
+            ))
+            print("  Added column: users.last_login_at")
+
     print("Database migration completed!")
 
 

@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 from typing import Optional
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from app.db.database import get_db
 from app.db.models import User, UserRole
@@ -83,6 +83,10 @@ async def login_api(
         user = await authenticate_user(db, request.email, request.password)
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        user.last_login_at = datetime.utcnow()
+        db.add(user)
+        await db.flush()
 
         token_data = {
             "sub": str(user.id),

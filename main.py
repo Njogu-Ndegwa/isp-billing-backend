@@ -551,6 +551,26 @@ async def run_payment_method_migrations():
 
 
 # ============================================================================
+# User column migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_user_migrations():
+    """Add columns to the users table that were introduced after initial creation."""
+    async with async_engine.begin() as conn:
+        result = await conn.execute(sa_text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'users' AND column_name = 'last_login_at'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text(
+                "ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP NULL"
+            ))
+            logger.info("Migration: Added last_login_at column to users")
+        else:
+            logger.info("Migration: users.last_login_at already exists, skipping")
+
+
+# ============================================================================
 # Startup / Shutdown
 # ============================================================================
 async def run_monitoring_migrations():
@@ -603,6 +623,12 @@ async def startup_event():
         logger.info("Payment method migrations completed successfully")
     except Exception as e:
         logger.error(f"Payment method migration failed (non-fatal): {e}")
+
+    try:
+        await run_user_migrations()
+        logger.info("User migrations completed successfully")
+    except Exception as e:
+        logger.error(f"User migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

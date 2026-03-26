@@ -78,6 +78,7 @@ class User(Base):
     mpesa_shortcode = Column(String(20), nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    last_login_at = Column(DateTime, nullable=True)
 
 class Customer(Base):
     __tablename__ = "customers"
