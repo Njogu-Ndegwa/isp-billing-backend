@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     WG_MANAGER_URL: str = "http://host.docker.internal:8729"
     WG_MANAGER_SECRET: str = "change-me-wg-secret"
     PROVISION_BASE_URL: str = "https://isp.bitwavetechnologies.net"
+    L2TP_IPSEC_PSK: str = "BitwaveL2TP2026!Secure"
 
     class Config:
         env_file = ".env"
