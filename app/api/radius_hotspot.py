@@ -344,43 +344,73 @@ async def radius_register_and_pay(
             await db.flush()
 
         if payment_method_enum == PaymentMethod.MOBILE_MONEY:
-            # Initiate STK push with RADIUS-specific callback URL
-            try:
-                reference = f"RADIUS-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+            reference = f"RADIUS-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
-                stk_response = await _initiate_radius_stk_push(
-                    phone_number=request.phone,
-                    amount=float(plan.price),
-                    reference=reference
-                )
+            # Check if router has a configured payment method
+            from app.services.payment_gateway import resolve_router_payment_method, initiate_customer_payment
+            router_pm = await resolve_router_payment_method(db, request.router_id)
 
-                # Store transaction
-                mpesa_txn = MpesaTransaction(
-                    checkout_request_id=stk_response['checkout_request_id'],
-                    merchant_request_id=stk_response['merchant_request_id'],
-                    phone_number=request.phone,
-                    amount=float(plan.price),
-                    reference=reference,
-                    customer_id=customer.id,
-                    status=MpesaTransactionStatus.pending
-                )
-                db.add(mpesa_txn)
-                await db.flush()
+            if router_pm:
+                try:
+                    gw_result = await initiate_customer_payment(
+                        db=db,
+                        payment_method=router_pm,
+                        customer=customer,
+                        router=db_router,
+                        phone=request.phone,
+                        amount=float(plan.price),
+                        reference=reference,
+                        plan_name=plan.name,
+                    )
+                    customer.status = CustomerStatus.PENDING
+                    await db.commit()
+                    await db.refresh(customer)
+                    logger.info(
+                        "[RADIUS] Payment initiated via %s for customer %s (%s)",
+                        gw_result.get("gateway"), customer.id, request.mac_address,
+                    )
+                except Exception as e:
+                    customer_id = getattr(customer, "id", None)
+                    await db.rollback()
+                    logger.exception("RADIUS payment gateway failed for customer %s", customer_id)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Payment initiation failed: {str(e)}",
+                    )
+            else:
+                try:
+                    stk_response = await _initiate_radius_stk_push(
+                        phone_number=request.phone,
+                        amount=float(plan.price),
+                        reference=reference
+                    )
 
-                customer.status = CustomerStatus.PENDING
-                await db.commit()
-                await db.refresh(customer)
+                    mpesa_txn = MpesaTransaction(
+                        checkout_request_id=stk_response['checkout_request_id'],
+                        merchant_request_id=stk_response['merchant_request_id'],
+                        phone_number=request.phone,
+                        amount=float(plan.price),
+                        reference=reference,
+                        customer_id=customer.id,
+                        status=MpesaTransactionStatus.pending
+                    )
+                    db.add(mpesa_txn)
+                    await db.flush()
 
-                logger.info(f"[RADIUS] STK Push initiated for customer {customer.id} ({request.mac_address})")
+                    customer.status = CustomerStatus.PENDING
+                    await db.commit()
+                    await db.refresh(customer)
 
-            except Exception as e:
-                customer_id = getattr(customer, "id", None)
-                await db.rollback()
-                logger.exception("RADIUS payment initiation failed for customer %s", customer_id)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Mobile money payment initiation failed: {str(e)}"
-                )
+                    logger.info(f"[RADIUS] STK Push initiated for customer {customer.id} ({request.mac_address})")
+
+                except Exception as e:
+                    customer_id = getattr(customer, "id", None)
+                    await db.rollback()
+                    logger.exception("RADIUS payment initiation failed for customer %s", customer_id)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Mobile money payment initiation failed: {str(e)}"
+                    )
         else:
             # Cash payment - provision immediately via RADIUS
             try:

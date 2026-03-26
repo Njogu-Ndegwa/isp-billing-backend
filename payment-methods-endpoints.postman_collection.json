@@ -1,0 +1,200 @@
+{
+    "info": {
+        "name": "Payment Methods & ZenoPay - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": "YOUR_JWT_TOKEN"}
+    ],
+    "item": [
+        {
+            "name": "Payment Methods",
+            "item": [
+                {
+                    "name": "Create Payment Method (M-Pesa Paybill with Keys)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/payment-methods",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"method_type\": \"mpesa_paybill_with_keys\",\n    \"label\": \"My M-Pesa Paybill\",\n    \"mpesa_shortcode\": \"174379\",\n    \"mpesa_passkey\": \"your-passkey-here\",\n    \"mpesa_consumer_key\": \"your-consumer-key\",\n    \"mpesa_consumer_secret\": \"your-consumer-secret\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Create Payment Method (M-Pesa Paybill without Keys)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/payment-methods",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"method_type\": \"mpesa_paybill\",\n    \"label\": \"My Paybill (System Collects)\",\n    \"mpesa_paybill_number\": \"123456\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Create Payment Method (Bank Account)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/payment-methods",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"method_type\": \"bank_account\",\n    \"label\": \"My Bank Account\",\n    \"bank_paybill_number\": \"654321\",\n    \"bank_account_number\": \"ACC-001234\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Create Payment Method (ZenoPay)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/payment-methods",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"method_type\": \"zenopay\",\n    \"label\": \"My ZenoPay Account\",\n    \"zenopay_api_key\": \"your-zenopay-api-key\",\n    \"zenopay_account_id\": \"optional-account-id\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "List My Payment Methods",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/payment-methods?include_inactive=false",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "payment-methods"],
+                            "query": [{"key": "include_inactive", "value": "false"}]
+                        },
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Payment Method by ID",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/payment-methods/1",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Update Payment Method",
+                    "request": {
+                        "method": "PUT",
+                        "url": "{{baseUrl}}/api/payment-methods/1",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"label\": \"Updated Label\",\n    \"is_active\": true\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Delete (Deactivate) Payment Method",
+                    "request": {
+                        "method": "DELETE",
+                        "url": "{{baseUrl}}/api/payment-methods/1",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Test Payment Method Credentials",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/payment-methods/1/test",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Router Payment Assignment",
+            "item": [
+                {
+                    "name": "Assign Payment Method to Router",
+                    "request": {
+                        "method": "PUT",
+                        "url": "{{baseUrl}}/api/routers/1/payment-method",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"payment_method_id\": 1\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Revert Router to Legacy Payment",
+                    "request": {
+                        "method": "PUT",
+                        "url": "{{baseUrl}}/api/routers/1/payment-method",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"payment_method_id\": null\n}"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "ZenoPay",
+            "item": [
+                {
+                    "name": "ZenoPay Webhook (called by ZenoPay)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/zenopay/webhook/1",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "x-api-key", "value": "ZENOPAY_API_KEY"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"order_id\": \"abc123-uuid\",\n    \"payment_status\": \"COMPLETED\",\n    \"reference\": \"1003020496\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Check ZenoPay Order Status",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/zenopay/order-status/abc123-uuid",
+                        "header": []
+                    }
+                }
+            ]
+        }
+    ]
+}

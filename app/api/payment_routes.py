@@ -400,33 +400,72 @@ async def initiate_mpesa_payment_api(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Initiate M-Pesa payment for existing customer"""
+    """Initiate payment for existing customer. Routes through the correct gateway
+    based on the customer's router payment method configuration."""
     current_user = await get_current_user(token, db)
     try:
         from app.services.mpesa import initiate_stk_push
         from app.services.mpesa_transactions import save_mpesa_transaction, link_transaction_to_customer
+        from app.services.payment_gateway import resolve_router_payment_method, initiate_customer_payment
         
-        # Validate input parameters
         if request.amount <= 0:
             raise HTTPException(status_code=400, detail="Payment amount must be greater than 0")
         
         if not request.phone or len(request.phone.strip()) < 10:
             raise HTTPException(status_code=400, detail="Invalid phone number format")
         
-        # Validate customer exists
-        stmt = select(Customer).where(Customer.id == request.customer_id)
+        stmt = select(Customer).options(
+            selectinload(Customer.plan), selectinload(Customer.router)
+        ).where(Customer.id == request.customer_id)
         result = await db.execute(stmt)
         customer = result.scalar_one_or_none()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
         
-        # Get the owner's shortcode for STK push
+        reference = f"PAYMENT-{request.customer_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+
+        # Check if the customer's router has a configured payment method
+        payment_method = None
+        if customer.router_id:
+            payment_method = await resolve_router_payment_method(db, customer.router_id)
+
+        if payment_method:
+            # --- New path: use configured payment method ---
+            try:
+                gw_result = await initiate_customer_payment(
+                    db=db,
+                    payment_method=payment_method,
+                    customer=customer,
+                    router=customer.router,
+                    phone=request.phone,
+                    amount=request.amount,
+                    reference=reference,
+                    plan_name=customer.plan.name if customer.plan else "",
+                )
+            except Exception as gw_error:
+                logger.error(f"Payment gateway failed for customer {request.customer_id}: {gw_error}")
+                raise HTTPException(status_code=500, detail=f"Failed to initiate payment: {str(gw_error)}")
+
+            customer.status = CustomerStatus.PENDING
+            await db.commit()
+
+            resp = {
+                "message": "Payment initiated successfully. Please check your phone to complete payment.",
+                "customer_id": request.customer_id,
+                "status": "PENDING",
+                "gateway": gw_result.get("gateway"),
+            }
+            if gw_result.get("checkout_request_id"):
+                resp["checkout_request_id"] = gw_result["checkout_request_id"]
+            if gw_result.get("order_id"):
+                resp["order_id"] = gw_result["order_id"]
+            return resp
+
+        # --- Legacy path: use system M-Pesa credentials ---
         owner_shortcode = None
         if customer.user_id:
             owner_result = await db.execute(select(User.mpesa_shortcode).where(User.id == customer.user_id))
             owner_shortcode = owner_result.scalar_one_or_none()
-        
-        reference = f"PAYMENT-{request.customer_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         
         try:
             stk_response = await initiate_stk_push(
@@ -438,7 +477,6 @@ async def initiate_mpesa_payment_api(
                 shortcode=owner_shortcode
             )
         except Exception as stk_error:
-            # STK push failed - record the failure so we can track M-Pesa API issues
             from app.db.models import FailureSource
             failed_txn = MpesaTransaction(
                 checkout_request_id=f"FAILED-{reference}",
@@ -461,7 +499,6 @@ async def initiate_mpesa_payment_api(
         if not stk_response:
             raise HTTPException(status_code=400, detail="Failed to initiate mobile money payment. Please try again.")
         
-        # Save transaction to database
         transaction = await save_mpesa_transaction(
             db=db,
             checkout_request_id=stk_response.get("checkoutRequestId") or stk_response.get("checkout_request_id"),
@@ -471,7 +508,6 @@ async def initiate_mpesa_payment_api(
             merchant_request_id=stk_response.get("merchantRequestId") or stk_response.get("merchant_request_id")
         )
         
-        # Link transaction to customer
         await link_transaction_to_customer(
             db=db,
             checkout_request_id=stk_response.get("checkoutRequestId") or stk_response.get("checkout_request_id"),
@@ -601,61 +637,91 @@ async def register_hotspot_and_pay_api(
         
         if payment_method_enum == PaymentMethod.MOBILE_MONEY:
             reference = f"HOTSPOT-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-            
-            try:
-                # Initiate STK push and get response
-                stk_response = await initiate_stk_push(
-                    phone_number=request.phone,
-                    amount=float(plan.price),
-                    reference=reference,
-                    shortcode=owner_shortcode
-                )
-                
-                # Store transaction mapping for callback lookup
-                mpesa_txn = MpesaTransaction(
-                    checkout_request_id=stk_response.checkout_request_id,
-                    merchant_request_id=stk_response.merchant_request_id,
-                    phone_number=request.phone,
-                    amount=float(plan.price),
-                    reference=reference,
-                    customer_id=customer.id,
-                    status=MpesaTransactionStatus.pending
-                )
-                db.add(mpesa_txn)
-                await db.flush()
-                
-                # Now update status and commit
-                customer.status = CustomerStatus.PENDING
-                await db.commit()
-                await db.refresh(customer)
-                
-                logger.info(f"STK Push initiated for customer {customer.id} ({request.mac_address})")
-            except Exception as e:
-                customer_id = getattr(customer, "id", None)
-                await db.rollback()
-                logger.exception("Payment initiation failed for customer %s", customer_id)
-                
-                # Record the STK push failure so we can track M-Pesa API issues
+
+            # Check if router has a configured payment method
+            from app.services.payment_gateway import resolve_router_payment_method, initiate_customer_payment
+            router_pm = await resolve_router_payment_method(db, request.router_id)
+
+            if router_pm:
+                # --- New path: use configured payment method ---
                 try:
-                    failed_txn = MpesaTransaction(
-                        checkout_request_id=f"FAILED-{reference}",
+                    gw_result = await initiate_customer_payment(
+                        db=db,
+                        payment_method=router_pm,
+                        customer=customer,
+                        router=router,
+                        phone=request.phone,
+                        amount=float(plan.price),
+                        reference=reference,
+                        plan_name=plan.name,
+                    )
+                    customer.status = CustomerStatus.PENDING
+                    await db.commit()
+                    await db.refresh(customer)
+                    logger.info(
+                        "Payment initiated via %s for customer %s (%s)",
+                        gw_result.get("gateway"), customer.id, request.mac_address,
+                    )
+                except Exception as e:
+                    customer_id = getattr(customer, "id", None)
+                    await db.rollback()
+                    logger.exception("Payment gateway failed for customer %s", customer_id)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Payment initiation failed: {str(e)}",
+                    )
+            else:
+                # --- Legacy path: use system M-Pesa credentials ---
+                try:
+                    stk_response = await initiate_stk_push(
                         phone_number=request.phone,
                         amount=float(plan.price),
                         reference=reference,
-                        customer_id=customer_id,
-                        status=MpesaTransactionStatus.failed,
-                        failure_source=FailureSource.MPESA_API,
-                        result_code="STK_PUSH_FAILED",
-                        result_desc=f"STK Push initiation failed: {str(e)[:450]}",
-                        created_at=datetime.utcnow(),
-                        updated_at=datetime.utcnow()
+                        shortcode=owner_shortcode
                     )
-                    db.add(failed_txn)
+                    
+                    mpesa_txn = MpesaTransaction(
+                        checkout_request_id=stk_response.checkout_request_id,
+                        merchant_request_id=stk_response.merchant_request_id,
+                        phone_number=request.phone,
+                        amount=float(plan.price),
+                        reference=reference,
+                        customer_id=customer.id,
+                        status=MpesaTransactionStatus.pending
+                    )
+                    db.add(mpesa_txn)
+                    await db.flush()
+                    
+                    customer.status = CustomerStatus.PENDING
                     await db.commit()
-                except Exception as record_err:
-                    logger.error(f"Failed to record STK push failure: {str(record_err)}")
-                
-                raise HTTPException(status_code=400, detail=f"Mobile money payment initiation failed: {str(e)}")
+                    await db.refresh(customer)
+                    
+                    logger.info(f"STK Push initiated for customer {customer.id} ({request.mac_address})")
+                except Exception as e:
+                    customer_id = getattr(customer, "id", None)
+                    await db.rollback()
+                    logger.exception("Payment initiation failed for customer %s", customer_id)
+                    
+                    try:
+                        failed_txn = MpesaTransaction(
+                            checkout_request_id=f"FAILED-{reference}",
+                            phone_number=request.phone,
+                            amount=float(plan.price),
+                            reference=reference,
+                            customer_id=customer_id,
+                            status=MpesaTransactionStatus.failed,
+                            failure_source=FailureSource.MPESA_API,
+                            result_code="STK_PUSH_FAILED",
+                            result_desc=f"STK Push initiation failed: {str(e)[:450]}",
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow()
+                        )
+                        db.add(failed_txn)
+                        await db.commit()
+                    except Exception as record_err:
+                        logger.error(f"Failed to record STK push failure: {str(record_err)}")
+                    
+                    raise HTTPException(status_code=400, detail=f"Mobile money payment initiation failed: {str(e)}")
         else:
             # For cash payments, process immediately
             try:

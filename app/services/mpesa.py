@@ -16,13 +16,16 @@ class StkPushResponse:
         self.checkout_request_id = checkout_request_id
         self.merchant_request_id = merchant_request_id
 
-async def get_access_token() -> str:
+async def get_access_token(
+    consumer_key: Optional[str] = None,
+    consumer_secret: Optional[str] = None,
+) -> str:
     try:
-        # Generate base64 encoded credentials from consumer key and secret
-        credentials = f"{settings.MPESA_CONSUMER_KEY}:{settings.MPESA_CONSUMER_SECRET}"
+        key = consumer_key or settings.MPESA_CONSUMER_KEY
+        secret = consumer_secret or settings.MPESA_CONSUMER_SECRET
+        credentials = f"{key}:{secret}"
         encoded_credentials = base64.b64encode(credentials.encode()).decode()
         
-        # Determine API URL based on environment
         base_url = "https://api.safaricom.co.ke" if settings.MPESA_ENVIRONMENT == "production" else "https://sandbox.safaricom.co.ke"
         
         async with httpx.AsyncClient() as client:
@@ -36,12 +39,28 @@ async def get_access_token() -> str:
         logger.error(f"Failed to get M-Pesa access token: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get M-Pesa access token: {str(e)}")
 
-async def initiate_stk_push_direct(phone_number: str, amount: float, reference: str, shortcode: Optional[str] = None) -> Optional[StkPushResponse]:
+async def initiate_stk_push_direct(
+    phone_number: str,
+    amount: float,
+    reference: str,
+    shortcode: Optional[str] = None,
+    passkey: Optional[str] = None,
+    consumer_key: Optional[str] = None,
+    consumer_secret: Optional[str] = None,
+    callback_url: Optional[str] = None,
+) -> Optional[StkPushResponse]:
     try:
-        access_token = await get_access_token()
+        access_token = await get_access_token(
+            consumer_key=consumer_key,
+            consumer_secret=consumer_secret,
+        )
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         active_shortcode = shortcode or settings.MPESA_SHORTCODE
-        password = base64.b64encode(f"{active_shortcode}{settings.MPESA_PASSKEY}{timestamp}".encode()).decode()
+        active_passkey = passkey or settings.MPESA_PASSKEY
+        active_callback = callback_url or settings.MPESA_CALLBACK_URL
+        password = base64.b64encode(
+            f"{active_shortcode}{active_passkey}{timestamp}".encode()
+        ).decode()
         
         payload = {
             "BusinessShortCode": active_shortcode,
@@ -52,12 +71,11 @@ async def initiate_stk_push_direct(phone_number: str, amount: float, reference: 
             "PartyA": phone_number,
             "PartyB": active_shortcode,
             "PhoneNumber": phone_number,
-            "CallBackURL": settings.MPESA_CALLBACK_URL,
+            "CallBackURL": active_callback,
             "AccountReference": reference,
             "TransactionDesc": "Payment via STK Push"
         }
 
-        # Determine API URL based on environment
         base_url = "https://api.safaricom.co.ke" if settings.MPESA_ENVIRONMENT == "production" else "https://sandbox.safaricom.co.ke"
         
         async with httpx.AsyncClient() as client:
@@ -70,7 +88,6 @@ async def initiate_stk_push_direct(phone_number: str, amount: float, reference: 
                 }
             )
             
-            # Log response for debugging
             if response.status_code != 200:
                 logger.error(f"M-Pesa API Error {response.status_code}: {response.text}")
                 try:
@@ -219,12 +236,17 @@ async def initiate_stk_push(
     user_id: Optional[int] = None,
     mac_address: Optional[str] = None,
     use_microservice: bool = False,
-    shortcode: Optional[str] = None
+    shortcode: Optional[str] = None,
+    passkey: Optional[str] = None,
+    consumer_key: Optional[str] = None,
+    consumer_secret: Optional[str] = None,
+    callback_url: Optional[str] = None,
 ):
     """
     Unified STK Push payment initiator.
     Uses the provided shortcode (user's paybill) if given,
     falls back to system default on failure.
+    Accepts optional per-reseller credentials for direct collection.
     """
     if shortcode and shortcode != settings.MPESA_SHORTCODE:
         try:
@@ -232,7 +254,11 @@ async def initiate_stk_push(
                 phone_number=phone_number,
                 amount=amount,
                 reference=reference,
-                shortcode=shortcode
+                shortcode=shortcode,
+                passkey=passkey,
+                consumer_key=consumer_key,
+                consumer_secret=consumer_secret,
+                callback_url=callback_url,
             )
         except Exception as e:
             logger.warning(f"STK Push with user shortcode {shortcode} failed: {e}. Falling back to default.")
@@ -240,7 +266,7 @@ async def initiate_stk_push(
     return await initiate_stk_push_direct(
         phone_number=phone_number,
         amount=amount,
-        reference=reference
+        reference=reference,
     )
 
 

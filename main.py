@@ -41,6 +41,8 @@ from app.api.voucher_routes import router as voucher_router
 from app.api.provisioning import router as provisioning_router
 from app.api.pppoe_monitor import router as pppoe_monitor_router
 from app.api.hotspot_monitor import router as hotspot_monitor_router
+from app.api.payment_method_routes import router as payment_method_router
+from app.api.zenopay_routes import router as zenopay_router
 from app.api.admin_reseller_routes import router as admin_reseller_router
 
 app.include_router(radius_router)
@@ -62,6 +64,8 @@ app.include_router(voucher_router)
 app.include_router(provisioning_router)
 app.include_router(pppoe_monitor_router)
 app.include_router(hotspot_monitor_router)
+app.include_router(payment_method_router)
+app.include_router(zenopay_router)
 app.include_router(admin_reseller_router)
 
 # --- Background job imports ---
@@ -143,21 +147,6 @@ async def run_radius_migrations():
             logger.info("Migration: Added pppoe_ports column to routers")
         else:
             logger.info("Migration: pppoe_ports column already exists, skipping")
-
-        # --- Router plain_ports column (no-auth port mode) ---
-        result = await conn.execute(sa_text("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'routers' AND column_name = 'plain_ports'
-        """))
-        if not result.fetchone():
-            await conn.execute(sa_text("""
-                ALTER TABLE routers
-                ADD COLUMN plain_ports JSON NULL
-            """))
-            logger.info("Migration: Added plain_ports column to routers")
-        else:
-            logger.info("Migration: plain_ports column already exists, skipping")
 
         # --- Voucher table ---
         result = await conn.execute(sa_text("""
@@ -260,28 +249,6 @@ async def run_radius_migrations():
         else:
             logger.info("Migration: provisioning_tokens table already exists, skipping")
 
-        # --- Provisioning tokens: L2TP/v6 support columns ---
-        result = await conn.execute(sa_text("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name = 'provisioning_tokens' AND column_name = 'vpn_type'
-        """))
-        if not result.fetchone():
-            await conn.execute(sa_text("""
-                ALTER TABLE provisioning_tokens
-                ADD COLUMN vpn_type VARCHAR(20) NOT NULL DEFAULT 'wireguard',
-                ADD COLUMN l2tp_username VARCHAR NULL,
-                ADD COLUMN l2tp_password VARCHAR NULL
-            """))
-            await conn.execute(sa_text("""
-                ALTER TABLE provisioning_tokens
-                ALTER COLUMN wg_private_key DROP NOT NULL,
-                ALTER COLUMN wg_public_key DROP NOT NULL,
-                ALTER COLUMN server_wg_pubkey DROP NOT NULL
-            """))
-            logger.info("Migration: Added vpn_type, l2tp columns to provisioning_tokens; made WG columns nullable")
-        else:
-            logger.info("Migration: provisioning_tokens L2TP columns already exist, skipping")
-
         # --- PPPoE columns on customers table ---
         result = await conn.execute(sa_text("""
             SELECT column_name
@@ -352,40 +319,6 @@ async def run_radius_migrations():
             logger.info("Migration: Added emergency_active, emergency_message to routers")
         else:
             logger.info("Migration: Router emergency columns already exist, skipping")
-
-        # --- User last_login_at column ---
-        await conn.execute(sa_text(
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP NULL"
-        ))
-
-        # --- Reseller payouts table ---
-        result = await conn.execute(sa_text("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_name = 'reseller_payouts'
-        """))
-        if not result.fetchone():
-            await conn.execute(sa_text("""
-                CREATE TABLE reseller_payouts (
-                    id SERIAL PRIMARY KEY,
-                    reseller_id INTEGER NOT NULL REFERENCES users(id),
-                    amount FLOAT NOT NULL,
-                    payment_method VARCHAR(50) NOT NULL,
-                    reference VARCHAR(255),
-                    notes VARCHAR(500),
-                    period_start TIMESTAMP,
-                    period_end TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """))
-            await conn.execute(sa_text(
-                "CREATE INDEX idx_reseller_payouts_reseller ON reseller_payouts(reseller_id)"
-            ))
-            await conn.execute(sa_text(
-                "CREATE INDEX idx_reseller_payouts_created ON reseller_payouts(created_at DESC)"
-            ))
-            logger.info("Migration: Created reseller_payouts table")
-        else:
-            logger.info("Migration: reseller_payouts table already exists, skipping")
 
         result = await conn.execute(sa_text("""
             SELECT table_name FROM information_schema.tables 
@@ -524,6 +457,75 @@ async def run_radius_migrations():
 
 
 # ============================================================================
+# Payment Method Migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_payment_method_migrations():
+    """Create tables and columns needed for the multi-payment-method feature."""
+    async with async_engine.begin() as conn:
+        # Create enum types
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE resellerpaymentmethodtype AS ENUM "
+            "('bank_account', 'mpesa_paybill', 'mpesa_paybill_with_keys', 'zenopay'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; "
+            "END $$"
+        ))
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE collectionmode AS ENUM ('direct', 'system_collected'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; "
+            "END $$"
+        ))
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE zenopaytransactionstatus AS ENUM ('pending', 'completed', 'failed'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; "
+            "END $$"
+        ))
+
+        # Create tables via ORM (checkfirst=True is safe to repeat)
+        from app.db.models import (
+            ResellerPaymentMethod, ZenoPayTransaction, ResellerPayout,
+        )
+        await conn.run_sync(
+            lambda c: ResellerPaymentMethod.__table__.create(c, checkfirst=True)
+        )
+        await conn.run_sync(
+            lambda c: ZenoPayTransaction.__table__.create(c, checkfirst=True)
+        )
+        await conn.run_sync(
+            lambda c: ResellerPayout.__table__.create(c, checkfirst=True)
+        )
+
+        # Add payment_method_id FK to routers if missing
+        result = await conn.execute(sa_text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'routers' AND column_name = 'payment_method_id'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE routers
+                ADD COLUMN payment_method_id INTEGER NULL
+                REFERENCES reseller_payment_methods(id)
+            """))
+            logger.info("Migration: Added payment_method_id column to routers")
+
+        # Add collection_mode to customer_payments if missing
+        result = await conn.execute(sa_text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'customer_payments' AND column_name = 'collection_mode'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE customer_payments
+                ADD COLUMN collection_mode collectionmode NULL
+            """))
+            logger.info("Migration: Added collection_mode column to customer_payments")
+
+
+# ============================================================================
 # Startup / Shutdown
 # ============================================================================
 async def run_monitoring_migrations():
@@ -570,6 +572,12 @@ async def startup_event():
         logger.info("Monitoring table migrations completed successfully")
     except Exception as e:
         logger.error(f"Monitoring migration failed (non-fatal): {e}")
+
+    try:
+        await run_payment_method_migrations()
+        logger.info("Payment method migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Payment method migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

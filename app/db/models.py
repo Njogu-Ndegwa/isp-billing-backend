@@ -51,6 +51,10 @@ class PaymentMethod(str, enum.Enum):
     CARD = "card"
     OTHER = "other"
 
+class CollectionMode(str, enum.Enum):
+    DIRECT = "direct"
+    SYSTEM_COLLECTED = "system_collected"
+
 class DurationUnit(str, enum.Enum):
     MINUTES = "MINUTES"
     HOURS = "HOURS"
@@ -74,7 +78,6 @@ class User(Base):
     mpesa_shortcode = Column(String(20), nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    last_login_at = Column(DateTime, nullable=True)
 
 class Customer(Base):
     __tablename__ = "customers"
@@ -164,7 +167,12 @@ class CustomerPayment(Base):
     days_paid_for = Column(Integer, nullable=False)
     status = Column(Enum(PaymentStatus), default=PaymentStatus.COMPLETED)
     notes = Column(String(500), nullable=True)
-    lipay_tx_no = Column(String(255), nullable=True)  # <-- Add this line
+    lipay_tx_no = Column(String(255), nullable=True)
+    collection_mode = Column(
+        Enum(CollectionMode, name="collectionmode",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=True,
+    )
     created_at = Column(DateTime, default=datetime.utcnow)
     customer = relationship("Customer", backref="customer_payments")
     reseller = relationship("User", backref="received_payments", foreign_keys=[reseller_id])
@@ -180,20 +188,6 @@ class ResellerFinancials(Base):
     last_payment_date = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     user = relationship("User", backref="financials")
-
-class ResellerPayout(Base):
-    __tablename__ = "reseller_payouts"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    amount = Column(Float, nullable=False)
-    payment_method = Column(String(50), nullable=False)
-    reference = Column(String(255), nullable=True)
-    notes = Column(String(500), nullable=True)
-    period_start = Column(DateTime, nullable=True)
-    period_end = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    reseller = relationship("User", backref="payouts_received")
-
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
@@ -227,7 +221,6 @@ class Router(Base):
     radius_nas_identifier = Column(String(100), nullable=True)  # NAS-Identifier for this router
     payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
     pppoe_ports = Column(JSON, nullable=True)  # e.g. ["ether4", "ether5"]
-    plain_ports = Column(JSON, nullable=True)  # e.g. ["ether3"] — no auth, free internet
     last_status = Column(Boolean, nullable=True)
     last_checked_at = Column(DateTime, nullable=True)
     last_online_at = Column(DateTime, nullable=True)
@@ -236,6 +229,8 @@ class Router(Base):
     availability_successes = Column(Integer, nullable=False, default=0, server_default="0")
     emergency_active = Column(Boolean, nullable=False, default=False, server_default="false")
     emergency_message = Column(String(500), nullable=True)
+    payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
+    assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 
 class ProvisioningLog(Base):
     __tablename__ = "provisioning_logs"
@@ -423,12 +418,9 @@ class ProvisioningToken(Base):
     wireguard_ip = Column(String(15), nullable=False)
     ssid = Column(String(100), nullable=False, default="Bitwave WiFi")
     router_admin_password = Column(String, nullable=False, default="admin")
-    vpn_type = Column(String(20), nullable=False, default="wireguard", server_default="wireguard")
-    wg_private_key = Column(String, nullable=True)
-    wg_public_key = Column(String, nullable=True)
-    server_wg_pubkey = Column(String, nullable=True)
-    l2tp_username = Column(String, nullable=True)
-    l2tp_password = Column(String, nullable=True)
+    wg_private_key = Column(String, nullable=False)
+    wg_public_key = Column(String, nullable=False)
+    server_wg_pubkey = Column(String, nullable=False)
     server_public_ip = Column(String(45), nullable=False)
     payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
     status = Column(
@@ -480,3 +472,102 @@ class RouterAvailabilityCheck(Base):
     source = Column(String(50), nullable=False, default="unknown")
 
     router = relationship("Router")
+
+
+# ========================================
+# RESELLER PAYMENT METHODS
+# ========================================
+
+class ResellerPaymentMethodType(str, enum.Enum):
+    BANK_ACCOUNT = "bank_account"
+    MPESA_PAYBILL = "mpesa_paybill"
+    MPESA_PAYBILL_WITH_KEYS = "mpesa_paybill_with_keys"
+    ZENOPAY = "zenopay"
+
+
+class ZenoPayTransactionStatus(str, enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ResellerPaymentMethod(Base):
+    """Payment method configured by a reseller, assignable to individual routers."""
+    __tablename__ = "reseller_payment_methods"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    method_type = Column(
+        Enum(ResellerPaymentMethodType, name="resellerpaymentmethodtype",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+    )
+    label = Column(String(100), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+
+    # Bank Account fields
+    bank_paybill_number = Column(String(20), nullable=True)
+    bank_account_number = Column(String(50), nullable=True)
+
+    # M-Pesa Paybill without API keys
+    mpesa_paybill_number = Column(String(20), nullable=True)
+
+    # M-Pesa Paybill/Till with API keys (encrypted at rest)
+    mpesa_shortcode = Column(String(20), nullable=True)
+    mpesa_passkey_encrypted = Column(String(500), nullable=True)
+    mpesa_consumer_key_encrypted = Column(String(500), nullable=True)
+    mpesa_consumer_secret_encrypted = Column(String(500), nullable=True)
+
+    # ZenoPay (Tanzania)
+    zenopay_api_key_encrypted = Column(String(500), nullable=True)
+    zenopay_account_id = Column(String(100), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", backref="payment_methods")
+    routers = relationship("Router", back_populates="assigned_payment_method")
+
+
+class ZenoPayTransaction(Base):
+    """Tracks ZenoPay payment lifecycle (analogous to MpesaTransaction)."""
+    __tablename__ = "zenopay_transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(String(255), unique=True, nullable=False, index=True)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True)
+    amount = Column(DECIMAL(10, 2), nullable=False)
+    status = Column(
+        Enum(ZenoPayTransactionStatus, name="zenopaytransactionstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=ZenoPayTransactionStatus.PENDING,
+    )
+    reference = Column(String(255), nullable=True)
+    channel = Column(String(50), nullable=True)
+    buyer_phone = Column(String(20), nullable=False)
+    buyer_name = Column(String(100), nullable=True)
+    buyer_email = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer = relationship("Customer")
+    reseller = relationship("User")
+
+
+class ResellerPayout(Base):
+    """Manual payout recorded by admin when system-collected funds are sent to a reseller."""
+    __tablename__ = "reseller_payouts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    amount = Column(Float, nullable=False)
+    payment_method = Column(String(50), nullable=False)
+    reference = Column(String(255), nullable=True)
+    notes = Column(String(500), nullable=True)
+    period_start = Column(DateTime, nullable=True)
+    period_end = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    reseller = relationship("User", backref="payouts")
