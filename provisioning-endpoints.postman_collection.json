@@ -20,8 +20,25 @@
                 ],
                 "body": {
                     "mode": "raw",
-                    "raw": "{\n    \"payment_methods\": [\"mpesa\", \"voucher\"]\n}"
-                }
+                    "raw": "{\n    \"payment_methods\": [\"mpesa\", \"voucher\"],\n    \"vpn_type\": \"wireguard\"\n}"
+                },
+                "description": "Create a provisioning token. Set vpn_type to 'wireguard' for RouterOS v7 or 'l2tp' for RouterOS v6."
+            }
+        },
+        {
+            "name": "Create Provisioning Token (RouterOS v6 / L2TP)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/provision/create",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{authToken}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"payment_methods\": [\"mpesa\", \"voucher\"],\n    \"vpn_type\": \"l2tp\"\n}"
+                },
+                "description": "Create a provisioning token for a RouterOS v6 router using L2TP/IPsec VPN."
             }
         },
         {

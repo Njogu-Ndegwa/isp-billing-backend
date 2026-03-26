@@ -12,6 +12,8 @@ app = FastAPI(title="WireGuard Peer Manager")
 API_SECRET = os.environ.get("WG_MANAGER_SECRET", "change-me-wg-secret")
 WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0")
 SERVER_PUBLIC_KEY_PATH = os.environ.get("WG_SERVER_PUBKEY_PATH", "/etc/wireguard/server_public.key")
+L2TP_CHAP_SECRETS_PATH = os.environ.get("L2TP_CHAP_SECRETS_PATH", "/etc/ppp/chap-secrets")
+L2TP_SERVER_NAME = "l2tp-server"
 
 
 def verify_secret(x_api_key: str = Header(...)):
@@ -27,6 +29,62 @@ class AddPeerRequest(BaseModel):
 
 class RemovePeerRequest(BaseModel):
     public_key: str
+
+
+class AddL2tpPeerRequest(BaseModel):
+    username: str
+    password: str
+    ip: str
+
+
+class RemoveL2tpPeerRequest(BaseModel):
+    username: str
+
+
+@app.post("/add-l2tp-peer")
+def add_l2tp_peer(req: AddL2tpPeerRequest, _=Depends(verify_secret)):
+    """Append a user line to /etc/ppp/chap-secrets for L2TP authentication."""
+    try:
+        line = f'{req.username}    {L2TP_SERVER_NAME}    "{req.password}"    {req.ip}\n'
+        existing = ""
+        if os.path.exists(L2TP_CHAP_SECRETS_PATH):
+            with open(L2TP_CHAP_SECRETS_PATH, "r") as f:
+                existing = f.read()
+        for existing_line in existing.splitlines():
+            if existing_line.strip() and existing_line.split()[0] == req.username:
+                logger.info(f"L2TP peer {req.username} already exists, updating")
+                lines = [l for l in existing.splitlines(True) if not l.strip() or l.split()[0] != req.username]
+                lines.append(line)
+                with open(L2TP_CHAP_SECRETS_PATH, "w") as f:
+                    f.writelines(lines)
+                return {"status": "ok", "message": "L2TP peer updated", "username": req.username, "ip": req.ip}
+        with open(L2TP_CHAP_SECRETS_PATH, "a") as f:
+            f.write(line)
+        logger.info(f"Added L2TP peer {req.username} with IP {req.ip}")
+        return {"status": "ok", "message": "L2TP peer added", "username": req.username, "ip": req.ip}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add L2TP peer: {e}")
+
+
+@app.delete("/remove-l2tp-peer")
+def remove_l2tp_peer(req: RemoveL2tpPeerRequest, _=Depends(verify_secret)):
+    """Remove a user line from /etc/ppp/chap-secrets."""
+    try:
+        if not os.path.exists(L2TP_CHAP_SECRETS_PATH):
+            raise HTTPException(status_code=404, detail="chap-secrets file not found")
+        with open(L2TP_CHAP_SECRETS_PATH, "r") as f:
+            lines = f.readlines()
+        new_lines = [l for l in lines if not l.strip() or l.split()[0] != req.username]
+        if len(new_lines) == len(lines):
+            raise HTTPException(status_code=404, detail=f"L2TP peer {req.username} not found")
+        with open(L2TP_CHAP_SECRETS_PATH, "w") as f:
+            f.writelines(new_lines)
+        logger.info(f"Removed L2TP peer {req.username}")
+        return {"status": "ok", "message": "L2TP peer removed"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to remove L2TP peer: {e}")
 
 
 @app.post("/add-peer")

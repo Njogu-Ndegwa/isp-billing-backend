@@ -25,6 +25,7 @@ router = APIRouter(tags=["provisioning"])
 
 class ProvisionCreateRequest(BaseModel):
     payment_methods: Optional[List[str]] = None
+    vpn_type: Optional[str] = "wireguard"
 
 
 # ── Authenticated endpoints ──────────────────────────────────────────────
@@ -38,14 +39,24 @@ async def create_provision_token(
 ):
     """
     Generate a provisioning token for a new MikroTik router.
+    Set vpn_type to "wireguard" (RouterOS v7) or "l2tp" (RouterOS v6).
     Returns the one-liner command to paste on a factory-reset router.
     """
     user = await get_current_user(token, db)
+
+    vpn_type = (request.vpn_type or "wireguard").lower()
+    if vpn_type not in ("wireguard", "l2tp"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid vpn_type '{vpn_type}'. Must be 'wireguard' or 'l2tp'.",
+        )
+
     try:
         token_obj = await create_provisioning_token(
             db=db,
             user_id=user.id,
             payment_methods=request.payment_methods,
+            vpn_type=vpn_type,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -58,18 +69,27 @@ async def create_provision_token(
 
     command = build_provision_command(token_obj)
 
-    return {
-        "token": token_obj.token,
-        "router_name": token_obj.router_name,
-        "identity": token_obj.identity,
-        "wireguard_ip": token_obj.wireguard_ip,
-        "command": command,
-        "note": (
+    if vpn_type == "l2tp":
+        note = (
+            "This token is for RouterOS v6 (L2TP/IPsec VPN). "
+            "Paste the command on a factory-reset MikroTik running RouterOS v6."
+        )
+    else:
+        note = (
             "IMPORTANT: Before running this command on the MikroTik, ensure "
             "device-mode hotspot is enabled. Run: "
             "/system/device-mode/update hotspot=yes  "
             "then tap the physical reset button on the router (quick tap, do NOT hold)."
-        ),
+        )
+
+    return {
+        "token": token_obj.token,
+        "router_name": token_obj.router_name,
+        "identity": token_obj.identity,
+        "vpn_type": token_obj.vpn_type,
+        "vpn_ip": token_obj.wireguard_ip,
+        "command": command,
+        "note": note,
         "created_at": token_obj.created_at.isoformat(),
         "expires_in_hours": 24,
     }
@@ -95,7 +115,8 @@ async def list_provision_tokens(
             "token": t.token,
             "router_name": t.router_name,
             "identity": t.identity,
-            "wireguard_ip": t.wireguard_ip,
+            "vpn_type": t.vpn_type,
+            "vpn_ip": t.wireguard_ip,
             "status": t.status.value if hasattr(t.status, "value") else t.status,
             "expired": is_token_expired(t) and t.status == ProvisioningTokenStatus.PENDING,
             "command": build_provision_command(t) if t.status == ProvisioningTokenStatus.PENDING and not is_token_expired(t) else None,
@@ -180,7 +201,8 @@ async def complete_provision(
         "status": "provisioned",
         "router_id": router_obj.id,
         "identity": router_obj.identity,
-        "wireguard_ip": router_obj.ip_address,
+        "vpn_ip": router_obj.ip_address,
+        "vpn_type": token_obj.vpn_type,
         "message": f"Router '{router_obj.name}' registered successfully",
     }
 

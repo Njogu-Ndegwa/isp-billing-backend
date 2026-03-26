@@ -15,7 +15,7 @@ from app.db.models import (
     RouterLogEntry, RouterAvailabilityCheck,
 )
 from app.services.auth import verify_token, get_current_user
-from app.services.provisioning import remove_wireguard_peer
+from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
 
 import logging
 
@@ -1115,10 +1115,13 @@ async def delete_reseller(
     )
     for tk in tokens_result.scalars().all():
         try:
-            await remove_wireguard_peer(tk.wg_public_key)
+            if tk.vpn_type == "l2tp" and tk.l2tp_username:
+                await remove_l2tp_peer(tk.l2tp_username)
+            elif tk.wg_public_key:
+                await remove_wireguard_peer(tk.wg_public_key)
         except Exception as e:
-            wg_failures.append({"token_id": tk.id, "public_key": tk.wg_public_key, "error": str(e)})
-            logger.warning(f"[DELETE-RESELLER] WG peer removal failed for token {tk.id}: {e}")
+            wg_failures.append({"token_id": tk.id, "error": str(e)})
+            logger.warning(f"[DELETE-RESELLER] VPN peer removal failed for token {tk.id}: {e}")
 
     # ── Phase 2: DB cascade deletion (bottom-up) ──
     customer_ids = select(Customer.id).where(Customer.user_id == reseller_id)

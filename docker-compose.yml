@@ -48,6 +48,7 @@ services:
       - WG_MANAGER_URL=${WG_MANAGER_URL:-http://host.docker.internal:8729}
       - WG_MANAGER_SECRET=${WG_MANAGER_SECRET:-change-me-wg-secret}
       - PROVISION_BASE_URL=${PROVISION_BASE_URL:-https://isp.bitwavetechnologies.net}
+      - L2TP_IPSEC_PSK=${L2TP_IPSEC_PSK:-BitwaveL2TP2026!Secure}
     volumes:
       - wg_sock:/var/run/wg-manager
     depends_on:
@@ -87,8 +88,10 @@ services:
     environment:
       - WG_MANAGER_SECRET=${WG_MANAGER_SECRET:-change-me-wg-secret}
       - WG_INTERFACE=${WG_INTERFACE:-wg0}
+      - L2TP_CHAP_SECRETS_PATH=/etc/ppp/chap-secrets
     volumes:
       - wg_sock:/var/run/wg-manager
+      - /etc/ppp:/etc/ppp
     restart: unless-stopped
 
 volumes:
