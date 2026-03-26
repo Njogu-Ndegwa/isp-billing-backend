@@ -1,0 +1,72 @@
+{
+    "info": {
+        "name": "Reseller Account Statement & Transaction Charges",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": "YOUR_JWT_TOKEN_HERE"},
+        {"key": "resellerId", "value": "1"}
+    ],
+    "auth": {
+        "type": "bearer",
+        "bearer": [{"key": "token", "value": "{{token}}"}]
+    },
+    "item": [
+        {
+            "name": "Admin - Add Transaction Charge to Reseller",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/admin/resellers/{{resellerId}}/transaction-charges",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"amount\": 150.00,\n    \"description\": \"M-Pesa withdrawal fee\",\n    \"reference\": \"TXN-FEE-001\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Admin - List Transaction Charges for Reseller",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/resellers/{{resellerId}}/transaction-charges?page=1&per_page=50",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "resellers", "{{resellerId}}", "transaction-charges"],
+                    "query": [
+                        {"key": "page", "value": "1"},
+                        {"key": "per_page", "value": "50"},
+                        {"key": "start_date", "value": "", "disabled": true},
+                        {"key": "end_date", "value": "", "disabled": true}
+                    ]
+                },
+                "header": [
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ]
+            }
+        },
+        {
+            "name": "Reseller - Account Statement",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/reseller/account-statement?page=1&per_page=50",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "reseller", "account-statement"],
+                    "query": [
+                        {"key": "page", "value": "1"},
+                        {"key": "per_page", "value": "50"},
+                        {"key": "start_date", "value": "", "disabled": true},
+                        {"key": "end_date", "value": "", "disabled": true}
+                    ]
+                },
+                "header": [
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ]
+            }
+        }
+    ]
+}

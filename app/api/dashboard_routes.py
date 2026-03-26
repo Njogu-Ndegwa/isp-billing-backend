@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract, case, distinct
 from sqlalchemy.orm import selectinload
@@ -10,6 +10,7 @@ from app.db.database import get_db
 from app.db.models import (
     Router, Customer, Plan, CustomerStatus, CustomerPayment,
     MpesaTransaction, MpesaTransactionStatus,
+    ResellerPayout, ResellerTransactionCharge, PaymentMethod,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.router_helpers import get_router_by_id
@@ -993,6 +994,137 @@ async def get_dashboard_stats(
     except Exception as e:
         logger.error(f"Error fetching dashboard stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/reseller/account-statement")
+async def get_reseller_account_statement(
+    page: int = 1,
+    per_page: int = 50,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Reseller-facing account statement showing:
+    - Total M-Pesa revenue collected by the system on their behalf
+    - All payouts made to their account (with references)
+    - All transaction charges deducted (with descriptions)
+    - Current unpaid balance
+
+    The entries list merges payouts and charges into a single chronological feed.
+    """
+    user = await get_current_user(token, db)
+    reseller_id = user.id
+
+    date_filters_payout: list = [ResellerPayout.reseller_id == reseller_id]
+    date_filters_charge: list = [ResellerTransactionCharge.reseller_id == reseller_id]
+
+    if start_date:
+        try:
+            sd = datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date format, use YYYY-MM-DD")
+        date_filters_payout.append(ResellerPayout.created_at >= sd)
+        date_filters_charge.append(ResellerTransactionCharge.created_at >= sd)
+    if end_date:
+        try:
+            ed = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date format, use YYYY-MM-DD")
+        date_filters_payout.append(ResellerPayout.created_at < ed)
+        date_filters_charge.append(ResellerTransactionCharge.created_at < ed)
+
+    # All-time M-Pesa revenue (system-collected)
+    mpesa_filter = CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY
+    all_time_mpesa = float((await db.execute(
+        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+            CustomerPayment.reseller_id == reseller_id, mpesa_filter
+        )
+    )).scalar())
+
+    # All-time payout + charge totals (always unfiltered for balance calc)
+    total_paid = float((await db.execute(
+        select(func.coalesce(func.sum(ResellerPayout.amount), 0)).where(
+            ResellerPayout.reseller_id == reseller_id
+        )
+    )).scalar())
+    total_charges = float((await db.execute(
+        select(func.coalesce(func.sum(ResellerTransactionCharge.amount), 0)).where(
+            ResellerTransactionCharge.reseller_id == reseller_id
+        )
+    )).scalar())
+
+    unpaid_balance = round(all_time_mpesa - total_paid - total_charges, 2)
+
+    # Fetch payouts in date range
+    payouts_result = await db.execute(
+        select(ResellerPayout).where(*date_filters_payout).order_by(ResellerPayout.created_at.desc())
+    )
+    payout_entries = [
+        {
+            "type": "payout",
+            "id": p.id,
+            "amount": p.amount,
+            "description": f"Payout via {p.payment_method}",
+            "reference": p.reference,
+            "notes": p.notes,
+            "date": p.created_at.isoformat(),
+        }
+        for p in payouts_result.scalars().all()
+    ]
+
+    # Fetch transaction charges in date range
+    charges_result = await db.execute(
+        select(ResellerTransactionCharge).where(*date_filters_charge)
+        .order_by(ResellerTransactionCharge.created_at.desc())
+    )
+    charge_entries = [
+        {
+            "type": "charge",
+            "id": c.id,
+            "amount": c.amount,
+            "description": c.description,
+            "reference": c.reference,
+            "notes": None,
+            "date": c.created_at.isoformat(),
+        }
+        for c in charges_result.scalars().all()
+    ]
+
+    # Merge and sort chronologically (newest first)
+    all_entries = sorted(payout_entries + charge_entries, key=lambda e: e["date"], reverse=True)
+    total_entries = len(all_entries)
+
+    offset = (page - 1) * per_page
+    paginated = all_entries[offset : offset + per_page]
+
+    # Period totals (scoped to date filters)
+    period_payouts = float((await db.execute(
+        select(func.coalesce(func.sum(ResellerPayout.amount), 0)).where(*date_filters_payout)
+    )).scalar())
+    period_charges = float((await db.execute(
+        select(func.coalesce(func.sum(ResellerTransactionCharge.amount), 0)).where(*date_filters_charge)
+    )).scalar())
+
+    return {
+        "balance": {
+            "total_system_collected": all_time_mpesa,
+            "total_paid_to_you": total_paid,
+            "total_transaction_charges": total_charges,
+            "unpaid_balance": unpaid_balance,
+        },
+        "period_summary": {
+            "total_payouts": round(period_payouts, 2),
+            "total_charges": round(period_charges, 2),
+            "net": round(period_payouts - period_charges, 2),
+        },
+        "page": page,
+        "per_page": per_page,
+        "total_entries": total_entries,
+        "total_pages": (total_entries + per_page - 1) // per_page if total_entries else 0,
+        "entries": paginated,
+    }
 
 
 def _parse_speed_value(speed_str: str) -> float:

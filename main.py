@@ -549,6 +549,13 @@ async def run_payment_method_migrations():
             """))
             logger.info("Migration: Added collection_mode column to customer_payments")
 
+        # Create reseller_transaction_charges table if it doesn't exist
+        from app.db.models import ResellerTransactionCharge
+        await conn.run_sync(
+            lambda c: ResellerTransactionCharge.__table__.create(c, checkfirst=True)
+        )
+        logger.info("Migration: Ensured reseller_transaction_charges table exists")
+
 
 # ============================================================================
 # User column migrations (runs on startup, idempotent)

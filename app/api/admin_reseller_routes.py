@@ -9,6 +9,7 @@ from app.db.database import get_db
 from app.db.models import (
     User, UserRole, Router, Customer, CustomerStatus,
     CustomerPayment, Plan, ResellerFinancials, ResellerPayout,
+    ResellerTransactionCharge,
     PaymentMethod, Payment, ProvisioningToken, Voucher,
     Subscription, CustomerRating, UserBandwidthUsage,
     MpesaTransaction, ProvisioningLog, BandwidthSnapshot,
@@ -55,6 +56,13 @@ async def _get_reseller_or_404(db: AsyncSession, reseller_id: int) -> User:
 async def _total_payouts(db: AsyncSession, reseller_id: int) -> float:
     stmt = select(func.coalesce(func.sum(ResellerPayout.amount), 0)).where(
         ResellerPayout.reseller_id == reseller_id
+    )
+    return float((await db.execute(stmt)).scalar())
+
+
+async def _total_transaction_charges(db: AsyncSession, reseller_id: int) -> float:
+    stmt = select(func.coalesce(func.sum(ResellerTransactionCharge.amount), 0)).where(
+        ResellerTransactionCharge.reseller_id == reseller_id
     )
     return float((await db.execute(stmt)).scalar())
 
@@ -191,10 +199,11 @@ async def list_resellers(
             select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*rev_filters, MPESA_FILTER)
         )).scalar())
 
-        # Unpaid balance is always all-time M-Pesa revenue minus total payouts
+        # Unpaid balance = all-time M-Pesa revenue minus payouts minus transaction charges
         all_time_mpesa = await _mpesa_revenue(db, r.id)
         paid = await _total_payouts(db, r.id)
-        unpaid = round(all_time_mpesa - paid, 2)
+        charges = await _total_transaction_charges(db, r.id)
+        unpaid = round(all_time_mpesa - paid - charges, 2)
 
         item = {
             "id": r.id,
@@ -212,6 +221,7 @@ async def list_resellers(
             "last_payment_date": fin.last_payment_date.isoformat() if fin and fin.last_payment_date else None,
             "router_count": router_count,
             "unpaid_balance": unpaid,
+            "total_transaction_charges": charges,
         }
 
         # Apply post-query filters that depend on computed values
@@ -366,11 +376,30 @@ async def get_reseller_detail(
     # Payout summary (always all-time, based on M-Pesa revenue only)
     all_time_mpesa = await _mpesa_revenue(db, reseller_id)
     total_paid = await _total_payouts(db, reseller_id)
+    total_charges = await _total_transaction_charges(db, reseller_id)
 
     last_payout_stmt = select(func.max(ResellerPayout.created_at)).where(
         ResellerPayout.reseller_id == reseller_id
     )
     last_payout_date = (await db.execute(last_payout_stmt)).scalar()
+
+    # Recent transaction charges
+    recent_charges_stmt = (
+        select(ResellerTransactionCharge)
+        .where(ResellerTransactionCharge.reseller_id == reseller_id)
+        .order_by(ResellerTransactionCharge.created_at.desc())
+        .limit(5)
+    )
+    recent_charges = [
+        {
+            "id": c.id,
+            "amount": c.amount,
+            "description": c.description,
+            "reference": c.reference,
+            "created_at": c.created_at.isoformat(),
+        }
+        for c in (await db.execute(recent_charges_stmt)).scalars().all()
+    ]
 
     return {
         "id": r.id,
@@ -392,9 +421,11 @@ async def get_reseller_detail(
         "recent_payments": recent_payments,
         "payouts": {
             "total_paid": total_paid,
+            "total_transaction_charges": total_charges,
             "last_payout_date": last_payout_date.isoformat() if last_payout_date else None,
-            "unpaid_balance": round(all_time_mpesa - total_paid, 2),
+            "unpaid_balance": round(all_time_mpesa - total_paid - total_charges, 2),
         },
+        "recent_transaction_charges": recent_charges,
     }
 
 
@@ -795,7 +826,11 @@ async def admin_dashboard(
         select(func.coalesce(func.sum(ResellerPayout.amount), 0))
     )).scalar())
 
-    total_unpaid = round(all_time_mpesa_revenue - total_payouts, 2)
+    total_charges = float((await db.execute(
+        select(func.coalesce(func.sum(ResellerTransactionCharge.amount), 0))
+    )).scalar())
+
+    total_unpaid = round(all_time_mpesa_revenue - total_payouts - total_charges, 2)
 
     # Recent 10 reseller sign-ups
     recent_stmt = (
@@ -848,6 +883,7 @@ async def admin_dashboard(
         "top_resellers_this_month": top_resellers,
         "payouts": {
             "total_paid": total_payouts,
+            "total_transaction_charges": total_charges,
             "total_unpaid": total_unpaid,
         },
         "recent_signups": recent_signups,
@@ -906,10 +942,11 @@ async def record_payout(
     await db.commit()
     await db.refresh(payout)
 
-    # Compute updated unpaid balance (M-Pesa revenue only)
+    # Compute updated unpaid balance (M-Pesa revenue minus payouts minus charges)
     mpesa_rev = await _mpesa_revenue(db, reseller_id)
     paid = await _total_payouts(db, reseller_id)
-    balance = round(mpesa_rev - paid, 2)
+    charges = await _total_transaction_charges(db, reseller_id)
+    balance = round(mpesa_rev - paid - charges, 2)
 
     return {
         "payout": {
@@ -1036,6 +1073,9 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
     payouts = (await db.execute(
         select(func.count(ResellerPayout.id)).where(ResellerPayout.reseller_id == reseller_id)
     )).scalar() or 0
+    transaction_charges = (await db.execute(
+        select(func.count(ResellerTransactionCharge.id)).where(ResellerTransactionCharge.reseller_id == reseller_id)
+    )).scalar() or 0
 
     payments = await _count(Payment, Payment.customer_id, customer_ids_stmt)
     mpesa_transactions = await _count(MpesaTransaction, MpesaTransaction.customer_id, customer_ids_stmt)
@@ -1071,6 +1111,7 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         "router_logs": router_logs,
         "availability_checks": availability_checks,
         "reseller_payouts": payouts,
+        "reseller_transaction_charges": transaction_charges,
         "wireguard_peers": wg_tokens,
     }
 
@@ -1199,6 +1240,9 @@ async def delete_reseller(
     # 20. Reseller payouts
     await db.execute(delete(ResellerPayout).where(ResellerPayout.reseller_id == reseller_id))
 
+    # 20b. Reseller transaction charges
+    await db.execute(delete(ResellerTransactionCharge).where(ResellerTransactionCharge.reseller_id == reseller_id))
+
     # 21. Subscriptions
     await db.execute(delete(Subscription).where(Subscription.user_id == reseller_id))
 
@@ -1222,4 +1266,132 @@ async def delete_reseller(
         "deleted": summary,
         "wireguard_failures": wg_failures,
         "message": "Reseller and all associated data deleted successfully.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 9. POST /api/admin/resellers/{reseller_id}/transaction-charges
+# ---------------------------------------------------------------------------
+class TransactionChargeRequest(BaseModel):
+    amount: float
+    description: str
+    reference: Optional[str] = None
+
+
+@router.post("/api/admin/resellers/{reseller_id}/transaction-charges")
+async def add_transaction_charge(
+    reseller_id: int,
+    request: TransactionChargeRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Record a transaction charge (deduction) against a reseller's balance.
+
+    Use this for bank fees, M-Pesa withdrawal charges, or any other
+    cost the admin wants to deduct before paying the reseller.
+    """
+    admin = await _require_admin(token, db)
+    await _get_reseller_or_404(db, reseller_id)
+
+    if request.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+    if not request.description.strip():
+        raise HTTPException(status_code=400, detail="Description is required")
+
+    charge = ResellerTransactionCharge(
+        reseller_id=reseller_id,
+        amount=request.amount,
+        description=request.description.strip(),
+        reference=request.reference,
+        created_by=admin.id,
+    )
+    db.add(charge)
+    await db.commit()
+    await db.refresh(charge)
+
+    mpesa_rev = await _mpesa_revenue(db, reseller_id)
+    paid = await _total_payouts(db, reseller_id)
+    charges = await _total_transaction_charges(db, reseller_id)
+    balance = round(mpesa_rev - paid - charges, 2)
+
+    return {
+        "charge": {
+            "id": charge.id,
+            "reseller_id": charge.reseller_id,
+            "amount": charge.amount,
+            "description": charge.description,
+            "reference": charge.reference,
+            "created_by": charge.created_by,
+            "created_at": charge.created_at.isoformat(),
+        },
+        "unpaid_balance": balance,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 10. GET /api/admin/resellers/{reseller_id}/transaction-charges
+# ---------------------------------------------------------------------------
+@router.get("/api/admin/resellers/{reseller_id}/transaction-charges")
+async def get_transaction_charges(
+    reseller_id: int,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """List all transaction charges for a reseller (paginated)."""
+    await _require_admin(token, db)
+    await _get_reseller_or_404(db, reseller_id)
+
+    filters = [ResellerTransactionCharge.reseller_id == reseller_id]
+    if start_date:
+        filters.append(ResellerTransactionCharge.created_at >= _parse_date(start_date, "start_date"))
+    if end_date:
+        filters.append(
+            ResellerTransactionCharge.created_at < _parse_date(end_date, "end_date") + timedelta(days=1)
+        )
+
+    summary_stmt = select(
+        func.count(ResellerTransactionCharge.id),
+        func.coalesce(func.sum(ResellerTransactionCharge.amount), 0),
+    ).where(*filters)
+    summary = (await db.execute(summary_stmt)).one()
+    total_count, total_amount = int(summary[0]), float(summary[1])
+
+    offset = (page - 1) * per_page
+    charges_stmt = (
+        select(ResellerTransactionCharge)
+        .where(*filters)
+        .order_by(ResellerTransactionCharge.created_at.desc())
+        .offset(offset)
+        .limit(per_page)
+    )
+    result = await db.execute(charges_stmt)
+
+    charges = [
+        {
+            "id": c.id,
+            "amount": c.amount,
+            "description": c.description,
+            "reference": c.reference,
+            "created_by": c.created_by,
+            "created_at": c.created_at.isoformat(),
+        }
+        for c in result.scalars().all()
+    ]
+
+    return {
+        "reseller_id": reseller_id,
+        "page": page,
+        "per_page": per_page,
+        "total_count": total_count,
+        "total_pages": (total_count + per_page - 1) // per_page,
+        "summary": {
+            "total_charges": total_count,
+            "total_amount": round(total_amount, 2),
+        },
+        "charges": charges,
     }

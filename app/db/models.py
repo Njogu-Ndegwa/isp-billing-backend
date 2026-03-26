@@ -575,3 +575,19 @@ class ResellerPayout(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     reseller = relationship("User", backref="payouts")
+
+
+class ResellerTransactionCharge(Base):
+    """Deduction recorded by admin against a reseller's balance (e.g. bank fees, M-Pesa charges)."""
+    __tablename__ = "reseller_transaction_charges"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    amount = Column(Float, nullable=False)
+    description = Column(String(255), nullable=False)
+    reference = Column(String(255), nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    reseller = relationship("User", foreign_keys=[reseller_id], backref="transaction_charges")
+    admin = relationship("User", foreign_keys=[created_by])
