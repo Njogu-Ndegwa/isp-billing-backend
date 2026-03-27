@@ -44,6 +44,32 @@ class PaymentStatus(str, enum.Enum):
     FAILED = "failed"
     REFUNDED = "refunded"
 
+
+class ProvisioningAttemptSource(str, enum.Enum):
+    MPESA_TRANSACTION = "mpesa_transaction"
+    CUSTOMER_PAYMENT = "customer_payment"
+
+
+class ProvisioningAttemptEntrypoint(str, enum.Enum):
+    HOTSPOT_PAYMENT = "hotspot_payment"
+    HOTSPOT_RECONCILIATION = "hotspot_reconciliation"
+    VOUCHER_DIRECT_API = "voucher_direct_api"
+    MANUAL_TRANSACTION_PROVISION = "manual_transaction_provision"
+
+
+class ProvisioningState(str, enum.Enum):
+    SCHEDULED = "scheduled"
+    IN_PROGRESS = "in_progress"
+    RETRY_PENDING = "retry_pending"
+    ROUTER_UPDATED = "router_updated"
+    FAILED = "failed"
+
+
+class ProvisioningOnlineState(str, enum.Enum):
+    UNKNOWN = "unknown"
+    OFFLINE = "offline"
+    ONLINE = "online"
+
 class PaymentMethod(str, enum.Enum):
     CASH = "cash"
     MOBILE_MONEY = "mobile_money"
@@ -239,12 +265,71 @@ class ProvisioningLog(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
+    attempt_id = Column(Integer, ForeignKey("provisioning_attempts.id"), nullable=True)
     mac_address = Column(String(50), nullable=True)
     action = Column(String, nullable=False)
     status = Column(String, nullable=False)
     error = Column(String(255))
     details = Column(String(255))
     log_date = Column(DateTime, default=datetime.utcnow)
+
+
+class ProvisioningAttempt(Base):
+    __tablename__ = "provisioning_attempts"
+    __table_args__ = (
+        UniqueConstraint("source_table", "source_pk", name="uq_provisioning_attempt_source"),
+        Index("idx_provisioning_attempt_state_updated", "provisioning_state", "updated_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=True, index=True)
+    mac_address = Column(String(50), nullable=True, index=True)
+    source_table = Column(
+        Enum(
+            ProvisioningAttemptSource,
+            name="provisioningattemptsource",
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+        ),
+        nullable=False,
+    )
+    source_pk = Column(Integer, nullable=False)
+    external_reference = Column(String(255), nullable=True, index=True)
+    entrypoint = Column(
+        Enum(
+            ProvisioningAttemptEntrypoint,
+            name="provisioningattemptentrypoint",
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+        ),
+        nullable=False,
+    )
+    provisioning_state = Column(
+        Enum(
+            ProvisioningState,
+            name="provisioningstate",
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+        ),
+        nullable=False,
+        default=ProvisioningState.SCHEDULED,
+        server_default=ProvisioningState.SCHEDULED.value,
+    )
+    online_state = Column(
+        Enum(
+            ProvisioningOnlineState,
+            name="provisioningonlinestate",
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+        ),
+        nullable=False,
+        default=ProvisioningOnlineState.UNKNOWN,
+        server_default=ProvisioningOnlineState.UNKNOWN.value,
+    )
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(String(255), nullable=True)
+    last_attempt_at = Column(DateTime, nullable=True)
+    router_updated_at = Column(DateTime, nullable=True)
+    last_online_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 class MpesaTransaction(Base):
     __tablename__ = "mpesa_transactions"

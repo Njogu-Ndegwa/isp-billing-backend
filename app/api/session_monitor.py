@@ -45,6 +45,7 @@ from sqlalchemy import text
 from pydantic import BaseModel, Field
 
 from app.db.database import get_db
+from app.services.hotspot_provisioning import derive_delivery_status
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +72,14 @@ class PaymentInfo(BaseModel):
 
 
 class ProvisioningInfo(BaseModel):
+    attempt_id: Optional[int] = None
     action: Optional[str] = None
     status: Optional[str] = None
     error: Optional[str] = None
     log_date: Optional[str] = None
+    provisioning_state: Optional[str] = None
+    online_state: Optional[str] = None
+    delivery_status: Optional[str] = None
 
 
 class SessionInfo(BaseModel):
@@ -232,11 +237,42 @@ async def _bulk_load_last_payments(
 async def _bulk_load_last_provisioning(
     db: AsyncSession, customer_ids: List[int]
 ) -> Dict[int, ProvisioningInfo]:
-    """Last provisioning log per customer."""
+    """Last delivery/provisioning record per customer, preferring attempts."""
     if not customer_ids:
         return {}
     placeholders = ", ".join(f":cid_{i}" for i in range(len(customer_ids)))
     params = {f"cid_{i}": cid for i, cid in enumerate(customer_ids)}
+
+    attempts_result = await db.execute(text(f"""
+        SELECT * FROM (
+            SELECT
+                customer_id, id, entrypoint, provisioning_state, online_state,
+                last_error, last_attempt_at, updated_at,
+                ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY updated_at DESC, id DESC) as rn
+            FROM provisioning_attempts
+            WHERE customer_id IN ({placeholders})
+        ) sub WHERE rn = 1
+    """), params)
+
+    result: Dict[int, ProvisioningInfo] = {}
+    for row in attempts_result.fetchall():
+        result[row.customer_id] = ProvisioningInfo(
+            attempt_id=row.id,
+            action=row.entrypoint,
+            status=row.provisioning_state,
+            error=row.last_error,
+            log_date=row.last_attempt_at.isoformat() if row.last_attempt_at else (row.updated_at.isoformat() if row.updated_at else None),
+            provisioning_state=row.provisioning_state,
+            online_state=row.online_state,
+            delivery_status=derive_delivery_status(row.provisioning_state, row.online_state),
+        )
+
+    remaining_ids = [customer_id for customer_id in customer_ids if customer_id not in result]
+    if not remaining_ids:
+        return result
+
+    placeholders = ", ".join(f":rcid_{i}" for i in range(len(remaining_ids)))
+    params = {f"rcid_{i}": cid for i, cid in enumerate(remaining_ids)}
 
     r = await db.execute(text(f"""
         SELECT * FROM (
@@ -248,7 +284,6 @@ async def _bulk_load_last_provisioning(
         ) sub WHERE rn = 1
     """), params)
 
-    result: Dict[int, ProvisioningInfo] = {}
     for row in r.fetchall():
         result[row.customer_id] = ProvisioningInfo(
             action=row.action,
@@ -456,7 +491,36 @@ def _analyze(
     # ================================================================
     # 3. PROVISIONING_FAILED
     # ================================================================
-    if prov and prov.status and prov.status.upper() == 'FAILED':
+    provisioning_state = (prov.provisioning_state or prov.status or "").upper() if prov else ""
+    online_state = (prov.online_state or "").lower() if prov else ""
+
+    if prov and provisioning_state == 'FAILED':
+        anomalies.append(SessionAnomaly(
+            code="PROVISIONING_FAILED",
+            severity="CRITICAL",
+            message=f"Last direct hotspot delivery attempt failed: {prov.error or 'No error details recorded.'}",
+            details={
+                "attempt_id": prov.attempt_id,
+                "action": prov.action,
+                "error": prov.error,
+                "log_date": prov.log_date,
+                "delivery_status": prov.delivery_status,
+            }
+        ))
+    elif prov and provisioning_state == 'ROUTER_UPDATED' and online_state == 'offline':
+        anomalies.append(SessionAnomaly(
+            code="PROVISIONING_FAILED",
+            severity="WARNING",
+            message="Router was updated successfully, but the client is still offline on router-side checks.",
+            details={
+                "attempt_id": prov.attempt_id,
+                "action": prov.action,
+                "log_date": prov.log_date,
+                "delivery_status": prov.delivery_status,
+                "online_state": prov.online_state,
+            }
+        ))
+    elif prov and prov.status and prov.status.upper() == 'FAILED':
         if is_active:
             anomalies.append(SessionAnomaly(
                 code="PROVISIONING_FAILED",

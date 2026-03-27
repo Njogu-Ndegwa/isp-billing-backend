@@ -249,6 +249,60 @@ async def run_radius_migrations():
         else:
             logger.info("Migration: provisioning_tokens table already exists, skipping")
 
+        # --- Provisioning attempts table / provisioning_logs correlation ---
+        from app.db.models import ProvisioningAttempt
+        await conn.run_sync(
+            lambda c: ProvisioningAttempt.__table__.create(c, checkfirst=True)
+        )
+        await conn.execute(sa_text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_provisioning_attempts_source "
+            "ON provisioning_attempts(source_table, source_pk)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_provisioning_attempts_state_updated "
+            "ON provisioning_attempts(provisioning_state, updated_at)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_provisioning_attempts_customer "
+            "ON provisioning_attempts(customer_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_provisioning_attempts_external_reference "
+            "ON provisioning_attempts(external_reference)"
+        ))
+
+        result = await conn.execute(sa_text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'provisioning_logs' AND column_name = 'attempt_id'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE provisioning_logs
+                ADD COLUMN attempt_id INTEGER NULL
+            """))
+            logger.info("Migration: Added attempt_id column to provisioning_logs")
+        else:
+            logger.info("Migration: provisioning_logs.attempt_id already exists, skipping")
+
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'fk_provisioning_logs_attempt_id'
+                ) THEN
+                    ALTER TABLE provisioning_logs
+                    ADD CONSTRAINT fk_provisioning_logs_attempt_id
+                    FOREIGN KEY (attempt_id) REFERENCES provisioning_attempts(id);
+                END IF;
+            END $$;
+        """))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_provisioning_logs_attempt_id "
+            "ON provisioning_logs(attempt_id)"
+        ))
+
         # --- Provisioning tokens: add vpn_type + L2TP columns, relax WG NOT NULL ---
         result = await conn.execute(sa_text("""
             SELECT column_name

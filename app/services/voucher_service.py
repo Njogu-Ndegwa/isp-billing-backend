@@ -12,12 +12,16 @@ from sqlalchemy.orm import selectinload
 
 from app.db.models import (
     Voucher, VoucherStatus, Plan, Router, Customer, CustomerStatus,
-    PaymentMethod, RouterAuthMethod, ConnectionType
+    PaymentMethod, ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
+    RouterAuthMethod, ConnectionType
 )
 from app.services.hotspot_provisioning import (
     build_hotspot_payload,
+    get_or_create_provisioning_attempt,
     log_provisioning_event,
     provision_hotspot_customer,
+    schedule_provisioning_attempt,
+    serialize_delivery_attempt,
 )
 from app.services.reseller_payments import record_customer_payment
 from app.services.mikrotik_api import normalize_mac_address
@@ -217,7 +221,7 @@ async def redeem_voucher(
 
     # Record payment
     days_paid_for = _duration_to_days(plan.duration_value, plan.duration_unit.value)
-    await record_customer_payment(
+    payment = await record_customer_payment(
         db=db,
         customer_id=customer.id,
         reseller_id=voucher.user_id,
@@ -249,7 +253,7 @@ async def redeem_voucher(
     if use_radius:
         return await _provision_radius(db, customer, plan, router)
     else:
-        return await _provision_direct_api(db, customer, plan, router, code)
+        return await _provision_direct_api(db, customer, plan, router, code, payment.id)
 
 
 async def _provision_radius(
@@ -306,6 +310,7 @@ async def _provision_direct_api(
     plan: Plan,
     router: Router,
     code: str,
+    payment_id: int,
 ) -> Dict[str, Any]:
     """Provision customer via MikroTik direct API (bypass mode)."""
     hotspot_payload = build_hotspot_payload(
@@ -314,6 +319,18 @@ async def _provision_direct_api(
         router,
         comment=f"Voucher {code} redeemed for {customer.name}",
     )
+    attempt = await get_or_create_provisioning_attempt(
+        db,
+        customer_id=customer.id,
+        router_id=router.id,
+        mac_address=customer.mac_address,
+        source_table=ProvisioningAttemptSource.CUSTOMER_PAYMENT,
+        source_pk=payment_id,
+        external_reference=code,
+        entrypoint=ProvisioningAttemptEntrypoint.VOUCHER_DIRECT_API,
+    )
+    await schedule_provisioning_attempt(db, attempt)
+    await db.commit()
 
     await log_provisioning_event(
         customer_id=customer.id,
@@ -322,6 +339,7 @@ async def _provision_direct_api(
         action="voucher_direct_api",
         status="scheduled",
         details=f"Queued after voucher {code} redemption for router {router.ip_address}",
+        attempt_id=attempt.id,
     )
 
     asyncio.create_task(
@@ -330,15 +348,18 @@ async def _provision_direct_api(
             router.id,
             hotspot_payload,
             "voucher_direct_api",
+            attempt.id,
         )
     )
 
     return {
         "success": True,
         "customer_id": customer.id,
+        "attempt_id": attempt.id,
         "auth_method": "DIRECT_API",
         "expiry": customer.expiry.isoformat() if customer.expiry else None,
         "plan_name": plan.name,
+        "delivery": serialize_delivery_attempt(attempt),
         "message": "Voucher redeemed. Internet access is being provisioned.",
     }
 

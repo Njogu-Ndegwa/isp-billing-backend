@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 from app.db.models import (
     MpesaTransaction, MpesaTransactionStatus, FailureSource,
     Customer, Plan, CustomerStatus, ConnectionType, PaymentMethod,
+    ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
 )
 from datetime import datetime, timedelta
 import asyncio
@@ -220,8 +221,10 @@ async def reconcile_pending_mpesa_transactions():
         from app.services.reseller_payments import record_customer_payment
         from app.services.hotspot_provisioning import (
             build_hotspot_payload,
+            get_or_create_provisioning_attempt,
             log_provisioning_event,
             provision_hotspot_customer,
+            schedule_provisioning_attempt,
         )
         from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
 
@@ -315,8 +318,10 @@ async def reconcile_pending_mpesa_transactions():
                     txn, result_desc,
                     record_customer_payment,
                     build_hotspot_payload,
+                    get_or_create_provisioning_attempt,
                     log_provisioning_event,
                     provision_hotspot_customer,
+                    schedule_provisioning_attempt,
                     call_pppoe_provision,
                     build_pppoe_payload,
                 )
@@ -353,8 +358,10 @@ async def _handle_successful_reconciliation(
     result_desc: str,
     record_customer_payment,
     build_hotspot_payload,
+    get_or_create_provisioning_attempt,
     log_provisioning_event,
     provision_hotspot_customer,
+    schedule_provisioning_attempt,
     call_pppoe_provision,
     build_pppoe_payload,
 ):
@@ -467,6 +474,18 @@ async def _handle_successful_reconciliation(
                 customer, plan, router_obj,
                 comment=f"Reconciled payment for {customer.name}",
             )
+            attempt = await get_or_create_provisioning_attempt(
+                db,
+                customer_id=customer.id,
+                router_id=router_obj.id,
+                mac_address=customer.mac_address,
+                source_table=ProvisioningAttemptSource.MPESA_TRANSACTION,
+                source_pk=mpesa_txn.id,
+                external_reference=mpesa_txn.checkout_request_id,
+                entrypoint=ProvisioningAttemptEntrypoint.HOTSPOT_RECONCILIATION,
+            )
+            await schedule_provisioning_attempt(db, attempt)
+            await db.commit()
             await log_provisioning_event(
                 customer_id=customer.id,
                 router_id=router_obj.id,
@@ -474,9 +493,14 @@ async def _handle_successful_reconciliation(
                 action="hotspot_reconciliation",
                 status="scheduled",
                 details=f"Queued after M-Pesa reconciliation for router {router_obj.ip_address}",
+                attempt_id=attempt.id,
             )
             await provision_hotspot_customer(
-                customer.id, router_obj.id, hotspot_payload, "hotspot_reconciliation",
+                customer.id,
+                router_obj.id,
+                hotspot_payload,
+                "hotspot_reconciliation",
+                attempt.id,
             )
         else:
             logger.error(

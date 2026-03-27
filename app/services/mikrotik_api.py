@@ -460,6 +460,97 @@ class MikroTikAPI:
             proplist=[".id", "name", "target", "max-limit", "disabled", "comment"]
         )
 
+    def get_hotspot_user_by_name(self, username: str) -> Dict[str, Any]:
+        """Fetch a single hotspot user by username."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.get_hotspot_users_minimal()
+            if not result.get("success"):
+                return {"error": result.get("error", "Failed to get hotspot users")}
+
+            wanted = str(username or "").strip().lower()
+            for user in result.get("data", []):
+                if str(user.get("name", "")).strip().lower() == wanted:
+                    return {"success": True, "found": True, "data": user}
+
+            return {"success": True, "found": False, "data": None}
+        except Exception as e:
+            logger.error(f"Error getting hotspot user {username}: {e}")
+            return {"error": str(e)}
+
+    def get_ip_binding_by_mac(self, mac_address: str) -> Dict[str, Any]:
+        """Fetch a single hotspot IP binding by MAC address."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.get_ip_bindings_minimal()
+            if not result.get("success"):
+                return {"error": result.get("error", "Failed to get hotspot IP bindings")}
+
+            wanted = normalize_mac_address(mac_address)
+            for binding in result.get("data", []):
+                binding_mac = binding.get("mac-address", "")
+                if binding_mac and normalize_mac_address(binding_mac) == wanted:
+                    return {"success": True, "found": True, "data": binding}
+
+            return {"success": True, "found": False, "data": None}
+        except Exception as e:
+            logger.error(f"Error getting IP binding for {mac_address}: {e}")
+            return {"error": str(e)}
+
+    def get_online_state_by_mac(self, mac_address: str) -> Dict[str, Any]:
+        """
+        Best-effort online state for a hotspot client.
+
+        A client is considered online when:
+        - an active hotspot session exists for the MAC, or
+        - a hotspot host entry exists with authorized=true or bypassed=true.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            wanted = normalize_mac_address(mac_address)
+
+            active_sessions = self.get_hotspot_active_minimal()
+            if active_sessions.get("success"):
+                for session in active_sessions.get("data", []):
+                    session_mac = session.get("mac-address", "")
+                    if session_mac and normalize_mac_address(session_mac) == wanted:
+                        return {
+                            "success": True,
+                            "online": True,
+                            "source": "active",
+                            "details": session,
+                        }
+            elif active_sessions.get("error"):
+                return {"error": active_sessions["error"]}
+
+            hosts = self.get_hotspot_hosts_minimal()
+            if hosts.get("success"):
+                for host in hosts.get("data", []):
+                    host_mac = host.get("mac-address", "")
+                    if not host_mac or normalize_mac_address(host_mac) != wanted:
+                        continue
+
+                    authorized = str(host.get("authorized", "")).lower() == "true"
+                    bypassed = str(host.get("bypassed", "")).lower() == "true"
+                    if authorized or bypassed:
+                        return {
+                            "success": True,
+                            "online": True,
+                            "source": "host",
+                            "details": host,
+                        }
+
+            elif hosts.get("error"):
+                return {"error": hosts["error"]}
+
+            return {"success": True, "online": False, "source": None, "details": None}
+        except Exception as e:
+            logger.error(f"Error getting hotspot online state for {mac_address}: {e}")
+            return {"error": str(e)}
+
     def ensure_queue_fasttrack_bypass(self, client_ips: List[str]) -> Dict[str, Any]:
         """
         Ensure queued client IPs are excluded from FastTrack so simple queues can enforce limits.
@@ -672,15 +763,24 @@ class MikroTikAPI:
             result = self.send_command("/ip/hotspot/user/add", args)
             if "error" in result:
                 if "already have user with this name" in result["error"]:
-                    # Update existing user with new profile and limits
+                    existing_user = self.get_hotspot_user_by_name(username)
+                    if existing_user.get("error"):
+                        logger.error(f"Failed to read existing hotspot user {username}: {existing_user['error']}")
+                        return {"error": existing_user["error"]}
+                    if not existing_user.get("found") or not existing_user.get("data"):
+                        return {"error": f"Hotspot user {username} already existed but could not be found for update"}
+
                     update_args = {
-                        "numbers": username,
+                        "numbers": existing_user["data"].get(".id") or username,
                         "profile": profile_name,
                         "limit-uptime": time_limit,
                         "comment": comment
                     }
                     update_result = self.send_command("/ip/hotspot/user/set", update_args)
                     logger.info(f"User {username} exists. Updated with profile {profile_name}: {update_result}")
+                    if update_result.get("error"):
+                        return {"error": update_result["error"]}
+                    result = update_result
                 else:
                     logger.error(f"Hotspot user add error: {result['error']}")
                     return {"error": result["error"]}
@@ -695,25 +795,81 @@ class MikroTikAPI:
             binding_result = self.send_command("/ip/hotspot/ip-binding/add", binding_args)
             if "error" in binding_result:
                 if "already exists" in binding_result.get("error", ""):
-                    # Update existing binding
+                    existing_binding = self.get_ip_binding_by_mac(mac_address)
+                    if existing_binding.get("error"):
+                        logger.error(f"Failed to read existing IP binding for {mac_address}: {existing_binding['error']}")
+                        return {"error": existing_binding["error"]}
+                    if not existing_binding.get("found") or not existing_binding.get("data"):
+                        return {"error": f"IP binding for {mac_address} already existed but could not be found for update"}
+
                     time.sleep(CMD_DELAY)
-                    bindings = self.send_command("/ip/hotspot/ip-binding/print")
-                    if bindings.get("success") and bindings.get("data"):
-                        for b in bindings["data"]:
-                            if normalize_mac_address(b.get("mac-address", "")) == normalize_mac_address(mac_address):
-                                time.sleep(CMD_DELAY)
-                                self.send_command("/ip/hotspot/ip-binding/set", {
-                                    "numbers": b[".id"],
-                                    "type": "bypassed",
-                                    "comment": f"USER:{username}|EXPIRES:DB_MANAGED|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                                })
-                                logger.info(f"Updated existing IP binding for {mac_address}")
-                                break
+                    binding_result = self.send_command("/ip/hotspot/ip-binding/set", {
+                        "numbers": existing_binding["data"].get(".id"),
+                        "type": "bypassed",
+                        "comment": f"USER:{username}|EXPIRES:DB_MANAGED|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    })
+                    logger.info(f"Updated existing IP binding for {mac_address}: {binding_result}")
+                    if binding_result.get("error"):
+                        return {"error": binding_result["error"]}
                 else:
                     logger.error(f"IP binding error: {binding_result['error']}")
+                    return {"error": binding_result["error"]}
             time.sleep(CMD_DELAY)  # Give router breathing room
 
-            # 4. Create Simple Queue for rate limiting (most reliable method in MikroTik)
+            # 4. Kick client from hotspot hosts/active sessions so the bypass
+            #    binding takes effect immediately.  Without this, clients already
+            #    sitting in the "unauthorized" state keep being redirected to the
+            #    captive portal until they manually reconnect.
+            kick_result = {"hosts_removed": 0, "sessions_removed": 0}
+            normalized_kick = normalize_mac_address(mac_address)
+
+            # 4a. Remove from hotspot active sessions
+            try:
+                active_sessions = self.send_command("/ip/hotspot/active/print")
+                if active_sessions.get("success") and active_sessions.get("data"):
+                    for session in active_sessions["data"]:
+                        session_mac = session.get("mac-address", "")
+                        if session_mac and normalize_mac_address(session_mac) == normalized_kick:
+                            session_id = session.get(".id")
+                            if session_id:
+                                time.sleep(CMD_DELAY)
+                                remove_result = self.send_command("/ip/hotspot/active/remove", {"numbers": session_id})
+                                if remove_result.get("error"):
+                                    kick_result.setdefault("session_errors", []).append(remove_result["error"])
+                                else:
+                                    kick_result["sessions_removed"] += 1
+                                    logger.warning(
+                                        "Removed active hotspot session for %s to apply bypass", mac_address
+                                    )
+            except Exception as kick_err:
+                logger.warning("Non-fatal: failed to remove active sessions for %s: %s", mac_address, kick_err)
+
+            time.sleep(CMD_DELAY)
+
+            # 4b. Remove from hotspot hosts table (covers unauthorized/blocked clients)
+            try:
+                hosts = self.send_command("/ip/hotspot/host/print")
+                if hosts.get("success") and hosts.get("data"):
+                    for host in hosts["data"]:
+                        host_mac = host.get("mac-address", "")
+                        if host_mac and normalize_mac_address(host_mac) == normalized_kick:
+                            host_id = host.get(".id")
+                            if host_id:
+                                time.sleep(CMD_DELAY)
+                                remove_result = self.send_command("/ip/hotspot/host/remove", {"numbers": host_id})
+                                if remove_result.get("error"):
+                                    kick_result.setdefault("host_errors", []).append(remove_result["error"])
+                                else:
+                                    kick_result["hosts_removed"] += 1
+                                    logger.warning(
+                                        "Removed hotspot host entry for %s to force bypass re-evaluation", mac_address
+                                    )
+            except Exception as kick_err:
+                logger.warning("Non-fatal: failed to remove host entries for %s: %s", mac_address, kick_err)
+
+            time.sleep(CMD_DELAY)
+
+            # 5. Create Simple Queue for rate limiting (most reliable method in MikroTik)
             # Simple queues work even with FastTrack and are the standard approach
             queue_result = {"skipped": True, "message": "No rate limit specified"}
             normalized = normalize_mac_address(mac_address)
@@ -767,6 +923,7 @@ class MikroTikAPI:
                 "profile_result": profile_result,
                 "hotspot_user_result": result,
                 "ip_binding_result": binding_result,
+                "kick_result": kick_result,
                 "queue_result": queue_result
             }
 

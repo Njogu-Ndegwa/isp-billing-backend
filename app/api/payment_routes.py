@@ -9,12 +9,18 @@ from app.db.database import get_db
 from app.db.models import (
     Router, Customer, Plan, MpesaTransaction, MpesaTransactionStatus,
     CustomerStatus, CustomerPayment, ConnectionType, User, PaymentMethod,
+    ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.hotspot_provisioning import (
     build_hotspot_payload,
+    get_or_create_provisioning_attempt,
+    get_recent_delivery_attempt_for_customer,
+    load_delivery_attempts_by_source,
     log_provisioning_event,
     provision_hotspot_customer,
+    schedule_provisioning_attempt,
+    serialize_delivery_attempt,
 )
 from app.services.mpesa_transactions import update_mpesa_transaction_status
 from app.services.billing import make_payment
@@ -339,6 +345,18 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                     router_obj,
                     comment=f"Payment successful for {customer.name}",
                 )
+                attempt = await get_or_create_provisioning_attempt(
+                    db,
+                    customer_id=customer.id,
+                    router_id=router_obj.id,
+                    mac_address=customer.mac_address,
+                    source_table=ProvisioningAttemptSource.MPESA_TRANSACTION,
+                    source_pk=mpesa_txn.id,
+                    external_reference=checkout_request_id,
+                    entrypoint=ProvisioningAttemptEntrypoint.HOTSPOT_PAYMENT,
+                )
+                await schedule_provisioning_attempt(db, attempt)
+                await db.commit()
                 logger.info(f"Prepared MikroTik Payload for customer {customer.id} -> Router: {router_obj.ip_address}")
                 await log_provisioning_event(
                     customer_id=customer.id,
@@ -347,6 +365,7 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                     action="hotspot_payment",
                     status="scheduled",
                     details=f"Queued after M-Pesa callback for router {router_obj.ip_address}",
+                    attempt_id=attempt.id,
                 )
                 background_tasks.add_task(
                     provision_hotspot_customer,
@@ -354,6 +373,7 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                     router_obj.id,
                     hotspot_payload,
                     "hotspot_payment",
+                    attempt.id,
                 )
             else:
                 logger.error(
@@ -789,13 +809,16 @@ async def get_payment_status(
         
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
+
+        attempt = await get_recent_delivery_attempt_for_customer(db, customer.id)
         
         return {
             "customer_id": customer.id,
             "status": customer.status.value,
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
             "plan_id": customer.plan_id,
-            "plan_name": customer.plan.name if customer.plan else None
+            "plan_name": customer.plan.name if customer.plan else None,
+            "delivery": serialize_delivery_attempt(attempt),
         }
     except HTTPException:
         raise
@@ -861,6 +884,8 @@ async def get_mpesa_transactions(
                     raise HTTPException(status_code=400, detail="Invalid end_date format")
 
         results = []
+        mpesa_source_ids = []
+        customer_payment_source_ids = []
         want_mpesa = payment_method in (None, "mobile_money")
         want_other = payment_method != "mobile_money"
 
@@ -937,7 +962,10 @@ async def get_mpesa_transactions(
                     } if plan else None,
                     "manual_provision_supported": manual_supported,
                     "manual_provision_reason": manual_reason,
+                    "_delivery_source_table": ProvisioningAttemptSource.MPESA_TRANSACTION.value,
+                    "_delivery_source_pk": tx.id,
                 })
+                mpesa_source_ids.append(tx.id)
 
         # --- Query 2: Non-M-Pesa payments (voucher, cash, etc.) ---
         if want_other:
@@ -1028,7 +1056,22 @@ async def get_mpesa_transactions(
                     } if plan else None,
                     "manual_provision_supported": manual_supported,
                     "manual_provision_reason": manual_reason,
+                    "_delivery_source_table": ProvisioningAttemptSource.CUSTOMER_PAYMENT.value,
+                    "_delivery_source_pk": pay.id,
                 })
+                customer_payment_source_ids.append(pay.id)
+
+        attempt_map = await load_delivery_attempts_by_source(
+            db,
+            mpesa_ids=mpesa_source_ids,
+            customer_payment_ids=customer_payment_source_ids,
+        )
+
+        for row in results:
+            source_key = (row.get("_delivery_source_table"), row.get("_delivery_source_pk"))
+            row["delivery"] = serialize_delivery_attempt(attempt_map.get(source_key))
+            row.pop("_delivery_source_table", None)
+            row.pop("_delivery_source_pk", None)
 
         # Merge and sort by date descending, then paginate
         results.sort(key=lambda r: r["created_at"] or "", reverse=True)
@@ -1065,6 +1108,8 @@ async def manual_provision_transaction(
         plan = None
         reference = None
         tx_status = None
+        source_table = None
+        source_pk = None
 
         if method == PaymentMethod.MOBILE_MONEY.value:
             stmt = (
@@ -1084,6 +1129,8 @@ async def manual_provision_transaction(
             tx, customer, router_obj, plan = row
             tx_status = tx.status.value
             reference = tx.mpesa_receipt_number or tx.reference or tx.checkout_request_id
+            source_table = ProvisioningAttemptSource.MPESA_TRANSACTION
+            source_pk = tx.id
         else:
             try:
                 pm_enum = PaymentMethod(method)
@@ -1112,6 +1159,8 @@ async def manual_provision_transaction(
             pay, customer, router_obj, plan = row
             tx_status = pay.status.value if pay.status else "completed"
             reference = pay.payment_reference or f"{pm_enum.value}-{pay.id}"
+            source_table = ProvisioningAttemptSource.CUSTOMER_PAYMENT
+            source_pk = pay.id
 
         supported, reason = _manual_provision_support(method, tx_status, customer, router_obj, plan)
         if not supported:
@@ -1134,6 +1183,18 @@ async def manual_provision_transaction(
             router_obj,
             comment=f"Manual provisioning for transaction {transaction_id}",
         )
+        attempt = await get_or_create_provisioning_attempt(
+            db,
+            customer_id=customer.id,
+            router_id=router_obj.id,
+            mac_address=customer.mac_address,
+            source_table=source_table,
+            source_pk=source_pk,
+            external_reference=reference,
+            entrypoint=ProvisioningAttemptEntrypoint.MANUAL_TRANSACTION_PROVISION,
+        )
+        await schedule_provisioning_attempt(db, attempt)
+        await db.commit()
         await log_provisioning_event(
             customer_id=customer.id,
             router_id=router_obj.id,
@@ -1141,12 +1202,14 @@ async def manual_provision_transaction(
             action="manual_transaction_provision",
             status="scheduled",
             details=f"Manual provisioning requested by user {user.id} for transaction {transaction_id}",
+            attempt_id=attempt.id,
         )
         result = await provision_hotspot_customer(
             customer.id,
             router_obj.id,
             hotspot_payload,
             "manual_transaction_provision",
+            attempt.id,
         )
 
         return {
@@ -1159,6 +1222,8 @@ async def manual_provision_transaction(
             "router_id": router_obj.id,
             "router_name": router_obj.name,
             "payment_id": payment_record.id if payment_record else None,
+            "attempt_id": attempt.id,
+            "delivery": result.get("delivery"),
             "provisioning_error": result.get("provisioning_error"),
             "provisioning_result": result,
         }
