@@ -204,8 +204,79 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
         mpesa_txn = result.scalar_one_or_none()
         
         if not mpesa_txn:
-            logger.error(f"Transaction not found for CheckoutRequestID: {checkout_request_id}")
-            return {"ResultCode": 1, "ResultDesc": "Transaction not found"}
+            # --- Orphan payment recovery ---
+            # If Safaricom processed the STK push but we never recorded the transaction
+            # (e.g. httpx timeout reading their response), try to match by phone number.
+            cb_metadata = stk_callback.get("CallbackMetadata", {})
+            cb_items = cb_metadata.get("Item", [])
+            cb_phone = cb_amount = cb_receipt = None
+            for item in cb_items:
+                name = item.get("Name")
+                if name == "PhoneNumber":
+                    cb_phone = str(item.get("Value"))
+                elif name == "Amount":
+                    cb_amount = item.get("Value")
+                elif name == "MpesaReceiptNumber":
+                    cb_receipt = item.get("Value")
+
+            if result_code == 0 and cb_phone and cb_amount:
+                logger.warning(
+                    f"[RECOVERY] Transaction not found for {checkout_request_id} "
+                    f"but payment SUCCEEDED (phone={cb_phone}, amount={cb_amount}, receipt={cb_receipt}). "
+                    f"Attempting recovery..."
+                )
+                phone_variants = [cb_phone]
+                if cb_phone.startswith("254"):
+                    phone_variants.append("0" + cb_phone[3:])
+                    phone_variants.append("+" + cb_phone)
+                elif cb_phone.startswith("+254"):
+                    phone_variants.append("0" + cb_phone[4:])
+                    phone_variants.append(cb_phone[1:])
+                elif cb_phone.startswith("0"):
+                    phone_variants.append("254" + cb_phone[1:])
+                    phone_variants.append("+254" + cb_phone[1:])
+
+                customer_stmt = (
+                    select(Customer)
+                    .options(selectinload(Customer.plan), selectinload(Customer.router))
+                    .where(
+                        Customer.phone.in_(phone_variants),
+                        Customer.status.in_([CustomerStatus.PENDING, CustomerStatus.INACTIVE]),
+                    )
+                    .order_by(Customer.created_at.desc())
+                    .limit(1)
+                )
+                cust_result = await db.execute(customer_stmt)
+                orphan_customer = cust_result.scalar_one_or_none()
+
+                if orphan_customer:
+                    logger.info(
+                        f"[RECOVERY] Matched orphan payment to customer {orphan_customer.id} "
+                        f"({orphan_customer.name}, phone={cb_phone})"
+                    )
+                    mpesa_txn = MpesaTransaction(
+                        checkout_request_id=checkout_request_id,
+                        merchant_request_id=merchant_request_id,
+                        phone_number=cb_phone,
+                        amount=float(cb_amount),
+                        reference=f"RECOVERED-{checkout_request_id}",
+                        customer_id=orphan_customer.id,
+                        status=MpesaTransactionStatus.pending,
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow(),
+                    )
+                    db.add(mpesa_txn)
+                    await db.flush()
+                else:
+                    logger.error(
+                        f"[RECOVERY] No matching customer for orphan payment "
+                        f"(phone={cb_phone}, amount={cb_amount}, receipt={cb_receipt}). "
+                        f"Manual reconciliation required."
+                    )
+                    return {"ResultCode": 0, "ResultDesc": "Payment received - manual reconciliation needed"}
+            else:
+                logger.error(f"Transaction not found for CheckoutRequestID: {checkout_request_id}")
+                return {"ResultCode": 1, "ResultDesc": "Transaction not found"}
         
         # DUPLICATE CALLBACK PROTECTION: Skip if already processed
         if mpesa_txn.status in (MpesaTransactionStatus.completed, MpesaTransactionStatus.failed):
@@ -510,21 +581,27 @@ async def initiate_mpesa_payment_api(
             )
         except Exception as stk_error:
             from app.db.models import FailureSource
-            failed_txn = MpesaTransaction(
-                checkout_request_id=f"FAILED-{reference}",
-                phone_number=request.phone,
-                amount=request.amount,
-                reference=reference,
-                customer_id=request.customer_id,
-                status=MpesaTransactionStatus.failed,
-                failure_source=FailureSource.MPESA_API,
-                result_code="STK_PUSH_FAILED",
-                result_desc=f"STK Push initiation failed: {str(stk_error)[:450]}",
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
-            )
-            db.add(failed_txn)
-            await db.commit()
+            await db.rollback()
+            try:
+                from app.db.database import AsyncSessionLocal
+                async with AsyncSessionLocal() as fresh_db:
+                    failed_txn = MpesaTransaction(
+                        checkout_request_id=f"FAILED-{reference}",
+                        phone_number=request.phone,
+                        amount=request.amount,
+                        reference=reference,
+                        customer_id=request.customer_id,
+                        status=MpesaTransactionStatus.failed,
+                        failure_source=FailureSource.MPESA_API,
+                        result_code="STK_PUSH_FAILED",
+                        result_desc=f"STK Push initiation failed: {str(stk_error)[:450]}",
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow()
+                    )
+                    fresh_db.add(failed_txn)
+                    await fresh_db.commit()
+            except Exception as record_err:
+                logger.error(f"Failed to record STK push failure: {str(record_err)}")
             logger.error(f"STK Push failed for customer {request.customer_id}: {str(stk_error)}")
             raise HTTPException(status_code=500, detail=f"Failed to initiate payment: {str(stk_error)}")
         
@@ -744,21 +821,23 @@ async def register_hotspot_and_pay_api(
                     logger.exception("Payment initiation failed for customer %s", customer_id)
                     
                     try:
-                        failed_txn = MpesaTransaction(
-                            checkout_request_id=f"FAILED-{reference}",
-                            phone_number=request.phone,
-                            amount=float(plan.price),
-                            reference=reference,
-                            customer_id=customer_id,
-                            status=MpesaTransactionStatus.failed,
-                            failure_source=FailureSource.MPESA_API,
-                            result_code="STK_PUSH_FAILED",
-                            result_desc=f"STK Push initiation failed: {str(e)[:450]}",
-                            created_at=datetime.utcnow(),
-                            updated_at=datetime.utcnow()
-                        )
-                        db.add(failed_txn)
-                        await db.commit()
+                        from app.db.database import AsyncSessionLocal
+                        async with AsyncSessionLocal() as fresh_db:
+                            failed_txn = MpesaTransaction(
+                                checkout_request_id=f"FAILED-{reference}",
+                                phone_number=request.phone,
+                                amount=float(plan.price),
+                                reference=reference,
+                                customer_id=customer_id,
+                                status=MpesaTransactionStatus.failed,
+                                failure_source=FailureSource.MPESA_API,
+                                result_code="STK_PUSH_FAILED",
+                                result_desc=f"STK Push initiation failed: {str(e)[:450]}",
+                                created_at=datetime.utcnow(),
+                                updated_at=datetime.utcnow()
+                            )
+                            fresh_db.add(failed_txn)
+                            await fresh_db.commit()
                     except Exception as record_err:
                         logger.error(f"Failed to record STK push failure: {str(record_err)}")
                     

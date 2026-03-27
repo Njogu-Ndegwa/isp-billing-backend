@@ -10,6 +10,8 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+SAFARICOM_TIMEOUT = httpx.Timeout(connect=5.0, read=25.0, write=15.0, pool=5.0)
+
 # --- Direct M-Pesa logic (for legacy/backup use) ---
 class StkPushResponse:
     def __init__(self, checkout_request_id: str, merchant_request_id: str):
@@ -28,7 +30,7 @@ async def get_access_token(
         
         base_url = "https://api.safaricom.co.ke" if settings.MPESA_ENVIRONMENT == "production" else "https://sandbox.safaricom.co.ke"
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
             response = await client.get(
                 f"{base_url}/oauth/v1/generate?grant_type=client_credentials",
                 headers={"Authorization": f"Basic {encoded_credentials}"}
@@ -79,7 +81,7 @@ async def initiate_stk_push_direct(
 
         base_url = "https://api.safaricom.co.ke" if settings.MPESA_ENVIRONMENT == "production" else "https://sandbox.safaricom.co.ke"
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
             response = await client.post(
                 f"{base_url}/mpesa/stkpush/v1/processrequest",
                 json=payload,
@@ -169,7 +171,7 @@ async def initiate_stk_push_via_graphql_microservice(
     ]
     last_error: Optional[Exception] = None
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
         for candidate in mutation_candidates:
             field_name = candidate["field_name"]
             var_defs = ", ".join(f"${name}: {type_}" for name, type_ in candidate["arguments"])
@@ -190,7 +192,6 @@ async def initiate_stk_push_via_graphql_microservice(
                 response = await client.post(
                     graphql_url,
                     json={"query": mutation, "variables": payload_variables},
-                    timeout=20
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -302,7 +303,7 @@ async def query_stk_push_status(checkout_request_id: str, access_token: str | No
         "CheckoutRequestID": checkout_request_id,
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
         response = await client.post(
             f"{base_url}/mpesa/stkpushquery/v1/query",
             json=payload,
