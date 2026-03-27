@@ -1186,11 +1186,15 @@ async def cleanup_expired_customers_for_router(
             }
         }
         
-        from app.services.mikrotik_background import mikrotik_lock, _cleanup_customer_from_mikrotik_sync
+        from app.services.mikrotik_background import router_locks, _cleanup_single_router_hotspot_sync
         
-        # Run cleanup in thread pool
-        async with mikrotik_lock:
-            mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
+        router_key = f"{router_obj.ip_address}:{router_obj.port}"
+        async with router_locks.acquire(router_key):
+            mikrotik_results = await asyncio.to_thread(
+                _cleanup_single_router_hotspot_sync,
+                router_customers_map[router_key]["router"],
+                router_customers_map[router_key]["customers"],
+            )
         
         # Update database
         successful_ids = [r["id"] for r in mikrotik_results["removed"]]

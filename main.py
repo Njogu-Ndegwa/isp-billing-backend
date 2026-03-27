@@ -74,8 +74,9 @@ from app.services.mikrotik_background import (
     collect_bandwidth_snapshot,
     # Exported for late-imports from router files
     remove_user_from_mikrotik,
-    mikrotik_lock,
+    router_locks,
     _cleanup_customer_from_mikrotik_sync,
+    _cleanup_single_router_hotspot_sync,
 )
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions

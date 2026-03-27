@@ -10,6 +10,7 @@ from sqlalchemy import and_, or_, select, text
 
 from app.config import settings
 from app.db.database import async_session
+from app.services.router_availability import derive_router_status, record_router_availability
 from app.db.models import (
     ConnectionType,
     Customer,
@@ -36,8 +37,8 @@ HOTSPOT_RETRY_MAX_ATTEMPTS = 5
 HOTSPOT_RETRY_MAX_AGE = timedelta(hours=4)
 HOTSPOT_VERIFY_REFRESH_WINDOW = timedelta(minutes=15)
 HOTSPOT_RECENT_DELIVERY_WINDOW = timedelta(minutes=30)
-HOTSPOT_ONLINE_POLL_INTERVAL_SECONDS = 3
-HOTSPOT_ONLINE_POLL_TIMEOUT_SECONDS = 30
+HOTSPOT_ONLINE_POLL_INTERVAL_SECONDS = 2
+HOTSPOT_ONLINE_POLL_TIMEOUT_SECONDS = 8
 
 _hotspot_provision_pool = ThreadPoolExecutor(
     max_workers=8,
@@ -503,48 +504,23 @@ def _attempt_should_be_terminal(attempt: ProvisioningAttempt, now: datetime) -> 
     )
 
 
-async def provision_hotspot_customer(
+async def _persist_provisioning_result(
+    *,
+    result: Dict[str, Any],
+    verify_only: bool,
     customer_id: int,
     router_id: int | None,
+    router_ip: str | None,
+    mac_address: str | None,
+    action: str,
+    attempt_id: int | None,
     hotspot_payload: Dict[str, Any],
-    action: str = "hotspot_payment",
-    attempt_id: int | None = None,
-    verify_only: bool = False,
 ) -> Dict[str, Any]:
-    """Provision a hotspot customer and persist the result for later reconciliation."""
-    router_ip = hotspot_payload.get("router_ip")
-    mac_address = hotspot_payload.get("mac_address")
-    now = datetime.utcnow()
+    """Persist the MikroTik operation result to the provisioning attempt.
 
-    attempt: ProvisioningAttempt | None = None
-
-    if attempt_id is not None:
-        async with async_session() as db:
-            attempt = await db.get(ProvisioningAttempt, attempt_id)
-            if attempt:
-                attempt.customer_id = customer_id
-                attempt.router_id = router_id
-                attempt.mac_address = normalize_mac_address(mac_address) if mac_address else None
-                if verify_only:
-                    attempt.updated_at = now
-                else:
-                    attempt.provisioning_state = ProvisioningState.IN_PROGRESS
-                    attempt.last_attempt_at = now
-                    attempt.attempt_count += 1
-                    attempt.last_error = None
-                    attempt.updated_at = now
-                await db.commit()
-
-    try:
-        result = await _run_mikrotik_operation(hotspot_payload, verify_only=verify_only)
-    except asyncio.TimeoutError:
-        result = {
-            "success": False,
-            "error": f"Provisioning timed out after {HOTSPOT_PROVISIONING_TIMEOUT_SECONDS}s",
-        }
-    except Exception as exc:
-        result = {"success": False, "error": str(exc)}
-
+    Extracted so provision_hotspot_customer can wrap this in a safety
+    try/except and recover stuck IN_PROGRESS attempts on any crash.
+    """
     if verify_only:
         verify_succeeded = not bool(result.get("error"))
         online_state_value = (
@@ -553,6 +529,7 @@ async def provision_hotspot_customer(
             else ProvisioningOnlineState.OFFLINE.value
         )
 
+        attempt = None
         if attempt_id is not None:
             async with async_session() as db:
                 attempt = await db.get(ProvisioningAttempt, attempt_id)
@@ -617,6 +594,15 @@ async def provision_hotspot_customer(
             provisioning_error,
         )
 
+        if router_id:
+            try:
+                async with async_session() as avail_db:
+                    is_online = "connect" not in provisioning_error.lower()
+                    await record_router_availability(avail_db, router_id, is_online, "provisioning")
+                    await avail_db.commit()
+            except Exception:
+                pass
+
         result["success"] = False
         result["provisioning_error"] = provisioning_error
         result["delivery"] = serialize_delivery_attempt(refreshed_attempt)
@@ -659,7 +645,8 @@ async def provision_hotspot_customer(
         attempt_id=attempt_id,
     )
     logger.info(
-        "[PROVISION] Hotspot provisioning succeeded for customer %s on router %s (kicked %d host(s), %d session(s), online=%s)",
+        "[PROVISION] Hotspot provisioning succeeded for customer %s on router %s "
+        "(kicked %d host(s), %d session(s), online=%s)",
         customer_id,
         router_ip,
         hosts_kicked,
@@ -667,10 +654,122 @@ async def provision_hotspot_customer(
         online_state_value,
     )
 
+    if router_id:
+        try:
+            async with async_session() as avail_db:
+                await record_router_availability(avail_db, router_id, True, "provisioning")
+                await avail_db.commit()
+        except Exception:
+            pass
+
     result["success"] = True
     result["provisioning_error"] = None
     result["delivery"] = serialize_delivery_attempt(refreshed_attempt)
     return result
+
+
+async def provision_hotspot_customer(
+    customer_id: int,
+    router_id: int | None,
+    hotspot_payload: Dict[str, Any],
+    action: str = "hotspot_payment",
+    attempt_id: int | None = None,
+    verify_only: bool = False,
+) -> Dict[str, Any]:
+    """Provision a hotspot customer and persist the result for later reconciliation."""
+    router_ip = hotspot_payload.get("router_ip")
+    mac_address = hotspot_payload.get("mac_address")
+    now = datetime.utcnow()
+
+    attempt: ProvisioningAttempt | None = None
+
+    if attempt_id is not None:
+        async with async_session() as db:
+            attempt = await db.get(ProvisioningAttempt, attempt_id)
+            if attempt:
+                attempt.customer_id = customer_id
+                attempt.router_id = router_id
+                attempt.mac_address = normalize_mac_address(mac_address) if mac_address else None
+                if verify_only:
+                    attempt.updated_at = now
+                else:
+                    attempt.provisioning_state = ProvisioningState.IN_PROGRESS
+                    attempt.last_attempt_at = now
+                    attempt.attempt_count += 1
+                    attempt.last_error = None
+                    attempt.updated_at = now
+                await db.commit()
+
+    if router_id and not verify_only:
+        try:
+            async with async_session() as db:
+                router_obj = await db.get(Router, router_id)
+                if router_obj and derive_router_status(router_obj) == "offline":
+                    logger.warning(
+                        "[PROVISION] Skipping customer %s — router %s is known offline",
+                        customer_id, router_ip,
+                    )
+                    result = {
+                        "success": False,
+                        "error": f"Router {router_ip} is known offline, will retry",
+                    }
+                    return await _persist_provisioning_result(
+                        result=result, verify_only=False,
+                        customer_id=customer_id, router_id=router_id,
+                        router_ip=router_ip, mac_address=mac_address,
+                        action=action, attempt_id=attempt_id,
+                        hotspot_payload=hotspot_payload,
+                    )
+        except Exception:
+            pass
+
+    try:
+        result = await _run_mikrotik_operation(hotspot_payload, verify_only=verify_only)
+    except asyncio.TimeoutError:
+        result = {
+            "success": False,
+            "error": f"Provisioning timed out after {HOTSPOT_PROVISIONING_TIMEOUT_SECONDS}s",
+        }
+    except Exception as exc:
+        result = {"success": False, "error": str(exc)}
+
+    try:
+        return await _persist_provisioning_result(
+            result=result,
+            verify_only=verify_only,
+            customer_id=customer_id,
+            router_id=router_id,
+            router_ip=router_ip,
+            mac_address=mac_address,
+            action=action,
+            attempt_id=attempt_id,
+            hotspot_payload=hotspot_payload,
+        )
+    except Exception as exc:
+        logger.error(
+            "[PROVISION] Unhandled error persisting provisioning result for customer %s "
+            "(attempt %s): %s",
+            customer_id, attempt_id, exc,
+        )
+        if attempt_id is not None:
+            try:
+                async with async_session() as db:
+                    stuck = await db.get(ProvisioningAttempt, attempt_id)
+                    if stuck and stuck.provisioning_state == ProvisioningState.IN_PROGRESS:
+                        stuck.provisioning_state = ProvisioningState.RETRY_PENDING
+                        stuck.last_error = _truncate(f"Post-MikroTik error: {exc}")
+                        stuck.updated_at = datetime.utcnow()
+                        await db.commit()
+                        logger.warning(
+                            "[PROVISION] Recovered stuck attempt %s → RETRY_PENDING",
+                            attempt_id,
+                        )
+            except Exception as recovery_exc:
+                logger.error(
+                    "[PROVISION] Failed to recover stuck attempt %s: %s",
+                    attempt_id, recovery_exc,
+                )
+        return {"success": False, "error": str(exc), "delivery": None}
 
 
 async def retry_pending_hotspot_provisioning_background():
@@ -826,8 +925,16 @@ async def retry_pending_hotspot_provisioning_background():
 
         logger.warning("[PROVISION-RETRY] Processing %d direct hotspot delivery attempt(s)", len(work_items))
 
-        for attempt, customer, plan, router, verify_only in work_items:
-            if attempt.id in queued_attempt_ids:
+        from collections import defaultdict
+        router_groups: dict[str, list] = defaultdict(list)
+        for item in work_items:
+            _attempt, _customer, _plan, _router, _verify = item
+            if _attempt.id in queued_attempt_ids:
+                rk = f"{_router.ip_address}:{_router.port}"
+                router_groups[rk].append(item)
+
+        async def _process_router_group(items):
+            for attempt, customer, plan, router, verify_only in items:
                 hotspot_payload = build_hotspot_payload(
                     customer,
                     plan,
@@ -846,6 +953,11 @@ async def retry_pending_hotspot_provisioning_background():
                     attempt_id=attempt.id,
                     verify_only=verify_only,
                 )
+
+        await asyncio.gather(
+            *[_process_router_group(items) for items in router_groups.values()],
+            return_exceptions=True,
+        )
 
     except Exception as exc:
         logger.error("[PROVISION-RETRY] Background retry job failed: %s", exc)

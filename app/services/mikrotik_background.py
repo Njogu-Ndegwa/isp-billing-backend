@@ -22,13 +22,36 @@ from app.services.router_availability import record_router_availability, prune_r
 from app.core.protected_devices import is_protected_device
 from app.config import settings
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import time
 
 logger = logging.getLogger(__name__)
 
+
+class RouterLockManager:
+    """Per-router async locks with a global concurrency semaphore.
+
+    Operations on the same router serialize; different routers run concurrently
+    up to *max_concurrent* at a time (to avoid exhausting the thread pool).
+    """
+
+    def __init__(self, max_concurrent: int = 6):
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+
+    @asynccontextmanager
+    async def acquire(self, router_key: str):
+        async with self._semaphore:
+            if router_key not in self._locks:
+                self._locks[router_key] = asyncio.Lock()
+            async with self._locks[router_key]:
+                yield
+
+
+router_locks = RouterLockManager()
+
 # Shared state for background jobs
-mikrotik_lock = asyncio.Lock()
 cleanup_running = False
 queue_sync_running = False
 
@@ -268,35 +291,31 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
 # EXPIRED USER CLEANUP (background job)
 # =============================================================================
 
-def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
-    results = {"removed": [], "failed": [], "routers_connected": 0}
-    if not router_customers_map:
+def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list) -> dict:
+    """Cleanup expired hotspot users on ONE router."""
+    results = {"removed": [], "failed": [], "connected": False}
+    if not customers_data:
         return results
 
-    for router_key, router_data in router_customers_map.items():
-        router_info = router_data["router"]
-        customers_data = router_data["customers"]
-        if not customers_data:
-            continue
+    logger.info(f"[CRON] Processing {len(customers_data)} customers on router {router_info['name']} ({router_info['ip']})")
 
-        logger.info(f"[CRON] Processing {len(customers_data)} customers on router {router_info['name']} ({router_info['ip']})")
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=15,
+        connect_timeout=5
+    )
+    if not api.connect():
+        logger.error(f"[CRON] Failed to connect to router {router_info['name']} at {router_info['ip']}")
+        for cust in customers_data:
+            results["failed"].append({"id": cust["id"], "error": f"Failed to connect to router {router_info['name']}"})
+        return results
 
-        api = MikroTikAPI(
-            router_info["ip"],
-            router_info["username"],
-            router_info["password"],
-            router_info["port"],
-            timeout=15,
-            connect_timeout=5
-        )
-        if not api.connect():
-            logger.error(f"[CRON] Failed to connect to router {router_info['name']} at {router_info['ip']}")
-            for cust in customers_data:
-                results["failed"].append({"id": cust["id"], "error": f"Failed to connect to router {router_info['name']}"})
-            continue
+    results["connected"] = True
 
-        results["routers_connected"] += 1
-
+    try:
         for cust in customers_data:
             try:
                 normalized_mac = normalize_mac_address(cust["mac_address"])
@@ -439,10 +458,22 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
             except Exception as e:
                 results["failed"].append({"id": cust["id"], "error": str(e)})
                 logger.error(f"[CRON] Failed to remove customer {cust['id']}: {e}")
-
+    finally:
         api.disconnect()
 
     return results
+
+
+def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
+    """Multi-router wrapper (sequential fallback). Prefer per-router calls."""
+    merged = {"removed": [], "failed": [], "routers_connected": 0}
+    for router_data in router_customers_map.values():
+        r = _cleanup_single_router_hotspot_sync(router_data["router"], router_data["customers"])
+        merged["removed"].extend(r["removed"])
+        merged["failed"].extend(r["failed"])
+        if r["connected"]:
+            merged["routers_connected"] += 1
+    return merged
 
 
 def _cleanup_router_bindings_sync(router_info: dict, active_macs: set) -> int:
@@ -496,54 +527,52 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
                 active_macs.add(normalized)
                 logger.debug(f"[SAFETY-NET] Grace period: keeping {normalized} (expiry: {c.expiry})")
 
-        for router in routers:
-            if getattr(router, 'auth_method', None) == 'RADIUS':
-                continue
-            try:
-                router_info = {
-                    "ip": router.ip_address, "username": router.username,
-                    "password": router.password, "port": router.port, "name": router.name
-                }
-                removed = await asyncio.to_thread(_cleanup_router_bindings_sync, router_info, active_macs)
-                total_removed += removed
-            except Exception as router_err:
-                logger.error(f"[SAFETY-NET] Error processing router {router.name}: {router_err}")
-                continue
+        async def _bypass_task(r):
+            rk = f"{r.ip_address}:{r.port}"
+            ri = {
+                "ip": r.ip_address, "username": r.username,
+                "password": r.password, "port": r.port, "name": r.name,
+            }
+            async with router_locks.acquire(rk):
+                return await asyncio.to_thread(_cleanup_router_bindings_sync, ri, active_macs)
+
+        eligible = [r for r in routers if getattr(r, "auth_method", None) != "RADIUS"]
+        outcomes = await asyncio.gather(
+            *[_bypass_task(r) for r in eligible],
+            return_exceptions=True,
+        )
+        for i, outcome in enumerate(outcomes):
+            if isinstance(outcome, Exception):
+                logger.error(f"[SAFETY-NET] Error processing router {eligible[i].name}: {outcome}")
+            else:
+                total_removed += outcome
     except Exception as e:
         logger.error(f"[SAFETY-NET] Cleanup failed: {e}")
     return total_removed
 
 
-def _cleanup_pppoe_customers_sync(router_pppoe_map: dict) -> dict:
-    """
-    Synchronous PPPoE cleanup -- disconnect sessions and remove secrets
-    for expired PPPoE customers. Mirrors _cleanup_customer_from_mikrotik_sync.
-    """
-    results = {"removed": [], "failed": [], "routers_connected": 0}
-    if not router_pppoe_map:
+def _cleanup_single_router_pppoe_sync(router_info: dict, customers_data: list) -> dict:
+    """Cleanup expired PPPoE users on ONE router."""
+    results = {"removed": [], "failed": [], "connected": False}
+    if not customers_data:
         return results
 
-    for router_key, router_data in router_pppoe_map.items():
-        router_info = router_data["router"]
-        customers_data = router_data["customers"]
-        if not customers_data:
-            continue
+    logger.info(f"[CRON-PPPoE] Processing {len(customers_data)} PPPoE customers on router {router_info['name']} ({router_info['ip']})")
 
-        logger.info(f"[CRON-PPPoE] Processing {len(customers_data)} PPPoE customers on router {router_info['name']} ({router_info['ip']})")
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"],
+        router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        logger.error(f"[CRON-PPPoE] Failed to connect to router {router_info['name']}")
+        for cust in customers_data:
+            results["failed"].append({"id": cust["id"], "error": f"Failed to connect to router {router_info['name']}"})
+        return results
 
-        api = MikroTikAPI(
-            router_info["ip"], router_info["username"],
-            router_info["password"], router_info["port"],
-            timeout=15, connect_timeout=5,
-        )
-        if not api.connect():
-            logger.error(f"[CRON-PPPoE] Failed to connect to router {router_info['name']}")
-            for cust in customers_data:
-                results["failed"].append({"id": cust["id"], "error": f"Failed to connect to router {router_info['name']}"})
-            continue
+    results["connected"] = True
 
-        results["routers_connected"] += 1
-
+    try:
         for cust in customers_data:
             try:
                 pppoe_user = cust["pppoe_username"]
@@ -567,10 +596,22 @@ def _cleanup_pppoe_customers_sync(router_pppoe_map: dict) -> dict:
             except Exception as e:
                 results["failed"].append({"id": cust["id"], "error": str(e)})
                 logger.error(f"[CRON-PPPoE] Error removing customer {cust['id']}: {e}")
-
+    finally:
         api.disconnect()
 
     return results
+
+
+def _cleanup_pppoe_customers_sync(router_pppoe_map: dict) -> dict:
+    """Multi-router wrapper (sequential fallback). Prefer per-router calls."""
+    merged = {"removed": [], "failed": [], "routers_connected": 0}
+    for router_data in router_pppoe_map.values():
+        r = _cleanup_single_router_pppoe_sync(router_data["router"], router_data["customers"])
+        merged["removed"].extend(r["removed"])
+        merged["failed"].extend(r["failed"])
+        if r["connected"]:
+            merged["routers_connected"] += 1
+    return merged
 
 
 async def cleanup_expired_users_background():
@@ -660,22 +701,81 @@ async def cleanup_expired_users_background():
             if no_router_customers:
                 logger.warning(f"[CRON] Skipping {len(no_router_customers)} customer(s) with no router assigned: {[c['id'] for c in no_router_customers]}")
 
+            offline_skipped = []
+            offline_stale_threshold = timedelta(minutes=5)
+            for router_key in list(router_customers_map.keys()):
+                rd = router_customers_map[router_key]
+                cust_sample = rd["customers"][0] if rd["customers"] else None
+                if not cust_sample:
+                    continue
+                sample_customer = next(
+                    (c for c in expired_customers if c.id == cust_sample["id"]), None
+                )
+                if sample_customer and sample_customer.router:
+                    r = sample_customer.router
+                    if (
+                        getattr(r, "last_status", None) is False
+                        and getattr(r, "last_checked_at", None)
+                        and (now - r.last_checked_at) < offline_stale_threshold
+                    ):
+                        for cust in rd["customers"]:
+                            offline_skipped.append(cust["id"])
+                        del router_customers_map[router_key]
+
+            if offline_skipped:
+                logger.warning(
+                    "[CRON] Skipping %d customer(s) on recently-offline routers: %s",
+                    len(offline_skipped), offline_skipped,
+                )
+
             pppoe_count = sum(len(rd["customers"]) for rd in router_pppoe_map.values())
             hotspot_count = sum(len(rd["customers"]) for rd in router_customers_map.values())
             logger.info(f"[CRON] Grouped: {hotspot_count} hotspot across {len(router_customers_map)} router(s), "
                         f"{pppoe_count} PPPoE across {len(router_pppoe_map)} router(s)")
 
-            # --- Hotspot cleanup ---
+            # --- Hotspot cleanup (concurrent per-router) ---
             mikrotik_results = {"removed": [], "failed": [], "routers_connected": 0}
             if router_customers_map:
-                async with mikrotik_lock:
-                    mikrotik_results = await asyncio.to_thread(_cleanup_customer_from_mikrotik_sync, router_customers_map)
+                async def _hotspot_task(rk, rd):
+                    async with router_locks.acquire(rk):
+                        return await asyncio.to_thread(
+                            _cleanup_single_router_hotspot_sync, rd["router"], rd["customers"],
+                        )
 
-            # --- PPPoE cleanup ---
+                hotspot_outcomes = await asyncio.gather(
+                    *[_hotspot_task(rk, rd) for rk, rd in router_customers_map.items()],
+                    return_exceptions=True,
+                )
+                for outcome in hotspot_outcomes:
+                    if isinstance(outcome, Exception):
+                        logger.error("[CRON] Hotspot cleanup task error: %s", outcome)
+                        continue
+                    mikrotik_results["removed"].extend(outcome["removed"])
+                    mikrotik_results["failed"].extend(outcome["failed"])
+                    if outcome["connected"]:
+                        mikrotik_results["routers_connected"] += 1
+
+            # --- PPPoE cleanup (concurrent per-router) ---
             pppoe_results = {"removed": [], "failed": [], "routers_connected": 0}
             if router_pppoe_map:
-                async with mikrotik_lock:
-                    pppoe_results = await asyncio.to_thread(_cleanup_pppoe_customers_sync, router_pppoe_map)
+                async def _pppoe_task(rk, rd):
+                    async with router_locks.acquire(rk):
+                        return await asyncio.to_thread(
+                            _cleanup_single_router_pppoe_sync, rd["router"], rd["customers"],
+                        )
+
+                pppoe_outcomes = await asyncio.gather(
+                    *[_pppoe_task(rk, rd) for rk, rd in router_pppoe_map.items()],
+                    return_exceptions=True,
+                )
+                for outcome in pppoe_outcomes:
+                    if isinstance(outcome, Exception):
+                        logger.error("[CRON] PPPoE cleanup task error: %s", outcome)
+                        continue
+                    pppoe_results["removed"].extend(outcome["removed"])
+                    pppoe_results["failed"].extend(outcome["failed"])
+                    if outcome["connected"]:
+                        pppoe_results["routers_connected"] += 1
 
             all_successful_ids = set(
                 [r["id"] for r in mikrotik_results["removed"]] +
@@ -686,10 +786,28 @@ async def cleanup_expired_users_background():
                 [r["id"] for r in pppoe_results["failed"]]
             )
 
+            now_after_cleanup = datetime.utcnow()
+            deactivated_count = 0
+            skipped_repaid_count = 0
             for customer in expired_customers:
                 if customer.id in all_successful_ids:
+                    await db.refresh(customer)
+                    if customer.expiry and customer.expiry > now_after_cleanup:
+                        logger.warning(
+                            "[CRON] Customer %s received new payment during cleanup "
+                            "(expiry=%s > now=%s), skipping deactivation",
+                            customer.id, customer.expiry, now_after_cleanup,
+                        )
+                        skipped_repaid_count += 1
+                        continue
                     customer.status = CustomerStatus.INACTIVE
+                    deactivated_count += 1
             await db.commit()
+            if skipped_repaid_count:
+                logger.warning(
+                    "[CRON] Skipped %d customer(s) that received new payments during cleanup",
+                    skipped_repaid_count,
+                )
 
             if all_failed_ids:
                 logger.warning(f"[CRON] {len(all_failed_ids)} customers kept ACTIVE for retry: {list(all_failed_ids)}")
@@ -703,8 +821,7 @@ async def cleanup_expired_users_background():
 
             try:
                 logger.info(f"[CRON] Running safety net bypass cleanup...")
-                async with mikrotik_lock:
-                    bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
+                bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
                 if bypass_cleaned > 0:
                     logger.warning(f"[CRON] Safety net removed {bypass_cleaned} orphaned IP bindings!")
             except Exception as bypass_err:
@@ -1092,8 +1209,7 @@ async def sync_active_user_queues():
                 logger.warning(f"[SYNC] Skipping {len(no_router_customers)} customer(s) with no router assigned")
             logger.info(f"[SYNC] Grouped customers across {len(router_customers_map)} router(s)")
 
-            async with mikrotik_lock:
-                mikrotik_results = await asyncio.to_thread(_sync_queues_mikrotik_sync, router_customers_map)
+            mikrotik_results = await asyncio.to_thread(_sync_queues_mikrotik_sync, router_customers_map)
 
             duration = (datetime.utcnow() - start_time).total_seconds()
             logger.info(f"[SYNC] Job completed in {duration:.2f}s: "
@@ -1234,7 +1350,8 @@ async def collect_bandwidth_snapshot():
                         "id": router.id, "ip_address": router.ip_address,
                         "username": router.username, "password": router.password, "port": router.port
                     }
-                    async with mikrotik_lock:
+                    router_key = f"{router.ip_address}:{router.port}"
+                    async with router_locks.acquire(router_key):
                         raw = await asyncio.to_thread(_fetch_bandwidth_data_sync_for_router, router_info)
                     if not raw:
                         logger.warning(f"Failed to connect to router {router.name} ({router.ip_address}) for bandwidth snapshot")
@@ -1358,7 +1475,7 @@ async def collect_bandwidth_snapshot():
                             cust_result = await db.execute(
                                 select(Customer).where(Customer.mac_address.ilike(f"%{mac}%"))
                             )
-                            customer = cust_result.scalar_one_or_none()
+                            customer = cust_result.scalars().first()
                             existing = await db.execute(
                                 select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == mac)
                             )

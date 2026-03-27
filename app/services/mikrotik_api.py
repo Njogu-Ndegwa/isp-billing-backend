@@ -736,7 +736,7 @@ class MikroTikAPI:
     ) -> Dict[str, Any]:
         import time
         # Rate limiting: small delays between commands to prevent overwhelming MikroTik
-        CMD_DELAY = 0.1  # 100ms between commands
+        CMD_DELAY = 0.05  # 50ms between commands
         
         try:
             # Convert bandwidth to MikroTik format
