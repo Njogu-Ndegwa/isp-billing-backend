@@ -222,6 +222,7 @@ class Router(Base):
     radius_nas_identifier = Column(String(100), nullable=True)  # NAS-Identifier for this router
     payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
     pppoe_ports = Column(JSON, nullable=True)  # e.g. ["ether4", "ether5"]
+    plain_ports = Column(JSON, nullable=True)  # e.g. ["ether6", "ether7"]
     last_status = Column(Boolean, nullable=True)
     last_checked_at = Column(DateTime, nullable=True)
     last_online_at = Column(DateTime, nullable=True)
