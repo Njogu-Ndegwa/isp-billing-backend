@@ -29,7 +29,7 @@ _OVERVIEW_CACHE_TTL = 60  # 60 seconds -- overview changes slowly, no need to hi
 # Sync helpers (run in thread pool)
 # ---------------------------------------------------------------------------
 
-def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list) -> dict:
+def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list, db_dual_ports: list = None) -> dict:
     """Gather all PPPoE infrastructure data in one connection."""
     api = MikroTikAPI(
         router_info["ip"], router_info["username"],
@@ -100,10 +100,36 @@ def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list) -> dict:
         checks.append({
             "check": "pppoe_ports",
             "description": "PPPoE ports attached correctly with link up",
-            "passed": all(p["attached"] and p["link_up"] for p in port_checks) if port_checks else False,
+            "passed": all(p["attached"] and p["link_up"] for p in port_checks) if port_checks else bool(db_dual_ports),
             "any_port_up": any_port_up,
             "detail": port_checks if port_checks else "No PPPoE ports configured in DB",
         })
+
+        # Dual-mode ports (PPPoE + Hotspot on same bridge)
+        dual_port_checks = []
+        has_dual = access_state.get("has_dual", False)
+        for port_name in (db_dual_ports or []):
+            iface = ifaces.get(port_name, {})
+            link_up = iface.get("running", False)
+            actual_bridge = port_bridge_map.get(port_name)
+            attachment = attachment_map.get(port_name, {})
+            dual_port_checks.append({
+                "port": port_name,
+                "mode": "dual",
+                "actual_bridge": actual_bridge or "(none)",
+                "pppoe_attachment_mode": attachment.get("mode", "none"),
+                "pppoe_server_on_bridge": has_dual and attachment.get("mode") == "dual",
+                "link_up": link_up,
+            })
+        if dual_port_checks:
+            checks.append({
+                "check": "dual_ports",
+                "description": "Dual-mode ports (PPPoE + Hotspot) on the dual bridge",
+                "passed": has_dual and all(
+                    p["pppoe_attachment_mode"] == "dual" and p["link_up"] for p in dual_port_checks
+                ),
+                "detail": dual_port_checks,
+            })
 
         ppp_profiles = api.get_ppp_profiles()
         profile_list = ppp_profiles.get("data", []) if ppp_profiles.get("success") else []
@@ -486,7 +512,9 @@ async def pppoe_overview(
         "password": router_obj.password, "port": router_obj.port,
     }
     result = await run_with_guard(
-        router_id, _pppoe_overview_sync, router_info, router_obj.pppoe_ports or [],
+        router_id, _pppoe_overview_sync, router_info,
+        router_obj.pppoe_ports or [],
+        getattr(router_obj, "dual_ports", None) or [],
     )
 
     if result.get("error") == "connect_failed":

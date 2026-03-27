@@ -73,6 +73,13 @@ async def migrate_db():
             ))
             print("  Added column: routers.plain_ports")
 
+        # Add dual_ports column if missing (PPPoE + Hotspot on same port)
+        if "dual_ports" not in router_columns:
+            await conn.execute(text(
+                "ALTER TABLE routers ADD COLUMN dual_ports JSON NULL"
+            ))
+            print("  Added column: routers.dual_ports")
+
         # Check which columns already exist on users
         def get_user_columns(connection):
             insp = inspect(connection)

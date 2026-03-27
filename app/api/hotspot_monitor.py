@@ -27,7 +27,12 @@ _OVERVIEW_CACHE_TTL = 60  # 60 seconds
 # Sync helpers (run in thread pool)
 # ---------------------------------------------------------------------------
 
-def _hotspot_overview_sync(router_info: dict, db_pppoe_ports: list, db_plain_ports: list = None) -> dict:
+def _hotspot_overview_sync(
+    router_info: dict,
+    db_pppoe_ports: list,
+    db_plain_ports: list = None,
+    db_dual_ports: list = None,
+) -> dict:
     """Gather all hotspot infrastructure data in one connection."""
     api = MikroTikAPI(
         router_info["ip"], router_info["username"],
@@ -49,18 +54,27 @@ def _hotspot_overview_sync(router_info: dict, db_pppoe_ports: list, db_plain_por
             "detail": enabled_servers if enabled_servers else "No hotspot server found or all disabled",
         })
 
-        hs_interface = enabled_servers[0].get("interface", "bridge") if enabled_servers else "bridge"
+        hotspot_interfaces = {
+            s.get("interface", "")
+            for s in enabled_servers
+            if s.get("interface")
+        }
 
         bridge_data = api.get_bridge_ports_status()
         bridges = bridge_data.get("bridges", {}) if bridge_data.get("success") else {}
         bridge_ports = bridge_data.get("ports", []) if bridge_data.get("success") else []
 
-        hotspot_bridge = bridges.get(hs_interface)
         checks.append({
             "check": "hotspot_bridge",
-            "description": f"Hotspot bridge '{hs_interface}' exists and running",
-            "passed": hotspot_bridge is not None and hotspot_bridge.get("running", False),
-            "detail": hotspot_bridge if hotspot_bridge else f"Bridge '{hs_interface}' not found",
+            "description": "Hotspot bridge interfaces exist and are running",
+            "passed": bool(hotspot_interfaces) and all(
+                bridges.get(name) is not None and bridges[name].get("running", False)
+                for name in hotspot_interfaces
+            ),
+            "detail": {
+                name: bridges.get(name) or {"missing": True}
+                for name in sorted(hotspot_interfaces)
+            } if hotspot_interfaces else "No enabled hotspot interface found",
         })
 
         ifaces_data = api.get_all_interfaces_detail()
@@ -68,6 +82,7 @@ def _hotspot_overview_sync(router_info: dict, db_pppoe_ports: list, db_plain_por
 
         port_bridge_map = {p["interface"]: p["bridge"] for p in bridge_ports}
         excluded_ports = set(db_pppoe_ports or []) | set(db_plain_ports or [])
+        dual_set = set(db_dual_ports or [])
         hotspot_ports = []
         any_port_up = False
         for port_name, iface in ifaces.items():
@@ -77,12 +92,14 @@ def _hotspot_overview_sync(router_info: dict, db_pppoe_ports: list, db_plain_por
                 continue
             actual_bridge = port_bridge_map.get(port_name)
             link_up = iface.get("running", False)
-            if link_up and actual_bridge == hs_interface:
+            if link_up and actual_bridge in hotspot_interfaces:
                 any_port_up = True
             hotspot_ports.append({
                 "port": port_name,
                 "bridge": actual_bridge or "(none)",
-                "in_hotspot_bridge": actual_bridge == hs_interface,
+                "hotspot_interface": actual_bridge if actual_bridge in hotspot_interfaces else "",
+                "in_hotspot_bridge": actual_bridge in hotspot_interfaces,
+                "dual_mode": port_name in dual_set,
                 "link_up": link_up,
                 "rx_error": iface.get("rx_error", 0),
                 "tx_error": iface.get("tx_error", 0),
@@ -96,24 +113,48 @@ def _hotspot_overview_sync(router_info: dict, db_pppoe_ports: list, db_plain_por
 
         dhcp_data = api.get_dhcp_server_status()
         dhcp_servers = dhcp_data.get("data", []) if dhcp_data.get("success") else []
-        active_dhcp = [d for d in dhcp_servers if not d["disabled"]]
+        active_dhcp = [
+            d for d in dhcp_servers
+            if not d["disabled"] and d.get("interface") in hotspot_interfaces
+        ]
+        dhcp_interfaces = {d.get("interface", "") for d in active_dhcp}
+        missing_dhcp = sorted(i for i in hotspot_interfaces if i not in dhcp_interfaces)
         checks.append({
             "check": "dhcp_server",
-            "description": "DHCP server running",
-            "passed": len(active_dhcp) > 0,
-            "detail": active_dhcp if active_dhcp else "No DHCP server found or all disabled",
+            "description": "DHCP server running on each hotspot interface",
+            "passed": bool(hotspot_interfaces) and not missing_dhcp,
+            "detail": {
+                "servers": active_dhcp,
+                "missing_interfaces": missing_dhcp,
+            } if active_dhcp or missing_dhcp else "No DHCP server found or all disabled",
         })
 
-        dhcp_pool_name = active_dhcp[0].get("address_pool", "") if active_dhcp else ""
-        if dhcp_pool_name:
+        dhcp_pool_checks = []
+        for dhcp_server in active_dhcp:
+            dhcp_pool_name = dhcp_server.get("address_pool", "")
+            if not dhcp_pool_name:
+                dhcp_pool_checks.append({
+                    "interface": dhcp_server.get("interface", ""),
+                    "pool": "",
+                    "ok": False,
+                    "detail": "No address pool configured",
+                })
+                continue
             pool_data = api.get_ip_pool_status(dhcp_pool_name)
             pools = pool_data.get("pools", []) if pool_data.get("success") else []
             pool_ok = len(pools) > 0 and not any(p.get("exhausted") for p in pools)
+            dhcp_pool_checks.append({
+                "interface": dhcp_server.get("interface", ""),
+                "pool": dhcp_pool_name,
+                "ok": pool_ok,
+                "detail": pools if pools else f"Pool '{dhcp_pool_name}' not found",
+            })
+        if dhcp_pool_checks:
             checks.append({
                 "check": "dhcp_pool",
-                "description": f"DHCP pool '{dhcp_pool_name}' not exhausted",
-                "passed": pool_ok,
-                "detail": pools if pools else f"Pool '{dhcp_pool_name}' not found",
+                "description": "DHCP pools for hotspot interfaces are configured and not exhausted",
+                "passed": all(item["ok"] for item in dhcp_pool_checks),
+                "detail": dhcp_pool_checks,
             })
         else:
             checks.append({
@@ -232,6 +273,7 @@ async def hotspot_overview(
     result = await run_with_guard(
         router_id, _hotspot_overview_sync, router_info,
         router_obj.pppoe_ports or [], router_obj.plain_ports or [],
+        getattr(router_obj, "dual_ports", None) or [],
     )
 
     if result.get("error") == "connect_failed":

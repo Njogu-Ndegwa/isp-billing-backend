@@ -18,6 +18,15 @@ QUEUE_FASTTRACK_BYPASS_LIST = "isp_queue_limited_clients"
 QUEUE_FASTTRACK_BYPASS_SRC_COMMENT = "ISP_BILLING_QUEUE_BYPASS_SRC"
 QUEUE_FASTTRACK_BYPASS_DST_COMMENT = "ISP_BILLING_QUEUE_BYPASS_DST"
 
+DUAL_BRIDGE_NAME = "bridge-dual"
+DUAL_BRIDGE_IP = "192.168.91.1/24"
+DUAL_HOTSPOT_POOL_NAME = "dual-hotspot-pool"
+DUAL_HOTSPOT_POOL_RANGE = "192.168.91.2-192.168.91.254"
+DUAL_DHCP_SERVER_NAME = "dhcp-dual"
+DUAL_HOTSPOT_PROFILE_NAME = "hsprof-dual"
+DUAL_HOTSPOT_SERVER_NAME = "hotspot-dual"
+DUAL_HOTSPOT_NAT_COMMENT = "NAT for dual hotspot clients"
+
 
 def _router_error_is_duplicate(error: str) -> bool:
     """Return True when RouterOS is reporting an idempotent duplicate/existing object."""
@@ -2384,14 +2393,19 @@ class MikroTikAPI:
             logger.error(last_result["error"])
         return last_result
 
-    def get_pppoe_access_state(self, legacy_bridge_name: str = "bridge-pppoe") -> Dict[str, Any]:
+    def get_pppoe_access_state(
+        self,
+        legacy_bridge_name: str = "bridge-pppoe",
+        dual_bridge_name: str = DUAL_BRIDGE_NAME,
+    ) -> Dict[str, Any]:
         """
         Discover how PPPoE access is attached on the router.
 
         Supported layouts:
         - direct: PPPoE server bound directly to physical interfaces
         - legacy_bridge: PPPoE server bound to a bridge such as bridge-pppoe
-        - mixed: a combination of both
+        - dual: PPPoE server bound to a dedicated dual bridge (both services coexist)
+        - mixed: a combination of direct and bridge-bound
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -2421,8 +2435,10 @@ class MikroTikAPI:
 
             direct_ports = set()
             bridge_ports_set = set()
+            dual_bridge_ports = set()
             direct_servers = []
             bridge_servers = []
+            dual_servers = []
             attachment_map: Dict[str, Dict[str, Any]] = {}
 
             for server in enabled_servers:
@@ -2430,11 +2446,32 @@ class MikroTikAPI:
                 if not interface:
                     continue
 
+                is_dual_bridge = interface == dual_bridge_name
                 is_bridge_server = (
                     interface in bridge_names
                     or interface == legacy_bridge_name
                     or interface.startswith("bridge")
                 )
+
+                if is_dual_bridge:
+                    member_ports = bridge_ports_by_name.get(interface)
+                    if member_ports is None:
+                        member_result = self.get_ports_in_bridge(interface)
+                        member_ports = [] if member_result.get("error") else member_result.get("ports", [])
+
+                    dual_servers.append({
+                        **server,
+                        "ports": sorted(member_ports),
+                    })
+                    for port in member_ports:
+                        dual_bridge_ports.add(port)
+                        attachment_map[port] = {
+                            "mode": "dual",
+                            "server_interface": interface,
+                            "bridge": interface,
+                        }
+                    continue
+
                 if is_bridge_server:
                     member_ports = bridge_ports_by_name.get(interface)
                     if member_ports is None:
@@ -2462,12 +2499,18 @@ class MikroTikAPI:
                     "bridge": "",
                 }
 
-            if direct_ports and bridge_ports_set:
+            has_direct = bool(direct_ports)
+            has_legacy = bool(bridge_ports_set)
+            has_dual = bool(dual_servers)
+
+            if has_direct and has_legacy:
                 mode = "mixed"
-            elif direct_ports:
+            elif has_direct:
                 mode = "direct"
-            elif bridge_ports_set:
+            elif has_legacy:
                 mode = "legacy_bridge"
+            elif has_dual:
+                mode = "dual"
             else:
                 mode = "none"
 
@@ -2477,8 +2520,11 @@ class MikroTikAPI:
                 "ports": sorted(direct_ports | bridge_ports_set),
                 "direct_ports": sorted(direct_ports),
                 "bridge_ports": sorted(bridge_ports_set),
+                "dual_bridge_ports": sorted(dual_bridge_ports),
                 "direct_servers": direct_servers,
                 "bridge_servers": bridge_servers,
+                "dual_servers": dual_servers,
+                "has_dual": has_dual,
                 "attachment_map": attachment_map,
                 "enabled_servers": enabled_servers,
                 "bridge_map": bridge_map,
@@ -2584,6 +2630,207 @@ class MikroTikAPI:
             return {"success": True, "action": "created", "interface": interface}
         except Exception as e:
             logger.error(f"Error ensuring PPPoE server on {interface}: {e}")
+            return {"error": str(e)}
+
+    def ensure_dhcp_server_on_interface(
+        self,
+        name: str,
+        interface: str,
+        address_pool: str,
+        verify: bool = True,
+    ) -> Dict[str, Any]:
+        """Ensure a DHCP server exists and is enabled on the requested interface."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command_optimized(
+                "/ip/dhcp-server/print",
+                proplist=[".id", "name", "interface", "address-pool", "disabled"],
+            )
+            if result.get("error"):
+                return {"error": f"Could not read DHCP servers: {result['error']}"}
+
+            matches = [
+                server for server in result.get("data", [])
+                if server.get("name") == name
+            ]
+
+            if matches:
+                primary = matches[0]
+                server_id = primary.get(".id")
+                if not server_id:
+                    return {"error": f"DHCP server '{name}' has no identifier"}
+
+                update = self.send_command("/ip/dhcp-server/set", {
+                    "numbers": server_id,
+                    "name": name,
+                    "interface": interface,
+                    "address-pool": address_pool,
+                    "disabled": "no",
+                })
+                if update.get("error"):
+                    return {"error": f"Failed to update DHCP server '{name}': {update['error']}"}
+
+                for duplicate in matches[1:]:
+                    duplicate_id = duplicate.get(".id")
+                    if duplicate_id:
+                        duplicate_remove = self.send_command(
+                            "/ip/dhcp-server/remove",
+                            {"numbers": duplicate_id},
+                        )
+                        if duplicate_remove.get("error"):
+                            logger.warning(
+                                "Failed to remove duplicate DHCP server '%s': %s",
+                                name,
+                                duplicate_remove["error"],
+                            )
+            else:
+                create = self.send_command("/ip/dhcp-server/add", {
+                    "name": name,
+                    "interface": interface,
+                    "address-pool": address_pool,
+                    "disabled": "no",
+                })
+                if create.get("error"):
+                    return {"error": f"Failed to create DHCP server '{name}': {create['error']}"}
+
+            if verify:
+                verify_result = self.get_dhcp_server_status()
+                verified = [
+                    server for server in verify_result.get("data", [])
+                    if server.get("name") == name
+                    and server.get("interface") == interface
+                    and not server.get("disabled", False)
+                ] if verify_result.get("success") else []
+                if not verified:
+                    return {"error": f"DHCP server '{name}' was not active on {interface} after apply"}
+
+            return {"success": True, "name": name, "interface": interface}
+        except Exception as e:
+            logger.error("Error ensuring DHCP server %s: %s", name, e)
+            return {"error": str(e)}
+
+    def ensure_hotspot_server_profile(
+        self,
+        profile_name: str,
+        hotspot_address: str,
+        dns_name: str = "",
+        html_directory: str = "hotspot",
+        login_by: str = "http-chap,http-pap",
+    ) -> Dict[str, Any]:
+        """Ensure a hotspot server profile exists with the expected gateway address."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/hotspot/profile/print")
+            if result.get("error"):
+                return {"error": f"Could not read hotspot profiles: {result['error']}"}
+
+            existing = None
+            for profile in result.get("data", []):
+                if profile.get("name") == profile_name:
+                    existing = profile
+                    break
+
+            args = {
+                "name": profile_name,
+                "hotspot-address": hotspot_address,
+                "dns-name": dns_name,
+                "login-by": login_by,
+                "html-directory": html_directory,
+            }
+
+            if existing:
+                profile_id = existing.get(".id")
+                if not profile_id:
+                    return {"error": f"Hotspot profile '{profile_name}' has no identifier"}
+                args["numbers"] = profile_id
+                update = self.send_command("/ip/hotspot/profile/set", args)
+                if update.get("error"):
+                    return {"error": f"Failed to update hotspot profile '{profile_name}': {update['error']}"}
+            else:
+                create = self.send_command("/ip/hotspot/profile/add", args)
+                if create.get("error"):
+                    return {"error": f"Failed to create hotspot profile '{profile_name}': {create['error']}"}
+
+            return {"success": True, "name": profile_name}
+        except Exception as e:
+            logger.error("Error ensuring hotspot profile %s: %s", profile_name, e)
+            return {"error": str(e)}
+
+    def ensure_hotspot_server_on_interface(
+        self,
+        interface: str,
+        server_name: str,
+        profile_name: str,
+        address_pool: str,
+        verify: bool = True,
+    ) -> Dict[str, Any]:
+        """Ensure a hotspot server exists and is enabled on the requested interface."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            result = self.send_command("/ip/hotspot/print")
+            if result.get("error"):
+                return {"error": f"Could not read hotspot servers: {result['error']}"}
+
+            matches = [
+                server for server in result.get("data", [])
+                if server.get("name") == server_name or server.get("interface") == interface
+            ]
+
+            if matches:
+                primary = matches[0]
+                server_id = primary.get(".id")
+                if not server_id:
+                    return {"error": f"Hotspot server '{server_name}' has no identifier"}
+
+                update = self.send_command("/ip/hotspot/set", {
+                    "numbers": server_id,
+                    "name": server_name,
+                    "interface": interface,
+                    "address-pool": address_pool,
+                    "profile": profile_name,
+                    "disabled": "no",
+                })
+                if update.get("error"):
+                    return {"error": f"Failed to update hotspot server '{server_name}': {update['error']}"}
+
+                for duplicate in matches[1:]:
+                    duplicate_id = duplicate.get(".id")
+                    if duplicate_id:
+                        duplicate_remove = self.send_command("/ip/hotspot/remove", {"numbers": duplicate_id})
+                        if duplicate_remove.get("error"):
+                            logger.warning(
+                                "Failed to remove duplicate hotspot server '%s': %s",
+                                server_name,
+                                duplicate_remove["error"],
+                            )
+            else:
+                create = self.send_command("/ip/hotspot/add", {
+                    "name": server_name,
+                    "interface": interface,
+                    "address-pool": address_pool,
+                    "profile": profile_name,
+                    "disabled": "no",
+                })
+                if create.get("error"):
+                    return {"error": f"Failed to create hotspot server '{server_name}': {create['error']}"}
+
+            if verify:
+                verify_result = self.get_hotspot_server_status()
+                verified = [
+                    server for server in verify_result.get("data", [])
+                    if server.get("name") == server_name
+                    and server.get("interface") == interface
+                    and not server.get("disabled", False)
+                ] if verify_result.get("success") else []
+                if not verified:
+                    return {"error": f"Hotspot server '{server_name}' was not active on {interface} after apply"}
+
+            return {"success": True, "name": server_name, "interface": interface}
+        except Exception as e:
+            logger.error("Error ensuring hotspot server %s on %s: %s", server_name, interface, e)
             return {"error": str(e)}
 
     def remove_pppoe_servers(self, interfaces: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -3114,6 +3361,381 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error tearing down PPPoE infrastructure: {e}")
             return {"error": str(e), "partial_errors": errors}
+
+    # =========================================================================
+    # DUAL-MODE (PPPoE + HOTSPOT) PORT INFRASTRUCTURE
+    # =========================================================================
+
+    def setup_dual_infrastructure(
+        self,
+        dual_ports: List[str],
+        hotspot_bridge: str = "bridge",
+        dual_bridge_name: str = DUAL_BRIDGE_NAME,
+        dual_bridge_ip: str = DUAL_BRIDGE_IP,
+        dual_pool_name: str = DUAL_HOTSPOT_POOL_NAME,
+        dual_pool_range: str = DUAL_HOTSPOT_POOL_RANGE,
+        dual_dhcp_server_name: str = DUAL_DHCP_SERVER_NAME,
+        dual_hotspot_profile_name: str = DUAL_HOTSPOT_PROFILE_NAME,
+        dual_hotspot_server_name: str = DUAL_HOTSPOT_SERVER_NAME,
+        dual_nat_comment: str = DUAL_HOTSPOT_NAT_COMMENT,
+        pppoe_pool_name: str = "pppoe-pool",
+        pppoe_pool_range: str = "192.168.89.2-192.168.89.254",
+        pppoe_local_address: str = "192.168.89.1/24",
+    ) -> Dict[str, Any]:
+        """
+        Set up dual-mode (PPPoE + Hotspot) on a dedicated access bridge.
+
+        The shared infrastructure is constant-cost; only changed ports are moved.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        errors = []
+        try:
+            target_ports = list(dict.fromkeys(dual_ports or []))
+            if not target_ports:
+                return {"success": True, "message": "No dual ports requested"}
+
+            bridge_data = self.get_bridge_ports_status()
+            port_bridge_map = {
+                p["interface"]: p["bridge"]
+                for p in bridge_data.get("ports", [])
+            } if bridge_data.get("success") else {}
+            current_dual_ports = sorted(
+                port for port, bridge in port_bridge_map.items()
+                if bridge == dual_bridge_name
+            )
+            ports_to_restore = [
+                port for port in current_dual_ports
+                if port not in target_ports
+            ]
+
+            result = self.send_command("/interface/bridge/add", {"name": dual_bridge_name})
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                return {"error": f"Dual bridge create: {result['error']}"}
+
+            dual_gateway = dual_bridge_ip.split("/")[0]
+            dual_subnet = dual_pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
+
+            result = self.send_command("/ip/address/add", {
+                "address": dual_bridge_ip,
+                "interface": dual_bridge_name,
+                "comment": "Dual bridge address",
+            })
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                errors.append(f"Dual bridge address: {result['error']}")
+
+            result = self.send_command("/ip/pool/add", {
+                "name": dual_pool_name,
+                "ranges": dual_pool_range,
+            })
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                errors.append(f"Dual hotspot pool: {result['error']}")
+
+            dhcp_result = self.ensure_dhcp_server_on_interface(
+                name=dual_dhcp_server_name,
+                interface=dual_bridge_name,
+                address_pool=dual_pool_name,
+                verify=True,
+            )
+            if dhcp_result.get("error"):
+                return {"error": f"Dual DHCP: {dhcp_result['error']}"}
+
+            result = self.send_command("/ip/dhcp-server/network/add", {
+                "address": dual_subnet,
+                "gateway": dual_gateway,
+                "dns-server": "8.8.8.8,8.8.4.4",
+            })
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                errors.append(f"Dual DHCP network: {result['error']}")
+
+            hotspot_profile = self.ensure_hotspot_server_profile(
+                profile_name=dual_hotspot_profile_name,
+                hotspot_address=dual_gateway,
+            )
+            if hotspot_profile.get("error"):
+                return {"error": f"Dual hotspot profile: {hotspot_profile['error']}"}
+
+            hotspot_server = self.ensure_hotspot_server_on_interface(
+                interface=dual_bridge_name,
+                server_name=dual_hotspot_server_name,
+                profile_name=dual_hotspot_profile_name,
+                address_pool=dual_pool_name,
+                verify=True,
+            )
+            if hotspot_server.get("error"):
+                return {"error": f"Dual hotspot server: {hotspot_server['error']}"}
+
+            result = self.send_command("/ip/firewall/nat/add", {
+                "chain": "srcnat",
+                "src-address": dual_subnet,
+                "out-interface": "ether1",
+                "action": "masquerade",
+                "comment": dual_nat_comment,
+            })
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                errors.append(f"Dual hotspot NAT: {result['error']}")
+
+            result = self.send_command("/ip/pool/add", {
+                "name": pppoe_pool_name,
+                "ranges": pppoe_pool_range,
+            })
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                errors.append(f"PPPoE pool: {result['error']}")
+
+            profile_result = self.ensure_pppoe_profile(
+                profile_name="default-pppoe",
+                rate_limit="0/0",
+                local_address=pppoe_local_address.split("/")[0],
+                pool_name=pppoe_pool_name,
+            )
+            if profile_result.get("error"):
+                return {"error": f"PPPoE profile: {profile_result['error']}"}
+
+            bind_result = self.ensure_pppoe_server_on_interface(
+                dual_bridge_name,
+                profile_name="default-pppoe",
+                service_name_prefix="pppoe-dual",
+                verify=True,
+            )
+            if bind_result.get("error"):
+                return {"error": f"PPPoE server on {dual_bridge_name}: {bind_result['error']}"}
+
+            pppoe_subnet = pppoe_pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
+            result = self.send_command("/ip/firewall/nat/add", {
+                "chain": "srcnat",
+                "src-address": pppoe_subnet,
+                "out-interface": "ether1",
+                "action": "masquerade",
+                "comment": "NAT for PPPoE clients",
+            })
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                errors.append(f"NAT: {result['error']}")
+
+            bypass_result = self.ensure_pppoe_fasttrack_bypass(
+                bridge_name=dual_bridge_name,
+                pool_name=pppoe_pool_name,
+                fallback_pool_ranges=pppoe_pool_range,
+            )
+            if bypass_result.get("error"):
+                errors.append(f"FastTrack bypass: {bypass_result['error']}")
+
+            for port in ports_to_restore:
+                restore_result = self.add_bridge_port(port, hotspot_bridge, verify=False)
+                if restore_result.get("error"):
+                    errors.append(f"Restore {port} to {hotspot_bridge}: {restore_result['error']}")
+
+            for port in target_ports:
+                if port_bridge_map.get(port) == dual_bridge_name:
+                    continue
+                move_result = self.add_bridge_port(port, dual_bridge_name, verify=False)
+                if move_result.get("error"):
+                    errors.append(f"Move {port} to {dual_bridge_name}: {move_result['error']}")
+
+            expected = {port: dual_bridge_name for port in target_ports}
+            if ports_to_restore:
+                expected.update({port: hotspot_bridge for port in ports_to_restore})
+            verify = self.verify_port_bridges(expected, retries=3, delay=0.3)
+            if verify.get("error"):
+                failed = verify.get("failed_ports", [])
+                details = "; ".join(
+                    f"{item['port']} is in '{item['actual_bridge']}' (expected '{item['expected_bridge']}')"
+                    for item in failed
+                ) if failed else verify["error"]
+                return {
+                    "error": f"Dual bridge layout does not match the request: {details}",
+                    "failed_ports": failed,
+                    "partial_errors": errors,
+                }
+
+            access_state = self.get_pppoe_access_state(
+                legacy_bridge_name="bridge-pppoe",
+                dual_bridge_name=dual_bridge_name,
+            )
+            if access_state.get("error"):
+                return {
+                    "error": f"Could not verify dual PPPoE state: {access_state['error']}",
+                    "partial_errors": errors,
+                }
+
+            actual_dual_ports = set(access_state.get("dual_bridge_ports", []))
+            missing_dual = [port for port in target_ports if port not in actual_dual_ports]
+            if missing_dual:
+                return {
+                    "error": f"Dual PPPoE was not active on: {', '.join(missing_dual)}",
+                    "failed_ports": [{"port": port, "expected_mode": "dual"} for port in missing_dual],
+                    "partial_errors": errors,
+                }
+
+            if errors:
+                logger.warning(f"Dual infrastructure setup completed with warnings: {errors}")
+                return {"success": True, "warnings": errors, "ports": target_ports}
+
+            logger.info("Dual-mode infrastructure setup completed successfully")
+            return {"success": True, "ports": target_ports}
+        except Exception as e:
+            logger.error(f"Error setting up dual infrastructure: {e}")
+            return {"error": str(e), "partial_errors": errors}
+
+    def restore_ports_from_dual(
+        self,
+        ports: List[str],
+        hotspot_bridge: str = "bridge",
+        dual_bridge_name: str = DUAL_BRIDGE_NAME,
+    ) -> Dict[str, Any]:
+        """Move specific ports from the dual bridge back to the main hotspot bridge."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            unique_ports = list(dict.fromkeys(ports or []))
+            if not unique_ports:
+                return {"success": True}
+
+            bridge_map = {}
+            bridge_data = self.get_bridge_ports_status()
+            if bridge_data.get("success"):
+                bridge_map = {
+                    p.get("interface", ""): p.get("bridge", "")
+                    for p in bridge_data.get("ports", [])
+                }
+
+            errors = []
+            for port in unique_ports:
+                current_bridge = bridge_map.get(port, "")
+                if current_bridge == hotspot_bridge:
+                    logger.info("%s already in hotspot bridge '%s'; skipping restore", port, hotspot_bridge)
+                    continue
+                restore = self.add_bridge_port(port, hotspot_bridge, verify=False)
+                if restore.get("error"):
+                    errors.append(f"{port}: {restore['error']}")
+
+            if errors:
+                return {"error": "Failed to restore dual ports: " + "; ".join(errors)}
+            return {"success": True, "ports": unique_ports}
+        except Exception as e:
+            logger.error(f"Error restoring dual ports: {e}")
+            return {"error": str(e)}
+
+    def teardown_dual_infrastructure(
+        self,
+        hotspot_bridge: str = "bridge",
+        dual_bridge_name: str = DUAL_BRIDGE_NAME,
+        dual_bridge_ip: str = DUAL_BRIDGE_IP,
+        dual_pool_name: str = DUAL_HOTSPOT_POOL_NAME,
+        dual_dhcp_server_name: str = DUAL_DHCP_SERVER_NAME,
+        dual_hotspot_profile_name: str = DUAL_HOTSPOT_PROFILE_NAME,
+        dual_hotspot_server_name: str = DUAL_HOTSPOT_SERVER_NAME,
+        dual_nat_comment: str = DUAL_HOTSPOT_NAT_COMMENT,
+        ports_to_restore: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Remove the dual bridge infrastructure and optionally restore its ports."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            warnings = []
+
+            for port in (ports_to_restore or []):
+                restore = self.add_bridge_port(port, hotspot_bridge, verify=False)
+                if restore.get("error"):
+                    warnings.append(f"Restore {port}: {restore['error']}")
+
+            remove_result = self.remove_pppoe_servers([dual_bridge_name])
+            if remove_result.get("error"):
+                warnings.append(remove_result["error"])
+
+            hotspot_servers = self.send_command("/ip/hotspot/print")
+            if hotspot_servers.get("success"):
+                for server in hotspot_servers.get("data", []):
+                    if (
+                        server.get("name") == dual_hotspot_server_name
+                        or server.get("interface") == dual_bridge_name
+                    ):
+                        server_id = server.get(".id")
+                        if server_id:
+                            remove = self.send_command("/ip/hotspot/remove", {"numbers": server_id})
+                            if remove.get("error"):
+                                warnings.append(f"Remove hotspot server: {remove['error']}")
+
+            dhcp_servers = self.send_command("/ip/dhcp-server/print")
+            if dhcp_servers.get("success"):
+                for server in dhcp_servers.get("data", []):
+                    if (
+                        server.get("name") == dual_dhcp_server_name
+                        or server.get("interface") == dual_bridge_name
+                    ):
+                        server_id = server.get(".id")
+                        if server_id:
+                            remove = self.send_command("/ip/dhcp-server/remove", {"numbers": server_id})
+                            if remove.get("error"):
+                                warnings.append(f"Remove DHCP server: {remove['error']}")
+
+            dhcp_networks = self.send_command("/ip/dhcp-server/network/print")
+            if dhcp_networks.get("success"):
+                dual_gateway = dual_bridge_ip.split("/")[0]
+                for network in dhcp_networks.get("data", []):
+                    if network.get("gateway") == dual_gateway:
+                        network_id = network.get(".id")
+                        if network_id:
+                            remove = self.send_command("/ip/dhcp-server/network/remove", {"numbers": network_id})
+                            if remove.get("error"):
+                                warnings.append(f"Remove dual DHCP network: {remove['error']}")
+
+            addresses = self.send_command("/ip/address/print")
+            if addresses.get("success"):
+                for address in addresses.get("data", []):
+                    if address.get("interface") == dual_bridge_name:
+                        address_id = address.get(".id")
+                        if address_id:
+                            remove = self.send_command("/ip/address/remove", {"numbers": address_id})
+                            if remove.get("error"):
+                                warnings.append(f"Remove dual bridge address: {remove['error']}")
+
+            pools = self.send_command("/ip/pool/print")
+            if pools.get("success"):
+                for pool in pools.get("data", []):
+                    if pool.get("name") == dual_pool_name:
+                        pool_id = pool.get(".id")
+                        if pool_id:
+                            remove = self.send_command("/ip/pool/remove", {"numbers": pool_id})
+                            if remove.get("error"):
+                                warnings.append(f"Remove dual hotspot pool: {remove['error']}")
+
+            nats = self.send_command("/ip/firewall/nat/print")
+            if nats.get("success"):
+                for nat in nats.get("data", []):
+                    if nat.get("comment") == dual_nat_comment:
+                        nat_id = nat.get(".id")
+                        if nat_id:
+                            remove = self.send_command("/ip/firewall/nat/remove", {"numbers": nat_id})
+                            if remove.get("error"):
+                                warnings.append(f"Remove dual hotspot NAT: {remove['error']}")
+
+            hotspot_profiles = self.send_command("/ip/hotspot/profile/print")
+            if hotspot_profiles.get("success"):
+                for profile in hotspot_profiles.get("data", []):
+                    if profile.get("name") == dual_hotspot_profile_name:
+                        profile_id = profile.get(".id")
+                        if profile_id:
+                            remove = self.send_command("/ip/hotspot/profile/remove", {"numbers": profile_id})
+                            if remove.get("error"):
+                                warnings.append(f"Remove dual hotspot profile: {remove['error']}")
+
+            bridges = self.send_command("/interface/bridge/print")
+            if bridges.get("success"):
+                for bridge in bridges.get("data", []):
+                    if bridge.get("name") == dual_bridge_name:
+                        bridge_id = bridge.get(".id")
+                        if bridge_id:
+                            remove = self.send_command("/interface/bridge/remove", {"numbers": bridge_id})
+                            if remove.get("error"):
+                                warnings.append(f"Remove dual bridge: {remove['error']}")
+
+            logger.info(f"Removed dual infrastructure on '{dual_bridge_name}'")
+            if warnings:
+                return {"success": True, "warnings": warnings}
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Error tearing down dual infrastructure: {e}")
+            return {"error": str(e)}
 
     # =========================================================================
     # PLAIN (NO-AUTH) PORT INFRASTRUCTURE

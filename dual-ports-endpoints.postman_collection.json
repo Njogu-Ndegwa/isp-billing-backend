@@ -1,0 +1,102 @@
+{
+    "info": {
+        "name": "Dual-Mode Ports (PPPoE + Hotspot) - Endpoints",
+        "description": "Configure ports to serve both PPPoE and Hotspot on the same interface. Ports stay in the hotspot bridge while a PPPoE server is also bound to that bridge.",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {
+            "key": "baseUrl",
+            "value": "http://localhost:8000"
+        },
+        {
+            "key": "routerId",
+            "value": "1"
+        }
+    ],
+    "item": [
+        {
+            "name": "Set Dual-Mode Ports",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/dual-ports",
+                "header": [
+                    {
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    },
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\"ports\": [\"ether3\", \"ether4\"]}"
+                },
+                "description": "Configure which ethernet ports run in dual mode (PPPoE + Hotspot). Ports stay in the hotspot bridge while a PPPoE server is also bound to the bridge. Pass an empty list to remove dual mode and revert to hotspot-only."
+            }
+        },
+        {
+            "name": "Clear Dual-Mode Ports",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/dual-ports",
+                "header": [
+                    {
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    },
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\"ports\": []}"
+                },
+                "description": "Remove dual mode from all ports, reverting them to hotspot-only."
+            }
+        },
+        {
+            "name": "Get Port Status (includes dual)",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/routers/{{routerId}}/ports",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "routers", "{{routerId}}", "ports"],
+                    "query": [
+                        {
+                            "key": "refresh",
+                            "value": "true",
+                            "description": "Force refresh, bypass cache"
+                        }
+                    ]
+                },
+                "header": [
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "description": "Get all port statuses. Ports in dual mode will show service='dual'."
+            }
+        },
+        {
+            "name": "Get Interfaces (includes dual_ports)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/interfaces",
+                "header": [
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "description": "Get available ethernet interfaces with current port assignments including dual_ports."
+            }
+        }
+    ]
+}

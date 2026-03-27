@@ -249,6 +249,7 @@ class Router(Base):
     payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
     pppoe_ports = Column(JSON, nullable=True)  # e.g. ["ether4", "ether5"]
     plain_ports = Column(JSON, nullable=True)  # e.g. ["ether6", "ether7"]
+    dual_ports = Column(JSON, nullable=True)   # e.g. ["ether3"] — PPPoE + Hotspot on same port
     last_status = Column(Boolean, nullable=True)
     last_checked_at = Column(DateTime, nullable=True)
     last_online_at = Column(DateTime, nullable=True)

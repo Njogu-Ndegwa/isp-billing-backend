@@ -121,6 +121,7 @@ async def get_routers(
             } if pm else None,
             "pppoe_ports": getattr(router_obj, "pppoe_ports", None),
             "plain_ports": getattr(router_obj, "plain_ports", None),
+            "dual_ports": getattr(router_obj, "dual_ports", None),
             "emergency_active": getattr(router_obj, "emergency_active", False),
             "emergency_message": getattr(router_obj, "emergency_message", None),
         }
@@ -259,6 +260,7 @@ async def create_router_api(
             "payment_method_id": router_obj.payment_method_id,
             "pppoe_ports": router_obj.pppoe_ports,
             "plain_ports": router_obj.plain_ports,
+            "dual_ports": router_obj.dual_ports,
             "emergency_active": router_obj.emergency_active,
             "emergency_message": router_obj.emergency_message,
             "created_at": router_obj.created_at.isoformat()
@@ -308,6 +310,7 @@ async def get_router_by_identity(
         } if pm else None,
         "pppoe_ports": getattr(router_obj, 'pppoe_ports', None),
         "plain_ports": getattr(router_obj, 'plain_ports', None),
+        "dual_ports": getattr(router_obj, 'dual_ports', None),
         "emergency_active": getattr(router_obj, 'emergency_active', False),
         "emergency_message": getattr(router_obj, 'emergency_message', None),
     }
@@ -392,6 +395,7 @@ async def update_router(
             "payment_method_id": router_obj.payment_method_id,
             "pppoe_ports": router_obj.pppoe_ports,
             "plain_ports": router_obj.plain_ports,
+            "dual_ports": router_obj.dual_ports,
             "emergency_active": router_obj.emergency_active,
             "emergency_message": router_obj.emergency_message,
             "updated_at": datetime.utcnow().isoformat()
