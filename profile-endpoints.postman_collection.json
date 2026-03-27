@@ -1,0 +1,63 @@
+{
+    "info": {
+        "name": "Profile - Endpoints",
+        "description": "CRUD endpoints for managing user/reseller profile (support_phone, business_name, password, etc.)",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        { "key": "baseUrl", "value": "http://localhost:8000" },
+        { "key": "token", "value": "<your_jwt_token>" }
+    ],
+    "item": [
+        {
+            "name": "Get Profile",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/profile",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "Update Profile",
+            "request": {
+                "method": "PATCH",
+                "url": "{{baseUrl}}/api/profile",
+                "header": [
+                    { "key": "Content-Type", "value": "application/json" },
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"business_name\": \"SIMSEAS TECHNOLOGIES AND SERVICES\",\n    \"support_phone\": \"+254712345678\",\n    \"mpesa_shortcode\": \"600123\",\n    \"organization_name\": \"My ISP Business\",\n    \"email\": \"newemail@example.com\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Change Password",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/profile/password",
+                "header": [
+                    { "key": "Content-Type", "value": "application/json" },
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"current_password\": \"oldpassword123\",\n    \"new_password\": \"newpassword456\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Delete Account",
+            "request": {
+                "method": "DELETE",
+                "url": "{{baseUrl}}/api/profile",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        }
+    ]
+}
