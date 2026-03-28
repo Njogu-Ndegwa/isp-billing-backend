@@ -351,10 +351,11 @@ async def delete_customer(
 
 @router.get("/api/customers")
 async def get_customers_api(
+    router_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Get all customers for the authenticated user"""
+    """Get all customers for the authenticated user, optionally filtered by router."""
     try:
         user = await get_current_user(token, db)
         
@@ -362,6 +363,8 @@ async def get_customers_api(
             selectinload(Customer.plan),
             selectinload(Customer.router)
         )
+        if router_id is not None:
+            stmt = stmt.where(Customer.router_id == router_id)
         result = await db.execute(stmt)
         customers = result.scalars().all()
         
@@ -399,10 +402,11 @@ async def get_customers_api(
 
 @router.get("/api/customers/active")
 async def get_active_customers(
+    router_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Get all currently active guests"""
+    """Get all currently active guests, optionally filtered by router."""
     try:
         user = await get_current_user(token, db)
         stmt = select(Customer).where(
@@ -412,6 +416,8 @@ async def get_active_customers(
             selectinload(Customer.plan),
             selectinload(Customer.router)
         ).order_by(Customer.expiry)
+        if router_id is not None:
+            stmt = stmt.where(Customer.router_id == router_id)
         
         result = await db.execute(stmt)
         customers = result.scalars().all()

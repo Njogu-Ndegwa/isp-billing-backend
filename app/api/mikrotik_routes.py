@@ -304,12 +304,10 @@ async def get_mikrotik_health(
 # ============================================================================
 
 class WalledGardenIPRequest(BaseModel):
-    router_id: int
     dst_address: str = Field(..., description="IP address or CIDR, e.g. '203.0.113.10' or '203.0.113.0/24'")
     comment: str = "Added via API"
 
 class WalledGardenDomainRequest(BaseModel):
-    router_id: int
     dst_host: str = Field(..., description="Domain or wildcard, e.g. 'example.com' or '*.example.com'")
     comment: str = "Added via API"
 
@@ -350,6 +348,7 @@ async def get_walled_garden(
 
 @router.post("/api/mikrotik/walled-garden/ip")
 async def add_walled_garden_ip_entry(
+    router_id: int,
     body: WalledGardenIPRequest,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
@@ -357,7 +356,7 @@ async def add_walled_garden_ip_entry(
     """Add an IP address to the walled garden (allows hotspot users to reach it before auth)."""
     try:
         current_user = await get_current_user(token, db)
-        target_router = await get_router_by_id(db, body.router_id, current_user.id, current_user.role.value)
+        target_router = await get_router_by_id(db, router_id, current_user.id, current_user.role.value)
         if not target_router:
             raise HTTPException(status_code=404, detail="Router not found or not accessible")
         host, user, pwd, port = target_router.ip_address, target_router.username, target_router.password, target_router.port
@@ -384,6 +383,7 @@ async def add_walled_garden_ip_entry(
 
 @router.post("/api/mikrotik/walled-garden/domain")
 async def add_walled_garden_domain_entry(
+    router_id: int,
     body: WalledGardenDomainRequest,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
@@ -391,7 +391,7 @@ async def add_walled_garden_domain_entry(
     """Add a domain to the walled garden (allows hotspot users to access it before auth)."""
     try:
         current_user = await get_current_user(token, db)
-        target_router = await get_router_by_id(db, body.router_id, current_user.id, current_user.role.value)
+        target_router = await get_router_by_id(db, router_id, current_user.id, current_user.role.value)
         if not target_router:
             raise HTTPException(status_code=404, detail="Router not found or not accessible")
         host, user, pwd, port = target_router.ip_address, target_router.username, target_router.password, target_router.port
