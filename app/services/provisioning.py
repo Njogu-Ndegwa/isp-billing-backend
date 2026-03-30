@@ -326,18 +326,30 @@ def _rsc_hotspot() -> str:
     :error "bridge interface does not exist — cannot create hotspot"
 }
 
-:do { /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=hotspot } on-error={
-    :log info "Provisioning: hotspot profile hsprof1 already exists, continuing"
+:do {
+    /ip/hotspot/profile/add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=hotspot
+    :log info "Provisioning: hotspot profile hsprof1 created"
+} on-error={
+    :log info "Provisioning: hotspot profile hsprof1 already exists or hotspot unavailable, continuing"
 }
 
-/ip hotspot add name=hotspot1 interface=bridge address-pool=dhcp-pool profile=hsprof1 disabled=no
+:do {
+    /ip/hotspot/add name=hotspot1 interface=bridge address-pool=dhcp-pool profile=hsprof1 disabled=no
+    :log info "Provisioning: hotspot1 created"
+} on-error={
+    :log warning "Provisioning: hotspot1 add failed (may already exist or hotspot feature unavailable)"
+}
 
-:local hsCount [:len [/ip hotspot find where name=hotspot1]]
+:local hsCount 0
+:do {
+    :set hsCount [:len [/ip/hotspot/find where name=hotspot1]]
+} on-error={
+    :log error "PROVISION WARNING: could not query hotspot — the hotspot feature may not be available. Ensure device-mode hotspot is enabled: /system/device-mode/update hotspot=yes then press the physical reset button."
+}
 :if ($hsCount = 0) do={
-    :log error "PROVISION FAILED: hotspot1 was not created"
-    :error "hotspot creation failed — aborting"
+    :log error "PROVISION WARNING: hotspot1 was not found — hotspot feature may not be enabled. Run: /system/device-mode/update hotspot=yes then press the physical reset button."
 } else={
-    :log info "Provisioning: hotspot1 created and running"
+    :log info "Provisioning: hotspot1 confirmed running"
 }
 
 :do { /interface bridge port remove [find where interface=ether1] } on-error={}

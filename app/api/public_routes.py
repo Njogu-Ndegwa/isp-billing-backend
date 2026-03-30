@@ -4,9 +4,14 @@ from sqlalchemy import select, or_, func
 from sqlalchemy.orm import selectinload
 from typing import Dict, Optional
 from datetime import datetime, timedelta
+from pydantic import BaseModel
 
 from app.db.database import get_db
-from app.db.models import Router, Customer, Plan, Ad, CustomerStatus, PlanType
+from app.db.models import (
+    Router, Customer, Plan, Ad, CustomerStatus, PlanType,
+    ConnectionType, RouterAuthMethod, ReconnectionAttempt,
+    Voucher, VoucherStatus,
+)
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
 from app.services.plan_cache import get_plans_cached
@@ -17,6 +22,10 @@ import asyncio
 import hashlib
 
 logger = logging.getLogger(__name__)
+
+RECONNECT_ATTEMPT_LIMIT_PER_HOUR = 5
+RECONNECT_SUCCESS_LIMIT_PER_DAY = 3
+RECONNECT_COOLDOWN_SECONDS = 120
 
 router = APIRouter(tags=["public"])
 
@@ -849,6 +858,426 @@ async def verify_voucher_public(
         raise HTTPException(status_code=400, detail=result.get("error", "Invalid voucher"))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Self-service reconnection by phone number
+# ---------------------------------------------------------------------------
+
+class ReconnectRequest(BaseModel):
+    phone: Optional[str] = None
+    voucher_code: Optional[str] = None
+    mac_address: str
+    router_id: int
+
+
+def _build_phone_variants(phone: str) -> list[str]:
+    """Build all common Kenyan phone format variants for matching."""
+    cleaned = phone.replace("+", "").replace(" ", "").replace("-", "")
+    variants = {cleaned}
+    if cleaned.startswith("254"):
+        variants.add("0" + cleaned[3:])
+        variants.add("+" + cleaned)
+    elif cleaned.startswith("0") and len(cleaned) >= 10:
+        variants.add("254" + cleaned[1:])
+        variants.add("+254" + cleaned[1:])
+    elif cleaned.startswith("+254"):
+        variants.add("0" + cleaned[4:])
+        variants.add(cleaned[1:])
+    return list(variants)
+
+
+async def _check_reconnect_rate_limits(
+    db: AsyncSession, phone_variants: list[str], mac_address: str
+) -> str | None:
+    """Return a rejection reason if rate limits are exceeded, else None."""
+    now = datetime.utcnow()
+    one_hour_ago = now - timedelta(hours=1)
+    one_day_ago = now - timedelta(hours=24)
+    cooldown_cutoff = now - timedelta(seconds=RECONNECT_COOLDOWN_SECONDS)
+
+    # Cooldown: reject if any attempt from this phone in last N seconds
+    cooldown_stmt = select(func.count(ReconnectionAttempt.id)).where(
+        ReconnectionAttempt.phone.in_(phone_variants),
+        ReconnectionAttempt.created_at >= cooldown_cutoff,
+    )
+    cooldown_count = (await db.execute(cooldown_stmt)).scalar() or 0
+    if cooldown_count > 0:
+        return f"Please wait {RECONNECT_COOLDOWN_SECONDS} seconds between reconnection attempts"
+
+    # Hourly attempt limit (any outcome) per phone
+    hourly_phone_stmt = select(func.count(ReconnectionAttempt.id)).where(
+        ReconnectionAttempt.phone.in_(phone_variants),
+        ReconnectionAttempt.created_at >= one_hour_ago,
+    )
+    hourly_phone = (await db.execute(hourly_phone_stmt)).scalar() or 0
+    if hourly_phone >= RECONNECT_ATTEMPT_LIMIT_PER_HOUR:
+        return "Too many reconnection attempts from this phone number. Try again later."
+
+    # Hourly attempt limit per MAC (prevents device-hopping abuse)
+    hourly_mac_stmt = select(func.count(ReconnectionAttempt.id)).where(
+        ReconnectionAttempt.mac_address == mac_address,
+        ReconnectionAttempt.created_at >= one_hour_ago,
+    )
+    hourly_mac = (await db.execute(hourly_mac_stmt)).scalar() or 0
+    if hourly_mac >= RECONNECT_ATTEMPT_LIMIT_PER_HOUR:
+        return "Too many reconnection attempts from this device. Try again later."
+
+    # Daily success limit per phone (prevents sharing with many devices)
+    daily_success_stmt = select(func.count(ReconnectionAttempt.id)).where(
+        ReconnectionAttempt.phone.in_(phone_variants),
+        ReconnectionAttempt.success == True,
+        ReconnectionAttempt.created_at >= one_day_ago,
+    )
+    daily_success = (await db.execute(daily_success_stmt)).scalar() or 0
+    if daily_success >= RECONNECT_SUCCESS_LIMIT_PER_DAY:
+        return "Daily reconnection limit reached. Contact support if you need help."
+
+    return None
+
+
+def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
+    """Remove hotspot user, binding, queue, and DHCP lease for the old MAC."""
+    normalized = normalize_mac_address(old_mac)
+    username = normalized.replace(":", "")
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"],
+        router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "Failed to connect to router for cleanup"}
+    try:
+        removed = {"user": False, "bindings": 0, "queues": 0, "sessions": 0}
+
+        users = api.send_command("/ip/hotspot/user/print")
+        if users.get("success") and users.get("data"):
+            for u in users["data"]:
+                if u.get("name", "").upper() == username.upper():
+                    api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
+                    removed["user"] = True
+                    break
+
+        bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        if bindings.get("success") and bindings.get("data"):
+            for b in bindings["data"]:
+                if normalize_mac_address(b.get("mac-address", "")) == normalized:
+                    api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
+                    removed["bindings"] += 1
+
+        queues = api.send_command("/queue/simple/print")
+        if queues.get("success") and queues.get("data"):
+            for q in queues["data"]:
+                if q.get("name", "") == f"queue_{username}":
+                    api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                    removed["queues"] += 1
+
+        active = api.send_command("/ip/hotspot/active/print")
+        if active.get("success") and active.get("data"):
+            for s in active["data"]:
+                if s.get("user", "").upper() == username.upper():
+                    api.send_command("/ip/hotspot/active/remove", {"numbers": s[".id"]})
+                    removed["sessions"] += 1
+
+        return {"success": True, "removed": removed}
+    finally:
+        api.disconnect()
+
+
+@router.post("/api/public/reconnect")
+async def reconnect_self_service(
+    request: ReconnectRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Self-service reconnection for hotspot users whose session dropped.
+
+    Provide EITHER a phone number (for M-Pesa customers) OR a voucher code
+    (for voucher customers). The system looks up the active subscription and
+    re-provisions the user's current device on the router.
+    """
+    phone_raw = (request.phone or "").strip()
+    voucher_code = (request.voucher_code or "").strip()
+
+    if not phone_raw and not voucher_code:
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter your phone number or voucher code",
+        )
+
+    if not request.mac_address or not validate_mac_address(request.mac_address):
+        raise HTTPException(status_code=400, detail="Invalid device identifier")
+
+    router_obj = await get_router_by_id(db, request.router_id)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    normalized_mac = normalize_mac_address(request.mac_address)
+    now = datetime.utcnow()
+
+    # Voucher code takes priority when both are provided
+    if voucher_code:
+        lookup_key = voucher_code
+        rate_limit_keys = [voucher_code]
+    else:
+        lookup_key = phone_raw
+        rate_limit_keys = _build_phone_variants(phone_raw)
+
+    rate_limit_reason = await _check_reconnect_rate_limits(db, rate_limit_keys, normalized_mac)
+    if rate_limit_reason:
+        db.add(ReconnectionAttempt(
+            phone=lookup_key, mac_address=normalized_mac,
+            router_id=request.router_id, success=False,
+            failure_reason="rate_limited",
+            created_at=datetime.utcnow(),
+        ))
+        await db.commit()
+        raise HTTPException(status_code=429, detail=rate_limit_reason)
+
+    # --- Find the active customer ---
+    customer = None
+
+    if voucher_code:
+        # Voucher lookup: find the redeemed voucher → follow to customer
+        voucher_stmt = (
+            select(Voucher)
+            .where(Voucher.code == voucher_code, Voucher.status == VoucherStatus.REDEEMED)
+        )
+        voucher_result = await db.execute(voucher_stmt)
+        voucher_obj = voucher_result.scalar_one_or_none()
+
+        if not voucher_obj or not voucher_obj.redeemed_by:
+            db.add(ReconnectionAttempt(
+                phone=lookup_key, mac_address=normalized_mac,
+                router_id=request.router_id, success=False,
+                failure_reason="voucher_not_found",
+                created_at=datetime.utcnow(),
+            ))
+            await db.commit()
+            raise HTTPException(
+                status_code=404,
+                detail="No redeemed voucher found with this code",
+            )
+
+        cust_stmt = (
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(
+                Customer.id == voucher_obj.redeemed_by,
+                Customer.router_id == request.router_id,
+                Customer.status == CustomerStatus.ACTIVE,
+                Customer.expiry.isnot(None),
+                Customer.expiry > now,
+            )
+        )
+        cust_result = await db.execute(cust_stmt)
+        customer = cust_result.scalar_one_or_none()
+
+        if not customer:
+            # Distinguish between wrong-router and expired for a clearer message
+            any_cust = (await db.execute(
+                select(Customer).where(Customer.id == voucher_obj.redeemed_by)
+            )).scalar_one_or_none()
+
+            if any_cust and any_cust.router_id != request.router_id:
+                reason = "voucher_wrong_router"
+                detail = "This voucher was redeemed on a different network"
+            elif any_cust and (any_cust.status != CustomerStatus.ACTIVE or not any_cust.expiry or any_cust.expiry <= now):
+                reason = "voucher_subscription_expired"
+                detail = "Your voucher subscription has expired"
+            else:
+                reason = "voucher_subscription_expired"
+                detail = "Your voucher subscription has expired"
+
+            db.add(ReconnectionAttempt(
+                phone=lookup_key, mac_address=normalized_mac,
+                router_id=request.router_id, success=False,
+                failure_reason=reason,
+                created_at=datetime.utcnow(),
+            ))
+            await db.commit()
+            raise HTTPException(status_code=404, detail=detail)
+
+    else:
+        # Phone number lookup
+        if len(phone_raw) < 9:
+            raise HTTPException(status_code=400, detail="Please enter a valid phone number")
+
+        customer_stmt = (
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(
+                Customer.phone.in_(rate_limit_keys),
+                Customer.router_id == request.router_id,
+                Customer.status == CustomerStatus.ACTIVE,
+                Customer.expiry.isnot(None),
+                Customer.expiry > now,
+            )
+            .order_by(Customer.expiry.desc())
+            .limit(1)
+        )
+        result = await db.execute(customer_stmt)
+        customer = result.scalar_one_or_none()
+
+        if not customer:
+            db.add(ReconnectionAttempt(
+                phone=lookup_key, mac_address=normalized_mac,
+                router_id=request.router_id, success=False,
+                failure_reason="no_active_subscription",
+                created_at=datetime.utcnow(),
+            ))
+            await db.commit()
+            raise HTTPException(
+                status_code=404,
+                detail="No active subscription found for this phone number on this network",
+            )
+
+    if not customer.plan:
+        raise HTTPException(status_code=400, detail="Customer has no plan assigned")
+
+    if customer.plan.connection_type != ConnectionType.HOTSPOT:
+        db.add(ReconnectionAttempt(
+            phone=lookup_key, mac_address=normalized_mac,
+            router_id=request.router_id, customer_id=customer.id,
+            success=False, failure_reason="not_hotspot",
+            created_at=datetime.utcnow(),
+        ))
+        await db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail="Reconnection is only available for WiFi/hotspot connections. "
+                   "PPPoE connections reconnect automatically.",
+        )
+
+    old_mac = normalize_mac_address(customer.mac_address) if customer.mac_address else None
+    mac_changed = old_mac is not None and old_mac != normalized_mac
+    mac_is_new = old_mac is None
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+        "name": router_obj.name,
+    }
+
+    # --- If MAC changed or was never set, update it in the DB ---
+    if mac_changed or mac_is_new:
+        conflict_stmt = select(Customer).where(
+            Customer.mac_address == normalized_mac,
+            Customer.user_id == router_obj.user_id,
+            Customer.id != customer.id,
+        )
+        conflict_result = await db.execute(conflict_stmt)
+        conflicting = conflict_result.scalar_one_or_none()
+
+        if conflicting and conflicting.status == CustomerStatus.ACTIVE and conflicting.expiry and conflicting.expiry > now:
+            db.add(ReconnectionAttempt(
+                phone=lookup_key, mac_address=normalized_mac,
+                router_id=request.router_id, customer_id=customer.id,
+                success=False, failure_reason="mac_conflict_active",
+                created_at=datetime.utcnow(),
+            ))
+            await db.commit()
+            raise HTTPException(
+                status_code=409,
+                detail="This device is currently registered to another active account",
+            )
+
+        if conflicting:
+            conflicting.mac_address = None
+            await db.flush()
+
+        if mac_changed:
+            cleanup_result = await asyncio.to_thread(
+                _cleanup_old_mac_from_router_sync, router_info, old_mac
+            )
+            if cleanup_result.get("error"):
+                logger.warning(
+                    "[RECONNECT] Old MAC cleanup failed for customer %s: %s",
+                    customer.id, cleanup_result["error"],
+                )
+
+        customer.mac_address = normalized_mac
+        await db.flush()
+        logger.info(
+            "[RECONNECT] Customer %s MAC updated: %s → %s",
+            customer.id, old_mac or "(none)", normalized_mac,
+        )
+
+    # --- Provision (or re-provision) the current MAC on the router ---
+    auth_method = getattr(router_obj, "auth_method", None)
+    use_radius = auth_method == RouterAuthMethod.RADIUS if auth_method else False
+
+    if use_radius:
+        db.add(ReconnectionAttempt(
+            phone=lookup_key, mac_address=normalized_mac,
+            router_id=request.router_id, customer_id=customer.id,
+            success=True, old_mac_address=old_mac if (mac_changed or mac_is_new) else None,
+            created_at=datetime.utcnow(),
+        ))
+        await db.commit()
+
+        remaining = customer.expiry - now
+        return {
+            "success": True,
+            "message": "Your session has been restored. You should be connected shortly.",
+            "customer_name": customer.name,
+            "plan_name": customer.plan.name,
+            "expires_at": customer.expiry.isoformat(),
+            "remaining_hours": round(remaining.total_seconds() / 3600, 1),
+        }
+
+    from app.services.hotspot_provisioning import build_hotspot_payload, provision_hotspot_customer
+
+    hotspot_payload = build_hotspot_payload(
+        customer, customer.plan, router_obj,
+        comment=f"Self-service reconnect for {customer.name} ({lookup_key})",
+    )
+
+    provision_result = await provision_hotspot_customer(
+        customer_id=customer.id,
+        router_id=router_obj.id,
+        hotspot_payload=hotspot_payload,
+        action="self_service_reconnect",
+    )
+
+    reconnect_success = provision_result.get("success", False)
+    db.add(ReconnectionAttempt(
+        phone=lookup_key, mac_address=normalized_mac,
+        router_id=request.router_id, customer_id=customer.id,
+        success=reconnect_success,
+        old_mac_address=old_mac if (mac_changed or mac_is_new) else None,
+        failure_reason=provision_result.get("provisioning_error") if not reconnect_success else None,
+        created_at=datetime.utcnow(),
+    ))
+    await db.commit()
+
+    if not reconnect_success:
+        logger.error(
+            "[RECONNECT] Provisioning failed for customer %s: %s",
+            customer.id, provision_result.get("provisioning_error"),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Reconnection failed due to a network issue. Please try again in a moment.",
+        )
+
+    remaining = customer.expiry - now
+    logger.info(
+        "[RECONNECT] Customer %s (%s) reconnected successfully on router %s",
+        customer.id, customer.name, router_obj.name,
+    )
+
+    return {
+        "success": True,
+        "message": "You're back online! Your session has been restored.",
+        "customer_name": customer.name,
+        "plan_name": customer.plan.name,
+        "expires_at": customer.expiry.isoformat(),
+        "remaining_hours": round(remaining.total_seconds() / 3600, 1),
+        "mac_changed": mac_changed,
+    }
 
 
 @router.get("/api/public/plans/{router_id}")

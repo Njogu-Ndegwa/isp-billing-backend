@@ -683,6 +683,41 @@ async def run_monitoring_migrations():
         ))
 
 
+async def run_reconnection_migrations():
+    """Create reconnection_attempts table for self-service reconnect (idempotent)."""
+    async with async_engine.begin() as conn:
+        result = await conn.execute(sa_text("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_name = 'reconnection_attempts'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                CREATE TABLE reconnection_attempts (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR NOT NULL,
+                    mac_address VARCHAR NOT NULL,
+                    router_id INTEGER NOT NULL REFERENCES routers(id),
+                    customer_id INTEGER REFERENCES customers(id),
+                    success BOOLEAN NOT NULL DEFAULT FALSE,
+                    failure_reason VARCHAR(255),
+                    old_mac_address VARCHAR,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_reconnect_phone ON reconnection_attempts(phone)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_reconnect_mac ON reconnection_attempts(mac_address)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_reconnect_created ON reconnection_attempts(created_at)"
+            ))
+            logger.info("Migration: Created reconnection_attempts table")
+        else:
+            logger.info("Migration: reconnection_attempts table already exists, skipping")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -708,6 +743,12 @@ async def startup_event():
         logger.info("User migrations completed successfully")
     except Exception as e:
         logger.error(f"User migration failed (non-fatal): {e}")
+
+    try:
+        await run_reconnection_migrations()
+        logger.info("Reconnection migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Reconnection migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

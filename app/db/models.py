@@ -678,3 +678,18 @@ class ResellerTransactionCharge(Base):
 
     reseller = relationship("User", foreign_keys=[reseller_id], backref="transaction_charges")
     admin = relationship("User", foreign_keys=[created_by])
+
+
+class ReconnectionAttempt(Base):
+    """Tracks self-service reconnection attempts for rate limiting and audit."""
+    __tablename__ = "reconnection_attempts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    phone = Column(String, nullable=False, index=True)
+    mac_address = Column(String, nullable=False, index=True)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=False)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    success = Column(Boolean, nullable=False, default=False)
+    failure_reason = Column(String(255), nullable=True)
+    old_mac_address = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)

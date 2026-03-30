@@ -1,0 +1,40 @@
+{
+    "info": {
+        "name": "Self-Service Reconnect - Endpoints",
+        "description": "Public endpoint for hotspot users to reconnect after session drop. Supports phone number (M-Pesa users) or voucher code (voucher users).",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"}
+    ],
+    "item": [
+        {
+            "name": "Reconnect by Phone Number",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/public/reconnect",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"phone\": \"0712345678\",\n    \"mac_address\": \"AA:BB:CC:DD:EE:FF\",\n    \"router_id\": 1\n}"
+                }
+            }
+        },
+        {
+            "name": "Reconnect by Voucher Code",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/public/reconnect",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"voucher_code\": \"4839-2910\",\n    \"mac_address\": \"AA:BB:CC:DD:EE:FF\",\n    \"router_id\": 1\n}"
+                }
+            }
+        }
+    ]
+}
