@@ -193,11 +193,11 @@ async def redeem_voucher(
     plan = voucher.plan
     normalized_mac = normalize_mac_address(mac_address)
 
-    # Find or create customer
+    # Find or create customer (scoped to reseller to match unique constraint)
     cust_result = await db.execute(
         select(Customer)
         .options(selectinload(Customer.plan), selectinload(Customer.router))
-        .where(Customer.mac_address == normalized_mac)
+        .where(Customer.mac_address == normalized_mac, Customer.user_id == voucher.user_id)
     )
     customer = cust_result.scalar_one_or_none()
 
