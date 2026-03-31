@@ -23,9 +23,6 @@ import hashlib
 
 logger = logging.getLogger(__name__)
 
-RECONNECT_ATTEMPT_LIMIT_PER_HOUR = 5
-RECONNECT_SUCCESS_LIMIT_PER_DAY = 3
-RECONNECT_COOLDOWN_SECONDS = 120
 
 router = APIRouter(tags=["public"])
 
@@ -887,55 +884,6 @@ def _build_phone_variants(phone: str) -> list[str]:
     return list(variants)
 
 
-async def _check_reconnect_rate_limits(
-    db: AsyncSession, phone_variants: list[str], mac_address: str
-) -> str | None:
-    """Return a rejection reason if rate limits are exceeded, else None."""
-    now = datetime.utcnow()
-    one_hour_ago = now - timedelta(hours=1)
-    one_day_ago = now - timedelta(hours=24)
-    cooldown_cutoff = now - timedelta(seconds=RECONNECT_COOLDOWN_SECONDS)
-
-    # Cooldown: reject if any attempt from this phone in last N seconds
-    cooldown_stmt = select(func.count(ReconnectionAttempt.id)).where(
-        ReconnectionAttempt.phone.in_(phone_variants),
-        ReconnectionAttempt.created_at >= cooldown_cutoff,
-    )
-    cooldown_count = (await db.execute(cooldown_stmt)).scalar() or 0
-    if cooldown_count > 0:
-        return f"Please wait {RECONNECT_COOLDOWN_SECONDS} seconds between reconnection attempts"
-
-    # Hourly attempt limit (any outcome) per phone
-    hourly_phone_stmt = select(func.count(ReconnectionAttempt.id)).where(
-        ReconnectionAttempt.phone.in_(phone_variants),
-        ReconnectionAttempt.created_at >= one_hour_ago,
-    )
-    hourly_phone = (await db.execute(hourly_phone_stmt)).scalar() or 0
-    if hourly_phone >= RECONNECT_ATTEMPT_LIMIT_PER_HOUR:
-        return "Too many reconnection attempts from this phone number. Try again later."
-
-    # Hourly attempt limit per MAC (prevents device-hopping abuse)
-    hourly_mac_stmt = select(func.count(ReconnectionAttempt.id)).where(
-        ReconnectionAttempt.mac_address == mac_address,
-        ReconnectionAttempt.created_at >= one_hour_ago,
-    )
-    hourly_mac = (await db.execute(hourly_mac_stmt)).scalar() or 0
-    if hourly_mac >= RECONNECT_ATTEMPT_LIMIT_PER_HOUR:
-        return "Too many reconnection attempts from this device. Try again later."
-
-    # Daily success limit per phone (prevents sharing with many devices)
-    daily_success_stmt = select(func.count(ReconnectionAttempt.id)).where(
-        ReconnectionAttempt.phone.in_(phone_variants),
-        ReconnectionAttempt.success == True,
-        ReconnectionAttempt.created_at >= one_day_ago,
-    )
-    daily_success = (await db.execute(daily_success_stmt)).scalar() or 0
-    if daily_success >= RECONNECT_SUCCESS_LIMIT_PER_DAY:
-        return "Daily reconnection limit reached. Contact support if you need help."
-
-    return None
-
-
 def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
     """Remove hotspot user, binding, queue, and DHCP lease for the old MAC."""
     normalized = normalize_mac_address(old_mac)
@@ -1016,23 +964,7 @@ async def reconnect_self_service(
     now = datetime.utcnow()
 
     # Voucher code takes priority when both are provided
-    if voucher_code:
-        lookup_key = voucher_code
-        rate_limit_keys = [voucher_code]
-    else:
-        lookup_key = phone_raw
-        rate_limit_keys = _build_phone_variants(phone_raw)
-
-    rate_limit_reason = await _check_reconnect_rate_limits(db, rate_limit_keys, normalized_mac)
-    if rate_limit_reason:
-        db.add(ReconnectionAttempt(
-            phone=lookup_key, mac_address=normalized_mac,
-            router_id=request.router_id, success=False,
-            failure_reason="rate_limited",
-            created_at=datetime.utcnow(),
-        ))
-        await db.commit()
-        raise HTTPException(status_code=429, detail=rate_limit_reason)
+    lookup_key = voucher_code if voucher_code else phone_raw
 
     # --- Find the active customer ---
     customer = None
@@ -1103,11 +1035,12 @@ async def reconnect_self_service(
         if len(phone_raw) < 9:
             raise HTTPException(status_code=400, detail="Please enter a valid phone number")
 
+        phone_variants = _build_phone_variants(phone_raw)
         customer_stmt = (
             select(Customer)
             .options(selectinload(Customer.plan), selectinload(Customer.router))
             .where(
-                Customer.phone.in_(rate_limit_keys),
+                Customer.phone.in_(phone_variants),
                 Customer.router_id == request.router_id,
                 Customer.status == CustomerStatus.ACTIVE,
                 Customer.expiry.isnot(None),
