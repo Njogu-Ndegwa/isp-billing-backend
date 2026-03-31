@@ -14,6 +14,7 @@ from app.db.models import (
     Subscription, CustomerRating, UserBandwidthUsage,
     MpesaTransaction, ProvisioningLog, BandwidthSnapshot,
     RouterLogEntry, RouterAvailabilityCheck,
+    ResellerPaymentMethod, ResellerPaymentMethodType,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
@@ -73,6 +74,31 @@ async def _mpesa_revenue(db: AsyncSession, reseller_id: int) -> float:
         CustomerPayment.reseller_id == reseller_id, MPESA_FILTER
     )
     return float((await db.execute(stmt)).scalar())
+
+
+def _serialize_payment_method_for_admin(pm: ResellerPaymentMethod) -> dict:
+    """Return payment-destination info visible to the admin (no API secrets)."""
+    mt = pm.method_type
+    method_type_value = mt if isinstance(mt, str) else mt.value
+
+    result = {
+        "id": pm.id,
+        "method_type": method_type_value,
+        "label": pm.label,
+        "is_active": pm.is_active,
+    }
+
+    if method_type_value == ResellerPaymentMethodType.BANK_ACCOUNT.value:
+        result["bank_paybill_number"] = pm.bank_paybill_number
+        result["bank_account_number"] = pm.bank_account_number
+    elif method_type_value == ResellerPaymentMethodType.MPESA_PAYBILL.value:
+        result["mpesa_paybill_number"] = pm.mpesa_paybill_number
+    elif method_type_value == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS.value:
+        result["mpesa_shortcode"] = pm.mpesa_shortcode
+    elif method_type_value == ResellerPaymentMethodType.ZENOPAY.value:
+        result["zenopay_account_id"] = pm.zenopay_account_id
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +214,13 @@ async def list_resellers(
             select(func.count(Router.id)).where(Router.user_id == r.id)
         )).scalar() or 0
 
+        payment_method_count = (await db.execute(
+            select(func.count(ResellerPaymentMethod.id)).where(
+                ResellerPaymentMethod.user_id == r.id,
+                ResellerPaymentMethod.is_active == True,
+            )
+        )).scalar() or 0
+
         # Revenue in the requested period (all methods)
         rev_filters = [CustomerPayment.reseller_id == r.id] + date_filters
         total_revenue = float((await db.execute(
@@ -222,6 +255,7 @@ async def list_resellers(
             "router_count": router_count,
             "unpaid_balance": unpaid,
             "total_transaction_charges": charges,
+            "payment_methods_count": payment_method_count,
         }
 
         # Apply post-query filters that depend on computed values
@@ -401,6 +435,17 @@ async def get_reseller_detail(
         for c in (await db.execute(recent_charges_stmt)).scalars().all()
     ]
 
+    # Payment methods registered by this reseller
+    pm_stmt = (
+        select(ResellerPaymentMethod)
+        .where(ResellerPaymentMethod.user_id == reseller_id)
+        .order_by(ResellerPaymentMethod.is_active.desc(), ResellerPaymentMethod.id)
+    )
+    payment_methods = [
+        _serialize_payment_method_for_admin(pm)
+        for pm in (await db.execute(pm_stmt)).scalars().all()
+    ]
+
     return {
         "id": r.id,
         "email": r.email,
@@ -426,6 +471,7 @@ async def get_reseller_detail(
             "unpaid_balance": round(all_time_mpesa - total_paid - total_charges, 2),
         },
         "recent_transaction_charges": recent_charges,
+        "payment_methods": payment_methods,
     }
 
 
