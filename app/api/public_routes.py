@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func
 from sqlalchemy.orm import selectinload
@@ -935,6 +935,7 @@ def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
 @router.post("/api/public/reconnect")
 async def reconnect_self_service(
     request: ReconnectRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1168,46 +1169,55 @@ async def reconnect_self_service(
         comment=f"Self-service reconnect for {customer.name} ({lookup_key})",
     )
 
-    provision_result = await provision_hotspot_customer(
-        customer_id=customer.id,
-        router_id=router_obj.id,
-        hotspot_payload=hotspot_payload,
-        action="self_service_reconnect",
-    )
+    # Capture values before the DB session closes
+    customer_id = customer.id
+    customer_name = customer.name
+    plan_name = customer.plan.name
+    expiry_iso = customer.expiry.isoformat()
+    router_id_val = router_obj.id
+    router_name = router_obj.name
 
-    reconnect_success = provision_result.get("success", False)
+    # Log the attempt and commit all DB changes (MAC update etc.) immediately
     db.add(ReconnectionAttempt(
         phone=lookup_key, mac_address=normalized_mac,
-        router_id=request.router_id, customer_id=customer.id,
-        success=reconnect_success,
+        router_id=request.router_id, customer_id=customer_id,
+        success=True,
         old_mac_address=old_mac if (mac_changed or mac_is_new) else None,
-        failure_reason=provision_result.get("provisioning_error") if not reconnect_success else None,
         created_at=datetime.utcnow(),
     ))
     await db.commit()
 
-    if not reconnect_success:
-        logger.error(
-            "[RECONNECT] Provisioning failed for customer %s: %s",
-            customer.id, provision_result.get("provisioning_error"),
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="Reconnection failed due to a network issue. Please try again in a moment.",
-        )
+    # Fire provisioning in background — respond to user instantly
+    async def _background_provision():
+        try:
+            result = await provision_hotspot_customer(
+                customer_id=customer_id,
+                router_id=router_id_val,
+                hotspot_payload=hotspot_payload,
+                action="self_service_reconnect",
+            )
+            if result.get("success"):
+                logger.info(
+                    "[RECONNECT] Customer %s (%s) provisioned on router %s",
+                    customer_id, customer_name, router_name,
+                )
+            else:
+                logger.error(
+                    "[RECONNECT] Background provisioning failed for customer %s: %s",
+                    customer_id, result.get("provisioning_error"),
+                )
+        except Exception as exc:
+            logger.error("[RECONNECT] Background provisioning error for customer %s: %s", customer_id, exc)
+
+    background_tasks.add_task(_background_provision)
 
     remaining = customer.expiry - now
-    logger.info(
-        "[RECONNECT] Customer %s (%s) reconnected successfully on router %s",
-        customer.id, customer.name, router_obj.name,
-    )
-
     return {
         "success": True,
         "message": "You're back online! Your session has been restored.",
-        "customer_name": customer.name,
-        "plan_name": customer.plan.name,
-        "expires_at": customer.expiry.isoformat(),
+        "customer_name": customer_name,
+        "plan_name": plan_name,
+        "expires_at": expiry_iso,
         "remaining_hours": round(remaining.total_seconds() / 3600, 1),
         "mac_changed": mac_changed,
     }
