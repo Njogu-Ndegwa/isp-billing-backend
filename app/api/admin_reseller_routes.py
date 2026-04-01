@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text, delete, update
+from sqlalchemy import select, func, text, delete, update, case
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 from app.db.database import get_db
 from app.db.models import (
@@ -291,6 +291,154 @@ async def list_resellers(
         "total": len(items),
         "filters_applied": {"sort_by": sort_by, "sort_order": sort_order, "filter": filter, "search": search},
         "resellers": items,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 1b. GET /api/admin/resellers/stats -- Reseller Stats Over Time
+# ---------------------------------------------------------------------------
+@router.get("/api/admin/resellers/stats")
+async def reseller_stats(
+    period: str = Query("30d", regex="^(7d|30d|90d|1y|all)$"),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Aggregate reseller statistics over time: revenue, M-Pesa revenue,
+    and new reseller sign-ups, bucketed by the requested period.
+    """
+    await _require_admin(token, db)
+
+    now = datetime.utcnow()
+    today = now.date()
+
+    if period == "7d":
+        start = today - timedelta(days=6)
+        trunc_unit = "day"
+    elif period == "30d":
+        start = today - timedelta(days=29)
+        trunc_unit = "day"
+    elif period == "90d":
+        start = today - timedelta(days=89)
+        trunc_unit = "week"
+    elif period == "1y":
+        m = today.month - 11
+        y = today.year
+        if m <= 0:
+            m += 12
+            y -= 1
+        start = date(y, m, 1)
+        trunc_unit = "month"
+    else:
+        earliest_user = (await db.execute(
+            select(func.min(User.created_at)).where(User.role == UserRole.RESELLER)
+        )).scalar()
+        earliest_payment = (await db.execute(
+            select(func.min(CustomerPayment.created_at))
+        )).scalar()
+        candidates = [d for d in [earliest_user, earliest_payment] if d]
+        start = min(candidates).date() if candidates else today
+        start = start.replace(day=1)
+        trunc_unit = "month"
+
+    start_dt = datetime(start.year, start.month, start.day)
+
+    def _make_buckets(trunc, s, end):
+        out = []
+        if trunc == "day":
+            cur = s
+            while cur <= end:
+                out.append(cur)
+                cur += timedelta(days=1)
+        elif trunc == "week":
+            cur = s - timedelta(days=s.weekday())
+            while cur <= end:
+                out.append(cur)
+                cur += timedelta(days=7)
+        else:
+            cy, cm = s.year, s.month
+            ey, em = end.year, end.month
+            while (cy, cm) <= (ey, em):
+                out.append(date(cy, cm, 1))
+                cm += 1
+                if cm > 12:
+                    cm = 1
+                    cy += 1
+        return out
+
+    def _label(d, trunc):
+        if trunc == "month":
+            return d.strftime("%b %Y")
+        return f"{d.day} {d.strftime('%b')}"
+
+    buckets = _make_buckets(trunc_unit, start, today)
+
+    rev_stmt = (
+        select(
+            func.date_trunc(trunc_unit, CustomerPayment.created_at).label("bucket"),
+            func.coalesce(func.sum(CustomerPayment.amount), 0).label("revenue"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY,
+                         CustomerPayment.amount),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("mpesa_revenue"),
+        )
+        .where(CustomerPayment.created_at >= start_dt)
+        .group_by(text("1"))
+        .order_by(text("1"))
+    )
+    rev_rows = (await db.execute(rev_stmt)).all()
+    rev_map = {r.bucket.date(): (float(r.revenue), float(r.mpesa_revenue)) for r in rev_rows}
+
+    signup_stmt = (
+        select(
+            func.date_trunc(trunc_unit, User.created_at).label("bucket"),
+            func.count(User.id).label("cnt"),
+        )
+        .where(User.role == UserRole.RESELLER, User.created_at >= start_dt)
+        .group_by(text("1"))
+        .order_by(text("1"))
+    )
+    signup_rows = (await db.execute(signup_stmt)).all()
+    signup_map = {r.bucket.date(): int(r.cnt) for r in signup_rows}
+
+    revenue_over_time = []
+    signups_over_time = []
+    total_revenue = 0
+    total_mpesa = 0
+    total_signups = 0
+
+    for b in buckets:
+        rev, mpesa = rev_map.get(b, (0, 0))
+        cnt = signup_map.get(b, 0)
+        total_revenue += rev
+        total_mpesa += mpesa
+        total_signups += cnt
+
+        lbl = _label(b, trunc_unit)
+        ds = b.isoformat()
+        revenue_over_time.append({
+            "date": ds, "label": lbl,
+            "revenue": int(round(rev)), "mpesa_revenue": int(round(mpesa)),
+        })
+        signups_over_time.append({
+            "date": ds, "label": lbl, "count": cnt,
+        })
+
+    return {
+        "period": period,
+        "revenue_over_time": revenue_over_time,
+        "signups_over_time": signups_over_time,
+        "totals": {
+            "revenue": int(round(total_revenue)),
+            "mpesa_revenue": int(round(total_mpesa)),
+            "new_resellers": total_signups,
+        },
     }
 
 
