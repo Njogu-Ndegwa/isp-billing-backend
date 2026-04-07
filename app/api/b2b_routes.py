@@ -23,6 +23,7 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user
 from app.services.mpesa_b2b import (
     get_b2b_fee,
+    get_kadogo_surcharge,
     get_unpaid_balance,
     payout_reseller,
     process_b2b_result,
@@ -166,7 +167,7 @@ async def b2b_fee_preview(
         raise HTTPException(status_code=404, detail="Reseller not found")
 
     balance = await get_unpaid_balance(db, reseller_id)
-    tier_gap = False
+    kadogo = 0
 
     if balance > 0:
         fee = get_b2b_fee(balance)
@@ -176,25 +177,25 @@ async def b2b_fee_preview(
             fee = actual_fee
             net = int(balance - fee)
             if get_b2b_fee(net) != fee:
-                tier_gap = True
-                fee = 0
-                net = 0
+                fee = get_b2b_fee(balance)
+
+        if balance <= 100:
+            kadogo = get_kadogo_surcharge(balance - fee)
+            fee += kadogo
+
+        net = int(balance - fee)
     else:
         fee = 0
         net = 0
 
-    result = {
+    return {
         "reseller_id": reseller_id,
         "unpaid_balance": balance,
-        "safaricom_fee": fee,
+        "safaricom_fee": fee - kadogo,
+        "kadogo_surcharge": kadogo,
+        "total_fee": fee,
         "net_payout": net,
     }
-    if tier_gap:
-        result["note"] = (
-            "Balance falls in a fee tier gap — payout will proceed "
-            "on the next cycle when more revenue accumulates"
-        )
-    return result
 
 
 # ---------------------------------------------------------------------------

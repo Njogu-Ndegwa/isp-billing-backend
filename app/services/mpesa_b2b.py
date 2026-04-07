@@ -63,12 +63,11 @@ BUSINESS_BOUQUET_TARIFF = [
     (70_001, 250_000, 108),
 ]
 
-# Kadogo surcharge after 3rd B2B transaction in a calendar month for sub-100 amounts
+# Kadogo surcharge on sub-100 B2B amounts
 KADOGO_TIERS = [
     (1,  49,  1),
     (50, 100, 2),
 ]
-KADOGO_FREE_TRANSACTIONS = 3
 
 
 def get_b2b_fee(amount: float) -> int:
@@ -82,10 +81,8 @@ def get_b2b_fee(amount: float) -> int:
     return 0
 
 
-def get_kadogo_surcharge(amount: float, monthly_tx_count: int) -> int:
-    """Return the Kadogo surcharge (applies after 3rd sub-KES-100 tx in the month)."""
-    if monthly_tx_count < KADOGO_FREE_TRANSACTIONS:
-        return 0
+def get_kadogo_surcharge(amount: float) -> int:
+    """Return the Kadogo surcharge for sub-KES-100 amounts."""
     amt = int(amount)
     for low, high, surcharge in KADOGO_TIERS:
         if low <= amt <= high:
@@ -468,10 +465,8 @@ async def payout_reseller(
     if balance is None:
         balance = await get_unpaid_balance(db, reseller_id)
 
-    if balance < settings.MPESA_B2B_MIN_PAYOUT:
-        raise ValueError(
-            f"Balance KES {balance} is below minimum payout of KES {settings.MPESA_B2B_MIN_PAYOUT}"
-        )
+    if balance < 1:
+        raise ValueError("Balance must be at least KES 1")
 
     method_type = payment_method.method_type
     if isinstance(method_type, str):
@@ -502,10 +497,10 @@ async def payout_reseller(
         fee = actual_fee
         net = int(balance - fee)
         if get_b2b_fee(net) != fee:
-            raise ValueError(
-                f"Balance KES {balance} falls in a fee tier gap — "
-                f"payout will proceed on the next cycle when more revenue accumulates"
-            )
+            fee = get_b2b_fee(balance)
+
+    if balance <= 100:
+        fee += get_kadogo_surcharge(balance - fee)
 
     txn = await initiate_b2b_payment(
         db=db,
@@ -547,7 +542,7 @@ async def run_daily_payouts():
         for reseller in resellers:
             try:
                 balance = await get_unpaid_balance(db, reseller.id)
-                if balance < settings.MPESA_B2B_MIN_PAYOUT:
+                if balance < 1:
                     skip_count += 1
                     continue
 
