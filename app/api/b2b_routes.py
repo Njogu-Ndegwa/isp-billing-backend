@@ -28,6 +28,7 @@ from app.services.mpesa_b2b import (
     payout_reseller,
     process_b2b_result,
     process_b2b_timeout,
+    resolve_b2b_payment_method,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,33 +103,12 @@ async def trigger_b2b_payout(
         if not pm or pm.user_id != reseller_id:
             raise HTTPException(status_code=404, detail="Payment method not found for this reseller")
     else:
-        pm_stmt = (
-            select(ResellerPaymentMethod)
-            .where(
-                ResellerPaymentMethod.user_id == reseller_id,
-                ResellerPaymentMethod.is_active == True,
-                ResellerPaymentMethod.method_type.in_([
-                    ResellerPaymentMethodType.BANK_ACCOUNT,
-                    ResellerPaymentMethodType.MPESA_PAYBILL,
-                ]),
-            )
-            .limit(1)
-        )
-        pm = (await db.execute(pm_stmt)).scalar_one_or_none()
+        pm = await resolve_b2b_payment_method(db, reseller_id)
 
     if not pm:
         raise HTTPException(
             status_code=400,
             detail="No eligible payment method (bank_account or mpesa_paybill) found for this reseller",
-        )
-
-    method_type = pm.method_type
-    if isinstance(method_type, str):
-        method_type = ResellerPaymentMethodType(method_type)
-    if method_type not in (ResellerPaymentMethodType.BANK_ACCOUNT, ResellerPaymentMethodType.MPESA_PAYBILL):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Payment method type '{method_type.value}' is not eligible for B2B payout",
         )
 
     try:

@@ -449,6 +449,51 @@ async def _monthly_b2b_count(db: AsyncSession, reseller_id: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Payment method resolution
+# ---------------------------------------------------------------------------
+
+B2B_ELIGIBLE_TYPES = [
+    ResellerPaymentMethodType.BANK_ACCOUNT,
+    ResellerPaymentMethodType.MPESA_PAYBILL,
+]
+
+
+async def resolve_b2b_payment_method(
+    db: AsyncSession, reseller_id: int
+) -> Optional[ResellerPaymentMethod]:
+    """
+    Find the best B2B-eligible payment method for a reseller.
+    1. First active bank_account or mpesa_paybill method
+    2. Fallback: if exactly one B2B-eligible method exists (even inactive), use it
+    """
+    active_stmt = (
+        select(ResellerPaymentMethod)
+        .where(
+            ResellerPaymentMethod.user_id == reseller_id,
+            ResellerPaymentMethod.is_active == True,
+            ResellerPaymentMethod.method_type.in_(B2B_ELIGIBLE_TYPES),
+        )
+        .limit(1)
+    )
+    pm = (await db.execute(active_stmt)).scalar_one_or_none()
+    if pm:
+        return pm
+
+    all_stmt = (
+        select(ResellerPaymentMethod)
+        .where(
+            ResellerPaymentMethod.user_id == reseller_id,
+            ResellerPaymentMethod.method_type.in_(B2B_ELIGIBLE_TYPES),
+        )
+    )
+    all_methods = (await db.execute(all_stmt)).scalars().all()
+    if len(all_methods) == 1:
+        return all_methods[0]
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Single-reseller payout (used by both manual trigger and daily job)
 # ---------------------------------------------------------------------------
 
@@ -562,19 +607,7 @@ async def run_daily_payouts():
                     skip_count += 1
                     continue
 
-                pm_stmt = (
-                    select(ResellerPaymentMethod)
-                    .where(
-                        ResellerPaymentMethod.user_id == reseller.id,
-                        ResellerPaymentMethod.is_active == True,
-                        ResellerPaymentMethod.method_type.in_([
-                            ResellerPaymentMethodType.BANK_ACCOUNT,
-                            ResellerPaymentMethodType.MPESA_PAYBILL,
-                        ]),
-                    )
-                    .limit(1)
-                )
-                pm = (await db.execute(pm_stmt)).scalar_one_or_none()
+                pm = await resolve_b2b_payment_method(db, reseller.id)
                 if not pm:
                     skip_count += 1
                     continue
