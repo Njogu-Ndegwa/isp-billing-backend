@@ -15,6 +15,7 @@ from app.db.models import (
     MpesaTransaction, ProvisioningLog, BandwidthSnapshot,
     RouterLogEntry, RouterAvailabilityCheck,
     ResellerPaymentMethod, ResellerPaymentMethodType,
+    B2BTransaction, B2BTransactionStatus,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
@@ -594,6 +595,55 @@ async def get_reseller_detail(
         for pm in (await db.execute(pm_stmt)).scalars().all()
     ]
 
+    # B2B payout summary and recent transactions
+    b2b_total_sent = float((await db.execute(
+        select(func.coalesce(func.sum(B2BTransaction.net_amount), 0)).where(
+            B2BTransaction.reseller_id == reseller_id,
+            B2BTransaction.status == B2BTransactionStatus.COMPLETED,
+        )
+    )).scalar())
+
+    b2b_total_fees = float((await db.execute(
+        select(func.coalesce(func.sum(B2BTransaction.fee), 0)).where(
+            B2BTransaction.reseller_id == reseller_id,
+            B2BTransaction.status == B2BTransactionStatus.COMPLETED,
+        )
+    )).scalar())
+
+    b2b_count = (await db.execute(
+        select(func.count(B2BTransaction.id)).where(
+            B2BTransaction.reseller_id == reseller_id,
+        )
+    )).scalar() or 0
+
+    last_b2b_stmt = select(func.max(B2BTransaction.completed_at)).where(
+        B2BTransaction.reseller_id == reseller_id,
+        B2BTransaction.status == B2BTransactionStatus.COMPLETED,
+    )
+    last_b2b_date = (await db.execute(last_b2b_stmt)).scalar()
+
+    recent_b2b_stmt = (
+        select(B2BTransaction)
+        .where(B2BTransaction.reseller_id == reseller_id)
+        .order_by(B2BTransaction.created_at.desc())
+        .limit(5)
+    )
+    recent_b2b = [
+        {
+            "id": t.id,
+            "amount": t.amount,
+            "fee": t.fee,
+            "net_amount": t.net_amount,
+            "party_b": t.party_b,
+            "account_reference": t.account_reference,
+            "status": t.status.value if hasattr(t.status, "value") else t.status,
+            "transaction_id": t.transaction_id,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+        }
+        for t in (await db.execute(recent_b2b_stmt)).scalars().all()
+    ]
+
     return {
         "id": r.id,
         "email": r.email,
@@ -618,6 +668,13 @@ async def get_reseller_detail(
             "last_payout_date": last_payout_date.isoformat() if last_payout_date else None,
             "unpaid_balance": round(all_time_mpesa - total_paid - total_charges, 2),
         },
+        "b2b_payouts": {
+            "total_sent": round(b2b_total_sent, 2),
+            "total_fees": round(b2b_total_fees, 2),
+            "transaction_count": b2b_count,
+            "last_payout_date": last_b2b_date.isoformat() if last_b2b_date else None,
+        },
+        "recent_b2b_transactions": recent_b2b,
         "recent_transaction_charges": recent_charges,
         "payment_methods": payment_methods,
     }
@@ -1026,6 +1083,25 @@ async def admin_dashboard(
 
     total_unpaid = round(all_time_mpesa_revenue - total_payouts - total_charges, 2)
 
+    # B2B payout totals
+    b2b_total_sent = float((await db.execute(
+        select(func.coalesce(func.sum(B2BTransaction.net_amount), 0)).where(
+            B2BTransaction.status == B2BTransactionStatus.COMPLETED,
+        )
+    )).scalar())
+
+    b2b_total_fees = float((await db.execute(
+        select(func.coalesce(func.sum(B2BTransaction.fee), 0)).where(
+            B2BTransaction.status == B2BTransactionStatus.COMPLETED,
+        )
+    )).scalar())
+
+    b2b_pending_count = (await db.execute(
+        select(func.count(B2BTransaction.id)).where(
+            B2BTransaction.status == B2BTransactionStatus.PENDING,
+        )
+    )).scalar() or 0
+
     # Recent 10 reseller sign-ups
     recent_stmt = (
         select(User)
@@ -1079,6 +1155,11 @@ async def admin_dashboard(
             "total_paid": total_payouts,
             "total_transaction_charges": total_charges,
             "total_unpaid": total_unpaid,
+        },
+        "b2b_payouts": {
+            "total_sent": round(b2b_total_sent, 2),
+            "total_fees": round(b2b_total_fees, 2),
+            "pending_count": b2b_pending_count,
         },
         "recent_signups": recent_signups,
         "generated_at": now.isoformat(),
@@ -1270,6 +1351,9 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
     transaction_charges = (await db.execute(
         select(func.count(ResellerTransactionCharge.id)).where(ResellerTransactionCharge.reseller_id == reseller_id)
     )).scalar() or 0
+    b2b_transactions = (await db.execute(
+        select(func.count(B2BTransaction.id)).where(B2BTransaction.reseller_id == reseller_id)
+    )).scalar() or 0
 
     payments = await _count(Payment, Payment.customer_id, customer_ids_stmt)
     mpesa_transactions = await _count(MpesaTransaction, MpesaTransaction.customer_id, customer_ids_stmt)
@@ -1306,6 +1390,7 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         "availability_checks": availability_checks,
         "reseller_payouts": payouts,
         "reseller_transaction_charges": transaction_charges,
+        "b2b_transactions": b2b_transactions,
         "wireguard_peers": wg_tokens,
     }
 
@@ -1431,10 +1516,13 @@ async def delete_reseller(
     # 19. Reseller financials
     await db.execute(delete(ResellerFinancials).where(ResellerFinancials.user_id == reseller_id))
 
-    # 20. Reseller payouts
+    # 20. B2B transactions (must precede payouts/charges due to FK)
+    await db.execute(delete(B2BTransaction).where(B2BTransaction.reseller_id == reseller_id))
+
+    # 21. Reseller payouts
     await db.execute(delete(ResellerPayout).where(ResellerPayout.reseller_id == reseller_id))
 
-    # 20b. Reseller transaction charges
+    # 21b. Reseller transaction charges
     await db.execute(delete(ResellerTransactionCharge).where(ResellerTransactionCharge.reseller_id == reseller_id))
 
     # 21. Subscriptions

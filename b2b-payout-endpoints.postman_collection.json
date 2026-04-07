@@ -1,0 +1,101 @@
+{
+    "info": {
+        "name": "B2B Payout Endpoints",
+        "description": "M-Pesa B2B automated and manual payout endpoints for reseller payouts.",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        { "key": "baseUrl", "value": "http://localhost:8000" },
+        { "key": "token", "value": "your-jwt-token-here" },
+        { "key": "resellerId", "value": "1" }
+    ],
+    "item": [
+        {
+            "name": "Manual B2B Payout (Admin)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/admin/resellers/{{resellerId}}/b2b-payout",
+                "header": [
+                    { "key": "Content-Type", "value": "application/json" },
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"payment_method_id\": null\n}"
+                }
+            }
+        },
+        {
+            "name": "B2B Fee Preview (Admin)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/resellers/{{resellerId}}/b2b-fee-preview",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "List All B2B Transactions (Admin)",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/b2b-transactions?page=1&per_page=50",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "b2b-transactions"],
+                    "query": [
+                        { "key": "page", "value": "1" },
+                        { "key": "per_page", "value": "50" },
+                        { "key": "status", "value": "", "disabled": true },
+                        { "key": "reseller_id", "value": "", "disabled": true },
+                        { "key": "start_date", "value": "", "disabled": true },
+                        { "key": "end_date", "value": "", "disabled": true }
+                    ]
+                },
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "List Reseller B2B Transactions (Admin)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/resellers/{{resellerId}}/b2b-transactions?page=1&per_page=50",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "B2B Result Callback (Safaricom)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/mpesa/b2b/result",
+                "header": [
+                    { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"Result\": {\n        \"ResultType\": 0,\n        \"ResultCode\": 0,\n        \"ResultDesc\": \"The service request is processed successfully.\",\n        \"OriginatorConversationID\": \"test-originator-id\",\n        \"ConversationID\": \"test-conversation-id\",\n        \"TransactionID\": \"TEST1234ABC\",\n        \"ResultParameters\": {\n            \"ResultParameter\": [\n                { \"Key\": \"DebitAccountBalance\", \"Value\": \"Working Account|KES|500000.00\" },\n                { \"Key\": \"Amount\", \"Value\": 9952 },\n                { \"Key\": \"DebitPartyAffectedAccountBalance\", \"Value\": \"Working Account|KES|490048.00\" },\n                { \"Key\": \"TransCompletedTime\", \"Value\": \"20260402235900\" },\n                { \"Key\": \"DebitPartyCharges\", \"Value\": \"Fee|KES|48.00\" },\n                { \"Key\": \"ReceiverPartyPublicName\", \"Value\": \"247247 - Equity Bank\" },\n                { \"Key\": \"Currency\", \"Value\": \"KES\" },\n                { \"Key\": \"InitiatorAccountCurrentBalance\", \"Value\": \"Working Account|KES|490048.00\" }\n            ]\n        }\n    }\n}"
+                },
+                "description": "Simulates a successful B2B result callback from Safaricom. Use this for testing."
+            }
+        },
+        {
+            "name": "B2B Timeout Callback (Safaricom)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/mpesa/b2b/timeout",
+                "header": [
+                    { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"Result\": {\n        \"ResultType\": 0,\n        \"ResultCode\": 100,\n        \"ResultDesc\": \"The transaction timed out.\",\n        \"OriginatorConversationID\": \"test-originator-id\",\n        \"ConversationID\": \"test-conversation-id\",\n        \"TransactionID\": \"\"\n    }\n}"
+                },
+                "description": "Simulates a B2B timeout callback from Safaricom."
+            }
+        }
+    ]
+}

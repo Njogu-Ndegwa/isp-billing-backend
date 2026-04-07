@@ -26,6 +26,15 @@ class Settings(BaseSettings):
     MPESA_CALLBACK_URL: str
     MPESA_ENVIRONMENT: str
 
+    # M-Pesa B2B (Business-to-Business) Payouts
+    MPESA_B2B_INITIATOR_NAME: str = ""
+    MPESA_B2B_INITIATOR_PASSWORD: str = ""
+    MPESA_B2B_SECURITY_CREDENTIAL: str = ""
+    MPESA_B2B_RESULT_URL: str = ""
+    MPESA_B2B_TIMEOUT_URL: str = ""
+    MPESA_B2B_MIN_PAYOUT: float = 100.0
+    MPESA_B2B_DAILY_PAYOUT_ENABLED: bool = False
+
     # Router Auto-Provisioning
     SERVER_PUBLIC_IP: str = ""
     WG_MANAGER_URL: str = "http://host.docker.internal:8729"

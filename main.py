@@ -5,6 +5,7 @@ from app.db.database import get_db, async_engine
 from app.services.plan_cache import warm_plan_cache
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +46,7 @@ from app.api.payment_method_routes import router as payment_method_router
 from app.api.zenopay_routes import router as zenopay_router
 from app.api.admin_reseller_routes import router as admin_reseller_router
 from app.api.profile_routes import router as profile_router
+from app.api.b2b_routes import router as b2b_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -69,6 +71,7 @@ app.include_router(payment_method_router)
 app.include_router(zenopay_router)
 app.include_router(admin_reseller_router)
 app.include_router(profile_router)
+app.include_router(b2b_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -82,6 +85,7 @@ from app.services.mikrotik_background import (
 )
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
+from app.services.mpesa_b2b import run_daily_payouts
 
 scheduler = AsyncIOScheduler()
 
@@ -718,6 +722,38 @@ async def run_reconnection_migrations():
             logger.info("Migration: reconnection_attempts table already exists, skipping")
 
 
+# ============================================================================
+# B2B Payout Migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_b2b_migrations():
+    """Create tables and enums needed for B2B reseller payouts."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE b2btransactionstatus AS ENUM "
+            "('pending', 'completed', 'failed', 'timeout'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; "
+            "END $$"
+        ))
+        from app.db.models import B2BTransaction
+        await conn.run_sync(
+            lambda c: B2BTransaction.__table__.create(c, checkfirst=True)
+        )
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_b2b_reseller_id "
+            "ON b2b_transactions(reseller_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_b2b_created_at "
+            "ON b2b_transactions(created_at)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_b2b_conversation_id "
+            "ON b2b_transactions(conversation_id) WHERE conversation_id IS NOT NULL"
+        ))
+        logger.info("Migration: Ensured b2b_transactions table and indexes exist")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -749,6 +785,12 @@ async def startup_event():
         logger.info("Reconnection migrations completed successfully")
     except Exception as e:
         logger.error(f"Reconnection migration failed (non-fatal): {e}")
+
+    try:
+        await run_b2b_migrations()
+        logger.info("B2B payout migrations completed successfully")
+    except Exception as e:
+        logger.error(f"B2B migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,
@@ -782,6 +824,20 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
+    from app.config import settings as app_settings
+    if app_settings.MPESA_B2B_DAILY_PAYOUT_ENABLED:
+        scheduler.add_job(
+            run_daily_payouts,
+            trigger=CronTrigger(hour=23, minute=59),
+            id='daily_b2b_payouts',
+            name='Daily B2B reseller payouts',
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info("B2B daily payout job scheduled at 23:59")
+    else:
+        logger.info("B2B daily payouts disabled (MPESA_B2B_DAILY_PAYOUT_ENABLED=False)")
+
     scheduler.start()
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "

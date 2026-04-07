@@ -680,6 +680,48 @@ class ResellerTransactionCharge(Base):
     admin = relationship("User", foreign_keys=[created_by])
 
 
+class B2BTransactionStatus(str, enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+
+
+class B2BTransaction(Base):
+    """Tracks M-Pesa B2B payout API calls to resellers."""
+    __tablename__ = "b2b_transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    conversation_id = Column(String(255), unique=True, nullable=True, index=True)
+    originator_conversation_id = Column(String(255), nullable=True)
+    amount = Column(Float, nullable=False)
+    fee = Column(Float, nullable=False, default=0)
+    net_amount = Column(Float, nullable=False)
+    party_a = Column(String(20), nullable=False)
+    party_b = Column(String(20), nullable=False)
+    account_reference = Column(String(255), nullable=True)
+    command_id = Column(String(50), nullable=False, default="BusinessPayBill")
+    remarks = Column(String(255), nullable=True)
+    status = Column(
+        Enum(B2BTransactionStatus, name="b2btransactionstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=B2BTransactionStatus.PENDING,
+    )
+    result_code = Column(String(50), nullable=True)
+    result_desc = Column(String(500), nullable=True)
+    transaction_id = Column(String(255), nullable=True)
+    payout_id = Column(Integer, ForeignKey("reseller_payouts.id"), nullable=True)
+    charge_id = Column(Integer, ForeignKey("reseller_transaction_charges.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    reseller = relationship("User", backref="b2b_transactions")
+    payout = relationship("ResellerPayout")
+    charge = relationship("ResellerTransactionCharge")
+
+
 class ReconnectionAttempt(Base):
     """Tracks self-service reconnection attempts for rate limiting and audit."""
     __tablename__ = "reconnection_attempts"
