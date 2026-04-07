@@ -739,6 +739,32 @@ async def run_b2b_migrations():
         await conn.run_sync(
             lambda c: B2BTransaction.__table__.create(c, checkfirst=True)
         )
+
+        # Add any columns missing from an earlier version of the table
+        _b2b_columns = [
+            ("conversation_id", "VARCHAR(255)"),
+            ("originator_conversation_id", "VARCHAR(255)"),
+            ("amount", "FLOAT NOT NULL DEFAULT 0"),
+            ("fee", "FLOAT NOT NULL DEFAULT 0"),
+            ("net_amount", "FLOAT NOT NULL DEFAULT 0"),
+            ("party_a", "VARCHAR(20) NOT NULL DEFAULT ''"),
+            ("party_b", "VARCHAR(20) NOT NULL DEFAULT ''"),
+            ("account_reference", "VARCHAR(255)"),
+            ("command_id", "VARCHAR(50) NOT NULL DEFAULT 'BusinessPayBill'"),
+            ("remarks", "VARCHAR(255)"),
+            ("result_code", "VARCHAR(50)"),
+            ("result_desc", "VARCHAR(500)"),
+            ("transaction_id", "VARCHAR(255)"),
+            ("payout_id", "INTEGER"),
+            ("charge_id", "INTEGER"),
+            ("completed_at", "TIMESTAMP"),
+        ]
+        for col_name, col_type in _b2b_columns:
+            await conn.execute(sa_text(
+                f"ALTER TABLE b2b_transactions ADD COLUMN IF NOT EXISTS "
+                f"{col_name} {col_type}"
+            ))
+
         await conn.execute(sa_text(
             "CREATE INDEX IF NOT EXISTS idx_b2b_reseller_id "
             "ON b2b_transactions(reseller_id)"
