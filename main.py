@@ -785,179 +785,177 @@ async def run_b2b_migrations():
 # ============================================================================
 # Subscription System Migrations (runs on startup, idempotent)
 # ============================================================================
+async def _run_sql(label: str, sql: str):
+    """Run a single migration step in its own transaction."""
+    try:
+        async with async_engine.begin() as conn:
+            await conn.execute(sa_text(sql))
+        logger.info(f"[SUB-MIGRATION] {label}: OK")
+    except Exception as e:
+        logger.warning(f"[SUB-MIGRATION] {label}: {e}")
+
+
 async def run_subscription_migrations():
     """Create subscription tables and columns for reseller billing."""
+
+    # Step 1: Create enum types (each in its own transaction)
+    await _run_sql("Create subscriptionstatus enum",
+        "DO $$ BEGIN "
+        "CREATE TYPE subscriptionstatus AS ENUM ('active', 'inactive', 'trial', 'suspended'); "
+        "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+    )
+    await _run_sql("Create invoicestatus enum",
+        "DO $$ BEGIN "
+        "CREATE TYPE invoicestatus AS ENUM ('pending', 'paid', 'overdue', 'waived'); "
+        "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+    )
+    await _run_sql("Create subscriptionpaymentstatus enum",
+        "DO $$ BEGIN "
+        "CREATE TYPE subscriptionpaymentstatus AS ENUM ('pending', 'completed', 'failed'); "
+        "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+    )
+
+    # Step 2: Add subscription columns to users table (separate statements)
+    await _run_sql("Add users.subscription_status",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+        "subscription_status subscriptionstatus NOT NULL DEFAULT 'trial'"
+    )
+    await _run_sql("Add users.subscription_expires_at",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+        "subscription_expires_at TIMESTAMP NULL"
+    )
+
+    # Step 3: Evolve or create subscriptions table
     async with async_engine.begin() as conn:
-        # Create enum types
-        await conn.execute(sa_text(
-            "DO $$ BEGIN "
-            "CREATE TYPE subscriptionstatus AS ENUM ('active', 'inactive', 'trial', 'suspended'); "
-            "EXCEPTION WHEN duplicate_object THEN NULL; "
-            "END $$"
+        result = await conn.execute(sa_text(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'subscriptions'"
         ))
-        await conn.execute(sa_text(
+        table_exists = result.fetchone() is not None
+
+    if table_exists:
+        for col_name, col_type in [
+            ("status", "subscriptionstatus DEFAULT 'trial'"),
+            ("current_period_start", "TIMESTAMP NULL"),
+            ("current_period_end", "TIMESTAMP NULL"),
+            ("trial_ends_at", "TIMESTAMP NULL"),
+            ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+        ]:
+            await _run_sql(f"Add subscriptions.{col_name}",
+                f"ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+            )
+        for col in ("plan_type", "cost"):
+            await _run_sql(f"Make subscriptions.{col} nullable",
+                f"DO $$ BEGIN "
+                f"ALTER TABLE subscriptions ALTER COLUMN {col} DROP NOT NULL; "
+                f"EXCEPTION WHEN undefined_column THEN NULL; WHEN others THEN NULL; "
+                f"END $$"
+            )
+        await _run_sql("Add subscriptions unique user_id constraint",
             "DO $$ BEGIN "
-            "CREATE TYPE invoicestatus AS ENUM ('pending', 'paid', 'overdue', 'waived'); "
-            "EXCEPTION WHEN duplicate_object THEN NULL; "
-            "END $$"
+            "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_subscriptions_user_id') THEN "
+            "BEGIN ALTER TABLE subscriptions ADD CONSTRAINT uq_subscriptions_user_id UNIQUE (user_id); "
+            "EXCEPTION WHEN unique_violation THEN NULL; END; "
+            "END IF; END $$"
+        )
+    else:
+        await _run_sql("Create subscriptions table",
+            "CREATE TABLE subscriptions ("
+            "id SERIAL PRIMARY KEY, "
+            "user_id INTEGER NOT NULL REFERENCES users(id) UNIQUE, "
+            "status subscriptionstatus NOT NULL DEFAULT 'trial', "
+            "current_period_start TIMESTAMP NULL, "
+            "current_period_end TIMESTAMP NULL, "
+            "trial_ends_at TIMESTAMP NULL, "
+            "created_at TIMESTAMP DEFAULT NOW(), "
+            "updated_at TIMESTAMP DEFAULT NOW(), "
+            "is_active BOOLEAN NULL, "
+            "paid_on TIMESTAMP NULL, "
+            "expires_on TIMESTAMP NULL, "
+            "plan_type VARCHAR NULL, "
+            "cost FLOAT NULL)"
+        )
+
+    # Step 4: Create subscription_invoices table
+    async with async_engine.begin() as conn:
+        result = await conn.execute(sa_text(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'subscription_invoices'"
         ))
-        await conn.execute(sa_text(
-            "DO $$ BEGIN "
-            "CREATE TYPE subscriptionpaymentstatus AS ENUM ('pending', 'completed', 'failed'); "
-            "EXCEPTION WHEN duplicate_object THEN NULL; "
-            "END $$"
+        has_invoices = result.fetchone() is not None
+
+    if not has_invoices:
+        await _run_sql("Create subscription_invoices table",
+            "CREATE TABLE subscription_invoices ("
+            "id SERIAL PRIMARY KEY, "
+            "user_id INTEGER NOT NULL REFERENCES users(id), "
+            "period_start TIMESTAMP NOT NULL, "
+            "period_end TIMESTAMP NOT NULL, "
+            "hotspot_revenue FLOAT NOT NULL DEFAULT 0, "
+            "hotspot_charge FLOAT NOT NULL DEFAULT 0, "
+            "pppoe_user_count INTEGER NOT NULL DEFAULT 0, "
+            "pppoe_charge FLOAT NOT NULL DEFAULT 0, "
+            "gross_charge FLOAT NOT NULL DEFAULT 0, "
+            "final_charge FLOAT NOT NULL DEFAULT 0, "
+            "status invoicestatus NOT NULL DEFAULT 'pending', "
+            "due_date TIMESTAMP NOT NULL, "
+            "paid_at TIMESTAMP NULL, "
+            "created_at TIMESTAMP DEFAULT NOW(), "
+            "CONSTRAINT uq_subscription_invoice_user_period UNIQUE (user_id, period_start))"
+        )
+        await _run_sql("Index subscription_invoices.user_id",
+            "CREATE INDEX IF NOT EXISTS idx_sub_invoices_user ON subscription_invoices(user_id)"
+        )
+        await _run_sql("Index subscription_invoices.status",
+            "CREATE INDEX IF NOT EXISTS idx_sub_invoices_status ON subscription_invoices(status)"
+        )
+        await _run_sql("Index subscription_invoices.due_date",
+            "CREATE INDEX IF NOT EXISTS idx_sub_invoices_due ON subscription_invoices(due_date)"
+        )
+
+    # Step 5: Create subscription_payments table
+    async with async_engine.begin() as conn:
+        result = await conn.execute(sa_text(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'subscription_payments'"
         ))
+        has_payments = result.fetchone() is not None
 
-        # Add subscription columns to users table
-        await conn.execute(sa_text("""
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS subscription_status subscriptionstatus NOT NULL DEFAULT 'trial',
-            ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMP NULL
-        """))
+    if not has_payments:
+        await _run_sql("Create subscription_payments table",
+            "CREATE TABLE subscription_payments ("
+            "id SERIAL PRIMARY KEY, "
+            "invoice_id INTEGER REFERENCES subscription_invoices(id), "
+            "user_id INTEGER NOT NULL REFERENCES users(id), "
+            "amount FLOAT NOT NULL, "
+            "payment_method VARCHAR(50) NOT NULL DEFAULT 'mpesa', "
+            "payment_reference VARCHAR(255) NULL, "
+            "mpesa_checkout_request_id VARCHAR(255) NULL UNIQUE, "
+            "phone_number VARCHAR(20) NULL, "
+            "status subscriptionpaymentstatus NOT NULL DEFAULT 'pending', "
+            "created_at TIMESTAMP DEFAULT NOW())"
+        )
+        await _run_sql("Index subscription_payments.user_id",
+            "CREATE INDEX IF NOT EXISTS idx_sub_payments_user ON subscription_payments(user_id)"
+        )
+        await _run_sql("Index subscription_payments.invoice_id",
+            "CREATE INDEX IF NOT EXISTS idx_sub_payments_invoice ON subscription_payments(invoice_id)"
+        )
+        await _run_sql("Index subscription_payments.checkout_id",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_payments_checkout "
+            "ON subscription_payments(mpesa_checkout_request_id) "
+            "WHERE mpesa_checkout_request_id IS NOT NULL"
+        )
 
-        # Evolve subscriptions table: add new columns if they don't exist
-        result = await conn.execute(sa_text("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_name = 'subscriptions'
-        """))
-        if result.fetchone():
-            # Table exists -- add new columns, keep legacy ones
-            for col_name, col_type in [
-                ("status", "subscriptionstatus DEFAULT 'trial'"),
-                ("current_period_start", "TIMESTAMP NULL"),
-                ("current_period_end", "TIMESTAMP NULL"),
-                ("trial_ends_at", "TIMESTAMP NULL"),
-                ("updated_at", "TIMESTAMP DEFAULT NOW()"),
-            ]:
-                await conn.execute(sa_text(
-                    f"ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
-                ))
-            # Make legacy columns nullable
-            for col in ("plan_type", "cost"):
-                await conn.execute(sa_text(f"""
-                    ALTER TABLE subscriptions ALTER COLUMN {col} DROP NOT NULL
-                """))
-            # Add unique constraint on user_id if not exists
-            await conn.execute(sa_text("""
-                DO $$ BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint WHERE conname = 'uq_subscriptions_user_id'
-                    ) THEN
-                        BEGIN
-                            ALTER TABLE subscriptions ADD CONSTRAINT uq_subscriptions_user_id UNIQUE (user_id);
-                        EXCEPTION WHEN unique_violation THEN NULL;
-                        END;
-                    END IF;
-                END $$;
-            """))
-        else:
-            # Create fresh subscriptions table
-            await conn.execute(sa_text("""
-                CREATE TABLE subscriptions (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) UNIQUE,
-                    status subscriptionstatus NOT NULL DEFAULT 'trial',
-                    current_period_start TIMESTAMP NULL,
-                    current_period_end TIMESTAMP NULL,
-                    trial_ends_at TIMESTAMP NULL,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    is_active BOOLEAN NULL,
-                    paid_on TIMESTAMP NULL,
-                    expires_on TIMESTAMP NULL,
-                    plan_type VARCHAR NULL,
-                    cost FLOAT NULL
-                )
-            """))
-
-        # Create subscription_invoices table
-        result = await conn.execute(sa_text("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_name = 'subscription_invoices'
-        """))
-        if not result.fetchone():
-            await conn.execute(sa_text("""
-                CREATE TABLE subscription_invoices (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    period_start TIMESTAMP NOT NULL,
-                    period_end TIMESTAMP NOT NULL,
-                    hotspot_revenue FLOAT NOT NULL DEFAULT 0,
-                    hotspot_charge FLOAT NOT NULL DEFAULT 0,
-                    pppoe_user_count INTEGER NOT NULL DEFAULT 0,
-                    pppoe_charge FLOAT NOT NULL DEFAULT 0,
-                    gross_charge FLOAT NOT NULL DEFAULT 0,
-                    final_charge FLOAT NOT NULL DEFAULT 0,
-                    status invoicestatus NOT NULL DEFAULT 'pending',
-                    due_date TIMESTAMP NOT NULL,
-                    paid_at TIMESTAMP NULL,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    CONSTRAINT uq_subscription_invoice_user_period UNIQUE (user_id, period_start)
-                )
-            """))
-            await conn.execute(sa_text(
-                "CREATE INDEX idx_sub_invoices_user ON subscription_invoices(user_id)"
-            ))
-            await conn.execute(sa_text(
-                "CREATE INDEX idx_sub_invoices_status ON subscription_invoices(status)"
-            ))
-            await conn.execute(sa_text(
-                "CREATE INDEX idx_sub_invoices_due ON subscription_invoices(due_date)"
-            ))
-            logger.info("Migration: Created subscription_invoices table")
-
-        # Create subscription_payments table
-        result = await conn.execute(sa_text("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_name = 'subscription_payments'
-        """))
-        if not result.fetchone():
-            await conn.execute(sa_text("""
-                CREATE TABLE subscription_payments (
-                    id SERIAL PRIMARY KEY,
-                    invoice_id INTEGER REFERENCES subscription_invoices(id),
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    amount FLOAT NOT NULL,
-                    payment_method VARCHAR(50) NOT NULL DEFAULT 'mpesa',
-                    payment_reference VARCHAR(255) NULL,
-                    mpesa_checkout_request_id VARCHAR(255) NULL UNIQUE,
-                    phone_number VARCHAR(20) NULL,
-                    status subscriptionpaymentstatus NOT NULL DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """))
-            await conn.execute(sa_text(
-                "CREATE INDEX idx_sub_payments_user ON subscription_payments(user_id)"
-            ))
-            await conn.execute(sa_text(
-                "CREATE INDEX idx_sub_payments_invoice ON subscription_payments(invoice_id)"
-            ))
-            await conn.execute(sa_text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_payments_checkout "
-                "ON subscription_payments(mpesa_checkout_request_id) "
-                "WHERE mpesa_checkout_request_id IS NOT NULL"
-            ))
-            logger.info("Migration: Created subscription_payments table")
-
-        # Set existing resellers to trial with 7-day trial from NOW
-        # Only applies to resellers still in trial with no expiry set
-        await conn.execute(sa_text("""
-            UPDATE users
-            SET subscription_expires_at = NOW() + INTERVAL '7 days'
-            WHERE role = 'reseller'
-              AND subscription_status = 'trial'
-              AND subscription_expires_at IS NULL
-        """))
-        # Also fix any trial resellers with an already-expired trial date
-        # (e.g. from a previous test run) -- reset to 7 days from now
-        await conn.execute(sa_text("""
-            UPDATE users
-            SET subscription_expires_at = NOW() + INTERVAL '7 days'
-            WHERE role = 'reseller'
-              AND subscription_status = 'trial'
-              AND subscription_expires_at < NOW()
-        """))
-        logger.info("Migration: Subscription system tables and columns ready")
+    # Step 6: Set trial expiry for existing resellers
+    await _run_sql("Set trial expiry for resellers (NULL)",
+        "UPDATE users SET subscription_expires_at = NOW() + INTERVAL '7 days' "
+        "WHERE role = 'reseller' AND subscription_status = 'trial' "
+        "AND subscription_expires_at IS NULL"
+    )
+    await _run_sql("Reset expired trial dates",
+        "UPDATE users SET subscription_expires_at = NOW() + INTERVAL '7 days' "
+        "WHERE role = 'reseller' AND subscription_status = 'trial' "
+        "AND subscription_expires_at < NOW()"
+    )
+    logger.info("Migration: Subscription system tables and columns ready")
 
 
 @app.on_event("startup")
