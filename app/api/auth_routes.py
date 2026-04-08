@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.db.models import User, UserRole
 from app.services.auth import create_user, authenticate_user, create_access_token
+from app.services.subscription import get_invoice_alert_for_user
 from app.config import settings
 import logging
 
@@ -100,7 +101,19 @@ async def login_api(
             expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         )
 
-        return {
+        sub_status = getattr(user, 'subscription_status', None)
+        if sub_status and hasattr(sub_status, 'value'):
+            sub_status = sub_status.value
+
+        subscription_alert = None
+        try:
+            subscription_alert = await get_invoice_alert_for_user(db, user.id)
+        except Exception as alert_err:
+            logger.warning(f"Failed to get subscription alert for user {user.id}: {alert_err}")
+
+        await db.commit()
+
+        response = {
             "access_token": access_token,
             "token_type": "bearer",
             "user": {
@@ -110,9 +123,16 @@ async def login_api(
                 "organization_name": user.organization_name,
                 "business_name": getattr(user, 'business_name', None),
                 "support_phone": getattr(user, 'support_phone', None),
-                "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None)
-            }
+                "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None),
+                "subscription_status": sub_status,
+                "subscription_expires_at": user.subscription_expires_at.isoformat() if getattr(user, 'subscription_expires_at', None) else None,
+            },
         }
+
+        if subscription_alert:
+            response["subscription_alert"] = subscription_alert
+
+        return response
     except HTTPException:
         raise
     except Exception as e:

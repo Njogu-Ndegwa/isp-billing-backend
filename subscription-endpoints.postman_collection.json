@@ -1,0 +1,242 @@
+{
+    "info": {
+        "name": "Subscription System - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": "your-jwt-token-here"}
+    ],
+    "item": [
+        {
+            "name": "Reseller Endpoints",
+            "item": [
+                {
+                    "name": "Get My Subscription",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/subscription",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Current Invoice",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/subscription/current-invoice",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "List My Invoices",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/subscription/invoices?page=1&per_page=20",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "subscription", "invoices"],
+                            "query": [
+                                {"key": "page", "value": "1"},
+                                {"key": "per_page", "value": "20"},
+                                {"key": "status", "value": "", "description": "Optional: pending, paid, overdue, waived"}
+                            ]
+                        },
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Invoice Detail",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/subscription/invoices/1",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Pay Subscription (M-Pesa STK)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/subscription/pay",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\"invoice_id\": 1, \"phone_number\": \"254712345678\"}"
+                        }
+                    }
+                },
+                {
+                    "name": "List My Subscription Payments",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/subscription/payments?page=1&per_page=20",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "subscription", "payments"],
+                            "query": [
+                                {"key": "page", "value": "1"},
+                                {"key": "per_page", "value": "20"}
+                            ]
+                        },
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Admin Endpoints",
+            "item": [
+                {
+                    "name": "List All Subscriptions",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/admin/subscriptions?status=&sort_by=expires_at&sort_order=asc&search=",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "admin", "subscriptions"],
+                            "query": [
+                                {"key": "status", "value": "", "description": "Optional: active, trial, suspended, inactive"},
+                                {"key": "sort_by", "value": "expires_at", "description": "Optional: expires_at, revenue, created_at"},
+                                {"key": "sort_order", "value": "asc"},
+                                {"key": "search", "value": ""}
+                            ]
+                        },
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Subscription Revenue Dashboard",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/admin/subscriptions/revenue",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Expiring Soon",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/admin/subscriptions/expiring-soon?days=7",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "admin", "subscriptions", "expiring-soon"],
+                            "query": [
+                                {"key": "days", "value": "7"}
+                            ]
+                        },
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Reseller Subscription Detail",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/admin/subscriptions/1",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Edit Subscription (Status/Expiry)",
+                    "request": {
+                        "method": "PATCH",
+                        "url": "{{baseUrl}}/api/admin/subscriptions/1",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"},
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\"subscription_status\": \"active\", \"subscription_expires_at\": \"2026-05-07T00:00:00\"}"
+                        }
+                    }
+                },
+                {
+                    "name": "Activate Subscription",
+                    "request": {
+                        "method": "POST",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/admin/subscriptions/1/activate?months=1",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "admin", "subscriptions", "1", "activate"],
+                            "query": [
+                                {"key": "months", "value": "1"}
+                            ]
+                        },
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Deactivate Subscription",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/admin/subscriptions/1/deactivate",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Waive Invoice",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/admin/subscriptions/1/waive/1",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                },
+                {
+                    "name": "Manually Generate Invoices",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/admin/subscriptions/generate-invoices",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"}
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Callbacks (Safaricom)",
+            "item": [
+                {
+                    "name": "Subscription M-Pesa Callback",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/subscription/mpesa/callback",
+                        "header": [
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\"Body\":{\"stkCallback\":{\"MerchantRequestID\":\"test\",\"CheckoutRequestID\":\"test-checkout-id\",\"ResultCode\":0,\"ResultDesc\":\"Success\",\"CallbackMetadata\":{\"Item\":[{\"Name\":\"MpesaReceiptNumber\",\"Value\":\"TEST123\"}]}}}}"
+                        }
+                    }
+                }
+            ]
+        }
+    ]
+}

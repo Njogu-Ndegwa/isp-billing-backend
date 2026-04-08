@@ -47,6 +47,7 @@ from app.api.zenopay_routes import router as zenopay_router
 from app.api.admin_reseller_routes import router as admin_reseller_router
 from app.api.profile_routes import router as profile_router
 from app.api.b2b_routes import router as b2b_router
+from app.api.subscription_routes import router as subscription_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -72,6 +73,7 @@ app.include_router(zenopay_router)
 app.include_router(admin_reseller_router)
 app.include_router(profile_router)
 app.include_router(b2b_router)
+app.include_router(subscription_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -780,6 +782,184 @@ async def run_b2b_migrations():
         logger.info("Migration: Ensured b2b_transactions table and indexes exist")
 
 
+# ============================================================================
+# Subscription System Migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_subscription_migrations():
+    """Create subscription tables and columns for reseller billing."""
+    async with async_engine.begin() as conn:
+        # Create enum types
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE subscriptionstatus AS ENUM ('active', 'inactive', 'trial', 'suspended'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; "
+            "END $$"
+        ))
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE invoicestatus AS ENUM ('pending', 'paid', 'overdue', 'waived'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; "
+            "END $$"
+        ))
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE subscriptionpaymentstatus AS ENUM ('pending', 'completed', 'failed'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; "
+            "END $$"
+        ))
+
+        # Add subscription columns to users table
+        await conn.execute(sa_text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS subscription_status subscriptionstatus NOT NULL DEFAULT 'trial',
+            ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMP NULL
+        """))
+
+        # Evolve subscriptions table: add new columns if they don't exist
+        result = await conn.execute(sa_text("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_name = 'subscriptions'
+        """))
+        if result.fetchone():
+            # Table exists -- add new columns, keep legacy ones
+            for col_name, col_type in [
+                ("status", "subscriptionstatus DEFAULT 'trial'"),
+                ("current_period_start", "TIMESTAMP NULL"),
+                ("current_period_end", "TIMESTAMP NULL"),
+                ("trial_ends_at", "TIMESTAMP NULL"),
+                ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+            ]:
+                await conn.execute(sa_text(
+                    f"ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                ))
+            # Make legacy columns nullable
+            for col in ("plan_type", "cost"):
+                await conn.execute(sa_text(f"""
+                    ALTER TABLE subscriptions ALTER COLUMN {col} DROP NOT NULL
+                """))
+            # Add unique constraint on user_id if not exists
+            await conn.execute(sa_text("""
+                DO $$ BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'uq_subscriptions_user_id'
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE subscriptions ADD CONSTRAINT uq_subscriptions_user_id UNIQUE (user_id);
+                        EXCEPTION WHEN unique_violation THEN NULL;
+                        END;
+                    END IF;
+                END $$;
+            """))
+        else:
+            # Create fresh subscriptions table
+            await conn.execute(sa_text("""
+                CREATE TABLE subscriptions (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) UNIQUE,
+                    status subscriptionstatus NOT NULL DEFAULT 'trial',
+                    current_period_start TIMESTAMP NULL,
+                    current_period_end TIMESTAMP NULL,
+                    trial_ends_at TIMESTAMP NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    is_active BOOLEAN NULL,
+                    paid_on TIMESTAMP NULL,
+                    expires_on TIMESTAMP NULL,
+                    plan_type VARCHAR NULL,
+                    cost FLOAT NULL
+                )
+            """))
+
+        # Create subscription_invoices table
+        result = await conn.execute(sa_text("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_name = 'subscription_invoices'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                CREATE TABLE subscription_invoices (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    period_start TIMESTAMP NOT NULL,
+                    period_end TIMESTAMP NOT NULL,
+                    hotspot_revenue FLOAT NOT NULL DEFAULT 0,
+                    hotspot_charge FLOAT NOT NULL DEFAULT 0,
+                    pppoe_user_count INTEGER NOT NULL DEFAULT 0,
+                    pppoe_charge FLOAT NOT NULL DEFAULT 0,
+                    gross_charge FLOAT NOT NULL DEFAULT 0,
+                    final_charge FLOAT NOT NULL DEFAULT 0,
+                    status invoicestatus NOT NULL DEFAULT 'pending',
+                    due_date TIMESTAMP NOT NULL,
+                    paid_at TIMESTAMP NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    CONSTRAINT uq_subscription_invoice_user_period UNIQUE (user_id, period_start)
+                )
+            """))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_sub_invoices_user ON subscription_invoices(user_id)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_sub_invoices_status ON subscription_invoices(status)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_sub_invoices_due ON subscription_invoices(due_date)"
+            ))
+            logger.info("Migration: Created subscription_invoices table")
+
+        # Create subscription_payments table
+        result = await conn.execute(sa_text("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_name = 'subscription_payments'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                CREATE TABLE subscription_payments (
+                    id SERIAL PRIMARY KEY,
+                    invoice_id INTEGER REFERENCES subscription_invoices(id),
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    amount FLOAT NOT NULL,
+                    payment_method VARCHAR(50) NOT NULL DEFAULT 'mpesa',
+                    payment_reference VARCHAR(255) NULL,
+                    mpesa_checkout_request_id VARCHAR(255) NULL UNIQUE,
+                    phone_number VARCHAR(20) NULL,
+                    status subscriptionpaymentstatus NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_sub_payments_user ON subscription_payments(user_id)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_sub_payments_invoice ON subscription_payments(invoice_id)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_payments_checkout "
+                "ON subscription_payments(mpesa_checkout_request_id) "
+                "WHERE mpesa_checkout_request_id IS NOT NULL"
+            ))
+            logger.info("Migration: Created subscription_payments table")
+
+        # Set existing resellers to trial with 7-day trial from NOW
+        # Only applies to resellers still in trial with no expiry set
+        await conn.execute(sa_text("""
+            UPDATE users
+            SET subscription_expires_at = NOW() + INTERVAL '7 days'
+            WHERE role = 'reseller'
+              AND subscription_status = 'trial'
+              AND subscription_expires_at IS NULL
+        """))
+        # Also fix any trial resellers with an already-expired trial date
+        # (e.g. from a previous test run) -- reset to 7 days from now
+        await conn.execute(sa_text("""
+            UPDATE users
+            SET subscription_expires_at = NOW() + INTERVAL '7 days'
+            WHERE role = 'reseller'
+              AND subscription_status = 'trial'
+              AND subscription_expires_at < NOW()
+        """))
+        logger.info("Migration: Subscription system tables and columns ready")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -818,6 +998,12 @@ async def startup_event():
     except Exception as e:
         logger.error(f"B2B migration failed (non-fatal): {e}")
 
+    try:
+        await run_subscription_migrations()
+        logger.info("Subscription migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Subscription migration failed (non-fatal): {e}")
+
     scheduler.add_job(
         cleanup_expired_users_background,
         trigger=IntervalTrigger(seconds=67),
@@ -850,6 +1036,45 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
+    # --- Subscription scheduler jobs ---
+    async def _generate_subscription_invoices_background():
+        from app.services.subscription import generate_monthly_invoices
+        async for db in get_db():
+            try:
+                result = await generate_monthly_invoices(db)
+                logger.info(f"[SUBSCRIPTION] Monthly invoice generation: {result}")
+            except Exception as e:
+                logger.error(f"[SUBSCRIPTION] Monthly invoice generation failed: {e}")
+            break
+
+    async def _check_overdue_subscriptions_background():
+        from app.services.subscription import check_overdue_invoices
+        async for db in get_db():
+            try:
+                result = await check_overdue_invoices(db)
+                logger.info(f"[SUBSCRIPTION] Overdue check: {result}")
+            except Exception as e:
+                logger.error(f"[SUBSCRIPTION] Overdue check failed: {e}")
+            break
+
+    scheduler.add_job(
+        _generate_subscription_invoices_background,
+        trigger=CronTrigger(day=1, hour=0, minute=30),
+        id='generate_subscription_invoices',
+        name='Generate monthly subscription invoices',
+        replace_existing=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        _check_overdue_subscriptions_background,
+        trigger=CronTrigger(hour=6, minute=0),
+        id='check_overdue_subscriptions',
+        name='Check overdue invoices and suspend non-payers',
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Subscription jobs scheduled: invoices on 1st of month, overdue check daily at 06:00")
+
     from app.config import settings as app_settings
     if app_settings.MPESA_B2B_DAILY_PAYOUT_ENABLED:
         scheduler.add_job(

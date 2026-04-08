@@ -13,6 +13,7 @@ from app.db.models import (
     ResellerPayout, ResellerTransactionCharge, PaymentMethod,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services.subscription import get_invoice_alert_for_user
 from app.services.router_helpers import get_router_by_id
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, validate_mac_address
 
@@ -312,6 +313,12 @@ async def get_dashboard_overview(
             router_obj = router_result.scalar_one_or_none()
             router_name = router_obj.name if router_obj else None
         
+        subscription_alert = None
+        try:
+            subscription_alert = await get_invoice_alert_for_user(db, user_id)
+        except Exception as alert_err:
+            logger.warning(f"Failed to get subscription alert for user {user_id}: {alert_err}")
+
         return {
             "router_id": router_id,
             "router_name": router_name,
@@ -330,6 +337,7 @@ async def get_dashboard_overview(
             "revenue_by_plan": plan_revenue,
             "recent_transactions": recent_transactions,
             "expiring_soon": expiring_soon,
+            "subscription_alert": subscription_alert,
             "generated_at": now.isoformat()
         }
         

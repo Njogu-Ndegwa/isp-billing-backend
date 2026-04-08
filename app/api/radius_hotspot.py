@@ -243,6 +243,23 @@ async def radius_register_and_pay(
 
         user_id = db_router.user_id
 
+        # Block payments if the reseller's subscription is suspended
+        if user_id:
+            from app.db.models import SubscriptionStatus
+            owner_sub_result = await db.execute(
+                select(User.subscription_status).where(User.id == user_id)
+            )
+            owner_sub_row = owner_sub_result.one_or_none()
+            if owner_sub_row:
+                sub_val = owner_sub_row[0]
+                if hasattr(sub_val, 'value'):
+                    sub_val = sub_val.value
+                if sub_val not in ("active", "trial"):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="This service is temporarily unavailable. Please contact your ISP."
+                    )
+
         # Look up the reseller's display name for the STK push prompt
         account_reference = None
         if user_id:

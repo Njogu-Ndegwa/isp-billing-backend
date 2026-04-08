@@ -11,7 +11,8 @@ from app.db.models import (
     CustomerPayment, Plan, ResellerFinancials, ResellerPayout,
     ResellerTransactionCharge,
     PaymentMethod, Payment, ProvisioningToken, Voucher,
-    Subscription, CustomerRating, UserBandwidthUsage,
+    Subscription, SubscriptionStatus, SubscriptionInvoice, SubscriptionPayment,
+    CustomerRating, UserBandwidthUsage,
     MpesaTransaction, ProvisioningLog, BandwidthSnapshot,
     RouterLogEntry, RouterAvailabilityCheck,
     ResellerPaymentMethod, ResellerPaymentMethodType,
@@ -107,7 +108,7 @@ def _serialize_payment_method_for_admin(pm: ResellerPaymentMethod) -> dict:
 # ---------------------------------------------------------------------------
 VALID_SORT_FIELDS = {
     "revenue", "mpesa_revenue", "customers", "created_at",
-    "last_login", "unpaid_balance", "router_count",
+    "last_login", "unpaid_balance", "router_count", "subscription_expires_at",
 }
 VALID_FILTERS = {
     "unpaid",       # unpaid_balance > 0
@@ -118,6 +119,10 @@ VALID_FILTERS = {
     "no_routers",   # owns 0 routers
     "has_revenue",  # has revenue in the selected period
     "no_revenue",   # zero revenue in the selected period
+    "sub_active",       # subscription active
+    "sub_trial",        # subscription trial
+    "sub_suspended",    # subscription suspended
+    "sub_inactive",     # subscription inactive
 }
 
 
@@ -192,13 +197,21 @@ async def list_resellers(
             User.email.ilike(pattern) | User.organization_name.ilike(pattern)
         )
 
-    # Pre-filter at DB level for login-based filters
+    # Pre-filter at DB level for login-based and subscription filters
     now = datetime.utcnow()
     active_cutoff = now - timedelta(days=30)
     if filter == "active":
         stmt = stmt.where(User.last_login_at >= active_cutoff)
     elif filter == "inactive":
         stmt = stmt.where((User.last_login_at == None) | (User.last_login_at < active_cutoff))
+    elif filter == "sub_active":
+        stmt = stmt.where(User.subscription_status == SubscriptionStatus.ACTIVE)
+    elif filter == "sub_trial":
+        stmt = stmt.where(User.subscription_status == SubscriptionStatus.TRIAL)
+    elif filter == "sub_suspended":
+        stmt = stmt.where(User.subscription_status == SubscriptionStatus.SUSPENDED)
+    elif filter == "sub_inactive":
+        stmt = stmt.where(User.subscription_status == SubscriptionStatus.INACTIVE)
 
     stmt = stmt.order_by(User.created_at.desc())
     result = await db.execute(stmt)
@@ -239,6 +252,9 @@ async def list_resellers(
         charges = await _total_transaction_charges(db, r.id)
         unpaid = round(all_time_mpesa - paid - charges, 2)
 
+        sub_status = r.subscription_status
+        sub_status_val = sub_status.value if hasattr(sub_status, 'value') else sub_status
+
         item = {
             "id": r.id,
             "email": r.email,
@@ -246,6 +262,8 @@ async def list_resellers(
             "business_name": r.business_name,
             "support_phone": r.support_phone,
             "mpesa_shortcode": r.mpesa_shortcode,
+            "subscription_status": sub_status_val,
+            "subscription_expires_at": r.subscription_expires_at.isoformat() if r.subscription_expires_at else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "last_login_at": r.last_login_at.isoformat() if r.last_login_at else None,
             "total_revenue": total_revenue,
@@ -284,6 +302,7 @@ async def list_resellers(
         "last_login": lambda x: x["last_login_at"] or "",
         "unpaid_balance": lambda x: x["unpaid_balance"],
         "router_count": lambda x: x["router_count"],
+        "subscription_expires_at": lambda x: x["subscription_expires_at"] or "",
     }
     if sort_by and sort_by in sort_key_map:
         items.sort(key=sort_key_map[sort_by], reverse=descending)
@@ -644,6 +663,9 @@ async def get_reseller_detail(
         for t in (await db.execute(recent_b2b_stmt)).scalars().all()
     ]
 
+    detail_sub_status = r.subscription_status
+    detail_sub_val = detail_sub_status.value if hasattr(detail_sub_status, 'value') else detail_sub_status
+
     return {
         "id": r.id,
         "email": r.email,
@@ -651,6 +673,8 @@ async def get_reseller_detail(
         "business_name": r.business_name,
         "support_phone": r.support_phone,
         "mpesa_shortcode": r.mpesa_shortcode,
+        "subscription_status": detail_sub_val,
+        "subscription_expires_at": r.subscription_expires_at.isoformat() if r.subscription_expires_at else None,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "last_login_at": r.last_login_at.isoformat() if r.last_login_at else None,
         "revenue": revenue,
@@ -1125,10 +1149,40 @@ async def admin_dashboard(
     week_rev = await _total_revenue_since(week_start)
     month_rev = await _total_revenue_since(month_start)
 
+    # Subscription status counts
+    sub_active = (await db.execute(
+        select(func.count(User.id)).where(
+            User.role == UserRole.RESELLER,
+            User.subscription_status == SubscriptionStatus.ACTIVE,
+        )
+    )).scalar() or 0
+    sub_trial = (await db.execute(
+        select(func.count(User.id)).where(
+            User.role == UserRole.RESELLER,
+            User.subscription_status == SubscriptionStatus.TRIAL,
+        )
+    )).scalar() or 0
+    sub_suspended = (await db.execute(
+        select(func.count(User.id)).where(
+            User.role == UserRole.RESELLER,
+            User.subscription_status == SubscriptionStatus.SUSPENDED,
+        )
+    )).scalar() or 0
+    sub_inactive = (await db.execute(
+        select(func.count(User.id)).where(
+            User.role == UserRole.RESELLER,
+            User.subscription_status == SubscriptionStatus.INACTIVE,
+        )
+    )).scalar() or 0
+
     return {
         "resellers": {
             "total": total_resellers,
             "active_last_30_days": active_resellers,
+            "subscription_active": sub_active,
+            "subscription_trial": sub_trial,
+            "subscription_suspended": sub_suspended,
+            "subscription_inactive": sub_inactive,
         },
         "revenue": {
             "today": today_rev["total"],
@@ -1525,7 +1579,13 @@ async def delete_reseller(
     # 21b. Reseller transaction charges
     await db.execute(delete(ResellerTransactionCharge).where(ResellerTransactionCharge.reseller_id == reseller_id))
 
-    # 21. Subscriptions
+    # 21c. Subscription payments (must precede invoices due to FK)
+    await db.execute(delete(SubscriptionPayment).where(SubscriptionPayment.user_id == reseller_id))
+
+    # 21d. Subscription invoices
+    await db.execute(delete(SubscriptionInvoice).where(SubscriptionInvoice.user_id == reseller_id))
+
+    # 21e. Subscriptions
     await db.execute(delete(Subscription).where(Subscription.user_id == reseller_id))
 
     # 22. Null out created_by references from other users

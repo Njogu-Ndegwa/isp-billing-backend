@@ -6,7 +6,7 @@ from jose import jwt, JWTError
 from datetime import datetime, timedelta
 import random
 from passlib.context import CryptContext
-from app.db.models import User, UserRole
+from app.db.models import User, UserRole, SubscriptionStatus
 from app.db.database import get_db
 from app.config import settings
 from app.core.security import ALGORITHM
@@ -42,6 +42,10 @@ async def create_user(db: AsyncSession, email: str, password: str, role: UserRol
         created_by=created_by,
         created_at=datetime.utcnow()
     )
+    if role == UserRole.RESELLER:
+        from app.services.subscription import TRIAL_DAYS
+        user.subscription_status = SubscriptionStatus.TRIAL
+        user.subscription_expires_at = datetime.utcnow() + timedelta(days=TRIAL_DAYS)
     db.add(user)
     await db.commit()
     await db.refresh(user)

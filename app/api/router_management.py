@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User, RouterAvailabilityCheck, ProvisioningToken, Voucher, RouterLogEntry
 from app.services.auth import verify_token, get_current_user
+from app.services.subscription import enforce_active_subscription
 from app.services.router_availability import build_router_status
 import logging
 import asyncio
@@ -222,6 +223,7 @@ async def create_router_api(
     """Create a new router"""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
         existing_router_stmt = select(Router).filter(
             Router.ip_address == request.ip_address,
             Router.user_id == user.id

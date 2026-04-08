@@ -16,6 +16,7 @@ from app.db.models import (
     UserBandwidthUsage, Voucher,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services.subscription import enforce_active_subscription
 from app.services.pppoe_provisioning import (
     call_pppoe_provision, call_pppoe_remove,
     build_pppoe_payload, build_pppoe_remove_payload,
@@ -58,6 +59,7 @@ async def register_customer_api(
     """Register a new customer"""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
         
         # Validate plan exists
         plan_stmt = select(Plan).where(Plan.id == request.plan_id, Plan.user_id == user.id)
@@ -162,6 +164,7 @@ async def edit_customer(
     """Edit an existing customer's details including hotspot/PPPoE fields."""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
 
         stmt = (
             select(Customer)

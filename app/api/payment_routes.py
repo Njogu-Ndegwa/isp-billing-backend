@@ -12,6 +12,7 @@ from app.db.models import (
     ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services.subscription import enforce_active_subscription
 from app.services.hotspot_provisioning import (
     build_hotspot_payload,
     get_or_create_provisioning_attempt,
@@ -494,6 +495,7 @@ async def initiate_mpesa_payment_api(
     """Initiate payment for existing customer. Routes through the correct gateway
     based on the customer's router payment method configuration."""
     current_user = await get_current_user(token, db)
+    enforce_active_subscription(current_user)
     try:
         from app.services.mpesa import initiate_stk_push
         from app.services.mpesa_transactions import save_mpesa_transaction, link_transaction_to_customer
@@ -669,6 +671,23 @@ async def register_hotspot_and_pay_api(
         if not router:
             raise HTTPException(status_code=404, detail="Router not found")
         user_id = router.user_id
+
+        # Block payments if the reseller's subscription is suspended
+        if user_id:
+            from app.db.models import SubscriptionStatus
+            owner_sub_result = await db.execute(
+                select(User.subscription_status).where(User.id == user_id)
+            )
+            owner_sub_row = owner_sub_result.one_or_none()
+            if owner_sub_row:
+                sub_val = owner_sub_row[0]
+                if hasattr(sub_val, 'value'):
+                    sub_val = sub_val.value
+                if sub_val not in ("active", "trial"):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="This service is temporarily unavailable. Please contact your ISP."
+                    )
         
         # Get the owner's shortcode and display name for STK push
         owner_shortcode = None

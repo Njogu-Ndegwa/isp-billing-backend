@@ -50,3 +50,39 @@ async def get_current_active_user(current_user: CurrentUser = Depends(get_curren
             headers={"WWW-Authenticate": "Bearer"},
         )
     return current_user
+
+
+async def require_active_subscription(
+    current_user: CurrentUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> CurrentUser:
+    """
+    Require that a reseller has an active or trial subscription.
+    Admins always pass. Suspended/inactive resellers are blocked.
+    """
+    if current_user.role == "admin":
+        return current_user
+
+    from sqlalchemy import select
+    from app.db.models import User, SubscriptionStatus
+
+    user = (await db.execute(
+        select(User).where(User.id == current_user.user_id)
+    )).scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
+
+    sub_status = user.subscription_status
+    if hasattr(sub_status, 'value'):
+        sub_status = sub_status.value
+
+    if sub_status not in ("active", "trial"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your subscription is inactive. Please renew your subscription to continue using the service.",
+        )
+    return current_user

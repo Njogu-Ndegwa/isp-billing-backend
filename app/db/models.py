@@ -91,6 +91,23 @@ class PlanType(str, enum.Enum):
     EMERGENCY = "emergency"
     SPECIAL_OFFER = "special_offer"
 
+class SubscriptionStatus(str, enum.Enum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    TRIAL = "trial"
+    SUSPENDED = "suspended"
+
+class InvoiceStatus(str, enum.Enum):
+    PENDING = "pending"
+    PAID = "paid"
+    OVERDUE = "overdue"
+    WAIVED = "waived"
+
+class SubscriptionPaymentStatus(str, enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -105,6 +122,14 @@ class User(Base):
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_login_at = Column(DateTime, nullable=True)
+    subscription_status = Column(
+        Enum(SubscriptionStatus, name="subscriptionstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=SubscriptionStatus.TRIAL,
+        server_default="trial"
+    )
+    subscription_expires_at = Column(DateTime, nullable=True)
 
 class Customer(Base):
     __tablename__ = "customers"
@@ -219,12 +244,75 @@ class ResellerFinancials(Base):
 class Subscription(Base):
     __tablename__ = "subscriptions"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    is_active = Column(Boolean, nullable=False, default=True)
-    paid_on = Column(DateTime, default=datetime.utcnow)
-    expires_on = Column(DateTime)
-    plan_type = Column(String, nullable=False)
-    cost = Column(Float, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    status = Column(
+        Enum(SubscriptionStatus, name="subscriptionstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=SubscriptionStatus.TRIAL,
+    )
+    current_period_start = Column(DateTime, nullable=True)
+    current_period_end = Column(DateTime, nullable=True)
+    trial_ends_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    user = relationship("User", backref="subscription")
+
+    # Legacy columns kept for migration compatibility
+    is_active = Column(Boolean, nullable=True)
+    paid_on = Column(DateTime, nullable=True)
+    expires_on = Column(DateTime, nullable=True)
+    plan_type = Column(String, nullable=True)
+    cost = Column(Float, nullable=True)
+
+
+class SubscriptionInvoice(Base):
+    __tablename__ = "subscription_invoices"
+    __table_args__ = (
+        UniqueConstraint("user_id", "period_start", name="uq_subscription_invoice_user_period"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    period_start = Column(DateTime, nullable=False)
+    period_end = Column(DateTime, nullable=False)
+    hotspot_revenue = Column(Float, nullable=False, default=0)
+    hotspot_charge = Column(Float, nullable=False, default=0)
+    pppoe_user_count = Column(Integer, nullable=False, default=0)
+    pppoe_charge = Column(Float, nullable=False, default=0)
+    gross_charge = Column(Float, nullable=False, default=0)
+    final_charge = Column(Float, nullable=False, default=0)
+    status = Column(
+        Enum(InvoiceStatus, name="invoicestatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=InvoiceStatus.PENDING,
+    )
+    due_date = Column(DateTime, nullable=False)
+    paid_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user = relationship("User", backref="subscription_invoices")
+
+
+class SubscriptionPayment(Base):
+    __tablename__ = "subscription_payments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    invoice_id = Column(Integer, ForeignKey("subscription_invoices.id"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    amount = Column(Float, nullable=False)
+    payment_method = Column(String(50), nullable=False, default="mpesa")
+    payment_reference = Column(String(255), nullable=True)
+    mpesa_checkout_request_id = Column(String(255), nullable=True, unique=True, index=True)
+    phone_number = Column(String(20), nullable=True)
+    status = Column(
+        Enum(SubscriptionPaymentStatus, name="subscriptionpaymentstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=SubscriptionPaymentStatus.PENDING,
+    )
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user = relationship("User", backref="subscription_payments")
+    invoice = relationship("SubscriptionInvoice", backref="payments")
+
 
 class Router(Base):
     __tablename__ = "routers"
