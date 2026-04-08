@@ -838,7 +838,13 @@ async def run_subscription_migrations():
             ("current_period_start", "TIMESTAMP NULL"),
             ("current_period_end", "TIMESTAMP NULL"),
             ("trial_ends_at", "TIMESTAMP NULL"),
+            ("created_at", "TIMESTAMP DEFAULT NOW()"),
             ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+            ("is_active", "BOOLEAN NULL"),
+            ("paid_on", "TIMESTAMP NULL"),
+            ("expires_on", "TIMESTAMP NULL"),
+            ("plan_type", "VARCHAR NULL"),
+            ("cost", "FLOAT NULL"),
         ]:
             await _run_sql(f"Add subscriptions.{col_name}",
                 f"ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
