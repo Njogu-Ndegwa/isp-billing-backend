@@ -303,6 +303,13 @@ async def get_subscription_summary(db: AsyncSession, user_id: int) -> dict:
     if not user:
         return {}
 
+    # Self-heal: if trial reseller has no expiry date, set it now
+    status_val = user.subscription_status.value if hasattr(user.subscription_status, 'value') else user.subscription_status
+    if status_val == "trial" and user.subscription_expires_at is None:
+        user.subscription_expires_at = datetime.utcnow() + timedelta(days=TRIAL_DAYS)
+        await db.commit()
+        await db.refresh(user)
+
     sub = (await db.execute(
         select(Subscription).where(Subscription.user_id == user_id)
     )).scalar_one_or_none()
@@ -433,6 +440,12 @@ async def get_invoice_alert_for_user(db: AsyncSession, user_id: int) -> dict | N
         return None
 
     status_val = user.subscription_status.value if hasattr(user.subscription_status, 'value') else user.subscription_status
+
+    # Self-heal: if trial reseller has no expiry date, set it now
+    if status_val == "trial" and user.subscription_expires_at is None:
+        user.subscription_expires_at = datetime.utcnow() + timedelta(days=TRIAL_DAYS)
+        await db.commit()
+        await db.refresh(user)
 
     pending_invoice = await get_pending_invoice(db, user_id)
 

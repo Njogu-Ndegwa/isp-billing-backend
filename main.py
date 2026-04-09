@@ -950,15 +950,15 @@ async def run_subscription_migrations():
             "WHERE mpesa_checkout_request_id IS NOT NULL"
         )
 
-    # Step 6: Set trial expiry for existing resellers
+    # Step 6: Set trial expiry for existing resellers (use text casts for safety)
     await _run_sql("Set trial expiry for resellers (NULL)",
         "UPDATE users SET subscription_expires_at = NOW() + INTERVAL '7 days' "
-        "WHERE role = 'reseller' AND subscription_status = 'trial' "
+        "WHERE role::text = 'reseller' AND subscription_status::text = 'trial' "
         "AND subscription_expires_at IS NULL"
     )
     await _run_sql("Reset expired trial dates",
         "UPDATE users SET subscription_expires_at = NOW() + INTERVAL '7 days' "
-        "WHERE role = 'reseller' AND subscription_status = 'trial' "
+        "WHERE role::text = 'reseller' AND subscription_status::text = 'trial' "
         "AND subscription_expires_at < NOW()"
     )
     logger.info("Migration: Subscription system tables and columns ready")
