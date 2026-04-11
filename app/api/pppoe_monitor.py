@@ -480,6 +480,115 @@ def _pppoe_secrets_sync(router_info: dict) -> dict:
         api.disconnect()
 
 
+def _pppoe_users_sync(router_info: dict) -> dict:
+    """Gather all PPPoE users with online/offline status and live bandwidth."""
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"],
+        router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        secrets_data = api.get_ppp_secrets_full()
+        secrets = secrets_data.get("data", []) if secrets_data.get("success") else []
+
+        sessions_data = api.get_pppoe_sessions_with_bandwidth()
+        active_map = {
+            s["user"]: s
+            for s in sessions_data.get("data", [])
+        } if sessions_data.get("success") else {}
+
+        profiles_data = api.get_ppp_profiles()
+        profiles = {
+            p["name"]: p
+            for p in profiles_data.get("data", [])
+        } if profiles_data.get("success") else {}
+
+        users = []
+        total_upload_rate = 0
+        total_download_rate = 0
+        online_count = 0
+        offline_count = 0
+
+        for secret in secrets:
+            username = secret["name"]
+            session = active_map.get(username)
+            profile = profiles.get(secret.get("profile", ""))
+            is_online = session is not None
+
+            if is_online:
+                online_count += 1
+                upload_rate_raw = _parse_rate_to_bps(session.get("upload_rate", "0"))
+                download_rate_raw = _parse_rate_to_bps(session.get("download_rate", "0"))
+                total_upload_rate += upload_rate_raw
+                total_download_rate += download_rate_raw
+            else:
+                offline_count += 1
+
+            users.append({
+                "username": username,
+                "service": secret.get("service", ""),
+                "profile": secret.get("profile", ""),
+                "disabled": secret.get("disabled", False),
+                "comment": secret.get("comment", ""),
+                "online": is_online,
+                "address": session.get("address", "") if session else None,
+                "uptime": session.get("uptime", "") if session else None,
+                "caller_id": session.get("caller_id", "") if session else None,
+                "upload_bytes": session.get("upload_bytes", 0) if session else 0,
+                "download_bytes": session.get("download_bytes", 0) if session else 0,
+                "upload_rate": session.get("upload_rate", "0") if session else "0",
+                "download_rate": session.get("download_rate", "0") if session else "0",
+                "max_limit": session.get("max_limit", "") if session else (
+                    profile.get("rate_limit", "") if profile else ""
+                ),
+                "last_logged_out": secret.get("last_logged_out", ""),
+                "last_disconnect_reason": secret.get("last_disconnect_reason", ""),
+                "last_caller_id": secret.get("last_caller_id", ""),
+            })
+
+        return {
+            "success": True,
+            "users": users,
+            "summary": {
+                "total": len(users),
+                "online": online_count,
+                "offline": offline_count,
+                "disabled": sum(1 for u in users if u["disabled"]),
+                "total_upload_rate_bps": total_upload_rate,
+                "total_download_rate_bps": total_download_rate,
+            },
+        }
+    except Exception as e:
+        logger.error(f"PPPoE users error: {e}")
+        return {"error": str(e)}
+    finally:
+        api.disconnect()
+
+
+def _parse_rate_to_bps(rate_str: str) -> int:
+    """Convert a MikroTik rate string like '1500000' or '1.5M' to bits per second."""
+    if not rate_str:
+        return 0
+    rate_str = rate_str.strip()
+    try:
+        return int(rate_str)
+    except ValueError:
+        pass
+    try:
+        upper = rate_str.upper()
+        if upper.endswith("G"):
+            return int(float(upper[:-1]) * 1_000_000_000)
+        if upper.endswith("M"):
+            return int(float(upper[:-1]) * 1_000_000)
+        if upper.endswith("K"):
+            return int(float(upper[:-1]) * 1_000)
+        return int(float(rate_str))
+    except (ValueError, TypeError):
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -746,3 +855,113 @@ async def pppoe_secrets(
         "generated_at": datetime.utcnow().isoformat(),
         **result,
     }
+
+
+_pppoe_users_cache: dict = {}  # router_id -> {"data": ..., "timestamp": datetime}
+_USERS_CACHE_TTL = 30  # 30 seconds -- live bandwidth changes fast, keep cache short
+
+
+@router.get("/api/pppoe/{router_id}/users")
+async def pppoe_users(
+    router_id: int,
+    refresh: bool = False,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """All PPPoE users for a router with online/offline status and live bandwidth.
+
+    Returns every PPPoE secret on the router, enriched with:
+    - ``online`` flag (whether the user has an active session right now)
+    - Live ``upload_rate`` / ``download_rate`` (current throughput from dynamic queues)
+    - Session ``upload_bytes`` / ``download_bytes`` (cumulative for current session)
+    - ``uptime``, ``address``, ``caller_id`` for online users
+    - ``last_disconnect_reason``, ``last_logged_out`` for offline users
+    - DB customer cross-reference (name, phone, status, plan, expiry)
+
+    Cached for 30s per router unless ``?refresh=true``.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+
+    if not refresh and router_id in _pppoe_users_cache:
+        cached = _pppoe_users_cache[router_id]
+        age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
+        if age < _USERS_CACHE_TTL:
+            result = cached["data"].copy()
+            result["cached"] = True
+            result["cache_age_seconds"] = round(age, 1)
+            return result
+
+    router_info = {
+        "ip": router_obj.ip_address, "username": router_obj.username,
+        "password": router_obj.password, "port": router_obj.port,
+    }
+    result = await run_with_guard(router_id, _pppoe_users_sync, router_info)
+
+    if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "pppoe_users")
+        if router_id in _pppoe_users_cache:
+            stale = _pppoe_users_cache[router_id]["data"].copy()
+            stale["cached"] = True
+            stale["stale"] = True
+            stale["cache_age_seconds"] = (
+                datetime.utcnow() - _pppoe_users_cache[router_id]["timestamp"]
+            ).total_seconds()
+            return stale
+        raise HTTPException(status_code=503, detail="Failed to connect to router")
+    if result.get("error") == "timeout":
+        await record_router_availability(db, router_id, False, "pppoe_users")
+        if router_id in _pppoe_users_cache:
+            stale = _pppoe_users_cache[router_id]["data"].copy()
+            stale["cached"] = True
+            stale["stale"] = True
+            return stale
+        raise HTTPException(status_code=504, detail=result.get("detail", "Operation timed out"))
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    await record_router_availability(db, router_id, True, "pppoe_users")
+
+    stmt = (
+        select(Customer)
+        .options(selectinload(Customer.plan))
+        .where(
+            Customer.router_id == router_id,
+            Customer.pppoe_username.isnot(None),
+        )
+    )
+    db_result = await db.execute(stmt)
+    customers = db_result.scalars().all()
+    customer_map = {c.pppoe_username: c for c in customers}
+
+    for u in result.get("users", []):
+        cust = customer_map.get(u["username"])
+        if cust:
+            u["customer"] = {
+                "id": cust.id,
+                "name": cust.name,
+                "phone": cust.phone,
+                "status": cust.status.value if cust.status else "unknown",
+                "plan": cust.plan.name if cust.plan else None,
+                "plan_speed": cust.plan.speed if cust.plan else None,
+                "expiry": cust.expiry.isoformat() if cust.expiry else None,
+            }
+        else:
+            u["customer"] = None
+
+    response = {
+        "router_id": router_id,
+        "router_name": router_obj.name,
+        "generated_at": datetime.utcnow().isoformat(),
+        "cached": False,
+        **result,
+    }
+
+    _pppoe_users_cache[router_id] = {
+        "data": response,
+        "timestamp": datetime.utcnow(),
+    }
+
+    return response

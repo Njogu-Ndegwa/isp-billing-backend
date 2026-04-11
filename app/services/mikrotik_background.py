@@ -1289,10 +1289,18 @@ def _fetch_bandwidth_data_sync_for_router(router_info: dict):
             speed_stats = api.get_queue_speed_stats()
 
     queues = api.send_command("/queue/simple/print")
+
+    pppoe_sessions = api.get_active_pppoe_sessions()
+    if not pppoe_sessions.get("success") and not api.connected:
+        if _bandwidth_reconnect(api, router_info):
+            pppoe_sessions = api.get_active_pppoe_sessions()
+
     api.disconnect()
 
+    pppoe_count = len(pppoe_sessions.get("data", [])) if pppoe_sessions.get("success") else 0
     logger.info(f"[BANDWIDTH] Router {router_info['id']} raw data:")
     logger.info(f"  - Hotspot active sessions: {len(active_sessions.get('data', []))}")
+    logger.info(f"  - PPPoE active sessions: {pppoe_count}")
     logger.info(f"  - Hotspot hosts total: {hotspot_hosts.get('total', 0)}, bypassed: {hotspot_hosts.get('bypassed', 0)}")
     logger.info(f"  - ARP entries: {arp_entries.get('count', 0)}")
     logger.info(f"  - Queue stats: active_queues={speed_stats.get('data', {}).get('active_queues', 0)}, total_queues={speed_stats.get('data', {}).get('total_queues', 0)}")
@@ -1313,7 +1321,8 @@ def _fetch_bandwidth_data_sync_for_router(router_info: dict):
         "speed_stats": speed_stats,
         "queues": queues,
         "hotspot_hosts": hotspot_hosts,
-        "arp_entries": arp_entries
+        "arp_entries": arp_entries,
+        "pppoe_sessions": pppoe_sessions,
     }
 
 
@@ -1445,6 +1454,10 @@ async def collect_bandwidth_snapshot():
                     else:
                         active_devices = 0
 
+                    pppoe_sessions = raw.get("pppoe_sessions", {})
+                    pppoe_active_count = len(pppoe_sessions.get("data", [])) if pppoe_sessions.get("success") else 0
+                    active_devices += pppoe_active_count
+
                     snapshot = BandwidthSnapshot(
                         router_id=router_id,
                         total_upload_bps=int(speed_data.get("total_upload_bps", 0)),
@@ -1462,39 +1475,83 @@ async def collect_bandwidth_snapshot():
                     queues = raw.get("queues", {})
                     if queues.get("success") and queues.get("data"):
                         for q in queues["data"]:
+                            qname = q.get("name", "")
                             comment = q.get("comment", "")
+
+                            # --- Hotspot queues (MAC-based) ---
                             mac = ""
                             if "MAC:" in comment:
                                 mac = comment.split("MAC:")[1].split("|")[0].strip()
-                            if not mac:
-                                continue
-                            bytes_str = q.get("bytes", "0/0")
-                            bytes_parts = bytes_str.split("/")
-                            upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 and bytes_parts[0].isdigit() else 0
-                            download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 and bytes_parts[1].isdigit() else 0
-                            cust_result = await db.execute(
-                                select(Customer).where(Customer.mac_address.ilike(f"%{mac}%"))
-                            )
-                            customer = cust_result.scalars().first()
-                            existing = await db.execute(
-                                select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == mac)
-                            )
-                            usage = existing.scalar_one_or_none()
-                            if usage:
-                                usage.upload_bytes = upload_bytes
-                                usage.download_bytes = download_bytes
-                                usage.max_limit = q.get("max-limit", "")
-                                usage.last_updated = now
-                                if customer:
-                                    usage.customer_id = customer.id
-                            else:
-                                usage = UserBandwidthUsage(
-                                    mac_address=mac, customer_id=customer.id if customer else None,
-                                    queue_name=q.get("name", ""), target_ip=q.get("target", ""),
-                                    upload_bytes=upload_bytes, download_bytes=download_bytes,
-                                    max_limit=q.get("max-limit", ""), last_updated=now
+                            if mac:
+                                bytes_str = q.get("bytes", "0/0")
+                                bytes_parts = bytes_str.split("/")
+                                upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 and bytes_parts[0].isdigit() else 0
+                                download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 and bytes_parts[1].isdigit() else 0
+                                cust_result = await db.execute(
+                                    select(Customer).where(Customer.mac_address.ilike(f"%{mac}%"))
                                 )
-                                db.add(usage)
+                                customer = cust_result.scalars().first()
+                                existing = await db.execute(
+                                    select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == mac)
+                                )
+                                usage = existing.scalar_one_or_none()
+                                if usage:
+                                    usage.upload_bytes = upload_bytes
+                                    usage.download_bytes = download_bytes
+                                    usage.max_limit = q.get("max-limit", "")
+                                    usage.last_updated = now
+                                    if customer:
+                                        usage.customer_id = customer.id
+                                else:
+                                    usage = UserBandwidthUsage(
+                                        mac_address=mac, customer_id=customer.id if customer else None,
+                                        queue_name=qname, target_ip=q.get("target", ""),
+                                        upload_bytes=upload_bytes, download_bytes=download_bytes,
+                                        max_limit=q.get("max-limit", ""), last_updated=now
+                                    )
+                                    db.add(usage)
+                                continue
+
+                            # --- PPPoE dynamic queues (<pppoe-USERNAME>) ---
+                            if qname.startswith("<pppoe-") and qname.endswith(">"):
+                                pppoe_user = qname[7:-1]
+                                bytes_str = q.get("bytes", "0/0")
+                                bytes_parts = bytes_str.split("/")
+                                upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 and bytes_parts[0].isdigit() else 0
+                                download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 and bytes_parts[1].isdigit() else 0
+                                pppoe_key = f"pppoe:{pppoe_user}"
+                                cust_result = await db.execute(
+                                    select(Customer).where(
+                                        Customer.pppoe_username == pppoe_user,
+                                        Customer.router_id == router_id,
+                                    )
+                                )
+                                customer = cust_result.scalars().first()
+                                existing = await db.execute(
+                                    select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == pppoe_key)
+                                )
+                                usage = existing.scalar_one_or_none()
+                                if usage:
+                                    usage.upload_bytes = upload_bytes
+                                    usage.download_bytes = download_bytes
+                                    usage.max_limit = q.get("max-limit", "")
+                                    usage.queue_name = qname
+                                    usage.target_ip = q.get("target", "")
+                                    usage.last_updated = now
+                                    if customer:
+                                        usage.customer_id = customer.id
+                                else:
+                                    usage = UserBandwidthUsage(
+                                        mac_address=pppoe_key,
+                                        customer_id=customer.id if customer else None,
+                                        queue_name=qname,
+                                        target_ip=q.get("target", ""),
+                                        upload_bytes=upload_bytes,
+                                        download_bytes=download_bytes,
+                                        max_limit=q.get("max-limit", ""),
+                                        last_updated=now,
+                                    )
+                                    db.add(usage)
 
                     logger.debug(f"Collected bandwidth snapshot for router {router.name} (ID: {router_id})")
                 except Exception as router_error:
