@@ -327,14 +327,14 @@ def _rsc_hotspot() -> str:
 }
 
 :do {
-    /ip/hotspot/profile/add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=hotspot
+    /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=hotspot
     :log info "Provisioning: hotspot profile hsprof1 created"
 } on-error={
     :log info "Provisioning: hotspot profile hsprof1 already exists or hotspot unavailable, continuing"
 }
 
 :do {
-    /ip/hotspot/add name=hotspot1 interface=bridge address-pool=dhcp-pool profile=hsprof1 disabled=no
+    /ip hotspot add name=hotspot1 interface=bridge address-pool=dhcp-pool profile=hsprof1 disabled=no
     :log info "Provisioning: hotspot1 created"
 } on-error={
     :log warning "Provisioning: hotspot1 add failed (may already exist or hotspot feature unavailable)"
@@ -342,7 +342,7 @@ def _rsc_hotspot() -> str:
 
 :local hsCount 0
 :do {
-    :set hsCount [:len [/ip/hotspot/find where name=hotspot1]]
+    :set hsCount [:len [/ip hotspot find where name=hotspot1]]
 } on-error={
     :log error "PROVISION WARNING: could not query hotspot — the hotspot feature may not be available. Ensure device-mode hotspot is enabled: /system/device-mode/update hotspot=yes then press the physical reset button."
 }

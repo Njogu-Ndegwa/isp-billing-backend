@@ -294,6 +294,7 @@ async def delete_customer(
     """Delete a customer and all related data. Removes PPPoE secret from router if active."""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
 
         stmt = (
             select(Customer)
@@ -523,6 +524,7 @@ async def update_customer_location(
     """
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
         stmt = select(Customer).where(Customer.id == customer_id, Customer.user_id == user.id)
         result = await db.execute(stmt)
         customer = result.scalar_one_or_none()
@@ -573,6 +575,7 @@ async def activate_pppoe_customer(
     """
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
 
         stmt = (
             select(Customer)
@@ -667,6 +670,7 @@ async def deactivate_pppoe_customer(
     """
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
 
         stmt = (
             select(Customer)
@@ -756,6 +760,7 @@ async def regenerate_pppoe_password(
     """
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
 
         stmt = (
             select(Customer)

@@ -337,18 +337,32 @@ async def get_subscription_summary(db: AsyncSession, user_id: int) -> dict:
         "current_period_end": sub.current_period_end.isoformat() if sub and sub.current_period_end else None,
         "total_paid": total_paid,
         "invoice_count": invoice_count,
-        "pending_invoice": enrich_invoice(pending_invoice) if pending_invoice else None,
+        "pending_invoice": (
+            enrich_invoice(pending_invoice, await get_invoice_amount_paid(db, pending_invoice.id))
+            if pending_invoice else None
+        ),
     }
 
 
-def enrich_invoice(invoice: SubscriptionInvoice) -> dict:
-    """Add computed timing fields to an invoice dict."""
+async def get_invoice_amount_paid(db: AsyncSession, invoice_id: int) -> float:
+    """Total completed payments toward a specific invoice."""
+    result = (await db.execute(
+        select(func.coalesce(func.sum(SubscriptionPayment.amount), 0)).where(
+            SubscriptionPayment.invoice_id == invoice_id,
+            SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+        )
+    )).scalar()
+    return float(result)
+
+
+def enrich_invoice(invoice: SubscriptionInvoice, amount_paid: float = 0.0) -> dict:
+    """Add computed timing fields and payment progress to an invoice dict."""
     now = datetime.utcnow()
     status_val = invoice.status.value if hasattr(invoice.status, 'value') else invoice.status
 
     days_until_due = (invoice.due_date - now).days if invoice.due_date else 0
+    balance_remaining = max(invoice.final_charge - amount_paid, 0.0)
 
-    # Paid/waived invoices are never overdue or due soon
     if status_val in ("paid", "waived"):
         is_overdue = False
         is_due_soon = False
@@ -384,6 +398,8 @@ def enrich_invoice(invoice: SubscriptionInvoice) -> dict:
         "pppoe_charge": invoice.pppoe_charge,
         "gross_charge": invoice.gross_charge,
         "final_charge": invoice.final_charge,
+        "amount_paid": round(amount_paid, 2),
+        "balance_remaining": round(balance_remaining, 2),
         "status": status_val,
         "due_date": invoice.due_date.isoformat() if invoice.due_date else None,
         "paid_at": invoice.paid_at.isoformat() if invoice.paid_at else None,
@@ -404,7 +420,7 @@ async def record_subscription_payment(
     checkout_request_id: str | None = None,
     phone_number: str | None = None,
 ) -> SubscriptionPayment:
-    """Record a completed subscription payment and activate the subscription."""
+    """Record a completed subscription payment. Activates only when invoice is fully paid."""
     payment = SubscriptionPayment(
         invoice_id=invoice_id,
         user_id=user_id,
@@ -416,16 +432,19 @@ async def record_subscription_payment(
         status=SubscriptionPaymentStatus.COMPLETED,
     )
     db.add(payment)
+    await db.flush()
 
     if invoice_id:
         invoice = (await db.execute(
             select(SubscriptionInvoice).where(SubscriptionInvoice.id == invoice_id)
         )).scalar_one_or_none()
         if invoice:
-            invoice.status = InvoiceStatus.PAID
-            invoice.paid_at = datetime.utcnow()
+            total_paid = await get_invoice_amount_paid(db, invoice.id)
+            if total_paid >= invoice.final_charge:
+                invoice.status = InvoiceStatus.PAID
+                invoice.paid_at = datetime.utcnow()
+                await activate_subscription(db, user_id, months=1)
 
-    await activate_subscription(db, user_id, months=1)
     await db.flush()
     return payment
 
@@ -448,15 +467,23 @@ async def get_invoice_alert_for_user(db: AsyncSession, user_id: int) -> dict | N
         await db.refresh(user)
 
     pending_invoice = await get_pending_invoice(db, user_id)
+    inv_paid = await get_invoice_amount_paid(db, pending_invoice.id) if pending_invoice else 0.0
 
     if status_val == "suspended":
         message = "Your subscription is suspended. Please pay your outstanding invoice to continue using the service."
     elif pending_invoice:
-        enriched = enrich_invoice(pending_invoice)
+        enriched = enrich_invoice(pending_invoice, inv_paid)
+        remaining = enriched["balance_remaining"]
         if enriched["is_overdue"]:
-            message = f"Your {enriched['period_label']} invoice of KES {enriched['final_charge']:,.0f} is overdue. Please pay to avoid suspension."
+            message = f"Your {enriched['period_label']} invoice of KES {enriched['final_charge']:,.0f} is overdue."
+            if inv_paid > 0:
+                message += f" KES {inv_paid:,.0f} paid, KES {remaining:,.0f} remaining."
+            else:
+                message += " Please pay to avoid suspension."
         elif enriched["is_due_soon"]:
             message = f"Your {enriched['period_label']} invoice of KES {enriched['final_charge']:,.0f} is due in {enriched['days_until_due']} day{'s' if enriched['days_until_due'] != 1 else ''}."
+            if inv_paid > 0:
+                message += f" KES {inv_paid:,.0f} paid, KES {remaining:,.0f} remaining."
         else:
             return None
     elif status_val == "trial":
@@ -478,7 +505,6 @@ async def get_invoice_alert_for_user(db: AsyncSession, user_id: int) -> dict | N
     }
 
     if pending_invoice:
-        enriched = enrich_invoice(pending_invoice)
-        result["current_invoice"] = enriched
+        result["current_invoice"] = enrich_invoice(pending_invoice, inv_paid)
 
     return result

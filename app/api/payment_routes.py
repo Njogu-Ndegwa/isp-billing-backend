@@ -1199,6 +1199,7 @@ async def manual_provision_transaction(
     """
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
         method = payment_method.lower()
 
         customer = None

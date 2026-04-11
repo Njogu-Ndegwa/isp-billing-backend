@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.db.models import Router, Customer, BandwidthSnapshot, UserBandwidthUsage
 from app.services.auth import verify_token, get_current_user
+from app.services.subscription import enforce_active_subscription
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.router_helpers import get_router_by_id
 from app.services.router_availability import record_router_availability
@@ -356,6 +357,7 @@ async def add_walled_garden_ip_entry(
     """Add an IP address to the walled garden (allows hotspot users to reach it before auth)."""
     try:
         current_user = await get_current_user(token, db)
+        enforce_active_subscription(current_user)
         target_router = await get_router_by_id(db, router_id, current_user.id, current_user.role.value)
         if not target_router:
             raise HTTPException(status_code=404, detail="Router not found or not accessible")
@@ -391,6 +393,7 @@ async def add_walled_garden_domain_entry(
     """Add a domain to the walled garden (allows hotspot users to access it before auth)."""
     try:
         current_user = await get_current_user(token, db)
+        enforce_active_subscription(current_user)
         target_router = await get_router_by_id(db, router_id, current_user.id, current_user.role.value)
         if not target_router:
             raise HTTPException(status_code=404, detail="Router not found or not accessible")
@@ -426,6 +429,7 @@ async def remove_walled_garden_ip_entry(
     """Remove an IP-based walled garden entry."""
     try:
         current_user = await get_current_user(token, db)
+        enforce_active_subscription(current_user)
         target_router = await get_router_by_id(db, router_id, current_user.id, current_user.role.value)
         if not target_router:
             raise HTTPException(status_code=404, detail="Router not found or not accessible")
@@ -461,6 +465,7 @@ async def remove_walled_garden_domain_entry(
     """Remove a domain-based walled garden entry."""
     try:
         current_user = await get_current_user(token, db)
+        enforce_active_subscription(current_user)
         target_router = await get_router_by_id(db, router_id, current_user.id, current_user.role.value)
         if not target_router:
             raise HTTPException(status_code=404, detail="Router not found or not accessible")
@@ -501,6 +506,7 @@ async def update_wireguard_endpoint(
     """Update WireGuard peer endpoint address (when server IP changes)."""
     try:
         current_user = await get_current_user(token, db)
+        enforce_active_subscription(current_user)
         if router_id:
             router = await get_router_by_id(db, router_id, current_user.id, current_user.role.value)
             if not router:

@@ -9,6 +9,8 @@ from datetime import datetime
 import csv
 import io
 
+from app.services.subscription import enforce_active_subscription
+
 from app.db.database import get_db
 from app.db.models import Voucher, VoucherStatus, Plan, Router
 from app.services.auth import verify_token, get_current_user
@@ -36,6 +38,7 @@ async def generate_vouchers_api(
 ):
     """Generate voucher codes. Set quantity=1 for on-demand single voucher."""
     user = await get_current_user(token, db)
+    enforce_active_subscription(user)
 
     result = await generate_vouchers(
         db=db,
@@ -246,6 +249,7 @@ async def disable_voucher(
 ):
     """Disable a voucher so it can no longer be redeemed."""
     user = await get_current_user(token, db)
+    enforce_active_subscription(user)
 
     result = await db.execute(
         select(Voucher).where(Voucher.id == voucher_id, Voucher.user_id == user.id)

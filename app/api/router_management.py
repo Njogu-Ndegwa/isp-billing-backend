@@ -327,6 +327,7 @@ async def update_router_identity(
 ):
     """Update router's MikroTik system identity"""
     user = await get_current_user(token, db)
+    enforce_active_subscription(user)
     stmt = select(Router).where(Router.id == router_id, Router.user_id == user.id)
     result = await db.execute(stmt)
     router_obj = result.scalar_one_or_none()
@@ -360,6 +361,7 @@ async def update_router(
     """Update router details"""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
         stmt = select(Router).where(Router.id == router_id, Router.user_id == user.id)
         result = await db.execute(stmt)
         router_obj = result.scalar_one_or_none()
@@ -430,6 +432,7 @@ async def delete_router(
     """
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
         stmt = select(Router).where(Router.id == router_id, Router.user_id == user.id)
         result = await db.execute(stmt)
         router_obj = result.scalar_one_or_none()

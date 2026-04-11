@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.db.models import Ad, AdClick, AdImpression, AdClickType, Advertiser, AdBadgeType
 from app.services.auth import verify_token, get_current_user
+from app.services.subscription import enforce_active_subscription
 
 import logging
 
@@ -90,7 +91,8 @@ async def create_advertiser(
     token: str = Depends(verify_token)
 ):
     """Create a new advertiser."""
-    await get_current_user(token, db)
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
     try:
         advertiser = Advertiser(
             name=request.name,
@@ -150,9 +152,9 @@ async def create_ad(
     token: str = Depends(verify_token)
 ):
     """Create a new ad."""
-    await get_current_user(token, db)
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
     try:
-        # Validate advertiser exists
         adv_result = await db.execute(select(Advertiser).where(Advertiser.id == request.advertiser_id))
         if not adv_result.scalar_one_or_none():
             raise HTTPException(status_code=404, detail="Advertiser not found")
@@ -212,7 +214,8 @@ async def delete_ad(
     token: str = Depends(verify_token)
 ):
     """Delete an ad by ID (cascades to clicks and impressions)."""
-    await get_current_user(token, db)
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
     try:
         result = await db.execute(select(Ad).where(Ad.id == ad_id))
         ad = result.scalar_one_or_none()
@@ -244,7 +247,8 @@ async def update_ad(
     token: str = Depends(verify_token)
 ):
     """Update an ad by ID."""
-    await get_current_user(token, db)
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
     try:
         result = await db.execute(select(Ad).where(Ad.id == ad_id))
         ad = result.scalar_one_or_none()

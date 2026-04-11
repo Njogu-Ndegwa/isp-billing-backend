@@ -9,6 +9,7 @@ from app.db.database import get_db
 from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router
 from app.services.auth import verify_token, get_current_user
 from app.services.plan_cache import get_plans_cached, invalidate_plan_cache
+from app.services.subscription import enforce_active_subscription
 import logging
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ async def create_plan_api(
     """Create a new internet plan"""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
         
         # Validate price and duration
         if request.price < 0:
@@ -185,6 +187,7 @@ async def update_plan_api(
     """Update an existing plan"""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
         stmt = select(Plan).where(Plan.id == plan_id, Plan.user_id == user.id)
         result = await db.execute(stmt)
         plan = result.scalar_one_or_none()
@@ -269,6 +272,7 @@ async def delete_plan(
     """Delete a plan (only if no active customers using it)"""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
         
         # Check if plan exists
         plan_stmt = select(Plan).where(Plan.id == plan_id, Plan.user_id == user.id)
@@ -432,6 +436,7 @@ async def activate_emergency_mode(
     then hide all REGULAR plans and show all EMERGENCY plans for this user."""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
 
         stmt = select(Router).where(Router.id == request.router_id, Router.user_id == user.id)
         result = await db.execute(stmt)
@@ -484,6 +489,7 @@ async def deactivate_emergency_mode(
     then show all REGULAR plans and hide all EMERGENCY plans for this user."""
     try:
         user = await get_current_user(token, db)
+        enforce_active_subscription(user)
 
         stmt = select(Router).where(Router.id == request.router_id, Router.user_id == user.id)
         result = await db.execute(stmt)

@@ -13,6 +13,7 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import (
     get_subscription_summary, get_pending_invoice, enrich_invoice,
+    get_invoice_amount_paid,
     activate_subscription, deactivate_subscription,
     generate_monthly_invoices, calculate_reseller_charges,
     generate_invoice_for_reseller, record_subscription_payment,
@@ -62,7 +63,8 @@ async def get_current_invoice(
     if not invoice:
         return {"current_invoice": None}
 
-    return {"current_invoice": enrich_invoice(invoice)}
+    paid = await get_invoice_amount_paid(db, invoice.id)
+    return {"current_invoice": enrich_invoice(invoice, paid)}
 
 
 @router.get("/api/subscription/invoices")
@@ -104,7 +106,10 @@ async def list_my_invoices(
         "per_page": per_page,
         "total": total,
         "total_pages": (total + per_page - 1) // per_page,
-        "invoices": [enrich_invoice(inv) for inv in invoices],
+        "invoices": [
+            enrich_invoice(inv, await get_invoice_amount_paid(db, inv.id))
+            for inv in invoices
+        ],
     }
 
 
@@ -133,7 +138,8 @@ async def get_invoice_detail(
         .order_by(SubscriptionPayment.created_at.desc())
     )).scalars().all()
 
-    enriched = enrich_invoice(invoice)
+    paid = await get_invoice_amount_paid(db, invoice.id)
+    enriched = enrich_invoice(invoice, paid)
     enriched["payments"] = [
         {
             "id": p.id,
@@ -153,6 +159,7 @@ async def get_invoice_detail(
 class SubscriptionPayRequest(BaseModel):
     invoice_id: int
     phone_number: str
+    amount: Optional[float] = None
 
 
 @router.post("/api/subscription/pay")
@@ -161,7 +168,8 @@ async def pay_subscription(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Initiate M-Pesa STK push to pay a subscription invoice."""
+    """Initiate M-Pesa STK push to pay a subscription invoice.
+    Supports partial payments — omit amount to pay the remaining balance."""
     user = await get_current_user(token, db)
     if user.role != UserRole.RESELLER:
         raise HTTPException(status_code=403, detail="Only resellers can pay subscriptions")
@@ -179,13 +187,22 @@ async def pay_subscription(
     if invoice.status in (InvoiceStatus.PAID, InvoiceStatus.WAIVED):
         raise HTTPException(status_code=400, detail="Invoice is already paid or waived")
 
+    already_paid = await get_invoice_amount_paid(db, invoice.id)
+    balance = round(invoice.final_charge - already_paid, 2)
+
+    if balance <= 0:
+        raise HTTPException(status_code=400, detail="Invoice is already fully paid")
+
+    amount = request.amount if request.amount else balance
+    if amount < 1:
+        raise HTTPException(status_code=400, detail="Amount must be at least KES 1")
+
     phone = request.phone_number.strip()
     if phone.startswith("0"):
         phone = "254" + phone[1:]
     elif phone.startswith("+"):
         phone = phone[1:]
 
-    amount = invoice.final_charge
     reference = f"SUB-{invoice.id}"
 
     callback_url = settings.MPESA_CALLBACK_URL.rstrip("/")
@@ -228,6 +245,9 @@ async def pay_subscription(
         "payment_id": pending_payment.id,
         "checkout_request_id": stk_response.checkout_request_id if stk_response else None,
         "amount": amount,
+        "invoice_total": invoice.final_charge,
+        "already_paid": round(already_paid, 2),
+        "balance_after_this": round(max(balance - amount, 0), 2),
         "phone_number": phone,
     }
 
@@ -273,6 +293,7 @@ async def subscription_mpesa_callback(request: Request, db: AsyncSession = Depen
             payment.status = SubscriptionPaymentStatus.COMPLETED
             payment.payment_reference = receipt_number
 
+            fully_paid = False
             if payment.invoice_id:
                 invoice = (await db.execute(
                     select(SubscriptionInvoice).where(
@@ -280,13 +301,29 @@ async def subscription_mpesa_callback(request: Request, db: AsyncSession = Depen
                     )
                 )).scalar_one_or_none()
                 if invoice:
-                    invoice.status = InvoiceStatus.PAID
-                    invoice.paid_at = datetime.utcnow()
+                    await db.flush()
+                    total_paid = await get_invoice_amount_paid(db, invoice.id)
+                    if total_paid >= invoice.final_charge:
+                        invoice.status = InvoiceStatus.PAID
+                        invoice.paid_at = datetime.utcnow()
+                        fully_paid = True
+                        logger.info(
+                            f"[SUBSCRIPTION] Invoice #{invoice.id} fully paid "
+                            f"({total_paid:,.0f} / {invoice.final_charge:,.0f})"
+                        )
+                    else:
+                        logger.info(
+                            f"[SUBSCRIPTION] Partial payment for invoice #{invoice.id}: "
+                            f"{total_paid:,.0f} / {invoice.final_charge:,.0f}"
+                        )
 
-            await activate_subscription(db, payment.user_id, months=1)
+            if fully_paid:
+                await activate_subscription(db, payment.user_id, months=1)
+
             logger.info(
                 f"[SUBSCRIPTION] Payment completed for reseller {payment.user_id}, "
-                f"invoice #{payment.invoice_id}, receipt={receipt_number}"
+                f"invoice #{payment.invoice_id}, receipt={receipt_number}, "
+                f"amount={payment.amount}, activated={fully_paid}"
             )
         else:
             payment.status = SubscriptionPaymentStatus.FAILED
@@ -400,9 +437,8 @@ async def admin_list_subscriptions(
             )
         )).scalar())
 
-        outstanding = 0.0
-        if pending_inv:
-            outstanding = pending_inv.final_charge
+        inv_paid = await get_invoice_amount_paid(db, pending_inv.id) if pending_inv else 0.0
+        outstanding = round(pending_inv.final_charge - inv_paid, 2) if pending_inv else 0.0
 
         sub_status = r.subscription_status
         sub_status_val = sub_status.value if hasattr(sub_status, 'value') else sub_status
@@ -416,7 +452,7 @@ async def admin_list_subscriptions(
             "subscription_expires_at": r.subscription_expires_at.isoformat() if r.subscription_expires_at else None,
             "total_paid": total_paid,
             "outstanding": outstanding,
-            "pending_invoice": enrich_invoice(pending_inv) if pending_inv else None,
+            "pending_invoice": enrich_invoice(pending_inv, inv_paid) if pending_inv else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "last_login_at": r.last_login_at.isoformat() if r.last_login_at else None,
         })
@@ -584,7 +620,10 @@ async def admin_get_subscription_detail(
             "business_name": user.business_name,
         },
         "subscription": summary,
-        "invoices": [enrich_invoice(inv) for inv in invoices],
+        "invoices": [
+            enrich_invoice(inv, await get_invoice_amount_paid(db, inv.id))
+            for inv in invoices
+        ],
         "payments": [
             {
                 "id": p.id,
