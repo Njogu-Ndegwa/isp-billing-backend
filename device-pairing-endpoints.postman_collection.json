@@ -1,0 +1,92 @@
+{
+    "info": {
+        "name": "Device Pairing - Companion Device Endpoints",
+        "description": "API endpoints for pairing browserless devices (Smart TVs, consoles, IoT) to the hotspot system via a companion phone.",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"}
+    ],
+    "item": [
+        {
+            "name": "Pair Device and Pay (M-Pesa)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/public/device/pair-and-pay",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"device_mac\": \"AA:BB:CC:DD:EE:FF\",\n    \"owner_phone\": \"0712345678\",\n    \"plan_id\": 1,\n    \"router_id\": 1,\n    \"device_name\": \"Living Room TV\",\n    \"device_type\": \"tv\",\n    \"payment_method\": \"mobile_money\",\n    \"owner_name\": \"John Doe\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Pair Device and Pay (Cash)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/public/device/pair-and-pay",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"device_mac\": \"AA:BB:CC:DD:EE:FF\",\n    \"owner_phone\": \"0712345678\",\n    \"plan_id\": 1,\n    \"router_id\": 1,\n    \"device_name\": \"Living Room TV\",\n    \"device_type\": \"tv\",\n    \"payment_method\": \"cash\",\n    \"payment_reference\": \"CASH-001\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Pair Device with Voucher",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/public/device/pair-voucher",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"device_mac\": \"AA:BB:CC:DD:EE:FF\",\n    \"voucher_code\": \"1234-5678\",\n    \"router_id\": 1,\n    \"device_name\": \"Bedroom TV\",\n    \"device_type\": \"tv\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Get Device Status",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/public/device/status/1/AA:BB:CC:DD:EE:FF",
+                "header": []
+            }
+        },
+        {
+            "name": "List Paired Devices by Phone",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/public/device/paired/1/0712345678",
+                "header": []
+            }
+        },
+        {
+            "name": "Unpair Device",
+            "request": {
+                "method": "DELETE",
+                "url": "{{baseUrl}}/api/public/device/unpair/1",
+                "header": []
+            }
+        },
+        {
+            "name": "Reconnect Device",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/public/device/reconnect",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"device_mac\": \"AA:BB:CC:DD:EE:FF\",\n    \"router_id\": 1,\n    \"owner_phone\": \"0712345678\"\n}"
+                }
+            }
+        }
+    ]
+}

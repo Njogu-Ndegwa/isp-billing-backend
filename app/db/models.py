@@ -810,6 +810,42 @@ class B2BTransaction(Base):
     charge = relationship("ResellerTransactionCharge")
 
 
+class DeviceType(str, enum.Enum):
+    TV = "tv"
+    CONSOLE = "console"
+    LAPTOP = "laptop"
+    IOT = "iot"
+    OTHER = "other"
+
+
+class DevicePairing(Base):
+    """Tracks companion device pairings (TVs, consoles, etc.) linked to a customer."""
+    __tablename__ = "device_pairings"
+    __table_args__ = (
+        UniqueConstraint("device_mac", "router_id", name="uq_device_mac_per_router"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    device_mac = Column(String, nullable=False, index=True)
+    device_name = Column(String(100), nullable=True)
+    device_type = Column(
+        Enum(DeviceType, name="devicetype", values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=DeviceType.TV,
+    )
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=False)
+    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=True)
+    is_active = Column(Boolean, default=True)
+    provisioned_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    customer = relationship("Customer", backref="paired_devices")
+    router = relationship("Router")
+    plan = relationship("Plan")
+
+
 class ReconnectionAttempt(Base):
     """Tracks self-service reconnection attempts for rate limiting and audit."""
     __tablename__ = "reconnection_attempts"

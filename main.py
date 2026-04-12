@@ -48,6 +48,7 @@ from app.api.admin_reseller_routes import router as admin_reseller_router
 from app.api.profile_routes import router as profile_router
 from app.api.b2b_routes import router as b2b_router
 from app.api.subscription_routes import router as subscription_router
+from app.api.device_pairing import router as device_pairing_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -74,6 +75,7 @@ app.include_router(admin_reseller_router)
 app.include_router(profile_router)
 app.include_router(b2b_router)
 app.include_router(subscription_router)
+app.include_router(device_pairing_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -725,6 +727,54 @@ async def run_reconnection_migrations():
 
 
 # ============================================================================
+# Device Pairing Migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_device_pairing_migrations():
+    """Create device_pairings table for companion device pairing (TVs, consoles, etc.)."""
+    async with async_engine.begin() as conn:
+        result = await conn.execute(sa_text("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_name = 'device_pairings'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                DO $$ BEGIN
+                    CREATE TYPE devicetype AS ENUM ('tv', 'console', 'laptop', 'iot', 'other');
+                EXCEPTION
+                    WHEN duplicate_object THEN null;
+                END $$;
+            """))
+            await conn.execute(sa_text("""
+                CREATE TABLE device_pairings (
+                    id SERIAL PRIMARY KEY,
+                    customer_id INTEGER NOT NULL REFERENCES customers(id),
+                    device_mac VARCHAR NOT NULL,
+                    device_name VARCHAR(100),
+                    device_type devicetype NOT NULL DEFAULT 'tv',
+                    router_id INTEGER NOT NULL REFERENCES routers(id),
+                    plan_id INTEGER REFERENCES plans(id),
+                    is_active BOOLEAN DEFAULT TRUE,
+                    provisioned_at TIMESTAMP,
+                    expires_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    CONSTRAINT uq_device_mac_per_router UNIQUE (device_mac, router_id)
+                )
+            """))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_device_pairings_customer ON device_pairings(customer_id)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_device_pairings_mac ON device_pairings(device_mac)"
+            ))
+            await conn.execute(sa_text(
+                "CREATE INDEX idx_device_pairings_router ON device_pairings(router_id)"
+            ))
+            logger.info("Migration: Created device_pairings table")
+        else:
+            logger.info("Migration: device_pairings table already exists, skipping")
+
+
+# ============================================================================
 # B2B Payout Migrations (runs on startup, idempotent)
 # ============================================================================
 async def run_b2b_migrations():
@@ -995,6 +1045,12 @@ async def startup_event():
         logger.info("Reconnection migrations completed successfully")
     except Exception as e:
         logger.error(f"Reconnection migration failed (non-fatal): {e}")
+
+    try:
+        await run_device_pairing_migrations()
+        logger.info("Device pairing migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Device pairing migration failed (non-fatal): {e}")
 
     try:
         await run_b2b_migrations()
