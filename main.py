@@ -1133,7 +1133,27 @@ async def startup_event():
         replace_existing=True,
         max_instances=1,
     )
-    logger.info("Subscription jobs scheduled: invoices on 1st of month, overdue check daily at 06:00")
+
+    async def _pre_expiry_invoices_background():
+        from app.services.subscription import generate_pre_expiry_invoices
+        async for db in get_db():
+            try:
+                result = await generate_pre_expiry_invoices(db)
+                logger.info(f"[SUBSCRIPTION] Pre-expiry invoices: {result}")
+            except Exception as e:
+                logger.error(f"[SUBSCRIPTION] Pre-expiry invoice job failed: {e}")
+            break
+
+    scheduler.add_job(
+        _pre_expiry_invoices_background,
+        trigger=CronTrigger(hour=8, minute=0),
+        id='pre_expiry_invoices',
+        name='Generate invoices 5 days before expiry',
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    logger.info("Subscription jobs scheduled: invoices on 1st of month, pre-expiry daily at 08:00, overdue check daily at 06:00")
 
     from app.config import settings as app_settings
     if app_settings.MPESA_B2B_DAILY_PAYOUT_ENABLED:

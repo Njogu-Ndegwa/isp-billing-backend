@@ -15,7 +15,8 @@ from app.services.subscription import (
     get_subscription_summary, get_pending_invoice, enrich_invoice,
     get_invoice_amount_paid,
     activate_subscription, deactivate_subscription,
-    generate_monthly_invoices, calculate_reseller_charges,
+    generate_monthly_invoices, generate_pre_expiry_invoices,
+    calculate_reseller_charges,
     generate_invoice_for_reseller, record_subscription_payment,
     get_invoice_alert_for_user,
     TRIAL_DAYS, GRACE_PERIOD_DAYS,
@@ -154,6 +155,70 @@ async def get_invoice_detail(
     ]
 
     return enriched
+
+
+@router.post("/api/subscription/request-invoice")
+async def request_my_invoice(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Generate an invoice on demand for the current billing period.
+    Returns the existing pending invoice if one already exists,
+    otherwise generates a new one based on current usage.
+    """
+    user = await get_current_user(token, db)
+    if user.role != UserRole.RESELLER:
+        raise HTTPException(status_code=403, detail="Only resellers have subscriptions")
+
+    existing = await get_pending_invoice(db, user.id)
+    if existing:
+        paid = await get_invoice_amount_paid(db, existing.id)
+        return {"current_invoice": enrich_invoice(existing, paid), "generated": False}
+
+    if not user.subscription_expires_at:
+        raise HTTPException(
+            status_code=400,
+            detail="No subscription expiry date set. Contact support.",
+        )
+
+    expires = user.subscription_expires_at
+    period_start = datetime(expires.year, expires.month, 1)
+    period_end = expires
+
+    if period_start >= period_end:
+        period_start = period_end - timedelta(days=30)
+
+    existing_any = (await db.execute(
+        select(SubscriptionInvoice).where(
+            SubscriptionInvoice.user_id == user.id,
+            SubscriptionInvoice.period_start == period_start,
+        )
+    )).scalar_one_or_none()
+    if existing_any:
+        paid = await get_invoice_amount_paid(db, existing_any.id)
+        return {"current_invoice": enrich_invoice(existing_any, paid), "generated": False}
+
+    charges = await calculate_reseller_charges(db, user.id, period_start, period_end)
+
+    invoice = SubscriptionInvoice(
+        user_id=user.id,
+        period_start=period_start,
+        period_end=period_end,
+        hotspot_revenue=charges["hotspot_revenue"],
+        hotspot_charge=charges["hotspot_charge"],
+        pppoe_user_count=charges["pppoe_user_count"],
+        pppoe_charge=charges["pppoe_charge"],
+        gross_charge=charges["gross_charge"],
+        final_charge=charges["final_charge"],
+        status=InvoiceStatus.PENDING,
+        due_date=expires,
+    )
+    db.add(invoice)
+    await db.commit()
+    await db.refresh(invoice)
+
+    return {"current_invoice": enrich_invoice(invoice, 0.0), "generated": True}
 
 
 class SubscriptionPayRequest(BaseModel):
@@ -810,3 +875,14 @@ async def admin_generate_invoices(
     await _require_admin(token, db)
     result = await generate_monthly_invoices(db)
     return {"message": "Invoice generation complete", **result}
+
+
+@router.post("/api/admin/subscriptions/generate-pre-expiry-invoices")
+async def admin_generate_pre_expiry_invoices(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Manually trigger pre-expiry invoice generation for resellers expiring within 5 days."""
+    await _require_admin(token, db)
+    result = await generate_pre_expiry_invoices(db)
+    return {"message": "Pre-expiry invoice generation complete", **result}

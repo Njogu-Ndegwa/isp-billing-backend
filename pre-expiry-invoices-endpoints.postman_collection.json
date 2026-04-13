@@ -1,0 +1,36 @@
+{
+    "info": {
+        "name": "Pre-Expiry Invoices - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": "your-jwt-token-here"}
+    ],
+    "item": [
+        {
+            "name": "Reseller - Request Invoice (on demand)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/subscription/request-invoice",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "description": "Generate an invoice on demand for the current billing period. Returns existing pending invoice if one exists, otherwise generates a new one. Response includes { current_invoice, generated: true/false }."
+            }
+        },
+        {
+            "name": "Admin - Generate Pre-Expiry Invoices",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/admin/subscriptions/generate-pre-expiry-invoices",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "description": "Manually trigger pre-expiry invoice generation for all resellers whose subscriptions expire within 5 days. Admin only."
+            }
+        }
+    ]
+}
