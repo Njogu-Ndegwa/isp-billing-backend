@@ -1011,6 +1011,12 @@ async def run_subscription_migrations():
         "WHERE role::text = 'reseller' AND subscription_status::text = 'trial' "
         "AND subscription_expires_at < NOW()"
     )
+    # Step 7: Fix legacy columns that may have been created with NOT NULL
+    for col in ("is_active", "paid_on", "expires_on", "plan_type", "cost"):
+        await _run_sql(f"Allow NULL on subscriptions.{col}",
+            f"ALTER TABLE subscriptions ALTER COLUMN {col} DROP NOT NULL"
+        )
+
     logger.info("Migration: Subscription system tables and columns ready")
 
 

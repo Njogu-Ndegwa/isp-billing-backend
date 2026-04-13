@@ -257,6 +257,7 @@ async def activate_subscription(db: AsyncSession, user_id: int, months: int = 1)
             status=SubscriptionStatus.ACTIVE,
             current_period_start=now,
             current_period_end=new_expiry,
+            is_active=True,
         )
         db.add(sub)
 
