@@ -1,0 +1,193 @@
+{
+    "info": {
+        "name": "Admin Dashboard Metrics - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        { "key": "baseUrl", "value": "http://localhost:8000" },
+        { "key": "token", "value": "YOUR_ADMIN_JWT_TOKEN" }
+    ],
+    "item": [
+        {
+            "name": "1. MRR Metrics",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/metrics/mrr",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "2. Churn Metrics",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/metrics/churn?period=month",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "metrics", "churn"],
+                    "query": [
+                        { "key": "period", "value": "month", "description": "week | month | quarter" }
+                    ]
+                },
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "3. Signups Summary",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/metrics/signups-summary?period=30d",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "metrics", "signups-summary"],
+                    "query": [
+                        { "key": "period", "value": "30d", "description": "7d | 30d | 90d | 1y" }
+                    ]
+                },
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "4. Admin Dashboard (v2 enhanced)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/dashboard",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "5. Customer Signups Time Series",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/metrics/customer-signups?period=30d",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "metrics", "customer-signups"],
+                    "query": [
+                        { "key": "period", "value": "30d", "description": "7d | 30d | 90d | 1y" }
+                    ]
+                },
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "6. Subscription Revenue History",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/metrics/subscription-revenue-history?period=30d",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "metrics", "subscription-revenue-history"],
+                    "query": [
+                        { "key": "period", "value": "30d", "description": "7d | 30d | 90d | 1y" }
+                    ]
+                },
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "7. ARPU Metrics",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/metrics/arpu",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "8. Trial Conversion",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/metrics/trial-conversion",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "9. Activation Funnel",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/metrics/activation-funnel",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "10. Revenue Concentration",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/metrics/revenue-concentration",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "11. Smart Alerts",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/metrics/smart-alerts",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "12. Revenue Forecast",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/admin/metrics/revenue-forecast?period=30d&forecast_days=30",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "admin", "metrics", "revenue-forecast"],
+                    "query": [
+                        { "key": "period", "value": "30d", "description": "7d | 30d | 90d" },
+                        { "key": "forecast_days", "value": "30", "description": "1-365" }
+                    ]
+                },
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "13a. Growth Targets (GET)",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/admin/metrics/growth-targets",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ]
+            }
+        },
+        {
+            "name": "13b. Growth Targets (PUT)",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/admin/metrics/growth-targets",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" },
+                    { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\"targets\": [{\"id\": \"mrr_target\", \"target_value\": 60000, \"period\": \"Q2 2026\"}]}"
+                }
+            }
+        }
+    ]
+}

@@ -20,6 +20,7 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
+from app.services.admin_metrics import compute_dashboard_v2_extras
 
 import logging
 
@@ -1175,6 +1176,8 @@ async def admin_dashboard(
         )
     )).scalar() or 0
 
+    v2_extras = await compute_dashboard_v2_extras(db)
+
     return {
         "resellers": {
             "total": total_resellers,
@@ -1216,6 +1219,10 @@ async def admin_dashboard(
             "pending_count": b2b_pending_count,
         },
         "recent_signups": recent_signups,
+        "growth_deltas": v2_extras["growth_deltas"],
+        "signups_today": v2_extras["signups_today"],
+        "signups_this_week": v2_extras["signups_this_week"],
+        "signups_this_month": v2_extras["signups_this_month"],
         "generated_at": now.isoformat(),
     }
 

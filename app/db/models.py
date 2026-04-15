@@ -847,6 +847,19 @@ class DevicePairing(Base):
     plan = relationship("Plan")
 
 
+class GrowthTarget(Base):
+    __tablename__ = "growth_targets"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    target_id = Column(String(100), unique=True, nullable=False)
+    label = Column(String(255), nullable=False)
+    target_value = Column(Float, nullable=False)
+    unit = Column(String(50), nullable=False)
+    period = Column(String(100), nullable=False)
+    inverse = Column(Boolean, default=False, server_default="false")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class ReconnectionAttempt(Base):
     """Tracks self-service reconnection attempts for rate limiting and audit."""
     __tablename__ = "reconnection_attempts"

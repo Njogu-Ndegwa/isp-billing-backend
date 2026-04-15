@@ -49,6 +49,7 @@ from app.api.profile_routes import router as profile_router
 from app.api.b2b_routes import router as b2b_router
 from app.api.subscription_routes import router as subscription_router
 from app.api.device_pairing import router as device_pairing_router
+from app.api.admin_metrics_routes import router as admin_metrics_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -76,6 +77,7 @@ app.include_router(profile_router)
 app.include_router(b2b_router)
 app.include_router(subscription_router)
 app.include_router(device_pairing_router)
+app.include_router(admin_metrics_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -1026,6 +1028,31 @@ async def run_subscription_migrations():
     logger.info("Migration: Subscription system tables and columns ready")
 
 
+async def run_growth_targets_migration():
+    """Create growth_targets table if it doesn't exist."""
+    async with async_engine.begin() as conn:
+        result = await conn.execute(sa_text(
+            "SELECT to_regclass('public.growth_targets')"
+        ))
+        if result.scalar() is None:
+            await conn.execute(sa_text("""
+                CREATE TABLE growth_targets (
+                    id SERIAL PRIMARY KEY,
+                    target_id VARCHAR(100) UNIQUE NOT NULL,
+                    label VARCHAR(255) NOT NULL,
+                    target_value DOUBLE PRECISION NOT NULL,
+                    unit VARCHAR(50) NOT NULL,
+                    period VARCHAR(100) NOT NULL,
+                    inverse BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            logger.info("Migration: Created growth_targets table")
+        else:
+            logger.info("Migration: growth_targets table already exists, skipping")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -1075,6 +1102,12 @@ async def startup_event():
         logger.info("Subscription migrations completed successfully")
     except Exception as e:
         logger.error(f"Subscription migration failed (non-fatal): {e}")
+
+    try:
+        await run_growth_targets_migration()
+        logger.info("Growth targets migration completed successfully")
+    except Exception as e:
+        logger.error(f"Growth targets migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,
