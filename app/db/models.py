@@ -802,6 +802,7 @@ class B2BTransaction(Base):
     transaction_id = Column(String(255), nullable=True)
     payout_id = Column(Integer, ForeignKey("reseller_payouts.id"), nullable=True)
     charge_id = Column(Integer, ForeignKey("reseller_transaction_charges.id"), nullable=True)
+    triggered_by = Column(String(20), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     completed_at = Column(DateTime, nullable=True)
 

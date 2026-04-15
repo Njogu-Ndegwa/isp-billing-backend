@@ -178,6 +178,7 @@ async def initiate_b2b_payment(
     account_reference: str,
     remarks: str = "Reseller payout",
     fee: float = 0,
+    triggered_by: str = "manual",
 ) -> B2BTransaction:
     """
     Initiate a B2B payment via Safaricom API and persist a pending transaction.
@@ -264,6 +265,7 @@ async def initiate_b2b_payment(
             status=B2BTransactionStatus.FAILED,
             result_code=str(response_code),
             result_desc=response_data.get("ResponseDescription", ""),
+            triggered_by=triggered_by,
         )
         db.add(txn)
         await db.flush()
@@ -281,6 +283,7 @@ async def initiate_b2b_payment(
         account_reference=account_reference,
         remarks=remarks,
         status=B2BTransactionStatus.PENDING,
+        triggered_by=triggered_by,
     )
     db.add(txn)
     await db.flush()
@@ -502,6 +505,7 @@ async def payout_reseller(
     reseller_id: int,
     payment_method: ResellerPaymentMethod,
     balance: Optional[float] = None,
+    triggered_by: str = "manual",
 ) -> B2BTransaction:
     """
     Pay out a single reseller via B2B.
@@ -555,6 +559,7 @@ async def payout_reseller(
         account_reference=account_ref,
         remarks=f"Payout to {payment_method.label}",
         fee=fee,
+        triggered_by=triggered_by,
     )
     return txn
 
@@ -596,6 +601,7 @@ async def run_daily_payouts():
                     select(func.count(B2BTransaction.id)).where(
                         B2BTransaction.reseller_id == reseller.id,
                         B2BTransaction.created_at >= today_start,
+                        B2BTransaction.triggered_by == "scheduled",
                         B2BTransaction.status.in_([
                             B2BTransactionStatus.PENDING,
                             B2BTransactionStatus.COMPLETED,
@@ -603,7 +609,7 @@ async def run_daily_payouts():
                     )
                 )
                 if existing_today.scalar() > 0:
-                    logger.info("Reseller %s already has a B2B tx today, skipping", reseller.id)
+                    logger.info("Reseller %s already has a scheduled B2B tx today, skipping", reseller.id)
                     skip_count += 1
                     continue
 
@@ -612,7 +618,7 @@ async def run_daily_payouts():
                     skip_count += 1
                     continue
 
-                txn = await payout_reseller(db, reseller.id, pm, balance)
+                txn = await payout_reseller(db, reseller.id, pm, balance, triggered_by="scheduled")
                 await db.commit()
 
                 if txn.status == B2BTransactionStatus.PENDING:

@@ -831,6 +831,12 @@ async def run_b2b_migrations():
         ))
         logger.info("Migration: Ensured b2b_transactions table and indexes exist")
 
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "ALTER TABLE b2b_transactions "
+            "ADD COLUMN IF NOT EXISTS triggered_by VARCHAR(20) NULL"
+        ))
+
 
 # ============================================================================
 # Subscription System Migrations (runs on startup, idempotent)
@@ -1130,6 +1136,7 @@ async def startup_event():
         name='Generate monthly subscription invoices',
         replace_existing=True,
         max_instances=1,
+        misfire_grace_time=900,
     )
     scheduler.add_job(
         _check_overdue_subscriptions_background,
@@ -1138,6 +1145,7 @@ async def startup_event():
         name='Check overdue invoices and suspend non-payers',
         replace_existing=True,
         max_instances=1,
+        misfire_grace_time=900,
     )
 
     async def _pre_expiry_invoices_background():
@@ -1157,9 +1165,30 @@ async def startup_event():
         name='Generate invoices 5 days before expiry',
         replace_existing=True,
         max_instances=1,
+        misfire_grace_time=900,
     )
 
     logger.info("Subscription jobs scheduled: invoices on 1st of month, pre-expiry daily at 08:00, overdue check daily at 06:00")
+
+    # --- Provisioning token cleanup (3:00 AM EAT / 0:00 UTC) ---
+    async def _expire_stale_provisioning_tokens():
+        from app.services.provisioning import expire_stale_tokens
+        try:
+            count = await expire_stale_tokens()
+            if count:
+                logger.info(f"[PROVISION] Nightly cleanup: expired {count} stale token(s)")
+        except Exception as e:
+            logger.error(f"[PROVISION] Nightly token cleanup failed: {e}")
+
+    scheduler.add_job(
+        _expire_stale_provisioning_tokens,
+        trigger=CronTrigger(hour=0, minute=0),
+        id='expire_stale_provisioning_tokens',
+        name='Expire stale provisioning tokens (3:00 AM EAT)',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=900,
+    )
 
     from app.config import settings as app_settings
     if app_settings.MPESA_B2B_DAILY_PAYOUT_ENABLED:
@@ -1170,6 +1199,7 @@ async def startup_event():
             name='Daily B2B reseller payouts',
             replace_existing=True,
             max_instances=1,
+            misfire_grace_time=900,
         )
         logger.info("B2B daily payout job scheduled at 23:59")
     else:
@@ -1178,7 +1208,8 @@ async def startup_event():
     scheduler.start()
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "
-        "hotspot provisioning retry every 97s, M-Pesa reconciliation every 90s"
+        "hotspot provisioning retry every 97s, M-Pesa reconciliation every 90s, "
+        "stale token cleanup daily at 00:00 UTC (3:00 AM EAT)"
     )
 
     async for db in get_db():

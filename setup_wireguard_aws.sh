@@ -48,7 +48,7 @@ SERVER_PUBLIC_KEY=$(cat server_public.key)
 echo "[5/6] Creating WireGuard configuration..."
 cat > "$WG_DIR/wg0.conf" << EOF
 [Interface]
-Address = 10.0.0.1/24
+Address = 10.0.0.1/16
 ListenPort = 51820
 PrivateKey = $SERVER_PRIVATE_KEY
 

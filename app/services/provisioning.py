@@ -15,16 +15,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.db.models import Router, ProvisioningToken, ProvisioningTokenStatus, User
+from app.db.database import AsyncSessionLocal
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
 WG_SOCKET_PATH = "/var/run/wg-manager/wg-manager.sock"
 
-WG_SUBNET = ipaddress.IPv4Network("10.0.0.0/24")
+WG_SUBNET = ipaddress.IPv4Network("10.0.0.0/16")
 WG_SERVER_IP = ipaddress.IPv4Address("10.0.0.1")
-WG_IP_RANGE = (ipaddress.IPv4Address("10.0.0.2"), ipaddress.IPv4Address("10.0.0.99"))
-L2TP_IP_RANGE = (ipaddress.IPv4Address("10.0.0.100"), ipaddress.IPv4Address("10.0.0.199"))
+WG_IP_RANGE = (ipaddress.IPv4Address("10.0.0.2"), ipaddress.IPv4Address("10.0.99.255"))
+L2TP_IP_RANGE = (ipaddress.IPv4Address("10.0.100.0"), ipaddress.IPv4Address("10.0.199.255"))
 TOKEN_EXPIRY_HOURS = 24
 
 LOGIN_PAGE_PATH = os.path.join(
@@ -73,9 +74,14 @@ async def allocate_vpn_ip(db: AsyncSession, vpn_type: str = "wireguard") -> str:
     router_result = await db.execute(select(Router.ip_address))
     router_ips = {row[0] for row in router_result.fetchall()}
 
+    # Only reserve IPs for PENDING tokens still within their 24h validity window.
+    # Tokens past the cutoff are ignored here regardless of DB status — their
+    # status gets cleaned up to EXPIRED by the nightly scheduled job.
+    cutoff = datetime.utcnow() - timedelta(hours=TOKEN_EXPIRY_HOURS)
     token_result = await db.execute(
         select(ProvisioningToken.wireguard_ip).where(
-            ProvisioningToken.status == ProvisioningTokenStatus.PENDING
+            ProvisioningToken.status == ProvisioningTokenStatus.PENDING,
+            ProvisioningToken.created_at > cutoff,
         )
     )
     token_ips = {row[0] for row in token_result.fetchall()}
@@ -93,7 +99,7 @@ async def allocate_vpn_ip(db: AsyncSession, vpn_type: str = "wireguard") -> str:
             return ip_str
         ip = ipaddress.IPv4Address(int(ip) + 1)
 
-    label = "L2TP (10.0.0.100-199)" if vpn_type == "l2tp" else "WireGuard (10.0.0.2-99)"
+    label = "L2TP (10.0.100.0-10.0.199.255)" if vpn_type == "l2tp" else "WireGuard (10.0.0.2-10.0.99.255)"
     raise ValueError(f"No available VPN IPs in the {label} range")
 
 
@@ -182,6 +188,49 @@ def generate_l2tp_username(identity: str) -> str:
 
 def is_token_expired(token: ProvisioningToken) -> bool:
     return datetime.utcnow() > token.created_at + timedelta(hours=TOKEN_EXPIRY_HOURS)
+
+
+async def expire_stale_tokens() -> int:
+    """
+    Mark expired PENDING tokens as EXPIRED so their IPs become available.
+
+    Runs as a nightly scheduled job (3:00 AM EAT / 0:00 UTC).
+    Uses its own DB session — safe to call from anywhere.
+
+    Stale WireGuard/L2TP peers are left on the server — they are harmless
+    (no one has the private key) and can be pruned separately if needed.
+
+    Safe because:
+    - Only touches tokens with status=PENDING that are past TOKEN_EXPIRY_HOURS.
+    - These tokens can never complete provisioning anyway (the /complete
+      endpoint already rejects expired tokens with HTTP 410).
+    - Active routers live in the Router table and are never touched here.
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=TOKEN_EXPIRY_HOURS)
+
+    async with AsyncSessionLocal() as cleanup_db:
+        try:
+            result = await cleanup_db.execute(
+                select(ProvisioningToken).where(
+                    ProvisioningToken.status == ProvisioningTokenStatus.PENDING,
+                    ProvisioningToken.created_at <= cutoff,
+                )
+            )
+            stale_tokens = result.scalars().all()
+
+            if not stale_tokens:
+                return 0
+
+            for tok in stale_tokens:
+                tok.status = ProvisioningTokenStatus.EXPIRED
+
+            await cleanup_db.commit()
+            logger.info(f"Expired {len(stale_tokens)} stale provisioning token(s), freeing their VPN IPs")
+            return len(stale_tokens)
+        except Exception as e:
+            await cleanup_db.rollback()
+            logger.warning(f"Failed to expire stale tokens: {e}")
+            return 0
 
 
 def get_login_page_html() -> str:
@@ -284,11 +333,11 @@ def _rsc_vpn_wireguard(token: ProvisioningToken) -> str:
 # ---- STEP 3: WIREGUARD VPN (RouterOS v7) ----
 
 /interface wireguard add name=wg-aws listen-port=51820 private-key="{token.wg_private_key}"
-/ip address add address={token.wireguard_ip}/24 interface=wg-aws
+/ip address add address={token.wireguard_ip}/16 interface=wg-aws
 /interface wireguard peers add interface=wg-aws \\
     public-key="{token.server_wg_pubkey}" \\
     endpoint-address={token.server_public_ip} endpoint-port=51820 \\
-    allowed-address=10.0.0.0/24 persistent-keepalive=25
+    allowed-address=10.0.0.0/16 persistent-keepalive=25
 :do {{ /ip firewall filter add chain=input protocol=udp dst-port=51820 action=accept comment="Allow WireGuard" }} on-error={{}}
 
 :log info "Provisioning: WireGuard tunnel configured"
