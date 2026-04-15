@@ -1600,6 +1600,22 @@ async def delete_reseller(
     # 16. Vouchers
     await db.execute(delete(Voucher).where(Voucher.user_id == reseller_id))
 
+    # 16b. Null out cross-reseller references: other resellers' customers or
+    #       vouchers may point to this reseller's routers/plans.
+    await db.execute(
+        update(Customer).where(Customer.router_id.in_(router_ids)).values(router_id=None)
+    )
+    plan_ids = select(Plan.id).where(Plan.user_id == reseller_id)
+    await db.execute(
+        update(Customer).where(Customer.plan_id.in_(plan_ids)).values(plan_id=None)
+    )
+    await db.execute(
+        update(Voucher).where(Voucher.router_id.in_(router_ids)).values(router_id=None)
+    )
+    await db.execute(
+        update(Voucher).where(Voucher.plan_id.in_(plan_ids)).values(plan_id=None)
+    )
+
     # 17. Routers
     await db.execute(delete(Router).where(Router.user_id == reseller_id))
 
