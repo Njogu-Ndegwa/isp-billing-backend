@@ -1558,11 +1558,14 @@ async def delete_reseller(
     # 8. Payments (old table)
     await db.execute(delete(Payment).where(Payment.customer_id.in_(customer_ids)))
 
-    # 9. Customer payments
+    # 9. Customer payments (delete by both reseller_id and customer_id to
+    #    catch cross-reseller references)
     await db.execute(delete(CustomerPayment).where(CustomerPayment.reseller_id == reseller_id))
+    await db.execute(delete(CustomerPayment).where(CustomerPayment.customer_id.in_(customer_ids)))
 
-    # 9b. ZenoPay transactions (references both customers and users)
+    # 9b. ZenoPay transactions (same cross-reference treatment)
     await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.reseller_id == reseller_id))
+    await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.customer_id.in_(customer_ids)))
 
     # 9c. Device pairings (references customers and routers)
     await db.execute(delete(DevicePairing).where(DevicePairing.customer_id.in_(customer_ids)))
