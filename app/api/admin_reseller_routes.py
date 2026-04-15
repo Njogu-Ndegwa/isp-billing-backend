@@ -17,6 +17,8 @@ from app.db.models import (
     RouterLogEntry, RouterAvailabilityCheck,
     ResellerPaymentMethod, ResellerPaymentMethodType,
     B2BTransaction, B2BTransactionStatus,
+    ZenoPayTransaction, DevicePairing, ReconnectionAttempt,
+    ProvisioningAttempt,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
@@ -1426,6 +1428,16 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
     router_logs = await _count(RouterLogEntry, RouterLogEntry.router_id, router_ids_stmt)
     availability_checks = await _count(RouterAvailabilityCheck, RouterAvailabilityCheck.router_id, router_ids_stmt)
 
+    zenopay_transactions = (await db.execute(
+        select(func.count(ZenoPayTransaction.id)).where(ZenoPayTransaction.reseller_id == reseller_id)
+    )).scalar() or 0
+    device_pairings = await _count(DevicePairing, DevicePairing.customer_id, customer_ids_stmt)
+    reconnection_attempts = await _count(ReconnectionAttempt, ReconnectionAttempt.customer_id, customer_ids_stmt)
+    provisioning_attempts = await _count(ProvisioningAttempt, ProvisioningAttempt.customer_id, customer_ids_stmt)
+    payment_methods = (await db.execute(
+        select(func.count(ResellerPaymentMethod.id)).where(ResellerPaymentMethod.user_id == reseller_id)
+    )).scalar() or 0
+
     # WG peers to remove
     wg_tokens = (await db.execute(
         select(func.count(ProvisioningToken.id)).where(
@@ -1442,13 +1454,18 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         "customer_payments": customer_payments,
         "payments": payments,
         "mpesa_transactions": mpesa_transactions,
+        "zenopay_transactions": zenopay_transactions,
         "provisioning_tokens": provisioning_tokens,
         "provisioning_logs": provisioning_logs_c + provisioning_logs_r,
+        "provisioning_attempts": provisioning_attempts,
         "customer_ratings": customer_ratings,
         "bandwidth_usage": bandwidth_usage,
         "bandwidth_snapshots": bandwidth_snapshots,
         "router_logs": router_logs,
         "availability_checks": availability_checks,
+        "device_pairings": device_pairings,
+        "reconnection_attempts": reconnection_attempts,
+        "payment_methods": payment_methods,
         "reseller_payouts": payouts,
         "reseller_transaction_charges": transaction_charges,
         "b2b_transactions": b2b_transactions,
@@ -1531,6 +1548,10 @@ async def delete_reseller(
     await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id.in_(customer_ids)))
     await db.execute(delete(ProvisioningLog).where(ProvisioningLog.router_id.in_(router_ids)))
 
+    # 6b. Provisioning attempts (references customers and routers; logs point here via attempt_id)
+    await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.customer_id.in_(customer_ids)))
+    await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.router_id.in_(router_ids)))
+
     # 7. M-Pesa transactions
     await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id.in_(customer_ids)))
 
@@ -1539,6 +1560,17 @@ async def delete_reseller(
 
     # 9. Customer payments
     await db.execute(delete(CustomerPayment).where(CustomerPayment.reseller_id == reseller_id))
+
+    # 9b. ZenoPay transactions (references both customers and users)
+    await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.reseller_id == reseller_id))
+
+    # 9c. Device pairings (references customers and routers)
+    await db.execute(delete(DevicePairing).where(DevicePairing.customer_id.in_(customer_ids)))
+    await db.execute(delete(DevicePairing).where(DevicePairing.router_id.in_(router_ids)))
+
+    # 9d. Reconnection attempts (references customers and routers; customer_id is nullable)
+    await db.execute(delete(ReconnectionAttempt).where(ReconnectionAttempt.customer_id.in_(customer_ids)))
+    await db.execute(delete(ReconnectionAttempt).where(ReconnectionAttempt.router_id.in_(router_ids)))
 
     # 10. Customers
     await db.execute(delete(Customer).where(Customer.user_id == reseller_id))
@@ -1595,10 +1627,13 @@ async def delete_reseller(
     # 21e. Subscriptions
     await db.execute(delete(Subscription).where(Subscription.user_id == reseller_id))
 
-    # 22. Null out created_by references from other users
+    # 22. Reseller payment methods
+    await db.execute(delete(ResellerPaymentMethod).where(ResellerPaymentMethod.user_id == reseller_id))
+
+    # 23. Null out created_by references from other users
     await db.execute(update(User).where(User.created_by == reseller_id).values(created_by=None))
 
-    # 23. Delete the user row
+    # 24. Delete the user row
     await db.execute(delete(User).where(User.id == reseller_id))
 
     await db.commit()
