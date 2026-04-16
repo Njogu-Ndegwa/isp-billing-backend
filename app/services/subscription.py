@@ -216,11 +216,33 @@ async def check_overdue_invoices(db: AsyncSession) -> dict:
                 f"for overdue invoice #{invoice.id}"
             )
 
-    # Also check trial expirations
+    # Self-heal trial users with no expiry: their trial clearly started long
+    # ago, so set expiry to now so they're caught by the trial-expired check
+    # below on the next run (gives them one day's notice via the pre-expiry
+    # invoice job that runs before this).
+    null_expiry_trials = (await db.execute(
+        select(User).where(
+            User.role == UserRole.RESELLER,
+            User.subscription_status == SubscriptionStatus.TRIAL,
+            User.subscription_expires_at.is_(None),
+        )
+    )).scalars().all()
+
+    healed_trials = 0
+    for user in null_expiry_trials:
+        user.subscription_expires_at = now
+        healed_trials += 1
+        logger.info(
+            f"[SUBSCRIPTION] Healed null expiry for trial reseller "
+            f"{user.id} ({user.email}), set to {now}"
+        )
+
+    # Now check trial expirations (includes just-healed users)
     expired_trials = (await db.execute(
         select(User).where(
             User.role == UserRole.RESELLER,
             User.subscription_status == SubscriptionStatus.TRIAL,
+            User.subscription_expires_at.isnot(None),
             User.subscription_expires_at < now,
         )
     )).scalars().all()
@@ -258,6 +280,7 @@ async def check_overdue_invoices(db: AsyncSession) -> dict:
         "suspended": suspended,
         "trial_expired": trial_expired,
         "active_expired": active_expired,
+        "healed_null_expiry": healed_trials,
     }
 
 
@@ -962,10 +985,11 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
 
 async def generate_catchup_invoices(db: AsyncSession) -> dict:
     """
-    One-time admin catch-up: generate invoices for ALL active/trial resellers
-    who don't currently have a pending/overdue invoice, regardless of how far
-    away (or past) their expiry date is.  Use after a deploy to backfill
-    users missed by the normal 5-day pre-expiry window.
+    Admin catch-up: generate invoices for ALL active/trial resellers who don't
+    currently have a pending/overdue invoice, regardless of how far away (or
+    past) their expiry date is.  Also heals trial users who have no expiry
+    date at all (sets expiry to now + GRACE_PERIOD_DAYS so they have time to
+    pay before the daily overdue check suspends them).
     """
     now = datetime.utcnow()
 
@@ -976,16 +1000,26 @@ async def generate_catchup_invoices(db: AsyncSession) -> dict:
                 SubscriptionStatus.ACTIVE,
                 SubscriptionStatus.TRIAL,
             ]),
-            User.subscription_expires_at.isnot(None),
         )
     )).scalars().all()
 
     created = 0
     skipped = 0
+    healed = 0
     errors = []
 
     for reseller in resellers:
         try:
+            # Self-heal: trial users with no expiry date get a grace window
+            if reseller.subscription_expires_at is None:
+                reseller.subscription_expires_at = now + timedelta(days=GRACE_PERIOD_DAYS)
+                healed += 1
+                logger.info(
+                    f"[SUBSCRIPTION] Healed null expiry for trial reseller "
+                    f"{reseller.id} ({reseller.email}), "
+                    f"set to {reseller.subscription_expires_at.date()}"
+                )
+
             existing_pending = await get_pending_invoice(db, reseller.id)
             if existing_pending:
                 skipped += 1
@@ -1004,9 +1038,12 @@ async def generate_catchup_invoices(db: AsyncSession) -> dict:
                 sub = (await db.execute(
                     select(Subscription).where(Subscription.user_id == reseller.id)
                 )).scalar_one_or_none()
-                period_start = sub.current_period_start if sub and sub.current_period_start else (
-                    reseller.subscription_expires_at - timedelta(days=30)
-                )
+                if sub and sub.current_period_start:
+                    period_start = sub.current_period_start
+                elif reseller.created_at:
+                    period_start = reseller.created_at
+                else:
+                    period_start = reseller.subscription_expires_at - timedelta(days=30)
 
             period_end = now
             if period_start >= period_end:
@@ -1053,6 +1090,6 @@ async def generate_catchup_invoices(db: AsyncSession) -> dict:
     await db.commit()
     logger.info(
         f"[SUBSCRIPTION] Catch-up invoices: created={created}, "
-        f"skipped={skipped}, errors={len(errors)}"
+        f"skipped={skipped}, healed={healed}, errors={len(errors)}"
     )
-    return {"created": created, "skipped": skipped, "errors": errors}
+    return {"created": created, "skipped": skipped, "healed": healed, "errors": errors}
