@@ -51,6 +51,21 @@ async def register_user_api(
             mpesa_shortcode=request.mpesa_shortcode
         )
 
+        if role_enum == UserRole.RESELLER:
+            try:
+                from app.services.lead_tracking import try_link_lead_on_registration
+                await try_link_lead_on_registration(
+                    db, user.id, request.email, request.support_phone,
+                    request.organization_name,
+                )
+                await db.commit()
+            except Exception as link_err:
+                logger.warning(f"Lead auto-link failed (non-fatal): {link_err}")
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
         return {
             "id": user.id,
             "email": user.email,

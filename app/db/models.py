@@ -873,3 +873,114 @@ class ReconnectionAttempt(Base):
     failure_reason = Column(String(255), nullable=True)
     old_mac_address = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+# ========================================
+# LEAD PIPELINE / CRM MODELS
+# ========================================
+
+class LeadStage(str, enum.Enum):
+    NEW_LEAD = "new_lead"
+    CONTACTED = "contacted"
+    TALKING = "talking"
+    INSTALLATION_HELP = "installation_help"
+    SIGNED_UP = "signed_up"
+    PAYING = "paying"
+    CHURNED = "churned"
+    LOST = "lost"
+
+
+class LeadActivityType(str, enum.Enum):
+    NOTE = "note"
+    CALL = "call"
+    DM = "dm"
+    EMAIL = "email"
+    MEETING = "meeting"
+    STAGE_CHANGE = "stage_change"
+    FOLLOWUP_COMPLETED = "followup_completed"
+    OTHER = "other"
+
+
+class LeadSource(Base):
+    """Managed list of lead sources for consistent analytics."""
+    __tablename__ = "lead_sources"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False, unique=True)
+    description = Column(String(255), nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+
+
+class Lead(Base):
+    """Tracks potential reseller customers through the sales pipeline."""
+    __tablename__ = "leads"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    phone = Column(String(20), nullable=True)
+    email = Column(String(255), nullable=True)
+    social_platform = Column(String(50), nullable=True)
+    social_handle = Column(String(100), nullable=True)
+    source_id = Column(Integer, ForeignKey("lead_sources.id"), nullable=True, index=True)
+    source_detail = Column(String(500), nullable=True)
+    stage = Column(
+        Enum(LeadStage, name="leadstage", values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=LeadStage.NEW_LEAD,
+        server_default="new_lead",
+    )
+    stage_changed_at = Column(DateTime, default=datetime.utcnow)
+    next_followup_at = Column(DateTime, nullable=True, index=True)
+    notes = Column(String(2000), nullable=True)
+    converted_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    lost_reason = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    owner = relationship("User", foreign_keys=[user_id], backref="leads")
+    converted_user = relationship("User", foreign_keys=[converted_user_id])
+    source = relationship("LeadSource", backref="leads")
+    activities = relationship("LeadActivity", back_populates="lead", order_by="LeadActivity.created_at.desc()")
+    follow_ups = relationship("LeadFollowUp", back_populates="lead", order_by="LeadFollowUp.due_at.asc()")
+
+
+class LeadActivity(Base):
+    """Timeline entry recording an interaction or event on a lead."""
+    __tablename__ = "lead_activities"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    lead_id = Column(Integer, ForeignKey("leads.id", ondelete="CASCADE"), nullable=False, index=True)
+    activity_type = Column(
+        Enum(LeadActivityType, name="leadactivitytype", values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+    )
+    description = Column(String(2000), nullable=True)
+    old_stage = Column(String(50), nullable=True)
+    new_stage = Column(String(50), nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    lead = relationship("Lead", back_populates="activities")
+    creator = relationship("User")
+
+
+class LeadFollowUp(Base):
+    """Scheduled follow-up reminder on a lead."""
+    __tablename__ = "lead_follow_ups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    lead_id = Column(Integer, ForeignKey("leads.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    due_at = Column(DateTime, nullable=False, index=True)
+    is_completed = Column(Boolean, nullable=False, default=False, server_default="false")
+    completed_at = Column(DateTime, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    lead = relationship("Lead", back_populates="follow_ups")
+    creator = relationship("User")

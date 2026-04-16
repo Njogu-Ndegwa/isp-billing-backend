@@ -1,0 +1,315 @@
+{
+    "info": {
+        "name": "Lead Pipeline / CRM - Endpoints",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": "YOUR_JWT_TOKEN_HERE"}
+    ],
+    "auth": {
+        "type": "bearer",
+        "bearer": [{"key": "token", "value": "{{token}}"}]
+    },
+    "item": [
+        {
+            "name": "Lead Sources",
+            "item": [
+                {
+                    "name": "List Lead Sources",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads/sources?active_only=true",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "Create Lead Source",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/leads/sources",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"name\": \"YouTube\",\n    \"description\": \"Leads from YouTube video comments\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Update Lead Source",
+                    "request": {
+                        "method": "PUT",
+                        "url": "{{baseUrl}}/api/leads/sources/1",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"name\": \"Instagram DMs\",\n    \"description\": \"Leads from Instagram DMs and comments\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Deactivate Lead Source",
+                    "request": {
+                        "method": "DELETE",
+                        "url": "{{baseUrl}}/api/leads/sources/1",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Leads CRUD",
+            "item": [
+                {
+                    "name": "Create Lead",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/leads",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"name\": \"John Doe\",\n    \"phone\": \"0712345678\",\n    \"email\": \"john@example.com\",\n    \"social_platform\": \"tiktok\",\n    \"social_handle\": \"@johndoe_isp\",\n    \"source_id\": 2,\n    \"source_detail\": \"Commented on router setup video\",\n    \"notes\": \"Interested in becoming a reseller in Nairobi area\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "List Leads",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads?page=1&per_page=50",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "List Leads (filtered by stage)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads?stage=talking&page=1",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "List Leads (filtered by source)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads?source_id=1",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "List Leads (search)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads?search=john",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "Get Lead Detail",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads/1",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "Update Lead",
+                    "request": {
+                        "method": "PUT",
+                        "url": "{{baseUrl}}/api/leads/1",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"phone\": \"0798765432\",\n    \"notes\": \"Updated - wants to cover Mombasa area too\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Change Lead Stage",
+                    "request": {
+                        "method": "PATCH",
+                        "url": "{{baseUrl}}/api/leads/1/stage",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"stage\": \"talking\",\n    \"note\": \"Had first call, very interested\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Mark Lead as Lost",
+                    "request": {
+                        "method": "PATCH",
+                        "url": "{{baseUrl}}/api/leads/1/stage",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"stage\": \"lost\",\n    \"lost_reason\": \"Went with a competitor\",\n    \"note\": \"Chose cheaper provider\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Delete Lead",
+                    "request": {
+                        "method": "DELETE",
+                        "url": "{{baseUrl}}/api/leads/1",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Pipeline",
+            "item": [
+                {
+                    "name": "Pipeline Summary (Kanban counts)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads/pipeline/summary",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "Pipeline Stats (analytics)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads/pipeline/stats",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Activities",
+            "item": [
+                {
+                    "name": "Log Activity (note)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/leads/1/activities",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"activity_type\": \"note\",\n    \"description\": \"Had a good chat, wants to start next week\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Log Activity (call)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/leads/1/activities",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"activity_type\": \"call\",\n    \"description\": \"Called to discuss pricing, agreed on Silver plan\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Log Activity (DM)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/leads/1/activities",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"activity_type\": \"dm\",\n    \"description\": \"Replied to their TikTok DM about router setup\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "List Activities for Lead",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads/1/activities",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Follow-ups",
+            "item": [
+                {
+                    "name": "Schedule Follow-up",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/leads/1/followups",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"title\": \"Call back about router installation\",\n    \"due_at\": \"2026-04-18T10:00:00\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Upcoming Follow-ups (next 7 days)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/api/leads/followups/upcoming?days=7",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                },
+                {
+                    "name": "Complete Follow-up",
+                    "request": {
+                        "method": "PATCH",
+                        "url": "{{baseUrl}}/api/leads/followups/1/complete",
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Conversion",
+            "item": [
+                {
+                    "name": "Convert Lead to Reseller",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/api/leads/1/convert",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"email\": \"john@example.com\",\n    \"organization_name\": \"John's ISP\",\n    \"password\": \"securepassword123\",\n    \"business_name\": \"John Internet Services\",\n    \"support_phone\": \"0712345678\"\n}"
+                        }
+                    }
+                }
+            ]
+        }
+    ]
+}

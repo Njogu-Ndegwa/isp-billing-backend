@@ -50,6 +50,7 @@ from app.api.b2b_routes import router as b2b_router
 from app.api.subscription_routes import router as subscription_router
 from app.api.device_pairing import router as device_pairing_router
 from app.api.admin_metrics_routes import router as admin_metrics_router
+from app.api.lead_routes import router as lead_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -78,6 +79,7 @@ app.include_router(b2b_router)
 app.include_router(subscription_router)
 app.include_router(device_pairing_router)
 app.include_router(admin_metrics_router)
+app.include_router(lead_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -1053,6 +1055,71 @@ async def run_growth_targets_migration():
             logger.info("Migration: growth_targets table already exists, skipping")
 
 
+# ============================================================================
+# Lead Pipeline Migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_lead_pipeline_migrations():
+    """Create tables for the lead tracking / CRM pipeline module."""
+    async with async_engine.begin() as conn:
+        # Create enum types
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE leadstage AS ENUM "
+            "('new_lead', 'contacted', 'talking', 'installation_help', "
+            "'signed_up', 'paying', 'churned', 'lost'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+        ))
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE leadactivitytype AS ENUM "
+            "('note', 'call', 'dm', 'email', 'meeting', "
+            "'stage_change', 'followup_completed', 'other'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+        ))
+
+        # Create tables via ORM
+        from app.db.models import LeadSource, Lead, LeadActivity, LeadFollowUp
+        await conn.run_sync(lambda c: LeadSource.__table__.create(c, checkfirst=True))
+        await conn.run_sync(lambda c: Lead.__table__.create(c, checkfirst=True))
+        await conn.run_sync(lambda c: LeadActivity.__table__.create(c, checkfirst=True))
+        await conn.run_sync(lambda c: LeadFollowUp.__table__.create(c, checkfirst=True))
+
+        # Seed default lead sources (skip if any already exist)
+        result = await conn.execute(sa_text("SELECT COUNT(*) FROM lead_sources"))
+        count = result.scalar()
+        if count == 0:
+            # Find an admin user to assign as owner
+            admin_result = await conn.execute(sa_text(
+                "SELECT id FROM users WHERE role = 'admin' LIMIT 1"
+            ))
+            admin_row = admin_result.fetchone()
+            if admin_row:
+                admin_id = admin_row[0]
+                default_sources = [
+                    ("Instagram", "Leads from Instagram DMs and comments"),
+                    ("TikTok", "Leads from TikTok videos and comments"),
+                    ("WhatsApp", "Leads from WhatsApp messages"),
+                    ("Referral", "Leads referred by existing customers"),
+                    ("Phone Call", "Leads from phone inquiries"),
+                    ("Walk-in", "Leads who visited in person"),
+                    ("Website", "Leads from website contact forms"),
+                    ("Facebook", "Leads from Facebook posts and messages"),
+                    ("Other", "Leads from other channels"),
+                ]
+                for name, desc in default_sources:
+                    await conn.execute(sa_text(
+                        "INSERT INTO lead_sources (name, description, is_active, user_id, created_at) "
+                        "VALUES (:name, :desc, true, :uid, NOW())"
+                    ), {"name": name, "desc": desc, "uid": admin_id})
+                logger.info(f"Migration: Seeded {len(default_sources)} default lead sources")
+            else:
+                logger.info("Migration: No admin user found, skipping lead source seeding")
+        else:
+            logger.info("Migration: Lead sources already populated, skipping seed")
+
+    logger.info("Migration: Lead pipeline tables and enums ready")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -1108,6 +1175,12 @@ async def startup_event():
         logger.info("Growth targets migration completed successfully")
     except Exception as e:
         logger.error(f"Growth targets migration failed (non-fatal): {e}")
+
+    try:
+        await run_lead_pipeline_migrations()
+        logger.info("Lead pipeline migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Lead pipeline migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,
