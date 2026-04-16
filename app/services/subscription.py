@@ -263,7 +263,8 @@ async def activate_subscription(db: AsyncSession, user_id: int, months: int = 1)
 
     try:
         from app.services.lead_tracking import advance_lead_to_paying
-        await advance_lead_to_paying(db, user_id)
+        async with db.begin_nested():
+            await advance_lead_to_paying(db, user_id)
     except Exception as e:
         logger.warning(f"Lead auto-advance failed (non-fatal): {e}")
 
@@ -292,7 +293,8 @@ async def deactivate_subscription(
     if status in (SubscriptionStatus.SUSPENDED, SubscriptionStatus.INACTIVE):
         try:
             from app.services.lead_tracking import regress_lead_to_churned
-            await regress_lead_to_churned(db, user_id)
+            async with db.begin_nested():
+                await regress_lead_to_churned(db, user_id)
         except Exception as e:
             logger.warning(f"Lead auto-churn failed (non-fatal): {e}")
 
