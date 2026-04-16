@@ -880,17 +880,62 @@ async def admin_waive_invoice(
 
 @router.post("/api/admin/subscriptions/generate-invoices")
 async def admin_generate_invoices(
-    catch_up: bool = Query(False, description="Generate for ALL resellers without a pending invoice, not just those expiring within 5 days"),
+    catch_up: bool = Query(False, description="Generate for resellers who should have an invoice but don't (expired or expiring within 5 days, plus heal null-expiry trials)"),
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Manually trigger invoice generation. Use ?catch_up=true to backfill all missed invoices."""
+    """Manually trigger invoice generation. Use ?catch_up=true to backfill missed invoices and heal null-expiry trials."""
     await _require_admin(token, db)
     if catch_up:
         result = await generate_catchup_invoices(db)
         return {"message": "Catch-up invoice generation complete", **result}
     result = await generate_pre_expiry_invoices(db)
     return {"message": "Invoice generation complete", **result}
+
+
+@router.post("/api/admin/subscriptions/waive-premature-invoices")
+async def admin_waive_premature_invoices(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Bulk-waive PENDING invoices that were generated prematurely for users
+    whose subscription expiry is still more than 5 days away.
+    These users will get a proper invoice from the daily pre-expiry job
+    at the right time.
+    """
+    from app.services.subscription import PRE_EXPIRY_DAYS
+    await _require_admin(token, db)
+
+    now = datetime.utcnow()
+    cutoff = now + timedelta(days=PRE_EXPIRY_DAYS)
+
+    premature_invoices = (await db.execute(
+        select(SubscriptionInvoice)
+        .join(User, SubscriptionInvoice.user_id == User.id)
+        .where(
+            SubscriptionInvoice.status == InvoiceStatus.PENDING,
+            User.subscription_expires_at > cutoff,
+        )
+    )).scalars().all()
+
+    waived = []
+    for invoice in premature_invoices:
+        invoice.status = InvoiceStatus.WAIVED
+        waived.append({
+            "invoice_id": invoice.id,
+            "reseller_id": invoice.user_id,
+            "due_date": invoice.due_date.isoformat() if invoice.due_date else None,
+            "amount": invoice.final_charge,
+        })
+
+    await db.commit()
+    logger.info(f"[SUBSCRIPTION] Bulk-waived {len(waived)} premature invoices")
+    return {
+        "message": f"Waived {len(waived)} premature invoice(s)",
+        "waived_count": len(waived),
+        "waived": waived,
+    }
 
 
 @router.post("/api/admin/subscriptions/{reseller_id}/verify-payments")

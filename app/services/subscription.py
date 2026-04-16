@@ -985,13 +985,18 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
 
 async def generate_catchup_invoices(db: AsyncSession) -> dict:
     """
-    Admin catch-up: generate invoices for ALL active/trial resellers who don't
-    currently have a pending/overdue invoice, regardless of how far away (or
-    past) their expiry date is.  Also heals trial users who have no expiry
-    date at all (sets expiry to now + GRACE_PERIOD_DAYS so they have time to
-    pay before the daily overdue check suspends them).
+    Admin catch-up: generate invoices for resellers who should have one but
+    don't.  Two things happen:
+
+    1. **Heal** trial users with NULL expiry (sets expiry = now + GRACE_PERIOD_DAYS).
+    2. **Invoice** resellers whose subscription expires within PRE_EXPIRY_DAYS
+       or has already expired — i.e. the same users the daily pre-expiry job
+       would target, but without the ±5-day window restriction on past expiry.
+       Users whose subscription is comfortably in the future (> PRE_EXPIRY_DAYS
+       away) are left alone — the daily job will invoice them at the right time.
     """
     now = datetime.utcnow()
+    cutoff = now + timedelta(days=PRE_EXPIRY_DAYS)
 
     resellers = (await db.execute(
         select(User).where(
@@ -1019,6 +1024,12 @@ async def generate_catchup_invoices(db: AsyncSession) -> dict:
                     f"{reseller.id} ({reseller.email}), "
                     f"set to {reseller.subscription_expires_at.date()}"
                 )
+
+            # Skip users whose subscription is comfortably in the future —
+            # the daily pre-expiry job will handle them at the right time.
+            if reseller.subscription_expires_at > cutoff:
+                skipped += 1
+                continue
 
             existing_pending = await get_pending_invoice(db, reseller.id)
             if existing_pending:
