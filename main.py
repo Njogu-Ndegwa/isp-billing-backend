@@ -93,6 +93,7 @@ from app.services.mikrotik_background import (
 )
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
+from app.services.subscription import reconcile_pending_subscription_payments
 from app.services.mpesa_b2b import run_daily_payouts
 
 scheduler = AsyncIOScheduler()
@@ -1211,6 +1212,14 @@ async def startup_event():
         trigger=IntervalTrigger(seconds=90),
         id='reconcile_pending_mpesa',
         name='Reconcile pending M-Pesa transactions via STK Query',
+        replace_existing=True,
+        max_instances=1
+    )
+    scheduler.add_job(
+        reconcile_pending_subscription_payments,
+        trigger=IntervalTrigger(seconds=90),
+        id='reconcile_pending_subscription_payments',
+        name='Reconcile pending subscription payments via STK Query',
         replace_existing=True,
         max_instances=1
     )

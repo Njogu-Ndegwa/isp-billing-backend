@@ -524,6 +524,287 @@ async def get_invoice_alert_for_user(db: AsyncSession, user_id: int) -> dict | N
     return result
 
 
+
+# ---------------------------------------------------------------------------
+# Background reconciliation for subscription payments
+# ---------------------------------------------------------------------------
+
+_sub_reconcile_running = False
+
+
+async def reconcile_pending_subscription_payments():
+    """
+    Periodically queries Safaricom for pending SubscriptionPayment rows and
+    resolves them (complete / fail / expire).  Mirrors the logic in
+    reconcile_pending_mpesa_transactions but operates on the subscription
+    payment table instead of MpesaTransaction.
+    """
+    global _sub_reconcile_running
+    if _sub_reconcile_running:
+        logger.debug("[SUB-RECONCILE] Previous run still active, skipping")
+        return
+    _sub_reconcile_running = True
+
+    try:
+        from app.db.database import async_session
+        from app.services.mpesa import query_stk_push_status, get_access_token
+        import asyncio
+
+        now = datetime.utcnow()
+        query_min_age = timedelta(minutes=2)
+        expire_threshold = timedelta(hours=2)
+
+        async with async_session() as db:
+            stmt = (
+                select(SubscriptionPayment)
+                .where(
+                    SubscriptionPayment.status == SubscriptionPaymentStatus.PENDING,
+                    SubscriptionPayment.created_at < now - query_min_age,
+                    SubscriptionPayment.mpesa_checkout_request_id.isnot(None),
+                )
+                .order_by(SubscriptionPayment.created_at.asc())
+                .limit(30)
+            )
+            result = await db.execute(stmt)
+            pending_payments = list(result.scalars().all())
+
+        if not pending_payments:
+            return
+
+        to_query = []
+        expired_count = 0
+        for pay in pending_payments:
+            age = now - pay.created_at
+            if age > expire_threshold:
+                try:
+                    async with async_session() as db:
+                        p = (await db.execute(
+                            select(SubscriptionPayment).where(
+                                SubscriptionPayment.id == pay.id
+                            )
+                        )).scalar_one_or_none()
+                        if p and p.status == SubscriptionPaymentStatus.PENDING:
+                            p.status = SubscriptionPaymentStatus.FAILED
+                            await db.commit()
+                            expired_count += 1
+                            logger.info(
+                                "[SUB-RECONCILE] Expired stale subscription payment %s (age: %s)",
+                                pay.id, age,
+                            )
+                except Exception as exp_err:
+                    logger.warning("[SUB-RECONCILE] Failed to expire payment %s: %s", pay.id, exp_err)
+            else:
+                to_query.append(pay)
+
+        if expired_count:
+            logger.info("[SUB-RECONCILE] Expired %d stale subscription payments", expired_count)
+
+        if not to_query:
+            return
+
+        to_query.sort(key=lambda p: p.created_at, reverse=True)
+        to_query = to_query[:15]
+
+        logger.info("[SUB-RECONCILE] Querying Safaricom for %d pending subscription payments", len(to_query))
+
+        try:
+            access_token = await get_access_token()
+        except Exception as token_err:
+            logger.warning("[SUB-RECONCILE] Cannot get Safaricom token, aborting batch: %s", token_err)
+            return
+
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+
+        for pay in to_query:
+            if consecutive_failures >= max_consecutive_failures:
+                logger.warning(
+                    "[SUB-RECONCILE] %d consecutive Safaricom failures, aborting remaining queries",
+                    consecutive_failures,
+                )
+                break
+
+            try:
+                stk_result = await query_stk_push_status(
+                    pay.mpesa_checkout_request_id, access_token=access_token
+                )
+                consecutive_failures = 0
+            except Exception as query_err:
+                consecutive_failures += 1
+                logger.warning(
+                    "[SUB-RECONCILE] Could not query Safaricom for payment %s (checkout %s): %s",
+                    pay.id, pay.mpesa_checkout_request_id, query_err,
+                )
+                await asyncio.sleep(3)
+                continue
+
+            result_code = stk_result["result_code"]
+            result_desc = stk_result["result_desc"]
+
+            if result_code == 0:
+                await _complete_subscription_payment(pay.id)
+            elif result_code == -1:
+                logger.debug(
+                    "[SUB-RECONCILE] Payment %s still processing at Safaricom, will retry later",
+                    pay.id,
+                )
+            else:
+                async with async_session() as db:
+                    p = (await db.execute(
+                        select(SubscriptionPayment).where(SubscriptionPayment.id == pay.id)
+                    )).scalar_one_or_none()
+                    if p and p.status == SubscriptionPaymentStatus.PENDING:
+                        p.status = SubscriptionPaymentStatus.FAILED
+                        await db.commit()
+                logger.info(
+                    "[SUB-RECONCILE] Marked subscription payment %s as failed (code=%s, desc=%s)",
+                    pay.id, result_code, result_desc,
+                )
+
+            await asyncio.sleep(2)
+
+    except Exception as outer_err:
+        logger.exception("[SUB-RECONCILE] Reconciliation job failed: %s", outer_err)
+    finally:
+        _sub_reconcile_running = False
+
+
+async def _complete_subscription_payment(payment_id: int):
+    """
+    Mark a single SubscriptionPayment as completed and activate the
+    subscription if the linked invoice is fully paid.  Used by both
+    the background reconciler and the manual verify endpoint.
+    """
+    from app.db.database import async_session
+
+    async with async_session() as db:
+        payment = (await db.execute(
+            select(SubscriptionPayment).where(SubscriptionPayment.id == payment_id)
+        )).scalar_one_or_none()
+
+        if not payment or payment.status != SubscriptionPaymentStatus.PENDING:
+            return False
+
+        payment.status = SubscriptionPaymentStatus.COMPLETED
+
+        fully_paid = False
+        if payment.invoice_id:
+            invoice = (await db.execute(
+                select(SubscriptionInvoice).where(
+                    SubscriptionInvoice.id == payment.invoice_id
+                )
+            )).scalar_one_or_none()
+            if invoice:
+                await db.flush()
+                total_paid = await get_invoice_amount_paid(db, invoice.id)
+                if total_paid >= invoice.final_charge:
+                    invoice.status = InvoiceStatus.PAID
+                    invoice.paid_at = datetime.utcnow()
+                    fully_paid = True
+                    logger.info(
+                        "[SUB-RECONCILE] Invoice #%s fully paid (%s / %s)",
+                        invoice.id, total_paid, invoice.final_charge,
+                    )
+
+        if fully_paid:
+            await activate_subscription(db, payment.user_id, months=1)
+
+        await db.commit()
+        logger.info(
+            "[SUB-RECONCILE] Payment %s completed for reseller %s, invoice #%s, activated=%s",
+            payment.id, payment.user_id, payment.invoice_id, fully_paid,
+        )
+        return True
+
+
+async def verify_subscription_payments_for_reseller(reseller_id: int) -> dict:
+    """
+    Look up all pending subscription payments for a reseller,
+    query Safaricom for each, and resolve them.  Returns a summary.
+    """
+    from app.db.database import async_session
+    from app.services.mpesa import query_stk_push_status, get_access_token
+
+    async with async_session() as db:
+        user = (await db.execute(
+            select(User).where(User.id == reseller_id, User.role == UserRole.RESELLER)
+        )).scalar_one_or_none()
+        if not user:
+            return {
+                "reseller_id": reseller_id,
+                "error": "Reseller not found",
+            }
+
+        stmt = (
+            select(SubscriptionPayment)
+            .where(
+                SubscriptionPayment.user_id == reseller_id,
+                SubscriptionPayment.status == SubscriptionPaymentStatus.PENDING,
+                SubscriptionPayment.mpesa_checkout_request_id.isnot(None),
+            )
+            .order_by(SubscriptionPayment.created_at.desc())
+            .limit(10)
+        )
+        result = await db.execute(stmt)
+        pending = list(result.scalars().all())
+
+    if not pending:
+        return {
+            "reseller_id": reseller_id,
+            "email": user.email,
+            "pending_found": 0,
+            "resolved": [],
+            "message": "No pending subscription payments found for this reseller.",
+        }
+
+    access_token = await get_access_token()
+    resolved = []
+    for pay in pending:
+        try:
+            stk_result = await query_stk_push_status(
+                pay.mpesa_checkout_request_id, access_token=access_token
+            )
+        except Exception as e:
+            resolved.append({
+                "payment_id": pay.id,
+                "checkout_request_id": pay.mpesa_checkout_request_id,
+                "phone_number": pay.phone_number,
+                "amount": pay.amount,
+                "status": "query_failed",
+                "error": str(e),
+            })
+            continue
+
+        rc = stk_result["result_code"]
+        if rc == 0:
+            completed = await _complete_subscription_payment(pay.id)
+            resolved.append({
+                "payment_id": pay.id,
+                "checkout_request_id": pay.mpesa_checkout_request_id,
+                "phone_number": pay.phone_number,
+                "amount": pay.amount,
+                "status": "completed" if completed else "already_processed",
+            })
+        else:
+            resolved.append({
+                "payment_id": pay.id,
+                "checkout_request_id": pay.mpesa_checkout_request_id,
+                "phone_number": pay.phone_number,
+                "amount": pay.amount,
+                "status": "not_paid",
+                "result_code": rc,
+                "result_desc": stk_result["result_desc"],
+            })
+
+    return {
+        "reseller_id": reseller_id,
+        "email": user.email,
+        "pending_found": len(pending),
+        "resolved": resolved,
+        "message": f"Checked {len(pending)} pending payment(s) against Safaricom.",
+    }
+
+
 PRE_EXPIRY_DAYS = 5
 
 

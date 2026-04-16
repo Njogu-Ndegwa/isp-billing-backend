@@ -19,6 +19,7 @@ from app.services.subscription import (
     calculate_reseller_charges,
     generate_invoice_for_reseller, record_subscription_payment,
     get_invoice_alert_for_user,
+    verify_subscription_payments_for_reseller,
     TRIAL_DAYS, GRACE_PERIOD_DAYS,
 )
 from app.services.mpesa import initiate_stk_push_direct
@@ -875,6 +876,21 @@ async def admin_generate_invoices(
     await _require_admin(token, db)
     result = await generate_monthly_invoices(db)
     return {"message": "Invoice generation complete", **result}
+
+
+@router.post("/api/admin/subscriptions/{reseller_id}/verify-payments")
+async def admin_verify_subscription_payments(
+    reseller_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Verify all pending subscription payments for a reseller against Safaricom.
+    Queries the STK Push Query API for each pending payment and auto-completes
+    any that Safaricom confirms as paid.
+    """
+    await _require_admin(token, db)
+    return await verify_subscription_payments_for_reseller(reseller_id)
 
 
 @router.post("/api/admin/subscriptions/generate-pre-expiry-invoices")
