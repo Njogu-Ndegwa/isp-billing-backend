@@ -1224,16 +1224,6 @@ async def startup_event():
         max_instances=1
     )
     # --- Subscription scheduler jobs ---
-    async def _generate_subscription_invoices_background():
-        from app.services.subscription import generate_monthly_invoices
-        async for db in get_db():
-            try:
-                result = await generate_monthly_invoices(db)
-                logger.info(f"[SUBSCRIPTION] Monthly invoice generation: {result}")
-            except Exception as e:
-                logger.error(f"[SUBSCRIPTION] Monthly invoice generation failed: {e}")
-            break
-
     async def _check_overdue_subscriptions_background():
         from app.services.subscription import check_overdue_invoices
         async for db in get_db():
@@ -1243,25 +1233,6 @@ async def startup_event():
             except Exception as e:
                 logger.error(f"[SUBSCRIPTION] Overdue check failed: {e}")
             break
-
-    scheduler.add_job(
-        _generate_subscription_invoices_background,
-        trigger=CronTrigger(day=1, hour=0, minute=30),
-        id='generate_subscription_invoices',
-        name='Generate monthly subscription invoices',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=900,
-    )
-    scheduler.add_job(
-        _check_overdue_subscriptions_background,
-        trigger=CronTrigger(hour=6, minute=0),
-        id='check_overdue_subscriptions',
-        name='Check overdue invoices and suspend non-payers',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=900,
-    )
 
     async def _pre_expiry_invoices_background():
         from app.services.subscription import generate_pre_expiry_invoices
@@ -1275,15 +1246,24 @@ async def startup_event():
 
     scheduler.add_job(
         _pre_expiry_invoices_background,
-        trigger=CronTrigger(hour=8, minute=0),
+        trigger=CronTrigger(hour=6, minute=0),
         id='pre_expiry_invoices',
         name='Generate invoices 5 days before expiry',
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=900,
     )
+    scheduler.add_job(
+        _check_overdue_subscriptions_background,
+        trigger=CronTrigger(hour=8, minute=0),
+        id='check_overdue_subscriptions',
+        name='Check overdue invoices and suspend non-payers',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=900,
+    )
 
-    logger.info("Subscription jobs scheduled: invoices on 1st of month, pre-expiry daily at 08:00, overdue check daily at 06:00")
+    logger.info("Subscription jobs scheduled: per-user invoices daily at 06:00, overdue/suspension check daily at 08:00")
 
     # --- Provisioning token cleanup (3:00 AM EAT / 0:00 UTC) ---
     async def _expire_stale_provisioning_tokens():

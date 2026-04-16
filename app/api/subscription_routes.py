@@ -15,7 +15,7 @@ from app.services.subscription import (
     get_subscription_summary, get_pending_invoice, enrich_invoice,
     get_invoice_amount_paid,
     activate_subscription, deactivate_subscription,
-    generate_monthly_invoices, generate_pre_expiry_invoices,
+    generate_pre_expiry_invoices, generate_catchup_invoices,
     calculate_reseller_charges,
     generate_invoice_for_reseller, record_subscription_payment,
     get_invoice_alert_for_user,
@@ -184,21 +184,32 @@ async def request_my_invoice(
         )
 
     expires = user.subscription_expires_at
-    period_start = datetime(expires.year, expires.month, 1)
-    period_end = expires
+    now = datetime.utcnow()
 
-    if period_start >= period_end:
-        period_start = period_end - timedelta(days=30)
-
-    existing_any = (await db.execute(
-        select(SubscriptionInvoice).where(
-            SubscriptionInvoice.user_id == user.id,
-            SubscriptionInvoice.period_start == period_start,
-        )
+    # period_start = last invoice's period_end, or subscription start
+    last_invoice = (await db.execute(
+        select(SubscriptionInvoice)
+        .where(SubscriptionInvoice.user_id == user.id)
+        .order_by(SubscriptionInvoice.period_end.desc())
+        .limit(1)
     )).scalar_one_or_none()
-    if existing_any:
-        paid = await get_invoice_amount_paid(db, existing_any.id)
-        return {"current_invoice": enrich_invoice(existing_any, paid), "generated": False}
+
+    if last_invoice:
+        period_start = last_invoice.period_end
+    else:
+        sub = (await db.execute(
+            select(Subscription).where(Subscription.user_id == user.id)
+        )).scalar_one_or_none()
+        period_start = sub.current_period_start if sub and sub.current_period_start else (
+            expires - timedelta(days=30)
+        )
+
+    period_end = now
+    if period_start >= period_end:
+        raise HTTPException(
+            status_code=400,
+            detail="No new billing period to invoice yet.",
+        )
 
     charges = await calculate_reseller_charges(db, user.id, period_start, period_end)
 
@@ -869,12 +880,16 @@ async def admin_waive_invoice(
 
 @router.post("/api/admin/subscriptions/generate-invoices")
 async def admin_generate_invoices(
+    catch_up: bool = Query(False, description="Generate for ALL resellers without a pending invoice, not just those expiring within 5 days"),
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Manually trigger invoice generation for the previous month."""
+    """Manually trigger invoice generation. Use ?catch_up=true to backfill all missed invoices."""
     await _require_admin(token, db)
-    result = await generate_monthly_invoices(db)
+    if catch_up:
+        result = await generate_catchup_invoices(db)
+        return {"message": "Catch-up invoice generation complete", **result}
+    result = await generate_pre_expiry_invoices(db)
     return {"message": "Invoice generation complete", **result}
 
 

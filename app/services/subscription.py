@@ -7,6 +7,7 @@ from app.db.models import (
 )
 from datetime import datetime, timedelta
 from fastapi import HTTPException
+import calendar
 import logging
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,17 @@ MINIMUM_CHARGE = 500.0        # 500 KES minimum monthly charge
 TRIAL_DAYS = 7
 GRACE_PERIOD_DAYS = 5
 DUE_SOON_THRESHOLD_DAYS = 5
+
+
+def add_calendar_months(dt: datetime, months: int) -> datetime:
+    """Advance *dt* by *months* calendar months, keeping the same day-of-month.
+    Clamps to the last valid day when the target month is shorter
+    (e.g. Jan 31 + 1 month -> Feb 28)."""
+    month = dt.month + months
+    year = dt.year + (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
 
 
 async def calculate_reseller_charges(
@@ -219,11 +231,33 @@ async def check_overdue_invoices(db: AsyncSession) -> dict:
         trial_expired += 1
         logger.info(f"[SUBSCRIPTION] Trial expired for reseller {user.id} ({user.email})")
 
+    # Catch ACTIVE resellers whose subscription_expires_at has passed but were
+    # not suspended via the invoice path (e.g. invoice was never generated, or
+    # the pre-expiry window was missed due to downtime/misfire).
+    expired_active = (await db.execute(
+        select(User).where(
+            User.role == UserRole.RESELLER,
+            User.subscription_status == SubscriptionStatus.ACTIVE,
+            User.subscription_expires_at.isnot(None),
+            User.subscription_expires_at < now,
+        )
+    )).scalars().all()
+
+    active_expired = 0
+    for user in expired_active:
+        await deactivate_subscription(db, user.id, status=SubscriptionStatus.SUSPENDED)
+        active_expired += 1
+        logger.info(
+            f"[SUBSCRIPTION] Suspended expired ACTIVE reseller {user.id} "
+            f"({user.email}), expired at {user.subscription_expires_at}"
+        )
+
     await db.commit()
     return {
         "marked_overdue": marked_overdue,
         "suspended": suspended,
         "trial_expired": trial_expired,
+        "active_expired": active_expired,
     }
 
 
@@ -234,10 +268,14 @@ async def activate_subscription(db: AsyncSession, user_id: int, months: int = 1)
         return None
 
     now = datetime.utcnow()
-    new_expiry = now + timedelta(days=months * 30)
 
+    # If the user pays before their current period ends, extend from the
+    # existing expiry so they don't lose the remaining days.
+    base = now
     if user.subscription_expires_at and user.subscription_expires_at > now:
-        new_expiry = user.subscription_expires_at + timedelta(days=months * 30)
+        base = user.subscription_expires_at
+
+    new_expiry = add_calendar_months(base, months)
 
     user.subscription_status = SubscriptionStatus.ACTIVE
     user.subscription_expires_at = new_expiry
@@ -812,12 +850,22 @@ PRE_EXPIRY_DAYS = 5
 
 async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
     """
-    Generate invoices for resellers whose subscriptions expire within
-    PRE_EXPIRY_DAYS. Catches mid-month signups whose trial or subscription
-    period ends before the regular 1st-of-month invoice run.
+    Primary invoice generation job (runs daily).
+    Generates an invoice for each reseller whose subscription expires within
+    PRE_EXPIRY_DAYS.  Also sweeps recently-expired users who were missed
+    (e.g. due to server downtime).
+
+    Billing period logic:
+      period_start = last invoice's period_end  (or subscription start)
+      period_end   = now  (so the *next* cycle resumes from here)
+      due_date     = subscription_expires_at
     """
     now = datetime.utcnow()
     cutoff = now + timedelta(days=PRE_EXPIRY_DAYS)
+
+    # Look-back window: also catch users who expired recently but never got an
+    # invoice (e.g. server downtime caused the 5-day window to be missed).
+    lookback = now - timedelta(days=PRE_EXPIRY_DAYS)
 
     expiring_resellers = (await db.execute(
         select(User).where(
@@ -827,7 +875,7 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
                 SubscriptionStatus.TRIAL,
             ]),
             User.subscription_expires_at.isnot(None),
-            User.subscription_expires_at > now,
+            User.subscription_expires_at >= lookback,
             User.subscription_expires_at <= cutoff,
         )
     )).scalars().all()
@@ -843,22 +891,31 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
                 skipped += 1
                 continue
 
-            expires = reseller.subscription_expires_at
-            period_start = datetime(expires.year, expires.month, 1)
-            period_end = expires
-
-            if period_start >= period_end:
-                period_start = period_end - timedelta(days=30)
-
-            already_invoiced = (await db.execute(
-                select(SubscriptionInvoice).where(
-                    SubscriptionInvoice.user_id == reseller.id,
-                    SubscriptionInvoice.period_start == period_start,
-                )
+            # Determine period_start from the last invoice's period_end, or
+            # fall back to the subscription's current_period_start.
+            last_invoice = (await db.execute(
+                select(SubscriptionInvoice)
+                .where(SubscriptionInvoice.user_id == reseller.id)
+                .order_by(SubscriptionInvoice.period_end.desc())
+                .limit(1)
             )).scalar_one_or_none()
-            if already_invoiced:
+
+            if last_invoice:
+                period_start = last_invoice.period_end
+            else:
+                sub = (await db.execute(
+                    select(Subscription).where(Subscription.user_id == reseller.id)
+                )).scalar_one_or_none()
+                period_start = sub.current_period_start if sub and sub.current_period_start else (
+                    reseller.subscription_expires_at - timedelta(days=30)
+                )
+
+            period_end = now
+            if period_start >= period_end:
                 skipped += 1
                 continue
+
+            expires = reseller.subscription_expires_at
 
             charges = await calculate_reseller_charges(
                 db, reseller.id, period_start, period_end
@@ -882,21 +939,120 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
             created += 1
 
             logger.info(
-                f"[SUBSCRIPTION] Pre-expiry invoice #{invoice.id} generated for "
+                f"[SUBSCRIPTION] Invoice #{invoice.id} generated for "
                 f"reseller {reseller.id} ({reseller.email}), "
+                f"period={period_start.date()}..{period_end.date()}, "
                 f"charge=KES {charges['final_charge']:,.0f}, "
-                f"due={expires}"
+                f"due={expires.date()}"
             )
         except Exception as e:
             errors.append({"reseller_id": reseller.id, "error": str(e)})
             logger.error(
-                f"[SUBSCRIPTION] Pre-expiry invoice failed for reseller "
+                f"[SUBSCRIPTION] Invoice generation failed for reseller "
                 f"{reseller.id}: {e}"
             )
 
     await db.commit()
     logger.info(
         f"[SUBSCRIPTION] Pre-expiry invoices: created={created}, "
+        f"skipped={skipped}, errors={len(errors)}"
+    )
+    return {"created": created, "skipped": skipped, "errors": errors}
+
+
+async def generate_catchup_invoices(db: AsyncSession) -> dict:
+    """
+    One-time admin catch-up: generate invoices for ALL active/trial resellers
+    who don't currently have a pending/overdue invoice, regardless of how far
+    away (or past) their expiry date is.  Use after a deploy to backfill
+    users missed by the normal 5-day pre-expiry window.
+    """
+    now = datetime.utcnow()
+
+    resellers = (await db.execute(
+        select(User).where(
+            User.role == UserRole.RESELLER,
+            User.subscription_status.in_([
+                SubscriptionStatus.ACTIVE,
+                SubscriptionStatus.TRIAL,
+            ]),
+            User.subscription_expires_at.isnot(None),
+        )
+    )).scalars().all()
+
+    created = 0
+    skipped = 0
+    errors = []
+
+    for reseller in resellers:
+        try:
+            existing_pending = await get_pending_invoice(db, reseller.id)
+            if existing_pending:
+                skipped += 1
+                continue
+
+            last_invoice = (await db.execute(
+                select(SubscriptionInvoice)
+                .where(SubscriptionInvoice.user_id == reseller.id)
+                .order_by(SubscriptionInvoice.period_end.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+
+            if last_invoice:
+                period_start = last_invoice.period_end
+            else:
+                sub = (await db.execute(
+                    select(Subscription).where(Subscription.user_id == reseller.id)
+                )).scalar_one_or_none()
+                period_start = sub.current_period_start if sub and sub.current_period_start else (
+                    reseller.subscription_expires_at - timedelta(days=30)
+                )
+
+            period_end = now
+            if period_start >= period_end:
+                skipped += 1
+                continue
+
+            expires = reseller.subscription_expires_at
+
+            charges = await calculate_reseller_charges(
+                db, reseller.id, period_start, period_end
+            )
+
+            invoice = SubscriptionInvoice(
+                user_id=reseller.id,
+                period_start=period_start,
+                period_end=period_end,
+                hotspot_revenue=charges["hotspot_revenue"],
+                hotspot_charge=charges["hotspot_charge"],
+                pppoe_user_count=charges["pppoe_user_count"],
+                pppoe_charge=charges["pppoe_charge"],
+                gross_charge=charges["gross_charge"],
+                final_charge=charges["final_charge"],
+                status=InvoiceStatus.PENDING,
+                due_date=expires,
+            )
+            db.add(invoice)
+            await db.flush()
+            created += 1
+
+            logger.info(
+                f"[SUBSCRIPTION] Catch-up invoice #{invoice.id} for "
+                f"reseller {reseller.id} ({reseller.email}), "
+                f"period={period_start.date()}..{period_end.date()}, "
+                f"charge=KES {charges['final_charge']:,.0f}, "
+                f"due={expires.date()}"
+            )
+        except Exception as e:
+            errors.append({"reseller_id": reseller.id, "error": str(e)})
+            logger.error(
+                f"[SUBSCRIPTION] Catch-up invoice failed for reseller "
+                f"{reseller.id}: {e}"
+            )
+
+    await db.commit()
+    logger.info(
+        f"[SUBSCRIPTION] Catch-up invoices: created={created}, "
         f"skipped={skipped}, errors={len(errors)}"
     )
     return {"created": created, "skipped": skipped, "errors": errors}
