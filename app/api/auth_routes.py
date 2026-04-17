@@ -51,6 +51,18 @@ async def register_user_api(
             mpesa_shortcode=request.mpesa_shortcode
         )
 
+        response_data = {
+            "id": user.id,
+            "email": user.email,
+            "user_code": user.user_code,
+            "role": user.role.value,
+            "organization_name": user.organization_name,
+            "business_name": getattr(user, 'business_name', None),
+            "support_phone": getattr(user, 'support_phone', None),
+            "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None),
+            "created_at": user.created_at.isoformat()
+        }
+
         if role_enum == UserRole.RESELLER:
             try:
                 from app.services.lead_tracking import try_link_lead_on_registration
@@ -66,17 +78,7 @@ async def register_user_api(
                 except Exception:
                     pass
 
-        return {
-            "id": user.id,
-            "email": user.email,
-            "user_code": user.user_code,
-            "role": user.role.value,
-            "organization_name": user.organization_name,
-            "business_name": getattr(user, 'business_name', None),
-            "support_phone": getattr(user, 'support_phone', None),
-            "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None),
-            "created_at": user.created_at.isoformat()
-        }
+        return response_data
     except HTTPException:
         raise
     except Exception as e:

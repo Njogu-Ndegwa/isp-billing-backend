@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
+import asyncio
 import random
 from passlib.context import CryptContext
 from app.db.models import User, UserRole, SubscriptionStatus
@@ -28,7 +29,7 @@ async def generate_unique_user_code(db: AsyncSession) -> int:
             return user_code
 
 async def create_user(db: AsyncSession, email: str, password: str, role: UserRole, organization_name: str, created_by: int = None, business_name: str = None, support_phone: str = None, mpesa_shortcode: str = None):
-    hashed_password = pwd_context.hash(password)
+    hashed_password = await asyncio.to_thread(pwd_context.hash, password)
     user_code = await generate_unique_user_code(db)
     user = User(
         user_code=user_code,
@@ -55,7 +56,10 @@ async def authenticate_user(db: AsyncSession, email: str, password: str):
     stmt = select(User).filter(User.email == email)
     result = await db.execute(stmt)
     user = result.scalar_one_or_none()
-    if not user or not pwd_context.verify(password, user.password_hash):
+    if not user:
+        return None
+    password_valid = await asyncio.to_thread(pwd_context.verify, password, user.password_hash)
+    if not password_valid:
         return None
     return user
 

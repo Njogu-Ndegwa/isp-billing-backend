@@ -2,9 +2,19 @@
 
 Track potential reseller customers from first social media contact through to paying member. Admin-only feature.
 
+**Base URL:** Your API root (e.g. `https://yourdomain.com`)
+
 ## Authentication
 
-All endpoints require admin JWT in the `Authorization: Bearer <token>` header.
+All endpoints require admin JWT in the `Authorization` header:
+
+```
+Authorization: Bearer <admin_token>
+```
+
+Non-admin users receive `403 Admin access required`.
+
+---
 
 ## Pipeline Stages
 
@@ -21,22 +31,39 @@ All endpoints require admin JWT in the `Authorization: Bearer <token>` header.
 
 ## Activity Types
 
-`note`, `call`, `dm`, `email`, `meeting`, `stage_change`, `followup_completed`, `other`
+| Value | Description |
+|-------|-------------|
+| `note` | General note |
+| `call` | Phone call |
+| `dm` | Direct message (social media) |
+| `email` | Email sent/received |
+| `meeting` | In-person or virtual meeting |
+| `stage_change` | Auto-logged when stage changes |
+| `followup_completed` | Auto-logged when a follow-up is marked done |
+| `other` | Anything else |
 
 ---
 
-## Lead Sources
+## 1. Lead Sources
 
-Managed list of channels where leads come from. Pre-seeded with: Instagram, TikTok, WhatsApp, Referral, Phone Call, Walk-in, Website, Facebook, Other.
+Managed list of channels where leads come from. Pre-seeded defaults: Instagram, TikTok, WhatsApp, Referral, Phone Call, Walk-in, Website, Facebook, Other.
 
-### GET `/api/leads/sources`
+---
 
-List all lead sources (for populating dropdowns).
+### 1.1 List Sources
+
+```
+GET /api/leads/sources?active_only=true
+```
 
 **Query Parameters:**
-- `active_only` (bool, default `true`) — only return active sources
 
-**Response:**
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `active_only` | bool | `true` | Only return active sources |
+
+**Response `200`:**
+
 ```json
 [
   {
@@ -45,15 +72,27 @@ List all lead sources (for populating dropdowns).
     "description": "Leads from Instagram DMs and comments",
     "is_active": true,
     "created_at": "2026-04-15T12:00:00"
+  },
+  {
+    "id": 2,
+    "name": "TikTok",
+    "description": "Leads from TikTok videos and comments",
+    "is_active": true,
+    "created_at": "2026-04-15T12:00:00"
   }
 ]
 ```
 
-### POST `/api/leads/sources`
+---
 
-Add a new lead source.
+### 1.2 Create Source
+
+```
+POST /api/leads/sources
+```
 
 **Request Body:**
+
 ```json
 {
   "name": "YouTube",
@@ -61,11 +100,35 @@ Add a new lead source.
 }
 ```
 
-### PUT `/api/leads/sources/{source_id}`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique source name |
+| `description` | string | No | What this source means |
 
-Update a source name or description.
+**Response `201`:**
 
-**Request Body:**
+```json
+{
+  "id": 10,
+  "name": "YouTube",
+  "description": "Leads from YouTube video comments",
+  "is_active": true,
+  "created_at": "2026-04-15T16:00:00"
+}
+```
+
+**Error `409`:** `"A source with this name already exists"`
+
+---
+
+### 1.3 Update Source
+
+```
+PUT /api/leads/sources/{source_id}
+```
+
+**Request Body (all fields optional):**
+
 ```json
 {
   "name": "Instagram DMs",
@@ -74,23 +137,66 @@ Update a source name or description.
 }
 ```
 
-### DELETE `/api/leads/sources/{source_id}`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | No | New name (checked for uniqueness) |
+| `description` | string | No | New description |
+| `is_active` | bool | No | Enable/disable this source |
 
-Soft-delete (deactivate) a source. Existing leads keep their source reference.
+**Response `200`:**
+
+```json
+{
+  "id": 1,
+  "name": "Instagram DMs",
+  "description": "Updated description",
+  "is_active": true,
+  "created_at": "2026-04-15T12:00:00"
+}
+```
+
+**Error `404`:** `"Source not found"`
+**Error `409`:** `"A source with this name already exists"`
 
 ---
 
-## Leads
+### 1.4 Delete Source (soft-delete)
 
-### POST `/api/leads`
+```
+DELETE /api/leads/sources/{source_id}
+```
 
-Create a new lead.
+Sets `is_active = false`. Existing leads keep their source reference.
+
+**Response `200`:**
+
+```json
+{
+  "detail": "Source deactivated",
+  "id": 1
+}
+```
+
+**Error `404`:** `"Source not found"`
+
+---
+
+## 2. Leads — CRUD
+
+---
+
+### 2.1 Create Lead
+
+```
+POST /api/leads
+```
 
 **Request Body:**
+
 ```json
 {
   "name": "John Doe",
-  "phone": "0712345678",
+  "phone": "+254712345678",
   "email": "john@example.com",
   "social_platform": "tiktok",
   "social_handle": "@johndoe_isp",
@@ -102,22 +208,65 @@ Create a new lead.
 }
 ```
 
-**Required fields:** `name`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | **Yes** | Lead's name or business name |
+| `phone` | string | No | Phone number |
+| `email` | string | No | Email address |
+| `social_platform` | string | No | e.g. `tiktok`, `instagram`, `facebook` |
+| `social_handle` | string | No | e.g. `@johndoe_isp` |
+| `source_id` | int | No | ID from lead sources list |
+| `source_detail` | string | No | Extra context (e.g. which post they commented on) |
+| `stage` | string | No | Starting stage (default: `new_lead`) |
+| `notes` | string | No | Free-form notes |
+| `next_followup_at` | datetime | No | When to follow up next |
 
-**Response:** Full lead object (see GET detail below).
+**Response `201`:**
 
-### GET `/api/leads`
+```json
+{
+  "id": 1,
+  "name": "John Doe",
+  "phone": "+254712345678",
+  "email": "john@example.com",
+  "social_platform": "tiktok",
+  "social_handle": "@johndoe_isp",
+  "source": "TikTok",
+  "source_id": 2,
+  "source_detail": "Commented on router setup video",
+  "stage": "new_lead",
+  "stage_changed_at": "2026-04-15T16:00:00",
+  "next_followup_at": "2026-04-18T10:00:00",
+  "notes": "Interested in becoming a reseller in Nairobi",
+  "converted_user_id": null,
+  "lost_reason": null,
+  "created_at": "2026-04-15T16:00:00",
+  "updated_at": "2026-04-15T16:00:00"
+}
+```
 
-List leads with filtering, search, and pagination.
+**Error `400`:** `"Invalid stage: xyz"` or `"Invalid source_id"`
+
+---
+
+### 2.2 List Leads
+
+```
+GET /api/leads?stage=talking&source_id=2&search=john&page=1&per_page=50
+```
 
 **Query Parameters:**
-- `stage` (string) — filter by pipeline stage (e.g., `talking`, `new_lead`)
-- `source_id` (int) — filter by lead source
-- `search` (string) — search in name, phone, email, social handle
-- `page` (int, default 1) — page number
-- `per_page` (int, default 50, max 200) — results per page
 
-**Response:**
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `stage` | string | — | Filter by stage value |
+| `source_id` | int | — | Filter by lead source |
+| `search` | string | — | Search in name, phone, email, social handle |
+| `page` | int | `1` | Page number (min 1) |
+| `per_page` | int | `50` | Results per page (1–200) |
+
+**Response `200`:**
+
 ```json
 {
   "total": 42,
@@ -127,7 +276,7 @@ List leads with filtering, search, and pagination.
     {
       "id": 1,
       "name": "John Doe",
-      "phone": "0712345678",
+      "phone": "+254712345678",
       "email": "john@example.com",
       "social_platform": "tiktok",
       "social_handle": "@johndoe_isp",
@@ -143,16 +292,23 @@ List leads with filtering, search, and pagination.
 }
 ```
 
-### GET `/api/leads/{lead_id}`
+---
 
-Get full lead detail including activities timeline and follow-ups.
+### 2.3 Get Lead Detail
 
-**Response:**
+```
+GET /api/leads/{lead_id}
+```
+
+Returns full lead info including activities timeline and follow-ups.
+
+**Response `200`:**
+
 ```json
 {
   "id": 1,
   "name": "John Doe",
-  "phone": "0712345678",
+  "phone": "+254712345678",
   "email": "john@example.com",
   "social_platform": "tiktok",
   "social_handle": "@johndoe_isp",
@@ -168,6 +324,14 @@ Get full lead detail including activities timeline and follow-ups.
   "created_at": "2026-04-14T09:00:00",
   "updated_at": "2026-04-15T14:30:00",
   "activities": [
+    {
+      "id": 3,
+      "activity_type": "call",
+      "description": "Called to discuss pricing, agreed on Silver plan",
+      "old_stage": null,
+      "new_stage": null,
+      "created_at": "2026-04-15T15:00:00"
+    },
     {
       "id": 2,
       "activity_type": "stage_change",
@@ -198,17 +362,63 @@ Get full lead detail including activities timeline and follow-ups.
 }
 ```
 
-### PUT `/api/leads/{lead_id}`
+**Error `404`:** `"Lead not found"`
 
-Update lead information (not the stage — use PATCH stage endpoint for that).
+---
 
-**Request Body:** Same fields as create, all optional.
+### 2.4 Update Lead
 
-### PATCH `/api/leads/{lead_id}/stage`
+```
+PUT /api/leads/{lead_id}
+```
 
-Move a lead to a new pipeline stage. Automatically logs a stage_change activity.
+Update lead info. **Send a field as `null` to clear it. Omit a field to leave it unchanged.** Do NOT use this to change stages — use the stage endpoint (2.5) instead.
+
+**Request Body (all fields optional):**
+
+```json
+{
+  "name": "John Doe Updated",
+  "phone": "+254700111222",
+  "email": "newemail@example.com",
+  "social_platform": "instagram",
+  "social_handle": "@johndoe_new",
+  "source_id": 1,
+  "source_detail": "Switched from TikTok to Instagram",
+  "notes": "Updated notes here",
+  "next_followup_at": "2026-04-20T10:00:00"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | No | Updated name |
+| `phone` | string | No | Updated phone (send `null` to clear) |
+| `email` | string | No | Updated email (send `null` to clear) |
+| `social_platform` | string | No | Updated platform (send `null` to clear) |
+| `social_handle` | string | No | Updated handle (send `null` to clear) |
+| `source_id` | int | No | Updated source (send `null` to clear) |
+| `source_detail` | string | No | Updated source detail (send `null` to clear) |
+| `notes` | string | No | Updated notes (send `null` to clear) |
+| `next_followup_at` | datetime | No | Updated follow-up date (send `null` to clear) |
+
+**Response `200`:** Full lead object (same shape as 2.3, without `activities` and `follow_ups`).
+
+**Error `404`:** `"Lead not found"`
+**Error `400`:** `"Invalid source_id"`
+
+---
+
+### 2.5 Change Lead Stage
+
+```
+PATCH /api/leads/{lead_id}/stage
+```
+
+Move a lead to a new pipeline stage. Automatically logs a `stage_change` activity.
 
 **Request Body:**
+
 ```json
 {
   "stage": "talking",
@@ -217,23 +427,54 @@ Move a lead to a new pipeline stage. Automatically logs a stage_change activity.
 }
 ```
 
-- `stage` (required) — one of the pipeline stage values
-- `note` (optional) — description logged in the activity timeline
-- `lost_reason` (optional) — reason for loss/churn (only used when stage is `lost` or `churned`)
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `stage` | string | **Yes** | Target stage value |
+| `note` | string | No | Description logged in activity timeline |
+| `lost_reason` | string | No | Why the lead was lost/churned (only for `lost` or `churned`) |
 
-### DELETE `/api/leads/{lead_id}`
+**Response `200`:** Full lead object (same shape as 2.3, without `activities` and `follow_ups`).
 
-Permanently delete a lead and all its activities/follow-ups.
+**Error `400`:** `"Invalid stage: xyz"` or `"Lead is already in this stage"`
+**Error `404`:** `"Lead not found"`
 
 ---
 
-## Pipeline Views
+### 2.6 Delete Lead
 
-### GET `/api/leads/pipeline/summary`
+```
+DELETE /api/leads/{lead_id}
+```
 
-Counts per stage — use this for Kanban board columns.
+Permanently deletes a lead and all its activities and follow-ups (cascade).
 
-**Response:**
+**Response `200`:**
+
+```json
+{
+  "detail": "Lead deleted",
+  "id": 1
+}
+```
+
+**Error `404`:** `"Lead not found"`
+
+---
+
+## 3. Pipeline & Analytics
+
+---
+
+### 3.1 Pipeline Summary
+
+```
+GET /api/leads/pipeline/summary
+```
+
+Counts per stage. Use this for Kanban board column headers.
+
+**Response `200`:**
+
 ```json
 {
   "stages": {
@@ -250,11 +491,18 @@ Counts per stage — use this for Kanban board columns.
 }
 ```
 
-### GET `/api/leads/pipeline/stats`
+---
 
-Comprehensive analytics: conversion funnel with drop-off percentages, source performance, stale lead detection, and actionable advice.
+### 3.2 Pipeline Stats (Full Analytics)
 
-**Response:**
+```
+GET /api/leads/pipeline/stats
+```
+
+Comprehensive analytics: conversion funnel, source performance, stale leads, and actionable advice.
+
+**Response `200`:**
+
 ```json
 {
   "total_leads": 41,
@@ -272,18 +520,70 @@ Comprehensive analytics: conversion funnel with drop-off percentages, source per
     "lost": 6
   },
   "by_source": {
-    "TikTok": {"total": 12, "converted": 5, "conversion_rate": 41.7},
-    "Instagram": {"total": 15, "converted": 4, "conversion_rate": 26.7},
-    "Referral": {"total": 8, "converted": 6, "conversion_rate": 75.0},
-    "WhatsApp": {"total": 6, "converted": 1, "conversion_rate": 16.7}
+    "TikTok": {
+      "total": 12,
+      "converted": 5,
+      "conversion_rate": 41.7
+    },
+    "Instagram": {
+      "total": 15,
+      "converted": 4,
+      "conversion_rate": 26.7
+    },
+    "Referral": {
+      "total": 8,
+      "converted": 6,
+      "conversion_rate": 75.0
+    },
+    "WhatsApp": {
+      "total": 6,
+      "converted": 1,
+      "conversion_rate": 16.7
+    }
   },
   "funnel": [
-    {"stage": "new_lead", "reached": 41, "percent_of_total": 100.0, "dropped_off": 0, "drop_off_percent": 0},
-    {"stage": "contacted", "reached": 36, "percent_of_total": 87.8, "dropped_off": 5, "drop_off_percent": 12.2},
-    {"stage": "talking", "reached": 30, "percent_of_total": 73.2, "dropped_off": 6, "drop_off_percent": 16.7},
-    {"stage": "installation_help", "reached": 22, "percent_of_total": 53.7, "dropped_off": 8, "drop_off_percent": 26.7},
-    {"stage": "signed_up", "reached": 17, "percent_of_total": 41.5, "dropped_off": 5, "drop_off_percent": 22.7},
-    {"stage": "paying", "reached": 13, "percent_of_total": 31.7, "dropped_off": 4, "drop_off_percent": 23.5}
+    {
+      "stage": "new_lead",
+      "reached": 35,
+      "percent_of_total": 85.4,
+      "dropped_off": 0,
+      "drop_off_percent": 0
+    },
+    {
+      "stage": "contacted",
+      "reached": 30,
+      "percent_of_total": 73.2,
+      "dropped_off": 5,
+      "drop_off_percent": 14.3
+    },
+    {
+      "stage": "talking",
+      "reached": 27,
+      "percent_of_total": 65.9,
+      "dropped_off": 3,
+      "drop_off_percent": 10.0
+    },
+    {
+      "stage": "installation_help",
+      "reached": 19,
+      "percent_of_total": 46.3,
+      "dropped_off": 8,
+      "drop_off_percent": 29.6
+    },
+    {
+      "stage": "signed_up",
+      "reached": 17,
+      "percent_of_total": 41.5,
+      "dropped_off": 2,
+      "drop_off_percent": 10.5
+    },
+    {
+      "stage": "paying",
+      "reached": 13,
+      "percent_of_total": 31.7,
+      "dropped_off": 4,
+      "drop_off_percent": 23.5
+    }
   ],
   "avg_days_in_stage": {
     "new_lead": 2.3,
@@ -297,7 +597,20 @@ Comprehensive analytics: conversion funnel with drop-off percentages, source per
     "no_followup_scheduled": 7,
     "overdue_followups": 2,
     "stale_lead_previews": [
-      {"id": 12, "name": "Jane Doe", "stage": "talking", "days_since_update": 14, "phone": "0712345678"}
+      {
+        "id": 12,
+        "name": "Jane Doe",
+        "stage": "talking",
+        "days_since_update": 14,
+        "phone": "+254712345678"
+      },
+      {
+        "id": 8,
+        "name": "Mike Reseller",
+        "stage": "new_lead",
+        "days_since_update": 10,
+        "phone": "+254700111222"
+      }
     ]
   },
   "advice": [
@@ -305,47 +618,68 @@ Comprehensive analytics: conversion funnel with drop-off percentages, source per
       "priority": "high",
       "category": "follow_up",
       "title": "4 lead(s) have gone cold",
-      "detail": "You have 4 leads in active stages with no update for 7+ days..."
+      "detail": "You have 4 leads in active stages with no update for 7+ days. These are at high risk of being lost. Reach out today."
     },
     {
       "priority": "high",
       "category": "funnel",
-      "title": "Biggest drop-off: 26.7% lost before \"Installation Help\"",
-      "detail": "26.7% of leads in conversation don't move to installation..."
+      "title": "Biggest drop-off: 29.6% lost before \"Installation Help\"",
+      "detail": "29.6% of leads in conversation don't move to installation. They may be unsure about the technical side. Create a simple guide or short video showing how easy setup is."
     },
     {
       "priority": "medium",
+      "category": "follow_up",
+      "title": "7 active lead(s) with no follow-up scheduled",
+      "detail": "Every active lead should have a next step. Schedule follow-ups so nothing slips through the cracks."
+    },
+    {
+      "priority": "low",
       "category": "source",
       "title": "Best source: Referral (75.0% conversion)",
-      "detail": "\"Referral\" converts at 75.0% (6 of 8 leads)..."
+      "detail": "\"Referral\" converts at 75.0% (6 of 8 leads). Consider doubling down on this channel."
     }
   ]
 }
 ```
 
-**Key sections explained:**
+**Field reference:**
 
-| Section | What it tells you |
-|---------|-------------------|
-| `funnel` | How many leads reached each stage, with drop-off between stages |
-| `by_source` | Which channels produce the most leads AND which actually convert to paying |
-| `avg_days_in_stage` | How long leads sit in each stage (helps spot bottlenecks) |
-| `health` | Stale leads, missing follow-ups, overdue reminders |
-| `advice` | Prioritized, actionable tips based on your actual data |
+| Field | Description |
+|-------|-------------|
+| `total_leads` | Total leads in system |
+| `active_pipeline` | Leads in stages: new_lead + contacted + talking + installation_help |
+| `conversion_rate` | % of leads that reached signed_up or paying |
+| `loss_rate` | % of leads that are lost or churned |
+| `by_stage` | Count of leads in each stage |
+| `by_source` | Per-source total leads, conversions, and conversion rate |
+| `funnel` | How many leads reached each stage or beyond, with drop-off between stages |
+| `avg_days_in_stage` | Average days leads sit in each active stage |
+| `health.stale_leads` | Leads in active stages with no update for 7+ days |
+| `health.no_followup_scheduled` | Active leads with no next follow-up |
+| `health.overdue_followups` | Follow-ups past their due date |
+| `health.stale_lead_previews` | Top 20 stale leads with preview info |
+| `advice` | Prioritized actionable tips based on your data |
 
-**Advice priorities:** `high` (act today), `medium` (address this week), `low` (good to know)
+**Advice priorities:** `high` (act today), `medium` (this week), `low` (good to know)
 
 **Advice categories:** `follow_up`, `funnel`, `speed`, `source`, `action`, `general`
 
 ---
 
-## Activities (Timeline)
+## 4. Activities (Timeline)
 
-### POST `/api/leads/{lead_id}/activities`
+---
+
+### 4.1 Log Activity
+
+```
+POST /api/leads/{lead_id}/activities
+```
 
 Log an interaction with a lead.
 
 **Request Body:**
+
 ```json
 {
   "activity_type": "call",
@@ -353,23 +687,105 @@ Log an interaction with a lead.
 }
 ```
 
-Valid `activity_type` values: `note`, `call`, `dm`, `email`, `meeting`, `other`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `activity_type` | string | **Yes** | One of: `note`, `call`, `dm`, `email`, `meeting`, `other` |
+| `description` | string | No | What happened |
 
-(Stage changes and follow-up completions are logged automatically.)
+Note: `stage_change` and `followup_completed` are logged automatically by the system.
 
-### GET `/api/leads/{lead_id}/activities`
+**Response `201`:**
 
-List all activities for a lead, newest first.
+```json
+{
+  "id": 5,
+  "lead_id": 1,
+  "activity_type": "call",
+  "description": "Called to discuss pricing, agreed on Silver plan",
+  "old_stage": null,
+  "new_stage": null,
+  "created_at": "2026-04-15T16:30:00"
+}
+```
+
+**Error `400`:** `"Invalid activity_type: xyz"`
+**Error `404`:** `"Lead not found"`
 
 ---
 
-## Follow-ups
+### 4.2 List Activities
 
-### POST `/api/leads/{lead_id}/followups`
+```
+GET /api/leads/{lead_id}/activities
+```
 
-Schedule a follow-up reminder.
+List all activities for a lead, newest first.
+
+**Response `200`:**
+
+```json
+{
+  "activities": [
+    {
+      "id": 5,
+      "activity_type": "call",
+      "description": "Called to discuss pricing, agreed on Silver plan",
+      "old_stage": null,
+      "new_stage": null,
+      "created_at": "2026-04-15T16:30:00"
+    },
+    {
+      "id": 4,
+      "activity_type": "followup_completed",
+      "description": "Completed follow-up: Call back about pricing",
+      "old_stage": null,
+      "new_stage": null,
+      "created_at": "2026-04-15T16:29:00"
+    },
+    {
+      "id": 3,
+      "activity_type": "stage_change",
+      "description": "Had first call, very interested",
+      "old_stage": "contacted",
+      "new_stage": "talking",
+      "created_at": "2026-04-15T14:30:00"
+    },
+    {
+      "id": 2,
+      "activity_type": "dm",
+      "description": "Sent intro DM on TikTok",
+      "old_stage": null,
+      "new_stage": null,
+      "created_at": "2026-04-14T12:00:00"
+    },
+    {
+      "id": 1,
+      "activity_type": "stage_change",
+      "description": "Lead created",
+      "old_stage": null,
+      "new_stage": "new_lead",
+      "created_at": "2026-04-14T09:00:00"
+    }
+  ]
+}
+```
+
+**Error `404`:** `"Lead not found"`
+
+---
+
+## 5. Follow-ups (Reminders)
+
+---
+
+### 5.1 Schedule Follow-up
+
+```
+POST /api/leads/{lead_id}/followups
+```
 
 **Request Body:**
+
 ```json
 {
   "title": "Call back about router installation",
@@ -377,58 +793,135 @@ Schedule a follow-up reminder.
 }
 ```
 
-### GET `/api/leads/followups/upcoming`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `title` | string | **Yes** | What to do |
+| `due_at` | datetime | **Yes** | When it's due (ISO 8601) |
 
-Get all upcoming (incomplete) follow-ups across all leads.
+Automatically updates the lead's `next_followup_at` if this is the earliest pending follow-up.
+
+**Response `201`:**
+
+```json
+{
+  "id": 3,
+  "lead_id": 1,
+  "title": "Call back about router installation",
+  "due_at": "2026-04-18T10:00:00",
+  "is_completed": false,
+  "created_at": "2026-04-15T16:35:00"
+}
+```
+
+**Error `404`:** `"Lead not found"`
+
+---
+
+### 5.2 List Upcoming Follow-ups
+
+```
+GET /api/leads/followups/upcoming?days=7
+```
+
+Lists all incomplete follow-ups across all your leads within the given time window, including overdue ones.
 
 **Query Parameters:**
-- `days` (int, default 7, max 90) — look-ahead window
 
-**Response:**
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `days` | int | `7` | Look-ahead window (1–90) |
+
+**Response `200`:**
+
 ```json
 {
   "followups": [
     {
-      "id": 1,
+      "id": 2,
+      "title": "Send pricing sheet",
+      "due_at": "2026-04-14T09:00:00",
+      "is_overdue": true,
+      "lead_id": 5,
+      "lead_name": "Mike Reseller",
+      "lead_stage": "talking",
+      "created_at": "2026-04-13T11:00:00"
+    },
+    {
+      "id": 3,
       "title": "Call back about router installation",
       "due_at": "2026-04-18T10:00:00",
       "is_overdue": false,
       "lead_id": 1,
       "lead_name": "John Doe",
       "lead_stage": "talking",
-      "created_at": "2026-04-15T14:35:00"
+      "created_at": "2026-04-15T16:35:00"
     }
   ],
-  "total": 1
+  "total": 2
 }
 ```
 
-### PATCH `/api/leads/followups/{followup_id}/complete`
+---
 
-Mark a follow-up as done. Automatically logs a `followup_completed` activity and updates the lead's `next_followup_at` to the next pending follow-up (if any).
+### 5.3 Complete Follow-up
+
+```
+PATCH /api/leads/followups/{followup_id}/complete
+```
+
+Marks a follow-up as done. Automatically:
+- Logs a `followup_completed` activity on the lead
+- Updates the lead's `next_followup_at` to the next pending follow-up (or `null` if none left)
+
+**Request Body:** None required.
+
+**Response `200`:**
+
+```json
+{
+  "detail": "Follow-up completed",
+  "id": 3
+}
+```
+
+**Error `404`:** `"Follow-up not found"`
 
 ---
 
-## Conversion
+## 6. Conversion (Lead → Reseller Account)
 
-### POST `/api/leads/{lead_id}/convert`
+---
 
-Convert a lead into a reseller account. Creates a new User with `role=reseller`, links it to the lead, and moves the stage to `signed_up`.
+### 6.1 Convert Lead
+
+```
+POST /api/leads/{lead_id}/convert
+```
+
+Creates a reseller user account directly from a lead, links it, and moves the stage to `signed_up`.
 
 **Request Body:**
+
 ```json
 {
   "email": "john@example.com",
   "organization_name": "John's ISP",
   "password": "securepassword123",
   "business_name": "John Internet Services",
-  "support_phone": "0712345678"
+  "support_phone": "+254712345678"
 }
 ```
 
-**Required:** `email`, `organization_name`, `password`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `email` | string | **Yes** | Login email for the new reseller account |
+| `organization_name` | string | **Yes** | Organization/company name |
+| `password` | string | **Yes** | Account password |
+| `business_name` | string | No | Display business name |
+| `support_phone` | string | No | Support phone number |
 
-**Response:**
+**Response `200`:**
+
 ```json
 {
   "detail": "Lead converted to reseller",
@@ -439,69 +932,91 @@ Convert a lead into a reseller account. Creates a new User with `role=reseller`,
 }
 ```
 
----
-
-## Automatic Stage Progression
-
-Once a lead is linked to a reseller account (either via the `/convert` endpoint or auto-linking on registration), the lead stage advances automatically based on real system events:
-
-```
-Lead created ──(manual)──> ... ──(manual/auto)──> signed_up
-                                                      │
-                                  Subscription activated (payment)
-                                                      │
-                                                      ▼
-                                                   paying
-                                                      │
-                                  Subscription suspended/deactivated
-                                                      │
-                                                      ▼
-                                                   churned
-                                                      │
-                                  Subscription reactivated (new payment)
-                                                      │
-                                                      ▼
-                                                   paying (again)
-```
-
-### Auto-linking on registration
-
-When a new reseller signs up via `POST /api/users/register`, the system checks if their email or phone matches an existing lead. If found:
-- The lead's `converted_user_id` is set to the new user ID
-- The lead stage moves to `signed_up`
-- A `stage_change` activity is logged automatically
-
-This means: if you add a lead with their email, and that person later signs up on their own, the link happens automatically.
-
-### Auto-advance to paying
-
-When `activate_subscription()` is called (reseller pays), the system checks if the user has a linked lead and moves it to `paying`. This is logged in the activity timeline.
-
-### Auto-regress to churned
-
-When `deactivate_subscription()` is called (subscription suspended due to non-payment), the system checks for a linked lead and moves it to `churned`.
-
-### What stays manual
-
-The early pipeline stages (new_lead → contacted → talking → installation_help) are always manual — these represent your personal conversations and outreach that only you know about.
+**Error `400`:** `"Lead has already been converted"`
+**Error `404`:** `"Lead not found"`
+**Error `409`:** `"A user with this email already exists"`
 
 ---
 
-## Frontend Integration Notes
+## 7. Automatic Stage Progression
 
-### Kanban Board
-1. Call `GET /api/leads/pipeline/summary` to get column counts
-2. Call `GET /api/leads?stage=<stage>` to load leads per column
-3. On drag-drop between columns, call `PATCH /api/leads/{id}/stage`
+These happen without any frontend calls. They are documented here so you can explain the behavior to users or show appropriate UI indicators.
 
-### Lead Detail Page
-1. Call `GET /api/leads/{id}` — returns activities + follow-ups in one call
-2. Show timeline from `activities` array (newest first)
-3. Show pending follow-ups from `follow_ups` array
+### 7.1 Self-signup auto-tracking
 
-### Dashboard Widget
-1. Call `GET /api/leads/followups/upcoming?days=7` for the follow-up reminder list
-2. Call `GET /api/leads/pipeline/stats` for the analytics card (conversion rate, leads by source chart)
+When a reseller registers via `POST /api/users/register`:
 
-### Source Dropdown
-1. Call `GET /api/leads/sources` on form load to populate the "Where did this lead come from?" dropdown
+1. System checks if their email or phone matches an existing lead
+2. **If a match is found:** lead is linked to the new user, stage moves to `signed_up`
+3. **If no match is found:** a new lead is auto-created at `signed_up` stage with source "Website" and detail "Self-signup (no prior lead record)"
+
+This means every reseller who signs up — from ads, website, referral link — automatically appears in your pipeline.
+
+### 7.2 Auto-advance to paying
+
+When a reseller's subscription is activated (they pay), the linked lead automatically moves to `paying`.
+
+### 7.3 Auto-regress to churned
+
+When a reseller's subscription is suspended or deactivated, the linked lead automatically moves to `churned`.
+
+### 7.4 Auto-recover to paying
+
+If a churned reseller reactivates their subscription, the lead moves back to `paying`.
+
+```
+Lead created ──(manual)──> ... ──(manual/convert)──> signed_up
+                                                        │
+                                    Subscription activated (payment)
+                                                        │
+                                                        ▼
+                                                     paying
+                                                        │
+                                    Subscription suspended/deactivated
+                                                        │
+                                                        ▼
+                                                     churned
+                                                        │
+                                    Subscription reactivated (new payment)
+                                                        │
+                                                        ▼
+                                                     paying (again)
+```
+
+---
+
+## 8. Endpoint Quick Reference
+
+| # | Method | Endpoint | Description |
+|---|--------|----------|-------------|
+| 1 | `GET` | `/api/leads/sources` | List lead sources |
+| 2 | `POST` | `/api/leads/sources` | Create lead source |
+| 3 | `PUT` | `/api/leads/sources/{source_id}` | Update lead source |
+| 4 | `DELETE` | `/api/leads/sources/{source_id}` | Deactivate lead source |
+| 5 | `POST` | `/api/leads` | Create lead |
+| 6 | `GET` | `/api/leads` | List leads (filtered, paginated) |
+| 7 | `GET` | `/api/leads/{lead_id}` | Get lead detail + activities + follow-ups |
+| 8 | `PUT` | `/api/leads/{lead_id}` | Update lead info |
+| 9 | `PATCH` | `/api/leads/{lead_id}/stage` | Change lead stage |
+| 10 | `DELETE` | `/api/leads/{lead_id}` | Delete lead |
+| 11 | `GET` | `/api/leads/pipeline/summary` | Stage counts for Kanban board |
+| 12 | `GET` | `/api/leads/pipeline/stats` | Full analytics + advice |
+| 13 | `POST` | `/api/leads/{lead_id}/activities` | Log activity on lead |
+| 14 | `GET` | `/api/leads/{lead_id}/activities` | List lead activities |
+| 15 | `POST` | `/api/leads/{lead_id}/followups` | Schedule follow-up |
+| 16 | `GET` | `/api/leads/followups/upcoming` | List upcoming follow-ups |
+| 17 | `PATCH` | `/api/leads/followups/{followup_id}/complete` | Complete follow-up |
+| 18 | `POST` | `/api/leads/{lead_id}/convert` | Convert lead to reseller account |
+
+---
+
+## 9. Frontend Page Mapping
+
+| Page | Endpoints Used |
+|------|---------------|
+| **Kanban Board** | 6 (list by stage), 9 (drag between columns), 11 (column counts) |
+| **Lead Detail** | 7 (full detail), 8 (edit info), 9 (change stage), 13 (log activity), 14 (timeline), 15 (add follow-up), 17 (complete follow-up) |
+| **Add/Edit Lead Form** | 1 (source dropdown), 5 (create), 8 (update) |
+| **Dashboard / Analytics** | 12 (stats + advice), 16 (upcoming follow-ups widget) |
+| **Settings > Lead Sources** | 1 (list), 2 (create), 3 (update), 4 (delete) |
+| **Convert Lead Modal** | 18 (convert to reseller) |
