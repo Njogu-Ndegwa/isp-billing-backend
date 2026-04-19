@@ -1,0 +1,122 @@
+{
+    "info": {
+        "name": "MTN MoMo - Endpoints",
+        "description": "Per-reseller MTN Mobile Money (Collection / RequestToPay) integration. Covers configuring credentials, initiating a payment via the generic /api/pay endpoint, polling status, and the public callback URL MTN will POST to.",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": "PASTE_RESELLER_JWT_HERE"},
+        {"key": "paymentMethodId", "value": "1"},
+        {"key": "routerId", "value": "1"},
+        {"key": "customerId", "value": "1"},
+        {"key": "resellerId", "value": "1"},
+        {"key": "referenceId", "value": "00000000-0000-0000-0000-000000000000"}
+    ],
+    "item": [
+        {
+            "name": "Create MTN MoMo payment method (reseller)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/payment-methods",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"method_type\": \"mtn_momo\",\n  \"label\": \"MTN Uganda (Sandbox)\",\n  \"mtn_api_user\": \"64f8c775-6dff-45c0-93e0-39a9cd78df8b\",\n  \"mtn_api_key\": \"3eccb4f68c3241caad25b59823b7ac86\",\n  \"mtn_subscription_key\": \"af8ced583a5849f5bcb7aa39f008ce4e\",\n  \"mtn_target_environment\": \"sandbox\",\n  \"mtn_base_url\": \"https://sandbox.momodeveloper.mtn.com\",\n  \"mtn_currency\": \"EUR\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Update MTN MoMo payment method",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/payment-methods/{{paymentMethodId}}",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"label\": \"MTN Uganda (Production)\",\n  \"mtn_target_environment\": \"mtnuganda\",\n  \"mtn_base_url\": \"https://proxy.momoapi.mtn.com\",\n  \"mtn_currency\": \"UGX\"\n}"
+                }
+            }
+        },
+        {
+            "name": "Test MTN MoMo credentials",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/payment-methods/{{paymentMethodId}}/test",
+                "header": [
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ]
+            }
+        },
+        {
+            "name": "List payment methods",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/payment-methods",
+                "header": [
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ]
+            }
+        },
+        {
+            "name": "Assign MTN MoMo to a router",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/payment-method",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"payment_method_id\": {{paymentMethodId}}\n}"
+                }
+            }
+        },
+        {
+            "name": "Initiate customer payment (uses router's MTN method)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/pay",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{token}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"customer_id\": {{customerId}},\n  \"phone\": \"46733123454\",\n  \"amount\": 1000\n}"
+                },
+                "description": "Returns { gateway: 'mtn_momo', reference_id: '...' } when the router is assigned to an MTN MoMo method. In MTN sandbox, 46733123454 succeeds and 46733123453 fails."
+            }
+        },
+        {
+            "name": "Poll MTN MoMo transaction status",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/mtn-momo/status/{{referenceId}}",
+                "description": "If the local record is still PENDING, actively polls MTN and persists the latest state."
+            }
+        },
+        {
+            "name": "MTN MoMo callback (public, called by MTN)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/mtn-momo/callback/{{resellerId}}",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"referenceId\": \"{{referenceId}}\",\n  \"status\": \"SUCCESSFUL\"\n}"
+                },
+                "description": "This is the URL you register as X-Callback-Url in the MTN developer portal. The handler re-GETs status from MTN on arrival, so the exact payload shape is not trusted."
+            }
+        }
+    ]
+}

@@ -96,11 +96,32 @@ async def migrate_db():
     print("Database migration completed!")
 
 
+async def _run_all():
+    """Run init_db and migrate_db in a single event loop, then dispose the engine.
+
+    Calling ``asyncio.run()`` twice in the same process would bind the async
+    engine's pooled connections to the first loop and then try to reuse them
+    from the second loop, raising:
+        RuntimeError: ... got Future ... attached to a different loop
+    Running both stages in one loop (and disposing the engine at the end)
+    avoids that entirely.
+    """
+    try:
+        await init_db()
+        await migrate_db()
+    finally:
+        await async_engine.dispose()
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "migrate":
-        asyncio.run(migrate_db())
+        async def _migrate_only():
+            try:
+                await migrate_db()
+            finally:
+                await async_engine.dispose()
+        asyncio.run(_migrate_only())
     else:
-        asyncio.run(init_db())
-        asyncio.run(migrate_db())
+        asyncio.run(_run_all())
 

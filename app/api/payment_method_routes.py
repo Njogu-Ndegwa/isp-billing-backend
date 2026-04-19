@@ -37,7 +37,12 @@ router = APIRouter(tags=["payment-methods"])
 # ---------------------------------------------------------------------------
 
 class PaymentMethodCreate(BaseModel):
-    method_type: str = Field(..., description="bank_account | mpesa_paybill | mpesa_paybill_with_keys | zenopay")
+    method_type: str = Field(
+        ...,
+        description=(
+            "bank_account | mpesa_paybill | mpesa_paybill_with_keys | zenopay | mtn_momo"
+        ),
+    )
     label: str = Field(..., max_length=100, description="Display name for this method")
 
     # Bank Account
@@ -56,6 +61,14 @@ class PaymentMethodCreate(BaseModel):
     # ZenoPay
     zenopay_api_key: Optional[str] = None
 
+    # MTN MoMo (Collection)
+    mtn_api_user: Optional[str] = None
+    mtn_api_key: Optional[str] = None
+    mtn_subscription_key: Optional[str] = None
+    mtn_target_environment: Optional[str] = None  # sandbox | mtnuganda | mtnghana | ...
+    mtn_base_url: Optional[str] = None
+    mtn_currency: Optional[str] = None  # EUR (sandbox) | UGX | GHS | ...
+
 
 class PaymentMethodUpdate(BaseModel):
     label: Optional[str] = None
@@ -69,6 +82,13 @@ class PaymentMethodUpdate(BaseModel):
     mpesa_consumer_key: Optional[str] = None
     mpesa_consumer_secret: Optional[str] = None
     zenopay_api_key: Optional[str] = None
+
+    mtn_api_user: Optional[str] = None
+    mtn_api_key: Optional[str] = None
+    mtn_subscription_key: Optional[str] = None
+    mtn_target_environment: Optional[str] = None
+    mtn_base_url: Optional[str] = None
+    mtn_currency: Optional[str] = None
 
 
 class AssignPaymentMethodRequest(BaseModel):
@@ -119,6 +139,24 @@ def _validate_fields(method_type: ResellerPaymentMethodType, data: PaymentMethod
                 detail="zenopay_api_key is required for ZenoPay",
             )
 
+    elif method_type == ResellerPaymentMethodType.MTN_MOMO:
+        missing = []
+        if not data.mtn_api_user:
+            missing.append("mtn_api_user")
+        if not data.mtn_api_key:
+            missing.append("mtn_api_key")
+        if not data.mtn_subscription_key:
+            missing.append("mtn_subscription_key")
+        if not data.mtn_target_environment:
+            missing.append("mtn_target_environment")
+        if not data.mtn_currency:
+            missing.append("mtn_currency")
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required fields for MTN MoMo: {', '.join(missing)}",
+            )
+
 
 def _serialize_payment_method(pm: ResellerPaymentMethod) -> dict:
     method_type = pm.method_type
@@ -165,6 +203,20 @@ def _serialize_payment_method(pm: ResellerPaymentMethod) -> dict:
             if pm.zenopay_api_key_encrypted else None
         )
         result["zenopay_account_id"] = pm.zenopay_account_id  # kept for backward compat with existing DB rows
+
+    elif method_type_value == ResellerPaymentMethodType.MTN_MOMO.value:
+        result["mtn_api_user"] = pm.mtn_api_user
+        result["mtn_api_key"] = mask_credential(
+            decrypt_credential(pm.mtn_api_key_encrypted)
+            if pm.mtn_api_key_encrypted else None
+        )
+        result["mtn_subscription_key"] = mask_credential(
+            decrypt_credential(pm.mtn_subscription_key_encrypted)
+            if pm.mtn_subscription_key_encrypted else None
+        )
+        result["mtn_target_environment"] = pm.mtn_target_environment
+        result["mtn_base_url"] = pm.mtn_base_url
+        result["mtn_currency"] = pm.mtn_currency
 
     return result
 
@@ -215,6 +267,22 @@ async def create_payment_method(
             encrypt_credential(request.zenopay_api_key) if request.zenopay_api_key else None
         ),
         zenopay_account_id=None,
+        mtn_api_user=request.mtn_api_user,
+        mtn_api_key_encrypted=(
+            encrypt_credential(request.mtn_api_key) if request.mtn_api_key else None
+        ),
+        mtn_subscription_key_encrypted=(
+            encrypt_credential(request.mtn_subscription_key)
+            if request.mtn_subscription_key else None
+        ),
+        mtn_target_environment=request.mtn_target_environment,
+        mtn_base_url=(
+            request.mtn_base_url
+            or ("https://sandbox.momodeveloper.mtn.com"
+                if request.mtn_target_environment == "sandbox"
+                else None)
+        ),
+        mtn_currency=request.mtn_currency,
     )
     db.add(pm)
     await db.commit()
@@ -305,6 +373,19 @@ async def update_payment_method(
         pm.mpesa_consumer_secret_encrypted = encrypt_credential(request.mpesa_consumer_secret)
     if request.zenopay_api_key is not None:
         pm.zenopay_api_key_encrypted = encrypt_credential(request.zenopay_api_key)
+
+    if request.mtn_api_user is not None:
+        pm.mtn_api_user = request.mtn_api_user
+    if request.mtn_api_key is not None:
+        pm.mtn_api_key_encrypted = encrypt_credential(request.mtn_api_key)
+    if request.mtn_subscription_key is not None:
+        pm.mtn_subscription_key_encrypted = encrypt_credential(request.mtn_subscription_key)
+    if request.mtn_target_environment is not None:
+        pm.mtn_target_environment = request.mtn_target_environment
+    if request.mtn_base_url is not None:
+        pm.mtn_base_url = request.mtn_base_url
+    if request.mtn_currency is not None:
+        pm.mtn_currency = request.mtn_currency
 
     await db.commit()
     await db.refresh(pm)
@@ -400,6 +481,25 @@ async def test_payment_method(
             if "401" in error_msg or "Unauthorized" in error_msg:
                 return {"status": "failed", "message": "ZenoPay API key is invalid"}
             return {"status": "success", "message": "ZenoPay API key accepted (order not found is expected)"}
+
+    elif method_type == ResellerPaymentMethodType.MTN_MOMO:
+        from app.services.mtn_momo import get_access_token
+
+        try:
+            api_key = decrypt_credential(pm.mtn_api_key_encrypted)
+            subscription_key = decrypt_credential(pm.mtn_subscription_key_encrypted)
+            await get_access_token(
+                api_user=pm.mtn_api_user,
+                api_key=api_key,
+                subscription_key=subscription_key,
+                base_url=pm.mtn_base_url or "https://sandbox.momodeveloper.mtn.com",
+            )
+            return {"status": "success", "message": "MTN MoMo credentials are valid"}
+        except Exception as e:
+            error_msg = str(e)
+            if "401" in error_msg or "Unauthorized" in error_msg:
+                return {"status": "failed", "message": "MTN MoMo credentials are invalid"}
+            return {"status": "failed", "message": f"MTN MoMo credential test failed: {error_msg}"}
 
     elif method_type in (
         ResellerPaymentMethodType.MPESA_PAYBILL,

@@ -662,11 +662,18 @@ class ResellerPaymentMethodType(str, enum.Enum):
     MPESA_PAYBILL = "mpesa_paybill"
     MPESA_PAYBILL_WITH_KEYS = "mpesa_paybill_with_keys"
     ZENOPAY = "zenopay"
+    MTN_MOMO = "mtn_momo"
 
 
 class ZenoPayTransactionStatus(str, enum.Enum):
     PENDING = "pending"
     COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class MtnMomoTransactionStatus(str, enum.Enum):
+    PENDING = "pending"
+    SUCCESSFUL = "successful"
     FAILED = "failed"
 
 
@@ -701,6 +708,14 @@ class ResellerPaymentMethod(Base):
     zenopay_api_key_encrypted = Column(String(500), nullable=True)
     zenopay_account_id = Column(String(100), nullable=True)
 
+    # MTN Mobile Money (Collection / RequestToPay)
+    mtn_api_user = Column(String(64), nullable=True)
+    mtn_api_key_encrypted = Column(String(500), nullable=True)
+    mtn_subscription_key_encrypted = Column(String(500), nullable=True)
+    mtn_target_environment = Column(String(50), nullable=True)  # sandbox | mtnuganda | mtnghana | ...
+    mtn_base_url = Column(String(255), nullable=True)  # https://sandbox.momodeveloper.mtn.com or prod host
+    mtn_currency = Column(String(10), nullable=True)   # EUR for sandbox, UGX/GHS/... for prod
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -728,6 +743,47 @@ class ZenoPayTransaction(Base):
     buyer_phone = Column(String(20), nullable=False)
     buyer_name = Column(String(100), nullable=True)
     buyer_email = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer = relationship("Customer")
+    reseller = relationship("User")
+
+
+class MtnMomoTransaction(Base):
+    """Tracks MTN MoMo Collection (RequestToPay) lifecycle per reseller."""
+    __tablename__ = "mtn_momo_transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # X-Reference-Id we generated (UUID v4) — doubles as the resource ID used by
+    # GET /requesttopay/{referenceId} and as our local unique key.
+    reference_id = Column(String(64), unique=True, nullable=False, index=True)
+    # We also send this as `externalId` in the RequestToPay body for reconciliation.
+    external_id = Column(String(64), nullable=True, index=True)
+
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True)
+
+    amount = Column(DECIMAL(10, 2), nullable=False)
+    currency = Column(String(10), nullable=False)
+    phone = Column(String(20), nullable=False)
+
+    status = Column(
+        Enum(MtnMomoTransactionStatus, name="mtnmomotransactionstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=MtnMomoTransactionStatus.PENDING,
+    )
+    # Returned by MTN once the payment succeeds
+    financial_transaction_id = Column(String(128), nullable=True)
+    # Populated on FAILED responses (code + message)
+    reason_code = Column(String(100), nullable=True)
+    reason_message = Column(String(500), nullable=True)
+
+    target_environment = Column(String(50), nullable=False)
+    payer_message = Column(String(160), nullable=True)
+    payee_note = Column(String(160), nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

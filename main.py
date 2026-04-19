@@ -44,6 +44,7 @@ from app.api.pppoe_monitor import router as pppoe_monitor_router
 from app.api.hotspot_monitor import router as hotspot_monitor_router
 from app.api.payment_method_routes import router as payment_method_router
 from app.api.zenopay_routes import router as zenopay_router
+from app.api.mtn_momo_routes import router as mtn_momo_router
 from app.api.admin_reseller_routes import router as admin_reseller_router
 from app.api.profile_routes import router as profile_router
 from app.api.b2b_routes import router as b2b_router
@@ -73,6 +74,7 @@ app.include_router(pppoe_monitor_router)
 app.include_router(hotspot_monitor_router)
 app.include_router(payment_method_router)
 app.include_router(zenopay_router)
+app.include_router(mtn_momo_router)
 app.include_router(admin_reseller_router)
 app.include_router(profile_router)
 app.include_router(b2b_router)

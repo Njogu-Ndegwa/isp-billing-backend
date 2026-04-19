@@ -563,6 +563,8 @@ async def initiate_mpesa_payment_api(
                 resp["checkout_request_id"] = gw_result["checkout_request_id"]
             if gw_result.get("order_id"):
                 resp["order_id"] = gw_result["order_id"]
+            if gw_result.get("reference_id"):
+                resp["reference_id"] = gw_result["reference_id"]
             return resp
 
         # --- Legacy path: use system M-Pesa credentials ---

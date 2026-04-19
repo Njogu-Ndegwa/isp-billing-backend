@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update, delete, or_
 from sqlalchemy.orm import selectinload
@@ -89,6 +89,16 @@ class LeadConvertRequest(BaseModel):
     password: str
     business_name: Optional[str] = None
     support_phone: Optional[str] = None
+
+
+class LeadBackfillRequest(BaseModel):
+    """Body for `POST /api/leads/backfill`.
+
+    All fields are optional; defaults backfill every reseller without a
+    lead record, no date cutoff, and actually write (no dry run).
+    """
+    since: Optional[str] = None   # "YYYY-MM-DD" or null / "all"
+    dry_run: bool = False
 
 
 # ========================================
@@ -246,6 +256,70 @@ async def create_lead(
     await db.refresh(lead)
 
     return await _lead_to_dict(lead, db)
+
+
+@router.post("/api/leads/backfill")
+async def backfill_leads_endpoint(
+    req: Optional[LeadBackfillRequest] = Body(default=None),
+    db: AsyncSession = Depends(get_db),
+    token: dict = Depends(verify_token),
+):
+    """Backfill Lead rows for resellers who never got auto-captured.
+
+    Admin-only manual override for the case where
+    `try_link_lead_on_registration` (called on signup) silently failed —
+    for example because the lead tables didn't exist yet, or the import
+    errored, or a deploy temporarily dropped them. Hits every reseller
+    without a matching `leads.converted_user_id` and creates one lead
+    each, with the stage inferred from their current state:
+
+      churned              — subscription suspended/inactive AND paid before
+      paying               — subscription active OR at least one completed payment
+      installation_help    — has routers or customers but no paying signal
+      signed_up            — registered, none of the above
+
+    Request body (all optional):
+        {
+          "since":    "2026-04-16",   // or "all" / null for no cutoff
+          "dry_run":  false            // true => preview only, no writes
+        }
+    """
+    from app.services.lead_backfill import backfill_leads
+    from dataclasses import asdict
+
+    admin = await _require_admin(token, db)
+
+    body = req or LeadBackfillRequest()
+
+    since_date = None
+    if body.since and body.since.lower() != "all":
+        try:
+            since_date = datetime.strptime(body.since, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="`since` must be in YYYY-MM-DD format, or 'all' / null for no cutoff",
+            )
+
+    try:
+        result = await backfill_leads(
+            db,
+            since=since_date,
+            dry_run=body.dry_run,
+            prefer_admin_id=admin.id,
+        )
+        if body.dry_run:
+            await db.rollback()
+        else:
+            await db.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.exception("Lead backfill failed")
+        raise HTTPException(status_code=500, detail=f"Backfill failed: {e}")
+
+    return asdict(result)
 
 
 @router.get("/api/leads")

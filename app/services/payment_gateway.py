@@ -24,6 +24,8 @@ from app.db.models import (
     Customer,
     MpesaTransaction,
     MpesaTransactionStatus,
+    MtnMomoTransaction,
+    MtnMomoTransactionStatus,
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
     Router,
@@ -150,6 +152,11 @@ async def initiate_customer_payment(
 
     if method_type == ResellerPaymentMethodType.ZENOPAY:
         return await _initiate_zenopay(
+            db, payment_method, customer, phone, amount, reference, plan_name,
+        )
+
+    if method_type == ResellerPaymentMethodType.MTN_MOMO:
+        return await _initiate_mtn_momo(
             db, payment_method, customer, phone, amount, reference, plan_name,
         )
 
@@ -304,4 +311,112 @@ async def _initiate_zenopay(
         "collection_mode": CollectionMode.DIRECT,
         "order_id": order_id,
         "zenopay_result": result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MTN Mobile Money (Collection / RequestToPay)
+# ---------------------------------------------------------------------------
+
+def _build_mtn_callback_url(reseller_id: int) -> Optional[str]:
+    """
+    Derive a public callback URL from the existing M-Pesa callback host.
+
+    We reuse ``MPESA_CALLBACK_URL`` (e.g. ``https://host/api/mpesa/callback``)
+    as the base, same trick ZenoPay uses.  Returns ``None`` if the base URL
+    is unset or not a full URL (MTN accepts no callback — polling still works).
+    """
+    base = settings.MPESA_CALLBACK_URL or ""
+    if "/api/" not in base:
+        return None
+    host = base.rsplit("/api/", 1)[0]
+    return f"{host}/api/mtn-momo/callback/{reseller_id}"
+
+
+async def _initiate_mtn_momo(
+    db: AsyncSession,
+    pm: ResellerPaymentMethod,
+    customer: Customer,
+    phone: str,
+    amount: float,
+    reference: str,
+    plan_name: str = "",
+) -> dict:
+    from app.services.mtn_momo import initiate_request_to_pay, normalize_msisdn
+
+    missing = []
+    if not pm.mtn_api_user:
+        missing.append("mtn_api_user")
+    if not pm.mtn_api_key_encrypted:
+        missing.append("mtn_api_key")
+    if not pm.mtn_subscription_key_encrypted:
+        missing.append("mtn_subscription_key")
+    if not pm.mtn_target_environment:
+        missing.append("mtn_target_environment")
+    if not pm.mtn_currency:
+        missing.append("mtn_currency")
+    if missing:
+        raise ValueError(
+            f"MTN MoMo payment method is missing required fields: {', '.join(missing)}"
+        )
+
+    api_key = decrypt_credential(pm.mtn_api_key_encrypted)
+    subscription_key = decrypt_credential(pm.mtn_subscription_key_encrypted)
+    base_url = pm.mtn_base_url or "https://sandbox.momodeveloper.mtn.com"
+
+    reference_id = str(uuid.uuid4())
+    external_id = reference  # keep human-readable ref for reconciliation
+    normalized_phone = normalize_msisdn(phone)
+
+    callback_url = _build_mtn_callback_url(pm.user_id)
+
+    payer_message = (
+        f"Payment for {plan_name}" if plan_name else f"Payment for {customer.name or 'service'}"
+    )[:160]
+    payee_note = f"Ref {reference}"[:160]
+
+    # Persist the PENDING row first so a fast webhook cannot race us.
+    txn = MtnMomoTransaction(
+        reference_id=reference_id,
+        external_id=external_id,
+        reseller_id=pm.user_id,
+        customer_id=customer.id,
+        amount=amount,
+        currency=pm.mtn_currency,
+        phone=normalized_phone,
+        status=MtnMomoTransactionStatus.PENDING,
+        target_environment=pm.mtn_target_environment,
+        payer_message=payer_message,
+        payee_note=payee_note,
+    )
+    db.add(txn)
+    await db.flush()
+
+    try:
+        await initiate_request_to_pay(
+            reference_id=reference_id,
+            amount=amount,
+            currency=pm.mtn_currency,
+            phone=normalized_phone,
+            external_id=external_id,
+            payer_message=payer_message,
+            payee_note=payee_note,
+            target_environment=pm.mtn_target_environment,
+            base_url=base_url,
+            api_user=pm.mtn_api_user,
+            api_key=api_key,
+            subscription_key=subscription_key,
+            callback_url=callback_url,
+        )
+    except Exception:
+        # Undo the provisional row so we don't leave orphaned PENDINGs on bad calls.
+        await db.delete(txn)
+        await db.flush()
+        raise
+
+    return {
+        "gateway": "mtn_momo",
+        "collection_mode": CollectionMode.DIRECT,
+        "reference_id": reference_id,
+        "callback_url": callback_url,
     }
