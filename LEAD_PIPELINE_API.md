@@ -658,10 +658,10 @@ Comprehensive analytics: conversion funnel, source performance, stale leads, and
 | `loss_rate` | % of leads that are lost or churned |
 | `by_stage` | Count of leads in each stage |
 | `by_source` | Per-source total leads, conversions, and conversion rate |
-| `funnel` | How many leads reached each stage or beyond, plus in-progress counts and true drop-off between stages |
-| `funnel[].reached` | Distinct leads that ever hit this stage (current stage at-or-past it, or found in the `stage_change` activity history). `lost` leads contribute based on how far they progressed before being marked lost. |
+| `funnel` | Per-stage view of how many leads have actually been recorded at each stage, plus in-progress counts and real drop-off between stages |
+| `funnel[].reached` | Distinct leads with this stage in their recorded history — i.e. it appears as the `old_stage` or `new_stage` of a `stage_change` activity, OR it is their current stage. **No progression is inferred:** a backfilled lead inserted directly at `paying` will count toward `paying` only, not toward earlier stages it never visited in this system. `churned` leads count toward `paying`. |
 | `funnel[].still_in_stage` | Leads currently sitting in this stage. These are **in-progress**, not drop-offs. |
-| `funnel[].dropped_off` | Leads that reached the *previous* stage but neither advanced to this stage nor are still at the previous stage — i.e. they were abandoned (marked `lost`). |
+| `funnel[].dropped_off` | Leads that have been marked `lost` whose furthest recorded stage is the *previous* funnel stage — they reached it and then abandoned the pipeline. |
 | `funnel[].drop_off_percent` | `dropped_off / reached[previous] * 100` — genuine loss rate between stages. Will be `0` when no leads have been marked `lost`. |
 | `avg_days_in_stage` | Average days leads sit in each active stage |
 | `health.stale_leads` | Leads in active stages with no update for 7+ days |
