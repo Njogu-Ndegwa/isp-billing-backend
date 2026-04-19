@@ -560,6 +560,60 @@ class MikroTikAPI:
             logger.error(f"Error getting hotspot online state for {mac_address}: {e}")
             return {"error": str(e)}
 
+    def remove_hotspot_parent_queues(self) -> Dict[str, Any]:
+        """
+        Remove MikroTik's auto-generated hotspot parent simple queue(s).
+
+        When the hotspot service (re)starts, MikroTik recreates a dynamic simple
+        queue named ``hs-<hotspot-server-name>`` whose target is the hotspot
+        bridge interface and whose max-limit defaults to ``unlimited/unlimited``.
+        Because simple queues are matched top-down and this entry sits at
+        position 0 on the bridge interface, it shadows every per-user
+        ``plan_<username>`` queue we create for rate limiting - the net effect
+        is that all hotspot users suddenly receive unlimited speeds.
+
+        This helper deletes any simple queue whose name starts with ``hs-`` so
+        the per-IP ``plan_<username>`` queues can match traffic again. It is
+        safe to call repeatedly; MikroTik will regenerate the queue on hotspot
+        service restart / router reboot, and the next provisioning or sync run
+        will clean it up again.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            queues = self.send_command("/queue/simple/print")
+            if not queues.get("success"):
+                return {"error": queues.get("error", "Failed to read simple queues")}
+
+            removed = 0
+            errors: List[str] = []
+            for q in queues.get("data", []) or []:
+                name = str(q.get("name", ""))
+                if not name.startswith("hs-"):
+                    continue
+                qid = q.get(".id")
+                if not qid:
+                    continue
+                remove_result = self.send_command("/queue/simple/remove", {"numbers": qid})
+                if remove_result.get("error"):
+                    errors.append(f"{name}: {remove_result['error']}")
+                    logger.warning(
+                        "Failed to remove hotspot parent queue %s (id=%s): %s",
+                        name, qid, remove_result["error"],
+                    )
+                else:
+                    removed += 1
+                    logger.warning(
+                        "Removed auto-generated hotspot parent queue %s "
+                        "(target=%s, max-limit=%s) - it was shadowing per-user plan queues",
+                        name, q.get("target"), q.get("max-limit"),
+                    )
+
+            return {"success": True, "removed": removed, "errors": errors}
+        except Exception as e:
+            logger.error(f"Error removing hotspot parent queues: {e}")
+            return {"error": str(e)}
+
     def ensure_queue_fasttrack_bypass(self, client_ips: List[str]) -> Dict[str, Any]:
         """
         Ensure queued client IPs are excluded from FastTrack so simple queues can enforce limits.
@@ -884,23 +938,43 @@ class MikroTikAPI:
             normalized = normalize_mac_address(mac_address)
             
             if rate_limit:
-                # Remove existing queue for this user
+                # Single /queue/simple/print, reused for both tasks below.
+                # We scan once for:
+                #   - stale plan_<username> entries we must replace
+                #   - auto-generated hs-<hotspot> parent queues that would
+                #     shadow our new per-user queue (see remove_hotspot_parent_queues)
+                # so we avoid paying for an extra list roundtrip per payment.
+                stale_plan_ids: List[str] = []
+                stale_hs_queues: List[Dict[str, Any]] = []
                 queues = self.send_command("/queue/simple/print")
                 if queues.get("success") and queues.get("data"):
                     for q in queues["data"]:
-                        if q.get("name") == f"plan_{username}" or f"MAC:{mac_address}" in q.get("comment", ""):
-                            time.sleep(CMD_DELAY)
-                            self.send_command("/queue/simple/remove", {"numbers": q[".id"]})
-                            logger.info(f"Removed existing queue for {username}")
-                
+                        name = str(q.get("name", ""))
+                        qid = q.get(".id")
+                        if not qid:
+                            continue
+                        if name.startswith("hs-"):
+                            stale_hs_queues.append(q)
+                        elif name == f"plan_{username}" or f"MAC:{mac_address}" in q.get("comment", ""):
+                            stale_plan_ids.append(qid)
+
+                # Drop the previous plan_<username> entry (if any) so the add
+                # below doesn't collide on the name.
+                for qid in stale_plan_ids:
+                    time.sleep(CMD_DELAY)
+                    self.send_command("/queue/simple/remove", {"numbers": qid})
+                    logger.info(f"Removed existing plan queue for {username}")
+
                 time.sleep(CMD_DELAY)  # Give router breathing room
-                
+
                 # Find client's current IP
                 client_ip = self.get_client_ip_by_mac(normalized)
-                
+
                 if client_ip:
                     time.sleep(CMD_DELAY)  # Give router breathing room
-                    # Create simple queue targeting client IP (no interface = matches all)
+                    # Create simple queue targeting client IP (no interface = matches all).
+                    # Done BEFORE cleaning up hs-* so the user-critical path
+                    # finishes as fast as possible.
                     queue_result = self.send_command("/queue/simple/add", {
                         "name": f"plan_{username}",
                         "target": f"{client_ip}/32",
@@ -918,6 +992,40 @@ class MikroTikAPI:
                     # Client not connected yet - will be created by sync job
                     logger.warning(f"Client {mac_address} not connected - queue will be created when they connect")
                     queue_result = {"pending": True, "message": "Client not connected, queue pending"}
+
+                # Finally, prune MikroTik's auto-generated hotspot parent
+                # queues (hs-<hotspot>, target=bridge, unlimited/unlimited).
+                # They sit at position 0 and shadow every per-user plan queue,
+                # so if they exist all hotspot users get unlimited internet.
+                # We do this AFTER the user's plan queue is in place so the
+                # payment-critical path (user + binding + plan queue) finishes
+                # first; and we only hit the network here if we already saw an
+                # hs-* entry in the single print above (zero-cost fast path
+                # when the router is healthy).
+                if stale_hs_queues:
+                    removed_hs = 0
+                    for q in stale_hs_queues:
+                        time.sleep(CMD_DELAY)
+                        remove_result = self.send_command(
+                            "/queue/simple/remove", {"numbers": q[".id"]}
+                        )
+                        if remove_result.get("error"):
+                            logger.warning(
+                                "Failed to remove hotspot parent queue %s: %s",
+                                q.get("name"), remove_result["error"],
+                            )
+                        else:
+                            removed_hs += 1
+                            logger.warning(
+                                "Removed auto-generated hotspot parent queue %s "
+                                "(target=%s, max-limit=%s) - was shadowing per-user plan queues",
+                                q.get("name"), q.get("target"), q.get("max-limit"),
+                            )
+                    if removed_hs:
+                        logger.warning(
+                            "Healed %d stale hotspot parent queue(s) after provisioning %s",
+                            removed_hs, username,
+                        )
 
             return {
                 "message": f"MAC address {mac_address} registered/updated successfully with rate limit {rate_limit}",

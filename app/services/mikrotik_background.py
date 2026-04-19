@@ -837,325 +837,383 @@ async def cleanup_expired_users_background():
 # QUEUE SYNC (background job, currently disabled)
 # =============================================================================
 
+def _sync_single_router_queues_sync(router_info: dict, customers_data: list) -> dict:
+    """
+    Queue sync for ONE router.
+
+    Isolated on purpose: this is designed to be invoked from `asyncio.to_thread`
+    under `router_locks.acquire(router_key)`, so that a slow or broken router
+    only delays its own task and never blocks sync for any other router in the
+    fleet. Each invocation opens its own `MikroTikAPI` connection, does its
+    work, and always disconnects in the `finally` block.
+
+    Returns a dict with per-router counters plus an optional `details` entry
+    describing what happened (consumed by the aggregator in
+    `sync_active_user_queues`).
+    """
+    results = {
+        "synced": 0,
+        "errors": 0,
+        "skipped": 0,
+        "routers_connected": 0,
+        "details": None,
+    }
+    if not customers_data:
+        return results
+
+    router_name = router_info["name"]
+    router_ip = router_info["ip"]
+    logger.info(f"[SYNC] Connecting to {router_name} ({router_ip}) for {len(customers_data)} customers...")
+
+    # Per-router operation budget. Was a global counter before the
+    # parallel refactor; making it per-router means one large router
+    # cannot starve the others, and any overflow just rolls over to the
+    # next sync tick for that specific router.
+    total_operations = 0
+
+    api = None
+    try:
+        api = MikroTikAPI(router_info["ip"], router_info["username"], router_info["password"], router_info["port"], timeout=30, connect_timeout=5)
+        if not api.connect():
+            logger.error(f"[SYNC] Failed to connect to {router_name} ({router_ip})")
+            results["errors"] = len(customers_data)
+            results["details"] = {"router": router_name, "error": "Connection failed"}
+            return results
+
+        results["routers_connected"] = 1
+        logger.info(f"[SYNC] Connected to {router_name} successfully")
+
+        logger.info(f"[SYNC] Fetching ARP table from {router_name} (optimized)...")
+        arp_result = api.get_arp_minimal()
+        if arp_result.get("error"):
+            if arp_result.get("error") == "Not connected":
+                logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                if api.connect():
+                    arp_result = api.get_arp_minimal()
+            if arp_result.get("error"):
+                logger.error(f"[SYNC] Failed to fetch ARP table: {arp_result.get('error')}")
+                arp_entries = []
+            else:
+                arp_entries = arp_result.get("data", [])
+        else:
+            arp_entries = arp_result.get("data", [])
+        logger.info(f"[SYNC] Got {len(arp_entries)} ARP entries")
+        time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
+
+        logger.info(f"[SYNC] Fetching DHCP leases from {router_name} (optimized)...")
+        dhcp_result = api.get_dhcp_leases_minimal()
+        if dhcp_result.get("error"):
+            if dhcp_result.get("error") == "Not connected":
+                logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                if api.connect():
+                    dhcp_result = api.get_dhcp_leases_minimal()
+            if dhcp_result.get("error"):
+                logger.error(f"[SYNC] Failed to fetch DHCP leases: {dhcp_result.get('error')}")
+                dhcp_leases = []
+            else:
+                dhcp_leases = dhcp_result.get("data", [])
+        else:
+            dhcp_leases = dhcp_result.get("data", [])
+        logger.info(f"[SYNC] Got {len(dhcp_leases)} DHCP leases")
+        time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
+
+        logger.info(f"[SYNC] Fetching hotspot hosts from {router_name} (optimized)...")
+        hosts_result = api.get_hotspot_hosts_minimal()
+        if hosts_result.get("error"):
+            if hosts_result.get("error") == "Not connected":
+                logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                if api.connect():
+                    hosts_result = api.get_hotspot_hosts_minimal()
+            if hosts_result.get("error"):
+                logger.error(f"[SYNC] Failed to fetch hotspot hosts: {hosts_result.get('error')}")
+                hotspot_hosts = []
+            else:
+                hotspot_hosts = hosts_result.get("data", [])
+        else:
+            hotspot_hosts = hosts_result.get("data", [])
+        logger.info(f"[SYNC] Got {len(hotspot_hosts)} hotspot hosts")
+        time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
+
+        logger.info(f"[SYNC] Fetching hotspot active sessions from {router_name} (optimized)...")
+        active_result = api.get_hotspot_active_minimal()
+        if active_result.get("error"):
+            if active_result.get("error") == "Not connected":
+                logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                if api.connect():
+                    active_result = api.get_hotspot_active_minimal()
+            if active_result.get("error"):
+                logger.error(f"[SYNC] Failed to fetch hotspot active sessions: {active_result.get('error')}")
+                hotspot_active = []
+            else:
+                hotspot_active = active_result.get("data", [])
+        else:
+            hotspot_active = active_result.get("data", [])
+        logger.info(f"[SYNC] Got {len(hotspot_active)} hotspot active sessions")
+        time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
+
+        logger.info(f"[SYNC] Fetching existing queues from {router_name} (optimized)...")
+        queues_result = api.get_simple_queues_minimal()
+        if queues_result.get("error"):
+            if queues_result.get("error") == "Not connected":
+                logger.warning(f"[SYNC] Connection lost, reconnecting...")
+                if api.connect():
+                    queues_result = api.get_simple_queues_minimal()
+            if queues_result.get("error"):
+                logger.error(f"[SYNC] Failed to fetch queues: {queues_result.get('error')}")
+                existing_queues = []
+            else:
+                existing_queues = queues_result.get("data", [])
+        else:
+            existing_queues = queues_result.get("data", [])
+        logger.info(f"[SYNC] Got {len(existing_queues)} existing queues")
+        time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
+
+        # Remove MikroTik's auto-generated hotspot parent simple queue(s).
+        # MikroTik recreates a dynamic "hs-<hotspot-name>" simple queue
+        # (target=bridge, max-limit=unlimited/unlimited) whenever the
+        # hotspot service restarts. Because simple queues match top-down
+        # and it targets the whole bridge, it shadows every per-user
+        # plan_<username> queue - net effect: all hotspot users get
+        # unlimited speed. Drop any such entry we just fetched and also
+        # prune it from the router so subsequent matching works.
+        hs_parent_queues = [
+            q for q in existing_queues
+            if str(q.get("name", "")).startswith("hs-")
+        ]
+        if hs_parent_queues:
+            logger.warning(
+                "[SYNC] Found %d auto-generated hotspot parent queue(s) on %s: %s",
+                len(hs_parent_queues), router_name,
+                [q.get("name") for q in hs_parent_queues],
+            )
+            hs_cleanup = api.remove_hotspot_parent_queues()
+            if hs_cleanup.get("removed"):
+                logger.warning(
+                    "[SYNC] Removed %d stale hotspot parent queue(s) on %s - "
+                    "per-user plan queues will now enforce speed limits",
+                    hs_cleanup["removed"], router_name,
+                )
+            existing_queues = [
+                q for q in existing_queues
+                if not str(q.get("name", "")).startswith("hs-")
+            ]
+            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
+
+        mac_to_ip = {}
+        for lease in dhcp_leases:
+            mac = lease.get("mac-address", "")
+            if mac and lease.get("address"):
+                mac_to_ip[normalize_mac_address(mac)] = lease.get("address")
+        for entry in arp_entries:
+            mac = entry.get("mac-address", "")
+            if mac and entry.get("address"):
+                mac_to_ip[normalize_mac_address(mac)] = entry.get("address")
+        for host in hotspot_hosts:
+            mac = host.get("mac-address", "")
+            host_ip = host.get("address") or host.get("to-address")
+            if mac and host_ip:
+                mac_to_ip[normalize_mac_address(mac)] = host_ip
+        for session in hotspot_active:
+            mac = session.get("mac-address", "")
+            if mac and session.get("address"):
+                mac_to_ip[normalize_mac_address(mac)] = session.get("address")
+
+        connected_customer_ips = []
+        for customer_item in customers_data:
+            customer_mac = normalize_mac_address(customer_item["mac_address"])
+            customer_ip = mac_to_ip.get(customer_mac)
+            if customer_ip:
+                connected_customer_ips.append(customer_ip)
+
+        if connected_customer_ips:
+            fasttrack_bypass_result = api.ensure_queue_fasttrack_bypass(connected_customer_ips)
+            if fasttrack_bypass_result.get("error"):
+                logger.warning(f"[SYNC] FastTrack bypass setup failed on {router_name}: {fasttrack_bypass_result.get('error')}")
+            elif fasttrack_bypass_result.get("fasttrack_enabled"):
+                logger.info(f"[SYNC] FastTrack bypass active on {router_name} (list={fasttrack_bypass_result.get('list_name')}, ips_added={fasttrack_bypass_result.get('ips_added', 0)})")
+
+        queue_by_name = {str(q.get("name", "")).lower(): q for q in existing_queues if q.get("name")}
+        queue_by_mac = {}
+        for queue in existing_queues:
+            queue_comment = str(queue.get("comment", ""))
+            comment_upper = queue_comment.upper()
+            if "MAC:" not in comment_upper:
+                continue
+            try:
+                raw_mac = comment_upper.split("MAC:", 1)[1].split("|", 1)[0].strip().split(" ", 1)[0]
+                if raw_mac:
+                    queue_by_mac[normalize_mac_address(raw_mac)] = queue
+            except Exception:
+                continue
+        logger.info(f"[SYNC] Built IP map with {len(mac_to_ip)} MAC->IP entries")
+
+        synced = 0
+        skipped_no_ip = 0
+        skipped_already_ok = 0
+        errors = 0
+        created_queues = []
+        updated_queues = []
+
+        logger.info(f"[SYNC] Starting queue processing for {len(customers_data)} customers on {router_name}")
+
+        for cust in customers_data:
+            if total_operations >= SYNC_MAX_QUEUE_OPERATIONS_PER_RUN:
+                logger.info(f"[SYNC] {router_name}: reached per-router max operations limit, will continue next run")
+                break
+            if not api.connected:
+                logger.warning(f"[SYNC] Connection to {router_name} lost, attempting reconnect...")
+                if not api.connect():
+                    logger.error(f"[SYNC] Reconnect failed, aborting sync for {router_name}")
+                    errors += len(customers_data) - (synced + skipped_no_ip + skipped_already_ok + errors)
+                    break
+                logger.info(f"[SYNC] Reconnected to {router_name}")
+            try:
+                if not cust.get("plan_speed"):
+                    skipped_already_ok += 1
+                    continue
+                normalized_mac = normalize_mac_address(cust["mac_address"])
+                username = normalized_mac.replace(":", "")
+                queue_name = f"plan_{username}"
+                rate_limit = api._parse_speed_to_mikrotik(cust["plan_speed"])
+                client_ip = mac_to_ip.get(normalized_mac)
+                if not client_ip:
+                    skipped_no_ip += 1
+                    continue
+                existing_queue = queue_by_name.get(queue_name.lower())
+                if not existing_queue:
+                    existing_queue = queue_by_name.get(f"queue_{username}".lower())
+                if not existing_queue:
+                    existing_queue = queue_by_mac.get(normalized_mac)
+                if existing_queue:
+                    current_target = existing_queue.get("target", "")
+                    current_limit = existing_queue.get("max-limit", "")
+                    current_target_ip = current_target.split("/")[0].strip() if current_target else ""
+                    queue_disabled = str(existing_queue.get("disabled", "false")).lower() == "true"
+                    needs_update = (current_target_ip != client_ip or rate_limit != current_limit or queue_disabled)
+                    if needs_update:
+                        queue_id = existing_queue.get(".id")
+                        if not queue_id:
+                            logger.error(f"[SYNC] Queue {queue_name} has no .id, cannot update")
+                            errors += 1
+                            continue
+                        time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)
+                        update_payload = {"numbers": queue_id, "target": f"{client_ip}/32", "max-limit": rate_limit}
+                        if queue_disabled:
+                            update_payload["disabled"] = "no"
+                        update_result = api.send_command("/queue/simple/set", update_payload)
+                        if update_result.get("error"):
+                            logger.error(f"[SYNC] Failed to update queue {queue_name}: {update_result.get('error')}")
+                            errors += 1
+                        else:
+                            logger.info(f"[SYNC] Updated queue {queue_name} -> {client_ip} ({rate_limit})")
+                            updated_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
+                            synced += 1
+                            total_operations += 1
+                    else:
+                        skipped_already_ok += 1
+                else:
+                    time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)
+                    add_result = api.send_command("/queue/simple/add", {
+                        "name": queue_name, "target": f"{client_ip}/32",
+                        "max-limit": rate_limit, "comment": f"MAC:{cust['mac_address']}|Plan rate limit"
+                    })
+                    if add_result.get("error"):
+                        if "already have" in add_result.get("error", "").lower():
+                            logger.warning(f"[SYNC] Queue {queue_name} already exists (created elsewhere), reconciling...")
+                            reconcile_result = api.get_simple_queues_minimal()
+                            duplicate_queue = None
+                            if reconcile_result.get("success") and reconcile_result.get("data"):
+                                for queue_item in reconcile_result["data"]:
+                                    if str(queue_item.get("name", "")).lower() == queue_name.lower():
+                                        duplicate_queue = queue_item
+                                        break
+                            if duplicate_queue and duplicate_queue.get(".id"):
+                                time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)
+                                set_result = api.send_command("/queue/simple/set", {
+                                    "numbers": duplicate_queue[".id"], "target": f"{client_ip}/32",
+                                    "max-limit": rate_limit, "disabled": "no"
+                                })
+                                if set_result.get("error"):
+                                    logger.error(f"[SYNC] Failed to reconcile existing queue {queue_name}: {set_result.get('error')}")
+                                    errors += 1
+                                else:
+                                    logger.info(f"[SYNC] Reconciled existing queue {queue_name} -> {client_ip} ({rate_limit})")
+                                    updated_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
+                                    synced += 1
+                                    total_operations += 1
+                            else:
+                                skipped_already_ok += 1
+                        else:
+                            logger.error(f"[SYNC] Failed to create queue {queue_name}: {add_result.get('error')}")
+                            errors += 1
+                    else:
+                        logger.info(f"[SYNC] CREATED queue {queue_name} -> {client_ip} ({rate_limit}) - BANDWIDTH NOW LIMITED")
+                        created_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
+                        synced += 1
+                        total_operations += 1
+            except Exception as e:
+                logger.error(f"[SYNC] Error syncing customer {cust['id']} ({cust['mac_address']}): {e}")
+                errors += 1
+
+        logger.info(f"[SYNC] Router {router_name} Summary:")
+        logger.info(f"[SYNC]    - Queues created: {len(created_queues)}")
+        logger.info(f"[SYNC]    - Queues updated: {len(updated_queues)}")
+        logger.info(f"[SYNC]    - Skipped (no IP): {skipped_no_ip}")
+        logger.info(f"[SYNC]    - Skipped (already correct): {skipped_already_ok}")
+        logger.info(f"[SYNC]    - Errors: {errors}")
+        if created_queues:
+            logger.info(f"[SYNC] Created queues: {[q['name'] + '=' + q['limit'] for q in created_queues]}")
+        if updated_queues:
+            logger.info(f"[SYNC] Updated queues: {[q['name'] + '=' + q['limit'] for q in updated_queues]}")
+
+        results["synced"] = synced
+        results["errors"] = errors
+        results["skipped"] = skipped_no_ip + skipped_already_ok
+        results["details"] = {
+            "router": router_name, "synced": synced, "errors": errors,
+            "skipped_no_ip": skipped_no_ip, "skipped_already_ok": skipped_already_ok,
+        }
+    except Exception as e:
+        logger.error(f"[SYNC] Error processing router {router_name}: {e}")
+        results["errors"] = len(customers_data)
+        results["details"] = {"router": router_name, "error": str(e)}
+    finally:
+        if api:
+            try:
+                api.disconnect()
+                logger.info(f"[SYNC] Disconnected from {router_name}")
+            except Exception as e:
+                logger.warning(f"[SYNC] Error disconnecting from {router_name}: {e}")
+
+    return results
+
+
 def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
+    """
+    Sequential multi-router wrapper around :func:`_sync_single_router_queues_sync`.
+
+    Kept for any direct callers that still invoke the sync function without
+    going through :func:`sync_active_user_queues` (which runs routers in
+    parallel via ``asyncio.gather``). Prefer the async path for background
+    jobs — one slow router here will still block the others because this
+    wrapper iterates sequentially.
+    """
     results = {"synced": 0, "errors": 0, "skipped": 0, "routers_connected": 0, "details": []}
     if not router_customers_map:
         logger.info("[SYNC] No routers to process")
         return results
 
-    total_operations = 0
-
-    for router_key, router_data in router_customers_map.items():
-        router_info = router_data["router"]
-        customers_data = router_data["customers"]
-        if not customers_data:
+    for router_data in router_customers_map.values():
+        if not router_data.get("customers"):
             continue
-        if total_operations >= SYNC_MAX_QUEUE_OPERATIONS_PER_RUN:
-            logger.info(f"[SYNC] Reached max operations limit ({SYNC_MAX_QUEUE_OPERATIONS_PER_RUN}), will continue next run")
-            break
-
-        router_name = router_info["name"]
-        router_ip = router_info["ip"]
-        logger.info(f"[SYNC] Connecting to {router_name} ({router_ip}) for {len(customers_data)} customers...")
-
-        api = None
-        try:
-            api = MikroTikAPI(router_info["ip"], router_info["username"], router_info["password"], router_info["port"], timeout=30, connect_timeout=5)
-            if not api.connect():
-                logger.error(f"[SYNC] Failed to connect to {router_name} ({router_ip})")
-                results["errors"] += len(customers_data)
-                results["details"].append({"router": router_name, "error": "Connection failed"})
-                continue
-
-            results["routers_connected"] += 1
-            logger.info(f"[SYNC] Connected to {router_name} successfully")
-
-            def send_with_retry(cmd: str, max_retries: int = 2) -> dict:
-                for attempt in range(max_retries + 1):
-                    result = api.send_command(cmd)
-                    if result.get("error") == "Not connected" and attempt < max_retries:
-                        logger.warning(f"[SYNC] Connection lost during {cmd}, reconnecting (attempt {attempt + 1}/{max_retries})...")
-                        time.sleep(0.5)
-                        if api.connect():
-                            logger.info(f"[SYNC] Reconnected successfully, retrying {cmd}")
-                            continue
-                        else:
-                            logger.error(f"[SYNC] Reconnect failed")
-                            break
-                    return result
-                return {"error": "Failed after retries"}
-
-            logger.info(f"[SYNC] Fetching ARP table from {router_name} (optimized)...")
-            arp_result = api.get_arp_minimal()
-            if arp_result.get("error"):
-                if arp_result.get("error") == "Not connected":
-                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
-                    if api.connect():
-                        arp_result = api.get_arp_minimal()
-                if arp_result.get("error"):
-                    logger.error(f"[SYNC] Failed to fetch ARP table: {arp_result.get('error')}")
-                    arp_entries = []
-                else:
-                    arp_entries = arp_result.get("data", [])
-            else:
-                arp_entries = arp_result.get("data", [])
-            logger.info(f"[SYNC] Got {len(arp_entries)} ARP entries")
-            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
-
-            logger.info(f"[SYNC] Fetching DHCP leases from {router_name} (optimized)...")
-            dhcp_result = api.get_dhcp_leases_minimal()
-            if dhcp_result.get("error"):
-                if dhcp_result.get("error") == "Not connected":
-                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
-                    if api.connect():
-                        dhcp_result = api.get_dhcp_leases_minimal()
-                if dhcp_result.get("error"):
-                    logger.error(f"[SYNC] Failed to fetch DHCP leases: {dhcp_result.get('error')}")
-                    dhcp_leases = []
-                else:
-                    dhcp_leases = dhcp_result.get("data", [])
-            else:
-                dhcp_leases = dhcp_result.get("data", [])
-            logger.info(f"[SYNC] Got {len(dhcp_leases)} DHCP leases")
-            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
-
-            logger.info(f"[SYNC] Fetching hotspot hosts from {router_name} (optimized)...")
-            hosts_result = api.get_hotspot_hosts_minimal()
-            if hosts_result.get("error"):
-                if hosts_result.get("error") == "Not connected":
-                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
-                    if api.connect():
-                        hosts_result = api.get_hotspot_hosts_minimal()
-                if hosts_result.get("error"):
-                    logger.error(f"[SYNC] Failed to fetch hotspot hosts: {hosts_result.get('error')}")
-                    hotspot_hosts = []
-                else:
-                    hotspot_hosts = hosts_result.get("data", [])
-            else:
-                hotspot_hosts = hosts_result.get("data", [])
-            logger.info(f"[SYNC] Got {len(hotspot_hosts)} hotspot hosts")
-            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
-
-            logger.info(f"[SYNC] Fetching hotspot active sessions from {router_name} (optimized)...")
-            active_result = api.get_hotspot_active_minimal()
-            if active_result.get("error"):
-                if active_result.get("error") == "Not connected":
-                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
-                    if api.connect():
-                        active_result = api.get_hotspot_active_minimal()
-                if active_result.get("error"):
-                    logger.error(f"[SYNC] Failed to fetch hotspot active sessions: {active_result.get('error')}")
-                    hotspot_active = []
-                else:
-                    hotspot_active = active_result.get("data", [])
-            else:
-                hotspot_active = active_result.get("data", [])
-            logger.info(f"[SYNC] Got {len(hotspot_active)} hotspot active sessions")
-            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
-
-            logger.info(f"[SYNC] Fetching existing queues from {router_name} (optimized)...")
-            queues_result = api.get_simple_queues_minimal()
-            if queues_result.get("error"):
-                if queues_result.get("error") == "Not connected":
-                    logger.warning(f"[SYNC] Connection lost, reconnecting...")
-                    if api.connect():
-                        queues_result = api.get_simple_queues_minimal()
-                if queues_result.get("error"):
-                    logger.error(f"[SYNC] Failed to fetch queues: {queues_result.get('error')}")
-                    existing_queues = []
-                else:
-                    existing_queues = queues_result.get("data", [])
-            else:
-                existing_queues = queues_result.get("data", [])
-            logger.info(f"[SYNC] Got {len(existing_queues)} existing queues")
-            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
-
-            mac_to_ip = {}
-            for lease in dhcp_leases:
-                mac = lease.get("mac-address", "")
-                if mac and lease.get("address"):
-                    mac_to_ip[normalize_mac_address(mac)] = lease.get("address")
-            for entry in arp_entries:
-                mac = entry.get("mac-address", "")
-                if mac and entry.get("address"):
-                    mac_to_ip[normalize_mac_address(mac)] = entry.get("address")
-            for host in hotspot_hosts:
-                mac = host.get("mac-address", "")
-                host_ip = host.get("address") or host.get("to-address")
-                if mac and host_ip:
-                    mac_to_ip[normalize_mac_address(mac)] = host_ip
-            for session in hotspot_active:
-                mac = session.get("mac-address", "")
-                if mac and session.get("address"):
-                    mac_to_ip[normalize_mac_address(mac)] = session.get("address")
-
-            connected_customer_ips = []
-            for customer_item in customers_data:
-                customer_mac = normalize_mac_address(customer_item["mac_address"])
-                customer_ip = mac_to_ip.get(customer_mac)
-                if customer_ip:
-                    connected_customer_ips.append(customer_ip)
-
-            if connected_customer_ips:
-                fasttrack_bypass_result = api.ensure_queue_fasttrack_bypass(connected_customer_ips)
-                if fasttrack_bypass_result.get("error"):
-                    logger.warning(f"[SYNC] FastTrack bypass setup failed on {router_name}: {fasttrack_bypass_result.get('error')}")
-                elif fasttrack_bypass_result.get("fasttrack_enabled"):
-                    logger.info(f"[SYNC] FastTrack bypass active on {router_name} (list={fasttrack_bypass_result.get('list_name')}, ips_added={fasttrack_bypass_result.get('ips_added', 0)})")
-
-            queue_by_name = {str(q.get("name", "")).lower(): q for q in existing_queues if q.get("name")}
-            queue_by_mac = {}
-            for queue in existing_queues:
-                queue_comment = str(queue.get("comment", ""))
-                comment_upper = queue_comment.upper()
-                if "MAC:" not in comment_upper:
-                    continue
-                try:
-                    raw_mac = comment_upper.split("MAC:", 1)[1].split("|", 1)[0].strip().split(" ", 1)[0]
-                    if raw_mac:
-                        queue_by_mac[normalize_mac_address(raw_mac)] = queue
-                except Exception:
-                    continue
-            logger.info(f"[SYNC] Built IP map with {len(mac_to_ip)} MAC->IP entries")
-
-            synced = 0
-            skipped_no_ip = 0
-            skipped_already_ok = 0
-            errors = 0
-            created_queues = []
-            updated_queues = []
-
-            logger.info(f"[SYNC] Starting queue processing for {len(customers_data)} customers on {router_name}")
-
-            for cust in customers_data:
-                if total_operations >= SYNC_MAX_QUEUE_OPERATIONS_PER_RUN:
-                    logger.info(f"[SYNC] Reached max operations limit, stopping customer processing")
-                    break
-                if not api.connected:
-                    logger.warning(f"[SYNC] Connection to {router_name} lost, attempting reconnect...")
-                    if not api.connect():
-                        logger.error(f"[SYNC] Reconnect failed, aborting sync for {router_name}")
-                        errors += len(customers_data) - (synced + skipped_no_ip + skipped_already_ok + errors)
-                        break
-                    logger.info(f"[SYNC] Reconnected to {router_name}")
-                try:
-                    if not cust.get("plan_speed"):
-                        skipped_already_ok += 1
-                        continue
-                    normalized_mac = normalize_mac_address(cust["mac_address"])
-                    username = normalized_mac.replace(":", "")
-                    queue_name = f"plan_{username}"
-                    rate_limit = api._parse_speed_to_mikrotik(cust["plan_speed"])
-                    client_ip = mac_to_ip.get(normalized_mac)
-                    if not client_ip:
-                        skipped_no_ip += 1
-                        continue
-                    existing_queue = queue_by_name.get(queue_name.lower())
-                    if not existing_queue:
-                        existing_queue = queue_by_name.get(f"queue_{username}".lower())
-                    if not existing_queue:
-                        existing_queue = queue_by_mac.get(normalized_mac)
-                    if existing_queue:
-                        current_target = existing_queue.get("target", "")
-                        current_limit = existing_queue.get("max-limit", "")
-                        current_target_ip = current_target.split("/")[0].strip() if current_target else ""
-                        queue_disabled = str(existing_queue.get("disabled", "false")).lower() == "true"
-                        needs_update = (current_target_ip != client_ip or rate_limit != current_limit or queue_disabled)
-                        if needs_update:
-                            queue_id = existing_queue.get(".id")
-                            if not queue_id:
-                                logger.error(f"[SYNC] Queue {queue_name} has no .id, cannot update")
-                                errors += 1
-                                continue
-                            time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)
-                            update_payload = {"numbers": queue_id, "target": f"{client_ip}/32", "max-limit": rate_limit}
-                            if queue_disabled:
-                                update_payload["disabled"] = "no"
-                            update_result = api.send_command("/queue/simple/set", update_payload)
-                            if update_result.get("error"):
-                                logger.error(f"[SYNC] Failed to update queue {queue_name}: {update_result.get('error')}")
-                                errors += 1
-                            else:
-                                logger.info(f"[SYNC] Updated queue {queue_name} -> {client_ip} ({rate_limit})")
-                                updated_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
-                                synced += 1
-                                total_operations += 1
-                        else:
-                            skipped_already_ok += 1
-                    else:
-                        time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)
-                        add_result = api.send_command("/queue/simple/add", {
-                            "name": queue_name, "target": f"{client_ip}/32",
-                            "max-limit": rate_limit, "comment": f"MAC:{cust['mac_address']}|Plan rate limit"
-                        })
-                        if add_result.get("error"):
-                            if "already have" in add_result.get("error", "").lower():
-                                logger.warning(f"[SYNC] Queue {queue_name} already exists (created elsewhere), reconciling...")
-                                reconcile_result = api.get_simple_queues_minimal()
-                                duplicate_queue = None
-                                if reconcile_result.get("success") and reconcile_result.get("data"):
-                                    for queue_item in reconcile_result["data"]:
-                                        if str(queue_item.get("name", "")).lower() == queue_name.lower():
-                                            duplicate_queue = queue_item
-                                            break
-                                if duplicate_queue and duplicate_queue.get(".id"):
-                                    time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)
-                                    set_result = api.send_command("/queue/simple/set", {
-                                        "numbers": duplicate_queue[".id"], "target": f"{client_ip}/32",
-                                        "max-limit": rate_limit, "disabled": "no"
-                                    })
-                                    if set_result.get("error"):
-                                        logger.error(f"[SYNC] Failed to reconcile existing queue {queue_name}: {set_result.get('error')}")
-                                        errors += 1
-                                    else:
-                                        logger.info(f"[SYNC] Reconciled existing queue {queue_name} -> {client_ip} ({rate_limit})")
-                                        updated_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
-                                        synced += 1
-                                        total_operations += 1
-                                else:
-                                    skipped_already_ok += 1
-                            else:
-                                logger.error(f"[SYNC] Failed to create queue {queue_name}: {add_result.get('error')}")
-                                errors += 1
-                        else:
-                            logger.info(f"[SYNC] CREATED queue {queue_name} -> {client_ip} ({rate_limit}) - BANDWIDTH NOW LIMITED")
-                            created_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
-                            synced += 1
-                            total_operations += 1
-                except Exception as e:
-                    logger.error(f"[SYNC] Error syncing customer {cust['id']} ({cust['mac_address']}): {e}")
-                    errors += 1
-
-            logger.info(f"[SYNC] Router {router_name} Summary:")
-            logger.info(f"[SYNC]    - Queues created: {len(created_queues)}")
-            logger.info(f"[SYNC]    - Queues updated: {len(updated_queues)}")
-            logger.info(f"[SYNC]    - Skipped (no IP): {skipped_no_ip}")
-            logger.info(f"[SYNC]    - Skipped (already correct): {skipped_already_ok}")
-            logger.info(f"[SYNC]    - Errors: {errors}")
-            if created_queues:
-                logger.info(f"[SYNC] Created queues: {[q['name'] + '=' + q['limit'] for q in created_queues]}")
-            if updated_queues:
-                logger.info(f"[SYNC] Updated queues: {[q['name'] + '=' + q['limit'] for q in updated_queues]}")
-
-            results["synced"] += synced
-            results["errors"] += errors
-            results["skipped"] += skipped_no_ip + skipped_already_ok
-            results["details"].append({
-                "router": router_name, "synced": synced, "errors": errors,
-                "skipped_no_ip": skipped_no_ip, "skipped_already_ok": skipped_already_ok
-            })
-        except Exception as e:
-            logger.error(f"[SYNC] Error processing router {router_name}: {e}")
-            results["errors"] += len(customers_data)
-            results["details"].append({"router": router_name, "error": str(e)})
-        finally:
-            if api:
-                try:
-                    api.disconnect()
-                    logger.info(f"[SYNC] Disconnected from {router_name}")
-                except Exception as e:
-                    logger.warning(f"[SYNC] Error disconnecting from {router_name}: {e}")
-            time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
+        per_router = _sync_single_router_queues_sync(router_data["router"], router_data["customers"])
+        results["synced"] += per_router["synced"]
+        results["errors"] += per_router["errors"]
+        results["skipped"] += per_router["skipped"]
+        results["routers_connected"] += per_router["routers_connected"]
+        if per_router.get("details"):
+            results["details"].append(per_router["details"])
+        time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
 
     return results
 
@@ -1209,7 +1267,55 @@ async def sync_active_user_queues():
                 logger.warning(f"[SYNC] Skipping {len(no_router_customers)} customer(s) with no router assigned")
             logger.info(f"[SYNC] Grouped customers across {len(router_customers_map)} router(s)")
 
-            mikrotik_results = await asyncio.to_thread(_sync_queues_mikrotik_sync, router_customers_map)
+            # Fan out per-router sync concurrently. Each router gets its own
+            # task running in a thread pool, so one slow or broken router only
+            # delays its own task; the others still complete on time.
+            # `router_locks.acquire(rk)` serializes concurrent access to the
+            # same router (other jobs like cleanup use the same locks), while
+            # the semaphore inside it caps overall MikroTik connection load.
+            async def _sync_router_task(rk, rd):
+                try:
+                    async with router_locks.acquire(rk):
+                        return await asyncio.to_thread(
+                            _sync_single_router_queues_sync, rd["router"], rd["customers"],
+                        )
+                except Exception as exc:
+                    logger.error("[SYNC] Router task %s crashed: %s", rk, exc)
+                    return {
+                        "synced": 0,
+                        "errors": len(rd.get("customers", [])),
+                        "skipped": 0,
+                        "routers_connected": 0,
+                        "details": {"router": rd["router"].get("name", rk), "error": str(exc)},
+                    }
+
+            pending_router_items = [
+                (rk, rd) for rk, rd in router_customers_map.items() if rd.get("customers")
+            ]
+
+            mikrotik_results = {
+                "synced": 0,
+                "errors": 0,
+                "skipped": 0,
+                "routers_connected": 0,
+                "details": [],
+            }
+
+            if pending_router_items:
+                outcomes = await asyncio.gather(
+                    *[_sync_router_task(rk, rd) for rk, rd in pending_router_items],
+                    return_exceptions=True,
+                )
+                for outcome in outcomes:
+                    if isinstance(outcome, Exception):
+                        logger.error("[SYNC] Router sync task error: %s", outcome)
+                        continue
+                    mikrotik_results["synced"] += outcome.get("synced", 0)
+                    mikrotik_results["errors"] += outcome.get("errors", 0)
+                    mikrotik_results["skipped"] += outcome.get("skipped", 0)
+                    mikrotik_results["routers_connected"] += outcome.get("routers_connected", 0)
+                    if outcome.get("details"):
+                        mikrotik_results["details"].append(outcome["details"])
 
             duration = (datetime.utcnow() - start_time).total_seconds()
             logger.info(f"[SYNC] Job completed in {duration:.2f}s: "
