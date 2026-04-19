@@ -454,44 +454,79 @@ async def pipeline_stats(
         }
 
     # --- Funnel: how many leads reached each stage or beyond? ---
-    # Churned leads are included (they made it through the full pipeline to paying).
-    # Lost leads are excluded (we don't know at which stage they dropped off).
+    # A lead has "reached" a stage if they are currently at-or-past that stage,
+    # OR their STAGE_CHANGE history shows they were ever at that stage or
+    # beyond (this captures `lost` leads whose current stage doesn't reveal
+    # how far they progressed). `churned` counts as having reached `paying`.
     funnel_order = [
         "new_lead", "contacted", "talking", "installation_help",
         "signed_up", "paying",
     ]
+    stage_rank = {s: i for i, s in enumerate(funnel_order)}
+    paying_rank = stage_rank["paying"]
 
-    reached = {}
-    for i, stage in enumerate(funnel_order):
-        stages_at_or_past = funnel_order[i:] + ["churned"]
-        stage_enums = []
-        for s in stages_at_or_past:
-            try:
-                stage_enums.append(LeadStage(s))
-            except ValueError:
-                pass
-        count_result = await db.execute(
-            select(func.count(Lead.id))
-            .where(Lead.user_id == admin.id, Lead.stage.in_(stage_enums))
+    history_result = await db.execute(
+        select(LeadActivity.lead_id, LeadActivity.new_stage)
+        .join(Lead, LeadActivity.lead_id == Lead.id)
+        .where(
+            Lead.user_id == admin.id,
+            LeadActivity.activity_type == LeadActivityType.STAGE_CHANGE,
         )
-        reached[stage] = count_result.scalar() or 0
+    )
+    max_historical_rank: dict[int, int] = {}
+    for lead_id, new_stage in history_result.all():
+        if new_stage == "churned":
+            r = paying_rank
+        else:
+            r = stage_rank.get(new_stage)
+        if r is None:
+            continue  # "lost" or any unknown stage contributes nothing
+        if r > max_historical_rank.get(lead_id, -1):
+            max_historical_rank[lead_id] = r
 
+    current_result = await db.execute(
+        select(Lead.id, Lead.stage).where(Lead.user_id == admin.id)
+    )
+    reached = {stage: 0 for stage in funnel_order}
+    for lead_id, stage in current_result.all():
+        stage_val = stage.value if hasattr(stage, "value") else stage
+        if stage_val == "churned":
+            current_rank = paying_rank
+        elif stage_val == "lost":
+            current_rank = -1  # current stage contributes nothing; use history
+        else:
+            current_rank = stage_rank.get(stage_val, -1)
+        best_rank = max(current_rank, max_historical_rank.get(lead_id, -1))
+        if best_rank < 0:
+            continue
+        for i in range(best_rank + 1):
+            reached[funnel_order[i]] += 1
+
+    # Build funnel steps. `still_in_stage` = currently in this stage (active,
+    # not a drop-off). `dropped_off` = leads that reached the PREVIOUS stage
+    # but neither progressed to this stage nor are still sitting at the
+    # previous stage — i.e. they gave up (went to `lost`) between the two.
     funnel_steps = []
     for i, stage in enumerate(funnel_order):
-        count = reached[stage]
-        pct_of_total = round(count / total * 100, 1) if total else 0
-        drop_off = 0
-        drop_off_pct = 0
-        if i > 0:
-            prev_count = reached[funnel_order[i - 1]]
-            drop_off = prev_count - count
-            drop_off_pct = round(drop_off / prev_count * 100, 1) if prev_count else 0
+        reached_here = reached[stage]
+        still_here = stage_counts.get(stage, 0)
+        pct_of_total = round(reached_here / total * 100, 1) if total else 0.0
+        if i == 0:
+            dropped = 0
+            drop_pct = 0.0
+        else:
+            prev = funnel_order[i - 1]
+            prev_reached = reached[prev]
+            prev_still = stage_counts.get(prev, 0)
+            dropped = max(prev_reached - reached_here - prev_still, 0)
+            drop_pct = round(dropped / prev_reached * 100, 1) if prev_reached else 0.0
         funnel_steps.append({
             "stage": stage,
-            "reached": count,
+            "reached": reached_here,
             "percent_of_total": pct_of_total,
-            "dropped_off": drop_off,
-            "drop_off_percent": drop_off_pct,
+            "still_in_stage": still_here,
+            "dropped_off": dropped,
+            "drop_off_percent": drop_pct,
         })
 
     # --- Stale leads: sitting in active stages with no update for 7+ days ---
@@ -652,13 +687,15 @@ def _generate_advice(
             ),
         })
 
-    # Tip: biggest drop-off in funnel
+    # Tip: biggest drop-off in funnel. Only flag stages where real losses
+    # occurred (leads left the pipeline without progressing); in-progress
+    # leads are reported via `still_in_stage` and are not drop-offs.
     biggest_drop = None
     for step in funnel_steps:
-        if step["drop_off_percent"] > 0:
+        if step.get("dropped_off", 0) > 0 and step["drop_off_percent"] > 0:
             if biggest_drop is None or step["drop_off_percent"] > biggest_drop["drop_off_percent"]:
                 biggest_drop = step
-    if biggest_drop and biggest_drop["drop_off_percent"] > 30:
+    if biggest_drop and biggest_drop["drop_off_percent"] >= 20:
         stage_name = biggest_drop["stage"].replace("_", " ").title()
         tips.append({
             "priority": "high",
@@ -682,8 +719,9 @@ def _generate_advice(
                 ),
             })
 
-    # Tip: best performing source
-    if source_conversion:
+    # Tip: best performing source. Only meaningful when we have more than
+    # one source to compare — calling the sole source "the best" is noise.
+    if source_conversion and len(source_conversion) > 1:
         best_source = max(
             source_conversion.items(),
             key=lambda x: x[1]["conversion_rate"],

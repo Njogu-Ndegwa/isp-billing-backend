@@ -544,45 +544,51 @@ Comprehensive analytics: conversion funnel, source performance, stale leads, and
   "funnel": [
     {
       "stage": "new_lead",
-      "reached": 35,
-      "percent_of_total": 85.4,
+      "reached": 41,
+      "percent_of_total": 100.0,
+      "still_in_stage": 5,
       "dropped_off": 0,
       "drop_off_percent": 0
     },
     {
       "stage": "contacted",
-      "reached": 30,
-      "percent_of_total": 73.2,
-      "dropped_off": 5,
-      "drop_off_percent": 14.3
+      "reached": 35,
+      "percent_of_total": 85.4,
+      "still_in_stage": 4,
+      "dropped_off": 1,
+      "drop_off_percent": 2.4
     },
     {
       "stage": "talking",
-      "reached": 27,
-      "percent_of_total": 65.9,
-      "dropped_off": 3,
-      "drop_off_percent": 10.0
+      "reached": 30,
+      "percent_of_total": 73.2,
+      "still_in_stage": 6,
+      "dropped_off": 1,
+      "drop_off_percent": 2.9
     },
     {
       "stage": "installation_help",
-      "reached": 19,
-      "percent_of_total": 46.3,
-      "dropped_off": 8,
-      "drop_off_percent": 29.6
+      "reached": 22,
+      "percent_of_total": 53.7,
+      "still_in_stage": 3,
+      "dropped_off": 2,
+      "drop_off_percent": 6.7
     },
     {
       "stage": "signed_up",
       "reached": 17,
       "percent_of_total": 41.5,
+      "still_in_stage": 4,
       "dropped_off": 2,
-      "drop_off_percent": 10.5
+      "drop_off_percent": 9.1
     },
     {
       "stage": "paying",
       "reached": 13,
       "percent_of_total": 31.7,
-      "dropped_off": 4,
-      "drop_off_percent": 23.5
+      "still_in_stage": 13,
+      "dropped_off": 1,
+      "drop_off_percent": 5.9
     }
   ],
   "avg_days_in_stage": {
@@ -652,7 +658,11 @@ Comprehensive analytics: conversion funnel, source performance, stale leads, and
 | `loss_rate` | % of leads that are lost or churned |
 | `by_stage` | Count of leads in each stage |
 | `by_source` | Per-source total leads, conversions, and conversion rate |
-| `funnel` | How many leads reached each stage or beyond, with drop-off between stages |
+| `funnel` | How many leads reached each stage or beyond, plus in-progress counts and true drop-off between stages |
+| `funnel[].reached` | Distinct leads that ever hit this stage (current stage at-or-past it, or found in the `stage_change` activity history). `lost` leads contribute based on how far they progressed before being marked lost. |
+| `funnel[].still_in_stage` | Leads currently sitting in this stage. These are **in-progress**, not drop-offs. |
+| `funnel[].dropped_off` | Leads that reached the *previous* stage but neither advanced to this stage nor are still at the previous stage — i.e. they were abandoned (marked `lost`). |
+| `funnel[].drop_off_percent` | `dropped_off / reached[previous] * 100` — genuine loss rate between stages. Will be `0` when no leads have been marked `lost`. |
 | `avg_days_in_stage` | Average days leads sit in each active stage |
 | `health.stale_leads` | Leads in active stages with no update for 7+ days |
 | `health.no_followup_scheduled` | Active leads with no next follow-up |
