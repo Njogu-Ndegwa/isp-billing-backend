@@ -861,6 +861,67 @@ _pppoe_users_cache: dict = {}  # router_id -> {"data": ..., "timestamp": datetim
 _USERS_CACHE_TTL = 30  # 30 seconds -- live bandwidth changes fast, keep cache short
 
 
+def _infer_disconnect_cause(reason: str) -> dict:
+    """Map MikroTik disconnect reasons to technician-friendly guidance."""
+    normalized = (reason or "").strip().lower()
+    if not normalized:
+        return {
+            "category": "unknown",
+            "probable_cause": "No router-reported disconnect reason",
+            "technician_action": "Check live logs and run full diagnose for this user",
+        }
+
+    reason_map = {
+        "peer-not-responding": {
+            "category": "physical_or_cpe",
+            "probable_cause": "Client CPE is unreachable or link is unstable",
+            "technician_action": "Check cable, switch port, CPE power, and link flaps",
+        },
+        "admin-disconnect": {
+            "category": "operator_action",
+            "probable_cause": "Session terminated manually by admin/script",
+            "technician_action": "Check operator actions, automation jobs, or reconnect endpoint calls",
+        },
+        "authentication-failed": {
+            "category": "authentication",
+            "probable_cause": "Wrong PPPoE credentials or secret mismatch",
+            "technician_action": "Confirm username/password on CPE and router secret state",
+        },
+        "tcp-connection-reset": {
+            "category": "network_instability",
+            "probable_cause": "Session dropped due to unstable network path",
+            "technician_action": "Inspect upstream stability and port errors",
+        },
+        "lost-service": {
+            "category": "service_state",
+            "probable_cause": "PPPoE service became unavailable on router",
+            "technician_action": "Check PPPoE server status and attached interfaces",
+        },
+        "disconnected": {
+            "category": "client_disconnect",
+            "probable_cause": "Client device disconnected normally",
+            "technician_action": "Verify customer CPE uptime and power",
+        },
+    }
+    return reason_map.get(normalized, {
+        "category": "other",
+        "probable_cause": f"Router reported: {reason}",
+        "technician_action": "Inspect per-user router logs and run diagnosis",
+    })
+
+
+def _build_technician_checklist(diag: dict) -> list:
+    """Create a compact action checklist from diagnostic issues."""
+    checklist = []
+    for issue in (diag or {}).get("issues", []):
+        checklist.append({
+            "severity": issue.get("severity", "info"),
+            "layer": issue.get("layer", "unknown"),
+            "action": issue.get("recommendation", "Review router state"),
+        })
+    return checklist[:8]
+
+
 @router.get("/api/pppoe/{router_id}/users")
 async def pppoe_users(
     router_id: int,
@@ -965,3 +1026,67 @@ async def pppoe_users(
     }
 
     return response
+
+
+@router.get("/api/pppoe/{router_id}/client-details/{username}")
+async def pppoe_client_details(
+    router_id: int,
+    username: str,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Detailed troubleshooting payload for one PPPoE client."""
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+
+    router_info = {
+        "ip": router_obj.ip_address, "username": router_obj.username,
+        "password": router_obj.password, "port": router_obj.port,
+    }
+
+    diag = await run_with_guard(
+        router_id, _pppoe_diagnose_sync, router_info, username, router_obj.pppoe_ports or [],
+    )
+    if diag.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "pppoe_client_details")
+        raise HTTPException(status_code=503, detail="Failed to connect to router")
+    if diag.get("error") == "timeout":
+        await record_router_availability(db, router_id, False, "pppoe_client_details")
+        raise HTTPException(status_code=504, detail=diag.get("detail", "Diagnostic timed out"))
+    if diag.get("error"):
+        raise HTTPException(status_code=500, detail=diag["error"])
+
+    logs = await run_with_guard(router_id, _pppoe_logs_sync, router_info, username, 30)
+    if logs.get("error") in {"connect_failed", "timeout"}:
+        await record_router_availability(db, router_id, False, "pppoe_client_details_logs")
+        logs = {"success": False, "data": [], "count": 0}
+    elif logs.get("error"):
+        logs = {"success": False, "data": [], "count": 0}
+
+    await record_router_availability(db, router_id, True, "pppoe_client_details")
+
+    disconnect_reason = (
+        diag.get("info", {}).get("last_disconnect_reason")
+        or diag.get("info", {}).get("secret", {}).get("last_disconnect_reason", "")
+    )
+    cause = _infer_disconnect_cause(disconnect_reason)
+
+    return {
+        "router_id": router_id,
+        "router_name": router_obj.name,
+        "username": username,
+        "generated_at": datetime.utcnow().isoformat(),
+        "connection_state": diag.get("status", "unknown"),
+        "disconnect_reason": disconnect_reason,
+        "cause_hints": cause,
+        "summary": {
+            "issues_count": diag.get("issues_count", 0),
+            "has_critical": diag.get("has_critical", False),
+            "log_entries": logs.get("count", 0),
+        },
+        "technician_checklist": _build_technician_checklist(diag),
+        "diagnostic": diag,
+        "recent_logs": logs.get("data", []),
+    }
