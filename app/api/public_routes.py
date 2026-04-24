@@ -806,10 +806,13 @@ async def redeem_voucher_public(
 
     Expected payload:
     {
-        "code": "4839-2910",
+        "code": "48392910",
         "mac_address": "AA:BB:CC:DD:EE:FF",
         "router_id": 1
     }
+
+    Codes generated before April 2026 used a "XXXX-XXXX" format; both that
+    legacy form and the new plain 8-digit form are accepted here.
     """
     code = (payload.get("code") or "").strip()
     mac_address = payload.get("mac_address", "")
@@ -971,10 +974,14 @@ async def reconnect_self_service(
     customer = None
 
     if voucher_code:
-        # Voucher lookup: find the redeemed voucher → follow to customer
+        # Voucher lookup: find the redeemed voucher → follow to customer.
+        # Accept both legacy "XXXX-XXXX" and new plain "XXXXXXXX" formats so
+        # customers with previously-printed vouchers still reconnect.
+        from app.services.voucher_service import voucher_lookup_candidates
+        code_candidates = voucher_lookup_candidates(voucher_code)
         voucher_stmt = (
             select(Voucher)
-            .where(Voucher.code == voucher_code, Voucher.status == VoucherStatus.REDEEMED)
+            .where(Voucher.code.in_(code_candidates), Voucher.status == VoucherStatus.REDEEMED)
         )
         voucher_result = await db.execute(voucher_stmt)
         voucher_obj = voucher_result.scalar_one_or_none()

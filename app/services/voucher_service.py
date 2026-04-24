@@ -30,9 +30,44 @@ logger = logging.getLogger(__name__)
 
 
 def generate_voucher_code() -> str:
-    """Generate a cryptographically random 8-digit voucher code in XXXX-XXXX format."""
-    digits = ''.join(str(secrets.randbelow(10)) for _ in range(8))
-    return f"{digits[:4]}-{digits[4:]}"
+    """Generate a cryptographically random 8-digit voucher code (no separators).
+
+    Codes are plain digits (e.g. "48392910") so end users clearly recognise them
+    as something they must type in. Input is normalised elsewhere so customers
+    who still paste an old-style "XXXX-XXXX" code continue to work.
+    """
+    return ''.join(str(secrets.randbelow(10)) for _ in range(8))
+
+
+def voucher_lookup_candidates(code: str) -> List[str]:
+    """Return possible stored representations for a voucher code a user typed.
+
+    The DB may hold codes in two historical formats:
+      * Legacy vouchers issued before we dropped the separator -> "XXXX-XXXX"
+      * New vouchers issued without a separator                -> "XXXXXXXX"
+
+    Rather than migrating existing rows (which would invalidate vouchers already
+    printed/SMS'd to customers), we accept either form on input and generate a
+    short list of candidate codes to look up against the `code` column. Both
+    legacy and new vouchers remain redeemable whether the customer types the
+    hyphen or not.
+    """
+    if not code:
+        return []
+    cleaned = code.strip().replace(" ", "").upper()
+    stripped = cleaned.replace("-", "")
+    candidates: List[str] = []
+    if cleaned:
+        candidates.append(cleaned)
+    if stripped and stripped not in candidates:
+        candidates.append(stripped)
+    # Reconstruct the legacy "XXXX-XXXX" form when the user typed 8 plain digits
+    # so a printed legacy voucher still matches if they omit the hyphen.
+    if len(stripped) == 8:
+        hyphenated = f"{stripped[:4]}-{stripped[4:]}"
+        if hyphenated not in candidates:
+            candidates.append(hyphenated)
+    return candidates
 
 
 async def generate_vouchers(
@@ -106,12 +141,14 @@ async def generate_vouchers(
 
 async def verify_voucher(db: AsyncSession, code: str) -> Dict[str, Any]:
     """Verify a voucher code is valid without redeeming it. Returns plan info."""
-    code = code.strip().upper() if not code.strip()[0].isdigit() else code.strip()
+    candidates = voucher_lookup_candidates(code)
+    if not candidates:
+        return {"valid": False, "error": "Voucher code is required"}
 
     result = await db.execute(
         select(Voucher)
         .options(selectinload(Voucher.plan))
-        .where(Voucher.code == code)
+        .where(Voucher.code.in_(candidates))
     )
     voucher = result.scalar_one_or_none()
 
@@ -154,17 +191,23 @@ async def redeem_voucher(
     Redeem a voucher code. Provisions the customer on the router
     using the appropriate method (DIRECT_API or RADIUS).
     """
-    code = code.strip()
+    candidates = voucher_lookup_candidates(code)
+    if not candidates:
+        return {"success": False, "error": "Voucher code is required"}
 
     result = await db.execute(
         select(Voucher)
         .options(selectinload(Voucher.plan))
-        .where(Voucher.code == code)
+        .where(Voucher.code.in_(candidates))
     )
     voucher = result.scalar_one_or_none()
 
     if not voucher:
         return {"success": False, "error": "Voucher code not found"}
+
+    # Use the stored canonical code from here on so downstream references
+    # (customer name, payment_reference, audit log) reflect what the DB holds.
+    code = voucher.code
 
     if voucher.status != VoucherStatus.AVAILABLE:
         status_messages = {

@@ -501,7 +501,7 @@ class AdClickType(str, enum.Enum):
 class Voucher(Base):
     __tablename__ = "vouchers"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    code = Column(String(9), unique=True, nullable=False, index=True)  # XXXX-XXXX
+    code = Column(String(9), unique=True, nullable=False, index=True)  # 8 digits (new) or legacy "XXXX-XXXX"
     plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
