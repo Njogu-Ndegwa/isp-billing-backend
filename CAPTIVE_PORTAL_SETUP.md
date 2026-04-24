@@ -163,7 +163,19 @@ The walled garden allows users to access your external portal **before authentic
 
 ### Step 5: Upload Custom login.html
 
-You need to upload your custom `login.html` file to MikroTik's `/hotspot` directory.
+You need to upload your custom `login.html` file into the hotspot HTML directory on the MikroTik.
+
+> **IMPORTANT — RouterBOARD / hEX persistence**
+>
+> RouterBOARD devices (hEX, hEX S, hEX lite, hEX PoE, CCR, ...) have a split filesystem: the root `/file` tree is **RAM-backed (tmpfs)** and only the **`flash/`** folder is persistent (NAND). If you upload `login.html` to `hotspot/` at the root on these boards, the file **disappears on reboot** and RouterOS silently serves the built-in default login page — users land on the stock MikroTik portal instead of yours.
+>
+> On RouterBOARD, always use **`flash/hotspot/`**. On CHR / x86 (no `flash/` folder), plain `hotspot/` is already persistent.
+>
+> You can tell which you're on with:
+> ```routeros
+> /file print where type="directory"
+> ```
+> If you see a `flash` directory, use `flash/hotspot/` everywhere below.
 
 **Option A: Via FTP (Easiest)**
 
@@ -178,7 +190,7 @@ You need to upload your custom `login.html` file to MikroTik's `/hotspot` direct
    - **Password:** Your MikroTik password
    - **Port:** `21`
 
-3. Navigate to `/hotspot` directory
+3. Navigate to `flash/hotspot/` (RouterBOARD) or `hotspot/` (CHR/x86)
 4. Upload your `login.html` file (see Part 3 for the HTML code)
 5. **Disable FTP after upload:**
 ```routeros
@@ -188,14 +200,17 @@ You need to upload your custom `login.html` file to MikroTik's `/hotspot` direct
 **Option B: Via Winbox (Drag & Drop)**
 
 1. Open **Winbox** → **Files**
-2. Drag and drop `login.html` into the `/hotspot` folder
-3. If `/hotspot` doesn't exist, create it or use the default hotspot directory
+2. On RouterBOARD: double-click into `flash`, then into `hotspot` (breadcrumb must show `flash/hotspot`) and drop `login.html` there.
+3. On CHR / x86: drop `login.html` into the `hotspot` folder at the root.
+4. If the `flash/hotspot/` directory doesn't exist yet, create it by running the `reset-html-directory` command in Step 6 first — RouterOS will materialise the full default file set for you.
 
 **Option C: Via Terminal (Paste HTML)**
 
 ```routeros
-/file print
-# Check if hotspot directory exists
+# RouterBOARD
+/file set flash/hotspot/login.html contents="<!DOCTYPE html>..."
+
+# CHR / x86
 /file set hotspot/login.html contents="<!DOCTYPE html>..."
 ```
 
@@ -205,21 +220,37 @@ You need to upload your custom `login.html` file to MikroTik's `/hotspot` direct
 /file print where name~"login.html"
 ```
 
+The result must include the `flash/` prefix on RouterBOARD (`flash/hotspot/login.html`). If it only shows `hotspot/login.html`, you uploaded to RAM — redo inside `flash/hotspot/`.
+
 ### Step 6: Configure Hotspot to Use Custom login.html
 
-**Set your hotspot profile to use the custom HTML directory:**
+**Point your hotspot profile at the right directory:**
 
 ```routeros
-/ip hotspot profile set hs_prof html-directory=hotspot
+# RouterBOARD (hEX, CCR, etc.)
+/ip hotspot profile set [find name=hsprof1] html-directory=flash/hotspot
+
+# CHR / x86
+/ip hotspot profile set [find name=hsprof1] html-directory=hotspot
 ```
+
+**Generate the supporting file set (rlogin.html, alogin.html, logout.html, md5.js, img/, ...) in that directory — this is idempotent and works on RouterOS v6 and v7:**
+
+```routeros
+/ip hotspot profile reset-html-directory [find name=hsprof1]
+```
+
+Now re-upload your custom `login.html` (Step 5) on top of the default it just generated.
 
 **Verify:**
 
 ```routeros
-/ip hotspot profile print detail where name=hs_prof
+/ip hotspot profile print detail where name=hsprof1
 ```
 
-Should show: `html-directory=hotspot`
+Should show `html-directory=flash/hotspot` on RouterBOARD or `html-directory=hotspot` on CHR/x86.
+
+> **Survives-reboot test:** `/system reboot`, wait, then `/file print where name="flash/hotspot/login.html"` — your custom file must still be there. If not, it was uploaded to RAM (root), not to `flash/`.
 
 ### Step 7: Test Hotspot Redirection
 

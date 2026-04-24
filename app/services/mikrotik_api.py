@@ -2881,18 +2881,99 @@ class MikroTikAPI:
             logger.error("Error ensuring DHCP server %s: %s", name, e)
             return {"error": str(e)}
 
+    def _resolve_hotspot_html_dir(self) -> str:
+        """Pick a persistent hotspot html-directory path for this device.
+
+        RouterBOARD devices (hEX, hEX S, hEX lite, hEX PoE, CCR, etc.) have
+        a split filesystem: the root /file tree is RAM-backed (tmpfs) and
+        only the `flash/` folder is NAND-persistent. Files written to a
+        root-level `hotspot/` directory therefore disappear on reboot and
+        RouterOS falls back to the built-in default login page, which is
+        why clients end up on the stock MikroTik hotspot login instead of
+        our captive portal. CHR / x86 have no `flash/` folder and their
+        whole filesystem is already persistent, so plain `hotspot` is fine.
+
+        We detect the platform via `/system/resource` `board-name`, which
+        returns "CHR" on Cloud Hosted, "x86" on x86 installs, and a real
+        model string (e.g. "hEX S", "CCR2004-...") on every RouterBOARD
+        device. A denylist of just CHR + x86 stays valid forever since
+        those are the only two non-persistent-root platforms MikroTik
+        ships. Works identically on RouterOS v6 and v7.
+        """
+        try:
+            result = self.send_command("/system/resource/print")
+            if result.get("success"):
+                data_list = result.get("data") or []
+                data = data_list[0] if data_list else {}
+                board = (data.get("board-name") or "").strip()
+                if board and board.lower() not in {"chr", "x86"}:
+                    return "flash/hotspot"
+        except Exception as exc:
+            logger.debug("Could not probe system resource for board-name: %s", exc)
+        return "hotspot"
+
+    def reset_hotspot_profile_html_directory(self, profile_name: str) -> Dict[str, Any]:
+        """Regenerate the RouterOS default hotspot HTML file set for a profile.
+
+        Invokes `/ip/hotspot/profile/reset-html-directory` which materialises
+        `login.html`, `rlogin.html`, `alogin.html`, `logout.html`, `status.html`,
+        `error.html`, `errors.txt`, `md5.js`, `radvert.html`, `redirect.html`,
+        and the `img/` folder into the profile's configured `html-directory`.
+        Safe to re-run; idempotent. Command exists in RouterOS v6 and v7.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            profiles = self.send_command("/ip/hotspot/profile/print")
+            if profiles.get("error"):
+                return {"error": f"Could not read hotspot profiles: {profiles['error']}"}
+
+            profile_id = None
+            for profile in profiles.get("data", []) or []:
+                if profile.get("name") == profile_name:
+                    profile_id = profile.get(".id")
+                    break
+            if not profile_id:
+                return {"error": f"Hotspot profile '{profile_name}' not found"}
+
+            result = self.send_command(
+                "/ip/hotspot/profile/reset-html-directory",
+                {"numbers": profile_id},
+            )
+            if result.get("error"):
+                return {"error": f"reset-html-directory failed: {result['error']}"}
+            return {"success": True, "profile": profile_name}
+        except Exception as exc:
+            logger.error("Error resetting hotspot html directory for %s: %s", profile_name, exc)
+            return {"error": str(exc)}
+
     def ensure_hotspot_server_profile(
         self,
         profile_name: str,
         hotspot_address: str,
         dns_name: str = "",
-        html_directory: str = "hotspot",
+        html_directory: Optional[str] = None,
         login_by: str = "http-chap,http-pap",
+        reset_html: bool = True,
     ) -> Dict[str, Any]:
-        """Ensure a hotspot server profile exists with the expected gateway address."""
+        """Ensure a hotspot server profile exists with the expected gateway address.
+
+        When `html_directory` is None (the recommended default), we auto-detect
+        the right path for the device: `flash/hotspot` on RouterBOARD boards
+        that have a NAND `flash/` partition, `hotspot` everywhere else. This
+        prevents the hEX-series regression where uploaded captive-portal HTML
+        was silently written to volatile RAM and wiped on reboot.
+
+        If `reset_html` is True (default), we also invoke RouterOS's
+        `reset-html-directory` after create/update so the profile's
+        html-directory is populated with the complete supporting file set
+        before any subsequent login.html upload / fetch step runs.
+        """
         if not self.connected:
             return {"error": "Not connected"}
         try:
+            resolved_html_dir = html_directory or self._resolve_hotspot_html_dir()
+
             result = self.send_command("/ip/hotspot/profile/print")
             if result.get("error"):
                 return {"error": f"Could not read hotspot profiles: {result['error']}"}
@@ -2908,7 +2989,7 @@ class MikroTikAPI:
                 "hotspot-address": hotspot_address,
                 "dns-name": dns_name,
                 "login-by": login_by,
-                "html-directory": html_directory,
+                "html-directory": resolved_html_dir,
             }
 
             if existing:
@@ -2924,7 +3005,19 @@ class MikroTikAPI:
                 if create.get("error"):
                     return {"error": f"Failed to create hotspot profile '{profile_name}': {create['error']}"}
 
-            return {"success": True, "name": profile_name}
+            if reset_html:
+                reset_result = self.reset_hotspot_profile_html_directory(profile_name)
+                if reset_result.get("error"):
+                    logger.warning(
+                        "reset-html-directory failed for %s (continuing): %s",
+                        profile_name, reset_result["error"],
+                    )
+
+            return {
+                "success": True,
+                "name": profile_name,
+                "html_directory": resolved_html_dir,
+            }
         except Exception as e:
             logger.error("Error ensuring hotspot profile %s: %s", profile_name, e)
             return {"error": str(e)}

@@ -375,11 +375,58 @@ def _rsc_hotspot() -> str:
     :error "bridge interface does not exist — cannot create hotspot"
 }
 
+# Pick a persistent hotspot html-directory for this device.
+# RouterBOARD boards (hEX, hEX S, hEX lite, hEX PoE, CCR, ...) have a
+# split filesystem: the root /file tree is RAM-backed (tmpfs) and only
+# the `flash/` folder is NAND-persistent. If we set html-directory=hotspot
+# on those boards, our custom login.html is written to RAM and wiped on
+# reboot — RouterOS then serves the built-in default login page instead
+# of redirecting clients to our captive portal. CHR / x86 have no `flash`
+# folder and their whole filesystem is already persistent, so plain
+# `hotspot` is fine for them.
+#
+# We detect the platform via /system resource board-name. It returns
+# "CHR" on Cloud Hosted, "x86" on x86 installs, and a real model name
+# like "hEX S" / "CCR2004-..." on every RouterBOARD device. A denylist
+# of just CHR + x86 stays valid forever since those are the only two
+# non-persistent-root platforms MikroTik ships.
+:global bwHtmlDir "hotspot"
+:local bwBoard ""
+:do { :set bwBoard [/system resource get board-name] } on-error={}
+:if ([:len $bwBoard] > 0 and $bwBoard != "CHR" and $bwBoard != "x86") do={
+    :set bwHtmlDir "flash/hotspot"
+    :log info ("Provisioning: RouterBOARD " . $bwBoard . " detected, html-directory=" . $bwHtmlDir)
+} else={
+    :log info ("Provisioning: board-name=" . $bwBoard . " (non-persistent root), html-directory=hotspot")
+}
+
+# Clean legacy hotspot directories left behind by previous provisioners
+# (CentiPid, OpenWISP, earlier versions of ours). This is best-effort and
+# must never touch flash/etc*, flash/user-manager*, flash/skins, etc.
+:do { /file remove [find where name="flash/centipid-hotspot"] } on-error={}
+:foreach legacyId in=[/file find where name~"^flash/openwisp-hotspot" and type="directory"] do={
+    :do { /file remove $legacyId } on-error={}
+}
+
 :do {
-    /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=hotspot
-    :log info "Provisioning: hotspot profile hsprof1 created"
+    /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=$bwHtmlDir
+    :log info ("Provisioning: hotspot profile hsprof1 created with html-directory=" . $bwHtmlDir)
 } on-error={
-    :log info "Provisioning: hotspot profile hsprof1 already exists or hotspot unavailable, continuing"
+    :do { /ip hotspot profile set [find where name=hsprof1] html-directory=$bwHtmlDir } on-error={
+        :log warning "Provisioning: could not update hsprof1 html-directory — continuing"
+    }
+    :log info ("Provisioning: hotspot profile hsprof1 already existed, html-directory=" . $bwHtmlDir)
+}
+
+# Materialise RouterOS's default hotspot HTML file set into html-directory
+# so our subsequent /tool fetch of login.html has a complete supporting
+# set (rlogin.html, alogin.html, logout.html, md5.js, img/, ...). Works on
+# RouterOS v6 and v7.
+:do {
+    /ip hotspot profile reset-html-directory [find where name=hsprof1]
+    :log info "Provisioning: hotspot profile reset-html-directory applied"
+} on-error={
+    :log warning "Provisioning: reset-html-directory not available on this RouterOS — continuing"
 }
 
 :do {
@@ -413,13 +460,33 @@ def _rsc_login_page(token: ProvisioningToken) -> str:
 # ---- STEP 5: DOWNLOAD CUSTOM LOGIN PAGE ----
 
 :delay 2s
+
+# Derive the destination from the hotspot profile so we always write into
+# whatever html-directory step 4 picked — `flash/hotspot` on hEX/CCR/etc.,
+# `hotspot` on CHR/x86. Falls back to the $bwHtmlDir global, then to the
+# legacy `hotspot` path if neither is available.
+:local htmlDir ""
+:do {{
+    :set htmlDir [/ip hotspot profile get [find where name=hsprof1] html-directory]
+}} on-error={{}}
+:if ([:len $htmlDir] = 0) do={{
+    :global bwHtmlDir
+    :if ([:typeof $bwHtmlDir] = "str" and [:len $bwHtmlDir] > 0) do={{
+        :set htmlDir $bwHtmlDir
+    }} else={{
+        :set htmlDir "hotspot"
+    }}
+}}
+:local loginPath ($htmlDir . "/login.html")
+:log info ("Provisioning: downloading login page to " . $loginPath)
+
 :local fetchOk false
 :for i from=1 to=5 do={{
     :if (!$fetchOk) do={{
         :do {{
-            /tool fetch url="{base_url}/api/provision/{t}/login-page" dst-path=hotspot/login.html
+            /tool fetch url="{base_url}/api/provision/{t}/login-page" dst-path=$loginPath
             :set fetchOk true
-            :log info "Provisioning: Login page downloaded"
+            :log info ("Provisioning: Login page downloaded to " . $loginPath)
         }} on-error={{
             :log warning "Provisioning: Login page download attempt $i failed, retrying..."
             :delay 5s
