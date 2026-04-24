@@ -52,10 +52,12 @@ def _run_mikrotik_health_sync(router_info: dict) -> dict:
     try:
         resources = api.get_system_resources()
         health = api.get_health()
+        pppoe_active = api.get_active_pppoe_sessions()
         return {
             "success": True,
             "resources": resources,
             "health": health,
+            "pppoe_active": pppoe_active,
             "router_name": router_info.get("name", "Unknown")
         }
     finally:
@@ -86,7 +88,6 @@ def _fetch_mikrotik_data_sync():
     resources = api.get_system_resources()
     health = api.get_health()
     active_sessions = api.get_active_hotspot_users()
-    active_pppoe = api.get_active_pppoe_sessions()
     traffic = api.get_interface_traffic()
     speed_stats = api.get_queue_speed_stats()
     api.disconnect()
@@ -95,7 +96,6 @@ def _fetch_mikrotik_data_sync():
         "resources": resources,
         "health": health,
         "active_sessions": active_sessions,
-        "active_pppoe": active_pppoe,
         "traffic": traffic,
         "speed_stats": speed_stats
     }
@@ -222,6 +222,7 @@ async def get_mikrotik_health(
         
         resources = mikrotik_result.get("resources", {})
         health = mikrotik_result.get("health", {})
+        pppoe_active = mikrotik_result.get("pppoe_active", {}) or {}
         
         if resources.get("error"):
             raise HTTPException(status_code=500, detail=resources["error"])
@@ -277,6 +278,8 @@ async def get_mikrotik_health(
             },
             "health_sensors": health.get("data", {}),
             "active_users": active_users,
+            "active_pppoe_users": pppoe_active.get("count", len(pppoe_active.get("data", []) or [])) if not pppoe_active.get("error") else 0,
+            "active_pppoe_sessions": pppoe_active.get("data", []) if not pppoe_active.get("error") else [],
             "bandwidth": {
                 "download_mbps": current_download_mbps,
                 "upload_mbps": current_upload_mbps
@@ -604,8 +607,6 @@ async def get_dashboard_mikrotik(
             "healthSensors": raw["health"].get("data", {}),
             "activeSessions": raw["active_sessions"].get("data", []),
             "activeSessionCount": len(raw["active_sessions"].get("data", [])),
-            "activePppoeSessions": raw["active_pppoe"].get("data", []),
-            "activePppoeCount": raw["active_pppoe"].get("count", len(raw["active_pppoe"].get("data", []))),
             "interfaces": raw["traffic"].get("data", []),
             "speedStats": {
                 "totalUploadMbps": speed_data.get("total_upload_mbps", 0),
