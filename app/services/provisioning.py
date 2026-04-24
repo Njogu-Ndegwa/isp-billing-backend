@@ -75,7 +75,7 @@ async def allocate_vpn_ip(db: AsyncSession, vpn_type: str = "wireguard") -> str:
     router_ips = {row[0] for row in router_result.fetchall()}
 
     # Only reserve IPs for PENDING tokens still within their 24h validity window.
-    # Tokens past the cutoff are ignored here regardless of DB status — their
+    # Tokens past the cutoff are ignored here regardless of DB status -- their
     # status gets cleaned up to EXPIRED by the nightly scheduled job.
     cutoff = datetime.utcnow() - timedelta(hours=TOKEN_EXPIRY_HOURS)
     token_result = await db.execute(
@@ -195,9 +195,9 @@ async def expire_stale_tokens() -> int:
     Mark expired PENDING tokens as EXPIRED so their IPs become available.
 
     Runs as a nightly scheduled job (3:00 AM EAT / 0:00 UTC).
-    Uses its own DB session — safe to call from anywhere.
+    Uses its own DB session -- safe to call from anywhere.
 
-    Stale WireGuard/L2TP peers are left on the server — they are harmless
+    Stale WireGuard/L2TP peers are left on the server -- they are harmless
     (no one has the private key) and can be pruned separately if needed.
 
     Safe because:
@@ -240,7 +240,7 @@ def get_login_page_html() -> str:
 
 
 # ---------------------------------------------------------------------------
-# .rsc script generation — shared + VPN-specific sections
+# .rsc script generation -- shared + VPN-specific sections
 # ---------------------------------------------------------------------------
 
 def _rsc_header(token: ProvisioningToken) -> str:
@@ -266,7 +266,7 @@ def _rsc_preflight_v7() -> str:
             :local dm [/system/device-mode/get hotspot]
             :if ($dm != true) do={
                 :log error "PROVISION ABORTED: device-mode hotspot is disabled. Run: /system/device-mode/update hotspot=yes  then press the physical reset button within 60s. After that, re-run this script."
-                :error "device-mode hotspot not enabled — aborting (see log)"
+                :error "device-mode hotspot not enabled -- aborting (see log)"
             }
             :log info "Provisioning: device-mode hotspot=yes confirmed"
         } on-error={
@@ -360,7 +360,7 @@ def _rsc_vpn_l2tp(token: ProvisioningToken) -> str:
 # Verify L2TP connected and got the expected IP
 :local l2tpRunning [:len [/interface l2tp-client find where name=l2tp-aws running=yes]]
 :if ($l2tpRunning = 0) do={{
-    :log warning "Provisioning: L2TP tunnel not yet connected — will retry on reboot"
+    :log warning "Provisioning: L2TP tunnel not yet connected -- will retry on reboot"
 }} else={{
     :log info "Provisioning: L2TP tunnel connected"
 }}"""
@@ -372,7 +372,7 @@ def _rsc_hotspot() -> str:
 
 :if ([:len [/interface bridge find where name=bridge]] = 0) do={
     :log error "PROVISION ABORTED at hotspot step: bridge interface missing"
-    :error "bridge interface does not exist — cannot create hotspot"
+    :error "bridge interface does not exist -- cannot create hotspot"
 }
 
 # Pick a persistent hotspot html-directory for this device.
@@ -380,7 +380,7 @@ def _rsc_hotspot() -> str:
 # split filesystem: the root /file tree is RAM-backed (tmpfs) and only
 # the `flash/` folder is NAND-persistent. If we set html-directory=hotspot
 # on those boards, our custom login.html is written to RAM and wiped on
-# reboot — RouterOS then serves the built-in default login page instead
+# reboot -- RouterOS then serves the built-in default login page instead
 # of redirecting clients to our captive portal. CHR / x86 have no `flash`
 # folder and their whole filesystem is already persistent, so plain
 # `hotspot` is fine for them.
@@ -413,7 +413,7 @@ def _rsc_hotspot() -> str:
     :log info ("Provisioning: hotspot profile hsprof1 created with html-directory=" . $bwHtmlDir)
 } on-error={
     :do { /ip hotspot profile set [find where name=hsprof1] html-directory=$bwHtmlDir } on-error={
-        :log warning "Provisioning: could not update hsprof1 html-directory — continuing"
+        :log warning "Provisioning: could not update hsprof1 html-directory, continuing"
     }
     :log info ("Provisioning: hotspot profile hsprof1 already existed, html-directory=" . $bwHtmlDir)
 }
@@ -421,12 +421,14 @@ def _rsc_hotspot() -> str:
 # Materialise RouterOS's default hotspot HTML file set into html-directory
 # so our subsequent /tool fetch of login.html has a complete supporting
 # set (rlogin.html, alogin.html, logout.html, md5.js, img/, ...). Works on
-# RouterOS v6 and v7.
+# RouterOS v6 and v7. NOTE: reset-html-directory takes the profile NAME
+# as a positional argument -- it rejects [find where name=...] in the CLI
+# parser even though most other commands accept that form.
 :do {
-    /ip hotspot profile reset-html-directory [find where name=hsprof1]
+    /ip hotspot profile reset-html-directory hsprof1
     :log info "Provisioning: hotspot profile reset-html-directory applied"
 } on-error={
-    :log warning "Provisioning: reset-html-directory not available on this RouterOS — continuing"
+    :log warning "Provisioning: reset-html-directory not available on this RouterOS, continuing"
 }
 
 :do {
@@ -440,10 +442,10 @@ def _rsc_hotspot() -> str:
 :do {
     :set hsCount [:len [/ip hotspot find where name=hotspot1]]
 } on-error={
-    :log error "PROVISION WARNING: could not query hotspot — the hotspot feature may not be available. Ensure device-mode hotspot is enabled: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode hotspot is enabled: /system/device-mode/update hotspot=yes then press the physical reset button."
 }
 :if ($hsCount = 0) do={
-    :log error "PROVISION WARNING: hotspot1 was not found — hotspot feature may not be enabled. Run: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update hotspot=yes then press the physical reset button."
 } else={
     :log info "Provisioning: hotspot1 confirmed running"
 }
@@ -462,7 +464,7 @@ def _rsc_login_page(token: ProvisioningToken) -> str:
 :delay 2s
 
 # Derive the destination from the hotspot profile so we always write into
-# whatever html-directory step 4 picked — `flash/hotspot` on hEX/CCR/etc.,
+# whatever html-directory step 4 picked -- `flash/hotspot` on hEX/CCR/etc.,
 # `hotspot` on CHR/x86. Falls back to the $bwHtmlDir global, then to the
 # legacy `hotspot` path if neither is available.
 :local htmlDir ""
@@ -535,7 +537,7 @@ def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
 :delay 2s
 :do {{
     /tool fetch url="{base_url}/api/provision/{t}/complete" http-method=post
-    :log info "Provisioning: Server notified — router registered"
+    :log info "Provisioning: Server notified -- router registered"
 }} on-error={{
     :log warning "Provisioning: Could not notify server (register manually via admin panel)"
 }}
@@ -554,7 +556,7 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 
     if token.vpn_type == "wireguard":
         parts.append(_rsc_preflight_v7())
-    # v6 (l2tp) has no device-mode concept — skip preflight
+    # v6 (l2tp) has no device-mode concept -- skip preflight
 
     parts.append(_rsc_wan_setup())
     parts.append(_rsc_lan_setup())
@@ -723,7 +725,7 @@ def build_provision_command(token: ProvisioningToken) -> str:
 async def complete_provisioning(
     db: AsyncSession, token: ProvisioningToken
 ) -> Router:
-    """Called by the .rsc callback — creates the Router record in the database."""
+    """Called by the .rsc callback -- creates the Router record in the database."""
     router_obj = Router(
         user_id=token.user_id,
         name=token.router_name,
