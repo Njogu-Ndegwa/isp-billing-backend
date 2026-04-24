@@ -86,6 +86,7 @@ def _fetch_mikrotik_data_sync():
     resources = api.get_system_resources()
     health = api.get_health()
     active_sessions = api.get_active_hotspot_users()
+    active_pppoe = api.get_active_pppoe_sessions()
     traffic = api.get_interface_traffic()
     speed_stats = api.get_queue_speed_stats()
     api.disconnect()
@@ -94,6 +95,7 @@ def _fetch_mikrotik_data_sync():
         "resources": resources,
         "health": health,
         "active_sessions": active_sessions,
+        "active_pppoe": active_pppoe,
         "traffic": traffic,
         "speed_stats": speed_stats
     }
@@ -602,6 +604,8 @@ async def get_dashboard_mikrotik(
             "healthSensors": raw["health"].get("data", {}),
             "activeSessions": raw["active_sessions"].get("data", []),
             "activeSessionCount": len(raw["active_sessions"].get("data", [])),
+            "activePppoeSessions": raw["active_pppoe"].get("data", []),
+            "activePppoeCount": raw["active_pppoe"].get("count", len(raw["active_pppoe"].get("data", []))),
             "interfaces": raw["traffic"].get("data", []),
             "speedStats": {
                 "totalUploadMbps": speed_data.get("total_upload_mbps", 0),
