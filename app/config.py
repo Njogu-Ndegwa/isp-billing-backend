@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     PROVISION_BASE_URL: str = "https://isp.bitwavetechnologies.net"
     L2TP_IPSEC_PSK: str = "BitwaveL2TP2026!Secure"
 
+    # Access credential idle reaper: minutes a bound MAC can be unseen on the
+    # router's hotspot host table before the credential is auto-released so
+    # another device can use it.
+    ACCESS_CRED_IDLE_RELEASE_MINUTES: int = 15
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -147,6 +147,15 @@ async def make_payment(
     customer.expiry = datetime.utcnow() + timedelta(days=days_paid_for)
     db.add(customer)
 
+    # Renewal hook: close previous usage period, open a fresh one,
+    # and lift any FUP throttle/block applied during the previous cycle.
+    try:
+        from app.services.usage_tracking import on_renewal
+
+        await on_renewal(db, customer, plan=customer.plan)
+    except Exception as e:
+        logger.error(f"[USAGE] on_renewal failed in make_payment for customer {customer.id}: {e}")
+
     # Commit the payment and customer update
     await db.commit()
 

@@ -634,6 +634,16 @@ async def activate_pppoe_customer(
             notes=request.notes or f"PPPoE activation via admin",
         )
         db.add(payment)
+
+        try:
+            from app.services.usage_tracking import on_renewal
+
+            await on_renewal(db, customer, plan=plan, now=now)
+        except Exception as renew_err:
+            logger.error(
+                f"[USAGE] on_renewal failed in PPPoE activation for customer {customer.id}: {renew_err}"
+            )
+
         await db.commit()
         await db.refresh(customer)
 

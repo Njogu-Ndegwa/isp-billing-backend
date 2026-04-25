@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router
+from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router, FupAction
 from app.services.auth import verify_token, get_current_user
 from app.services.plan_cache import get_plans_cached, invalidate_plan_cache
 from app.services.subscription import enforce_active_subscription
@@ -17,6 +17,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["plans"])
 
 VALID_PLAN_TYPES = [pt.value for pt in PlanType]
+VALID_FUP_ACTIONS = [a.value for a in FupAction]
+
+
+def _parse_fup_action(value: Optional[str]) -> Optional[FupAction]:
+    if value is None or value == "":
+        return None
+    if value.lower() not in VALID_FUP_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid fup_action. Must be one of: {', '.join(VALID_FUP_ACTIONS)}",
+        )
+    return FupAction(value.lower())
+
+
+def _serialize_plan_fup(plan: Plan) -> dict:
+    return {
+        "data_cap_mb": plan.data_cap_mb,
+        "fup_action": plan.fup_action.value if plan.fup_action else None,
+        "fup_throttle_profile": plan.fup_throttle_profile,
+    }
 
 
 class PlanCreateRequest(BaseModel):
@@ -32,6 +52,9 @@ class PlanCreateRequest(BaseModel):
     badge_text: Optional[str] = None
     original_price: Optional[int] = None
     valid_until: Optional[str] = None
+    data_cap_mb: Optional[int] = None
+    fup_action: Optional[str] = None
+    fup_throttle_profile: Optional[str] = None
 
 
 class PlanUpdateRequest(BaseModel):
@@ -47,6 +70,9 @@ class PlanUpdateRequest(BaseModel):
     badge_text: Optional[str] = None
     original_price: Optional[int] = None
     valid_until: Optional[str] = None
+    data_cap_mb: Optional[int] = None
+    fup_action: Optional[str] = None
+    fup_throttle_profile: Optional[str] = None
 
 
 @router.post("/api/plans/create")
@@ -112,6 +138,10 @@ async def create_plan_api(
         if existing_result.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Plan with this name already exists")
         
+        fup_action_enum = _parse_fup_action(request.fup_action)
+        if request.data_cap_mb is not None and request.data_cap_mb < 0:
+            raise HTTPException(status_code=400, detail="data_cap_mb cannot be negative")
+
         plan = Plan(
             name=request.name,
             speed=request.speed,
@@ -126,6 +156,9 @@ async def create_plan_api(
             badge_text=request.badge_text,
             original_price=request.original_price,
             valid_until=valid_until_dt,
+            data_cap_mb=request.data_cap_mb,
+            fup_action=fup_action_enum,
+            fup_throttle_profile=request.fup_throttle_profile,
         )
         
         db.add(plan)
@@ -151,7 +184,8 @@ async def create_plan_api(
             "badge_text": plan.badge_text,
             "original_price": plan.original_price,
             "valid_until": plan.valid_until.isoformat() if plan.valid_until else None,
-            "created_at": plan.created_at.isoformat()
+            "created_at": plan.created_at.isoformat(),
+            **_serialize_plan_fup(plan),
         }
     except HTTPException:
         raise
@@ -233,7 +267,15 @@ async def update_plan_api(
                 plan.valid_until = datetime.fromisoformat(request.valid_until.replace('Z', '+00:00')) if request.valid_until != "" else None
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid valid_until format. Use ISO 8601.")
-        
+        if request.data_cap_mb is not None:
+            if request.data_cap_mb < 0:
+                raise HTTPException(status_code=400, detail="data_cap_mb cannot be negative")
+            plan.data_cap_mb = request.data_cap_mb if request.data_cap_mb > 0 else None
+        if request.fup_action is not None:
+            plan.fup_action = _parse_fup_action(request.fup_action)
+        if request.fup_throttle_profile is not None:
+            plan.fup_throttle_profile = request.fup_throttle_profile if request.fup_throttle_profile != "" else None
+
         await db.commit()
         await db.refresh(plan)
         await invalidate_plan_cache()
@@ -254,6 +296,7 @@ async def update_plan_api(
             "badge_text": plan.badge_text,
             "original_price": plan.original_price,
             "valid_until": plan.valid_until.isoformat() if plan.valid_until else None,
+            **_serialize_plan_fup(plan),
         }
     except HTTPException:
         raise
