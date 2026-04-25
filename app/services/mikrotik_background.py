@@ -1952,6 +1952,14 @@ async def collect_bandwidth_snapshot():
                     logger.debug(f"Collected bandwidth snapshot for router {router.name} (ID: {router_id})")
                 except Exception as router_error:
                     logger.error(f"Error collecting bandwidth from router {router.name}: {router_error}")
+                    # Roll the session back so a single failed query (e.g. a missing
+                    # column on plans / user_bandwidth_usage) doesn't leave the
+                    # connection in 'aborted-transaction' state and poison every
+                    # subsequent query on that pooled asyncpg connection.
+                    try:
+                        await db.rollback()
+                    except Exception as rb_err:
+                        logger.error(f"[BANDWIDTH] Rollback after router error failed: {rb_err}")
                     continue
 
             cutoff = now - timedelta(days=1)

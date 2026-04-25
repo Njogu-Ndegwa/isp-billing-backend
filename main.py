@@ -1063,6 +1063,87 @@ async def run_growth_targets_migration():
 
 
 # ============================================================================
+# FUP / per-customer usage migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_fup_usage_migrations():
+    """Add FUP fields to plans, delta-tracking columns to user_bandwidth_usage,
+    and create the customer_usage_periods table.
+
+    Mirrors migrations/add_fup_usage_tracking.py but runs automatically on
+    startup so deploys don't require a separate manual step. Idempotent: every
+    ALTER/CREATE is gated on a catalog existence check.
+    """
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE fupaction AS ENUM ('throttle', 'block', 'notify_only'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+        ))
+
+        await conn.execute(sa_text(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS data_cap_mb BIGINT NULL"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS fup_action fupaction NULL"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS fup_throttle_profile VARCHAR(100) NULL"
+        ))
+
+        await conn.execute(sa_text(
+            "ALTER TABLE user_bandwidth_usage "
+            "ADD COLUMN IF NOT EXISTS last_upload_bytes BIGINT NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE user_bandwidth_usage "
+            "ADD COLUMN IF NOT EXISTS last_download_bytes BIGINT NOT NULL DEFAULT 0"
+        ))
+
+        await conn.execute(sa_text(
+            """
+            CREATE TABLE IF NOT EXISTS customer_usage_periods (
+                id SERIAL PRIMARY KEY,
+                customer_id INTEGER NOT NULL REFERENCES customers(id),
+                period_start TIMESTAMP NOT NULL,
+                period_end TIMESTAMP NOT NULL,
+                upload_bytes BIGINT NOT NULL DEFAULT 0,
+                download_bytes BIGINT NOT NULL DEFAULT 0,
+                total_bytes BIGINT NOT NULL DEFAULT 0,
+                cap_mb_snapshot BIGINT NULL,
+                fup_action_snapshot fupaction NULL,
+                fup_triggered_at TIMESTAMP NULL,
+                fup_action_taken fupaction NULL,
+                fup_reverted_at TIMESTAMP NULL,
+                closed_at TIMESTAMP NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_customer_period_start UNIQUE (customer_id, period_start)
+            )
+            """
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_customer_usage_periods_customer_id "
+            "ON customer_usage_periods (customer_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_customer_usage_periods_period_start "
+            "ON customer_usage_periods (period_start)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_customer_usage_periods_closed_at "
+            "ON customer_usage_periods (closed_at)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_customer_usage_periods_customer_open "
+            "ON customer_usage_periods (customer_id, closed_at)"
+        ))
+        logger.info(
+            "Migration: Ensured FUP enum, plans/user_bandwidth_usage columns, "
+            "and customer_usage_periods table"
+        )
+
+
+# ============================================================================
 # Access Credentials Migrations (runs on startup, idempotent)
 # ============================================================================
 async def run_access_credential_migrations():
@@ -1226,6 +1307,12 @@ async def startup_event():
         logger.info("Access credential migrations completed successfully")
     except Exception as e:
         logger.error(f"Access credential migration failed (non-fatal): {e}")
+
+    try:
+        await run_fup_usage_migrations()
+        logger.info("FUP / usage tracking migrations completed successfully")
+    except Exception as e:
+        logger.error(f"FUP / usage tracking migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,
