@@ -842,6 +842,112 @@ async def redeem_voucher_public(
     return result
 
 
+@router.post("/api/public/access-login")
+async def access_credential_login_public(
+    payload: Dict[str, str],
+    db: AsyncSession = Depends(get_db),
+):
+    """Authenticate a reseller-issued access credential and grant the device internet.
+
+    Expected payload::
+
+        {
+            "router_id": 1,
+            "username": "alice",
+            "password": "s3cret",
+            "mac_address": "AA:BB:CC:DD:EE:FF"
+        }
+
+    Returns 401 on bad credential / revoked credential, 409 when the credential
+    is currently bound to a different MAC. On success the requester's MAC is
+    added as a ``bypassed`` IP-binding on the router (with a per-MAC simple
+    queue carrying the credential's rate-limit), and the credential's
+    ``bound_mac_address`` is updated.
+    """
+    from app.db.models import AccessCredential, AccessCredStatus
+    from app.services.access_credentials import bind_mac_for_login
+
+    username = (payload.get("username") or "").strip().lower()
+    password = (payload.get("password") or "").strip()
+    mac_address = payload.get("mac_address", "")
+    router_id_raw = payload.get("router_id", "")
+
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+    if not password:
+        raise HTTPException(status_code=400, detail="Password is required")
+    if not mac_address:
+        raise HTTPException(status_code=400, detail="MAC address is required")
+    if not router_id_raw:
+        raise HTTPException(status_code=400, detail="Router ID is required")
+
+    try:
+        rid = int(router_id_raw)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid router ID")
+
+    if not validate_mac_address(mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address format")
+
+    normalized_mac = normalize_mac_address(mac_address)
+
+    cred_stmt = select(AccessCredential).where(
+        AccessCredential.router_id == rid,
+        func.lower(AccessCredential.username) == username,
+    )
+    cred = (await db.execute(cred_stmt)).scalar_one_or_none()
+
+    # Constant-ish responses to avoid leaking which credentials exist
+    if not cred or cred.password != password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if cred.status != AccessCredStatus.ACTIVE:
+        raise HTTPException(status_code=401, detail="Credential is revoked")
+
+    # Single-concurrent enforcement: same MAC is idempotent, different MAC is rejected.
+    existing_mac = (cred.bound_mac_address or "").upper() or None
+    if existing_mac and normalize_mac_address(existing_mac) != normalized_mac:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "credential_in_use",
+                "message": "This credential is currently in use on another device",
+            },
+        )
+
+    router_obj = await db.get(Router, rid)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    bind_result = await bind_mac_for_login(cred, router_obj, normalized_mac)
+    if bind_result.get("error"):
+        logger.warning(
+            f"access-login: binding failed for cred {cred.id} mac {normalized_mac}: "
+            f"{bind_result.get('message')}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Router binding failed: {bind_result.get('message', 'unknown error')}",
+        )
+
+    now = datetime.utcnow()
+    cred.bound_mac_address = normalized_mac
+    cred.bound_at = now
+    cred.last_login_at = now
+    cred.last_seen_at = now
+    cred.last_seen_ip = bind_result.get("client_ip")
+    await db.commit()
+
+    return {
+        "success": True,
+        "username": cred.username,
+        "rate_limit": cred.rate_limit,
+        "router_id": rid,
+        "mac_address": normalized_mac,
+        "client_ip": bind_result.get("client_ip"),
+        "message": "You're online. Enjoy your WiFi.",
+    }
+
+
 @router.get("/api/public/voucher/verify/{code}")
 async def verify_voucher_public(
     code: str,

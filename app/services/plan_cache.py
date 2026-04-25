@@ -42,6 +42,9 @@ def _serialize_plan(plan: Plan) -> Dict:
         "badge_text": plan.badge_text,
         "original_price": plan.original_price,
         "valid_until": plan.valid_until.isoformat() if plan.valid_until else None,
+        "data_cap_mb": plan.data_cap_mb,
+        "fup_action": plan.fup_action.value if plan.fup_action else None,
+        "fup_throttle_profile": plan.fup_throttle_profile,
     }
 
 async def get_plans_cached(

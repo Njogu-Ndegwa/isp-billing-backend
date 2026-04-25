@@ -16,9 +16,18 @@ from sqlalchemy import select, delete
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
 from app.db.database import get_db, async_engine
-from app.db.models import Router, Customer, CustomerStatus, BandwidthSnapshot, UserBandwidthUsage
+from app.db.models import (
+    Router,
+    Customer,
+    CustomerStatus,
+    BandwidthSnapshot,
+    UserBandwidthUsage,
+    Plan,
+    ConnectionType,
+)
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.router_availability import record_router_availability, prune_router_availability_history
+from app.services.usage_tracking import record_usage
 from app.core.protected_devices import is_protected_device
 from app.config import settings
 import asyncio
@@ -827,10 +836,240 @@ async def cleanup_expired_users_background():
             except Exception as bypass_err:
                 logger.error(f"[CRON] Safety net cleanup failed: {bypass_err}")
 
+            try:
+                released = await _reap_idle_access_credentials(db)
+                if released:
+                    logger.info(f"[CRON] Released {released} idle access credential(s)")
+            except Exception as reap_err:
+                logger.error(f"[CRON] Access credential reaper failed: {reap_err}")
+
     except Exception as e:
         logger.error(f"[CRON] Cleanup job failed: {e}")
     finally:
         cleanup_running = False
+
+
+# =============================================================================
+# Idle access credential reaper
+# =============================================================================
+
+def _scan_router_idle_credentials_sync(
+    router_info: dict,
+    creds: list,
+    idle_threshold_seconds: int,
+) -> dict:
+    """Inspect /ip/hotspot/host once per router and decide which credentials to release.
+
+    A credential is released when its bound MAC is either:
+      * absent from /ip/hotspot/host entirely, or
+      * present with an idle-time exceeding ``idle_threshold_seconds``.
+
+    Returns ``{"to_release": [{"id": int, "mac": str, "bytes_in": int, "bytes_out": int}, ...],
+              "to_update": [{"id": int, "bytes_in": int, "bytes_out": int, "ip": str}, ...]}``.
+
+    No DB writes happen here; the async caller applies the changes.
+    """
+    from app.services.access_credentials import queue_name_for_credential
+
+    out = {"to_release": [], "to_update": []}
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"],
+        router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        logger.warning(f"[REAPER] Could not connect to {router_info.get('name')}, skipping")
+        return out
+
+    try:
+        hosts_resp = api.send_command("/ip/hotspot/host/print")
+        hosts_by_mac = {}
+        if hosts_resp.get("success") and hosts_resp.get("data"):
+            for h in hosts_resp["data"]:
+                hm = h.get("mac-address", "")
+                if hm:
+                    hosts_by_mac[normalize_mac_address(hm)] = h
+
+        # Pull bindings + queues once so per-cred release is just a lookup + remove.
+        bindings_resp = api.send_command("/ip/hotspot/ip-binding/print")
+        bindings_by_mac: dict[str, str] = {}
+        if bindings_resp.get("success") and bindings_resp.get("data"):
+            for b in bindings_resp["data"]:
+                bm = b.get("mac-address", "")
+                bid = b.get(".id")
+                if bm and bid:
+                    bindings_by_mac[normalize_mac_address(bm)] = bid
+
+        queues_resp = api.send_command("/queue/simple/print")
+        queues_by_name: dict[str, str] = {}
+        if queues_resp.get("success") and queues_resp.get("data"):
+            for q in queues_resp["data"]:
+                qn = q.get("name", "")
+                qid = q.get(".id")
+                if qn and qid:
+                    queues_by_name[qn] = qid
+
+        for cred in creds:
+            mac = cred.get("bound_mac_address")
+            if not mac:
+                continue
+            wanted = normalize_mac_address(mac)
+            host = hosts_by_mac.get(wanted)
+            should_release = False
+            if not host:
+                should_release = True
+            else:
+                idle_str = host.get("idle-time", "")
+                idle_seconds = _parse_mikrotik_duration(idle_str)
+                if idle_seconds >= idle_threshold_seconds:
+                    should_release = True
+
+            if should_release:
+                binding_id = bindings_by_mac.get(wanted)
+                if binding_id:
+                    api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
+                queue_id = queues_by_name.get(queue_name_for_credential(cred["id"]))
+                if queue_id:
+                    api.send_command("/queue/simple/remove", {"numbers": queue_id})
+                out["to_release"].append({
+                    "id": cred["id"],
+                    "mac": mac,
+                    "bytes_in": int(host.get("bytes-in", 0) or 0) if host else 0,
+                    "bytes_out": int(host.get("bytes-out", 0) or 0) if host else 0,
+                    "ip": (host.get("address") or host.get("to-address")) if host else None,
+                })
+            else:
+                out["to_update"].append({
+                    "id": cred["id"],
+                    "bytes_in": int(host.get("bytes-in", 0) or 0),
+                    "bytes_out": int(host.get("bytes-out", 0) or 0),
+                    "ip": host.get("address") or host.get("to-address"),
+                })
+        return out
+    finally:
+        api.disconnect()
+
+
+def _parse_mikrotik_duration(s: str) -> int:
+    """Parse MikroTik durations like '1h22m13s', '45s', '2d3h' into total seconds."""
+    if not s:
+        return 0
+    import re
+    total = 0
+    for value, unit in re.findall(r"(\d+)([wdhms])", s):
+        v = int(value)
+        if unit == "w":
+            total += v * 7 * 86400
+        elif unit == "d":
+            total += v * 86400
+        elif unit == "h":
+            total += v * 3600
+        elif unit == "m":
+            total += v * 60
+        elif unit == "s":
+            total += v
+    return total
+
+
+async def _reap_idle_access_credentials(db: AsyncSession) -> int:
+    """Free credentials whose bound MAC is gone or idle, and refresh usage stats."""
+    from app.db.models import AccessCredential, AccessCredStatus, Router as RouterModel
+    from app.config import settings as _settings
+
+    threshold_minutes = max(1, int(getattr(_settings, "ACCESS_CRED_IDLE_RELEASE_MINUTES", 15)))
+    threshold_seconds = threshold_minutes * 60
+
+    stmt = (
+        select(AccessCredential)
+        .options(selectinload(AccessCredential.router))
+        .where(
+            AccessCredential.bound_mac_address.isnot(None),
+            AccessCredential.status == AccessCredStatus.ACTIVE,
+        )
+    )
+    result = await db.execute(stmt)
+    creds = list(result.scalars().all())
+    if not creds:
+        return 0
+
+    by_router: dict[int, dict] = {}
+    for c in creds:
+        if not c.router:
+            continue
+        # RADIUS routers manage sessions externally; we just trust DB state.
+        am = getattr(c.router, "auth_method", None)
+        if am is not None and getattr(am, "value", None) == "RADIUS":
+            continue
+        rid = c.router.id
+        if rid not in by_router:
+            by_router[rid] = {
+                "router_info": {
+                    "ip": c.router.ip_address,
+                    "username": c.router.username,
+                    "password": c.router.password,
+                    "port": c.router.port,
+                    "name": c.router.name,
+                },
+                "creds": [],
+            }
+        by_router[rid]["creds"].append({
+            "id": c.id,
+            "bound_mac_address": c.bound_mac_address,
+        })
+
+    if not by_router:
+        return 0
+
+    async def _scan(rid: int, bundle: dict):
+        async with router_locks.acquire(f"{bundle['router_info']['ip']}:{bundle['router_info']['port']}"):
+            return rid, await asyncio.to_thread(
+                _scan_router_idle_credentials_sync,
+                bundle["router_info"],
+                bundle["creds"],
+                threshold_seconds,
+            )
+
+    outcomes = await asyncio.gather(
+        *[_scan(rid, bundle) for rid, bundle in by_router.items()],
+        return_exceptions=True,
+    )
+
+    cred_by_id = {c.id: c for c in creds}
+    released_count = 0
+    now = datetime.utcnow()
+
+    for outcome in outcomes:
+        if isinstance(outcome, Exception):
+            logger.error(f"[REAPER] Router scan failed: {outcome}")
+            continue
+        _rid, scan = outcome
+        for entry in scan.get("to_release", []):
+            cred = cred_by_id.get(entry["id"])
+            if not cred:
+                continue
+            if entry.get("bytes_in"):
+                cred.total_bytes_in = (cred.total_bytes_in or 0) + entry["bytes_in"]
+            if entry.get("bytes_out"):
+                cred.total_bytes_out = (cred.total_bytes_out or 0) + entry["bytes_out"]
+            if entry.get("ip"):
+                cred.last_seen_ip = entry["ip"]
+            cred.last_seen_at = now
+            cred.bound_mac_address = None
+            cred.bound_at = None
+            released_count += 1
+
+        for entry in scan.get("to_update", []):
+            cred = cred_by_id.get(entry["id"])
+            if not cred:
+                continue
+            cred.last_seen_at = now
+            if entry.get("ip"):
+                cred.last_seen_ip = entry["ip"]
+            # Note: we don't accumulate bytes here because MikroTik counters
+            # are session-cumulative; we only record final totals on release.
+
+    await db.commit()
+    return released_count
 
 
 # =============================================================================
@@ -1626,20 +1865,41 @@ async def collect_bandwidth_snapshot():
                                 upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 and bytes_parts[0].isdigit() else 0
                                 download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 and bytes_parts[1].isdigit() else 0
                                 pppoe_key = f"pppoe:{pppoe_user}"
+
                                 cust_result = await db.execute(
-                                    select(Customer).where(
+                                    select(Customer)
+                                    .options(selectinload(Customer.plan))
+                                    .where(
                                         Customer.pppoe_username == pppoe_user,
                                         Customer.router_id == router_id,
                                     )
                                 )
                                 customer = cust_result.scalars().first()
+
                                 existing = await db.execute(
                                     select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == pppoe_key)
                                 )
                                 usage = existing.scalar_one_or_none()
+
+                                # --- Reset-safe delta computation ---
                                 if usage:
+                                    prev_up = usage.last_upload_bytes or 0
+                                    prev_dn = usage.last_download_bytes or 0
+                                    if upload_bytes < prev_up or download_bytes < prev_dn:
+                                        # Counter / queue reset detected. Treat current sample as delta.
+                                        delta_up = upload_bytes
+                                        delta_dn = download_bytes
+                                        logger.info(
+                                            f"[FUP] PPPoE counter reset for {pppoe_user} "
+                                            f"(prev={prev_up}/{prev_dn}, now={upload_bytes}/{download_bytes})"
+                                        )
+                                    else:
+                                        delta_up = upload_bytes - prev_up
+                                        delta_dn = download_bytes - prev_dn
                                     usage.upload_bytes = upload_bytes
                                     usage.download_bytes = download_bytes
+                                    usage.last_upload_bytes = upload_bytes
+                                    usage.last_download_bytes = download_bytes
                                     usage.max_limit = q.get("max-limit", "")
                                     usage.queue_name = qname
                                     usage.target_ip = q.get("target", "")
@@ -1647,6 +1907,9 @@ async def collect_bandwidth_snapshot():
                                     if customer:
                                         usage.customer_id = customer.id
                                 else:
+                                    # First time we see this user: record the baseline; no delta yet.
+                                    delta_up = 0
+                                    delta_dn = 0
                                     usage = UserBandwidthUsage(
                                         mac_address=pppoe_key,
                                         customer_id=customer.id if customer else None,
@@ -1654,10 +1917,37 @@ async def collect_bandwidth_snapshot():
                                         target_ip=q.get("target", ""),
                                         upload_bytes=upload_bytes,
                                         download_bytes=download_bytes,
+                                        last_upload_bytes=upload_bytes,
+                                        last_download_bytes=download_bytes,
                                         max_limit=q.get("max-limit", ""),
                                         last_updated=now,
                                     )
                                     db.add(usage)
+
+                                # --- Roll deltas into the open period (PPPoE only) ---
+                                if customer and customer.plan and customer.plan.connection_type == ConnectionType.PPPOE:
+                                    try:
+                                        period = await record_usage(
+                                            db,
+                                            customer,
+                                            delta_up,
+                                            delta_dn,
+                                            plan=customer.plan,
+                                            now=now,
+                                        )
+                                        # Lazy FUP enforcement (skipped if module/cap not present)
+                                        try:
+                                            from app.services.fup import evaluate_and_enforce
+                                        except ImportError:
+                                            evaluate_and_enforce = None
+                                        if evaluate_and_enforce is not None:
+                                            await evaluate_and_enforce(
+                                                db, customer, period, plan=customer.plan, now=now
+                                            )
+                                    except Exception as fup_err:
+                                        logger.error(
+                                            f"[FUP] Failed to record/enforce usage for {pppoe_user}: {fup_err}"
+                                        )
 
                     logger.debug(f"Collected bandwidth snapshot for router {router.name} (ID: {router_id})")
                 except Exception as router_error:

@@ -91,6 +91,11 @@ class PlanType(str, enum.Enum):
     EMERGENCY = "emergency"
     SPECIAL_OFFER = "special_offer"
 
+class FupAction(str, enum.Enum):
+    THROTTLE = "throttle"
+    BLOCK = "block"
+    NOTIFY_ONLY = "notify_only"
+
 class SubscriptionStatus(str, enum.Enum):
     ACTIVE = "active"
     INACTIVE = "inactive"
@@ -197,6 +202,12 @@ class Plan(Base):
     original_price = Column(Integer, nullable=True)
     valid_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    data_cap_mb = Column(BigInteger, nullable=True)
+    fup_action = Column(
+        Enum(FupAction, name="fupaction", values_callable=lambda e: [x.value for x in e]),
+        nullable=True,
+    )
+    fup_throttle_profile = Column(String(100), nullable=True)
 
 class Payment(Base):
     __tablename__ = "payments"
@@ -464,7 +475,13 @@ class BandwidthSnapshot(Base):
 
 
 class UserBandwidthUsage(Base):
-    """Track cumulative bandwidth usage per user for top downloaders"""
+    """Track cumulative bandwidth usage per user for top downloaders.
+
+    ``upload_bytes`` / ``download_bytes`` keep the latest cumulative router
+    counter (legacy semantics, used by existing UIs).  ``last_upload_bytes`` /
+    ``last_download_bytes`` record the *previous* sample so the snapshot job
+    can compute reset-safe deltas and add them into ``CustomerUsagePeriod``.
+    """
     __tablename__ = "user_bandwidth_usage"
     id = Column(Integer, primary_key=True, autoincrement=True)
     mac_address = Column(String(50), index=True)
@@ -473,8 +490,47 @@ class UserBandwidthUsage(Base):
     target_ip = Column(String(50))
     upload_bytes = Column(BigInteger, default=0)
     download_bytes = Column(BigInteger, default=0)
+    last_upload_bytes = Column(BigInteger, default=0, server_default="0")
+    last_download_bytes = Column(BigInteger, default=0, server_default="0")
     max_limit = Column(String(50))
     last_updated = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class CustomerUsagePeriod(Base):
+    """Per-customer billing-period bandwidth aggregate, anchored to ``customer.expiry``.
+
+    A new row is opened on each renewal (payment that extends ``expiry``) and the
+    previous row is closed.  ``cap_mb_snapshot`` and ``fup_action_snapshot``
+    capture the plan's FUP settings *at the time the period opened* so mid-period
+    plan changes don't corrupt history.
+    """
+    __tablename__ = "customer_usage_periods"
+    __table_args__ = (
+        UniqueConstraint("customer_id", "period_start", name="uq_customer_period_start"),
+        Index("ix_customer_usage_periods_customer_open", "customer_id", "closed_at"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    period_start = Column(DateTime, nullable=False, index=True)
+    period_end = Column(DateTime, nullable=False)
+    upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    total_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    cap_mb_snapshot = Column(BigInteger, nullable=True)
+    fup_action_snapshot = Column(
+        Enum(FupAction, name="fupaction", values_callable=lambda e: [x.value for x in e]),
+        nullable=True,
+    )
+    fup_triggered_at = Column(DateTime, nullable=True)
+    fup_action_taken = Column(
+        Enum(FupAction, name="fupaction", values_callable=lambda e: [x.value for x in e]),
+        nullable=True,
+    )
+    fup_reverted_at = Column(DateTime, nullable=True)
+    closed_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    customer = relationship("Customer", backref="usage_periods")
 
 
 # ========================================
@@ -1040,3 +1096,60 @@ class LeadFollowUp(Base):
 
     lead = relationship("Lead", back_populates="follow_ups")
     creator = relationship("User")
+
+
+# ========================================
+# ACCESS CREDENTIALS (reseller-managed comp accounts)
+# ========================================
+
+class AccessCredStatus(str, enum.Enum):
+    ACTIVE = "active"
+    REVOKED = "revoked"
+
+
+class AccessCredential(Base):
+    """Persistent username/password credential a reseller hands to someone for free
+    hotspot access. Not tied to a Plan, no expiry, single concurrent device enforced
+    via ``bound_mac_address`` plus MikroTik ``shared-users=1`` / RADIUS ``Simultaneous-Use``.
+    """
+    __tablename__ = "access_credentials"
+    __table_args__ = (
+        UniqueConstraint("router_id", "username", name="uq_access_cred_router_username"),
+        Index("idx_access_cred_user", "user_id"),
+        Index("idx_access_cred_router", "router_id"),
+        Index("idx_access_cred_bound_mac", "bound_mac_address"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=False)
+
+    username = Column(String(64), nullable=False)
+    password = Column(String(128), nullable=False)
+
+    rate_limit = Column(String(50), nullable=True)  # e.g. "5M/2M"; null = no throttle
+    data_cap_mb = Column(BigInteger, nullable=True)  # null = unlimited
+    label = Column(String(255), nullable=True)
+
+    status = Column(
+        Enum(AccessCredStatus, name="accesscredstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=AccessCredStatus.ACTIVE,
+        server_default="active",
+    )
+
+    bound_mac_address = Column(String(50), nullable=True)
+    bound_at = Column(DateTime, nullable=True)
+    last_login_at = Column(DateTime, nullable=True)
+    last_seen_at = Column(DateTime, nullable=True)
+    last_seen_ip = Column(String(45), nullable=True)
+    total_bytes_in = Column(BigInteger, nullable=False, default=0, server_default="0")
+    total_bytes_out = Column(BigInteger, nullable=False, default=0, server_default="0")
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    revoked_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", backref="access_credentials")
+    router = relationship("Router")

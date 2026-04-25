@@ -52,6 +52,8 @@ from app.api.subscription_routes import router as subscription_router
 from app.api.device_pairing import router as device_pairing_router
 from app.api.admin_metrics_routes import router as admin_metrics_router
 from app.api.lead_routes import router as lead_router
+from app.api.usage_routes import router as usage_router
+from app.api.access_credential_routes import router as access_credential_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -82,6 +84,8 @@ app.include_router(subscription_router)
 app.include_router(device_pairing_router)
 app.include_router(admin_metrics_router)
 app.include_router(lead_router)
+app.include_router(usage_router)
+app.include_router(access_credential_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -1059,6 +1063,38 @@ async def run_growth_targets_migration():
 
 
 # ============================================================================
+# Access Credentials Migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_access_credential_migrations():
+    """Create access_credentials table for reseller-managed comp hotspot logins."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE accesscredstatus AS ENUM ('active', 'revoked'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+        ))
+
+        from app.db.models import AccessCredential
+        await conn.run_sync(
+            lambda c: AccessCredential.__table__.create(c, checkfirst=True)
+        )
+
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_access_cred_user "
+            "ON access_credentials(user_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_access_cred_router "
+            "ON access_credentials(router_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_access_cred_bound_mac "
+            "ON access_credentials(bound_mac_address)"
+        ))
+        logger.info("Migration: Ensured access_credentials table and indexes exist")
+
+
+# ============================================================================
 # Lead Pipeline Migrations (runs on startup, idempotent)
 # ============================================================================
 async def run_lead_pipeline_migrations():
@@ -1184,6 +1220,12 @@ async def startup_event():
         logger.info("Lead pipeline migrations completed successfully")
     except Exception as e:
         logger.error(f"Lead pipeline migration failed (non-fatal): {e}")
+
+    try:
+        await run_access_credential_migrations()
+        logger.info("Access credential migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Access credential migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

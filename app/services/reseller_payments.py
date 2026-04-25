@@ -79,15 +79,27 @@ async def record_customer_payment(
         customer.expiry = now + time_delta
     
     customer.status = CustomerStatus.ACTIVE
-    
+
+    # Renewal hook: roll usage period and lift any FUP throttle/block.
+    try:
+        from app.services.usage_tracking import on_renewal
+
+        await on_renewal(db, customer, plan=customer.plan, now=now)
+    except Exception as renew_err:
+        import logging
+
+        logging.getLogger(__name__).error(
+            f"[USAGE] on_renewal failed in reseller payment for customer {customer.id}: {renew_err}"
+        )
+
     # NOTE: Removed duplicate Payment record creation
     # CustomerPayment is the primary payment record - no need for both
-    
+
     await update_reseller_financials(db, reseller_id)
-    
+
     await db.commit()
     await db.refresh(payment)
-    
+
     return payment
 
 async def update_reseller_financials(db: AsyncSession, reseller_id: int):
