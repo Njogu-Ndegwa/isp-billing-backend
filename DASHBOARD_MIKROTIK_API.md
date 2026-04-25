@@ -9,6 +9,7 @@ Returns a snapshot of a single router's health (CPU, memory, disk, uptime), live
 
 ---
 
+
 ## Request
 
 ```http
