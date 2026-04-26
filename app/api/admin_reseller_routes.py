@@ -19,6 +19,8 @@ from app.db.models import (
     B2BTransaction, B2BTransactionStatus,
     ZenoPayTransaction, DevicePairing, ReconnectionAttempt,
     ProvisioningAttempt,
+    Lead, LeadActivity, LeadFollowUp, LeadSource,
+    MtnMomoTransaction, AccessCredential,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
@@ -1438,6 +1440,36 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         select(func.count(ResellerPaymentMethod.id)).where(ResellerPaymentMethod.user_id == reseller_id)
     )).scalar() or 0
 
+    mtn_momo_transactions = (await db.execute(
+        select(func.count(MtnMomoTransaction.id)).where(MtnMomoTransaction.reseller_id == reseller_id)
+    )).scalar() or 0
+
+    # CRM / lead pipeline owned by this reseller
+    leads_owned = (await db.execute(
+        select(func.count(Lead.id)).where(Lead.user_id == reseller_id)
+    )).scalar() or 0
+    lead_sources = (await db.execute(
+        select(func.count(LeadSource.id)).where(LeadSource.user_id == reseller_id)
+    )).scalar() or 0
+    # Leads on OTHER resellers' pipelines that converted to *this* user — we
+    # null out the back-pointer rather than delete them so the historical
+    # conversion record on the other reseller's funnel is preserved.
+    leads_converted_ref = (await db.execute(
+        select(func.count(Lead.id)).where(Lead.converted_user_id == reseller_id)
+    )).scalar() or 0
+    # Cross-reseller activities/follow-ups created by this reseller on other
+    # resellers' leads (will be deleted to clear the FK).
+    cross_lead_activities = (await db.execute(
+        select(func.count(LeadActivity.id)).where(LeadActivity.created_by == reseller_id)
+    )).scalar() or 0
+    cross_lead_followups = (await db.execute(
+        select(func.count(LeadFollowUp.id)).where(LeadFollowUp.created_by == reseller_id)
+    )).scalar() or 0
+
+    access_credentials = (await db.execute(
+        select(func.count(AccessCredential.id)).where(AccessCredential.user_id == reseller_id)
+    )).scalar() or 0
+
     # WG peers to remove
     wg_tokens = (await db.execute(
         select(func.count(ProvisioningToken.id)).where(
@@ -1455,6 +1487,7 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         "payments": payments,
         "mpesa_transactions": mpesa_transactions,
         "zenopay_transactions": zenopay_transactions,
+        "mtn_momo_transactions": mtn_momo_transactions,
         "provisioning_tokens": provisioning_tokens,
         "provisioning_logs": provisioning_logs_c + provisioning_logs_r,
         "provisioning_attempts": provisioning_attempts,
@@ -1469,6 +1502,12 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         "reseller_payouts": payouts,
         "reseller_transaction_charges": transaction_charges,
         "b2b_transactions": b2b_transactions,
+        "leads_owned": leads_owned,
+        "lead_sources": lead_sources,
+        "leads_converted_ref_nulled": leads_converted_ref,
+        "cross_lead_activities": cross_lead_activities,
+        "cross_lead_followups": cross_lead_followups,
+        "access_credentials": access_credentials,
         "wireguard_peers": wg_tokens,
     }
 
@@ -1648,6 +1687,31 @@ async def delete_reseller(
 
     # 22. Reseller payment methods
     await db.execute(delete(ResellerPaymentMethod).where(ResellerPaymentMethod.user_id == reseller_id))
+
+    # 22b. MTN MoMo transactions (references reseller_id and customer_id)
+    await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.reseller_id == reseller_id))
+    await db.execute(
+        delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id.in_(customer_ids))
+    )
+
+    # 22c. Access credentials owned by this reseller (router FK already cleaned up above)
+    await db.execute(delete(AccessCredential).where(AccessCredential.user_id == reseller_id))
+
+    # 22d. CRM / Lead pipeline cleanup
+    #   - Drop activities/follow-ups this reseller created on OTHER resellers'
+    #     leads (created_by is NOT NULL so we can't null them out).
+    #   - Delete this reseller's own leads (lead_activities/lead_follow_ups
+    #     cascade via ondelete="CASCADE" on lead_id).
+    #   - Null out leads.converted_user_id pointing to this user so we don't
+    #     trip the leads_converted_user_id_fkey constraint.
+    #   - Delete this reseller's lead sources.
+    await db.execute(delete(LeadActivity).where(LeadActivity.created_by == reseller_id))
+    await db.execute(delete(LeadFollowUp).where(LeadFollowUp.created_by == reseller_id))
+    await db.execute(delete(Lead).where(Lead.user_id == reseller_id))
+    await db.execute(
+        update(Lead).where(Lead.converted_user_id == reseller_id).values(converted_user_id=None)
+    )
+    await db.execute(delete(LeadSource).where(LeadSource.user_id == reseller_id))
 
     # 23. Null out created_by references from other users
     await db.execute(update(User).where(User.created_by == reseller_id).values(created_by=None))
