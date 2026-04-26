@@ -238,47 +238,63 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
     Mirrors the voucher / payment flow's bypass logic but does not write a hotspot
     user record (the reseller side already provisioned it).
     """
+    logger.info(
+        "[ACCESS-CRED BIND] start router=%s mac=%s cred=%s rate=%s",
+        router_info.get("ip"),
+        payload.get("mac_address"),
+        payload.get("cred_id"),
+        payload.get("rate_limit") or "(none)",
+    )
     api = MikroTikAPI(
         router_info["ip"], router_info["username"],
         router_info["password"], router_info["port"],
         timeout=15, connect_timeout=5,
     )
     if not api.connect():
+        logger.warning(
+            "[ACCESS-CRED BIND] connect failed router=%s err=%s",
+            router_info.get("ip"), api.last_connect_error,
+        )
         return {
             "error": "connection_failed",
             "message": api.last_connect_error or "Failed to connect to router",
         }
     try:
+        bind_started = time.monotonic()
         mac_address = normalize_mac_address(payload["mac_address"])
         username = payload["username"]
         cred_id = payload["cred_id"]
         rate_limit = payload.get("rate_limit") or None
         comment = f"{USER_COMMENT_PREFIX}|cred:{cred_id}|user:{username}"
+        old_mac_raw = payload.get("previous_mac_address")
+        wanted_old = normalize_mac_address(old_mac_raw) if (old_mac_raw and normalize_mac_address(old_mac_raw) != mac_address) else None
 
-        # 1. Remove any prior bindings/queues for this credential (different MAC)
-        old_mac = payload.get("previous_mac_address")
-        if old_mac and normalize_mac_address(old_mac) != mac_address:
-            wanted_old = normalize_mac_address(old_mac)
-            bindings = api.send_command("/ip/hotspot/ip-binding/print")
-            if bindings.get("success") and bindings.get("data"):
-                for b in bindings["data"]:
-                    bm = b.get("mac-address", "")
-                    if bm and normalize_mac_address(bm) == wanted_old:
-                        bid = b.get(".id")
-                        if bid:
-                            time.sleep(CMD_DELAY)
-                            api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": bid})
-
-        # 2. Add or update IP binding
-        bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        # 1. Single /ip/hotspot/ip-binding/print covers BOTH:
+        #      - old-MAC removal (if the credential moved devices)
+        #      - existing-binding lookup for the current MAC
+        #    The previous code did this as two separate /print calls back to
+        #    back -- on busy routers each /print walks the binding table, so
+        #    the round-trip cost shows up directly in user-perceived login
+        #    latency. One scan is enough.
+        bindings_resp = api.send_command("/ip/hotspot/ip-binding/print")
         existing_id = None
-        if bindings.get("success") and bindings.get("data"):
-            for b in bindings["data"]:
-                bm = b.get("mac-address", "")
-                if bm and normalize_mac_address(bm) == mac_address:
+        old_binding_id = None
+        if bindings_resp.get("success") and bindings_resp.get("data"):
+            for b in bindings_resp["data"]:
+                bm_raw = b.get("mac-address", "")
+                if not bm_raw:
+                    continue
+                bm = normalize_mac_address(bm_raw)
+                if bm == mac_address and existing_id is None:
                     existing_id = b.get(".id")
-                    break
+                elif wanted_old and bm == wanted_old and old_binding_id is None:
+                    old_binding_id = b.get(".id")
 
+        if old_binding_id:
+            time.sleep(CMD_DELAY)
+            api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": old_binding_id})
+
+        # 2. Add or update the bypass IP-binding for the current MAC
         if existing_id:
             time.sleep(CMD_DELAY)
             br = api.send_command("/ip/hotspot/ip-binding/set", {
@@ -294,59 +310,54 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                 "comment": comment,
             })
         if br.get("error"):
+            logger.warning(
+                "[ACCESS-CRED BIND] binding write FAILED router=%s mac=%s err=%s",
+                router_info.get("ip"), mac_address, br.get("error"),
+            )
             return {"error": "binding_failed", "message": br["error"]}
 
-        # 3. Per-credential simple queue (created if a rate-limit is set; resolved
-        # to the client's IP once the host shows up). If no rate, skip.
+        # 3. Read live IP from hosts table once (used for queue target AND
+        #    surfaced back to the route). One /print, not two.
         client_ip = None
-        if rate_limit:
-            hosts = api.send_command("/ip/hotspot/host/print")
-            if hosts.get("success") and hosts.get("data"):
-                for h in hosts["data"]:
-                    hm = h.get("mac-address", "")
-                    if hm and normalize_mac_address(hm) == mac_address:
-                        client_ip = h.get("address") or h.get("to-address")
-                        if client_ip:
-                            break
+        hosts_resp = api.send_command("/ip/hotspot/host/print")
+        if hosts_resp.get("success") and hosts_resp.get("data"):
+            for h in hosts_resp["data"]:
+                hm = h.get("mac-address", "")
+                if hm and normalize_mac_address(hm) == mac_address:
+                    client_ip = h.get("address") or h.get("to-address")
+                    if client_ip:
+                        break
 
+        # 4. Per-credential simple queue (only if a rate-limit is set AND we
+        #    found a client IP; without an IP there's nothing to attach the
+        #    queue to, and MikroTik would reject the call).
+        if rate_limit and client_ip:
             queue_name = queue_name_for_credential(cred_id)
-            queues = api.send_command("/queue/simple/print")
+            queues_resp = api.send_command("/queue/simple/print")
             existing_qid = None
-            if queues.get("success") and queues.get("data"):
-                for q in queues["data"]:
+            if queues_resp.get("success") and queues_resp.get("data"):
+                for q in queues_resp["data"]:
                     if q.get("name", "") == queue_name:
                         existing_qid = q.get(".id")
                         break
 
-            if client_ip:
-                target = f"{client_ip}/32"
-                if existing_qid:
-                    time.sleep(CMD_DELAY)
-                    api.send_command("/queue/simple/set", {
-                        "numbers": existing_qid,
-                        "target": target,
-                        "max-limit": rate_limit,
-                        "comment": comment,
-                    })
-                else:
-                    time.sleep(CMD_DELAY)
-                    api.send_command("/queue/simple/add", {
-                        "name": queue_name,
-                        "target": target,
-                        "max-limit": rate_limit,
-                        "comment": comment,
-                    })
-
-        # 4. Read live IP from hosts table for the response (best-effort).
-        if not client_ip:
-            hosts = api.send_command("/ip/hotspot/host/print")
-            if hosts.get("success") and hosts.get("data"):
-                for h in hosts["data"]:
-                    hm = h.get("mac-address", "")
-                    if hm and normalize_mac_address(hm) == mac_address:
-                        client_ip = h.get("address") or h.get("to-address")
-                        if client_ip:
-                            break
+            target = f"{client_ip}/32"
+            if existing_qid:
+                time.sleep(CMD_DELAY)
+                api.send_command("/queue/simple/set", {
+                    "numbers": existing_qid,
+                    "target": target,
+                    "max-limit": rate_limit,
+                    "comment": comment,
+                })
+            else:
+                time.sleep(CMD_DELAY)
+                api.send_command("/queue/simple/add", {
+                    "name": queue_name,
+                    "target": target,
+                    "max-limit": rate_limit,
+                    "comment": comment,
+                })
 
         # NOTE: the "kick" step (removing /ip/hotspot/active + /ip/hotspot/host
         # entries to force MikroTik to re-evaluate against the bypass binding)
@@ -357,6 +368,11 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         # now exposed as a separate helper (`kick_mac_async`) and is scheduled
         # by the access-login route as a FastAPI BackgroundTask, so it runs
         # *after* the response has been delivered.
+        elapsed_ms = int((time.monotonic() - bind_started) * 1000)
+        logger.info(
+            "[ACCESS-CRED BIND] ok router=%s mac=%s client_ip=%s elapsed_ms=%d",
+            router_info.get("ip"), mac_address, client_ip, elapsed_ms,
+        )
         return {"success": True, "client_ip": client_ip}
     finally:
         api.disconnect()
@@ -372,12 +388,20 @@ def _kick_mac_direct_api_sync(router_info: dict, mac_address: str) -> dict:
     drops the conntrack entry carrying the response and the phone sees a
     spurious network error.
     """
+    logger.info(
+        "[ACCESS-CRED KICK] start router=%s mac=%s",
+        router_info.get("ip"), mac_address,
+    )
     api = MikroTikAPI(
         router_info["ip"], router_info["username"],
         router_info["password"], router_info["port"],
         timeout=15, connect_timeout=5,
     )
     if not api.connect():
+        logger.warning(
+            "[ACCESS-CRED KICK] connect failed router=%s err=%s",
+            router_info.get("ip"), api.last_connect_error,
+        )
         return {
             "error": "connection_failed",
             "message": api.last_connect_error or "Failed to connect to router",
@@ -398,7 +422,7 @@ def _kick_mac_direct_api_sync(router_info: dict, mac_address: str) -> dict:
                             api.send_command("/ip/hotspot/active/remove", {"numbers": sid})
                             kicked["sessions_removed"] += 1
         except Exception as e:
-            logger.debug(f"Active-session kick failed for {wanted}: {e}")
+            logger.warning("[ACCESS-CRED KICK] active-session removal failed mac=%s err=%s", wanted, e)
 
         try:
             hosts = api.send_command("/ip/hotspot/host/print")
@@ -412,8 +436,13 @@ def _kick_mac_direct_api_sync(router_info: dict, mac_address: str) -> dict:
                             api.send_command("/ip/hotspot/host/remove", {"numbers": hid})
                             kicked["hosts_removed"] += 1
         except Exception as e:
-            logger.debug(f"Hotspot-host kick failed for {wanted}: {e}")
+            logger.warning("[ACCESS-CRED KICK] host-table removal failed mac=%s err=%s", wanted, e)
 
+        logger.info(
+            "[ACCESS-CRED KICK] done router=%s mac=%s hosts_removed=%s sessions_removed=%s",
+            router_info.get("ip"), wanted,
+            kicked["hosts_removed"], kicked["sessions_removed"],
+        )
         return {"success": True, "kicked": kicked}
     finally:
         api.disconnect()
@@ -634,16 +663,35 @@ async def bind_mac_for_login(
     return await asyncio.to_thread(_bind_mac_direct_api_sync, _router_info(router), payload)
 
 
+# Delay (seconds) between the access-login response being sent to the phone
+# and the kick that forces MikroTik to re-evaluate the bypass binding.
+#
+# The bypass binding is already written by the time the route returns 200, so
+# the phone's *new* connections after login are bypassed immediately. The kick
+# only exists to clean up the stale "unauthorized" host/active rows that
+# MikroTik kept around from before the binding existed. Removing those rows
+# tears down conntrack for any TCP session currently using them -- which, if
+# done too soon, is exactly the session the phone just opened to load
+# google.com / its target URL after seeing the success message. Waiting ~5s
+# gives the phone time to establish steady-state browsing through the bypass
+# binding *before* we touch the host table; afterwards the brief disruption is
+# invisible because MikroTik immediately re-creates the host row as bypassed
+# on the next packet.
+KICK_DELAY_SECONDS = 5.0
+
+
 async def kick_mac_async(router_info: dict, mac_address: str, *, is_radius: bool = False) -> None:
     """Background-task helper.
 
     Schedule this with FastAPI's ``BackgroundTasks`` from the access-login
     route. It removes the device's stale ``/ip/hotspot/host`` + ``/ip/hotspot/
     active`` entries so MikroTik re-evaluates against the bypass binding
-    that the request just installed. Running it inside the access-login
-    request itself drops the conntrack entry carrying the response and the
-    phone sees a spurious network error -- so it MUST run after the
-    response is sent.
+    that the request just installed.
+
+    The task is intentionally delayed by ``KICK_DELAY_SECONDS`` so that the
+    phone has time to establish a real browsing session through the new
+    bypass binding *before* the kick disturbs MikroTik's connection-tracking
+    state. See the comment on ``KICK_DELAY_SECONDS`` for why.
 
     Takes a plain dict (built via ``router_info_for_kick``) rather than an
     ORM ``Router`` because the request-scoped DB session is already closed
@@ -651,18 +699,19 @@ async def kick_mac_async(router_info: dict, mac_address: str, *, is_radius: bool
 
     Failures are swallowed: by the time we get here the user already has
     their 200 OK and the bypass binding is in place, so they'll come online
-    on the next packet anyway (just with a few seconds extra delay).
+    on the next packet anyway.
     """
     if is_radius:
         return
     try:
+        await asyncio.sleep(KICK_DELAY_SECONDS)
         await asyncio.to_thread(
             _kick_mac_direct_api_sync,
             router_info,
             mac_address,
         )
     except Exception as e:
-        logger.debug(f"Background kick failed for mac {mac_address}: {e}")
+        logger.warning("[ACCESS-CRED KICK] background task failed mac=%s err=%s", mac_address, e)
 
 
 def router_info_for_kick(router: Router) -> dict:
