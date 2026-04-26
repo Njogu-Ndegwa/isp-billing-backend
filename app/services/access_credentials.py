@@ -338,8 +338,6 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                     })
 
         # 4. Read live IP from hosts table for the response (best-effort).
-        #    This must run BEFORE the kick step because removing the host entry
-        #    drops the IP we want to surface back to the caller.
         if not client_ip:
             hosts = api.send_command("/ip/hotspot/host/print")
             if hosts.get("success") and hosts.get("data"):
@@ -350,45 +348,73 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                         if client_ip:
                             break
 
-        # 5. Kick the device out of the hotspot's active session and host table
-        #    so the bypass binding takes effect immediately. Without this,
-        #    MikroTik keeps the client pinned to its previous "unauthorized"
-        #    state and keeps redirecting to the captive portal until the device
-        #    reconnects to WiFi or its host entry ages out (~5 min). Mirrors the
-        #    M-Pesa add_customer_bypass_mode flow. Only invoked on the actual
-        #    login path (kick=True) to avoid briefly disconnecting already-
-        #    online devices when the reseller just changes a rate limit.
+        # NOTE: the "kick" step (removing /ip/hotspot/active + /ip/hotspot/host
+        # entries to force MikroTik to re-evaluate against the bypass binding)
+        # used to live here, but it MUST NOT run during the access-login HTTP
+        # request: removing the host row drops the conntrack entry that's
+        # anchoring the response packet back to the phone, and the phone then
+        # sees a "network error" even though the API returned 200. The kick is
+        # now exposed as a separate helper (`kick_mac_async`) and is scheduled
+        # by the access-login route as a FastAPI BackgroundTask, so it runs
+        # *after* the response has been delivered.
+        return {"success": True, "client_ip": client_ip}
+    finally:
+        api.disconnect()
+
+
+def _kick_mac_direct_api_sync(router_info: dict, mac_address: str) -> dict:
+    """Remove the device's stale ``/ip/hotspot/active`` + ``/ip/hotspot/host``
+    rows so MikroTik re-evaluates the MAC against the freshly-installed
+    bypass IP-binding.
+
+    Run this AFTER the access-login HTTP response has been sent to the phone
+    (via FastAPI ``BackgroundTasks``). Doing it during the request itself
+    drops the conntrack entry carrying the response and the phone sees a
+    spurious network error.
+    """
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"],
+        router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {
+            "error": "connection_failed",
+            "message": api.last_connect_error or "Failed to connect to router",
+        }
+    try:
+        wanted = normalize_mac_address(mac_address)
         kicked = {"hosts_removed": 0, "sessions_removed": 0}
-        if payload.get("kick"):
-            try:
-                active = api.send_command("/ip/hotspot/active/print")
-                if active.get("success") and active.get("data"):
-                    for s in active["data"]:
-                        sm = s.get("mac-address", "")
-                        if sm and normalize_mac_address(sm) == mac_address:
-                            sid = s.get(".id")
-                            if sid:
-                                time.sleep(CMD_DELAY)
-                                api.send_command("/ip/hotspot/active/remove", {"numbers": sid})
-                                kicked["sessions_removed"] += 1
-            except Exception as e:
-                logger.debug(f"Active-session kick failed for {mac_address}: {e}")
 
-            try:
-                hosts = api.send_command("/ip/hotspot/host/print")
-                if hosts.get("success") and hosts.get("data"):
-                    for h in hosts["data"]:
-                        hm = h.get("mac-address", "")
-                        if hm and normalize_mac_address(hm) == mac_address:
-                            hid = h.get(".id")
-                            if hid:
-                                time.sleep(CMD_DELAY)
-                                api.send_command("/ip/hotspot/host/remove", {"numbers": hid})
-                                kicked["hosts_removed"] += 1
-            except Exception as e:
-                logger.debug(f"Hotspot-host kick failed for {mac_address}: {e}")
+        try:
+            active = api.send_command("/ip/hotspot/active/print")
+            if active.get("success") and active.get("data"):
+                for s in active["data"]:
+                    sm = s.get("mac-address", "")
+                    if sm and normalize_mac_address(sm) == wanted:
+                        sid = s.get(".id")
+                        if sid:
+                            time.sleep(CMD_DELAY)
+                            api.send_command("/ip/hotspot/active/remove", {"numbers": sid})
+                            kicked["sessions_removed"] += 1
+        except Exception as e:
+            logger.debug(f"Active-session kick failed for {wanted}: {e}")
 
-        return {"success": True, "client_ip": client_ip, "kicked": kicked}
+        try:
+            hosts = api.send_command("/ip/hotspot/host/print")
+            if hosts.get("success") and hosts.get("data"):
+                for h in hosts["data"]:
+                    hm = h.get("mac-address", "")
+                    if hm and normalize_mac_address(hm) == wanted:
+                        hid = h.get(".id")
+                        if hid:
+                            time.sleep(CMD_DELAY)
+                            api.send_command("/ip/hotspot/host/remove", {"numbers": hid})
+                            kicked["hosts_removed"] += 1
+        except Exception as e:
+            logger.debug(f"Hotspot-host kick failed for {wanted}: {e}")
+
+        return {"success": True, "kicked": kicked}
     finally:
         api.disconnect()
 
@@ -583,7 +609,6 @@ async def deprovision_credential(db: AsyncSession, cred: AccessCredential, route
 
 async def bind_mac_for_login(
     cred: AccessCredential, router: Router, mac_address: str,
-    *, kick: bool = False,
 ) -> dict:
     """Install the bypass binding + queue for the user's MAC.
 
@@ -592,12 +617,9 @@ async def bind_mac_for_login(
     they hit the MikroTik captive portal), so we only run the IP-binding flow
     on DIRECT_API routers.
 
-    Set ``kick=True`` on the actual login path so the device's existing
-    ``/ip/hotspot/host`` and ``/ip/hotspot/active`` entries are removed,
-    forcing MikroTik to re-evaluate against the freshly-installed bypass
-    binding (otherwise the captive portal keeps redirecting until the host
-    entry ages out). Leave it ``False`` (default) when the caller is just
-    refreshing a rate-limit / queue for an already-online device.
+    This intentionally does NOT kick the device's stale hotspot host/active
+    entries -- that step has to happen *after* the HTTP response has been
+    delivered to the phone (see ``kick_mac_async``).
     """
     if router.auth_method == RouterAuthMethod.RADIUS:
         return {"success": True, "method": "radius", "client_ip": None}
@@ -608,9 +630,46 @@ async def bind_mac_for_login(
         "mac_address": mac_address,
         "rate_limit": cred.rate_limit or "",
         "previous_mac_address": cred.bound_mac_address,
-        "kick": bool(kick),
     }
     return await asyncio.to_thread(_bind_mac_direct_api_sync, _router_info(router), payload)
+
+
+async def kick_mac_async(router_info: dict, mac_address: str, *, is_radius: bool = False) -> None:
+    """Background-task helper.
+
+    Schedule this with FastAPI's ``BackgroundTasks`` from the access-login
+    route. It removes the device's stale ``/ip/hotspot/host`` + ``/ip/hotspot/
+    active`` entries so MikroTik re-evaluates against the bypass binding
+    that the request just installed. Running it inside the access-login
+    request itself drops the conntrack entry carrying the response and the
+    phone sees a spurious network error -- so it MUST run after the
+    response is sent.
+
+    Takes a plain dict (built via ``router_info_for_kick``) rather than an
+    ORM ``Router`` because the request-scoped DB session is already closed
+    by the time a BackgroundTask runs, so the ORM object would be detached.
+
+    Failures are swallowed: by the time we get here the user already has
+    their 200 OK and the bypass binding is in place, so they'll come online
+    on the next packet anyway (just with a few seconds extra delay).
+    """
+    if is_radius:
+        return
+    try:
+        await asyncio.to_thread(
+            _kick_mac_direct_api_sync,
+            router_info,
+            mac_address,
+        )
+    except Exception as e:
+        logger.debug(f"Background kick failed for mac {mac_address}: {e}")
+
+
+def router_info_for_kick(router: Router) -> dict:
+    """Snapshot the router's connection details into a plain dict that's safe
+    to hand to a FastAPI BackgroundTask (which runs after the DB session has
+    closed)."""
+    return _router_info(router)
 
 
 async def release_mac(cred: AccessCredential, router: Router, mac_address: str) -> dict:

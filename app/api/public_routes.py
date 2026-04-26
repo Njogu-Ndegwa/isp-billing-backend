@@ -845,6 +845,7 @@ async def redeem_voucher_public(
 @router.post("/api/public/access-login")
 async def access_credential_login_public(
     payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     """Authenticate a reseller-issued access credential and grant the device internet.
@@ -865,7 +866,11 @@ async def access_credential_login_public(
     ``bound_mac_address`` is updated.
     """
     from app.db.models import AccessCredential, AccessCredStatus
-    from app.services.access_credentials import bind_mac_for_login
+    from app.services.access_credentials import (
+        bind_mac_for_login,
+        kick_mac_async,
+        router_info_for_kick,
+    )
 
     username = (payload.get("username") or "").strip().lower()
     password = (payload.get("password") or "").strip()
@@ -918,7 +923,7 @@ async def access_credential_login_public(
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
-    bind_result = await bind_mac_for_login(cred, router_obj, normalized_mac, kick=True)
+    bind_result = await bind_mac_for_login(cred, router_obj, normalized_mac)
     if bind_result.get("error"):
         logger.warning(
             f"access-login: binding failed for cred {cred.id} mac {normalized_mac}: "
@@ -936,6 +941,21 @@ async def access_credential_login_public(
     cred.last_seen_at = now
     cred.last_seen_ip = bind_result.get("client_ip")
     await db.commit()
+
+    # Force MikroTik to re-evaluate the device's hotspot state against the
+    # bypass binding we just installed. MUST run after the response is sent:
+    # the kick removes the device's /ip/hotspot/host row, which drops the
+    # conntrack entry that's NATing this very HTTP response back to the
+    # phone -- doing it inline here would deliver a "network error" instead
+    # of the 200 below. We snapshot the router into a plain dict because the
+    # DB session is closed by the time the BackgroundTask runs.
+    is_radius_router = router_obj.auth_method == RouterAuthMethod.RADIUS
+    if not is_radius_router:
+        background_tasks.add_task(
+            kick_mac_async,
+            router_info_for_kick(router_obj),
+            normalized_mac,
+        )
 
     return {
         "success": True,
