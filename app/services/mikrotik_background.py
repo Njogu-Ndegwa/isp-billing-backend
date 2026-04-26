@@ -24,6 +24,8 @@ from app.db.models import (
     UserBandwidthUsage,
     Plan,
     ConnectionType,
+    AccessCredential,
+    AccessCredStatus,
 )
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.router_availability import record_router_availability, prune_router_availability_history
@@ -535,6 +537,19 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
             elif c.expiry and c.expiry > (now - grace_period):
                 active_macs.add(normalized)
                 logger.debug(f"[SAFETY-NET] Grace period: keeping {normalized} (expiry: {c.expiry})")
+
+        # Reseller-issued access credentials live in their own table — their
+        # bound MACs MUST be in the allow-list or the safety-net will tear
+        # down the bypass binding installed by /api/public/access-login a
+        # minute after every login, kicking the user back to the portal.
+        cred_stmt = select(AccessCredential.bound_mac_address).where(
+            AccessCredential.bound_mac_address.isnot(None),
+            AccessCredential.status == AccessCredStatus.ACTIVE,
+        )
+        cred_result = await db.execute(cred_stmt)
+        for (bound_mac,) in cred_result.all():
+            if bound_mac:
+                active_macs.add(normalize_mac_address(bound_mac))
 
         async def _bypass_task(r):
             rk = f"{r.ip_address}:{r.port}"
