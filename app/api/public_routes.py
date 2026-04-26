@@ -2,7 +2,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func
 from sqlalchemy.orm import selectinload
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 
@@ -797,7 +797,7 @@ async def _fetch_active_ads(db: AsyncSession, limit: int = 20):
 
 @router.post("/api/public/voucher/redeem")
 async def redeem_voucher_public(
-    payload: Dict[str, str],
+    payload: Dict[str, Any],
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -844,7 +844,7 @@ async def redeem_voucher_public(
 
 @router.post("/api/public/access-login")
 async def access_credential_login_public(
-    payload: Dict[str, str],
+    payload: Dict[str, Any],
     db: AsyncSession = Depends(get_db),
 ):
     """Authenticate a reseller-issued access credential and grant the device internet.
