@@ -125,6 +125,10 @@ class MikroTikAPI:
         self.connect_timeout = connect_timeout
         self.sock = None
         self.connected = False
+        # Set on every connect() failure so callers can surface a useful reason
+        # instead of a generic "Failed to connect to router" message. Cleared on
+        # successful connect().
+        self.last_connect_error: Optional[str] = None
 
     def connect(self) -> bool:
         """
@@ -132,9 +136,15 @@ class MikroTikAPI:
         Uses short connect_timeout for initial connection, then switches to 
         regular timeout for operations.
         """
+        self.last_connect_error = None
+
         # Check circuit breaker first - avoid blocking on known-bad routers
         if _is_circuit_open(self.host, self.port):
             logger.warning(f"Circuit breaker OPEN - skipping connection to {self.host}:{self.port}")
+            self.last_connect_error = (
+                f"Circuit breaker open for {self.host}:{self.port} after repeated failures "
+                f"(retrying in up to {CIRCUIT_BREAKER_RESET_TIME}s)"
+            )
             return False
         
         try:
@@ -150,24 +160,44 @@ class MikroTikAPI:
                 return True
             else:
                 _record_failure(self.host, self.port)
+                # login() already set last_connect_error with a precise reason
+                if not self.last_connect_error:
+                    self.last_connect_error = (
+                        f"API login rejected by {self.host}:{self.port} "
+                        f"(check the router's API username/password)"
+                    )
                 return False
         except socket.timeout:
-            logger.error(f"Connection timed out to {self.host}:{self.port} (timeout: {self.connect_timeout}s)")
+            msg = (
+                f"Connection to {self.host}:{self.port} timed out after "
+                f"{self.connect_timeout}s (router unreachable or API service down)"
+            )
+            logger.error(msg)
+            self.last_connect_error = msg
             _record_failure(self.host, self.port)
             self._cleanup_socket()
             return False
         except ConnectionRefusedError:
-            logger.error(f"Connection refused by {self.host}:{self.port}")
+            msg = (
+                f"Connection refused by {self.host}:{self.port} "
+                f"(API service not enabled, or wrong port)"
+            )
+            logger.error(msg)
+            self.last_connect_error = msg
             _record_failure(self.host, self.port)
             self._cleanup_socket()
             return False
         except OSError as e:
-            logger.error(f"Network error connecting to {self.host}:{self.port}: {e}")
+            msg = f"Network error connecting to {self.host}:{self.port}: {e}"
+            logger.error(msg)
+            self.last_connect_error = msg
             _record_failure(self.host, self.port)
             self._cleanup_socket()
             return False
         except Exception as e:
-            logger.error(f"Connection failed to {self.host}: {e}")
+            msg = f"Connection failed to {self.host}:{self.port}: {e}"
+            logger.error(msg)
+            self.last_connect_error = msg
             _record_failure(self.host, self.port)
             self._cleanup_socket()
             return False
@@ -282,9 +312,20 @@ class MikroTikAPI:
                 return True
             else:
                 logger.error(f"Login failed to {self.host}: {response}")
+                # Surface the exact RouterOS rejection (e.g. !trap message=cannot log in).
+                trap_msg = ""
+                for word in response or []:
+                    if word.startswith("=message="):
+                        trap_msg = word[len("=message="):]
+                        break
+                self.last_connect_error = (
+                    f"API login rejected by {self.host}:{self.port}"
+                    + (f": {trap_msg}" if trap_msg else " (check the router's API username/password)")
+                )
                 return False
         except Exception as e:
             logger.error(f"Login error to {self.host}: {e}")
+            self.last_connect_error = f"API login error on {self.host}:{self.port}: {e}"
             return False
 
     def send_command(self, command: str, arguments: Dict[str, str] = None) -> Dict[str, Any]:

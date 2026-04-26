@@ -918,7 +918,7 @@ async def access_credential_login_public(
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
-    bind_result = await bind_mac_for_login(cred, router_obj, normalized_mac)
+    bind_result = await bind_mac_for_login(cred, router_obj, normalized_mac, kick=True)
     if bind_result.get("error"):
         logger.warning(
             f"access-login: binding failed for cred {cred.id} mac {normalized_mac}: "

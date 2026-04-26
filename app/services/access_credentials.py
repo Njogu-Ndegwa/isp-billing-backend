@@ -112,7 +112,10 @@ def _provision_direct_api_sync(router_info: dict, payload: dict) -> dict:
         timeout=15, connect_timeout=5,
     )
     if not api.connect():
-        return {"error": "connection_failed", "message": "Failed to connect to router"}
+        return {
+            "error": "connection_failed",
+            "message": api.last_connect_error or "Failed to connect to router",
+        }
     try:
         username = payload["username"]
         password = payload["password"]
@@ -169,7 +172,10 @@ def _deprovision_direct_api_sync(router_info: dict, payload: dict) -> dict:
         timeout=15, connect_timeout=5,
     )
     if not api.connect():
-        return {"error": "connection_failed", "message": "Failed to connect to router"}
+        return {
+            "error": "connection_failed",
+            "message": api.last_connect_error or "Failed to connect to router",
+        }
     try:
         username = payload["username"]
         bound_mac = payload.get("bound_mac_address")
@@ -238,7 +244,10 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         timeout=15, connect_timeout=5,
     )
     if not api.connect():
-        return {"error": "connection_failed", "message": "Failed to connect to router"}
+        return {
+            "error": "connection_failed",
+            "message": api.last_connect_error or "Failed to connect to router",
+        }
     try:
         mac_address = normalize_mac_address(payload["mac_address"])
         username = payload["username"]
@@ -328,7 +337,9 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                         "comment": comment,
                     })
 
-        # 4. Read live IP from hosts table for the response (best-effort)
+        # 4. Read live IP from hosts table for the response (best-effort).
+        #    This must run BEFORE the kick step because removing the host entry
+        #    drops the IP we want to surface back to the caller.
         if not client_ip:
             hosts = api.send_command("/ip/hotspot/host/print")
             if hosts.get("success") and hosts.get("data"):
@@ -339,7 +350,45 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                         if client_ip:
                             break
 
-        return {"success": True, "client_ip": client_ip}
+        # 5. Kick the device out of the hotspot's active session and host table
+        #    so the bypass binding takes effect immediately. Without this,
+        #    MikroTik keeps the client pinned to its previous "unauthorized"
+        #    state and keeps redirecting to the captive portal until the device
+        #    reconnects to WiFi or its host entry ages out (~5 min). Mirrors the
+        #    M-Pesa add_customer_bypass_mode flow. Only invoked on the actual
+        #    login path (kick=True) to avoid briefly disconnecting already-
+        #    online devices when the reseller just changes a rate limit.
+        kicked = {"hosts_removed": 0, "sessions_removed": 0}
+        if payload.get("kick"):
+            try:
+                active = api.send_command("/ip/hotspot/active/print")
+                if active.get("success") and active.get("data"):
+                    for s in active["data"]:
+                        sm = s.get("mac-address", "")
+                        if sm and normalize_mac_address(sm) == mac_address:
+                            sid = s.get(".id")
+                            if sid:
+                                time.sleep(CMD_DELAY)
+                                api.send_command("/ip/hotspot/active/remove", {"numbers": sid})
+                                kicked["sessions_removed"] += 1
+            except Exception as e:
+                logger.debug(f"Active-session kick failed for {mac_address}: {e}")
+
+            try:
+                hosts = api.send_command("/ip/hotspot/host/print")
+                if hosts.get("success") and hosts.get("data"):
+                    for h in hosts["data"]:
+                        hm = h.get("mac-address", "")
+                        if hm and normalize_mac_address(hm) == mac_address:
+                            hid = h.get(".id")
+                            if hid:
+                                time.sleep(CMD_DELAY)
+                                api.send_command("/ip/hotspot/host/remove", {"numbers": hid})
+                                kicked["hosts_removed"] += 1
+            except Exception as e:
+                logger.debug(f"Hotspot-host kick failed for {mac_address}: {e}")
+
+        return {"success": True, "client_ip": client_ip, "kicked": kicked}
     finally:
         api.disconnect()
 
@@ -354,7 +403,10 @@ def _release_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         timeout=15, connect_timeout=5,
     )
     if not api.connect():
-        return {"error": "connection_failed", "message": "Failed to connect to router"}
+        return {
+            "error": "connection_failed",
+            "message": api.last_connect_error or "Failed to connect to router",
+        }
     try:
         mac_address = normalize_mac_address(payload["mac_address"])
         cred_id = payload["cred_id"]
@@ -395,7 +447,7 @@ def _live_usage_direct_api_sync(router_info: dict, mac_address: str, queue_name:
         timeout=10, connect_timeout=5,
     )
     if not api.connect():
-        return {"error": "connection_failed"}
+        return {"error": "connection_failed", "message": api.last_connect_error}
     try:
         wanted = normalize_mac_address(mac_address)
         info: Dict[str, Any] = {"online": False}
@@ -530,7 +582,8 @@ async def deprovision_credential(db: AsyncSession, cred: AccessCredential, route
 
 
 async def bind_mac_for_login(
-    cred: AccessCredential, router: Router, mac_address: str
+    cred: AccessCredential, router: Router, mac_address: str,
+    *, kick: bool = False,
 ) -> dict:
     """Install the bypass binding + queue for the user's MAC.
 
@@ -538,6 +591,13 @@ async def bind_mac_for_login(
     For RADIUS routers the binding is implicit (RADIUS authorizes the user when
     they hit the MikroTik captive portal), so we only run the IP-binding flow
     on DIRECT_API routers.
+
+    Set ``kick=True`` on the actual login path so the device's existing
+    ``/ip/hotspot/host`` and ``/ip/hotspot/active`` entries are removed,
+    forcing MikroTik to re-evaluate against the freshly-installed bypass
+    binding (otherwise the captive portal keeps redirecting until the host
+    entry ages out). Leave it ``False`` (default) when the caller is just
+    refreshing a rate-limit / queue for an already-online device.
     """
     if router.auth_method == RouterAuthMethod.RADIUS:
         return {"success": True, "method": "radius", "client_ip": None}
@@ -548,6 +608,7 @@ async def bind_mac_for_login(
         "mac_address": mac_address,
         "rate_limit": cred.rate_limit or "",
         "previous_mac_address": cred.bound_mac_address,
+        "kick": bool(kick),
     }
     return await asyncio.to_thread(_bind_mac_direct_api_sync, _router_info(router), payload)
 

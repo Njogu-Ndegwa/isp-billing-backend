@@ -172,9 +172,13 @@ async def create_credential(
         return {
             **serialize_credential(cred, include_password=True),
             "warning": provision_result.get("message", "Router provisioning failed"),
+            "provisioned": False,
         }
 
-    return serialize_credential(cred, include_password=True)
+    return {
+        **serialize_credential(cred, include_password=True),
+        "provisioned": True,
+    }
 
 
 @router.get("")
@@ -296,15 +300,20 @@ async def update_credential(
     await db.commit()
     await db.refresh(cred)
 
+    payload_out = serialize_credential(cred)
     if rate_changed and cred.status == AccessCredStatus.ACTIVE:
         prov = await provision_credential(db, cred, router_obj)
         if prov.get("error"):
             logger.warning(f"Re-provision after rate change failed for cred {cred.id}: {prov}")
+            payload_out["warning"] = prov.get("message") or "Router provisioning failed"
+            payload_out["provisioned"] = False
+        else:
+            payload_out["provisioned"] = True
         # If a MAC is currently bound, refresh its queue too
-        if cred.bound_mac_address:
+        if cred.bound_mac_address and not prov.get("error"):
             await bind_mac_for_login(cred, router_obj, cred.bound_mac_address)
 
-    return serialize_credential(cred)
+    return payload_out
 
 
 @router.post("/{cred_id}/rotate-password")
@@ -324,12 +333,20 @@ async def rotate_password(
     await db.commit()
     await db.refresh(cred)
 
+    warning: Optional[str] = None
+    provisioned = True
     if cred.status == AccessCredStatus.ACTIVE:
         prov = await provision_credential(db, cred, router_obj)
         if prov.get("error"):
             logger.warning(f"Re-provision after password rotation failed for cred {cred.id}: {prov}")
+            warning = prov.get("message") or "Router provisioning failed"
+            provisioned = False
 
-    return serialize_credential(cred, include_password=True)
+    payload = serialize_credential(cred, include_password=True)
+    payload["provisioned"] = provisioned
+    if warning:
+        payload["warning"] = warning
+    return payload
 
 
 @router.post("/{cred_id}/revoke")
@@ -374,10 +391,69 @@ async def restore_credential(
     await db.refresh(cred)
 
     prov = await provision_credential(db, cred, router_obj)
+    payload = serialize_credential(cred)
     if prov.get("error"):
         logger.warning(f"Re-provision on restore failed for cred {cred.id}: {prov}")
+        payload["warning"] = prov.get("message") or "Router provisioning failed"
+        payload["provisioned"] = False
+    else:
+        payload["provisioned"] = True
 
-    return serialize_credential(cred)
+    return payload
+
+
+@router.post("/{cred_id}/sync")
+async def sync_credential(
+    cred_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Re-push an active credential to its router.
+
+    Use this after a create / rotate-password / restore call returned a
+    ``warning`` (i.e. ``provisioned: false``) and you have since fixed the
+    router (brought it online, fixed the API user/pass/port, etc.). Idempotent:
+    safe to call repeatedly.
+
+    Revoked credentials should use ``POST /{id}/restore`` instead, which both
+    re-activates the row and re-pushes it.
+    """
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    cred = await _own_or_admin(db, cred_id, user)
+    router_obj = await db.get(Router, cred.router_id)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    if cred.status != AccessCredStatus.ACTIVE:
+        raise HTTPException(
+            status_code=409,
+            detail="Credential is revoked; use /restore to re-activate it",
+        )
+
+    prov = await provision_credential(db, cred, router_obj)
+
+    payload = serialize_credential(cred, include_password=True)
+    if prov.get("error"):
+        logger.warning(f"Sync failed for cred {cred.id} on router {router_obj.id}: {prov}")
+        payload["warning"] = prov.get("message") or "Router provisioning failed"
+        payload["provisioned"] = False
+    else:
+        payload["provisioned"] = True
+
+    # If a MAC is currently bound, refresh its binding/queue too so the user
+    # sees the new password / rate-limit immediately without re-login.
+    if not prov.get("error") and cred.bound_mac_address:
+        bind_result = await bind_mac_for_login(cred, router_obj, cred.bound_mac_address)
+        if bind_result.get("error"):
+            logger.warning(
+                f"Sync MAC re-bind failed for cred {cred.id}: {bind_result.get('message')}"
+            )
+            # Provisioning succeeded, the MAC bypass refresh didn't — surface
+            # both so the caller can decide how to react.
+            payload.setdefault("warning", bind_result.get("message", "MAC re-bind failed"))
+
+    return payload
 
 
 @router.post("/{cred_id}/force-logout")

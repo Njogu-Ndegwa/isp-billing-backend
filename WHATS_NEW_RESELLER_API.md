@@ -92,10 +92,14 @@ Content-Type: application/json
 * Response includes `password` so you can hand it to the user (this is the
   only time the password is returned without `?reveal=true`).
 * `409 Conflict` if `(router_id, username)` already exists for the reseller.
-* On success the credential is provisioned to the router immediately. If the
-  router push fails, the credential is still created in the DB and the
-  response includes a `warning` field; the reseller can fix the router and
-  hit `POST /{id}/restore` (which re-pushes).
+* On success the credential is provisioned to the router immediately and the
+  response carries `"provisioned": true`. If the router push fails the
+  credential is still created in the DB and the response carries
+  `"provisioned": false` plus a `warning` string with the precise reason
+  ("Connection refused…", "Connection timed out…", "API login rejected…",
+  "Network error…", "Circuit breaker open…"). The credential will not let
+  anyone log in until the push succeeds — fix the router and call
+  `POST /{id}/sync` to re-push.
 
 #### List
 
@@ -184,6 +188,28 @@ POST /api/access-credentials/{id}/restore
 ```
 
 Re-activates a previously revoked credential and re-pushes it to the router.
+Same response shape as `sync` — `provisioned: true` on success, or
+`provisioned: false` plus a `warning` string if the router push failed.
+
+#### Sync (re-push to the router)
+
+```http
+POST /api/access-credentials/{id}/sync
+```
+
+Re-pushes an active credential to its router. Use this after `create`,
+`rotate-password`, or `update` returned `"provisioned": false` with a
+`warning` and you have since fixed the router (brought it online, fixed the
+API user / password / port, opened the API service, etc.). Idempotent: safe
+to call repeatedly.
+
+* `409 Conflict` if the credential is revoked — call `restore` instead.
+* Response is the credential resource (with `password`) plus `"provisioned":
+  true` on success, or `"provisioned": false` with a `warning` string on
+  failure.
+* If a MAC is already bound to the credential, the sync also refreshes the
+  per-MAC IP-binding and simple-queue so the new password / rate-limit takes
+  effect without forcing the user to re-login.
 
 #### Force-logout (free credential without revoking)
 
@@ -240,6 +266,43 @@ idle-MAC reaper without any extra polling on the frontend.
 | 404 | `"Router not found"` | Router not owned by this reseller (or admin) |
 | 404 | `"Access credential not found"` | Wrong id / not owned |
 | 409 | `"A credential with username '<u>' already exists on this router"` | Create conflict |
+| 409 | `"Credential is revoked; use /restore to re-activate it"` | `sync` called on a revoked credential |
+
+### 1.6 Provisioning failures (soft-fail)
+
+Create / rotate-password / update / restore / sync all return **200** even when
+the router push fails — the DB row is the source of truth, the router is just
+where the user-record gets enforced. The shape is:
+
+```json
+{
+  "id": 42,
+  "username": "alice",
+  "password": "s3cretpass",
+  "...": "...",
+  "provisioned": false,
+  "warning": "Connection refused by 10.0.0.7:8728 (API service not enabled, or wrong port)"
+}
+```
+
+When `"provisioned": false` the user-record does **not** exist on MikroTik
+yet, so the credential will not let anyone log in. The reseller workflow is:
+
+1. Read the `warning` to figure out what's wrong.
+2. Fix the router (bring it online, enable the API service on the right port,
+   fix the API username/password, etc.).
+3. Call `POST /api/access-credentials/{id}/sync` to re-push. Repeat until
+   `"provisioned": true`.
+
+Common warning messages and what they mean:
+
+| Warning prefix | Meaning |
+|---|---|
+| `Connection to <host>:<port> timed out…` | Router is unreachable on the network (powered off, firewall blocks the API port, wrong IP) |
+| `Connection refused by <host>:<port>…` | Host is reachable but no service is listening — typically `/ip/service` has the API disabled or it's on a different port |
+| `Network error connecting to <host>:<port>: …` | Underlying socket error, e.g. *No route to host* (the backend can't even reach that subnet, often a WireGuard / VPN issue) |
+| `API login rejected by <host>:<port>…` | TCP connection succeeded but RouterOS rejected the credentials. Fix the router's API user/password (the ones you saved on the Router record) |
+| `Circuit breaker open for <host>:<port>…` | Three connection failures in a row tripped the in-process breaker; it auto-clears after 60s, just retry `sync` later |
 
 ---
 
