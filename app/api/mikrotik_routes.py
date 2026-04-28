@@ -151,16 +151,73 @@ def _get_mikrotik_active_sessions_sync(router_info: dict) -> dict:
 # MIKROTIK HEALTH AND STATS ENDPOINTS
 # =============================================================================
 
+# Cap on inline session arrays returned from /api/mikrotik/health when the
+# caller opts in via include_sessions=true. Beyond this we set
+# ``sessions_truncated: true`` and direct callers to the dedicated drill-down
+# endpoints (which paginate per-session detail without hitting the health cache).
+_HEALTH_MAX_INLINE_SESSIONS = 50
+
+
+def _shape_health_response(
+    full: dict,
+    *,
+    include_sessions: bool,
+    cached: bool,
+    cache_age_seconds: Optional[float],
+    stale: bool = False,
+) -> dict:
+    """Project the cached, full health payload into the public response shape.
+
+    Keeping the cache entry "fat" (with the live session arrays) and slicing
+    here means a single cache entry can serve both ``include_sessions=false``
+    (default, dashboard tile) and ``include_sessions=true`` (drill-down
+    fallback) without doubling cache pressure on the router.
+    """
+    result = {k: v for k, v in full.items() if k != "_full_pppoe_sessions"}
+    full_sessions = full.get("_full_pppoe_sessions", []) or []
+
+    if include_sessions:
+        capped = full_sessions[:_HEALTH_MAX_INLINE_SESSIONS]
+        result["active_pppoe_sessions"] = capped
+        result["sessions_truncated"] = len(full_sessions) > _HEALTH_MAX_INLINE_SESSIONS
+    else:
+        # Default: no per-session payload on the tile endpoint. Frontends that
+        # need the table should call /api/mikrotik/{router_id}/pppoe/active and
+        # /api/mikrotik/active-sessions?router_id={id}.
+        result.pop("active_pppoe_sessions", None)
+        result["sessions_truncated"] = False
+
+    result["cached"] = cached
+    if cache_age_seconds is not None:
+        result["cache_age_seconds"] = round(cache_age_seconds, 1)
+    if stale:
+        result["stale"] = True
+    return result
+
+
 @router.get("/api/mikrotik/health")
 async def get_mikrotik_health(
     router_id: Optional[int] = None,
+    include_sessions: bool = False,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Get MikroTik router health metrics (CPU, memory, disk, uptime).
+    """Get MikroTik router health metrics (CPU, memory, disk, uptime, user counts).
+    
+    Returns counts only by default. Per-session arrays are intentionally NOT
+    included — they bloat the dashboard tile poll and become stale. Use the
+    drill-down endpoints when you need them:
+    
+        GET /api/mikrotik/{router_id}/pppoe/active   -> live PPPoE sessions
+        GET /api/mikrotik/active-sessions?router_id  -> live hotspot sessions
+    
+    Pass ``include_sessions=true`` to opt back into an inline (capped) PPPoE
+    session array on this endpoint for backward compatibility. The array is
+    capped at ``_HEALTH_MAX_INLINE_SESSIONS`` entries; ``sessions_truncated``
+    indicates when callers should switch to the drill-down endpoint.
     
     Active users and bandwidth come from background job data (more reliable).
-    Cached for 30 seconds per router to prevent overloading MikroTik.
+    Cached for 5 min per router to prevent overloading MikroTik.
     """
     user = await get_current_user(token, db)
     global _health_cache
@@ -172,11 +229,12 @@ async def get_mikrotik_health(
         cached = _health_cache[cache_key]
         age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
         if age < _health_cache_ttl:
-            # Return cached data with cache info
-            result = cached["data"].copy()
-            result["cached"] = True
-            result["cache_age_seconds"] = round(age, 1)
-            return result
+            return _shape_health_response(
+                cached["data"],
+                include_sessions=include_sessions,
+                cached=True,
+                cache_age_seconds=age,
+            )
     
     try:
         # Get router by ID or use default settings
@@ -210,11 +268,15 @@ async def get_mikrotik_health(
                 await record_router_availability(db, router_id, False, "mikrotik_health")
             # Return stale cache if available when router unreachable
             if cache_key in _health_cache:
-                result = _health_cache[cache_key]["data"].copy()
-                result["cached"] = True
-                result["cache_age_seconds"] = (datetime.utcnow() - _health_cache[cache_key]["timestamp"]).total_seconds()
-                result["stale"] = True
-                return result
+                cached_entry = _health_cache[cache_key]
+                age = (datetime.utcnow() - cached_entry["timestamp"]).total_seconds()
+                return _shape_health_response(
+                    cached_entry["data"],
+                    include_sessions=include_sessions,
+                    cached=True,
+                    cache_age_seconds=age,
+                    stale=True,
+                )
             raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
 
         if router_id:
@@ -313,7 +375,10 @@ async def get_mikrotik_health(
             "active_hotspot_users": active_hotspot_users,
             "active_pppoe_users": active_pppoe_users,
             "active_total_users": total_active_users,
-            "active_pppoe_sessions": active_pppoe_sessions,
+            # Per-session arrays are stashed under a private key on the cached
+            # payload and only surfaced by the response shaper when the caller
+            # asks for them via ?include_sessions=true. See _shape_health_response.
+            "_full_pppoe_sessions": active_pppoe_sessions,
             "bandwidth": {
                 "download_mbps": current_download_mbps,
                 "upload_mbps": current_upload_mbps
@@ -330,8 +395,12 @@ async def get_mikrotik_health(
             "timestamp": datetime.utcnow()
         }
         
-        result["cached"] = False
-        return result
+        return _shape_health_response(
+            result,
+            include_sessions=include_sessions,
+            cached=False,
+            cache_age_seconds=None,
+        )
     except HTTPException:
         raise
     except Exception as e:

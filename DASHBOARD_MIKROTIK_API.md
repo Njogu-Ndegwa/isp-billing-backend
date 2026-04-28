@@ -19,9 +19,10 @@ Authorization: Bearer <jwt_token>
 
 ### Query Parameters
 
-| Param | Type | Required | Description |
-|---|---|---|---|
-| `router_id` | integer | No | ID of the router. If omitted, the backend uses the default router from env config. |
+| Param | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `router_id` | integer | No | env default | ID of the router. If omitted, the backend uses the default router from env config. |
+| `include_sessions` | boolean | No | `false` | If `true`, the response includes an inline (capped at 50) `active_pppoe_sessions` array. **The dashboard tile should leave this off** — use the dedicated drill-down endpoints for per-session detail (see "Related endpoints"). Provided only for backward compatibility. |
 
 ### Example (fetch)
 
@@ -67,17 +68,7 @@ const data = await res.json();
   "active_hotspot_users": 59,
   "active_pppoe_users": 12,
   "active_total_users": 71,
-  "active_pppoe_sessions": [
-    {
-      "user": "john_doe",
-      "service": "pppoe",
-      "caller_id": "AA:BB:CC:11:22:33",
-      "address": "10.10.0.14",
-      "uptime": "3d4h",
-      "encoding": "",
-      "session_id": "0x81000012"
-    }
-  ],
+  "sessions_truncated": false,
 
   "bandwidth": {
     "download_mbps": 71.28,
@@ -97,18 +88,19 @@ const data = await res.json();
 
 | Field | Type | Meaning |
 |---|---|---|
-| `active_users` | integer | **Hotspot users only** (from the latest bandwidth snapshot, with the live PPPoE count subtracted out). Same value as `active_hotspot_users`; kept for backward compatibility. |
+| `active_users` | integer | **Hotspot users only** (persisted on the latest bandwidth snapshot). Same value as `active_hotspot_users`; kept for backward compatibility. |
 | `active_hotspot_users` | integer | Explicit alias for hotspot-only users — prefer this in new code for clarity |
 | `active_pppoe_users` | integer | **PPPoE** users currently online on the router (live from `/ppp/active/print`) |
 | `active_total_users` | integer | Combined hotspot + PPPoE active users (`active_hotspot_users + active_pppoe_users`). Use this if you want a single "everyone online" tile. |
-| `active_pppoe_sessions` | array | Per-user PPPoE session details (`user`, `service`, `caller_id`, `address`, `uptime`, `encoding`, `session_id`) — useful for a drill-down table |
+| `active_pppoe_sessions` | array | **Only present when `?include_sessions=true`.** Capped at 50 entries. Per-user PPPoE session details (`user`, `service`, `caller_id`, `address`, `uptime`, `encoding`, `session_id`). For drill-down tables, prefer `GET /api/mikrotik/{router_id}/pppoe/active` instead — it isn't capped and isn't tied to the 5-minute health cache. |
+| `sessions_truncated` | boolean | Always present. `true` only when `include_sessions=true` AND there were more than 50 PPPoE sessions, in which case the inline array was capped — switch to the drill-down endpoint. `false` otherwise (including when sessions weren't requested). |
 | `bandwidth.download_mbps` / `bandwidth.upload_mbps` | number | Current total router throughput |
 | `router_id` / `router_name` | — | Router identity |
 | `generated_at` | ISO string | When the backend produced this snapshot |
 | `cached` / `cache_age_seconds` | boolean / number | True if served from backend cache and how old it is |
 | `stale` | boolean (optional) | Present and `true` if the router is unreachable and a stale cache is being served |
 
-If you only need the dashboard tile counts, use `active_hotspot_users` (Hotspot), `active_pppoe_users` (PPPoE), and `active_total_users` (combined). `active_users` is preserved as an alias for `active_hotspot_users`.
+If you only need the dashboard tile counts, use `active_hotspot_users` (Hotspot), `active_pppoe_users` (PPPoE), and `active_total_users` (combined). `active_users` is preserved as an alias for `active_hotspot_users`. **Do not pass `include_sessions=true` from the dashboard tile** — it bloats every poll and the array is capped anyway. Drill-down tables should call the dedicated endpoints listed below.
 
 ---
 
@@ -129,8 +121,16 @@ If you only need the dashboard tile counts, use `active_hotspot_users` (Hotspot)
 
 - **Polling cadence:** every 30–60 s is fine; backend cache is 5 min, so more frequent polling is just a cheap re-read of the cache.
 - **Stale data:** check `stale` and `cache_age_seconds` → show a subtle "last updated Xs ago" label next to the tile.
-- **Multi-router dashboards:** call this endpoint once per `router_id`. Each has an independent cache key.
+- **Multi-router dashboards:** call this endpoint once per `router_id`. Each has an independent cache key. The dashboard tile poll should leave `include_sessions` off so the response stays small (~1–2 KB) regardless of how many users are online.
 - Bandwidth and `active_hotspot_users` come from the backend's background bandwidth-snapshot job (more reliable, no extra load on the router). `active_pppoe_users` is live per request (reuses the same open MikroTik connection — no extra connection overhead). `active_total_users` is always computed as `active_hotspot_users + active_pppoe_users`, so the three counts are guaranteed to be self-consistent (no more "PPPoE > total" weirdness when fresh PPPoE sessions land between snapshots).
-- **Related endpoints if you need drill-downs:**
+- **Related endpoints if you need drill-downs:** these are the right place to fetch per-session data. Don't lean on `include_sessions=true` for tables — it's capped and tied to the dashboard cache.
   - `GET /api/mikrotik/active-sessions?router_id={id}` — detailed hotspot sessions with traffic
   - `GET /api/mikrotik/{router_id}/pppoe/active` — detailed PPPoE sessions
+
+### Migrating an existing frontend
+
+If your tile currently relies on `active_pppoe_sessions` being inline in `/api/mikrotik/health`:
+
+1. **Tile-only views** (just want counts): no change beyond reading the new count fields. The session array is no longer there by default — the tile gets smaller and faster automatically.
+2. **Drill-down tables**: switch the data source from `health.active_pppoe_sessions` to `GET /api/mikrotik/{router_id}/pppoe/active`. That endpoint is live (no cache lag), unbounded, and fetches per-row traffic stats.
+3. **Quick rollback path**: if you need the old shape during the migration, pass `include_sessions=true` — the inline array is back (capped at 50 with a `sessions_truncated` flag).
