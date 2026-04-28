@@ -720,17 +720,24 @@ async def remediate_captive_portal(
             # 4. Drive the router itself to /tool/fetch our custom login.html
             #    onto the correct path. send_command blocks until RouterOS
             #    returns !done, which on /tool/fetch is sent only after the
-            #    HTTP transaction completes and (with keep-result=yes) the
-            #    file has been written to disk. The login-page URL is the
-            #    same one the original .rsc used during provisioning, so it
-            #    must already be reachable from the router.
+            #    HTTP transaction completes and the file has been written
+            #    to disk via dst-path. The login-page URL is the same one
+            #    the original .rsc used during provisioning, so it must
+            #    already be reachable from the router.
+            #
+            #    NOTE: do NOT pass keep-result=yes here. With dst-path set
+            #    that flag also embeds the fetched bytes in an !re field of
+            #    the API response, and the API protocol parser then tries
+            #    to UTF-8-decode the binary HTML payload, blowing up on
+            #    any non-ASCII byte (e.g. 0x89). dst-path alone is enough
+            #    to save the file -- the API response then only carries
+            #    text status fields.
             fetch = api.send_command(
                 "/tool/fetch",
                 {
                     "url": login_page_url,
                     "dst-path": login_dst,
                     "mode": "https",
-                    "keep-result": "yes",
                 },
             )
             if fetch.get("error"):

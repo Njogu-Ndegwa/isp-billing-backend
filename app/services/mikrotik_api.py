@@ -274,7 +274,14 @@ class MikroTikAPI:
         length = self.decode_length()
         if length == 0:
             return ""
-        return self._recv_all(length).decode('utf-8')
+        # Use errors='replace' so a single non-UTF-8 byte from RouterOS
+        # (e.g. binary embedded in /tool/fetch !re fields when callers
+        # accidentally pass keep-result=yes alongside dst-path, or any
+        # other field that legitimately carries non-text bytes) doesn't
+        # take down the whole API connection. The replacement char only
+        # affects the specific word; every other field in the sentence
+        # still parses normally.
+        return self._recv_all(length).decode('utf-8', errors='replace')
 
     def send_sentence(self, words: List[str]):
         for word in words:
