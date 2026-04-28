@@ -147,8 +147,25 @@ async def serve_login_page(
     provision_token: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Serve the captive portal login.html. Called by /tool fetch inside the .rsc script."""
-    await _get_valid_token(db, provision_token)
+    """Serve the captive portal login.html.
+
+    Called by /tool fetch inside the .rsc script during initial provisioning,
+    AND by the captive-portal remediation flow when an already-provisioned
+    router needs to re-download the template (e.g. recovering from the
+    hEX/v7 html-directory regression). The HTML is identical for every
+    router and doesn't depend on token state, so we only validate that the
+    token exists -- we intentionally do NOT reject PROVISIONED or expired
+    tokens here.
+    """
+    result = await db.execute(
+        select(ProvisioningToken).where(
+            ProvisioningToken.token == provision_token
+        )
+    )
+    token_obj = result.scalar_one_or_none()
+    if not token_obj:
+        raise HTTPException(status_code=404, detail="Provisioning token not found")
+
     try:
         html = get_login_page_html()
     except FileNotFoundError:

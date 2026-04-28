@@ -13,6 +13,7 @@ from app.services.subscription import enforce_active_subscription
 from app.services.router_availability import build_router_status
 import logging
 import asyncio
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -560,3 +561,290 @@ async def delete_router(
         logger.error(f"Error deleting router: {str(e)}")
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to delete router: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Captive-portal remediation
+#
+# Recovers an already-provisioned router from the hEX/v7 hotspot regression
+# (commit cef0221, fixed in 1b94872): the .rsc generator was setting
+# `html-directory=flash/hotspot` on every non-CHR/non-x86 board, which is
+# wrong on RouterOS v7 RouterBOARDs (their filesystem is unified and the
+# hotspot service reads from `hotspot/`, not `flash/hotspot/`). The result
+# was clients never reaching our captive portal.
+#
+# This endpoint repairs a deployed router in-place over its existing API
+# tunnel, without re-running provisioning. It is idempotent and safe to
+# run on healthy routers as well.
+# ---------------------------------------------------------------------------
+
+
+class CaptivePortalRemediateRequest(BaseModel):
+    profile_name: str = "hsprof1"
+    hotspot_name: str = "hotspot1"
+    target_html_directory: str = "hotspot"
+
+
+@router.post("/api/routers/{router_id}/remediate-captive-portal")
+async def remediate_captive_portal(
+    router_id: int,
+    request: Optional[CaptivePortalRemediateRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Repoint an already-provisioned router's hotspot profile back at the
+    correct html-directory, repopulate the default HTML files, redownload
+    our custom login.html, and bounce the hotspot interface.
+
+    Use this when a router was provisioned by the buggy hEX/v7 .rsc and
+    clients aren't being redirected to the captive portal. Caller must own
+    the router. Returns a per-step report so you can see what changed.
+    """
+    from app.services.mikrotik_api import MikroTikAPI
+    from app.config import settings
+
+    req = request or CaptivePortalRemediateRequest()
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+
+    stmt = select(Router).where(Router.id == router_id, Router.user_id == user.id)
+    result = await db.execute(stmt)
+    router_obj = result.scalar_one_or_none()
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    # Look up the original provisioning token so the router can /tool fetch
+    # its login page from the same URL it used during initial provisioning.
+    # The /login-page endpoint accepts PROVISIONED tokens for exactly this
+    # remediation use-case.
+    pt_stmt = (
+        select(ProvisioningToken)
+        .where(ProvisioningToken.router_id == router_id)
+        .order_by(ProvisioningToken.created_at.desc())
+    )
+    pt_result = await db.execute(pt_stmt)
+    pt = pt_result.scalars().first()
+    if not pt:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No provisioning token is linked to this router, so we cannot "
+                "build the login-page URL for /tool fetch. Re-link a token to "
+                "the router or fall back to re-provisioning."
+            ),
+        )
+
+    base_url = settings.PROVISION_BASE_URL.rstrip("/")
+    login_page_url = f"{base_url}/api/provision/{pt.token}/login-page"
+    target_dir = req.target_html_directory.rstrip("/")
+    login_dst = f"{target_dir}/login.html"
+
+    def _remediate_blocking() -> dict:
+        """Synchronous remediation -- runs in a thread to keep the event loop free."""
+        report: dict = {
+            "router_id": router_id,
+            "router_ip": router_obj.ip_address,
+            "profile_name": req.profile_name,
+            "hotspot_name": req.hotspot_name,
+            "target_html_directory": target_dir,
+            "steps": [],
+        }
+
+        def step(name: str, ok: bool, detail: object = None):
+            report["steps"].append({"step": name, "ok": ok, "detail": detail})
+
+        api = MikroTikAPI(
+            host=router_obj.ip_address,
+            username=router_obj.username,
+            password=router_obj.password,
+            port=router_obj.port or 8728,
+            timeout=30,
+        )
+
+        if not api.connect():
+            step("connect", False, api.last_connect_error or "connection failed")
+            report["success"] = False
+            return report
+        step("connect", True, f"{router_obj.ip_address}:{router_obj.port or 8728}")
+
+        try:
+            # 1. Find the hotspot profile and its current html-directory.
+            profiles = api.send_command("/ip/hotspot/profile/print")
+            if profiles.get("error"):
+                step("profile.print", False, profiles["error"])
+                report["success"] = False
+                return report
+
+            profile = next(
+                (p for p in profiles.get("data", []) if p.get("name") == req.profile_name),
+                None,
+            )
+            if not profile:
+                step("profile.find", False, f"profile '{req.profile_name}' not found")
+                report["success"] = False
+                return report
+
+            previous_dir = profile.get("html-directory") or "(unset)"
+            step("profile.find", True, {
+                "id": profile.get(".id"),
+                "previous_html_directory": previous_dir,
+            })
+
+            # 2. Update html-directory if needed.
+            if previous_dir == target_dir:
+                step("profile.set_html_directory", True, "already correct, skipped")
+            else:
+                update = api.send_command(
+                    "/ip/hotspot/profile/set",
+                    {"numbers": profile[".id"], "html-directory": target_dir},
+                )
+                if update.get("error"):
+                    step("profile.set_html_directory", False, update["error"])
+                    report["success"] = False
+                    return report
+                step("profile.set_html_directory", True, f"{previous_dir} -> {target_dir}")
+
+            # 3. Reset (repopulate) the default HTML file set into the new directory.
+            #    NOTE: positional profile name on RouterOS, NOT a `numbers=...` arg.
+            reset = api.send_command(
+                "/ip/hotspot/profile/reset-html-directory",
+                {"numbers": profile[".id"]},
+            )
+            if reset.get("error"):
+                # Non-fatal: some RouterOS builds reject this command. We can
+                # still drop our login.html on top via /tool fetch below.
+                step("profile.reset_html_directory", False, reset["error"])
+            else:
+                step("profile.reset_html_directory", True)
+
+            # 4. Drive the router itself to /tool/fetch our custom login.html
+            #    onto the correct path. send_command blocks until RouterOS
+            #    returns !done, which on /tool/fetch is sent only after the
+            #    HTTP transaction completes and (with keep-result=yes) the
+            #    file has been written to disk. The login-page URL is the
+            #    same one the original .rsc used during provisioning, so it
+            #    must already be reachable from the router.
+            fetch = api.send_command(
+                "/tool/fetch",
+                {
+                    "url": login_page_url,
+                    "dst-path": login_dst,
+                    "mode": "https",
+                    "keep-result": "yes",
+                },
+            )
+            if fetch.get("error"):
+                step("tool.fetch_login_page", False, {
+                    "error": fetch["error"],
+                    "url": login_page_url,
+                    "dst": login_dst,
+                })
+                report["success"] = False
+                return report
+            step("tool.fetch_login_page", True, {
+                "url": login_page_url,
+                "dst": login_dst,
+            })
+
+            # 5. Confirm login.html actually landed on disk (size > 0).
+            #    /file/print is small enough on a freshly-provisioned router
+            #    that listing-and-filtering is fine; we don't need to
+            #    construct an API ?-query (which send_command does not
+            #    natively support). Retry once with a short settle delay in
+            #    case the FS write hasn't been observed yet on slower
+            #    RouterBOARD flash.
+            login_size = -1
+            for attempt in range(2):
+                if attempt:
+                    time.sleep(1.0)
+                files = api.send_command("/file/print").get("data") or []
+                file_row = next(
+                    (f for f in files if f.get("name") == login_dst),
+                    None,
+                )
+                if file_row:
+                    try:
+                        login_size = int(file_row.get("size") or 0)
+                    except (TypeError, ValueError):
+                        login_size = 0
+                    if login_size > 0:
+                        break
+            if login_size <= 0:
+                step("file.verify_login_html", False, {
+                    "path": login_dst,
+                    "size": login_size,
+                    "msg": "login.html missing or empty after fetch",
+                })
+                report["success"] = False
+                return report
+            step("file.verify_login_html", True, {"path": login_dst, "size": login_size})
+
+            # 6. Bounce hotspot1 so RouterOS re-reads the profile's
+            #    html-directory. We use /ip/hotspot/set disabled=yes|no
+            #    rather than the /disable & /enable shortcuts because that
+            #    is the pattern every other RouterOS interaction in this
+            #    codebase uses (see ensure_hotspot_server_on_interface in
+            #    app/services/mikrotik_api.py), and it's the form that has
+            #    been tested across our deployed router fleet.
+            hotspots = api.send_command("/ip/hotspot/print")
+            hs = next(
+                (h for h in (hotspots.get("data") or []) if h.get("name") == req.hotspot_name),
+                None,
+            )
+            if not hs:
+                step("hotspot.find", False, f"hotspot '{req.hotspot_name}' not found")
+                report["success"] = False
+                return report
+            hs_id = hs.get(".id")
+
+            disable = api.send_command(
+                "/ip/hotspot/set",
+                {"numbers": hs_id, "disabled": "yes"},
+            )
+            if disable.get("error"):
+                step("hotspot.disable", False, disable["error"])
+                # We still try to re-enable -- otherwise we leave the
+                # customer's hotspot down on a partial failure.
+            else:
+                step("hotspot.disable", True)
+
+            time.sleep(0.5)  # let RouterOS fully unbind before re-binding
+
+            enable = api.send_command(
+                "/ip/hotspot/set",
+                {"numbers": hs_id, "disabled": "no"},
+            )
+            if enable.get("error"):
+                step("hotspot.enable", False, enable["error"])
+                report["success"] = False
+                return report
+            step("hotspot.enable", True)
+
+            report["success"] = True
+            return report
+
+        finally:
+            api.disconnect()
+
+    try:
+        report = await asyncio.to_thread(_remediate_blocking)
+    except Exception as e:
+        logger.error(
+            f"Captive-portal remediation crashed for router_id={router_id}: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Remediation failed: {type(e).__name__}: {e}",
+        )
+
+    if not report.get("success"):
+        # Surface the detailed step report to the caller so they can see
+        # exactly which command on the router rejected the change.
+        raise HTTPException(status_code=502, detail=report)
+
+    logger.info(
+        f"Captive-portal remediation succeeded for router_id={router_id} "
+        f"({router_obj.ip_address}): html-directory now '{target_dir}'"
+    )
+    return report
