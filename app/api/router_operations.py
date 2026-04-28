@@ -3423,3 +3423,150 @@ async def set_dual_ports(
         resp["migrated_from_plain"] = sorted(plain_overlap)
         resp["plain_ports"] = router_obj.plain_ports
     return resp
+
+
+# =========================================================================
+# DUAL-PORT HOTSPOT DIAGNOSTIC
+# =========================================================================
+
+class DiagnoseDualPortRequest(BaseModel):
+    port: Optional[str] = None
+    mac_address: Optional[str] = None
+    customer_id: Optional[int] = None
+
+
+def _run_dual_diagnostic_sync(
+    router_info: dict,
+    port: Optional[str],
+    mac_address: Optional[str],
+    customer: Optional[dict],
+) -> dict:
+    """Connect to the router and run the layered hotspot diagnostic."""
+    from app.services.dual_port_diagnostic import diagnose_dual_port
+
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=20,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        return diagnose_dual_port(api, port=port, mac_address=mac_address, customer=customer)
+    except Exception as e:
+        logger.exception("Dual-port diagnostic failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        api.disconnect()
+
+
+@router.post("/api/routers/{router_id}/diagnose/dual-port")
+async def diagnose_dual_port_endpoint(
+    router_id: int,
+    request: DiagnoseDualPortRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Admin diagnostic for a dual-mode (PPPoE + Hotspot) port.
+
+    Walks the dual-bridge stack (bridge, address, DHCP, hotspot profile/server,
+    NAT, PPPoE, WAN, port link) and — when a MAC or customer_id is supplied —
+    inspects ARP, DHCP lease, hotspot host, ip-binding, active session, queues
+    and customer billing state. Every check the BILLING SYSTEM itself causes
+    is tagged `system_block: true`, surfaced under `system_blocks`, so you can
+    instantly see whether you are blocking the customer's hotspot.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    if request.mac_address and not validate_mac_address(request.mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address")
+
+    customer_payload: Optional[dict] = None
+    mac_address = request.mac_address
+
+    if request.customer_id:
+        cstmt = (
+            select(Customer)
+            .where(Customer.id == request.customer_id)
+            .options(selectinload(Customer.plan))
+        )
+        if getattr(user, "role", None) and user.role.value != "admin":
+            cstmt = cstmt.where(Customer.user_id == user.id)
+        cres = await db.execute(cstmt)
+        cust = cres.scalar_one_or_none()
+        if not cust:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        customer_payload = {
+            "id": cust.id,
+            "name": cust.name,
+            "phone": cust.phone,
+            "mac_address": cust.mac_address,
+            "status": cust.status.value if cust.status else None,
+            "expiry": cust.expiry,
+            "router_id": cust.router_id,
+            "plan": (
+                {
+                    "id": cust.plan.id,
+                    "name": cust.plan.name,
+                    "speed": cust.plan.speed,
+                    "connection_type": cust.plan.connection_type.value if cust.plan.connection_type else None,
+                }
+                if cust.plan
+                else None
+            ),
+        }
+        if not mac_address and cust.mac_address:
+            mac_address = cust.mac_address
+
+    port_warning: Optional[str] = None
+    if request.port:
+        configured = router_obj.dual_ports or []
+        if request.port not in configured:
+            port_warning = (
+                f"{request.port} is not currently registered as a dual port in our DB "
+                f"({configured or 'none'}). Diagnostic will still run against the live router."
+            )
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    result = await asyncio.to_thread(
+        _run_dual_diagnostic_sync,
+        router_info,
+        request.port,
+        mac_address,
+        customer_payload,
+    )
+
+    if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "diagnose_dual_port")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to router: {router_obj.name}",
+        )
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    await record_router_availability(db, router_id, True, "diagnose_dual_port")
+
+    return {
+        "router_id": router_id,
+        "router_name": router_obj.name,
+        "port": request.port,
+        "mac_address": normalize_mac_address(mac_address) if mac_address else None,
+        "customer": customer_payload,
+        "port_warning": port_warning,
+        "configured_dual_ports": router_obj.dual_ports or [],
+        "generated_at": datetime.utcnow().isoformat(),
+        **result,
+    }

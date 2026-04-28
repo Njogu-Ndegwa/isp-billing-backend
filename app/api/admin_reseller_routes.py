@@ -18,7 +18,7 @@ from app.db.models import (
     ResellerPaymentMethod, ResellerPaymentMethodType,
     B2BTransaction, B2BTransactionStatus,
     ZenoPayTransaction, DevicePairing, ReconnectionAttempt,
-    ProvisioningAttempt,
+    ProvisioningAttempt, CustomerUsagePeriod,
     Lead, LeadActivity, LeadFollowUp, LeadSource,
     MtnMomoTransaction, AccessCredential,
 )
@@ -1436,6 +1436,7 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
     device_pairings = await _count(DevicePairing, DevicePairing.customer_id, customer_ids_stmt)
     reconnection_attempts = await _count(ReconnectionAttempt, ReconnectionAttempt.customer_id, customer_ids_stmt)
     provisioning_attempts = await _count(ProvisioningAttempt, ProvisioningAttempt.customer_id, customer_ids_stmt)
+    customer_usage_periods = await _count(CustomerUsagePeriod, CustomerUsagePeriod.customer_id, customer_ids_stmt)
     payment_methods = (await db.execute(
         select(func.count(ResellerPaymentMethod.id)).where(ResellerPaymentMethod.user_id == reseller_id)
     )).scalar() or 0
@@ -1498,6 +1499,7 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         "availability_checks": availability_checks,
         "device_pairings": device_pairings,
         "reconnection_attempts": reconnection_attempts,
+        "customer_usage_periods": customer_usage_periods,
         "payment_methods": payment_methods,
         "reseller_payouts": payouts,
         "reseller_transaction_charges": transaction_charges,
@@ -1582,6 +1584,10 @@ async def delete_reseller(
 
     # 5. User bandwidth usage
     await db.execute(delete(UserBandwidthUsage).where(UserBandwidthUsage.customer_id.in_(customer_ids)))
+
+    # 5b. Customer usage periods (NOT NULL customer_id FK — must be deleted
+    #     explicitly; SQLAlchemy's default would try to NULL the FK and fail).
+    await db.execute(delete(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id.in_(customer_ids)))
 
     # 6. Provisioning logs (customer-side + router-side)
     await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id.in_(customer_ids)))

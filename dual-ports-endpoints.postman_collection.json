@@ -97,6 +97,72 @@
                 ],
                 "description": "Get available ethernet interfaces with current port assignments including dual_ports."
             }
+        },
+        {
+            "name": "Diagnose Dual Port (full stack + customer)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/diagnose/dual-port",
+                "header": [
+                    {
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    },
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"port\": \"ether3\",\n  \"mac_address\": \"AA:BB:CC:DD:EE:FF\",\n  \"customer_id\": 123\n}"
+                },
+                "description": "Admin-facing diagnostic for the case 'PPPoE works but hotspot says no internet / no Wi-Fi'. Walks the dual-bridge stack (bridge, address, DHCP, hotspot profile/server, NAT, PPPoE, WAN, port link) and — when a MAC or customer_id is supplied — inspects ARP, DHCP lease, hotspot host, ip-binding, active session, queues and the customer's billing state. Every check that the BILLING SYSTEM itself causes is tagged `system_block: true` and surfaced under `system_blocks`, so you can instantly see whether you are blocking the customer's hotspot.\n\nAll body fields are optional — call with no body for an infrastructure-only health check on the dual-mode bridge."
+            }
+        },
+        {
+            "name": "Diagnose Dual Port (port only - infra check)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/diagnose/dual-port",
+                "header": [
+                    {
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    },
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"port\": \"ether3\"\n}"
+                },
+                "description": "Run only the infrastructure + physical-link layer diagnostic on a port — no customer/MAC required. Useful when a whole port has no Wi-Fi service."
+            }
+        },
+        {
+            "name": "Diagnose Dual Port (customer only)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/routers/{{routerId}}/diagnose/dual-port",
+                "header": [
+                    {
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    },
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"customer_id\": 123\n}"
+                },
+                "description": "Pull the customer's MAC + plan + status from our DB and run the diagnostic with that context — no port needed."
+            }
         }
     ]
 }

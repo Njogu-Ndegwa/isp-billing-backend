@@ -13,7 +13,9 @@ from app.db.models import (
     Router, Customer, Plan, CustomerStatus, ConnectionType,
     CustomerPayment, PaymentMethod, PaymentStatus, DurationUnit,
     Payment, CustomerRating, ProvisioningLog, MpesaTransaction,
-    UserBandwidthUsage, Voucher,
+    UserBandwidthUsage, Voucher, CustomerUsagePeriod,
+    ProvisioningAttempt, DevicePairing, ReconnectionAttempt,
+    ZenoPayTransaction, MtnMomoTransaction,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -318,6 +320,13 @@ async def delete_customer(
                 logger.warning(f"Failed to remove PPPoE secret for customer {customer_id} during delete: {e}")
                 deprovision_result = "failed"
 
+        # Clean up child rows before deleting the parent. Tables with a
+        # NOT NULL customer_id FK (CustomerUsagePeriod, ProvisioningLog,
+        # ProvisioningAttempt, DevicePairing, Payment, CustomerPayment) MUST be
+        # deleted explicitly — SQLAlchemy's default behaviour on parent delete
+        # is to UPDATE child.customer_id = NULL, which violates those NOT NULL
+        # constraints. Tables with a nullable FK are deleted here too so the
+        # customer's history is cleaned up rather than orphaned.
         await db.execute(
             update(Voucher).where(Voucher.redeemed_by == customer_id).values(redeemed_by=None)
         )
@@ -329,8 +338,14 @@ async def delete_customer(
         ).bindparams(cid=customer_id))
         await db.execute(delete(CustomerRating).where(CustomerRating.customer_id == customer_id))
         await db.execute(delete(UserBandwidthUsage).where(UserBandwidthUsage.customer_id == customer_id))
+        await db.execute(delete(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id == customer_id))
         await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id == customer_id))
+        await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.customer_id == customer_id))
+        await db.execute(delete(DevicePairing).where(DevicePairing.customer_id == customer_id))
+        await db.execute(delete(ReconnectionAttempt).where(ReconnectionAttempt.customer_id == customer_id))
         await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id == customer_id))
+        await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.customer_id == customer_id))
+        await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id == customer_id))
         await db.execute(delete(Payment).where(Payment.customer_id == customer_id))
         await db.execute(delete(CustomerPayment).where(CustomerPayment.customer_id == customer_id))
 
