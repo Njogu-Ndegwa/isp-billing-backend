@@ -366,7 +366,48 @@ def _rsc_vpn_l2tp(token: ProvisioningToken) -> str:
 }}"""
 
 
-def _rsc_hotspot() -> str:
+def _rsc_hotspot(token: ProvisioningToken) -> str:
+    # The split-filesystem (`flash/` is NAND-persistent, `/file` root is
+    # tmpfs) is a RouterOS v6 RouterBOARD characteristic. RouterOS v7
+    # RouterBOARDs ship a unified, fully persistent filesystem -- writing
+    # custom hotspot HTML to plain `hotspot/` is correct on all v7 devices,
+    # including hEX/hEX S/CCR running v7. Forcing `flash/hotspot` there
+    # points the profile at a directory the hotspot service does not read
+    # from, so the captive-portal redirect breaks.
+    #
+    # We use vpn_type as the RouterOS-version marker (l2tp == v6,
+    # wireguard == v7) and only run the board-name detection on v6.
+    is_v6 = token.vpn_type == "l2tp"
+    if is_v6:
+        html_dir_block = """
+# Pick a persistent hotspot html-directory for this device.
+# RouterBOARD boards on RouterOS v6 (hEX, hEX S, hEX lite, hEX PoE,
+# CCR, ...) have a split filesystem: the root /file tree is RAM-backed
+# (tmpfs) and only the `flash/` folder is NAND-persistent. If we set
+# html-directory=hotspot on those boards, our custom login.html is
+# written to RAM and wiped on reboot -- RouterOS then serves the
+# built-in default login page instead of redirecting clients to our
+# captive portal. CHR / x86 have no `flash` folder and their whole
+# filesystem is already persistent, so plain `hotspot` is fine for them.
+:global bwHtmlDir "hotspot"
+:local bwBoard ""
+:do { :set bwBoard [/system resource get board-name] } on-error={}
+:if ([:len $bwBoard] > 0 and $bwBoard != "CHR" and $bwBoard != "x86") do={
+    :set bwHtmlDir "flash/hotspot"
+    :log info ("Provisioning: RouterBOARD " . $bwBoard . " (v6) detected, html-directory=" . $bwHtmlDir)
+} else={
+    :log info ("Provisioning: board-name=" . $bwBoard . " (v6, non-persistent root), html-directory=hotspot")
+}"""
+    else:
+        # RouterOS v7: unified persistent filesystem on every platform we
+        # support, so the default `hotspot/` directory is correct.
+        html_dir_block = """
+# RouterOS v7: filesystem is unified and persistent on every supported
+# platform (CHR, x86, hEX/CCR/etc. running v7), so use the default
+# `hotspot` html-directory unconditionally.
+:global bwHtmlDir "hotspot"
+:log info "Provisioning: RouterOS v7 detected, html-directory=hotspot" """
+
     return """
 # ---- STEP 4: HOTSPOT SETUP ----
 
@@ -374,31 +415,7 @@ def _rsc_hotspot() -> str:
     :log error "PROVISION ABORTED at hotspot step: bridge interface missing"
     :error "bridge interface does not exist -- cannot create hotspot"
 }
-
-# Pick a persistent hotspot html-directory for this device.
-# RouterBOARD boards (hEX, hEX S, hEX lite, hEX PoE, CCR, ...) have a
-# split filesystem: the root /file tree is RAM-backed (tmpfs) and only
-# the `flash/` folder is NAND-persistent. If we set html-directory=hotspot
-# on those boards, our custom login.html is written to RAM and wiped on
-# reboot -- RouterOS then serves the built-in default login page instead
-# of redirecting clients to our captive portal. CHR / x86 have no `flash`
-# folder and their whole filesystem is already persistent, so plain
-# `hotspot` is fine for them.
-#
-# We detect the platform via /system resource board-name. It returns
-# "CHR" on Cloud Hosted, "x86" on x86 installs, and a real model name
-# like "hEX S" / "CCR2004-..." on every RouterBOARD device. A denylist
-# of just CHR + x86 stays valid forever since those are the only two
-# non-persistent-root platforms MikroTik ships.
-:global bwHtmlDir "hotspot"
-:local bwBoard ""
-:do { :set bwBoard [/system resource get board-name] } on-error={}
-:if ([:len $bwBoard] > 0 and $bwBoard != "CHR" and $bwBoard != "x86") do={
-    :set bwHtmlDir "flash/hotspot"
-    :log info ("Provisioning: RouterBOARD " . $bwBoard . " detected, html-directory=" . $bwHtmlDir)
-} else={
-    :log info ("Provisioning: board-name=" . $bwBoard . " (non-persistent root), html-directory=hotspot")
-}
+""" + html_dir_block + """
 
 # Clean legacy hotspot directories left behind by previous provisioners
 # (CentiPid, OpenWISP, earlier versions of ours). This is best-effort and
@@ -566,7 +583,7 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     else:
         parts.append(_rsc_vpn_wireguard(token))
 
-    parts.append(_rsc_hotspot())
+    parts.append(_rsc_hotspot(token))
     parts.append(_rsc_login_page(token))
     parts.append(_rsc_walled_garden(token))
     parts.append(_rsc_api_access())
