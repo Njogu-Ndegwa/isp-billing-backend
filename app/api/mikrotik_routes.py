@@ -233,8 +233,17 @@ async def get_mikrotik_health(
         total_hdd = res_data.get("total_hdd_space", 1)
         free_hdd = res_data.get("free_hdd_space", 0)
         
-        # Get active users and bandwidth from latest snapshot (collected by background job)
-        active_users = 0
+        # Active users come from two different clocks:
+        #   * Hotspot count   -> persisted on the snapshot (background job, ~min stale)
+        #   * PPPoE count     -> live from ``/ppp/active/print`` on this very request
+        # We do NOT derive hotspot from ``active_queues - live_pppoe`` anymore: the
+        # combined ``active_queues`` is from time T, while live PPPoE is from now,
+        # so subtraction can flip negative if PPPoE sessions reconnected in between
+        # (that is the "pppoe(16) > total(14)" symptom). Instead we trust the
+        # snapshot's persisted hotspot figure and add the live PPPoE on top, which
+        # always yields a self-consistent total = hotspot + pppoe.
+        snapshot_hotspot_users = 0
+        snapshot_active_queues = 0
         current_download_mbps = 0.0
         current_upload_mbps = 0.0
         snapshot_age = None
@@ -247,10 +256,29 @@ async def get_mikrotik_health(
         latest_snapshot = snapshot_result.scalar_one_or_none()
         
         if latest_snapshot:
-            active_users = latest_snapshot.active_queues  # We store active users here
+            snapshot_active_queues = latest_snapshot.active_queues or 0
+            # active_hotspot_users column was added later; fall back to deriving
+            # it from the legacy combined value for snapshots written before the
+            # column existed. Clamp to 0 to stay safe.
+            persisted_hotspot = getattr(latest_snapshot, "active_hotspot_users", None)
+            if persisted_hotspot is None:
+                snapshot_hotspot_users = max(0, snapshot_active_queues)
+            else:
+                snapshot_hotspot_users = max(0, int(persisted_hotspot))
             current_download_mbps = round(latest_snapshot.avg_download_bps / 1000000, 2)
             current_upload_mbps = round(latest_snapshot.avg_upload_bps / 1000000, 2)
             snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
+        
+        active_pppoe_users = (
+            pppoe_active.get("count", len(pppoe_active.get("data", []) or []))
+            if not pppoe_active.get("error")
+            else 0
+        )
+        active_pppoe_sessions = (
+            pppoe_active.get("data", []) if not pppoe_active.get("error") else []
+        )
+        active_hotspot_users = snapshot_hotspot_users
+        total_active_users = active_hotspot_users + active_pppoe_users
         
         result = {
             "system": {
@@ -277,9 +305,15 @@ async def get_mikrotik_health(
                 "used_percent": round(((total_hdd - free_hdd) / total_hdd) * 100, 1) if total_hdd > 0 else 0
             },
             "health_sensors": health.get("data", {}),
-            "active_users": active_users,
-            "active_pppoe_users": pppoe_active.get("count", len(pppoe_active.get("data", []) or [])) if not pppoe_active.get("error") else 0,
-            "active_pppoe_sessions": pppoe_active.get("data", []) if not pppoe_active.get("error") else [],
+            # ``active_users`` is hotspot-only per DASHBOARD_MIKROTIK_API.md.
+            # ``active_hotspot_users`` is an explicit alias so frontends don't
+            # have to know that historical name. ``active_total_users`` is the
+            # combined hotspot + PPPoE figure for callers that want it.
+            "active_users": active_hotspot_users,
+            "active_hotspot_users": active_hotspot_users,
+            "active_pppoe_users": active_pppoe_users,
+            "active_total_users": total_active_users,
+            "active_pppoe_sessions": active_pppoe_sessions,
             "bandwidth": {
                 "download_mbps": current_download_mbps,
                 "upload_mbps": current_upload_mbps

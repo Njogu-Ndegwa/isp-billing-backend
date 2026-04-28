@@ -466,7 +466,8 @@ class BandwidthSnapshot(Base):
     total_download_bps = Column(BigInteger, default=0)
     avg_upload_bps = Column(Float, default=0)
     avg_download_bps = Column(Float, default=0)
-    active_queues = Column(Integer, default=0)
+    active_queues = Column(Integer, default=0)  # combined hotspot hosts + PPPoE sessions (legacy field; kept for back-compat)
+    active_hotspot_users = Column(Integer, default=0)  # hotspot-only host count at snapshot time (authorized + bypassed)
     active_sessions = Column(Integer, default=0)
     # Interface-based counters for accurate averaging
     interface_rx_bytes = Column(BigInteger, default=0)

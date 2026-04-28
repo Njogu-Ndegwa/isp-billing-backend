@@ -63,8 +63,10 @@ const data = await res.json();
   },
   "health_sensors": {},
 
-  "active_users": 71,
+  "active_users": 59,
+  "active_hotspot_users": 59,
   "active_pppoe_users": 12,
+  "active_total_users": 71,
   "active_pppoe_sessions": [
     {
       "user": "john_doe",
@@ -95,8 +97,10 @@ const data = await res.json();
 
 | Field | Type | Meaning |
 |---|---|---|
-| `active_users` | integer | **Hotspot / total active queue** users (from the latest bandwidth snapshot) |
+| `active_users` | integer | **Hotspot users only** (from the latest bandwidth snapshot, with the live PPPoE count subtracted out). Same value as `active_hotspot_users`; kept for backward compatibility. |
+| `active_hotspot_users` | integer | Explicit alias for hotspot-only users — prefer this in new code for clarity |
 | `active_pppoe_users` | integer | **PPPoE** users currently online on the router (live from `/ppp/active/print`) |
+| `active_total_users` | integer | Combined hotspot + PPPoE active users (`active_hotspot_users + active_pppoe_users`). Use this if you want a single "everyone online" tile. |
 | `active_pppoe_sessions` | array | Per-user PPPoE session details (`user`, `service`, `caller_id`, `address`, `uptime`, `encoding`, `session_id`) — useful for a drill-down table |
 | `bandwidth.download_mbps` / `bandwidth.upload_mbps` | number | Current total router throughput |
 | `router_id` / `router_name` | — | Router identity |
@@ -104,7 +108,7 @@ const data = await res.json();
 | `cached` / `cache_age_seconds` | boolean / number | True if served from backend cache and how old it is |
 | `stale` | boolean (optional) | Present and `true` if the router is unreachable and a stale cache is being served |
 
-If you only need the dashboard tile counts, use `active_users` (hotspot) and `active_pppoe_users` (PPPoE).
+If you only need the dashboard tile counts, use `active_hotspot_users` (Hotspot), `active_pppoe_users` (PPPoE), and `active_total_users` (combined). `active_users` is preserved as an alias for `active_hotspot_users`.
 
 ---
 
@@ -126,7 +130,7 @@ If you only need the dashboard tile counts, use `active_users` (hotspot) and `ac
 - **Polling cadence:** every 30–60 s is fine; backend cache is 5 min, so more frequent polling is just a cheap re-read of the cache.
 - **Stale data:** check `stale` and `cache_age_seconds` → show a subtle "last updated Xs ago" label next to the tile.
 - **Multi-router dashboards:** call this endpoint once per `router_id`. Each has an independent cache key.
-- Bandwidth & `active_users` come from the backend's background bandwidth-snapshot job (more reliable, no extra load on the router). `active_pppoe_users` is live per request (reuses the same open MikroTik connection — no extra connection overhead).
+- Bandwidth and `active_hotspot_users` come from the backend's background bandwidth-snapshot job (more reliable, no extra load on the router). `active_pppoe_users` is live per request (reuses the same open MikroTik connection — no extra connection overhead). `active_total_users` is always computed as `active_hotspot_users + active_pppoe_users`, so the three counts are guaranteed to be self-consistent (no more "PPPoE > total" weirdness when fresh PPPoE sessions land between snapshots).
 - **Related endpoints if you need drill-downs:**
   - `GET /api/mikrotik/active-sessions?router_id={id}` — detailed hotspot sessions with traffic
   - `GET /api/mikrotik/{router_id}/pppoe/active` — detailed PPPoE sessions

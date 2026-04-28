@@ -1805,18 +1805,33 @@ async def collect_bandwidth_snapshot():
                     elif not interface_fetch_failed:
                         logger.info(f"[BANDWIDTH] Router {router_id}: No previous snapshot or rx_bytes=0, first measurement")
 
+                    # Hotspot host count (authorized + bypassed). We persist this
+                    # SEPARATELY from the combined ``active_queues`` total so the
+                    # /api/mikrotik/health endpoint can return a stable hotspot
+                    # figure without having to subtract a live PPPoE count from a
+                    # stale combined total (which produced the impossible
+                    # "pppoe > total" symptom users were reporting).
                     hotspot_fetch_ok = hotspot_hosts.get("success", False)
                     if hotspot_fetch_ok:
-                        active_devices = hotspot_hosts.get("bypassed", 0) + hotspot_hosts.get("authorized", 0)
+                        active_hotspot_users = hotspot_hosts.get("bypassed", 0) + hotspot_hosts.get("authorized", 0)
                     elif prev:
-                        active_devices = prev.active_queues
-                        logger.warning(f"[BANDWIDTH] Router {router_id}: Hotspot hosts fetch failed, carrying forward previous active_users={active_devices}")
+                        # Carry forward the hotspot-only count, not active_queues
+                        # (which already includes the previous PPPoE sample).
+                        active_hotspot_users = getattr(prev, "active_hotspot_users", None)
+                        if active_hotspot_users is None:
+                            # Backfill for snapshots written before active_hotspot_users existed.
+                            active_hotspot_users = max(0, (prev.active_queues or 0) - 0)
+                        logger.warning(f"[BANDWIDTH] Router {router_id}: Hotspot hosts fetch failed, carrying forward previous active_hotspot_users={active_hotspot_users}")
                     else:
-                        active_devices = 0
+                        active_hotspot_users = 0
 
                     pppoe_sessions = raw.get("pppoe_sessions", {})
                     pppoe_active_count = len(pppoe_sessions.get("data", [])) if pppoe_sessions.get("success") else 0
-                    active_devices += pppoe_active_count
+
+                    # active_queues stays as the COMBINED hotspot+PPPoE count to
+                    # preserve the historical contract for graphs and other
+                    # consumers (see app/api/mikrotik_routes.py bandwidth-history).
+                    active_devices = active_hotspot_users + pppoe_active_count
 
                     snapshot = BandwidthSnapshot(
                         router_id=router_id,
@@ -1825,6 +1840,7 @@ async def collect_bandwidth_snapshot():
                         avg_upload_bps=avg_upload_bps,
                         avg_download_bps=avg_download_bps,
                         active_queues=active_devices,
+                        active_hotspot_users=active_hotspot_users,
                         active_sessions=len(active_sessions.get("data", [])),
                         interface_rx_bytes=total_rx,
                         interface_tx_bytes=total_tx,
