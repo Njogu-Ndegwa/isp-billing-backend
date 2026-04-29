@@ -26,6 +26,17 @@ router = APIRouter(tags=["provisioning"])
 class ProvisionCreateRequest(BaseModel):
     payment_methods: Optional[List[str]] = None
     vpn_type: Optional[str] = "wireguard"
+    # Opt-in for the v6 hEX/RouterBOARD split-filesystem workaround. Only
+    # honoured when vpn_type == "l2tp" (RouterOS v6); ignored on wireguard/v7
+    # because v7 has a unified persistent filesystem on every supported
+    # platform. Set this to true when provisioning a v6 hEX, hEX S, hEX lite,
+    # hAP, RB-series, etc. whose root filesystem is RAM-backed (tmpfs) and
+    # whose `flash/` folder is the only NAND-persistent storage. Leave false
+    # (the default) for everything else, including CHR, x86, and any v6 board
+    # whose firmware uses a unified persistent filesystem -- those just use
+    # plain `hotspot` as the html-directory and the captive-portal redirect
+    # works correctly.
+    is_routerboard: Optional[bool] = False
 
 
 # ── Authenticated endpoints ──────────────────────────────────────────────
@@ -51,12 +62,18 @@ async def create_provision_token(
             detail=f"Invalid vpn_type '{vpn_type}'. Must be 'wireguard' or 'l2tp'.",
         )
 
+    # is_routerboard is a v6-only opt-in. Silently ignore it on v7 rather than
+    # rejecting the request, so a frontend that always sends the flag still
+    # works for wireguard/v7 provisioning.
+    is_routerboard = bool(request.is_routerboard) if vpn_type == "l2tp" else False
+
     try:
         token_obj = await create_provisioning_token(
             db=db,
             user_id=user.id,
             payment_methods=request.payment_methods,
             vpn_type=vpn_type,
+            is_routerboard=is_routerboard,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -70,10 +87,23 @@ async def create_provision_token(
     command = build_provision_command(token_obj)
 
     if vpn_type == "l2tp":
-        note = (
-            "This token is for RouterOS v6 (L2TP/IPsec VPN). "
-            "Paste the command on a factory-reset MikroTik running RouterOS v6."
-        )
+        if is_routerboard:
+            note = (
+                "This token is for RouterOS v6 (L2TP/IPsec VPN) on a hEX / "
+                "RouterBOARD with a split filesystem -- the captive portal "
+                "html-directory will be set to `flash/hotspot` so the custom "
+                "login page survives reboot. Paste the command on a "
+                "factory-reset MikroTik."
+            )
+        else:
+            note = (
+                "This token is for RouterOS v6 (L2TP/IPsec VPN). "
+                "Paste the command on a factory-reset MikroTik running RouterOS v6. "
+                "If after provisioning your clients are NOT redirected to the "
+                "captive portal AND the device is a hEX / hAP / RB-series board "
+                "(split RAM/flash filesystem), recreate the token with "
+                "`is_routerboard=true`."
+            )
     else:
         note = (
             "IMPORTANT: Before running this command on the MikroTik, ensure "
@@ -87,6 +117,7 @@ async def create_provision_token(
         "router_name": token_obj.router_name,
         "identity": token_obj.identity,
         "vpn_type": token_obj.vpn_type,
+        "is_routerboard": token_obj.is_routerboard,
         "vpn_ip": token_obj.wireguard_ip,
         "command": command,
         "note": note,
@@ -116,6 +147,7 @@ async def list_provision_tokens(
             "router_name": t.router_name,
             "identity": t.identity,
             "vpn_type": t.vpn_type,
+            "is_routerboard": t.is_routerboard,
             "vpn_ip": t.wireguard_ip,
             "status": t.status.value if hasattr(t.status, "value") else t.status,
             "expired": is_token_expired(t) and t.status == ProvisioningTokenStatus.PENDING,

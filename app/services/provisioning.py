@@ -367,46 +367,71 @@ def _rsc_vpn_l2tp(token: ProvisioningToken) -> str:
 
 
 def _rsc_hotspot(token: ProvisioningToken) -> str:
-    # The split-filesystem (`flash/` is NAND-persistent, `/file` root is
-    # tmpfs) is a RouterOS v6 RouterBOARD characteristic. RouterOS v7
-    # RouterBOARDs ship a unified, fully persistent filesystem -- writing
-    # custom hotspot HTML to plain `hotspot/` is correct on all v7 devices,
-    # including hEX/hEX S/CCR running v7. Forcing `flash/hotspot` there
-    # points the profile at a directory the hotspot service does not read
-    # from, so the captive-portal redirect breaks.
+    # Pick the hotspot html-directory at script-render time based on
+    # (vpn_type, is_routerboard):
     #
-    # We use vpn_type as the RouterOS-version marker (l2tp == v6,
-    # wireguard == v7) and only run the board-name detection on v6.
+    #   * v7 (wireguard)              -> "hotspot"     (unified persistent FS,
+    #                                                   always correct)
+    #   * v6 (l2tp), is_routerboard=F -> "hotspot"     (DEFAULT: matches the
+    #                                                   pre-cef0221 behaviour
+    #                                                   that worked for every
+    #                                                   v6 router we had in
+    #                                                   the field; the
+    #                                                   captive-portal redirect
+    #                                                   works correctly on CHR,
+    #                                                   x86, and on every v6
+    #                                                   build whose firmware
+    #                                                   uses a unified FS.)
+    #   * v6 (l2tp), is_routerboard=T -> "flash/hotspot"  (legacy hEX/RB-series
+    #                                                   workaround: the root
+    #                                                   `/file` tree on those
+    #                                                   boards is RAM-backed
+    #                                                   tmpfs and only `flash/`
+    #                                                   is NAND-persistent, so
+    #                                                   custom login.html
+    #                                                   written to plain
+    #                                                   `hotspot/` is wiped on
+    #                                                   reboot. The frontend
+    #                                                   exposes this as an
+    #                                                   explicit "hEX /
+    #                                                   RouterBOARD on v6"
+    #                                                   checkbox -- it is NOT
+    #                                                   inferred from
+    #                                                   board-name anymore,
+    #                                                   because the same
+    #                                                   detection mis-fired on
+    #                                                   v6 hAP-series and
+    #                                                   newer-firmware hEX
+    #                                                   builds where `flash/`
+    #                                                   either does not exist
+    #                                                   or is not what the
+    #                                                   hotspot service reads
+    #                                                   from.)
     is_v6 = token.vpn_type == "l2tp"
-    if is_v6:
+    use_flash_dir = is_v6 and bool(getattr(token, "is_routerboard", False))
+
+    if use_flash_dir:
         html_dir_block = """
-# Pick a persistent hotspot html-directory for this device.
-# RouterBOARD boards on RouterOS v6 (hEX, hEX S, hEX lite, hEX PoE,
-# CCR, ...) have a split filesystem: the root /file tree is RAM-backed
-# (tmpfs) and only the `flash/` folder is NAND-persistent. If we set
-# html-directory=hotspot on those boards, our custom login.html is
-# written to RAM and wiped on reboot -- RouterOS then serves the
-# built-in default login page instead of redirecting clients to our
-# captive portal. CHR / x86 have no `flash` folder and their whole
-# filesystem is already persistent, so plain `hotspot` is fine for them.
-:global bwHtmlDir "hotspot"
-:local bwBoard ""
-:do { :set bwBoard [/system resource get board-name] } on-error={}
-:if ([:len $bwBoard] > 0 and $bwBoard != "CHR" and $bwBoard != "x86") do={
-    :set bwHtmlDir "flash/hotspot"
-    :log info ("Provisioning: RouterBOARD " . $bwBoard . " (v6) detected, html-directory=" . $bwHtmlDir)
-} else={
-    :log info ("Provisioning: board-name=" . $bwBoard . " (v6, non-persistent root), html-directory=hotspot")
-}"""
+# RouterOS v6 hEX / hAP / RB-series with split filesystem (root is tmpfs,
+# only `flash/` is NAND-persistent). The frontend opted in via
+# is_routerboard=true, so point hsprof1.html-directory at `flash/hotspot`
+# so our custom login.html survives reboot.
+:global bwHtmlDir "flash/hotspot"
+:log info "Provisioning: v6 RouterBOARD opt-in, html-directory=flash/hotspot" """
     else:
-        # RouterOS v7: unified persistent filesystem on every platform we
-        # support, so the default `hotspot/` directory is correct.
+        # Default path: plain `hotspot`. Correct for v7 on every platform,
+        # and correct for v6 on CHR / x86 / any v6 firmware with a unified
+        # persistent filesystem. Matches the behaviour we shipped before
+        # commit cef0221.
         html_dir_block = """
-# RouterOS v7: filesystem is unified and persistent on every supported
-# platform (CHR, x86, hEX/CCR/etc. running v7), so use the default
-# `hotspot` html-directory unconditionally.
+# Default html-directory. Works on:
+#   - RouterOS v7 (unified persistent FS on every supported platform)
+#   - RouterOS v6 CHR / x86 / unified-FS builds
+# v6 RouterBOARDs with a split RAM/flash filesystem (legacy hEX, hAP, RB-
+# series) need is_routerboard=true at token-creation time to switch to
+# `flash/hotspot` instead.
 :global bwHtmlDir "hotspot"
-:log info "Provisioning: RouterOS v7 detected, html-directory=hotspot" """
+:log info "Provisioning: default html-directory=hotspot" """
 
     return """
 # ---- STEP 4: HOTSPOT SETUP ----
@@ -481,9 +506,10 @@ def _rsc_login_page(token: ProvisioningToken) -> str:
 :delay 2s
 
 # Derive the destination from the hotspot profile so we always write into
-# whatever html-directory step 4 picked -- `flash/hotspot` on hEX/CCR/etc.,
-# `hotspot` on CHR/x86. Falls back to the $bwHtmlDir global, then to the
-# legacy `hotspot` path if neither is available.
+# whatever html-directory step 4 picked: `flash/hotspot` for v6 RouterBOARDs
+# provisioned with is_routerboard=true, `hotspot` everywhere else. Falls back
+# to the $bwHtmlDir global, then to the legacy `hotspot` path if neither is
+# available.
 :local htmlDir ""
 :do {{
     :set htmlDir [/ip hotspot profile get [find where name=hsprof1] html-directory]
@@ -646,6 +672,7 @@ async def create_provisioning_token(
     user_id: int,
     payment_methods: Optional[list] = None,
     vpn_type: str = "wireguard",
+    is_routerboard: bool = False,
 ) -> ProvisioningToken:
     """
     Full provisioning flow supporting both WireGuard (v7) and L2TP/IPsec (v6):
@@ -702,6 +729,9 @@ async def create_provisioning_token(
             l2tp_password=l2tp_password,
             server_public_ip=settings.SERVER_PUBLIC_IP,
             payment_methods=payment_methods or ["mpesa", "voucher"],
+            # v7 always uses unified `hotspot` html-directory; only honour the
+            # routerboard opt-in for v6 (L2TP) tokens.
+            is_routerboard=bool(is_routerboard) and vpn_type == "l2tp",
             status=ProvisioningTokenStatus.PENDING,
         )
 

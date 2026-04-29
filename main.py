@@ -365,6 +365,21 @@ async def run_radius_migrations():
         else:
             logger.info("Migration: provisioning_tokens vpn_type column already exists, skipping")
 
+        # --- Provisioning tokens: add is_routerboard opt-in flag (v6 hEX/RouterBOARD split-FS) ---
+        result = await conn.execute(sa_text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'provisioning_tokens' AND column_name = 'is_routerboard'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE provisioning_tokens
+                ADD COLUMN is_routerboard BOOLEAN NOT NULL DEFAULT FALSE
+            """))
+            logger.info("Migration: Added is_routerboard column to provisioning_tokens")
+        else:
+            logger.info("Migration: provisioning_tokens is_routerboard column already exists, skipping")
+
         # --- PPPoE columns on customers table ---
         result = await conn.execute(sa_text("""
             SELECT column_name

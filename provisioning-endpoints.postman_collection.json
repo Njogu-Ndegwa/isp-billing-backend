@@ -10,7 +10,7 @@
     ],
     "item": [
         {
-            "name": "Create Provisioning Token",
+            "name": "Create Provisioning Token (RouterOS v7 / WireGuard)",
             "request": {
                 "method": "POST",
                 "url": "{{baseUrl}}/api/provision/create",
@@ -22,11 +22,11 @@
                     "mode": "raw",
                     "raw": "{\n    \"payment_methods\": [\"mpesa\", \"voucher\"],\n    \"vpn_type\": \"wireguard\"\n}"
                 },
-                "description": "Create a provisioning token. Set vpn_type to 'wireguard' for RouterOS v7 or 'l2tp' for RouterOS v6."
+                "description": "Create a provisioning token for a RouterOS v7 router (WireGuard VPN). is_routerboard is ignored on v7."
             }
         },
         {
-            "name": "Create Provisioning Token (RouterOS v6 / L2TP)",
+            "name": "Create Provisioning Token (RouterOS v6 / L2TP, default)",
             "request": {
                 "method": "POST",
                 "url": "{{baseUrl}}/api/provision/create",
@@ -36,9 +36,25 @@
                 ],
                 "body": {
                     "mode": "raw",
-                    "raw": "{\n    \"payment_methods\": [\"mpesa\", \"voucher\"],\n    \"vpn_type\": \"l2tp\"\n}"
+                    "raw": "{\n    \"payment_methods\": [\"mpesa\", \"voucher\"],\n    \"vpn_type\": \"l2tp\",\n    \"is_routerboard\": false\n}"
                 },
-                "description": "Create a provisioning token for a RouterOS v6 router using L2TP/IPsec VPN."
+                "description": "Create a provisioning token for a RouterOS v6 router using L2TP/IPsec VPN. Default behaviour: hotspot html-directory is set to 'hotspot'. Use this for CHR / x86 / any v6 build with a unified persistent filesystem."
+            }
+        },
+        {
+            "name": "Create Provisioning Token (RouterOS v6 / L2TP, hEX/RouterBOARD)",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/provision/create",
+                "header": [
+                    {"key": "Content-Type", "value": "application/json"},
+                    {"key": "Authorization", "value": "Bearer {{authToken}}"}
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"payment_methods\": [\"mpesa\", \"voucher\"],\n    \"vpn_type\": \"l2tp\",\n    \"is_routerboard\": true\n}"
+                },
+                "description": "Create a provisioning token for a v6 hEX / hAP / RB-series router whose root filesystem is RAM-backed (tmpfs) and only `flash/` is NAND-persistent. The .rsc will set hotspot html-directory=flash/hotspot so the custom login.html survives reboot. Only set is_routerboard=true if the default token (above) does NOT redirect clients to the captive portal after a reboot."
             }
         },
         {

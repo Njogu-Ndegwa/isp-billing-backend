@@ -659,6 +659,15 @@ class ProvisioningToken(Base):
     server_wg_pubkey = Column(String, nullable=True)
     server_public_ip = Column(String(45), nullable=False)
     payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
+    # Opt-in flag for the legacy v6 RouterBOARD split-filesystem workaround.
+    # When True (and vpn_type == "l2tp"), the .rsc generator points the hotspot
+    # html-directory at `flash/hotspot` so our custom login.html survives reboot
+    # on hEX / hAP / RB-series boards whose root filesystem is RAM-backed
+    # (tmpfs) and only `flash/` is NAND-persistent. When False (default), we use
+    # plain `hotspot` -- the safe path that works on CHR, x86, and on every v6
+    # board whose RouterOS build uses a unified persistent filesystem. v7 always
+    # ignores this flag because v7 has a unified filesystem on all platforms.
+    is_routerboard = Column(Boolean, nullable=False, server_default="false", default=False)
     status = Column(
         Enum(ProvisioningTokenStatus, name="provisioningtokenstatus", values_callable=lambda e: [x.value for x in e]),
         nullable=False,
