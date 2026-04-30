@@ -54,6 +54,7 @@ from app.api.admin_metrics_routes import router as admin_metrics_router
 from app.api.lead_routes import router as lead_router
 from app.api.usage_routes import router as usage_router
 from app.api.access_credential_routes import router as access_credential_router
+from app.api.shop_routes import router as shop_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -86,6 +87,7 @@ app.include_router(admin_metrics_router)
 app.include_router(lead_router)
 app.include_router(usage_router)
 app.include_router(access_credential_router)
+app.include_router(shop_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -1326,6 +1328,88 @@ async def run_payment_history_migrations():
     logger.info("Migration: payment-history preservation + balance-correction + cascade-guard schema ready")
 
 
+async def run_shop_migrations():
+    """Create shop tables (idempotent)."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                CREATE TYPE shoporderstatus AS ENUM (
+                    'pending','confirmed','processing','shipped','delivered','cancelled'
+                );
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$
+        """))
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                CREATE TYPE shoporderpaymentstatus AS ENUM ('unpaid','paid','refunded');
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$
+        """))
+        await conn.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS shop_products (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                name VARCHAR(255) NOT NULL,
+                description VARCHAR(2000),
+                price NUMERIC(10,2) NOT NULL,
+                stock_quantity INTEGER NOT NULL DEFAULT 0,
+                image_url VARCHAR(500),
+                category VARCHAR(100),
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        await conn.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS shop_orders (
+                id SERIAL PRIMARY KEY,
+                order_number VARCHAR(20) UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                buyer_name VARCHAR(255) NOT NULL,
+                buyer_phone VARCHAR(20) NOT NULL,
+                buyer_email VARCHAR(100),
+                delivery_address VARCHAR(500),
+                total_amount NUMERIC(10,2) NOT NULL,
+                status shoporderstatus NOT NULL DEFAULT 'pending',
+                payment_status shoporderpaymentstatus NOT NULL DEFAULT 'unpaid',
+                mpesa_checkout_request_id VARCHAR(255) UNIQUE,
+                mpesa_receipt_number VARCHAR(255),
+                notes VARCHAR(500),
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        await conn.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS shop_order_items (
+                id SERIAL PRIMARY KEY,
+                order_id INTEGER NOT NULL REFERENCES shop_orders(id) ON DELETE CASCADE,
+                product_id INTEGER REFERENCES shop_products(id),
+                product_name VARCHAR(255) NOT NULL,
+                product_price NUMERIC(10,2) NOT NULL,
+                quantity INTEGER NOT NULL,
+                subtotal NUMERIC(10,2) NOT NULL
+            )
+        """))
+        await conn.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS shop_order_tracking (
+                id SERIAL PRIMARY KEY,
+                order_id INTEGER NOT NULL REFERENCES shop_orders(id) ON DELETE CASCADE,
+                status_label VARCHAR(100) NOT NULL,
+                note VARCHAR(500),
+                updated_by_user_id INTEGER REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        # Indexes
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_shop_products_user ON shop_products(user_id)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_shop_products_active ON shop_products(is_active)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_shop_orders_user ON shop_orders(user_id)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_shop_orders_number ON shop_orders(order_number)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_shop_order_items_order ON shop_order_items(order_id)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_shop_tracking_order ON shop_order_tracking(order_id)"))
+    logger.info("Shop tables ready")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -1405,6 +1489,12 @@ async def startup_event():
         logger.info("Payment history migrations completed successfully")
     except Exception as e:
         logger.error(f"Payment history migration failed (non-fatal): {e}")
+
+    try:
+        await run_shop_migrations()
+        logger.info("Shop migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Shop migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

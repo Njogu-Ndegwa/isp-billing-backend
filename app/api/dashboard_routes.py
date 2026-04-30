@@ -11,6 +11,7 @@ from app.db.models import (
     Router, Customer, Plan, CustomerStatus, CustomerPayment,
     MpesaTransaction, MpesaTransactionStatus,
     ResellerPayout, ResellerTransactionCharge, PaymentMethod,
+    ShopOrder, ShopOrderPaymentStatus,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import get_invoice_alert_for_user
@@ -319,6 +320,13 @@ async def get_dashboard_overview(
         except Exception as alert_err:
             logger.warning(f"Failed to get subscription alert for user {user_id}: {alert_err}")
 
+        # --- Shop revenue block (additive; failure never affects billing data) ---
+        shop_summary = None
+        try:
+            shop_summary = await _compute_shop_summary(db, user_id, now)
+        except Exception as shop_err:
+            logger.warning(f"Shop summary skipped (non-fatal): {shop_err}")
+
         return {
             "router_id": router_id,
             "router_name": router_name,
@@ -338,6 +346,7 @@ async def get_dashboard_overview(
             "recent_transactions": recent_transactions,
             "expiring_soon": expiring_soon,
             "subscription_alert": subscription_alert,
+            "shop": shop_summary,
             "generated_at": now.isoformat()
         }
         
@@ -1132,6 +1141,53 @@ async def get_reseller_account_statement(
         "total_entries": total_entries,
         "total_pages": (total_entries + per_page - 1) // per_page if total_entries else 0,
         "entries": paginated,
+    }
+
+
+async def _compute_shop_summary(db: AsyncSession, user_id: int, now: datetime) -> dict:
+    """
+    Compute the shop revenue block included in the unified overview.
+    Completely isolated — any exception is caught by the caller.
+    """
+    today_start = datetime(now.year, now.month, now.day)
+    week_start = today_start - timedelta(days=today_start.weekday())
+    month_start = datetime(now.year, now.month, 1)
+
+    base = (
+        select(func.coalesce(func.sum(ShopOrder.total_amount), 0))
+        .where(
+            ShopOrder.user_id == user_id,
+            ShopOrder.payment_status == ShopOrderPaymentStatus.PAID,
+        )
+    )
+
+    async def _rev(extra):
+        return float((await db.execute(base.where(extra))).scalar())
+
+    pending_count = int((await db.execute(
+        select(func.count(ShopOrder.id)).where(
+            ShopOrder.user_id == user_id,
+            ShopOrder.payment_status == ShopOrderPaymentStatus.UNPAID,
+        )
+    )).scalar() or 0)
+
+    needs_fulfillment = int((await db.execute(
+        select(func.count(ShopOrder.id)).where(
+            ShopOrder.user_id == user_id,
+            ShopOrder.payment_status == ShopOrderPaymentStatus.PAID,
+            ShopOrder.status.in_(["confirmed", "processing"]),
+        )
+    )).scalar() or 0)
+
+    return {
+        "revenue": {
+            "today":      await _rev(ShopOrder.created_at >= today_start),
+            "this_week":  await _rev(ShopOrder.created_at >= week_start),
+            "this_month": await _rev(ShopOrder.created_at >= month_start),
+            "all_time":   float((await db.execute(base)).scalar()),
+        },
+        "pending_payment_orders": pending_count,
+        "needs_fulfillment": needs_fulfillment,
     }
 
 

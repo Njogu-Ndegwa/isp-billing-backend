@@ -1171,3 +1171,109 @@ class AccessCredential(Base):
 
     user = relationship("User", backref="access_credentials")
     router = relationship("Router")
+
+
+# ========================================
+# SHOP / E-COMMERCE MODELS
+# ========================================
+
+class ShopOrderStatus(str, enum.Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    PROCESSING = "processing"
+    SHIPPED = "shipped"
+    DELIVERED = "delivered"
+    CANCELLED = "cancelled"
+
+
+class ShopOrderPaymentStatus(str, enum.Enum):
+    UNPAID = "unpaid"
+    PAID = "paid"
+    REFUNDED = "refunded"
+
+
+class ShopProduct(Base):
+    __tablename__ = "shop_products"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    description = Column(String(2000), nullable=True)
+    price = Column(DECIMAL(10, 2), nullable=False)
+    stock_quantity = Column(Integer, default=0, server_default="0")
+    image_url = Column(String(500), nullable=True)
+    category = Column(String(100), nullable=True)
+    is_active = Column(Boolean, default=True, server_default="true", index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", backref="shop_products")
+    order_items = relationship("ShopOrderItem", back_populates="product")
+
+
+class ShopOrder(Base):
+    __tablename__ = "shop_orders"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_number = Column(String(20), unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    buyer_name = Column(String(255), nullable=False)
+    buyer_phone = Column(String(20), nullable=False)
+    buyer_email = Column(String(100), nullable=True)
+    delivery_address = Column(String(500), nullable=True)
+    total_amount = Column(DECIMAL(10, 2), nullable=False)
+    status = Column(
+        Enum(ShopOrderStatus, name="shoporderstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=ShopOrderStatus.PENDING,
+        server_default="pending",
+    )
+    payment_status = Column(
+        Enum(ShopOrderPaymentStatus, name="shoporderpaymentstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=ShopOrderPaymentStatus.UNPAID,
+        server_default="unpaid",
+    )
+    mpesa_checkout_request_id = Column(String(255), nullable=True, unique=True, index=True)
+    mpesa_receipt_number = Column(String(255), nullable=True)
+    notes = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", backref="shop_orders")
+    items = relationship("ShopOrderItem", back_populates="order", cascade="all, delete-orphan")
+    tracking_history = relationship(
+        "ShopOrderTracking", back_populates="order",
+        order_by="ShopOrderTracking.created_at.asc()",
+    )
+
+
+class ShopOrderItem(Base):
+    __tablename__ = "shop_order_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(Integer, ForeignKey("shop_orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    product_id = Column(Integer, ForeignKey("shop_products.id"), nullable=True)
+    product_name = Column(String(255), nullable=False)
+    product_price = Column(DECIMAL(10, 2), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    subtotal = Column(DECIMAL(10, 2), nullable=False)
+
+    order = relationship("ShopOrder", back_populates="items")
+    product = relationship("ShopProduct", back_populates="order_items")
+
+
+class ShopOrderTracking(Base):
+    __tablename__ = "shop_order_tracking"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(Integer, ForeignKey("shop_orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    status_label = Column(String(100), nullable=False)
+    note = Column(String(500), nullable=True)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    order = relationship("ShopOrder", back_populates="tracking_history")
+    updated_by = relationship("User", foreign_keys=[updated_by_user_id])
