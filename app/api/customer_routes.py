@@ -320,13 +320,35 @@ async def delete_customer(
                 logger.warning(f"Failed to remove PPPoE secret for customer {customer_id} during delete: {e}")
                 deprovision_result = "failed"
 
-        # Clean up child rows before deleting the parent. Tables with a
-        # NOT NULL customer_id FK (CustomerUsagePeriod, ProvisioningLog,
-        # ProvisioningAttempt, DevicePairing, Payment, CustomerPayment) MUST be
-        # deleted explicitly — SQLAlchemy's default behaviour on parent delete
-        # is to UPDATE child.customer_id = NULL, which violates those NOT NULL
-        # constraints. Tables with a nullable FK are deleted here too so the
-        # customer's history is cleaned up rather than orphaned.
+        # -----------------------------------------------------------------
+        # Snapshot the customer name into every payment row BEFORE we null
+        # out the FK, so the history UI can still show who paid.
+        # -----------------------------------------------------------------
+        await db.execute(
+            update(CustomerPayment)
+            .where(
+                CustomerPayment.customer_id == customer_id,
+                CustomerPayment.customer_name == None,  # noqa: E711
+            )
+            .values(customer_name=customer.name)
+        )
+
+        # -----------------------------------------------------------------
+        # Clean up child rows before deleting the parent.
+        # Rules:
+        #   • Operational rows (RADIUS, bandwidth, usage periods,
+        #     provisioning logs, device pairings, reconnections, ratings)
+        #     — DELETE: no audit value.
+        #   • CustomerPayment — SET customer_id = NULL: this is the
+        #     financial ledger used by balance calculations; preserving
+        #     these rows keeps total_revenue and unpaid_balance correct.
+        #   • MpesaTransaction / ZenoPay / MtnMomo raw event logs — DELETE:
+        #     the transactions list query filters on "customer_id IS NULL"
+        #     which is visible to all users, so nulling these out would
+        #     leak data across resellers. Balance is covered by
+        #     CustomerPayment, so deleting these is safe.
+        #   • Legacy Payment rows — NOT NULL column, deprecated, DELETE.
+        # -----------------------------------------------------------------
         await db.execute(
             update(Voucher).where(Voucher.redeemed_by == customer_id).values(redeemed_by=None)
         )
@@ -343,13 +365,35 @@ async def delete_customer(
         await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.customer_id == customer_id))
         await db.execute(delete(DevicePairing).where(DevicePairing.customer_id == customer_id))
         await db.execute(delete(ReconnectionAttempt).where(ReconnectionAttempt.customer_id == customer_id))
+
+        # CustomerPayment: NULL out customer FK to preserve revenue history.
+        # Balance calculations read CustomerPayment, so this keeps all totals intact.
+        await db.execute(
+            update(CustomerPayment)
+            .where(CustomerPayment.customer_id == customer_id)
+            .values(customer_id=None)
+        )
+
+        # MpesaTransaction / ZenoPay / MtnMomo: DELETE these raw event-log tables.
+        # Reason: the transactions list query uses "customer_id IS NULL" as a
+        # catch-all that is visible to every authenticated user — setting NULL
+        # would expose this customer's history to other resellers. Financial
+        # accuracy is already fully covered by the CustomerPayment rows above.
         await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id == customer_id))
         await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.customer_id == customer_id))
         await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id == customer_id))
-        await db.execute(delete(Payment).where(Payment.customer_id == customer_id))
-        await db.execute(delete(CustomerPayment).where(CustomerPayment.customer_id == customer_id))
 
+        # Legacy table — NOT NULL column, table is deprecated, safe to delete
+        await db.execute(delete(Payment).where(Payment.customer_id == customer_id))
+
+        # Delete the customer first, then flush so the upcoming count queries
+        # from update_reseller_financials already see N-1 customers.
         await db.delete(customer)
+        await db.flush()
+
+        from app.services.reseller_payments import update_reseller_financials
+        await update_reseller_financials(db, user.id)
+
         await db.commit()
 
         logger.info(f"Customer {customer_id} ({customer_name}) deleted by user {user.id}")
@@ -647,6 +691,7 @@ async def activate_pppoe_customer(
             days_paid_for=days_paid_for,
             status=PaymentStatus.COMPLETED,
             notes=request.notes or f"PPPoE activation via admin",
+            customer_name=customer.name,
         )
         db.add(payment)
 

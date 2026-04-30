@@ -42,7 +42,8 @@ async def record_customer_payment(
         payment_method=payment_method,
         payment_reference=payment_reference,
         days_paid_for=days_paid_for,
-        notes=notes
+        notes=notes,
+        customer_name=customer.name,
     )
     
     db.add(payment)

@@ -138,7 +138,8 @@ async def make_payment(
         payment_reference=payment_reference,
         payment_date=datetime.utcnow(),
         days_paid_for=days_paid_for,
-        status=PaymentStatus.COMPLETED
+        status=PaymentStatus.COMPLETED,
+        customer_name=customer.name,
     )
     db.add(payment)
 

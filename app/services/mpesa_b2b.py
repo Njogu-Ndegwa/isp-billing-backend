@@ -22,6 +22,8 @@ from app.db.models import (
     B2BTransactionStatus,
     CustomerPayment,
     PaymentMethod,
+    PaymentStatus,
+    ResellerFinancials,
     ResellerPayout,
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
@@ -433,11 +435,21 @@ async def _total_charges(db: AsyncSession, reseller_id: int) -> float:
     return float((await db.execute(stmt)).scalar())
 
 
+async def _balance_correction(db: AsyncSession, reseller_id: int) -> float:
+    """Return the stored one-time balance correction for this reseller (0 if none)."""
+    stmt = select(ResellerFinancials.balance_correction).where(
+        ResellerFinancials.user_id == reseller_id
+    )
+    val = (await db.execute(stmt)).scalar_one_or_none()
+    return float(val or 0)
+
+
 async def get_unpaid_balance(db: AsyncSession, reseller_id: int) -> float:
     mpesa_rev = await _mpesa_revenue(db, reseller_id)
     paid = await _total_payouts(db, reseller_id)
     charges = await _total_charges(db, reseller_id)
-    return round(mpesa_rev - paid - charges, 2)
+    correction = await _balance_correction(db, reseller_id)
+    return round(mpesa_rev + correction - paid - charges, 2)
 
 
 async def _monthly_b2b_count(db: AsyncSession, reseller_id: int) -> int:

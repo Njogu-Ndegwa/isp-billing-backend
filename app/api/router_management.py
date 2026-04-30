@@ -541,7 +541,12 @@ async def delete_router(
             sql_delete(RouterLogEntry)
             .where(RouterLogEntry.router_id == router_id)
         )
-        
+        # RouterAvailabilityCheck FK is RESTRICT (not CASCADE) — must delete explicitly
+        await db.execute(
+            sql_delete(RouterAvailabilityCheck)
+            .where(RouterAvailabilityCheck.router_id == router_id)
+        )
+
         await db.delete(router_obj)
         await db.commit()
         

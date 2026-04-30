@@ -1068,10 +1068,12 @@ async def get_mpesa_transactions(
                 mpesa_source_ids.append(tx.id)
 
         # --- Query 2: Non-M-Pesa payments (voucher, cash, etc.) ---
+        # Outer-join Customer so that payments whose customer was later deleted
+        # (customer_id SET NULL) are still included in the ledger.
         if want_other:
             cp_stmt = (
                 select(CustomerPayment, Customer, Router, Plan)
-                .join(Customer, CustomerPayment.customer_id == Customer.id)
+                .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
                 .outerjoin(Plan, Customer.plan_id == Plan.id)
                 .where(
@@ -1117,6 +1119,9 @@ async def get_mpesa_transactions(
                     rtr,
                     plan,
                 )
+                # When the customer was deleted, customer is None but
+                # pay.customer_name holds the name snapshot from deletion time.
+                display_name = (customer.name if customer else None) or pay.customer_name or "Deleted customer"
                 results.append({
                     "transaction_id": pay.id,
                     "checkout_request_id": None,
@@ -1139,7 +1144,13 @@ async def get_mpesa_transactions(
                         "phone": customer.phone,
                         "mac_address": customer.mac_address,
                         "status": customer.status.value,
-                    } if customer else None,
+                    } if customer else {
+                        "id": None,
+                        "name": display_name,
+                        "phone": None,
+                        "mac_address": None,
+                        "status": "deleted",
+                    },
                     "router": {
                         "id": rtr.id,
                         "name": rtr.name,
@@ -1412,7 +1423,7 @@ async def get_mpesa_transactions_summary(
         if want_other:
             cp_stmt = (
                 select(CustomerPayment, Customer, Router)
-                .join(Customer, CustomerPayment.customer_id == Customer.id)
+                .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
                 .where(
                     CustomerPayment.reseller_id == user.id,

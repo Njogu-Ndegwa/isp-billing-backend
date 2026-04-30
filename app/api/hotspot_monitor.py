@@ -1,12 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from typing import Optional
 from datetime import datetime
 
 
 from app.db.database import get_db
+from app.db.models import Customer
 from app.services.auth import verify_token, get_current_user
-from app.services.mikrotik_api import MikroTikAPI
+from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
 from app.services.log_persistence import persist_notable_logs
 from app.services.router_concurrency import run_with_guard
@@ -21,6 +24,9 @@ router = APIRouter(tags=["hotspot-monitor"])
 
 _hotspot_overview_cache: dict = {}  # router_id -> {"data": ..., "timestamp": datetime}
 _OVERVIEW_CACHE_TTL = 60  # 60 seconds
+
+_hotspot_users_cache: dict = {}  # router_id -> {"data": ..., "timestamp": datetime}
+_USERS_CACHE_TTL = 30  # 30 seconds -- live bandwidth changes fast
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +223,21 @@ def _hotspot_overview_sync(
         api.disconnect()
 
 
+def _hotspot_users_sync(router_info: dict) -> dict:
+    """Gather all hotspot users (configured + bypassed) with bandwidth and online state."""
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"],
+        router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        return api.get_hotspot_users_with_bandwidth()
+    finally:
+        api.disconnect()
+
+
 def _hotspot_logs_sync(router_info: dict, search: str = "", limit: int = 50) -> dict:
     api = MikroTikAPI(
         router_info["ip"], router_info["username"],
@@ -356,3 +377,129 @@ async def hotspot_logs(
         "notable_entries_persisted": persisted,
         **result,
     }
+
+
+@router.get("/api/hotspot/{router_id}/users")
+async def hotspot_users(
+    router_id: int,
+    refresh: bool = False,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """All hotspot clients for a router with online/offline status and live bandwidth.
+
+    The hotspot equivalent of ``GET /api/pppoe/{router_id}/users`` -- it returns
+    every configured hotspot user *and* every IP-binding (typically the bypassed
+    ISP-billed customers) on the router, enriched with:
+
+    - ``online`` flag (active session OR a hotspot host entry that is
+      authorized/bypassed). ``online_source`` tells you which signal won
+      (``"active"`` for portal sessions, ``"host"`` for bypassed customers).
+    - Live ``upload_rate`` / ``download_rate`` in bps, from the per-user
+      ``plan_<username>`` simple queue (same trick PPPoE uses).
+    - Cumulative session ``upload_bytes`` / ``download_bytes`` -- preferring
+      the active session counters and falling back to the queue's running
+      totals for bypassed clients that never touch the captive portal.
+    - ``mac_address``, ``address`` (IP), ``uptime``, ``idle_time``, ``login_by``
+      and ``binding_type`` (``bypassed`` / ``regular`` / ``blocked``).
+    - DB customer cross-reference (matched by MAC) with name, phone, plan,
+      and subscription status / expiry.
+
+    Cached for 30s per router unless ``?refresh=true``.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+
+    if not refresh and router_id in _hotspot_users_cache:
+        cached = _hotspot_users_cache[router_id]
+        age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
+        if age < _USERS_CACHE_TTL:
+            result = cached["data"].copy()
+            result["cached"] = True
+            result["cache_age_seconds"] = round(age, 1)
+            return result
+
+    router_info = {
+        "ip": router_obj.ip_address, "username": router_obj.username,
+        "password": router_obj.password, "port": router_obj.port,
+    }
+    result = await run_with_guard(router_id, _hotspot_users_sync, router_info)
+
+    if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "hotspot_users")
+        if router_id in _hotspot_users_cache:
+            stale = _hotspot_users_cache[router_id]["data"].copy()
+            stale["cached"] = True
+            stale["stale"] = True
+            stale["cache_age_seconds"] = (
+                datetime.utcnow() - _hotspot_users_cache[router_id]["timestamp"]
+            ).total_seconds()
+            return stale
+        raise HTTPException(status_code=503, detail="Failed to connect to router")
+    if result.get("error") == "timeout":
+        await record_router_availability(db, router_id, False, "hotspot_users")
+        if router_id in _hotspot_users_cache:
+            stale = _hotspot_users_cache[router_id]["data"].copy()
+            stale["cached"] = True
+            stale["stale"] = True
+            return stale
+        raise HTTPException(status_code=504, detail=result.get("detail", "Operation timed out"))
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    await record_router_availability(db, router_id, True, "hotspot_users")
+
+    # Cross-reference DB customers by MAC. Hotspot customers in this app are
+    # keyed on `Customer.mac_address`, normalized to colon-separated upper-case.
+    stmt = (
+        select(Customer)
+        .options(selectinload(Customer.plan))
+        .where(
+            Customer.router_id == router_id,
+            Customer.mac_address.isnot(None),
+        )
+    )
+    db_result = await db.execute(stmt)
+    customers = db_result.scalars().all()
+    customer_map: dict = {}
+    for c in customers:
+        mac = c.mac_address or ""
+        if not mac:
+            continue
+        try:
+            customer_map[normalize_mac_address(mac)] = c
+        except Exception:
+            customer_map[mac.upper()] = c
+
+    for u in result.get("users", []):
+        mac = u.get("mac_address") or ""
+        cust = customer_map.get(mac) if mac else None
+        if cust:
+            u["customer"] = {
+                "id": cust.id,
+                "name": cust.name,
+                "phone": cust.phone,
+                "status": cust.status.value if cust.status else "unknown",
+                "plan": cust.plan.name if cust.plan else None,
+                "plan_speed": cust.plan.speed if cust.plan else None,
+                "expiry": cust.expiry.isoformat() if cust.expiry else None,
+            }
+        else:
+            u["customer"] = None
+
+    response = {
+        "router_id": router_id,
+        "router_name": router_obj.name,
+        "generated_at": datetime.utcnow().isoformat(),
+        "cached": False,
+        **result,
+    }
+
+    _hotspot_users_cache[router_id] = {
+        "data": response,
+        "timestamp": datetime.utcnow(),
+    }
+
+    return response

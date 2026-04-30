@@ -221,7 +221,8 @@ class Payment(Base):
 class CustomerPayment(Base):
     __tablename__ = "customer_payments"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    # Nullable so that deleting a customer preserves the payment history (SET NULL, not CASCADE DELETE)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
     reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     amount = Column(Float, nullable=False)
     payment_method = Column(Enum(PaymentMethod), nullable=False, default=PaymentMethod.CASH)
@@ -230,6 +231,8 @@ class CustomerPayment(Base):
     days_paid_for = Column(Integer, nullable=False)
     status = Column(Enum(PaymentStatus), default=PaymentStatus.COMPLETED)
     notes = Column(String(500), nullable=True)
+    # Snapshot of customer name at payment time — preserved after customer deletion
+    customer_name = Column(String(255), nullable=True)
     lipay_tx_no = Column(String(255), nullable=True)
     collection_mode = Column(
         Enum(CollectionMode, name="collectionmode",
@@ -250,6 +253,10 @@ class ResellerFinancials(Base):
     active_customers = Column(Integer, default=0)
     last_payment_date = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # One-time correction applied when historical payment rows were lost due to
+    # cascading deletes. Always >= 0. Repaired via /api/admin/repair-balance.
+    balance_correction = Column(Float, default=0.0, nullable=False)
+    balance_corrected_at = Column(DateTime, nullable=True)
     user = relationship("User", backref="financials")
 
 class Subscription(Base):
@@ -711,7 +718,8 @@ class RouterAvailabilityCheck(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    router_id = Column(Integer, ForeignKey("routers.id", ondelete="CASCADE"), nullable=False, index=True)
+    # RESTRICT (not CASCADE) — router deletion must explicitly clean these rows
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="RESTRICT"), nullable=False, index=True)
     checked_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     is_online = Column(Boolean, nullable=False, index=True)
     source = Column(String(50), nullable=False, default="unknown")

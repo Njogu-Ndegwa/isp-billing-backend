@@ -1,3 +1,23 @@
+# ---------------------------------------------------------------------------
+# Shared logging config.
+#
+# Default driver: json-file with rotation (50MB x 5 files = ~250MB max per
+# container). This prevents the EC2 root volume from filling up when a
+# container runs for weeks. Logs still live under
+# /var/lib/docker/containers/<id>/ and are LOST when a container is removed
+# (e.g. on `docker compose up` after a new image is pulled).
+#
+# To survive deploys, enable CloudWatch Logs by overriding the `logging:`
+# block on individual services (see commented examples below). Requires the
+# EC2 instance role to have `logs:CreateLogStream` + `logs:PutLogEvents` on
+# the target log group.
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+
 services:
   db:
     image: postgres:15-alpine
@@ -13,6 +33,7 @@ services:
     restart: unless-stopped
     networks:
       - isp-network
+    logging: *default-logging
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U isp_user -d isp_billing_db"]
       interval: 10s
@@ -62,6 +83,17 @@ services:
       db:
         condition: service_healthy
     restart: unless-stopped
+    logging: *default-logging
+    # --- To ship `web` logs to CloudWatch (survive deploys), comment out the
+    #     line above and uncomment this block. Then `docker compose up -d web`.
+    # logging:
+    #   driver: awslogs
+    #   options:
+    #     awslogs-region: us-east-1
+    #     awslogs-group: /isp-billing/web
+    #     awslogs-stream: web
+    #     awslogs-create-group: "true"
+    #     tag: "{{.Name}}/{{.ID}}"
 
   freeradius:
     build:
@@ -85,6 +117,15 @@ services:
     networks:
       - isp-network
     restart: unless-stopped
+    logging: *default-logging
+    # --- Optional: ship FreeRADIUS auth logs to CloudWatch
+    # logging:
+    #   driver: awslogs
+    #   options:
+    #     awslogs-region: us-east-1
+    #     awslogs-group: /isp-billing/freeradius
+    #     awslogs-stream: freeradius
+    #     awslogs-create-group: "true"
 
   wg-manager:
     build: ./wg-manager
@@ -100,6 +141,7 @@ services:
       - wg_sock:/var/run/wg-manager
       - /etc/ppp:/etc/ppp
     restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   postgres_data:

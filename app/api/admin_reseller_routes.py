@@ -83,6 +83,23 @@ async def _mpesa_revenue(db: AsyncSession, reseller_id: int) -> float:
     return float((await db.execute(stmt)).scalar())
 
 
+async def _unpaid_balance(db: AsyncSession, reseller_id: int) -> float:
+    """
+    Canonical unpaid-balance formula that includes the one-time balance_correction
+    applied when historical payment rows were lost to cascading deletes.
+    Always use this instead of computing mpesa_rev - paid - charges inline.
+    """
+    mpesa_rev = await _mpesa_revenue(db, reseller_id)
+    paid = await _total_payouts(db, reseller_id)
+    charges = await _total_transaction_charges(db, reseller_id)
+    correction_row = (await db.execute(
+        select(func.coalesce(ResellerFinancials.balance_correction, 0.0))
+        .where(ResellerFinancials.user_id == reseller_id)
+    )).scalar_one_or_none()
+    correction = float(correction_row or 0)
+    return round(mpesa_rev + correction - paid - charges, 2)
+
+
 def _serialize_payment_method_for_admin(pm: ResellerPaymentMethod) -> dict:
     """Return payment-destination info visible to the admin (no API secrets)."""
     mt = pm.method_type
@@ -251,11 +268,7 @@ async def list_resellers(
             select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*rev_filters, MPESA_FILTER)
         )).scalar())
 
-        # Unpaid balance = all-time M-Pesa revenue minus payouts minus transaction charges
-        all_time_mpesa = await _mpesa_revenue(db, r.id)
-        paid = await _total_payouts(db, r.id)
-        charges = await _total_transaction_charges(db, r.id)
-        unpaid = round(all_time_mpesa - paid - charges, 2)
+        unpaid = await _unpaid_balance(db, r.id)
 
         sub_status = r.subscription_status
         sub_status_val = sub_status.value if hasattr(sub_status, 'value') else sub_status
@@ -560,7 +573,7 @@ async def get_reseller_detail(
     # Recent 10 payments
     recent_stmt = (
         select(CustomerPayment, Customer, Plan)
-        .join(Customer, CustomerPayment.customer_id == Customer.id)
+        .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
         .outerjoin(Plan, Customer.plan_id == Plan.id)
         .where(CustomerPayment.reseller_id == reseller_id)
         .order_by(CustomerPayment.created_at.desc())
@@ -572,8 +585,8 @@ async def get_reseller_detail(
             "id": p.id,
             "amount": float(p.amount),
             "payment_method": p.payment_method.value,
-            "customer_name": c.name,
-            "customer_phone": c.phone,
+            "customer_name": (c.name if c else None) or p.customer_name or "Deleted customer",
+            "customer_phone": c.phone if c else None,
             "plan_name": pl.name if pl else None,
             "created_at": p.created_at.isoformat(),
         }
@@ -584,6 +597,7 @@ async def get_reseller_detail(
     all_time_mpesa = await _mpesa_revenue(db, reseller_id)
     total_paid = await _total_payouts(db, reseller_id)
     total_charges = await _total_transaction_charges(db, reseller_id)
+    unpaid_balance_with_correction = await _unpaid_balance(db, reseller_id)
 
     last_payout_stmt = select(func.max(ResellerPayout.created_at)).where(
         ResellerPayout.reseller_id == reseller_id
@@ -695,7 +709,7 @@ async def get_reseller_detail(
             "total_paid": total_paid,
             "total_transaction_charges": total_charges,
             "last_payout_date": last_payout_date.isoformat() if last_payout_date else None,
-            "unpaid_balance": round(all_time_mpesa - total_paid - total_charges, 2),
+            "unpaid_balance": unpaid_balance_with_correction,
         },
         "b2b_payouts": {
             "total_sent": round(b2b_total_sent, 2),
@@ -766,7 +780,7 @@ async def get_reseller_payments(
     offset = (page - 1) * per_page
     payments_stmt = (
         select(CustomerPayment, Customer, Plan)
-        .join(Customer, CustomerPayment.customer_id == Customer.id)
+        .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
         .outerjoin(Plan, Customer.plan_id == Plan.id)
         .where(*base_filter)
         .order_by(CustomerPayment.created_at.desc())
@@ -781,8 +795,8 @@ async def get_reseller_payments(
             "amount": float(p.amount),
             "payment_method": p.payment_method.value,
             "payment_reference": p.payment_reference,
-            "customer_name": c.name,
-            "customer_phone": c.phone,
+            "customer_name": (c.name if c else None) or p.customer_name or "Deleted customer",
+            "customer_phone": c.phone if c else None,
             "plan_name": pl.name if pl else None,
             "created_at": p.created_at.isoformat(),
         }
@@ -1282,11 +1296,7 @@ async def record_payout(
     await db.commit()
     await db.refresh(payout)
 
-    # Compute updated unpaid balance (M-Pesa revenue minus payouts minus charges)
-    mpesa_rev = await _mpesa_revenue(db, reseller_id)
-    paid = await _total_payouts(db, reseller_id)
-    charges = await _total_transaction_charges(db, reseller_id)
-    balance = round(mpesa_rev - paid - charges, 2)
+    balance = await _unpaid_balance(db, reseller_id)
 
     return {
         "payout": {
@@ -1783,10 +1793,7 @@ async def add_transaction_charge(
     await db.commit()
     await db.refresh(charge)
 
-    mpesa_rev = await _mpesa_revenue(db, reseller_id)
-    paid = await _total_payouts(db, reseller_id)
-    charges = await _total_transaction_charges(db, reseller_id)
-    balance = round(mpesa_rev - paid - charges, 2)
+    balance = await _unpaid_balance(db, reseller_id)
 
     return {
         "charge": {
@@ -1867,4 +1874,206 @@ async def get_transaction_charges(
             "total_amount": round(total_amount, 2),
         },
         "charges": charges,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Balance repair endpoints
+#
+# Context: before the payment-history fix, deleting a customer (or reseller)
+# deleted their CustomerPayment rows, which reduced mpesa_rev and drove the
+# unpaid balance negative. These endpoints correct that for affected resellers
+# without touching anyone whose balance is already accurate.
+#
+# Algorithm:
+#   last_payout_date = most recent ResellerPayout.created_at
+#   true_unpaid      = SUM(mobile-money CustomerPayments since last_payout_date)
+#                    - SUM(charges since last_payout_date)
+#   raw_balance      = mpesa_rev - total_paid - total_charges  (may be negative)
+#   correction       = max(0, true_unpaid - raw_balance)
+#
+# Non-affected resellers produce correction = 0 and are left untouched.
+# ---------------------------------------------------------------------------
+
+async def _compute_repair(db: AsyncSession, reseller_id: int) -> dict:
+    """
+    Compute the balance correction for one reseller without writing anything.
+    Returns a dict with diagnostic fields and the proposed correction amount.
+    """
+    MPESA = CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY
+
+    # Last payout date (None if no payouts ever)
+    last_payout_stmt = select(func.max(ResellerPayout.created_at)).where(
+        ResellerPayout.reseller_id == reseller_id
+    )
+    last_payout_date: datetime | None = (await db.execute(last_payout_stmt)).scalar_one_or_none()
+
+    # Payments since last payout (all time if no payout ever)
+    pm_filters = [CustomerPayment.reseller_id == reseller_id, MPESA]
+    if last_payout_date:
+        pm_filters.append(CustomerPayment.created_at > last_payout_date)
+    payments_since = float(
+        (await db.execute(
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*pm_filters)
+        )).scalar()
+    )
+
+    # Charges since last payout
+    ch_filters = [ResellerTransactionCharge.reseller_id == reseller_id]
+    if last_payout_date:
+        ch_filters.append(ResellerTransactionCharge.created_at > last_payout_date)
+    charges_since = float(
+        (await db.execute(
+            select(func.coalesce(func.sum(ResellerTransactionCharge.amount), 0)).where(*ch_filters)
+        )).scalar()
+    )
+
+    true_unpaid = max(0.0, round(payments_since - charges_since, 2))
+
+    # Raw balance: mpesa_rev minus total payouts minus total charges (no correction)
+    mpesa_rev = float(
+        (await db.execute(
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0))
+            .where(CustomerPayment.reseller_id == reseller_id, MPESA)
+        )).scalar()
+    )
+    total_paid = float(
+        (await db.execute(
+            select(func.coalesce(func.sum(ResellerPayout.amount), 0))
+            .where(ResellerPayout.reseller_id == reseller_id)
+        )).scalar()
+    )
+    total_charges = float(
+        (await db.execute(
+            select(func.coalesce(func.sum(ResellerTransactionCharge.amount), 0))
+            .where(ResellerTransactionCharge.reseller_id == reseller_id)
+        )).scalar()
+    )
+    raw_balance = round(mpesa_rev - total_paid - total_charges, 2)
+
+    # Existing correction already applied (to avoid double-applying)
+    existing_correction = float(
+        (await db.execute(
+            select(func.coalesce(ResellerFinancials.balance_correction, 0))
+            .where(ResellerFinancials.user_id == reseller_id)
+        )).scalar() or 0
+    )
+
+    new_correction = max(0.0, round(true_unpaid - raw_balance, 2))
+
+    return {
+        "reseller_id": reseller_id,
+        "last_payout_date": last_payout_date.isoformat() if last_payout_date else None,
+        "payments_since_last_payout": payments_since,
+        "charges_since_last_payout": charges_since,
+        "true_unpaid_balance": true_unpaid,
+        "raw_balance": raw_balance,
+        "existing_correction": existing_correction,
+        "proposed_correction": new_correction,
+        "needs_repair": new_correction > 0,
+    }
+
+
+async def _apply_repair(db: AsyncSession, reseller_id: int, correction: float) -> None:
+    """Persist the balance correction on reseller_financials."""
+    stmt = select(ResellerFinancials).where(ResellerFinancials.user_id == reseller_id)
+    financials = (await db.execute(stmt)).scalar_one_or_none()
+    if not financials:
+        financials = ResellerFinancials(user_id=reseller_id)
+        db.add(financials)
+    financials.balance_correction = correction
+    financials.balance_corrected_at = datetime.utcnow()
+
+
+@router.post("/api/admin/resellers/{reseller_id}/repair-balance")
+async def repair_reseller_balance(
+    reseller_id: int,
+    dry_run: bool = False,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Repair the unpaid balance for a reseller whose balance was corrupted by
+    historical cascading deletes.
+
+    The correction is computed as:
+        max(0,  payments_since_last_payout - charges_since_last_payout
+              - raw_current_balance)
+
+    For non-affected resellers the correction is 0 (idempotent).
+
+    Set dry_run=true to inspect the proposed correction without applying it.
+    """
+    await _require_admin(token, db)
+    await _get_reseller_or_404(db, reseller_id)
+
+    info = await _compute_repair(db, reseller_id)
+
+    if dry_run:
+        return {"dry_run": True, **info}
+
+    if info["proposed_correction"] > 0:
+        await _apply_repair(db, reseller_id, info["proposed_correction"])
+        await db.commit()
+        logger.info(
+            "Balance repaired: reseller=%s correction=%.2f raw_balance=%.2f true_unpaid=%.2f",
+            reseller_id, info["proposed_correction"], info["raw_balance"], info["true_unpaid_balance"],
+        )
+
+    return {
+        "dry_run": False,
+        "applied": info["proposed_correction"] > 0,
+        **info,
+    }
+
+
+@router.post("/api/admin/repair-all-balances")
+async def repair_all_balances(
+    dry_run: bool = True,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Scan every reseller and repair those with a corrupted balance.
+
+    Defaults to dry_run=true so you can review before committing.
+    Pass dry_run=false to apply all corrections in one transaction.
+
+    Only resellers with a positive proposed_correction are included in the
+    'repaired' list — non-affected users are listed under 'skipped'.
+    """
+    await _require_admin(token, db)
+
+    resellers_stmt = select(User).where(User.role == UserRole.RESELLER)
+    resellers = (await db.execute(resellers_stmt)).scalars().all()
+
+    repaired = []
+    skipped = []
+
+    for reseller in resellers:
+        info = await _compute_repair(db, reseller.id)
+        if info["needs_repair"]:
+            if not dry_run:
+                await _apply_repair(db, reseller.id, info["proposed_correction"])
+            repaired.append({
+                "reseller_id": reseller.id,
+                "email": reseller.email,
+                "proposed_correction": info["proposed_correction"],
+                "raw_balance": info["raw_balance"],
+                "true_unpaid_balance": info["true_unpaid_balance"],
+                "last_payout_date": info["last_payout_date"],
+            })
+        else:
+            skipped.append({"reseller_id": reseller.id, "email": reseller.email})
+
+    if not dry_run and repaired:
+        await db.commit()
+        logger.info("Bulk balance repair applied to %d reseller(s)", len(repaired))
+
+    return {
+        "dry_run": dry_run,
+        "repaired_count": len(repaired),
+        "skipped_count": len(skipped),
+        "repaired": repaired,
+        "skipped": skipped,
     }

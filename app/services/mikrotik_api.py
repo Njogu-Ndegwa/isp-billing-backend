@@ -1290,6 +1290,311 @@ class MikroTikAPI:
             logger.error(f"Error getting active hotspot users: {e}")
             return {"error": str(e)}
 
+    def get_hotspot_users_with_bandwidth(self) -> Dict[str, Any]:
+        """Get every hotspot client on the router with online status and live bandwidth.
+
+        Hotspot has two distinct identity models that this app uses side-by-side:
+
+        1. ``/ip/hotspot/user/print`` -- captive-portal users (username/password
+           voucher accounts).
+        2. ``/ip/hotspot/ip-binding/print`` -- MAC-based IP bindings, typically
+           ``bypassed`` for ISP-billed customers so they skip the portal.
+
+        The function unifies both lists, then joins each entry with:
+          * ``/ip/hotspot/active/print`` -- currently online portal sessions
+            (matched by user OR MAC).
+          * ``/ip/hotspot/host/print``   -- every device the hotspot service has
+            seen, including bypassed clients that never touch the portal. Used
+            to detect online state and pull cumulative bytes for bypassed
+            customers (they don't appear in /active because they skip the auth
+            step).
+          * ``/queue/simple/print``      -- per-user ``plan_<username>`` simple
+            queues created at provisioning time. These are the source of truth
+            for live upload/download rate (``rate``) and cumulative session
+            bytes (``bytes``) -- the same dynamic-queue trick PPPoE uses, just
+            with a different naming scheme.
+
+        Returns a list of ``users`` mirroring the PPPoE shape (online flag,
+        ``upload_rate``/``download_rate`` as bps strings, session ``upload_bytes``/
+        ``download_bytes``, ``uptime``, ``address``, ``max_limit``, etc.) plus
+        hotspot-specific fields (``mac_address``, ``binding_type``, ``bypassed``,
+        ``authorized``) and a summary block.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            users_res = self.send_command("/ip/hotspot/user/print")
+            bindings_res = self.send_command("/ip/hotspot/ip-binding/print")
+            active_res = self.send_command("/ip/hotspot/active/print")
+            hosts_res = self.send_command("/ip/hotspot/host/print")
+            queue_res = self.send_command_optimized(
+                "/queue/simple/print",
+                proplist=[".id", "name", "target", "max-limit", "rate", "bytes",
+                          "comment", "disabled"],
+            )
+
+            users_raw = users_res.get("data", []) if users_res.get("success") else []
+            bindings_raw = bindings_res.get("data", []) if bindings_res.get("success") else []
+            actives_raw = active_res.get("data", []) if active_res.get("success") else []
+            hosts_raw = hosts_res.get("data", []) if hosts_res.get("success") else []
+            queues_raw = queue_res.get("data", []) if queue_res.get("success") else []
+
+            def _norm(mac: str) -> str:
+                if not mac:
+                    return ""
+                try:
+                    return normalize_mac_address(mac)
+                except Exception:
+                    return mac.upper()
+
+            active_by_mac: Dict[str, dict] = {}
+            active_by_user: Dict[str, dict] = {}
+            for a in actives_raw:
+                mac = _norm(a.get("mac-address", ""))
+                if mac:
+                    active_by_mac[mac] = a
+                user_name = a.get("user", "")
+                if user_name:
+                    active_by_user[user_name.lower()] = a
+
+            host_by_mac: Dict[str, dict] = {}
+            for h in hosts_raw:
+                mac = _norm(h.get("mac-address", ""))
+                if mac:
+                    host_by_mac[mac] = h
+
+            binding_by_mac: Dict[str, dict] = {}
+            user_to_mac: Dict[str, str] = {}
+            for b in bindings_raw:
+                mac = _norm(b.get("mac-address", ""))
+                if not mac:
+                    continue
+                binding_by_mac[mac] = b
+                comment = b.get("comment", "") or ""
+                m = re.search(r"USER:([^|]+)", comment)
+                if m:
+                    user_to_mac[m.group(1).strip().lower()] = mac
+
+            queue_by_user: Dict[str, dict] = {}
+            queue_by_ip: Dict[str, dict] = {}
+            for q in queues_raw:
+                qname = (q.get("name") or "").strip()
+                if qname.startswith("plan_"):
+                    queue_by_user[qname[5:].lower()] = q
+                target = (q.get("target") or "").strip()
+                if target:
+                    ip = target.split("/", 1)[0]
+                    if ip:
+                        queue_by_ip[ip] = q
+
+            def _parse_pair_bytes(raw: str):
+                if not raw:
+                    return 0, 0
+                parts = str(raw).split("/")
+                up = parts[0] if parts else "0"
+                down = parts[1] if len(parts) > 1 else "0"
+                return self._safe_int(up), self._safe_int(down)
+
+            def _parse_pair_rate(raw: str):
+                if not raw:
+                    return "0", "0"
+                parts = str(raw).split("/")
+                up = parts[0] if parts else "0"
+                down = parts[1] if len(parts) > 1 else "0"
+                return up or "0", down or "0"
+
+            def _build_entry(username: str,
+                             user_record: Optional[dict],
+                             binding: Optional[dict],
+                             mac: str) -> dict:
+                # Try every angle for an active session: by username, by MAC.
+                active = None
+                if username:
+                    active = active_by_user.get(username.lower())
+                if not active and mac:
+                    active = active_by_mac.get(mac)
+                host = host_by_mac.get(mac) if mac else None
+
+                # Queue lookup: by username first (matches plan_<username>),
+                # then by current IP if we have one. The IP fallback covers
+                # cases where the queue was created against the IP after a
+                # MAC change.
+                queue = queue_by_user.get(username.lower()) if username else None
+                if not queue:
+                    ip_hint = (active or {}).get("address") or (host or {}).get("address")
+                    if ip_hint:
+                        queue = queue_by_ip.get(ip_hint)
+
+                # Online detection in priority order:
+                #   1. There is an active session  -> portal-authenticated and online
+                #   2. Bypassed binding + host entry recently active -> ISP customer online
+                #   3. Otherwise offline.
+                online = False
+                source = None
+                if active:
+                    online = True
+                    source = "active"
+                elif host and (
+                    str(host.get("authorized", "")).lower() == "true"
+                    or str(host.get("bypassed", "")).lower() == "true"
+                ):
+                    online = True
+                    source = "host"
+
+                # Address: live session beats host beats binding's static address.
+                address = (
+                    (active or {}).get("address")
+                    or (host or {}).get("address")
+                    or (binding or {}).get("address")
+                    or ""
+                ) or None
+
+                # Cumulative bytes for the current "session". We prefer the
+                # queue (continuous since provisioning) for bypassed users,
+                # then active session, then host entry, then 0.
+                if queue:
+                    qb_up, qb_down = _parse_pair_bytes(queue.get("bytes", "0/0"))
+                else:
+                    qb_up, qb_down = 0, 0
+
+                if active:
+                    sess_up = self._safe_int(active.get("bytes-in"))
+                    sess_down = self._safe_int(active.get("bytes-out"))
+                elif host and online:
+                    sess_up = self._safe_int(host.get("bytes-in"))
+                    sess_down = self._safe_int(host.get("bytes-out"))
+                else:
+                    sess_up, sess_down = 0, 0
+
+                upload_bytes = sess_up if sess_up else qb_up
+                download_bytes = sess_down if sess_down else qb_down
+
+                # Live throughput from the per-user queue. MikroTik
+                # populates the "rate" field with current bps, so this is
+                # the same trick used by PPPoE monitoring.
+                if queue:
+                    upload_rate, download_rate = _parse_pair_rate(queue.get("rate", "0/0"))
+                else:
+                    upload_rate, download_rate = "0", "0"
+                if not online:
+                    upload_rate, download_rate = "0", "0"
+
+                max_limit = (queue or {}).get("max-limit", "") if queue else ""
+                if not max_limit and user_record:
+                    max_limit = user_record.get("limit-bytes-total", "") or ""
+
+                binding_type = (binding or {}).get("type", "") if binding else ""
+                disabled = False
+                if user_record:
+                    disabled = str(user_record.get("disabled", "")).lower() == "true"
+                # A "blocked" IP binding is functionally disabled even if the
+                # captive-portal user record (if any) is still enabled.
+                if binding_type == "blocked":
+                    disabled = True
+
+                comment = ""
+                if user_record and user_record.get("comment"):
+                    comment = user_record.get("comment", "")
+                elif binding and binding.get("comment"):
+                    comment = binding.get("comment", "")
+
+                return {
+                    "username": username,
+                    "mac_address": mac or "",
+                    "profile": (user_record or {}).get("profile", "") if user_record else "",
+                    "disabled": disabled,
+                    "comment": comment,
+                    "online": online,
+                    "online_source": source,  # "active" | "host" | None
+                    "address": address,
+                    "uptime": (active or {}).get("uptime") or (host or {}).get("uptime") or None,
+                    "idle_time": (active or {}).get("idle-time") or (host or {}).get("idle-time") or None,
+                    "login_by": (active or {}).get("login-by", "") if active else "",
+                    "upload_bytes": upload_bytes,
+                    "download_bytes": download_bytes,
+                    "upload_rate": upload_rate,
+                    "download_rate": download_rate,
+                    "max_limit": max_limit,
+                    "binding_type": binding_type,
+                    "bypassed": str((host or {}).get("bypassed", "")).lower() == "true"
+                                or binding_type == "bypassed",
+                    "authorized": str((host or {}).get("authorized", "")).lower() == "true",
+                    "has_queue": bool(queue),
+                }
+
+            users_out: List[dict] = []
+            seen_mac: set = set()
+            seen_username: set = set()
+            total_upload_rate = 0
+            total_download_rate = 0
+            online_count = 0
+            offline_count = 0
+            disabled_count = 0
+
+            # 1. Captive-portal users first -- they have a stable username.
+            for u in users_raw:
+                username = u.get("name", "")
+                if not username:
+                    continue
+
+                mac = user_to_mac.get(username.lower(), "")
+                # Fallback: this app provisions users as the MAC with no
+                # colons, so we can rebuild a candidate MAC from the username.
+                if not mac and len(username) == 12 and all(
+                    c in "0123456789abcdefABCDEF" for c in username
+                ):
+                    candidate = ":".join(username.upper()[i:i + 2] for i in range(0, 12, 2))
+                    if candidate in binding_by_mac:
+                        mac = candidate
+                binding = binding_by_mac.get(mac) if mac else None
+                entry = _build_entry(username, u, binding, mac)
+                users_out.append(entry)
+                seen_username.add(username.lower())
+                if mac:
+                    seen_mac.add(mac)
+
+            # 2. IP bindings without a matching captive-portal user (the
+            #    common case for ISP-billed bypass customers).
+            for b in bindings_raw:
+                mac = _norm(b.get("mac-address", ""))
+                if not mac or mac in seen_mac:
+                    continue
+                comment = b.get("comment", "") or ""
+                m = re.search(r"USER:([^|]+)", comment)
+                username = m.group(1).strip() if m else mac.replace(":", "").lower()
+                if username.lower() in seen_username:
+                    continue
+                entry = _build_entry(username, None, b, mac)
+                users_out.append(entry)
+                seen_username.add(username.lower())
+                seen_mac.add(mac)
+
+            for entry in users_out:
+                if entry["online"]:
+                    online_count += 1
+                    total_upload_rate += self._parse_rate_to_bps(entry["upload_rate"])
+                    total_download_rate += self._parse_rate_to_bps(entry["download_rate"])
+                else:
+                    offline_count += 1
+                if entry["disabled"]:
+                    disabled_count += 1
+
+            return {
+                "success": True,
+                "users": users_out,
+                "summary": {
+                    "total": len(users_out),
+                    "online": online_count,
+                    "offline": offline_count,
+                    "disabled": disabled_count,
+                    "total_upload_rate_bps": total_upload_rate,
+                    "total_download_rate_bps": total_download_rate,
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error getting hotspot users with bandwidth: {e}")
+            return {"error": str(e)}
+
     def get_health(self) -> Dict[str, Any]:
         """Get system health (temperature, voltage if available)"""
         if not self.connected:

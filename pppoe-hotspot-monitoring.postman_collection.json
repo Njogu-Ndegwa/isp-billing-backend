@@ -72,6 +72,22 @@
                     }
                 },
                 {
+                    "name": "Hotspot Users (online/offline + live bandwidth)",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "{{baseUrl}}/api/hotspot/{{router_id}}/users?refresh=false",
+                            "host": ["{{baseUrl}}"],
+                            "path": ["api", "hotspot", "{{router_id}}", "users"],
+                            "query": [
+                                {"key": "refresh", "value": "false"}
+                            ]
+                        },
+                        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}],
+                        "description": "Every hotspot client on the router (configured users + IP bindings) with online flag, mac address, IP, uptime, current upload/download rate (bps), session bytes, and DB customer cross-reference. Cached 30s; pass refresh=true to bypass."
+                    }
+                },
+                {
                     "name": "Hotspot Logs",
                     "request": {
                         "method": "GET",

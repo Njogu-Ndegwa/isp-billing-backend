@@ -1255,6 +1255,77 @@ async def run_lead_pipeline_migrations():
     logger.info("Migration: Lead pipeline tables and enums ready")
 
 
+async def run_payment_history_migrations():
+    """
+    Four idempotent schema changes that protect payment history:
+
+    1. Make customer_payments.customer_id nullable — rows survive customer deletion.
+    2. Add customer_name snapshot column — displays name even after customer deleted.
+    3. Back-fill customer_name from live customers table.
+    4. Add balance_correction + balance_corrected_at to reseller_financials — used
+       by the /api/admin/repair-balance endpoint to fix balances damaged by past
+       cascading deletes without touching non-affected users.
+    5. Change router_availability_checks FK from ON DELETE CASCADE → RESTRICT so
+       router deletion never silently wipes monitoring history (the deletion handler
+       now does this explicitly).
+    """
+    async with async_engine.begin() as conn:
+        # ── 1. Drop NOT NULL on customer_payments.customer_id ──────────────
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                ALTER TABLE customer_payments ALTER COLUMN customer_id DROP NOT NULL;
+            EXCEPTION WHEN others THEN NULL;
+            END $$
+        """))
+
+        # ── 2. Add customer_name snapshot column ────────────────────────────
+        await conn.execute(sa_text(
+            "ALTER TABLE customer_payments "
+            "ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255) NULL"
+        ))
+
+        # ── 3. Back-fill customer_name for rows that still have a customer_id ─
+        await conn.execute(sa_text("""
+            UPDATE customer_payments cp
+            SET customer_name = c.name
+            FROM customers c
+            WHERE cp.customer_id = c.id
+              AND cp.customer_name IS NULL
+        """))
+
+        # ── 4. Balance correction columns on reseller_financials ─────────────
+        await conn.execute(sa_text(
+            "ALTER TABLE reseller_financials "
+            "ADD COLUMN IF NOT EXISTS balance_correction FLOAT NOT NULL DEFAULT 0.0"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE reseller_financials "
+            "ADD COLUMN IF NOT EXISTS balance_corrected_at TIMESTAMP NULL"
+        ))
+
+        # ── 5. Change router_availability_checks FK: CASCADE → RESTRICT ──────
+        # Drop the old FK (name may vary; try both the auto-generated name and a
+        # custom one — ignore errors if neither exists).
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                ALTER TABLE router_availability_checks
+                    DROP CONSTRAINT IF EXISTS router_availability_checks_router_id_fkey;
+            EXCEPTION WHEN undefined_object THEN NULL;
+            END $$
+        """))
+        # Re-add with RESTRICT so deletion is always explicit in application code
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                ALTER TABLE router_availability_checks
+                    ADD CONSTRAINT router_availability_checks_router_id_fkey
+                    FOREIGN KEY (router_id) REFERENCES routers(id) ON DELETE RESTRICT;
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$
+        """))
+
+    logger.info("Migration: payment-history preservation + balance-correction + cascade-guard schema ready")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -1328,6 +1399,12 @@ async def startup_event():
         logger.info("FUP / usage tracking migrations completed successfully")
     except Exception as e:
         logger.error(f"FUP / usage tracking migration failed (non-fatal): {e}")
+
+    try:
+        await run_payment_history_migrations()
+        logger.info("Payment history migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Payment history migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,
