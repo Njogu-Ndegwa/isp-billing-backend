@@ -269,6 +269,7 @@ async def list_resellers(
         )).scalar())
 
         unpaid = await _unpaid_balance(db, r.id)
+        charges = await _total_transaction_charges(db, r.id)
 
         sub_status = r.subscription_status
         sub_status_val = sub_status.value if hasattr(sub_status, 'value') else sub_status
