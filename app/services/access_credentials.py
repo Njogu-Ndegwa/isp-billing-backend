@@ -290,11 +290,42 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                 elif wanted_old and bm == wanted_old and old_binding_id is None:
                     old_binding_id = b.get(".id")
 
+        # 2. Capture the client IP BEFORE writing the bypass binding.
+        #    When RouterOS processes a new bypass entry it immediately
+        #    transitions the device out of hotspot tracking, which removes
+        #    (or clears the address on) its /ip/hotspot/host row.  Reading
+        #    the host table after the bypass is written therefore returns
+        #    nothing, client_ip stays None, and the rate-limit queue is
+        #    never created — leaving the user with unrestricted speed.
+        #    Reading here, before the binding write, guarantees we capture
+        #    the IP while the device is still a tracked hotspot guest.
+        #    The ARP table is checked as a fallback for devices that
+        #    connected without triggering a hotspot redirect.
+        client_ip = None
+        hosts_resp = api.send_command("/ip/hotspot/host/print")
+        if hosts_resp.get("success") and hosts_resp.get("data"):
+            for h in hosts_resp["data"]:
+                hm = h.get("mac-address", "")
+                if hm and normalize_mac_address(hm) == mac_address:
+                    client_ip = h.get("address") or h.get("to-address")
+                    if client_ip:
+                        break
+
+        if not client_ip:
+            arp_resp = api.send_command("/ip/arp/print")
+            if arp_resp.get("success") and arp_resp.get("data"):
+                for entry in arp_resp["data"]:
+                    am = entry.get("mac-address", "")
+                    if am and normalize_mac_address(am) == mac_address:
+                        client_ip = entry.get("address")
+                        if client_ip:
+                            break
+
         if old_binding_id:
             time.sleep(CMD_DELAY)
             api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": old_binding_id})
 
-        # 2. Add or update the bypass IP-binding for the current MAC
+        # 3. Add or update the bypass IP-binding for the current MAC
         if existing_id:
             time.sleep(CMD_DELAY)
             br = api.send_command("/ip/hotspot/ip-binding/set", {
@@ -315,18 +346,6 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                 router_info.get("ip"), mac_address, br.get("error"),
             )
             return {"error": "binding_failed", "message": br["error"]}
-
-        # 3. Read live IP from hosts table once (used for queue target AND
-        #    surfaced back to the route). One /print, not two.
-        client_ip = None
-        hosts_resp = api.send_command("/ip/hotspot/host/print")
-        if hosts_resp.get("success") and hosts_resp.get("data"):
-            for h in hosts_resp["data"]:
-                hm = h.get("mac-address", "")
-                if hm and normalize_mac_address(hm) == mac_address:
-                    client_ip = h.get("address") or h.get("to-address")
-                    if client_ip:
-                        break
 
         # 4. Per-credential simple queue (only if a rate-limit is set AND we
         #    found a client IP; without an IP there's nothing to attach the
