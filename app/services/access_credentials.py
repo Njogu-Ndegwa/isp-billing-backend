@@ -685,18 +685,19 @@ async def bind_mac_for_login(
 # Delay (seconds) between the access-login response being sent to the phone
 # and the kick that forces MikroTik to re-evaluate the bypass binding.
 #
-# The bypass binding is already written by the time the route returns 200, so
-# the phone's *new* connections after login are bypassed immediately. The kick
-# only exists to clean up the stale "unauthorized" host/active rows that
-# MikroTik kept around from before the binding existed. Removing those rows
-# tears down conntrack for any TCP session currently using them -- which, if
-# done too soon, is exactly the session the phone just opened to load
-# google.com / its target URL after seeing the success message. Waiting ~5s
-# gives the phone time to establish steady-state browsing through the bypass
-# binding *before* we touch the host table; afterwards the brief disruption is
-# invisible because MikroTik immediately re-creates the host row as bypassed
-# on the next packet.
-KICK_DELAY_SECONDS = 5.0
+# Even though the bypass binding is written before the 200 is returned,
+# MikroTik's existing conntrack redirect rules (established when the device
+# first hit the hotspot and was sent to the captive portal) persist until the
+# host entry is removed. Those stale conntrack rules intercept the phone's
+# first navigation attempt and redirect it back to the captive portal, making
+# the user think the login failed and requiring a second click.
+#
+# The kick MUST run after the 200 response is delivered (removing the host
+# entry tears down the conntrack entry carrying the response itself). Over
+# local WiFi the response reaches the phone in well under 200ms, so 1.5s
+# gives a safe margin while being short enough that the stale redirect
+# is cleared before the user's first navigation attempt fails visibly.
+KICK_DELAY_SECONDS = 1.5
 
 
 async def kick_mac_async(router_info: dict, mac_address: str, *, is_radius: bool = False) -> None:
