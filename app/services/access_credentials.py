@@ -685,19 +685,24 @@ async def bind_mac_for_login(
 # Delay (seconds) between the access-login response being sent to the phone
 # and the kick that forces MikroTik to re-evaluate the bypass binding.
 #
-# Even though the bypass binding is written before the 200 is returned,
-# MikroTik's existing conntrack redirect rules (established when the device
-# first hit the hotspot and was sent to the captive portal) persist until the
-# host entry is removed. Those stale conntrack rules intercept the phone's
-# first navigation attempt and redirect it back to the captive portal, making
-# the user think the login failed and requiring a second click.
+# FastAPI BackgroundTasks run AFTER the response bytes have been handed to
+# the OS network stack, so even at 0 s the kick never races with the response
+# itself. The conntrack entry for the phone→server TCP session is a Layer-4
+# kernel structure that persists independently of the hotspot host table; it
+# is not torn down when the host entry is removed.
 #
-# The kick MUST run after the 200 response is delivered (removing the host
-# entry tears down the conntrack entry carrying the response itself). Over
-# local WiFi the response reaches the phone in well under 200ms, so 1.5s
-# gives a safe margin while being short enough that the stale redirect
-# is cleared before the user's first navigation attempt fails visibly.
-KICK_DELAY_SECONDS = 1.5
+# Keeping this at 0 is important for two reasons:
+#  1. Android/iOS captive-portal detection sends a probe request (to
+#     connectivitycheck.gstatic.com / captive.apple.com) within ~200 ms of
+#     the device seeing the 200 OK. If the stale "unauthorized" host entry is
+#     still in place at that point, MikroTik redirects the probe to the
+#     captive portal, the OS marks the network as captive, and the user sees
+#     a "Sign in to network" notification even though they just logged in.
+#  2. The background REAPER job treats any MAC absent from /ip/hotspot/host
+#     as idle and removes its bypass binding. A non-zero kick delay creates a
+#     window where the host entry is gone but the REAPER can fire and
+#     mistakenly release the credential.
+KICK_DELAY_SECONDS = 0
 
 
 async def kick_mac_async(router_info: dict, mac_address: str, *, is_radius: bool = False) -> None:

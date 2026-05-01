@@ -924,6 +924,8 @@ def _scan_router_idle_credentials_sync(
                 if qn and qid:
                     queues_by_name[qn] = qid
 
+        now_utc = datetime.utcnow()
+
         for cred in creds:
             mac = cred.get("bound_mac_address")
             if not mac:
@@ -932,7 +934,28 @@ def _scan_router_idle_credentials_sync(
             host = hosts_by_mac.get(wanted)
             should_release = False
             if not host:
-                should_release = True
+                # After a successful login the kick removes the host entry so
+                # MikroTik can re-evaluate the device as bypassed. There is a
+                # brief window (a few seconds) where the host entry is gone
+                # but the device is still active. Treat any credential bound
+                # within the last 2 minutes as "recently connected" and skip
+                # the absent-host release to avoid kicking live users.
+                bound_at_str = cred.get("bound_at")
+                recently_bound = False
+                if bound_at_str:
+                    try:
+                        from datetime import timezone
+                        bound_at = datetime.fromisoformat(bound_at_str)
+                        # Handle both timezone-aware and naive datetimes
+                        if bound_at.tzinfo is not None:
+                            age_seconds = (now_utc.replace(tzinfo=timezone.utc) - bound_at).total_seconds()
+                        else:
+                            age_seconds = (now_utc - bound_at).total_seconds()
+                        recently_bound = age_seconds < 120
+                    except (ValueError, TypeError):
+                        pass
+                if not recently_bound:
+                    should_release = True
             else:
                 idle_str = host.get("idle-time", "")
                 idle_seconds = _parse_mikrotik_duration(idle_str)
@@ -1030,6 +1053,7 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
         by_router[rid]["creds"].append({
             "id": c.id,
             "bound_mac_address": c.bound_mac_address,
+            "bound_at": c.bound_at.isoformat() if c.bound_at else None,
         })
 
     if not by_router:
