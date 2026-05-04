@@ -2066,8 +2066,13 @@ class MikroTikAPI:
 
             profile_args = {
                 "name": profile_name,
-                "rate-limit": rate_limit,
             }
+            # Omit rate-limit entirely when the caller wants unlimited (0/0 or empty).
+            # RouterOS V7 treats a missing rate-limit as unlimited, which is correct
+            # behaviour. Sending "0/0" explicitly can be misinterpreted on some V7
+            # builds as "0 bps" and silently block all traffic through the profile.
+            if rate_limit and rate_limit not in ("0/0", "0"):
+                profile_args["rate-limit"] = rate_limit
             if local_address:
                 profile_args["local-address"] = local_address
             if pool_name:

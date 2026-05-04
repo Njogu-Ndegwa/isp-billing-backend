@@ -80,11 +80,20 @@ def _provision_pppoe_sync(payload: dict) -> dict:
         base_profile = api.get_active_pppoe_profile()
         base_profile_data = base_profile.get("data") if base_profile.get("found") else {}
 
+        # Fall back to the standard infrastructure defaults when the server lookup
+        # doesn't resolve them. This covers: (a) customer provisioned before PPPoE
+        # ports are configured on the router, and (b) any race/timing window where
+        # the server is not yet visible. Without these fallbacks the created profile
+        # would have no remote-address, so RouterOS accepts the PPPoE auth but then
+        # fails to assign an IP -- the session silently drops at IPCP.
+        local_address = base_profile_data.get("local_address") or "192.168.89.1"
+        pool_name = base_profile_data.get("remote_address") or "pppoe-pool"
+
         profile_result = api.ensure_pppoe_profile(
             profile_name,
             rate_limit,
-            local_address=base_profile_data.get("local_address", ""),
-            pool_name=base_profile_data.get("remote_address", ""),
+            local_address=local_address,
+            pool_name=pool_name,
             dns_server=base_profile_data.get("dns_server", ""),
             change_tcp_mss=base_profile_data.get("change_tcp_mss", ""),
         )
@@ -103,7 +112,11 @@ def _provision_pppoe_sync(payload: dict) -> dict:
             logger.error(f"[PPPoE] Secret creation failed: {secret_result['error']}")
             return {"error": f"Secret creation failed: {secret_result['error']}"}
 
-        bypass_result = api.ensure_pppoe_fasttrack_bypass()
+        # Pass pool_name directly so the bypass logic doesn't have to re-query the
+        # server profile. Without this, on direct-interface routers the pool lookup
+        # can fail silently, leaving FastTrack in place without bypass rules and
+        # allowing it to skip the per-user simple queues (rate limits unenforced).
+        bypass_result = api.ensure_pppoe_fasttrack_bypass(pool_name=pool_name)
         if bypass_result.get("error"):
             logger.warning(f"[PPPoE] FastTrack bypass ensure failed: {bypass_result['error']}")
 
