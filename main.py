@@ -55,6 +55,7 @@ from app.api.lead_routes import router as lead_router
 from app.api.usage_routes import router as usage_router
 from app.api.access_credential_routes import router as access_credential_router
 from app.api.shop_routes import router as shop_router
+from app.api.portal_routes import router as portal_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -88,6 +89,7 @@ app.include_router(lead_router)
 app.include_router(usage_router)
 app.include_router(access_credential_router)
 app.include_router(shop_router)
+app.include_router(portal_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -1328,6 +1330,20 @@ async def run_payment_history_migrations():
     logger.info("Migration: payment-history preservation + balance-correction + cascade-guard schema ready")
 
 
+async def run_portal_settings_migrations():
+    """Create portal_settings table (idempotent)."""
+    async with async_engine.begin() as conn:
+        from app.db.models import PortalSettings
+        await conn.run_sync(
+            lambda c: PortalSettings.__table__.create(c, checkfirst=True)
+        )
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_portal_settings_user "
+            "ON portal_settings(user_id)"
+        ))
+    logger.info("Portal settings table ready")
+
+
 async def run_shop_migrations():
     """Create shop tables (idempotent)."""
     async with async_engine.begin() as conn:
@@ -1495,6 +1511,12 @@ async def startup_event():
         logger.info("Shop migrations completed successfully")
     except Exception as e:
         logger.error(f"Shop migration failed (non-fatal): {e}")
+
+    try:
+        await run_portal_settings_migrations()
+        logger.info("Portal settings migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Portal settings migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

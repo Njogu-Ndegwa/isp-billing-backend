@@ -1,0 +1,63 @@
+{
+    "info": {
+        "name": "Portal Customization - Endpoints",
+        "description": "Admin and public endpoints for the captive portal customization feature.",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        { "key": "baseUrl", "value": "http://localhost:8000" },
+        { "key": "token", "value": "YOUR_JWT_TOKEN_HERE" }
+    ],
+    "item": [
+        {
+            "name": "Admin - Get Portal Settings",
+            "request": {
+                "method": "GET",
+                "url": "{{baseUrl}}/api/portal/settings",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ],
+                "description": "Get the current portal customization settings for the authenticated reseller. Returns defaults if never configured. Also returns all valid options for theme, header style, language, and announcement type."
+            }
+        },
+        {
+            "name": "Admin - Update Portal Settings",
+            "request": {
+                "method": "PUT",
+                "url": "{{baseUrl}}/api/portal/settings",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" },
+                    { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n  \"color_theme\": \"emerald_green\",\n  \"header_style\": \"hero\",\n  \"show_ads\": false,\n  \"show_welcome_banner\": true,\n  \"welcome_title\": \"Welcome to FastNet WiFi\",\n  \"welcome_subtitle\": \"Affordable, fast internet for everyone\",\n  \"company_logo_url\": \"https://example.com/logo.png\",\n  \"header_bg_image_url\": \"https://example.com/header-bg.jpg\",\n  \"footer_text\": \"© 2026 FastNet. All rights reserved.\",\n  \"portal_support_phone\": \"+254700000000\",\n  \"portal_support_whatsapp\": \"+254700000000\",\n  \"show_ratings\": true,\n  \"show_reconnect_button\": true,\n  \"show_social_links\": true,\n  \"facebook_url\": \"https://facebook.com/fastnet\",\n  \"whatsapp_group_url\": \"https://chat.whatsapp.com/xyz\",\n  \"instagram_url\": \"https://instagram.com/fastnet\",\n  \"show_announcement\": true,\n  \"announcement_type\": \"info\",\n  \"announcement_text\": \"Network upgrade in progress. Expect brief interruptions tonight after 11 PM.\",\n  \"portal_language\": \"en\",\n  \"plans_section_title\": \"Choose Your Internet Plan\",\n  \"featured_plan_ids\": \"3,7\"\n}"
+                },
+                "description": "Partial update — only provided fields are changed. Supported color_theme values: ocean_blue, emerald_green, sunset_orange, midnight_purple, rose_gold, slate_gray. Supported header_style values: standard, minimal, hero, compact. Supported portal_language values: en, sw, fr. Supported announcement_type values: info, warning, success."
+            }
+        },
+        {
+            "name": "Admin - Reset Portal Settings to Defaults",
+            "request": {
+                "method": "POST",
+                "url": "{{baseUrl}}/api/portal/settings/reset",
+                "header": [
+                    { "key": "Authorization", "value": "Bearer {{token}}" }
+                ],
+                "description": "Deletes all custom settings and recreates a default row. Useful as an 'undo all' action."
+            }
+        },
+        {
+            "name": "Public - Get Portal Settings by Router ID",
+            "request": {
+                "method": "GET",
+                "url": {
+                    "raw": "{{baseUrl}}/api/public/portal/settings/1",
+                    "host": ["{{baseUrl}}"],
+                    "path": ["api", "public", "portal", "settings", "1"]
+                },
+                "description": "No auth required. Returns the portal customization settings for the reseller who owns the specified router. Called by the captive portal frontend on load. Falls back to system defaults if the reseller has not configured any settings."
+            }
+        }
+    ]
+}

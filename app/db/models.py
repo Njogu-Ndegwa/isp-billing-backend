@@ -1277,3 +1277,74 @@ class ShopOrderTracking(Base):
 
     order = relationship("ShopOrder", back_populates="tracking_history")
     updated_by = relationship("User", foreign_keys=[updated_by_user_id])
+
+
+# ========================================
+# PORTAL CUSTOMIZATION SETTINGS
+# ========================================
+
+class PortalSettings(Base):
+    """
+    Per-reseller customization settings for the public captive portal.
+    One row per user (unique on user_id). Missing rows are treated as defaults.
+    """
+    __tablename__ = "portal_settings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+
+    # ── Theme ────────────────────────────────────────────────────────────────
+    # Preselected options: ocean_blue | emerald_green | sunset_orange |
+    #                      midnight_purple | rose_gold | slate_gray
+    color_theme = Column(String(50), nullable=False, default="ocean_blue", server_default="ocean_blue")
+
+    # ── Header section ───────────────────────────────────────────────────────
+    # standard | minimal | hero | compact
+    header_style = Column(String(50), nullable=False, default="standard", server_default="standard")
+    show_ads = Column(Boolean, nullable=False, default=True, server_default="true")
+    show_welcome_banner = Column(Boolean, nullable=False, default=True, server_default="true")
+    welcome_title = Column(String(200), nullable=True)
+    welcome_subtitle = Column(String(500), nullable=True)
+
+    # ── Branding ─────────────────────────────────────────────────────────────
+    company_logo_url = Column(String(500), nullable=True)
+    # background for hero header style
+    header_bg_image_url = Column(String(500), nullable=True)
+
+    # ── Footer ───────────────────────────────────────────────────────────────
+    footer_text = Column(String(500), nullable=True)
+
+    # ── Support contacts shown on portal ─────────────────────────────────────
+    # Falls back to users.support_phone when null
+    portal_support_phone = Column(String(20), nullable=True)
+    portal_support_whatsapp = Column(String(20), nullable=True)
+
+    # ── Feature toggles ──────────────────────────────────────────────────────
+    show_ratings = Column(Boolean, nullable=False, default=True, server_default="true")
+    show_reconnect_button = Column(Boolean, nullable=False, default=True, server_default="true")
+    show_social_links = Column(Boolean, nullable=False, default=False, server_default="false")
+
+    # ── Social / community links ──────────────────────────────────────────────
+    facebook_url = Column(String(500), nullable=True)
+    whatsapp_group_url = Column(String(500), nullable=True)
+    instagram_url = Column(String(500), nullable=True)
+
+    # ── Announcement banner ───────────────────────────────────────────────────
+    show_announcement = Column(Boolean, nullable=False, default=False, server_default="false")
+    # info | warning | success
+    announcement_type = Column(String(20), nullable=False, default="info", server_default="info")
+    announcement_text = Column(String(500), nullable=True)
+
+    # ── Localisation ─────────────────────────────────────────────────────────
+    # ISO 639-1: en | sw (Swahili) | fr
+    portal_language = Column(String(10), nullable=False, default="en", server_default="en")
+
+    # ── Plan section ─────────────────────────────────────────────────────────
+    plans_section_title = Column(String(200), nullable=True)
+    # Comma-separated plan IDs to pin at top, e.g. "3,7"
+    featured_plan_ids = Column(String(200), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", backref="portal_settings")
