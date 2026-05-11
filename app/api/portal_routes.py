@@ -328,7 +328,7 @@ def _build_public_response(settings: Optional[PortalSettings], reseller: Optiona
         return {
             "color_theme": "ocean_blue",
             "header_style": "standard",
-            "show_ads": True,
+            "show_ads": False,
             "show_welcome_banner": True,
             "welcome_title": business_name or org_name,
             "welcome_subtitle": None,

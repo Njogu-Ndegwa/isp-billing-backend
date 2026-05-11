@@ -1301,7 +1301,7 @@ class PortalSettings(Base):
     # ── Header section ───────────────────────────────────────────────────────
     # standard | minimal | hero | compact
     header_style = Column(String(50), nullable=False, default="standard", server_default="standard")
-    show_ads = Column(Boolean, nullable=False, default=True, server_default="true")
+    show_ads = Column(Boolean, nullable=False, default=False, server_default="false")
     show_welcome_banner = Column(Boolean, nullable=False, default=True, server_default="true")
     welcome_title = Column(String(200), nullable=True)
     welcome_subtitle = Column(String(500), nullable=True)
