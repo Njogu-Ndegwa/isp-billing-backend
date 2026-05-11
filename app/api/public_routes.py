@@ -716,10 +716,11 @@ async def get_portal_data(
     Returns router info, plans, and ads in a single request,
     eliminating the waterfall of sequential API calls.
     """
-    from app.db.models import User, Ad
+    from app.db.models import User, Ad, PortalSettings
+    from app.api.portal_routes import _build_public_response
 
     stmt = (
-        select(Router, User.business_name, User.support_phone)
+        select(Router, User)
         .join(User, Router.user_id == User.id)
         .where(Router.identity == identity)
     )
@@ -729,12 +730,13 @@ async def get_portal_data(
     if not row:
         raise HTTPException(status_code=404, detail=f"Router with identity '{identity}' not found")
 
-    router_obj, business_name, support_phone = row
+    router_obj, reseller = row
 
-    plans, all_plans_for_flags, ads_data = await asyncio.gather(
+    plans, all_plans_for_flags, ads_data, portal_settings_result = await asyncio.gather(
         get_plans_cached(db, router_obj.user_id, connection_type),
         get_plans_cached(db, router_obj.user_id, connection_type, include_hidden=True),
         _fetch_active_ads(db),
+        db.execute(select(PortalSettings).where(PortalSettings.user_id == router_obj.user_id)),
     )
 
     has_emergency = any(p.get("plan_type") == "emergency" for p in all_plans_for_flags)
@@ -743,6 +745,8 @@ async def get_portal_data(
         p.get("is_hidden") for p in all_plans_for_flags if p.get("plan_type") == "regular"
     ) if any(p.get("plan_type") == "regular" for p in all_plans_for_flags) else False
 
+    portal_settings = portal_settings_result.scalar_one_or_none()
+
     return {
         "router": {
             "router_id": router_obj.id,
@@ -750,9 +754,9 @@ async def get_portal_data(
             "identity": router_obj.identity,
             "user_id": router_obj.user_id,
             "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API',
-            "business_name": business_name,
+            "business_name": reseller.business_name,
             "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
-            "support_phone": support_phone,
+            "support_phone": reseller.support_phone,
         },
         "plans": plans,
         "ads": ads_data,
@@ -762,6 +766,7 @@ async def get_portal_data(
             "emergency_mode_active": getattr(router_obj, 'emergency_active', False),
             "emergency_message": getattr(router_obj, 'emergency_message', None),
         },
+        "portal_settings": _build_public_response(portal_settings, reseller),
     }
 
 

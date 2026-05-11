@@ -1343,6 +1343,7 @@ class PortalSettings(Base):
     plans_section_title = Column(String(200), nullable=True)
     # Comma-separated plan IDs to pin at top, e.g. "3,7"
     featured_plan_ids = Column(String(200), nullable=True)
+    show_plan_speed = Column(Boolean, nullable=False, default=True, server_default="true")
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

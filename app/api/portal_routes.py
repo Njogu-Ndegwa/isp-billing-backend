@@ -74,6 +74,7 @@ class PortalSettingsUpdate(BaseModel):
     # Plans section
     plans_section_title: Optional[str] = None
     featured_plan_ids: Optional[str] = None
+    show_plan_speed: Optional[bool] = None
 
     @field_validator("color_theme")
     @classmethod
@@ -145,6 +146,7 @@ def _settings_to_dict(s: PortalSettings) -> dict:
         # Plans
         "plans_section_title": s.plans_section_title,
         "featured_plan_ids": s.featured_plan_ids,
+        "show_plan_speed": s.show_plan_speed,
         # Timestamps
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
@@ -212,7 +214,7 @@ async def update_portal_settings(
         "show_social_links", "facebook_url", "whatsapp_group_url",
         "instagram_url", "show_announcement", "announcement_type",
         "announcement_text", "portal_language", "plans_section_title",
-        "featured_plan_ids",
+        "featured_plan_ids", "show_plan_speed",
     ]
 
     changed = []
@@ -226,6 +228,7 @@ async def update_portal_settings(
     bool_fields = [
         "show_ads", "show_welcome_banner", "show_ratings",
         "show_reconnect_button", "show_social_links", "show_announcement",
+        "show_plan_speed",
     ]
     for field in bool_fields:
         raw = request.model_fields_set  # fields that were explicitly provided
@@ -346,6 +349,7 @@ def _build_public_response(settings: Optional[PortalSettings], reseller: Optiona
             "portal_language": "en",
             "plans_section_title": None,
             "featured_plan_ids": None,
+            "show_plan_speed": True,
         }
 
     return {
@@ -372,4 +376,5 @@ def _build_public_response(settings: Optional[PortalSettings], reseller: Optiona
         "portal_language": settings.portal_language,
         "plans_section_title": settings.plans_section_title,
         "featured_plan_ids": settings.featured_plan_ids,
+        "show_plan_speed": settings.show_plan_speed,
     }

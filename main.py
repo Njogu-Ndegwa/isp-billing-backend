@@ -1341,6 +1341,13 @@ async def run_portal_settings_migrations():
             "CREATE INDEX IF NOT EXISTS idx_portal_settings_user "
             "ON portal_settings(user_id)"
         ))
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                ALTER TABLE portal_settings
+                    ADD COLUMN show_plan_speed BOOLEAN NOT NULL DEFAULT TRUE;
+            EXCEPTION WHEN duplicate_column THEN NULL;
+            END $$
+        """))
     logger.info("Portal settings table ready")
 
 
