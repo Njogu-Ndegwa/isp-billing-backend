@@ -1296,11 +1296,11 @@ class PortalSettings(Base):
     # ── Theme ────────────────────────────────────────────────────────────────
     # Preselected options: ocean_blue | emerald_green | sunset_orange |
     #                      midnight_purple | rose_gold | slate_gray
-    color_theme = Column(String(50), nullable=False, default="ocean_blue", server_default="ocean_blue")
+    color_theme = Column(String(50), nullable=False, default="slate_gray", server_default="slate_gray")
 
     # ── Header section ───────────────────────────────────────────────────────
     # standard | minimal | hero | compact
-    header_style = Column(String(50), nullable=False, default="standard", server_default="standard")
+    header_style = Column(String(50), nullable=False, default="hero", server_default="hero")
     show_ads = Column(Boolean, nullable=False, default=False, server_default="false")
     show_welcome_banner = Column(Boolean, nullable=False, default=True, server_default="true")
     welcome_title = Column(String(200), nullable=True)
@@ -1309,7 +1309,11 @@ class PortalSettings(Base):
     # ── Branding ─────────────────────────────────────────────────────────────
     company_logo_url = Column(String(500), nullable=True)
     # background for hero header style
-    header_bg_image_url = Column(String(500), nullable=True)
+    header_bg_image_url = Column(
+        String(500),
+        nullable=True,
+        default="https://images.unsplash.com/photo-1523805009345-7448845a9e53?w=750&h=370&fit=crop&q=80",
+    )
 
     # ── Footer ───────────────────────────────────────────────────────────────
     footer_text = Column(String(500), nullable=True)

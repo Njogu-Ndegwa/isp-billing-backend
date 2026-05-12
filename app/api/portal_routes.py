@@ -326,14 +326,14 @@ def _build_public_response(settings: Optional[PortalSettings], reseller: Optiona
 
     if settings is None:
         return {
-            "color_theme": "ocean_blue",
-            "header_style": "standard",
+            "color_theme": "slate_gray",
+            "header_style": "hero",
             "show_ads": False,
             "show_welcome_banner": True,
             "welcome_title": business_name or org_name,
             "welcome_subtitle": None,
             "company_logo_url": None,
-            "header_bg_image_url": None,
+            "header_bg_image_url": "https://images.unsplash.com/photo-1523805009345-7448845a9e53?w=750&h=370&fit=crop&q=80",
             "footer_text": None,
             "portal_support_phone": fallback_support_phone,
             "portal_support_whatsapp": None,
