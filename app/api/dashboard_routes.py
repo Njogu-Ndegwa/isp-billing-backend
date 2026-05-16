@@ -8,7 +8,7 @@ from collections import defaultdict
 
 from app.db.database import get_db
 from app.db.models import (
-    Router, Customer, Plan, CustomerStatus, CustomerPayment,
+    Router, Customer, Plan, CustomerStatus, CustomerPayment, PaymentStatus,
     MpesaTransaction, MpesaTransactionStatus,
     ResellerPayout, ResellerTransactionCharge, PaymentMethod,
     ShopOrder, ShopOrderPaymentStatus,
@@ -714,6 +714,148 @@ async def get_dashboard_analytics(
 @router.get("/health")
 def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+
+@router.get("/api/dashboard/revenue-over-time")
+async def get_revenue_over_time(
+    period: Optional[str] = "30d",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    router_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """
+    Revenue time series for the reseller dashboard chart.
+
+    period: 7d | 30d | 90d | 6m | 1y  (ignored when start_date+end_date provided)
+    group_by is auto-selected: daily ≤30 days, weekly ≤180 days, monthly otherwise
+    """
+    try:
+        user = await get_current_user(token, db)
+        user_id = user.id
+
+        now = datetime.utcnow()
+
+        if start_date and end_date:
+            try:
+                range_start = datetime.strptime(start_date, "%Y-%m-%d")
+                range_end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Use YYYY-MM-DD for start_date / end_date")
+            period_label = "custom"
+        else:
+            period_map = {
+                "7d": 7, "30d": 30, "90d": 90, "6m": 180, "1y": 365,
+            }
+            days = period_map.get(period or "30d", 30)
+            range_start = datetime(now.year, now.month, now.day) - timedelta(days=days - 1)
+            range_end = datetime(now.year, now.month, now.day) + timedelta(days=1)
+            period_label = period or "30d"
+
+        total_days = (range_end - range_start).days
+
+        if total_days <= 30:
+            group_by = "daily"
+        elif total_days <= 180:
+            group_by = "weekly"
+        else:
+            group_by = "monthly"
+
+        # Fetch all completed payments in the range
+        base_where = [
+            CustomerPayment.reseller_id == user_id,
+            CustomerPayment.created_at >= range_start,
+            CustomerPayment.created_at < range_end,
+            CustomerPayment.status == PaymentStatus.COMPLETED,
+        ]
+        if router_id:
+            payments_q = (
+                select(CustomerPayment.amount, CustomerPayment.created_at)
+                .join(Customer, CustomerPayment.customer_id == Customer.id)
+                .where(*base_where, Customer.router_id == router_id)
+            )
+        else:
+            payments_q = select(CustomerPayment.amount, CustomerPayment.created_at).where(*base_where)
+
+        rows = (await db.execute(payments_q)).all()
+
+        # Bucket payments into periods
+        buckets: dict = {}
+
+        def bucket_key(dt: datetime) -> str:
+            if group_by == "daily":
+                return dt.strftime("%Y-%m-%d")
+            elif group_by == "weekly":
+                # ISO week Monday
+                monday = dt - timedelta(days=dt.weekday())
+                return monday.strftime("%Y-%m-%d")
+            else:
+                return dt.strftime("%Y-%m-01")
+
+        def bucket_label(key: str) -> str:
+            d = datetime.strptime(key, "%Y-%m-%d")
+            if group_by == "daily":
+                return d.strftime("%b %d")
+            elif group_by == "weekly":
+                return f"W {d.strftime('%b %d')}"
+            else:
+                return d.strftime("%b %Y")
+
+        for row in rows:
+            key = bucket_key(row.created_at)
+            if key not in buckets:
+                buckets[key] = {"revenue": 0.0, "transactions": 0}
+            buckets[key]["revenue"] += float(row.amount)
+            buckets[key]["transactions"] += 1
+
+        # Build complete date sequence (no gaps)
+        data_points = []
+        cursor = range_start
+        while cursor < range_end:
+            key = bucket_key(cursor)
+            if key not in [p["date"] for p in data_points]:
+                bucket = buckets.get(key, {"revenue": 0.0, "transactions": 0})
+                data_points.append({
+                    "date": key,
+                    "label": bucket_label(key),
+                    "revenue": round(bucket["revenue"], 2),
+                    "transactions": bucket["transactions"],
+                })
+            if group_by == "daily":
+                cursor += timedelta(days=1)
+            elif group_by == "weekly":
+                cursor += timedelta(weeks=1)
+            else:
+                # advance one month
+                month = cursor.month % 12 + 1
+                year = cursor.year + (1 if cursor.month == 12 else 0)
+                cursor = cursor.replace(year=year, month=month, day=1)
+
+        total_revenue = sum(p["revenue"] for p in data_points)
+        total_transactions = sum(p["transactions"] for p in data_points)
+        non_zero = [p for p in data_points if p["revenue"] > 0]
+        avg_per_period = round(total_revenue / len(non_zero), 2) if non_zero else 0.0
+
+        return {
+            "period": period_label,
+            "group_by": group_by,
+            "start_date": range_start.strftime("%Y-%m-%d"),
+            "end_date": (range_end - timedelta(days=1)).strftime("%Y-%m-%d"),
+            "router_id": router_id,
+            "data": data_points,
+            "totals": {
+                "revenue": round(total_revenue, 2),
+                "transactions": total_transactions,
+                "avg_per_period": avg_per_period,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching revenue-over-time: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/api/dashboard/daily-revenue")
