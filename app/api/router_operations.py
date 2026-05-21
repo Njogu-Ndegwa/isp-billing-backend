@@ -3861,9 +3861,24 @@ async def get_hotspot_diagnostics_by_identity(
 
 ALLOWED_DEVICE_MODES = {"home", "enterprise", "basic"}
 
+# Per-feature flags accepted by /system/device-mode/update on RouterOS 7.13+.
+# We keep an allowlist so a bad key doesn't get passed straight through to
+# the router; values are expected to be "yes" / "no" (RouterOS booleans).
+ALLOWED_DEVICE_MODE_FLAGS = {
+    "scheduler", "socks", "fetch", "pptp", "l2tp", "bandwidth-test",
+    "traffic-gen", "sniffer", "ipsec", "romon", "proxy", "hotspot", "smb",
+    "email", "zerotier", "container", "install-any-version", "partitions",
+    "routerboard",
+}
+
 
 class DeviceModeUpdateRequest(BaseModel):
-    mode: str
+    # Use either `mode` (a preset like "enterprise") OR `flags` (per-feature
+    # toggles, e.g. {"hotspot": "yes"}). Newer RouterOS builds only accept
+    # the flags form — the response message tells you which one this device
+    # expects.
+    mode: Optional[str] = None
+    flags: Optional[dict] = None
 
 
 def _get_device_mode_sync(router_info: dict) -> dict:
@@ -3887,7 +3902,11 @@ def _get_device_mode_sync(router_info: dict) -> dict:
         api.disconnect()
 
 
-def _update_device_mode_sync(router_info: dict, mode: str) -> dict:
+def _update_device_mode_sync(
+    router_info: dict,
+    mode: Optional[str] = None,
+    flags: Optional[dict] = None,
+) -> dict:
     api = MikroTikAPI(
         router_info["ip"],
         router_info["username"],
@@ -3903,7 +3922,9 @@ def _update_device_mode_sync(router_info: dict, mode: str) -> dict:
         before = (before_resp.get("data") or [{}])[0] if before_resp.get("success") else {}
         current_mode = before.get("mode", "")
 
-        if current_mode == mode:
+        # If the caller asked for a preset that's already active and didn't
+        # also pass per-feature flags, there's nothing to do.
+        if mode and current_mode == mode and not flags:
             return {
                 "success": True,
                 "status": "already_in_mode",
@@ -3912,9 +3933,20 @@ def _update_device_mode_sync(router_info: dict, mode: str) -> dict:
                 "device_mode_after": before,
             }
 
+        # Build the command arguments. `mode` takes precedence as a preset;
+        # `flags` switches the router into the per-feature ("flagged") form
+        # and toggles individual capabilities.
+        args: dict = {}
+        if mode:
+            args["mode"] = mode
+        if flags:
+            args["flagged"] = "yes"
+            for key, value in flags.items():
+                args[key] = str(value)
+
         update_resp = api.send_command(
             "/system/device-mode/update",
-            {"mode": mode},
+            args,
         )
 
         # NOTE: RouterOS device-mode/update is special. The expected response
@@ -3954,6 +3986,15 @@ def _update_device_mode_sync(router_info: dict, mode: str) -> dict:
                 "feature was added in RouterOS 7.13; older versions don't have "
                 "device-mode at all (and won't have the hotspot-blocking issue "
                 "either)."
+            )
+        elif "does not match any value of mode" in raw_router_message_lower:
+            status = "mode_value_rejected"
+            human_message = (
+                "This RouterOS build does not accept a preset for `mode` — it "
+                "expects per-feature flags. Retry with body "
+                "{\"flags\": {\"hotspot\": \"yes\"}} (add other features as "
+                "needed). That puts the router into `flagged` device-mode and "
+                "enables only what you list."
             )
         elif update_resp.get("success") and not raw_router_message:
             status = "applied"
@@ -4043,12 +4084,27 @@ async def update_device_mode(
     within ~5 minutes to physically confirm the change. Poll the GET
     endpoint afterwards to see whether the mode flipped.
     """
-    mode = (request.mode or "").strip().lower()
-    if mode not in ALLOWED_DEVICE_MODES:
+    mode = (request.mode or "").strip().lower() or None
+    flags = request.flags or None
+
+    if not mode and not flags:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either `mode` (preset) or `flags` (per-feature toggles).",
+        )
+    if mode and mode not in ALLOWED_DEVICE_MODES:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid mode '{request.mode}'. Allowed: {sorted(ALLOWED_DEVICE_MODES)}",
         )
+    if flags:
+        bad_keys = [k for k in flags.keys() if k not in ALLOWED_DEVICE_MODE_FLAGS]
+        if bad_keys:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown flag(s): {bad_keys}. "
+                       f"Allowed: {sorted(ALLOWED_DEVICE_MODE_FLAGS)}",
+            )
 
     user = await get_current_user(token, db)
     router_obj = await get_router_by_identity(db, identity, user.id, user.role.value)
@@ -4064,7 +4120,7 @@ async def update_device_mode(
         "password": router_obj.password,
         "port": router_obj.port,
     }
-    result = await asyncio.to_thread(_update_device_mode_sync, router_info, mode)
+    result = await asyncio.to_thread(_update_device_mode_sync, router_info, mode, flags)
 
     if result.get("error") == "connection_failed":
         await record_router_availability(db, router_obj.id, False, "device_mode_update")
@@ -4090,6 +4146,7 @@ async def update_device_mode(
         "router_name": router_obj.name,
         "router_identity_db": router_obj.identity,
         "requested_mode": mode,
+        "requested_flags": flags,
         "generated_at": datetime.utcnow().isoformat(),
         **result,
     }
