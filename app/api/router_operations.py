@@ -4564,11 +4564,28 @@ def _sync_hotspot_files_sync(
                 size = src_file.get("size", "")
 
                 if contents is None:
+                    # RouterOS /file/print contents only returns the body for
+                    # files smaller than ~4 KB. Larger text files (md5.js,
+                    # WISPr xsd, etc.) come back with contents=None and we
+                    # can't transfer them via this protocol — they need
+                    # Winbox/FTP. Genuinely binary files (favicon.ico) also
+                    # land here. Neither category is required for the basic
+                    # captive-portal redirect flow.
                     skipped.append({"file": name, "size": size,
-                                    "reason": "no contents (likely binary)"})
+                                    "reason": "no contents (size > ~4KB API "
+                                              "cap, or binary file)"})
                     continue
 
-                check = dst_api.send_command("/file/print", {"?name": name})
+                # NOTE: query attributes must be sent as bare words
+                # (`?name=...`), NOT as `=?name=...` (the latter is parsed
+                # as an attribute with a literal `?name` key and the filter
+                # gets ignored). Use send_command_optimized which appends
+                # the query word verbatim.
+                check = dst_api.send_command_optimized(
+                    "/file/print",
+                    proplist=[".id", "name"],
+                    query=f"?name={name}",
+                )
                 existing = check.get("data") or []
 
                 if existing and not overwrite_existing:
