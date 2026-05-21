@@ -3849,3 +3849,224 @@ async def get_hotspot_diagnostics_by_identity(
         "generated_at": datetime.utcnow().isoformat(),
         **result,
     }
+
+
+# ---------------------------------------------------------------------------
+# Device-mode management — RouterOS 7.13+ gates features like `hotspot` and
+# `container` behind a configurable device-mode. Changes to a more permissive
+# mode require physical confirmation at the router (reset button press or
+# power cycle within ~5 min). We can initiate remotely and poll for the
+# result; someone on site must finish the physical step.
+# ---------------------------------------------------------------------------
+
+ALLOWED_DEVICE_MODES = {"home", "enterprise", "basic"}
+
+
+class DeviceModeUpdateRequest(BaseModel):
+    mode: str
+
+
+def _get_device_mode_sync(router_info: dict) -> dict:
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=10,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connection_failed", "reason": api.last_connect_error}
+    try:
+        resp = api.send_command("/system/device-mode/print")
+        if resp.get("error"):
+            return {"error": "command_failed", "reason": resp["error"]}
+        data = (resp.get("data") or [{}])[0]
+        return {"success": True, "device_mode": data}
+    finally:
+        api.disconnect()
+
+
+def _update_device_mode_sync(router_info: dict, mode: str) -> dict:
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=15,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connection_failed", "reason": api.last_connect_error}
+    try:
+        before_resp = api.send_command("/system/device-mode/print")
+        before = (before_resp.get("data") or [{}])[0] if before_resp.get("success") else {}
+        current_mode = before.get("mode", "")
+
+        if current_mode == mode:
+            return {
+                "success": True,
+                "status": "already_in_mode",
+                "message": f"Router is already in device-mode '{mode}'. Nothing to do.",
+                "device_mode_before": before,
+                "device_mode_after": before,
+            }
+
+        update_resp = api.send_command(
+            "/system/device-mode/update",
+            {"mode": mode},
+        )
+
+        # RouterOS responds with a !trap containing a message asking for
+        # physical confirmation — that's the expected path, not an error.
+        # Real errors look like "invalid value", "no such command", etc.
+        raw_error = (update_resp.get("error") or "").lower()
+        pending_markers = ("confirm", "reset button", "reboot", "cold reboot",
+                           "physical", "press")
+        looks_pending = any(m in raw_error for m in pending_markers)
+
+        after_resp = api.send_command("/system/device-mode/print")
+        after = (after_resp.get("data") or [{}])[0] if after_resp.get("success") else {}
+
+        if update_resp.get("success") and not raw_error:
+            return {
+                "success": True,
+                "status": "applied",
+                "message": f"Device-mode changed to '{mode}' without requiring confirmation.",
+                "device_mode_before": before,
+                "device_mode_after": after,
+                "router_response": update_resp,
+            }
+
+        if looks_pending:
+            return {
+                "success": True,
+                "status": "pending_physical_confirmation",
+                "message": (
+                    "Update accepted. Someone at the router must briefly press the "
+                    "reset button OR power-cycle the router within ~5 minutes to "
+                    "confirm. Poll GET /device-mode to verify the change."
+                ),
+                "router_response_message": update_resp.get("error"),
+                "device_mode_before": before,
+                "device_mode_after": after,
+            }
+
+        return {
+            "error": "update_failed",
+            "reason": update_resp.get("error") or "Unknown RouterOS response",
+            "device_mode_before": before,
+            "device_mode_after": after,
+        }
+    finally:
+        api.disconnect()
+
+
+@router.get("/api/routers/by-identity/{identity}/device-mode")
+async def get_device_mode(
+    identity: str,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Return the router's current /system/device-mode print output."""
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_identity(db, identity, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No router found for identity/name '{identity}'",
+        )
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    result = await asyncio.to_thread(_get_device_mode_sync, router_info)
+
+    if result.get("error") == "connection_failed":
+        await record_router_availability(db, router_obj.id, False, "device_mode_get")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to router '{router_obj.name}' "
+                   f"({router_obj.ip_address}): {result.get('reason') or 'unknown'}",
+        )
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result.get("reason") or result["error"])
+
+    await record_router_availability(db, router_obj.id, True, "device_mode_get")
+
+    return {
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "router_identity_db": router_obj.identity,
+        "generated_at": datetime.utcnow().isoformat(),
+        **result,
+    }
+
+
+@router.post("/api/routers/by-identity/{identity}/device-mode")
+async def update_device_mode(
+    identity: str,
+    request: DeviceModeUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Initiate a /system/device-mode change. RouterOS will require someone
+    at the site to press the reset button briefly or power-cycle the router
+    within ~5 minutes to physically confirm the change. Poll the GET
+    endpoint afterwards to see whether the mode flipped.
+    """
+    mode = (request.mode or "").strip().lower()
+    if mode not in ALLOWED_DEVICE_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid mode '{request.mode}'. Allowed: {sorted(ALLOWED_DEVICE_MODES)}",
+        )
+
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_identity(db, identity, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No router found for identity/name '{identity}'",
+        )
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    result = await asyncio.to_thread(_update_device_mode_sync, router_info, mode)
+
+    if result.get("error") == "connection_failed":
+        await record_router_availability(db, router_obj.id, False, "device_mode_update")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to router '{router_obj.name}' "
+                   f"({router_obj.ip_address}): {result.get('reason') or 'unknown'}",
+        )
+    if result.get("error"):
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("reason") or result["error"],
+        )
+
+    await record_router_availability(db, router_obj.id, True, "device_mode_update")
+
+    logger.info(
+        f"Device-mode update for router {router_obj.name} (id={router_obj.id}) "
+        f"to '{mode}': status={result.get('status')}"
+    )
+
+    return {
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "router_identity_db": router_obj.identity,
+        "requested_mode": mode,
+        "generated_at": datetime.utcnow().isoformat(),
+        **result,
+    }
