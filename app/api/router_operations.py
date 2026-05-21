@@ -4492,3 +4492,206 @@ async def toggle_winbox_access(
         "generated_at": datetime.utcnow().isoformat(),
         **result,
     }
+
+
+# ---------------------------------------------------------------------------
+# Hotspot files sync — fallback for routers where the built-in
+# /ip/hotspot/profile/reset-html-directory command is unavailable (returns
+# "no such command" on some RouterOS builds, so the standard captive-portal
+# HTML scaffolding never gets installed). Pulls every text file under
+# hotspot/ from a known-working router and writes them to the destination.
+# Skips binary files (favicon.ico, etc.) — those aren't required for the
+# captive-portal redirect to function.
+# ---------------------------------------------------------------------------
+
+class SyncHotspotFilesRequest(BaseModel):
+    from_identity: str
+    # Default False to preserve a freshly-fetched custom login.html on the
+    # destination. Set True to overwrite everything under hotspot/.
+    overwrite_existing: bool = False
+
+
+def _sync_hotspot_files_sync(
+    src_router_info: dict,
+    dst_router_info: dict,
+    overwrite_existing: bool,
+) -> dict:
+    src_api = MikroTikAPI(
+        src_router_info["ip"], src_router_info["username"],
+        src_router_info["password"], src_router_info["port"],
+        timeout=20, connect_timeout=5,
+    )
+    if not src_api.connect():
+        return {"error": "src_connection_failed", "reason": src_api.last_connect_error}
+
+    try:
+        dst_api = MikroTikAPI(
+            dst_router_info["ip"], dst_router_info["username"],
+            dst_router_info["password"], dst_router_info["port"],
+            timeout=20, connect_timeout=5,
+        )
+        if not dst_api.connect():
+            return {"error": "dst_connection_failed", "reason": dst_api.last_connect_error}
+
+        try:
+            src_resp = src_api.send_command_optimized(
+                "/file/print",
+                proplist=[".id", "name", "type", "size", "contents"],
+            )
+            if src_resp.get("error"):
+                return {"error": "src_list_failed", "reason": src_resp["error"]}
+
+            hotspot_src = [
+                f for f in (src_resp.get("data") or [])
+                if (f.get("name") or "").startswith("hotspot/")
+            ]
+            files_to_copy = [f for f in hotspot_src if f.get("type") != "directory"]
+            if not files_to_copy:
+                return {"error": "no_source_files",
+                        "reason": "Source has nothing under hotspot/."}
+
+            # Order by depth so parent paths are created first.
+            files_to_copy.sort(key=lambda f: (f.get("name") or "").count("/"))
+
+            created: list = []
+            updated: list = []
+            preserved: list = []
+            skipped: list = []
+
+            for src_file in files_to_copy:
+                name = src_file.get("name") or ""
+                contents = src_file.get("contents")
+                size = src_file.get("size", "")
+
+                if contents is None:
+                    skipped.append({"file": name, "size": size,
+                                    "reason": "no contents (likely binary)"})
+                    continue
+
+                check = dst_api.send_command("/file/print", {"?name": name})
+                existing = check.get("data") or []
+
+                if existing and not overwrite_existing:
+                    preserved.append({"file": name, "size": size,
+                                      "reason": "already present, overwrite_existing=false"})
+                    continue
+
+                if existing:
+                    resp = dst_api.send_command("/file/set", {
+                        "numbers": existing[0][".id"], "contents": contents,
+                    })
+                    if resp.get("error"):
+                        skipped.append({"file": name, "size": size,
+                                        "reason": f"set failed: {resp['error']}"})
+                    else:
+                        updated.append({"file": name, "size": size})
+                else:
+                    resp = dst_api.send_command("/file/add", {
+                        "name": name, "contents": contents,
+                    })
+                    if resp.get("error"):
+                        skipped.append({"file": name, "size": size,
+                                        "reason": f"add failed: {resp['error']}"})
+                    else:
+                        created.append({"file": name, "size": size})
+
+            verify = dst_api.send_command_optimized(
+                "/file/print",
+                proplist=[".id", "name", "type", "size"],
+            )
+            dst_after = [
+                f for f in (verify.get("data") or [])
+                if (f.get("name") or "").startswith("hotspot/")
+            ]
+
+            return {
+                "success": True,
+                "summary": {
+                    "source_hotspot_files": len(hotspot_src),
+                    "source_copyable": len(files_to_copy),
+                    "created": len(created),
+                    "updated": len(updated),
+                    "preserved": len(preserved),
+                    "skipped": len(skipped),
+                    "destination_hotspot_files_after": len(dst_after),
+                },
+                "created_files": created,
+                "updated_files": updated,
+                "preserved_files": preserved,
+                "skipped_files": skipped,
+                "destination_files_after": dst_after,
+            }
+        finally:
+            dst_api.disconnect()
+    finally:
+        src_api.disconnect()
+
+
+@router.post("/api/routers/by-identity/{identity}/sync-hotspot-files")
+async def sync_hotspot_files(
+    identity: str,
+    request: SyncHotspotFilesRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Copy text files under hotspot/ from `from_identity` to this router.
+    Use when /ip/hotspot/profile/reset-html-directory is unavailable on
+    the destination (returns "no such command") and the standard
+    captive-portal HTML scaffolding is missing.
+
+    Default behaviour preserves any file already present on the destination
+    (so a freshly-fetched custom login.html survives). Pass
+    `overwrite_existing: true` to mirror the source exactly.
+    """
+    if request.from_identity == identity:
+        raise HTTPException(status_code=400,
+                            detail="from_identity must differ from destination.")
+
+    user = await get_current_user(token, db)
+    dst_router = await get_router_by_identity(db, identity, user.id, user.role.value)
+    if not dst_router:
+        raise HTTPException(status_code=404,
+                            detail=f"Destination router '{identity}' not found.")
+    src_router = await get_router_by_identity(
+        db, request.from_identity, user.id, user.role.value
+    )
+    if not src_router:
+        raise HTTPException(status_code=404,
+                            detail=f"Source router '{request.from_identity}' not found.")
+
+    src_info = {"ip": src_router.ip_address, "username": src_router.username,
+                "password": src_router.password, "port": src_router.port}
+    dst_info = {"ip": dst_router.ip_address, "username": dst_router.username,
+                "password": dst_router.password, "port": dst_router.port}
+
+    result = await asyncio.to_thread(
+        _sync_hotspot_files_sync, src_info, dst_info, request.overwrite_existing
+    )
+
+    if result.get("error") == "src_connection_failed":
+        raise HTTPException(status_code=503,
+                            detail=f"Source '{src_router.name}' unreachable: "
+                                   f"{result.get('reason') or 'unknown'}")
+    if result.get("error") == "dst_connection_failed":
+        raise HTTPException(status_code=503,
+                            detail=f"Destination '{dst_router.name}' unreachable: "
+                                   f"{result.get('reason') or 'unknown'}")
+    if result.get("error"):
+        raise HTTPException(status_code=500,
+                            detail=result.get("reason") or result["error"])
+
+    logger.info(
+        f"Hotspot files synced from '{src_router.name}' to '{dst_router.name}': "
+        f"{result.get('summary')}"
+    )
+
+    return {
+        "from_router": {"id": src_router.id, "name": src_router.name,
+                        "identity": src_router.identity},
+        "to_router": {"id": dst_router.id, "name": dst_router.name,
+                      "identity": dst_router.identity},
+        "overwrite_existing": request.overwrite_existing,
+        "generated_at": datetime.utcnow().isoformat(),
+        **result,
+    }
