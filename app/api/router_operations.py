@@ -4150,3 +4150,345 @@ async def update_device_mode(
         "generated_at": datetime.utcnow().isoformat(),
         **result,
     }
+
+
+# ---------------------------------------------------------------------------
+# File listing — confirms whether hotspot HTML pages (login.html etc.) are
+# actually present on the router. A hotspot can be fully configured and
+# active but silently fail to redirect if the login page file is missing.
+# ---------------------------------------------------------------------------
+
+def _list_router_files_sync(router_info: dict, path_prefix: Optional[str]) -> dict:
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=15,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connection_failed", "reason": api.last_connect_error}
+    try:
+        resp = api.send_command_optimized(
+            "/file/print",
+            proplist=[".id", "name", "type", "size", "creation-time"],
+        )
+        if resp.get("error"):
+            return {"error": "command_failed", "reason": resp["error"]}
+
+        files = resp.get("data") or []
+        if path_prefix:
+            files = [f for f in files if (f.get("name") or "").startswith(path_prefix)]
+
+        # Sort by name for predictable output
+        files.sort(key=lambda f: f.get("name") or "")
+
+        # Common red flags worth surfacing
+        hotspot_files = [f for f in files if (f.get("name") or "").startswith("hotspot/")]
+        login_html = next(
+            (f for f in hotspot_files if (f.get("name") or "").lower() == "hotspot/login.html"),
+            None,
+        )
+        findings = []
+        if path_prefix in (None, "hotspot/", "hotspot"):
+            if not hotspot_files:
+                findings.append({
+                    "severity": "critical",
+                    "code": "hotspot_directory_empty",
+                    "message": "No files found under hotspot/. The captive portal "
+                               "redirect will hit an empty proxy and never show a "
+                               "login page. Re-upload the hotspot HTML pages.",
+                })
+            elif not login_html:
+                findings.append({
+                    "severity": "critical",
+                    "code": "login_html_missing",
+                    "message": "hotspot/login.html is missing. The portal redirect "
+                               "fires but there is no page to serve, so phones "
+                               "never recognise the network as a captive portal.",
+                })
+            elif login_html.get("size") in ("0", 0, None, ""):
+                findings.append({
+                    "severity": "high",
+                    "code": "login_html_empty",
+                    "message": "hotspot/login.html exists but is 0 bytes. "
+                               "Re-upload the redirect page.",
+                    "row": login_html,
+                })
+
+        return {
+            "success": True,
+            "summary": {
+                "total_files": len(files),
+                "hotspot_files": len(hotspot_files),
+                "login_html_present": login_html is not None,
+                "login_html_size": login_html.get("size") if login_html else None,
+            },
+            "findings": findings,
+            "files": files,
+        }
+    finally:
+        api.disconnect()
+
+
+@router.get("/api/routers/by-identity/{identity}/files")
+async def list_router_files(
+    identity: str,
+    path_prefix: Optional[str] = "hotspot/",
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    List files on the router (`/file/print`). Defaults to filtering by
+    `hotspot/` so the response is small and focused on captive-portal
+    assets. Pass `?path_prefix=` (empty) to see everything.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_identity(db, identity, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No router found for identity/name '{identity}'",
+        )
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    result = await asyncio.to_thread(
+        _list_router_files_sync, router_info, path_prefix or None
+    )
+
+    if result.get("error") == "connection_failed":
+        await record_router_availability(db, router_obj.id, False, "files_list")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to router '{router_obj.name}' "
+                   f"({router_obj.ip_address}): {result.get('reason') or 'unknown'}",
+        )
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result.get("reason") or result["error"])
+
+    await record_router_availability(db, router_obj.id, True, "files_list")
+
+    return {
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "router_identity_db": router_obj.identity,
+        "path_prefix": path_prefix,
+        "generated_at": datetime.utcnow().isoformat(),
+        **result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Winbox-over-WireGuard toggle — temporarily opens the Winbox service to
+# the WG management network so an operator can connect with Winbox for
+# visual exploration that's awkward to do via the API. Call again with
+# {"enable": false} when done.
+# ---------------------------------------------------------------------------
+
+_WINBOX_FW_COMMENT = "API-managed: Allow Winbox from WG"
+
+
+class WinboxAccessRequest(BaseModel):
+    enable: bool
+    wg_source: str = "10.0.0.1/32"  # AWS server's WG address by default
+
+
+def _toggle_winbox_access_sync(
+    router_info: dict, enable: bool, wg_source: str
+) -> dict:
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=15,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connection_failed", "reason": api.last_connect_error}
+    try:
+        steps: list = []
+
+        # 1. Find the input filter rule we own (by comment), if any.
+        existing_fw = api.send_command_optimized(
+            "/ip/firewall/filter/print",
+            proplist=[".id", "chain", "comment"],
+            query=f"?comment={_WINBOX_FW_COMMENT}",
+        )
+        existing_rules = existing_fw.get("data") or []
+
+        # 2. Find the Winbox service entry.
+        svc_resp = api.send_command(
+            "/ip/service/print",
+            {"?name": "winbox"},
+        )
+        winbox_svc = (svc_resp.get("data") or [{}])[0]
+        winbox_id = winbox_svc.get(".id")
+
+        if enable:
+            # Add firewall rule if missing. Place it before any defconf
+            # drop rule so it actually has an effect.
+            if not existing_rules:
+                # Locate the "drop all not coming from LAN" rule to place before it
+                defconf = api.send_command_optimized(
+                    "/ip/firewall/filter/print",
+                    proplist=[".id", "chain", "action", "comment"],
+                    query="?comment=defconf: drop all not coming from LAN",
+                )
+                defconf_rules = defconf.get("data") or []
+                add_args = {
+                    "chain": "input",
+                    "protocol": "tcp",
+                    "dst-port": "8291",
+                    "src-address": wg_source,
+                    "action": "accept",
+                    "comment": _WINBOX_FW_COMMENT,
+                }
+                if defconf_rules:
+                    add_args["place-before"] = defconf_rules[0][".id"]
+                add_resp = api.send_command(
+                    "/ip/firewall/filter/add",
+                    add_args,
+                )
+                steps.append({"step": "add_firewall_rule", "result": add_resp})
+            else:
+                steps.append({
+                    "step": "firewall_rule_exists",
+                    "result": {"existing_count": len(existing_rules)},
+                })
+
+            # Enable Winbox service restricted to the WG source.
+            if winbox_id:
+                set_resp = api.send_command(
+                    "/ip/service/set",
+                    {
+                        "numbers": winbox_id,
+                        "address": wg_source,
+                        "disabled": "no",
+                    },
+                )
+                steps.append({"step": "enable_winbox_service", "result": set_resp})
+            else:
+                steps.append({
+                    "step": "enable_winbox_service",
+                    "result": {"error": "Winbox service entry not found"},
+                })
+
+            human = (
+                f"Winbox now reachable on the router at port 8291 from {wg_source}. "
+                f"From the AWS server (10.0.0.1) on the WG mesh you can connect: "
+                f"`winbox {router_info['ip']}:8291`. Remember to call this endpoint "
+                f"with {{\"enable\": false}} when done."
+            )
+        else:
+            # Disable: remove our firewall rule(s) and turn the service off.
+            for rule in existing_rules:
+                rule_id = rule.get(".id")
+                if rule_id:
+                    rm = api.send_command(
+                        "/ip/firewall/filter/remove",
+                        {"numbers": rule_id},
+                    )
+                    steps.append({"step": "remove_firewall_rule",
+                                  "rule_id": rule_id, "result": rm})
+
+            if winbox_id:
+                set_resp = api.send_command(
+                    "/ip/service/set",
+                    {"numbers": winbox_id, "disabled": "yes"},
+                )
+                steps.append({"step": "disable_winbox_service", "result": set_resp})
+
+            human = "Winbox service disabled and our firewall rule removed."
+
+        # Re-read state for confirmation.
+        after_svc = api.send_command("/ip/service/print", {"?name": "winbox"})
+        after_winbox = (after_svc.get("data") or [{}])[0]
+        after_fw = api.send_command_optimized(
+            "/ip/firewall/filter/print",
+            proplist=[".id", "chain", "action", "protocol", "dst-port",
+                      "src-address", "comment", "disabled"],
+            query=f"?comment={_WINBOX_FW_COMMENT}",
+        )
+
+        return {
+            "success": True,
+            "message": human,
+            "steps": steps,
+            "winbox_service_after": after_winbox,
+            "firewall_rules_after": after_fw.get("data") or [],
+        }
+    finally:
+        api.disconnect()
+
+
+@router.post("/api/routers/by-identity/{identity}/winbox-access")
+async def toggle_winbox_access(
+    identity: str,
+    request: WinboxAccessRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Enable or disable Winbox access from the WireGuard management network.
+
+    On enable: adds a firewall input-chain accept rule for TCP 8291 from the
+    given WG source (default 10.0.0.1/32) and unblocks the Winbox service
+    restricted to that source. Connect with Winbox from your AWS host
+    (which lives at 10.0.0.1 on the WG mesh).
+
+    On disable: removes our firewall rule and re-disables the service.
+
+    The firewall rule is tagged with a known comment so it can be cleanly
+    reversed.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_identity(db, identity, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No router found for identity/name '{identity}'",
+        )
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    result = await asyncio.to_thread(
+        _toggle_winbox_access_sync, router_info, request.enable, request.wg_source
+    )
+
+    if result.get("error") == "connection_failed":
+        await record_router_availability(db, router_obj.id, False, "winbox_toggle")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to router '{router_obj.name}' "
+                   f"({router_obj.ip_address}): {result.get('reason') or 'unknown'}",
+        )
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result.get("reason") or result["error"])
+
+    await record_router_availability(db, router_obj.id, True, "winbox_toggle")
+
+    logger.info(
+        f"Winbox access {'enabled' if request.enable else 'disabled'} for "
+        f"router {router_obj.name} (id={router_obj.id}) from {request.wg_source}"
+    )
+
+    return {
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "router_identity_db": router_obj.identity,
+        "enabled": request.enable,
+        "wg_source": request.wg_source,
+        "generated_at": datetime.utcnow().isoformat(),
+        **result,
+    }
