@@ -3917,44 +3917,68 @@ def _update_device_mode_sync(router_info: dict, mode: str) -> dict:
             {"mode": mode},
         )
 
-        # RouterOS responds with a !trap containing a message asking for
-        # physical confirmation — that's the expected path, not an error.
-        # Real errors look like "invalid value", "no such command", etc.
-        raw_error = (update_resp.get("error") or "").lower()
+        # NOTE: RouterOS device-mode/update is special. The expected response
+        # is a !trap whose message tells you how to physically confirm. We
+        # don't classify any non-success as an HTTP error — we relay
+        # whatever the router said so the caller can react. The endpoint
+        # itself only fails when we cannot even reach the router.
+        raw_router_message = update_resp.get("error") or ""
+        raw_router_message_lower = raw_router_message.lower()
+
         pending_markers = ("confirm", "reset button", "reboot", "cold reboot",
-                           "physical", "press")
-        looks_pending = any(m in raw_error for m in pending_markers)
+                           "physical", "press", "5 minutes", "timer")
+        denial_markers = ("not allowed", "denied", "permission", "policy")
+        no_command_markers = ("no such command", "unknown command",
+                              "syntax error", "expected end of command")
 
-        after_resp = api.send_command("/system/device-mode/print")
-        after = (after_resp.get("data") or [{}])[0] if after_resp.get("success") else {}
+        if any(m in raw_router_message_lower for m in pending_markers):
+            status = "pending_physical_confirmation"
+            human_message = (
+                "RouterOS accepted the update and is waiting for physical "
+                "confirmation. Someone at the site must briefly press the reset "
+                "button OR power-cycle the router within ~5 minutes. Poll GET "
+                "/device-mode to verify the flip."
+            )
+        elif any(m in raw_router_message_lower for m in denial_markers):
+            status = "denied_by_router"
+            human_message = (
+                "RouterOS rejected the update. Common causes: the API user's "
+                "group lacks the 'policy' permission required for "
+                "/system/device-mode/update, or the requested feature set is "
+                "blocked. Try with an API user in the 'full' group."
+            )
+        elif any(m in raw_router_message_lower for m in no_command_markers):
+            status = "command_not_supported"
+            human_message = (
+                "RouterOS did not recognise /system/device-mode/update. This "
+                "feature was added in RouterOS 7.13; older versions don't have "
+                "device-mode at all (and won't have the hotspot-blocking issue "
+                "either)."
+            )
+        elif update_resp.get("success") and not raw_router_message:
+            status = "applied"
+            human_message = f"Device-mode changed to '{mode}' without requiring confirmation."
+        else:
+            status = "router_responded_unrecognised"
+            human_message = (
+                "RouterOS responded but we don't know how to classify it. See "
+                "router_response_message for the raw text and decide manually."
+            )
 
-        if update_resp.get("success") and not raw_error:
-            return {
-                "success": True,
-                "status": "applied",
-                "message": f"Device-mode changed to '{mode}' without requiring confirmation.",
-                "device_mode_before": before,
-                "device_mode_after": after,
-                "router_response": update_resp,
-            }
-
-        if looks_pending:
-            return {
-                "success": True,
-                "status": "pending_physical_confirmation",
-                "message": (
-                    "Update accepted. Someone at the router must briefly press the "
-                    "reset button OR power-cycle the router within ~5 minutes to "
-                    "confirm. Poll GET /device-mode to verify the change."
-                ),
-                "router_response_message": update_resp.get("error"),
-                "device_mode_before": before,
-                "device_mode_after": after,
-            }
+        # Re-read state. The connection may have been closed by the router
+        # after a successful confirmation request, so handle that gracefully.
+        try:
+            after_resp = api.send_command("/system/device-mode/print")
+            after = (after_resp.get("data") or [{}])[0] if after_resp.get("success") else {}
+        except Exception:
+            after = {}
 
         return {
-            "error": "update_failed",
-            "reason": update_resp.get("error") or "Unknown RouterOS response",
+            "success": True,
+            "status": status,
+            "message": human_message,
+            "router_response_message": raw_router_message or None,
+            "router_response_raw": update_resp,
             "device_mode_before": before,
             "device_mode_after": after,
         }
@@ -4049,12 +4073,11 @@ async def update_device_mode(
             detail=f"Failed to connect to router '{router_obj.name}' "
                    f"({router_obj.ip_address}): {result.get('reason') or 'unknown'}",
         )
-    if result.get("error"):
-        raise HTTPException(
-            status_code=502,
-            detail=result.get("reason") or result["error"],
-        )
 
+    # Any other helper outcome — including RouterOS rejecting the change —
+    # is returned as 200 so the caller can see the raw router message and
+    # decide what to do. Cloudflare/origin layers will not swap our payload
+    # for a generic 5xx page.
     await record_router_availability(db, router_obj.id, True, "device_mode_update")
 
     logger.info(
