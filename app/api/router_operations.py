@@ -10,7 +10,7 @@ from app.db.database import get_db
 from app.db.models import Router, Customer, Plan, CustomerStatus, ConnectionType
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
-from app.services.router_helpers import get_router_by_id, connect_to_router
+from app.services.router_helpers import get_router_by_id, get_router_by_identity, connect_to_router
 from app.core.protected_devices import is_protected_device
 from app.services.router_availability import record_router_availability
 from app.config import settings
@@ -3567,6 +3567,285 @@ async def diagnose_dual_port_endpoint(
         "customer": customer_payload,
         "port_warning": port_warning,
         "configured_dual_ports": router_obj.dual_ports or [],
+        "generated_at": datetime.utcnow().isoformat(),
+        **result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hotspot diagnostics — for investigating "free internet" / captive-portal
+# bypass complaints. Returns raw output of the relevant /ip/hotspot/* tables
+# plus a `findings` block that flags the usual suspects.
+# ---------------------------------------------------------------------------
+
+def _get_hotspot_diagnostics_sync(router_info: dict) -> dict:
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=20,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connection_failed", "reason": api.last_connect_error}
+
+    def _rows(resp):
+        if not resp or resp.get("error"):
+            return {"error": resp.get("error") if resp else "no response"}
+        return resp.get("data", []) or []
+
+    try:
+        identity_resp = api.send_command("/system/identity/print")
+        hotspot_servers = api.send_command("/ip/hotspot/print")
+        server_profiles = api.send_command("/ip/hotspot/profile/print")
+        user_profiles = api.send_command("/ip/hotspot/user/profile/print")
+        users = api.send_command("/ip/hotspot/user/print")
+        ip_bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        walled_garden = api.send_command("/ip/hotspot/walled-garden/print")
+        walled_garden_ip = api.send_command("/ip/hotspot/walled-garden/ip/print")
+        active = api.send_command("/ip/hotspot/active/print")
+        hosts = api.send_command("/ip/hotspot/host/print")
+
+        # Limit firewall + NAT to relevant chains to keep payload small
+        fw_filter = api.send_command_optimized(
+            "/ip/firewall/filter/print",
+            proplist=[".id", "chain", "action", "protocol", "dst-port",
+                      "src-address", "dst-address", "in-interface",
+                      "out-interface", "comment", "disabled", "place-before"],
+        )
+        fw_nat = api.send_command_optimized(
+            "/ip/firewall/nat/print",
+            proplist=[".id", "chain", "action", "protocol", "dst-port",
+                      "src-address", "dst-address", "to-addresses",
+                      "to-ports", "in-interface", "out-interface",
+                      "comment", "disabled"],
+        )
+
+        # Last hotspot-topic log entries (server-side filtered)
+        hotspot_logs = api.send_command_optimized(
+            "/log/print",
+            proplist=["time", "topics", "message"],
+            query="?topics~hotspot",
+        )
+
+        identity = ""
+        if identity_resp.get("success") and identity_resp.get("data"):
+            identity = identity_resp["data"][0].get("name", "")
+
+        servers_rows = _rows(hotspot_servers)
+        server_profiles_rows = _rows(server_profiles)
+        user_profiles_rows = _rows(user_profiles)
+        users_rows = _rows(users)
+        bindings_rows = _rows(ip_bindings)
+        wg_rows = _rows(walled_garden)
+        wg_ip_rows = _rows(walled_garden_ip)
+        active_rows = _rows(active)
+        hosts_rows = _rows(hosts)
+        fw_filter_rows = _rows(fw_filter)
+        fw_nat_rows = _rows(fw_nat)
+        log_rows = _rows(hotspot_logs)
+
+        # ---- Findings -----------------------------------------------------
+        findings = []
+
+        # 1. Hotspot servers: any disabled? bound to a bridge that includes WAN?
+        if isinstance(servers_rows, list):
+            if not servers_rows:
+                findings.append({
+                    "severity": "critical",
+                    "code": "no_hotspot_server",
+                    "message": "No /ip/hotspot server configured — captive portal not running at all.",
+                })
+            for s in servers_rows:
+                if s.get("disabled") == "true" or s.get("invalid") == "true":
+                    findings.append({
+                        "severity": "critical",
+                        "code": "hotspot_server_disabled_or_invalid",
+                        "message": f"Hotspot server '{s.get('name','?')}' on interface "
+                                   f"'{s.get('interface','?')}' is disabled/invalid.",
+                        "row": s,
+                    })
+
+        # 2. IP bindings with type=bypassed — these MACs get free internet
+        bypassed = [b for b in bindings_rows if isinstance(b, dict) and b.get("type") == "bypassed"]
+        if bypassed:
+            findings.append({
+                "severity": "high",
+                "code": "ip_bindings_bypassed",
+                "message": f"{len(bypassed)} ip-binding entries with type=bypassed — "
+                           f"these MAC/IP combos skip the captive portal entirely.",
+                "rows": bypassed[:50],
+            })
+
+        # 3. Walled-garden IP rules that whitelist the whole internet
+        broad_wg = []
+        for r in wg_ip_rows if isinstance(wg_ip_rows, list) else []:
+            dst = r.get("dst-address", "")
+            action = r.get("action", "")
+            if action == "accept" and dst in ("0.0.0.0/0", "", "0.0.0.0/0,::/0"):
+                broad_wg.append(r)
+        if broad_wg:
+            findings.append({
+                "severity": "critical",
+                "code": "walled_garden_ip_too_broad",
+                "message": f"{len(broad_wg)} walled-garden IP rule(s) accept traffic to "
+                           f"0.0.0.0/0 — clients can reach anything on those ports without auth.",
+                "rows": broad_wg,
+            })
+
+        # 4. User profile trial settings that grant generous free access
+        loose_trials = []
+        for p in user_profiles_rows if isinstance(user_profiles_rows, list) else []:
+            uptime = (p.get("trial-uptime-limit") or "").strip()
+            if uptime and uptime not in ("0s", "0", ""):
+                loose_trials.append(p)
+        if loose_trials:
+            findings.append({
+                "severity": "medium",
+                "code": "trial_enabled",
+                "message": f"{len(loose_trials)} user-profile(s) have a non-zero trial-uptime-limit "
+                           f"— trial users get internet without paying.",
+                "rows": loose_trials,
+            })
+
+        # 5. Active vs host ratio — many hosts but few authenticated = bypass
+        active_count = len(active_rows) if isinstance(active_rows, list) else 0
+        host_count = len(hosts_rows) if isinstance(hosts_rows, list) else 0
+        unauth_hosts = []
+        if isinstance(hosts_rows, list):
+            for h in hosts_rows:
+                if h.get("authorized") != "true" and h.get("bypassed") != "true":
+                    # Unauthenticated hosts that are still passing traffic
+                    bytes_in = h.get("bytes-in") or "0"
+                    try:
+                        if int(bytes_in) > 0:
+                            unauth_hosts.append(h)
+                    except (TypeError, ValueError):
+                        pass
+        if unauth_hosts:
+            findings.append({
+                "severity": "high",
+                "code": "unauthenticated_hosts_using_data",
+                "message": f"{len(unauth_hosts)} hotspot host(s) are not authorized but have "
+                           f"non-zero bytes-in. Traffic is leaking past the portal.",
+                "rows": unauth_hosts[:30],
+            })
+
+        # 6. Firewall: accept rules in forward chain on auth-required interfaces
+        suspicious_fw = []
+        for r in fw_filter_rows if isinstance(fw_filter_rows, list) else []:
+            if r.get("chain") == "forward" and r.get("action") == "accept" and r.get("disabled") != "true":
+                # Anything matching dst-port 443 or with no constraint is suspect
+                suspicious_fw.append(r)
+        if suspicious_fw:
+            findings.append({
+                "severity": "info",
+                "code": "forward_accept_rules_present",
+                "message": f"{len(suspicious_fw)} accept rule(s) in chain=forward — review whether "
+                           f"any of them allow client traffic before hotspot's hs-unauth chain runs.",
+                "rows": suspicious_fw[:30],
+            })
+
+        # Identity mismatch sanity check
+        if identity and router_info.get("expected_identity") and identity != router_info["expected_identity"]:
+            findings.append({
+                "severity": "info",
+                "code": "identity_mismatch",
+                "message": f"Connected router reports identity '{identity}' but lookup expected "
+                           f"'{router_info['expected_identity']}'. Are credentials for the right router?",
+            })
+
+        return {
+            "success": True,
+            "router_identity_live": identity,
+            "summary": {
+                "hotspot_servers": len(servers_rows) if isinstance(servers_rows, list) else 0,
+                "user_profiles": len(user_profiles_rows) if isinstance(user_profiles_rows, list) else 0,
+                "hotspot_users": len(users_rows) if isinstance(users_rows, list) else 0,
+                "ip_bindings_total": len(bindings_rows) if isinstance(bindings_rows, list) else 0,
+                "ip_bindings_bypassed": len(bypassed),
+                "walled_garden_domain_rules": len(wg_rows) if isinstance(wg_rows, list) else 0,
+                "walled_garden_ip_rules": len(wg_ip_rows) if isinstance(wg_ip_rows, list) else 0,
+                "active_sessions": active_count,
+                "hosts_total": host_count,
+                "hosts_unauth_with_traffic": len(unauth_hosts),
+                "forward_accept_rules": len(suspicious_fw),
+            },
+            "findings": findings,
+            "raw": {
+                "hotspot_servers": servers_rows,
+                "server_profiles": server_profiles_rows,
+                "user_profiles": user_profiles_rows,
+                "hotspot_users": users_rows,
+                "ip_bindings": bindings_rows,
+                "walled_garden": wg_rows,
+                "walled_garden_ip": wg_ip_rows,
+                "active": active_rows,
+                "hosts": hosts_rows[:200] if isinstance(hosts_rows, list) else hosts_rows,
+                "firewall_filter": fw_filter_rows,
+                "firewall_nat": fw_nat_rows,
+                "hotspot_log_tail": log_rows[-100:] if isinstance(log_rows, list) else log_rows,
+            },
+        }
+    finally:
+        api.disconnect()
+
+
+@router.get("/api/routers/by-identity/{identity}/hotspot-diagnostics")
+async def get_hotspot_diagnostics_by_identity(
+    identity: str,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Investigate a hotspot router by its MikroTik `identity` (e.g. "Router-0305").
+
+    Returns hotspot config + a `findings` block highlighting the likely causes
+    of "users get free internet / no transactions" — broad walled-garden IP
+    rules, bypassed ip-bindings, trial profiles, unauthorized hosts using
+    bandwidth, suspicious forward-chain accept rules, etc.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_identity(db, identity, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No router found for identity/name '{identity}'",
+        )
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+        "name": router_obj.name,
+        "expected_identity": router_obj.identity or router_obj.name,
+    }
+
+    result = await asyncio.to_thread(_get_hotspot_diagnostics_sync, router_info)
+
+    if result.get("error") == "connection_failed":
+        await record_router_availability(
+            db, router_obj.id, False, "hotspot_diagnostics"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to router '{router_obj.name}' "
+                   f"({router_obj.ip_address}): {result.get('reason') or 'unknown'}",
+        )
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    await record_router_availability(
+        db, router_obj.id, True, "hotspot_diagnostics"
+    )
+
+    return {
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "router_identity_db": router_obj.identity,
+        "router_ip": router_obj.ip_address,
         "generated_at": datetime.utcnow().isoformat(),
         **result,
     }
