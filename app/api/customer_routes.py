@@ -23,6 +23,7 @@ from app.services.pppoe_provisioning import (
     call_pppoe_provision, call_pppoe_remove,
     build_pppoe_payload, build_pppoe_remove_payload,
 )
+from app.services.account_numbers import generate_account_number
 
 import logging
 
@@ -102,6 +103,8 @@ async def register_customer_api(
                     detail=f"PPPoE username '{pppoe_username}' already exists"
                 )
 
+        account_number = await generate_account_number(db)
+
         # Create customer
         customer = Customer(
             name=request.name,
@@ -113,15 +116,19 @@ async def register_customer_api(
             status=CustomerStatus.INACTIVE,
             plan_id=request.plan_id,
             user_id=user.id,
-            router_id=request.router_id
+            router_id=request.router_id,
+            account_number=account_number,
         )
-        
+
         db.add(customer)
         await db.commit()
         await db.refresh(customer)
-        
-        logger.info(f"Customer registered: {customer.id} by user {user.id}")
-        
+
+        logger.info(
+            f"Customer registered: {customer.id} (account_number={customer.account_number}) "
+            f"by user {user.id}"
+        )
+
         return {
             "id": customer.id,
             "name": customer.name,
@@ -133,6 +140,7 @@ async def register_customer_api(
             "plan_id": customer.plan_id,
             "router_id": customer.router_id,
             "user_id": customer.user_id,
+            "account_number": customer.account_number,
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
             "created_at": customer.created_at.isoformat()
         }
@@ -445,6 +453,8 @@ async def get_customers_api(
                 "created_at": c.created_at.isoformat() if c.created_at else None,
                 "plan_id": c.plan_id,
                 "router_id": c.router_id,
+                "account_number": c.account_number,
+                "wallet_credit_kes": c.wallet_credit_kes,
                 "plan": {
                     "id": c.plan.id,
                     "name": c.plan.name,
@@ -553,6 +563,8 @@ async def get_customer_detail(
             "created_at": customer.created_at.isoformat() if customer.created_at else None,
             "plan_id": customer.plan_id,
             "router_id": customer.router_id,
+            "account_number": customer.account_number,
+            "wallet_credit_kes": customer.wallet_credit_kes,
             "plan": {
                 "id": customer.plan.id,
                 "name": customer.plan.name,
