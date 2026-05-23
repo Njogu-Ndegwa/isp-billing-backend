@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -9,6 +9,8 @@ from app.db.database import get_db
 from app.db.models import (
     User, UserRole, Subscription, SubscriptionInvoice, SubscriptionPayment,
     SubscriptionStatus, InvoiceStatus, SubscriptionPaymentStatus,
+    B2BTransaction, B2BTransactionStatus, ResellerPaymentMethod,
+    ResellerPaymentMethodType,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import (
@@ -23,6 +25,12 @@ from app.services.subscription import (
     TRIAL_DAYS, GRACE_PERIOD_DAYS,
 )
 from app.services.mpesa import initiate_stk_push_direct
+from app.services.mpesa_b2b import (
+    SUBSCRIPTION_OWNER_TRIGGER,
+    get_b2b_fee,
+    get_kadogo_surcharge,
+    initiate_b2b_payment,
+)
 from app.config import settings
 
 import logging
@@ -30,6 +38,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["subscriptions"])
+
+OWNER_DESTINATION_TYPES = [
+    ResellerPaymentMethodType.BANK_ACCOUNT,
+    ResellerPaymentMethodType.MPESA_PAYBILL,
+]
 
 
 # ============================================================
@@ -472,6 +485,452 @@ async def _require_admin(token: str, db: AsyncSession) -> User:
     if user.role != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+
+def _enum_value(value):
+    return value.value if hasattr(value, "value") else value
+
+
+def _serialize_owner_destination(pm: ResellerPaymentMethod) -> dict:
+    method_type = _enum_value(pm.method_type)
+    result = {
+        "id": pm.id,
+        "user_id": pm.user_id,
+        "method_type": method_type,
+        "label": pm.label,
+        "is_active": pm.is_active,
+        "created_at": pm.created_at.isoformat() if pm.created_at else None,
+        "updated_at": pm.updated_at.isoformat() if pm.updated_at else None,
+    }
+    if method_type == ResellerPaymentMethodType.BANK_ACCOUNT.value:
+        result["bank_paybill_number"] = pm.bank_paybill_number
+        result["bank_account_number"] = pm.bank_account_number
+    elif method_type == ResellerPaymentMethodType.MPESA_PAYBILL.value:
+        result["mpesa_paybill_number"] = pm.mpesa_paybill_number
+    return result
+
+
+def _calculate_owner_b2b_fee(amount: float) -> dict:
+    if amount <= 0:
+        return {
+            "safaricom_fee": 0,
+            "kadogo_surcharge": 0,
+            "total_fee": 0,
+            "net_payout": 0,
+        }
+
+    fee = get_b2b_fee(amount)
+    net = int(amount - fee)
+    actual_fee = get_b2b_fee(net)
+    if actual_fee != fee:
+        fee = actual_fee
+        net = int(amount - fee)
+        if get_b2b_fee(net) != fee:
+            fee = get_b2b_fee(amount)
+
+    kadogo = 0
+    if amount <= 100:
+        kadogo = get_kadogo_surcharge(amount - fee)
+        fee += kadogo
+
+    return {
+        "safaricom_fee": fee - kadogo,
+        "kadogo_surcharge": kadogo,
+        "total_fee": fee,
+        "net_payout": int(amount - fee),
+    }
+
+
+async def _subscription_owner_transfer_totals(db: AsyncSession) -> dict:
+    completed = float((await db.execute(
+        select(func.coalesce(func.sum(B2BTransaction.amount), 0)).where(
+            B2BTransaction.triggered_by == SUBSCRIPTION_OWNER_TRIGGER,
+            B2BTransaction.status == B2BTransactionStatus.COMPLETED,
+        )
+    )).scalar() or 0)
+    pending = float((await db.execute(
+        select(func.coalesce(func.sum(B2BTransaction.amount), 0)).where(
+            B2BTransaction.triggered_by == SUBSCRIPTION_OWNER_TRIGGER,
+            B2BTransaction.status == B2BTransactionStatus.PENDING,
+        )
+    )).scalar() or 0)
+    completed_net = float((await db.execute(
+        select(func.coalesce(func.sum(B2BTransaction.net_amount), 0)).where(
+            B2BTransaction.triggered_by == SUBSCRIPTION_OWNER_TRIGGER,
+            B2BTransaction.status == B2BTransactionStatus.COMPLETED,
+        )
+    )).scalar() or 0)
+    completed_fees = float((await db.execute(
+        select(func.coalesce(func.sum(B2BTransaction.fee), 0)).where(
+            B2BTransaction.triggered_by == SUBSCRIPTION_OWNER_TRIGGER,
+            B2BTransaction.status == B2BTransactionStatus.COMPLETED,
+        )
+    )).scalar() or 0)
+    return {
+        "completed_gross": round(completed, 2),
+        "pending_gross": round(pending, 2),
+        "completed_net": round(completed_net, 2),
+        "completed_fees": round(completed_fees, 2),
+    }
+
+
+async def _subscription_collection_summary(db: AsyncSession) -> dict:
+    total_collected = float((await db.execute(
+        select(func.coalesce(func.sum(SubscriptionPayment.amount), 0)).where(
+            SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+        )
+    )).scalar() or 0)
+    transfers = await _subscription_owner_transfer_totals(db)
+    available = round(
+        total_collected - transfers["completed_gross"] - transfers["pending_gross"],
+        2,
+    )
+    if available < 0:
+        available = 0.0
+    fee_preview = _calculate_owner_b2b_fee(available)
+    return {
+        "total_collected": round(total_collected, 2),
+        "completed_sent": transfers["completed_gross"],
+        "pending_send": transfers["pending_gross"],
+        "completed_bank_net": transfers["completed_net"],
+        "completed_fees": transfers["completed_fees"],
+        "available_to_send": available,
+        "fee_preview": fee_preview,
+    }
+
+
+async def _subscription_payment_send_allocations(db: AsyncSession) -> dict[int, dict]:
+    transfers = await _subscription_owner_transfer_totals(db)
+    completed_remaining = transfers["completed_gross"]
+    pending_remaining = transfers["pending_gross"]
+
+    payments = (await db.execute(
+        select(SubscriptionPayment)
+        .where(SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED)
+        .order_by(SubscriptionPayment.created_at.asc(), SubscriptionPayment.id.asc())
+    )).scalars().all()
+
+    allocations = {}
+    for payment in payments:
+        amount = round(float(payment.amount or 0), 2)
+        completed_amount = round(min(amount, completed_remaining), 2)
+        completed_remaining = round(max(completed_remaining - completed_amount, 0), 2)
+
+        remaining = round(amount - completed_amount, 2)
+        pending_amount = round(min(remaining, pending_remaining), 2)
+        pending_remaining = round(max(pending_remaining - pending_amount, 0), 2)
+
+        applied = round(completed_amount + pending_amount, 2)
+        if completed_amount >= amount:
+            send_status = "sent"
+        elif pending_amount > 0 and applied >= amount:
+            send_status = "pending_send"
+        elif applied > 0:
+            send_status = "partially_sent"
+        else:
+            send_status = "unsent"
+
+        allocations[payment.id] = {
+            "send_status": send_status,
+            "sent_amount": completed_amount,
+            "pending_send_amount": pending_amount,
+            "unsent_amount": round(max(amount - applied, 0), 2),
+        }
+
+    return allocations
+
+
+async def _get_owner_destination(
+    db: AsyncSession,
+    admin_id: int,
+    payment_method_id: Optional[int] = None,
+) -> Optional[ResellerPaymentMethod]:
+    if payment_method_id:
+        pm = await db.get(ResellerPaymentMethod, payment_method_id)
+        method_type = _enum_value(pm.method_type) if pm else None
+        eligible_types = [t.value for t in OWNER_DESTINATION_TYPES]
+        if (
+            not pm
+            or pm.user_id != admin_id
+            or method_type not in eligible_types
+        ):
+            return None
+        return pm
+
+    return (await db.execute(
+        select(ResellerPaymentMethod)
+        .where(
+            ResellerPaymentMethod.user_id == admin_id,
+            ResellerPaymentMethod.is_active == True,
+            ResellerPaymentMethod.method_type.in_(OWNER_DESTINATION_TYPES),
+        )
+        .order_by(ResellerPaymentMethod.created_at.asc(), ResellerPaymentMethod.id.asc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+
+def _owner_destination_party(admin: User, pm: ResellerPaymentMethod) -> tuple[str, str]:
+    method_type = pm.method_type
+    if isinstance(method_type, str):
+        method_type = ResellerPaymentMethodType(method_type)
+
+    if method_type == ResellerPaymentMethodType.BANK_ACCOUNT:
+        return pm.bank_paybill_number, pm.bank_account_number or ""
+    if method_type == ResellerPaymentMethodType.MPESA_PAYBILL:
+        account_ref = admin.business_name or admin.organization_name or admin.email
+        return pm.mpesa_paybill_number, account_ref[:13]
+    raise ValueError(f"Payment method type {method_type} is not eligible")
+
+
+class AdminOwnerDestinationCreate(BaseModel):
+    method_type: str = Field(
+        ResellerPaymentMethodType.BANK_ACCOUNT.value,
+        description="bank_account or mpesa_paybill",
+    )
+    label: str = Field(..., max_length=100)
+    bank_paybill_number: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    mpesa_paybill_number: Optional[str] = None
+
+
+class AdminSubscriptionSendRequest(BaseModel):
+    payment_method_id: Optional[int] = None
+
+
+@router.get("/api/admin/subscriptions/payments")
+async def admin_list_subscription_payments(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    reseller_id: Optional[int] = None,
+    status: Optional[str] = Query(None, description="pending, completed, failed"),
+    send_status: Optional[str] = Query(
+        None,
+        description="sent, partially_sent, pending_send, unsent, not_applicable",
+    ),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """List individual reseller subscription payments with computed owner-bank send status."""
+    await _require_admin(token, db)
+
+    filters = []
+    if reseller_id:
+        filters.append(SubscriptionPayment.user_id == reseller_id)
+    if status:
+        try:
+            filters.append(SubscriptionPayment.status == SubscriptionPaymentStatus(status))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid status")
+    if start_date:
+        try:
+            filters.append(SubscriptionPayment.created_at >= datetime.strptime(start_date, "%Y-%m-%d"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date format, use YYYY-MM-DD")
+    if end_date:
+        try:
+            filters.append(
+                SubscriptionPayment.created_at < datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date format, use YYYY-MM-DD")
+
+    valid_send_statuses = {"sent", "partially_sent", "pending_send", "unsent", "not_applicable"}
+    if send_status and send_status not in valid_send_statuses:
+        raise HTTPException(status_code=400, detail="Invalid send_status")
+
+    allocations = await _subscription_payment_send_allocations(db)
+    stmt = (
+        select(SubscriptionPayment, User)
+        .join(User, SubscriptionPayment.user_id == User.id)
+        .where(User.role == UserRole.RESELLER)
+    )
+    if filters:
+        stmt = stmt.where(*filters)
+    stmt = stmt.order_by(SubscriptionPayment.created_at.desc(), SubscriptionPayment.id.desc())
+
+    rows = (await db.execute(stmt)).all()
+
+    items = []
+    for payment, reseller in rows:
+        status_value = _enum_value(payment.status)
+        allocation = allocations.get(payment.id, {
+            "send_status": "not_applicable" if status_value != "completed" else "unsent",
+            "sent_amount": 0.0,
+            "pending_send_amount": 0.0,
+            "unsent_amount": float(payment.amount or 0) if status_value == "completed" else 0.0,
+        })
+        if send_status and allocation["send_status"] != send_status:
+            continue
+        items.append({
+            "id": payment.id,
+            "invoice_id": payment.invoice_id,
+            "reseller_id": reseller.id,
+            "reseller_email": reseller.email,
+            "reseller_name": reseller.organization_name,
+            "amount": payment.amount,
+            "payment_method": payment.payment_method,
+            "payment_reference": payment.payment_reference,
+            "mpesa_checkout_request_id": payment.mpesa_checkout_request_id,
+            "phone_number": payment.phone_number,
+            "status": status_value,
+            "send_status": allocation["send_status"],
+            "sent_amount": allocation["sent_amount"],
+            "pending_send_amount": allocation["pending_send_amount"],
+            "unsent_amount": allocation["unsent_amount"],
+            "created_at": payment.created_at.isoformat() if payment.created_at else None,
+        })
+
+    total = len(items)
+    offset = (page - 1) * per_page
+    paged = items[offset:offset + per_page]
+    return {
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "total_pages": (total + per_page - 1) // per_page,
+        "summary": await _subscription_collection_summary(db),
+        "payments": paged,
+    }
+
+
+@router.get("/api/admin/subscriptions/collections")
+async def admin_subscription_collections(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Summarize subscription collections and the amount not yet sent to the owner bank."""
+    await _require_admin(token, db)
+    return await _subscription_collection_summary(db)
+
+
+@router.get("/api/admin/subscriptions/bank-destinations")
+async def admin_list_owner_bank_destinations(
+    include_inactive: bool = False,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """List admin-owned bank/paybill destinations for subscription collection transfers."""
+    admin = await _require_admin(token, db)
+    filters = [
+        ResellerPaymentMethod.user_id == admin.id,
+        ResellerPaymentMethod.method_type.in_(OWNER_DESTINATION_TYPES),
+    ]
+    if not include_inactive:
+        filters.append(ResellerPaymentMethod.is_active == True)
+
+    methods = (await db.execute(
+        select(ResellerPaymentMethod)
+        .where(*filters)
+        .order_by(ResellerPaymentMethod.created_at.desc(), ResellerPaymentMethod.id.desc())
+    )).scalars().all()
+    return {"destinations": [_serialize_owner_destination(pm) for pm in methods]}
+
+
+@router.post("/api/admin/subscriptions/bank-destinations")
+async def admin_create_owner_bank_destination(
+    request: AdminOwnerDestinationCreate,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Create an admin-owned bank/paybill destination without adding new schema."""
+    admin = await _require_admin(token, db)
+    try:
+        method_type = ResellerPaymentMethodType(request.method_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="method_type must be bank_account or mpesa_paybill")
+
+    if method_type not in OWNER_DESTINATION_TYPES:
+        raise HTTPException(status_code=400, detail="method_type must be bank_account or mpesa_paybill")
+    if method_type == ResellerPaymentMethodType.BANK_ACCOUNT:
+        if not request.bank_paybill_number or not request.bank_account_number:
+            raise HTTPException(
+                status_code=400,
+                detail="bank_paybill_number and bank_account_number are required",
+            )
+    if method_type == ResellerPaymentMethodType.MPESA_PAYBILL and not request.mpesa_paybill_number:
+        raise HTTPException(status_code=400, detail="mpesa_paybill_number is required")
+
+    pm = ResellerPaymentMethod(
+        user_id=admin.id,
+        method_type=method_type,
+        label=request.label,
+        is_active=True,
+        bank_paybill_number=request.bank_paybill_number,
+        bank_account_number=request.bank_account_number,
+        mpesa_paybill_number=request.mpesa_paybill_number,
+    )
+    db.add(pm)
+    await db.commit()
+    await db.refresh(pm)
+    return _serialize_owner_destination(pm)
+
+
+@router.post("/api/admin/subscriptions/send-to-bank")
+async def admin_send_subscription_collections_to_bank(
+    request: AdminSubscriptionSendRequest = AdminSubscriptionSendRequest(),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Initiate a B2B transfer for completed subscription payments not yet sent/reserved."""
+    admin = await _require_admin(token, db)
+    summary = await _subscription_collection_summary(db)
+    amount = summary["available_to_send"]
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="No completed subscription collections available to send")
+
+    destination = await _get_owner_destination(db, admin.id, request.payment_method_id)
+    if not destination:
+        raise HTTPException(status_code=400, detail="No eligible owner bank/paybill destination found")
+
+    try:
+        party_b, account_ref = _owner_destination_party(admin, destination)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not party_b:
+        raise HTTPException(status_code=400, detail="Destination has no paybill/shortcode configured")
+
+    fee_preview = _calculate_owner_b2b_fee(amount)
+    if fee_preview["net_payout"] <= 0:
+        raise HTTPException(status_code=400, detail="Available amount is too small after B2B fees")
+
+    try:
+        txn = await initiate_b2b_payment(
+            db=db,
+            reseller_id=admin.id,
+            amount=amount,
+            party_b=party_b,
+            account_reference=account_ref,
+            remarks=f"Subscription collections to {destination.label}",
+            fee=fee_preview["total_fee"],
+            triggered_by=SUBSCRIPTION_OWNER_TRIGGER,
+        )
+        await db.commit()
+        await db.refresh(txn)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("[SUBSCRIPTION] Owner bank B2B initiation failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"B2B transfer initiation failed: {e}")
+
+    return {
+        "message": "Subscription collection transfer initiated",
+        "balance_before": amount,
+        "destination": _serialize_owner_destination(destination),
+        "transaction": {
+            "id": txn.id,
+            "amount": txn.amount,
+            "fee": txn.fee,
+            "net_amount": txn.net_amount,
+            "party_a": txn.party_a,
+            "party_b": txn.party_b,
+            "account_reference": txn.account_reference,
+            "status": _enum_value(txn.status),
+            "conversation_id": txn.conversation_id,
+            "created_at": txn.created_at.isoformat() if txn.created_at else None,
+        },
+    }
 
 
 @router.get("/api/admin/subscriptions")

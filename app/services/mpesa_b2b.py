@@ -35,6 +35,7 @@ from app.db.models import (
 logger = logging.getLogger(__name__)
 
 SAFARICOM_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=5.0)
+SUBSCRIPTION_OWNER_TRIGGER = "subscription_owner"
 
 CERTS_DIR = Path(__file__).resolve().parent.parent / "certs"
 
@@ -337,6 +338,14 @@ async def process_b2b_result(db: AsyncSession, result_body: dict) -> Optional[B2
     if str(result_code) == "0":
         txn.status = B2BTransactionStatus.COMPLETED
         txn.completed_at = datetime.utcnow()
+
+        if txn.triggered_by == SUBSCRIPTION_OWNER_TRIGGER:
+            logger.info(
+                "Subscription owner B2B transfer completed: owner=%s net=%s fee=%s ref=%s",
+                txn.reseller_id, txn.net_amount, txn.fee, transaction_id,
+            )
+            await db.flush()
+            return txn
 
         payout = ResellerPayout(
             reseller_id=txn.reseller_id,
