@@ -453,6 +453,8 @@ async def get_customers_api(
                 "created_at": c.created_at.isoformat() if c.created_at else None,
                 "plan_id": c.plan_id,
                 "router_id": c.router_id,
+                "account_number": c.account_number,
+                "wallet_credit_kes": c.wallet_credit_kes,
                 "plan": {
                     "id": c.plan.id,
                     "name": c.plan.name,
@@ -561,6 +563,8 @@ async def get_customer_detail(
             "created_at": customer.created_at.isoformat() if customer.created_at else None,
             "plan_id": customer.plan_id,
             "router_id": customer.router_id,
+            "account_number": customer.account_number,
+            "wallet_credit_kes": customer.wallet_credit_kes,
             "plan": {
                 "id": customer.plan.id,
                 "name": customer.plan.name,
