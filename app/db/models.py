@@ -161,6 +161,10 @@ class Customer(Base):
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
     location_captured_at = Column(DateTime, nullable=True)
+    # C2B Paybill: 8-digit Luhn-validated account number a customer types
+    # into the M-Pesa Paybill menu. Nullable during backfill; flipped to
+    # NOT NULL once migrations/make_customer_account_number_not_null.py runs.
+    account_number = Column(String(8), unique=True, nullable=True, index=True)
 
 class CustomerRating(Base):
     """Customer ratings/feedback after purchase - identified by phone number"""
