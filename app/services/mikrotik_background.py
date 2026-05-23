@@ -12,10 +12,10 @@ remove_user_from_mikrotik function used by multiple router files.
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
-from app.db.database import get_db, async_engine
+from app.db.database import get_db, async_engine, async_session
 from app.db.models import (
     Router,
     Customer,
@@ -38,6 +38,8 @@ import logging
 import time
 
 logger = logging.getLogger(__name__)
+
+SAFETY_NET_BYPASS_GRACE_PERIOD = timedelta(minutes=5)
 
 
 class RouterLockManager:
@@ -487,8 +489,84 @@ def _cleanup_customer_from_mikrotik_sync(router_customers_map: dict) -> dict:
     return merged
 
 
-def _cleanup_router_bindings_sync(router_info: dict, active_macs: set) -> int:
-    removed = 0
+def _mac_compact_expr(column):
+    return func.replace(func.replace(func.upper(column), ":", ""), "-", "")
+
+
+async def _load_authorized_bypass_macs(
+    db: AsyncSession,
+    candidate_macs: set[str] | None = None,
+    now: datetime | None = None,
+) -> set[str]:
+    now = now or datetime.utcnow()
+    candidate_compacts = {
+        mac.replace(":", "").replace("-", "").upper()
+        for mac in (candidate_macs or set())
+        if mac
+    }
+    authorized_macs: set[str] = set()
+
+    customer_stmt = select(Customer.mac_address, Customer.status, Customer.expiry).where(
+        Customer.mac_address.isnot(None)
+    )
+    if candidate_compacts:
+        customer_stmt = customer_stmt.where(
+            _mac_compact_expr(Customer.mac_address).in_(candidate_compacts)
+        )
+
+    customer_result = await db.execute(customer_stmt)
+    for mac_address, status, expiry in customer_result.all():
+        if not mac_address:
+            continue
+        normalized = normalize_mac_address(mac_address)
+        if status in (CustomerStatus.ACTIVE, CustomerStatus.PENDING):
+            authorized_macs.add(normalized)
+        elif expiry and expiry > (now - SAFETY_NET_BYPASS_GRACE_PERIOD):
+            authorized_macs.add(normalized)
+            logger.debug("[SAFETY-NET] Grace period: keeping %s (expiry: %s)", normalized, expiry)
+
+    cred_stmt = select(AccessCredential.bound_mac_address).where(
+        AccessCredential.bound_mac_address.isnot(None),
+        AccessCredential.status == AccessCredStatus.ACTIVE,
+    )
+    if candidate_compacts:
+        cred_stmt = cred_stmt.where(
+            _mac_compact_expr(AccessCredential.bound_mac_address).in_(candidate_compacts)
+        )
+
+    cred_result = await db.execute(cred_stmt)
+    for (bound_mac,) in cred_result.all():
+        if bound_mac:
+            authorized_macs.add(normalize_mac_address(bound_mac))
+
+    return authorized_macs
+
+
+async def _filter_current_orphan_bypass_macs(candidate_macs: set[str]) -> set[str]:
+    normalized_candidates = {normalize_mac_address(mac) for mac in candidate_macs if mac}
+    if not normalized_candidates:
+        return set()
+
+    async with async_session() as fresh_db:
+        currently_authorized = await _load_authorized_bypass_macs(
+            fresh_db,
+            candidate_macs=normalized_candidates,
+            now=datetime.utcnow(),
+        )
+
+    protected = normalized_candidates & currently_authorized
+    if protected:
+        logger.info(
+            "[SAFETY-NET] Skipping %d bypass binding(s) that became active during cleanup: %s",
+            len(protected),
+            sorted(protected),
+        )
+
+    return normalized_candidates - currently_authorized
+
+
+def _find_router_binding_cleanup_candidates_sync(router_info: dict, active_macs: set) -> set[str]:
+    candidates: set[str] = set()
     api = MikroTikAPI(
         router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
         timeout=15, connect_timeout=5
@@ -507,6 +585,35 @@ def _cleanup_router_bindings_sync(router_info: dict, active_macs: set) -> int:
                 continue
             normalized_mac = normalize_mac_address(binding_mac)
             if normalized_mac not in active_macs:
+                candidates.add(normalized_mac)
+        return candidates
+    finally:
+        api.disconnect()
+
+
+def _remove_router_bindings_sync(router_info: dict, orphan_macs: set[str]) -> int:
+    removed = 0
+    normalized_orphans = {normalize_mac_address(mac) for mac in orphan_macs if mac}
+    if not normalized_orphans:
+        return 0
+
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5
+    )
+    if not api.connect():
+        return set()
+    try:
+        bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
+        if not bindings_result.get("success"):
+            return set()
+        for binding in bindings_result.get("data", []):
+            binding_mac = binding.get("mac-address", "")
+            binding_type = binding.get("type", "")
+            if not binding_mac or binding_type != "bypassed":
+                continue
+            normalized_mac = normalize_mac_address(binding_mac)
+            if normalized_mac in normalized_orphans:
                 remove_result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
                 if remove_result.get("success") or "error" not in remove_result:
                     removed += 1
@@ -523,34 +630,14 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
         result = await db.execute(stmt)
         routers = result.scalars().all()
 
-        stmt = select(Customer).where(Customer.mac_address.isnot(None))
-        result = await db.execute(stmt)
-        all_customers = result.scalars().all()
+        async with async_session() as fresh_db:
+            active_macs = await _load_authorized_bypass_macs(
+                fresh_db,
+                now=datetime.utcnow(),
+            )
 
-        now = datetime.utcnow()
-        grace_period = timedelta(minutes=5)
-        active_macs = set()
-        for c in all_customers:
-            normalized = normalize_mac_address(c.mac_address)
-            if c.status in (CustomerStatus.ACTIVE, CustomerStatus.PENDING):
-                active_macs.add(normalized)
-            elif c.expiry and c.expiry > (now - grace_period):
-                active_macs.add(normalized)
-                logger.debug(f"[SAFETY-NET] Grace period: keeping {normalized} (expiry: {c.expiry})")
-
-        # Reseller-issued access credentials live in their own table — their
-        # bound MACs MUST be in the allow-list or the safety-net will tear
-        # down the bypass binding installed by /api/public/access-login a
-        # minute after every login, kicking the user back to the portal.
-        cred_stmt = select(AccessCredential.bound_mac_address).where(
-            AccessCredential.bound_mac_address.isnot(None),
-            AccessCredential.status == AccessCredStatus.ACTIVE,
-        )
-        cred_result = await db.execute(cred_stmt)
-        for (bound_mac,) in cred_result.all():
-            if bound_mac:
-                active_macs.add(normalize_mac_address(bound_mac))
-
+        # Payment callbacks can activate a MAC while this cleanup run is still
+        # working, so every candidate is re-checked before removal.
         async def _bypass_task(r):
             rk = f"{r.ip_address}:{r.port}"
             ri = {
@@ -558,7 +645,17 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
                 "password": r.password, "port": r.port, "name": r.name,
             }
             async with router_locks.acquire(rk):
-                return await asyncio.to_thread(_cleanup_router_bindings_sync, ri, active_macs)
+                candidates = await asyncio.to_thread(
+                    _find_router_binding_cleanup_candidates_sync,
+                    ri,
+                    active_macs,
+                )
+                confirmed_orphans = await _filter_current_orphan_bypass_macs(candidates)
+                return await asyncio.to_thread(
+                    _remove_router_bindings_sync,
+                    ri,
+                    confirmed_orphans,
+                )
 
         eligible = [r for r in routers if getattr(r, "auth_method", None) != "RADIUS"]
         outcomes = await asyncio.gather(
