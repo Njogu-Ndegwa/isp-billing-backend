@@ -798,6 +798,14 @@ class ResellerPaymentMethod(Base):
     mtn_base_url = Column(String(255), nullable=True)  # https://sandbox.momodeveloper.mtn.com or prod host
     mtn_currency = Column(String(10), nullable=True)   # EUR for sandbox, UGX/GHS/... for prod
 
+    # M-Pesa C2B Paybill registration. Populated by POST /api/payment-methods/{id}/register-c2b,
+    # which calls Daraja's /mpesa/c2b/v1/registerurl with the reseller's own credentials.
+    # Only meaningful for method_type == MPESA_PAYBILL_WITH_KEYS — paybill-only resellers
+    # use the platform's shared shortcode and never register their own URLs.
+    c2b_validation_url = Column(String(500), nullable=True)
+    c2b_confirmation_url = Column(String(500), nullable=True)
+    c2b_registered_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1361,3 +1369,83 @@ class PortalSettings(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", backref="portal_settings")
+
+
+# ========================================
+# C2B PAYBILL (Customer-to-Business)
+# ========================================
+
+class C2BTransactionStatus(str, enum.Enum):
+    PROCESSED = "processed"    # Matched a customer, provisioning triggered
+    UNMATCHED = "unmatched"    # Account number unknown / amount too low — needs human attention
+    REJECTED = "rejected"      # Paybill shortcode didn't resolve to anyone we know
+    DUPLICATE = "duplicate"    # Safaricom retry — same TransID seen before, no-op
+
+
+class UnmatchedC2BReason(str, enum.Enum):
+    UNKNOWN_ACCOUNT = "unknown_account"      # account_number didn't match any customer
+    AMOUNT_TOO_LOW = "amount_too_low"        # amount + wallet < plan.price
+    WRONG_RESELLER = "wrong_reseller"        # account belongs to a different reseller's customer
+    INVALID_LUHN = "invalid_luhn"            # BillRefNumber failed Luhn check
+
+
+class C2BTransaction(Base):
+    """Every Safaricom C2B confirmation we receive, archived in full.
+
+    Idempotency anchor: trans_id is Safaricom's globally-unique TransID. The
+    handler bails out early if it sees a duplicate TransID — Safaricom will
+    retry confirmations on network errors, and we must not double-credit a
+    customer on a retry.
+    """
+    __tablename__ = "c2b_transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trans_id = Column(String(64), unique=True, nullable=False, index=True)
+    bill_ref_number = Column(String(64), nullable=True, index=True)
+    trans_amount = Column(Float, nullable=False)
+    msisdn = Column(String(20), nullable=True)
+    business_shortcode = Column(String(20), nullable=True, index=True)
+    payload_json = Column(JSON, nullable=True)  # raw Safaricom payload for audit
+    status = Column(
+        Enum(C2BTransactionStatus, name="c2btransactionstatus",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+    )
+    matched_customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True)
+    matched_reseller_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    received_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    processed_at = Column(DateTime, nullable=True)
+
+    matched_customer = relationship("Customer")
+    matched_reseller = relationship("User")
+
+
+class UnmatchedC2BPayment(Base):
+    """Buffer for C2B payments that couldn't be auto-applied.
+
+    Resellers see these on their dashboard and can attribute them to a
+    customer manually via POST /api/c2b/unmatched/{id}/attribute. Once
+    resolved, resolved_at is set; the row is kept for audit.
+    """
+    __tablename__ = "unmatched_c2b_payments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    c2b_transaction_id = Column(Integer, ForeignKey("c2b_transactions.id"), unique=True, nullable=False)
+    reason = Column(
+        Enum(UnmatchedC2BReason, name="unmatchedc2breason",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+    )
+    # Reseller the system thinks should triage this (paybill owner). May be
+    # null if BusinessShortCode didn't resolve at all — in that case the
+    # platform admin handles it.
+    assigned_reseller_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    resolved_at = Column(DateTime, nullable=True)
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    resolution_customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    notes = Column(String(500), nullable=True)
+
+    c2b_transaction = relationship("C2BTransaction")
+    assigned_reseller = relationship("User", foreign_keys=[assigned_reseller_id])
+    resolved_by = relationship("User", foreign_keys=[resolved_by_user_id])
+    resolution_customer = relationship("Customer", foreign_keys=[resolution_customer_id])
