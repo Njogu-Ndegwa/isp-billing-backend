@@ -165,6 +165,10 @@ class Customer(Base):
     # into the M-Pesa Paybill menu. Nullable during backfill; flipped to
     # NOT NULL once migrations/make_customer_account_number_not_null.py runs.
     account_number = Column(String(8), unique=True, nullable=True, index=True)
+    # Overpayment credit; applied on next renewal before the customer must
+    # top up. Replaced (not incremented) by the C2B handler. CHECK >= 0 at
+    # DB level (see migrations/add_customer_wallet_credit.py).
+    wallet_credit_kes = Column(Integer, nullable=False, default=0, server_default="0")
 
 class CustomerRating(Base):
     """Customer ratings/feedback after purchase - identified by phone number"""
