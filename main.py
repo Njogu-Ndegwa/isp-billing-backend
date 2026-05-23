@@ -1435,6 +1435,102 @@ async def run_shop_migrations():
     logger.info("Shop tables ready")
 
 
+# ============================================================================
+# C2B Paybill Migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_c2b_migrations():
+    """Create columns and tables for the C2B Paybill auto-activation feature.
+
+    Adds Customer.account_number, Customer.wallet_credit_kes, C2B URL fields
+    on ResellerPaymentMethod, and the c2b_transactions + unmatched_c2b_payments
+    tables. Idempotent: checks information_schema before every ALTER.
+    """
+    async with async_engine.begin() as conn:
+        # -- Customer.account_number (nullable, unique)
+        result = await conn.execute(sa_text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'customers' AND column_name = 'account_number'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE customers ADD COLUMN account_number VARCHAR(8) NULL
+            """))
+            await conn.execute(sa_text("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ix_customers_account_number
+                ON customers (account_number)
+            """))
+            logger.info("C2B migration: added customers.account_number")
+
+        # -- Customer.wallet_credit_kes (NOT NULL DEFAULT 0)
+        result = await conn.execute(sa_text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'customers' AND column_name = 'wallet_credit_kes'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE customers
+                ADD COLUMN wallet_credit_kes INTEGER NOT NULL DEFAULT 0
+            """))
+            await conn.execute(sa_text("""
+                ALTER TABLE customers
+                ADD CONSTRAINT ck_customers_wallet_credit_non_negative
+                CHECK (wallet_credit_kes >= 0)
+            """))
+            logger.info("C2B migration: added customers.wallet_credit_kes")
+
+        # -- ResellerPaymentMethod C2B URL fields
+        for col_name, col_type in [
+            ("c2b_validation_url", "VARCHAR(500) NULL"),
+            ("c2b_confirmation_url", "VARCHAR(500) NULL"),
+            ("c2b_registered_at", "TIMESTAMP NULL"),
+        ]:
+            result = await conn.execute(sa_text(f"""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'reseller_payment_methods'
+                  AND column_name = '{col_name}'
+            """))
+            if not result.fetchone():
+                await conn.execute(sa_text(f"""
+                    ALTER TABLE reseller_payment_methods
+                    ADD COLUMN {col_name} {col_type}
+                """))
+                logger.info(f"C2B migration: added reseller_payment_methods.{col_name}")
+
+        # -- Enum types for C2B tables
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                CREATE TYPE c2btransactionstatus AS ENUM
+                    ('processed', 'unmatched', 'rejected', 'duplicate');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;
+        """))
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                CREATE TYPE unmatchedc2breason AS ENUM
+                    ('unknown_account', 'amount_too_low', 'wrong_reseller', 'invalid_luhn');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;
+        """))
+
+        # -- c2b_transactions table
+        from app.db.models import C2BTransaction, UnmatchedC2BPayment
+        await conn.run_sync(
+            lambda c: C2BTransaction.__table__.create(c, checkfirst=True)
+        )
+        # Indexes (IF NOT EXISTS is safe to repeat)
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_c2b_transactions_trans_id ON c2b_transactions(trans_id)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_c2b_transactions_bill_ref ON c2b_transactions(bill_ref_number)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_c2b_transactions_shortcode ON c2b_transactions(business_shortcode)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_c2b_transactions_matched_customer ON c2b_transactions(matched_customer_id)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_c2b_transactions_received_at ON c2b_transactions(received_at)"))
+
+        # -- unmatched_c2b_payments table
+        await conn.run_sync(
+            lambda c: UnmatchedC2BPayment.__table__.create(c, checkfirst=True)
+        )
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_unmatched_c2b_assigned_reseller ON unmatched_c2b_payments(assigned_reseller_id)"))
+
+    logger.info("C2B Paybill migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -1526,6 +1622,12 @@ async def startup_event():
         logger.info("Portal settings migrations completed successfully")
     except Exception as e:
         logger.error(f"Portal settings migration failed (non-fatal): {e}")
+
+    try:
+        await run_c2b_migrations()
+        logger.info("C2B Paybill migrations completed successfully")
+    except Exception as e:
+        logger.error(f"C2B migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,
