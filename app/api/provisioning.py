@@ -208,6 +208,7 @@ async def serve_login_page(
     return HTMLResponse(content=html)
 
 
+@router.get("/api/provision/{provision_token}/complete")
 @router.post("/api/provision/{provision_token}/complete")
 async def complete_provision(
     provision_token: str,

@@ -617,7 +617,7 @@ def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
 
 :delay 2s
 :do {{
-    /tool fetch url="{base_url}/api/provision/{t}/complete" http-method=post{cert_flag}
+    /tool fetch url="{base_url}/api/provision/{t}/complete"{cert_flag}
     :log info "Provisioning: Server notified -- router registered"
 }} on-error={{
     :log warning "Provisioning: Could not notify server (register manually via admin panel)"
