@@ -500,6 +500,7 @@ def _rsc_hotspot(token: ProvisioningToken) -> str:
 def _rsc_login_page(token: ProvisioningToken) -> str:
     base_url = settings.PROVISION_BASE_URL.rstrip("/")
     t = token.token
+    cert_flag = " check-certificate=no" if token.vpn_type == "l2tp" else ""
     return f"""
 # ---- STEP 5: DOWNLOAD CUSTOM LOGIN PAGE ----
 
@@ -529,7 +530,7 @@ def _rsc_login_page(token: ProvisioningToken) -> str:
 :for i from=1 to=5 do={{
     :if (!$fetchOk) do={{
         :do {{
-            /tool fetch url="{base_url}/api/provision/{t}/login-page" dst-path=$loginPath
+            /tool fetch url="{base_url}/api/provision/{t}/login-page" dst-path=$loginPath{cert_flag}
             :set fetchOk true
             :log info ("Provisioning: Login page downloaded to " . $loginPath)
         }} on-error={{
@@ -574,12 +575,13 @@ def _rsc_identity_and_user(token: ProvisioningToken) -> str:
 def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
     base_url = settings.PROVISION_BASE_URL.rstrip("/")
     t = token.token
+    cert_flag = " check-certificate=no" if token.vpn_type == "l2tp" else ""
     return f"""
 # ---- STEP 9: NOTIFY SERVER ----
 
 :delay 2s
 :do {{
-    /tool fetch url="{base_url}/api/provision/{t}/complete" http-method=post
+    /tool fetch url="{base_url}/api/provision/{t}/complete" http-method=post{cert_flag}
     :log info "Provisioning: Server notified -- router registered"
 }} on-error={{
     :log warning "Provisioning: Could not notify server (register manually via admin panel)"
@@ -762,8 +764,12 @@ def build_provision_command(token: ProvisioningToken) -> str:
     """Build the one-liner command the admin pastes on a factory-reset MikroTik."""
     base_url = settings.PROVISION_BASE_URL.rstrip("/")
     url = f"{base_url}/api/provision/{token.token}"
+    # RouterOS v6 ships with outdated CA certificates that can't verify
+    # Cloudflare (or most modern) TLS certificates, causing /tool fetch to
+    # fail with "ssl connection error".  Skip verification for v6.
+    cert_flag = " check-certificate=no" if token.vpn_type == "l2tp" else ""
     return (
-        f'/tool fetch url="{url}" dst-path=provision.rsc;'
+        f'/tool fetch url="{url}" dst-path=provision.rsc{cert_flag};'
         f":delay 2s;"
         f"/import provision.rsc;"
     )

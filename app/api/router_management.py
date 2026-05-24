@@ -737,14 +737,14 @@ async def remediate_captive_portal(
             #    any non-ASCII byte (e.g. 0x89). dst-path alone is enough
             #    to save the file -- the API response then only carries
             #    text status fields.
-            fetch = api.send_command(
-                "/tool/fetch",
-                {
+            fetch_params = {
                     "url": login_page_url,
                     "dst-path": login_dst,
                     "mode": "https",
-                },
-            )
+                }
+            if pt.vpn_type == "l2tp":
+                fetch_params["check-certificate"] = "no"
+            fetch = api.send_command("/tool/fetch", fetch_params)
             if fetch.get("error"):
                 step("tool.fetch_login_page", False, {
                     "error": fetch["error"],
