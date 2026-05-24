@@ -42,8 +42,8 @@ def _run_mikrotik_health_sync(router_info: dict) -> dict:
         router_info["username"],
         router_info["password"],
         router_info["port"],
-        timeout=15,
-        connect_timeout=5
+        timeout=6,
+        connect_timeout=3
     )
     
     if not api.connect():
@@ -51,8 +51,37 @@ def _run_mikrotik_health_sync(router_info: dict) -> dict:
     
     try:
         resources = api.get_system_resources()
-        health = api.get_health()
-        pppoe_active = api.get_active_pppoe_sessions()
+        if resources.get("error"):
+            return {
+                "error": resources["error"],
+                "router_name": router_info.get("name", "Unknown"),
+            }
+
+        health = {"success": True, "data": {}, "skipped": True}
+        if api.connected and api.sock:
+            original_timeout = api.sock.gettimeout()
+            try:
+                api.sock.settimeout(2)
+                health_result = api.get_health()
+                if health_result.get("success"):
+                    health = health_result
+            except Exception as exc:
+                logger.warning(
+                    "Skipping optional health sensors for router %s (%s): %s",
+                    router_info.get("name", "Unknown"),
+                    router_info["ip"],
+                    exc,
+                )
+            finally:
+                try:
+                    api.sock.settimeout(original_timeout)
+                except Exception:
+                    pass
+
+        # Keep /api/mikrotik/health fast. Live PPPoE session detail can be
+        # slow on old RouterOS builds and has a dedicated drill-down endpoint.
+        # The route below derives the count from the latest bandwidth snapshot.
+        pppoe_active = {"success": True, "data": [], "count": 0, "skipped": True}
         return {
             "success": True,
             "resources": resources,
@@ -261,7 +290,28 @@ async def get_mikrotik_health(
             router_name = "Default Router"
         
         # Run MikroTik operations in thread pool (non-blocking!)
-        mikrotik_result = await run_mikrotik_health_async(router_info)
+        try:
+            mikrotik_result = await asyncio.wait_for(
+                run_mikrotik_health_async(router_info),
+                timeout=10,
+            )
+        except asyncio.TimeoutError:
+            if router_id:
+                await record_router_availability(db, router_id, False, "mikrotik_health_timeout")
+            if cache_key in _health_cache:
+                cached_entry = _health_cache[cache_key]
+                age = (datetime.utcnow() - cached_entry["timestamp"]).total_seconds()
+                return _shape_health_response(
+                    cached_entry["data"],
+                    include_sessions=include_sessions,
+                    cached=True,
+                    cache_age_seconds=age,
+                    stale=True,
+                )
+            raise HTTPException(
+                status_code=504,
+                detail=f"Timed out fetching router health: {router_name}",
+            )
         
         if mikrotik_result.get("error"):
             if router_id:
@@ -331,11 +381,14 @@ async def get_mikrotik_health(
             current_upload_mbps = round(latest_snapshot.avg_upload_bps / 1000000, 2)
             snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
         
-        active_pppoe_users = (
-            pppoe_active.get("count", len(pppoe_active.get("data", []) or []))
-            if not pppoe_active.get("error")
-            else 0
-        )
+        if pppoe_active.get("skipped") and latest_snapshot:
+            active_pppoe_users = max(0, (latest_snapshot.active_queues or 0) - active_hotspot_users)
+        else:
+            active_pppoe_users = (
+                pppoe_active.get("count", len(pppoe_active.get("data", []) or []))
+                if not pppoe_active.get("error")
+                else 0
+            )
         active_pppoe_sessions = (
             pppoe_active.get("data", []) if not pppoe_active.get("error") else []
         )

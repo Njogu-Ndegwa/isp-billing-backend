@@ -572,15 +572,14 @@ def _find_router_binding_cleanup_candidates_sync(router_info: dict, active_macs:
         timeout=15, connect_timeout=5
     )
     if not api.connect():
-        return 0
+        return set()
     try:
         bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
         if not bindings_result.get("success"):
-            return 0
+            return set()
         for binding in bindings_result.get("data", []):
             binding_mac = binding.get("mac-address", "")
             binding_type = binding.get("type", "")
-            binding_id = binding.get(".id", "")
             if not binding_mac or binding_type != "bypassed":
                 continue
             normalized_mac = normalize_mac_address(binding_mac)
@@ -602,15 +601,23 @@ def _remove_router_bindings_sync(router_info: dict, orphan_macs: set[str]) -> in
         timeout=15, connect_timeout=5
     )
     if not api.connect():
-        return set()
+        return 0
     try:
         bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
         if not bindings_result.get("success"):
-            return set()
+            return 0
         for binding in bindings_result.get("data", []):
             binding_mac = binding.get("mac-address", "")
             binding_type = binding.get("type", "")
+            binding_id = binding.get(".id", "")
             if not binding_mac or binding_type != "bypassed":
+                continue
+            if not binding_id:
+                logger.warning(
+                    "[SAFETY-NET] Skipping orphaned binding without .id for %s on %s",
+                    binding_mac,
+                    router_info["name"],
+                )
                 continue
             normalized_mac = normalize_mac_address(binding_mac)
             if normalized_mac in normalized_orphans:
