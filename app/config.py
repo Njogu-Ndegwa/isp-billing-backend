@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     WG_MANAGER_URL: str = "http://host.docker.internal:8729"
     WG_MANAGER_SECRET: str = "change-me-wg-secret"
     PROVISION_BASE_URL: str = "https://isp.bitwavetechnologies.net"
+    # RouterOS v6 often cannot complete a TLS handshake with modern CDN edges.
+    # When set, L2TP/v6 provisioning fetches scripts from this URL instead of
+    # PROVISION_BASE_URL. Leave blank to auto-downgrade https://... to http://...
+    # for v6 bootstrap only.
+    PROVISION_LEGACY_BASE_URL: str = ""
     L2TP_IPSEC_PSK: str = "BitwaveL2TP2026!Secure"
 
     # Access credential idle reaper: minutes a bound MAC can be unseen on the

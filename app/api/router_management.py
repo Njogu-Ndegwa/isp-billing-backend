@@ -11,9 +11,11 @@ from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, Ban
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.router_availability import build_router_status
+from app.services.provisioning import provision_base_url_for_vpn
 import logging
 import asyncio
 import time
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -606,7 +608,6 @@ async def remediate_captive_portal(
     the router. Returns a per-step report so you can see what changed.
     """
     from app.services.mikrotik_api import MikroTikAPI
-    from app.config import settings
 
     req = request or CaptivePortalRemediateRequest()
     user = await get_current_user(token, db)
@@ -639,8 +640,9 @@ async def remediate_captive_portal(
             ),
         )
 
-    base_url = settings.PROVISION_BASE_URL.rstrip("/")
+    base_url = provision_base_url_for_vpn(pt.vpn_type)
     login_page_url = f"{base_url}/api/provision/{pt.token}/login-page"
+    fetch_mode = urlsplit(login_page_url).scheme.lower() or "http"
     target_dir = req.target_html_directory.rstrip("/")
     login_dst = f"{target_dir}/login.html"
 
@@ -738,11 +740,11 @@ async def remediate_captive_portal(
             #    to save the file -- the API response then only carries
             #    text status fields.
             fetch_params = {
-                    "url": login_page_url,
-                    "dst-path": login_dst,
-                    "mode": "https",
-                }
-            if pt.vpn_type == "l2tp":
+                "url": login_page_url,
+                "dst-path": login_dst,
+                "mode": fetch_mode,
+            }
+            if pt.vpn_type == "l2tp" and fetch_mode == "https":
                 fetch_params["check-certificate"] = "no"
             fetch = api.send_command("/tool/fetch", fetch_params)
             if fetch.get("error"):

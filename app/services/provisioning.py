@@ -7,6 +7,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -34,6 +35,33 @@ LOGIN_PAGE_PATH = os.path.join(
 )
 
 API_USERNAME = "bitwave-api"
+
+
+def _downgrade_https_to_http(base_url: str) -> str:
+    """Return an HTTP version of base_url when it explicitly uses HTTPS."""
+    clean_url = (base_url or "").strip().rstrip("/")
+    parsed = urlsplit(clean_url)
+    if parsed.scheme.lower() != "https":
+        return clean_url
+    return urlunsplit(parsed._replace(scheme="http")).rstrip("/")
+
+
+def provision_base_url_for_vpn(vpn_type: str) -> str:
+    """Pick the public fetch base URL for the router's provisioning transport."""
+    if (vpn_type or "").lower() == "l2tp":
+        legacy_url = (settings.PROVISION_LEGACY_BASE_URL or "").strip().rstrip("/")
+        if legacy_url:
+            return legacy_url
+        return _downgrade_https_to_http(settings.PROVISION_BASE_URL)
+    return settings.PROVISION_BASE_URL.rstrip("/")
+
+
+def fetch_certificate_flag_for_url(url: str, vpn_type: str) -> str:
+    """RouterOS v6 needs certificate checks disabled only when using HTTPS."""
+    scheme = urlsplit((url or "").strip()).scheme.lower()
+    if (vpn_type or "").lower() == "l2tp" and scheme == "https":
+        return " check-certificate=no"
+    return ""
 
 
 def _wg_client(timeout: int = 10) -> httpx.AsyncClient:
@@ -498,9 +526,9 @@ def _rsc_hotspot(token: ProvisioningToken) -> str:
 
 
 def _rsc_login_page(token: ProvisioningToken) -> str:
-    base_url = settings.PROVISION_BASE_URL.rstrip("/")
+    base_url = provision_base_url_for_vpn(token.vpn_type)
     t = token.token
-    cert_flag = " check-certificate=no" if token.vpn_type == "l2tp" else ""
+    cert_flag = fetch_certificate_flag_for_url(base_url, token.vpn_type)
     return f"""
 # ---- STEP 5: DOWNLOAD CUSTOM LOGIN PAGE ----
 
@@ -573,9 +601,9 @@ def _rsc_identity_and_user(token: ProvisioningToken) -> str:
 
 
 def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
-    base_url = settings.PROVISION_BASE_URL.rstrip("/")
+    base_url = provision_base_url_for_vpn(token.vpn_type)
     t = token.token
-    cert_flag = " check-certificate=no" if token.vpn_type == "l2tp" else ""
+    cert_flag = fetch_certificate_flag_for_url(base_url, token.vpn_type)
     return f"""
 # ---- STEP 9: NOTIFY SERVER ----
 
@@ -762,12 +790,9 @@ async def create_provisioning_token(
 
 def build_provision_command(token: ProvisioningToken) -> str:
     """Build the one-liner command the admin pastes on a factory-reset MikroTik."""
-    base_url = settings.PROVISION_BASE_URL.rstrip("/")
+    base_url = provision_base_url_for_vpn(token.vpn_type)
     url = f"{base_url}/api/provision/{token.token}"
-    # RouterOS v6 ships with outdated CA certificates that can't verify
-    # Cloudflare (or most modern) TLS certificates, causing /tool fetch to
-    # fail with "ssl connection error".  Skip verification for v6.
-    cert_flag = " check-certificate=no" if token.vpn_type == "l2tp" else ""
+    cert_flag = fetch_certificate_flag_for_url(base_url, token.vpn_type)
     return (
         f'/tool fetch url="{url}" dst-path=provision.rsc{cert_flag};'
         f":delay 2s;"
