@@ -224,6 +224,78 @@ def _shape_health_response(
     return result
 
 
+def _health_payload_from_snapshot(
+    *,
+    latest_snapshot: Optional[BandwidthSnapshot],
+    router_id: Optional[int],
+    router_name: str,
+    reason: str,
+) -> dict:
+    """Build a contract-compatible health payload from the latest snapshot."""
+    snapshot_active_queues = 0
+    active_hotspot_users = 0
+    current_download_mbps = 0.0
+    current_upload_mbps = 0.0
+    snapshot_age = None
+
+    if latest_snapshot:
+        snapshot_active_queues = latest_snapshot.active_queues or 0
+        persisted_hotspot = getattr(latest_snapshot, "active_hotspot_users", None)
+        active_hotspot_users = (
+            max(0, snapshot_active_queues)
+            if persisted_hotspot is None
+            else max(0, int(persisted_hotspot))
+        )
+        current_download_mbps = round((latest_snapshot.avg_download_bps or 0) / 1000000, 2)
+        current_upload_mbps = round((latest_snapshot.avg_upload_bps or 0) / 1000000, 2)
+        snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
+
+    active_pppoe_users = max(0, snapshot_active_queues - active_hotspot_users)
+    total_active_users = active_hotspot_users + active_pppoe_users
+
+    return {
+        "system": {
+            "uptime": "",
+            "version": "",
+            "platform": "",
+            "board_name": "",
+            "architecture": "",
+            "cpu": "",
+            "cpu_count": 1,
+            "cpu_frequency_mhz": 0,
+        },
+        "cpu_load_percent": 0,
+        "memory": {
+            "total_bytes": 0,
+            "free_bytes": 0,
+            "used_bytes": 0,
+            "used_percent": 0,
+        },
+        "storage": {
+            "total_bytes": 0,
+            "free_bytes": 0,
+            "used_bytes": 0,
+            "used_percent": 0,
+        },
+        "health_sensors": {},
+        "active_users": active_hotspot_users,
+        "active_hotspot_users": active_hotspot_users,
+        "active_pppoe_users": active_pppoe_users,
+        "active_total_users": total_active_users,
+        "_full_pppoe_sessions": [],
+        "bandwidth": {
+            "download_mbps": current_download_mbps,
+            "upload_mbps": current_upload_mbps,
+        },
+        "snapshot_age_seconds": round(snapshot_age, 1) if snapshot_age else None,
+        "router_id": router_id,
+        "router_name": router_name,
+        "generated_at": datetime.utcnow().isoformat(),
+        "live": False,
+        "fallback_reason": reason,
+    }
+
+
 @router.get("/api/mikrotik/health")
 async def get_mikrotik_health(
     router_id: Optional[int] = None,
@@ -288,6 +360,13 @@ async def get_mikrotik_health(
                 "name": "Default Router"
             }
             router_name = "Default Router"
+
+        snapshot_query = select(BandwidthSnapshot).order_by(BandwidthSnapshot.recorded_at.desc()).limit(1)
+        if router_id:
+            snapshot_query = snapshot_query.where(BandwidthSnapshot.router_id == router_id)
+
+        snapshot_result = await db.execute(snapshot_query)
+        latest_snapshot = snapshot_result.scalar_one_or_none()
         
         # Run MikroTik operations in thread pool (non-blocking!)
         try:
@@ -296,7 +375,7 @@ async def get_mikrotik_health(
                 timeout=10,
             )
         except asyncio.TimeoutError:
-            if router_id:
+            if router_id and not latest_snapshot:
                 await record_router_availability(db, router_id, False, "mikrotik_health_timeout")
             if cache_key in _health_cache:
                 cached_entry = _health_cache[cache_key]
@@ -308,13 +387,27 @@ async def get_mikrotik_health(
                     cache_age_seconds=age,
                     stale=True,
                 )
+            if latest_snapshot:
+                fallback = _health_payload_from_snapshot(
+                    latest_snapshot=latest_snapshot,
+                    router_id=router_id,
+                    router_name=router_name,
+                    reason="live_health_timeout",
+                )
+                return _shape_health_response(
+                    fallback,
+                    include_sessions=include_sessions,
+                    cached=False,
+                    cache_age_seconds=None,
+                    stale=True,
+                )
             raise HTTPException(
                 status_code=504,
                 detail=f"Timed out fetching router health: {router_name}",
             )
         
         if mikrotik_result.get("error"):
-            if router_id:
+            if router_id and not latest_snapshot:
                 await record_router_availability(db, router_id, False, "mikrotik_health")
             # Return stale cache if available when router unreachable
             if cache_key in _health_cache:
@@ -325,6 +418,20 @@ async def get_mikrotik_health(
                     include_sessions=include_sessions,
                     cached=True,
                     cache_age_seconds=age,
+                    stale=True,
+                )
+            if latest_snapshot:
+                fallback = _health_payload_from_snapshot(
+                    latest_snapshot=latest_snapshot,
+                    router_id=router_id,
+                    router_name=router_name,
+                    reason=mikrotik_result.get("error") or "live_health_failed",
+                )
+                return _shape_health_response(
+                    fallback,
+                    include_sessions=include_sessions,
+                    cached=False,
+                    cache_age_seconds=None,
                     stale=True,
                 )
             raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
@@ -359,14 +466,7 @@ async def get_mikrotik_health(
         current_download_mbps = 0.0
         current_upload_mbps = 0.0
         snapshot_age = None
-        
-        snapshot_query = select(BandwidthSnapshot).order_by(BandwidthSnapshot.recorded_at.desc()).limit(1)
-        if router_id:
-            snapshot_query = snapshot_query.where(BandwidthSnapshot.router_id == router_id)
-        
-        snapshot_result = await db.execute(snapshot_query)
-        latest_snapshot = snapshot_result.scalar_one_or_none()
-        
+
         if latest_snapshot:
             snapshot_active_queues = latest_snapshot.active_queues or 0
             # active_hotspot_users column was added later; fall back to deriving
@@ -381,6 +481,7 @@ async def get_mikrotik_health(
             current_upload_mbps = round(latest_snapshot.avg_upload_bps / 1000000, 2)
             snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
         
+        active_hotspot_users = snapshot_hotspot_users
         if pppoe_active.get("skipped") and latest_snapshot:
             active_pppoe_users = max(0, (latest_snapshot.active_queues or 0) - active_hotspot_users)
         else:
@@ -392,7 +493,6 @@ async def get_mikrotik_health(
         active_pppoe_sessions = (
             pppoe_active.get("data", []) if not pppoe_active.get("error") else []
         )
-        active_hotspot_users = snapshot_hotspot_users
         total_active_users = active_hotspot_users + active_pppoe_users
         
         result = {
