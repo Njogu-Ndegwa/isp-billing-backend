@@ -373,7 +373,21 @@ def _rsc_vpn_l2tp(token: ProvisioningToken) -> str:
     return f"""
 # ---- STEP 3: L2TP/IPsec VPN (RouterOS v6) ----
 
-/interface l2tp-client add name=l2tp-aws connect-to={token.server_public_ip} user="{token.l2tp_username}" password="{token.l2tp_password}" use-ipsec=yes ipsec-secret="{settings.L2TP_IPSEC_PSK}" disabled=no allow=mschap2,mschap1 comment="Management VPN to AWS"
+:do {{
+    /interface l2tp-client add name=l2tp-aws connect-to={token.server_public_ip} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=no allow=mschap2,mschap1 comment="Management VPN to AWS"
+}} on-error={{
+    /interface l2tp-client set [find where name=l2tp-aws] connect-to={token.server_public_ip} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=no allow=mschap2,mschap1 comment="Management VPN to AWS"
+}}
+
+# Some RouterOS v6 builds reject `use-ipsec` while importing an add command.
+# Parse it at runtime so unsupported builds warn without aborting provisioning.
+:do {{
+    :local bwSetIpsec [:parse "/interface l2tp-client set [find where name=l2tp-aws] use-ipsec=yes ipsec-secret={settings.L2TP_IPSEC_PSK}"]
+    $bwSetIpsec
+    :log info "Provisioning: L2TP IPsec settings applied"
+}} on-error={{
+    :log warning "Provisioning: RouterOS rejected L2TP use-ipsec/ipsec-secret settings"
+}}
 :do {{ /ip firewall filter add chain=input protocol=udp dst-port=500,4500,1701 action=accept comment="Allow L2TP/IPsec" }} on-error={{}}
 
 :log info "Provisioning: L2TP/IPsec tunnel configured, waiting for connection..."

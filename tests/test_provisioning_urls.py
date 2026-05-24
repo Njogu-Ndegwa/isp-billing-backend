@@ -40,6 +40,9 @@ def test_l2tp_provisioning_uses_http_bootstrap_when_no_legacy_url(monkeypatch):
     assert 'url="http://isp.bitwavetechnologies.net/api/provision/abc123/complete"' in script
     assert "https://isp.bitwavetechnologies.net/api/provision" not in script
     assert "l2tp-client add" in script
+    assert "l2tp-client add name=l2tp-aws" in script
+    assert "l2tp-client add name=l2tp-aws" in script and " use-ipsec=yes " not in script.split("l2tp-client add name=l2tp-aws", 1)[1].splitlines()[0]
+    assert ':parse "/interface l2tp-client set [find where name=l2tp-aws] use-ipsec=yes' in script
     assert not any(line.rstrip().endswith("\\") for line in script.splitlines())
 
 
