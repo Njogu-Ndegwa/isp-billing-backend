@@ -39,6 +39,8 @@ def test_l2tp_provisioning_uses_http_bootstrap_when_no_legacy_url(monkeypatch):
     assert 'url="http://isp.bitwavetechnologies.net/api/provision/abc123/login-page"' in script
     assert 'url="http://isp.bitwavetechnologies.net/api/provision/abc123/complete"' in script
     assert "https://isp.bitwavetechnologies.net/api/provision" not in script
+    assert "l2tp-client add" in script
+    assert not any(line.rstrip().endswith("\\") for line in script.splitlines())
 
 
 def test_l2tp_provisioning_honors_explicit_legacy_base_url(monkeypatch):
@@ -81,3 +83,5 @@ def test_wireguard_provisioning_keeps_https_base_url(monkeypatch):
     assert 'url="https://isp.bitwavetechnologies.net/api/provision/abc123"' in command
     assert 'url="https://isp.bitwavetechnologies.net/api/provision/abc123/login-page"' in script
     assert 'url="https://isp.bitwavetechnologies.net/api/provision/abc123/complete"' in script
+    assert "wireguard peers add" in script
+    assert not any(line.rstrip().endswith("\\") for line in script.splitlines())

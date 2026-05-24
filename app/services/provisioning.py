@@ -362,10 +362,7 @@ def _rsc_vpn_wireguard(token: ProvisioningToken) -> str:
 
 /interface wireguard add name=wg-aws listen-port=51820 private-key="{token.wg_private_key}"
 /ip address add address={token.wireguard_ip}/16 interface=wg-aws
-/interface wireguard peers add interface=wg-aws \\
-    public-key="{token.server_wg_pubkey}" \\
-    endpoint-address={token.server_public_ip} endpoint-port=51820 \\
-    allowed-address=10.0.0.0/16 persistent-keepalive=25
+/interface wireguard peers add interface=wg-aws public-key="{token.server_wg_pubkey}" endpoint-address={token.server_public_ip} endpoint-port=51820 allowed-address=10.0.0.0/16 persistent-keepalive=25
 :do {{ /ip firewall filter add chain=input protocol=udp dst-port=51820 action=accept comment="Allow WireGuard" }} on-error={{}}
 
 :log info "Provisioning: WireGuard tunnel configured"
@@ -376,10 +373,7 @@ def _rsc_vpn_l2tp(token: ProvisioningToken) -> str:
     return f"""
 # ---- STEP 3: L2TP/IPsec VPN (RouterOS v6) ----
 
-/interface l2tp-client add name=l2tp-aws connect-to={token.server_public_ip} \\
-    user="{token.l2tp_username}" password="{token.l2tp_password}" \\
-    use-ipsec=yes ipsec-secret="{settings.L2TP_IPSEC_PSK}" \\
-    disabled=no allow=mschap2,mschap1 comment="Management VPN to AWS"
+/interface l2tp-client add name=l2tp-aws connect-to={token.server_public_ip} user="{token.l2tp_username}" password="{token.l2tp_password}" use-ipsec=yes ipsec-secret="{settings.L2TP_IPSEC_PSK}" disabled=no allow=mschap2,mschap1 comment="Management VPN to AWS"
 :do {{ /ip firewall filter add chain=input protocol=udp dst-port=500,4500,1701 action=accept comment="Allow L2TP/IPsec" }} on-error={{}}
 
 :log info "Provisioning: L2TP/IPsec tunnel configured, waiting for connection..."
