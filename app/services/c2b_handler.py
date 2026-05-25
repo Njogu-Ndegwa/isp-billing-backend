@@ -31,9 +31,11 @@ from app.config import settings
 from app.db.models import (
     C2BTransaction,
     C2BTransactionStatus,
+    CollectionMode,
     ConnectionType,
     Customer,
     PaymentMethod,
+    Plan,
     ResellerPaymentMethod,
     UnmatchedC2BPayment,
     UnmatchedC2BReason,
@@ -273,12 +275,35 @@ async def handle_confirmation(
         )
         return SUCCESS_RESPONSE
 
-    # 5. Amount logic — wallet credit applies first, overage is replaced
-    plan_price = float(customer.plan.price) if customer.plan else 0.0
+    # 5. Handle pending plan change (customer paying for a different plan)
+    import json as _json
+    plan = customer.plan
+    pending_data = None
+    if customer.pending_update_data:
+        try:
+            pending_data = (
+                _json.loads(customer.pending_update_data)
+                if isinstance(customer.pending_update_data, str)
+                else customer.pending_update_data
+            )
+        except (ValueError, TypeError):
+            pending_data = None
+
+    if pending_data and pending_data.get("plan_id"):
+        pending_plan = (
+            await db.execute(select(Plan).where(Plan.id == pending_data["plan_id"]))
+        ).scalar_one_or_none()
+        if pending_plan:
+            plan = pending_plan
+            customer.plan_id = plan.id
+            logger.info("[C2B] Applied pending plan change: customer %s -> plan %s (%s)",
+                        customer.id, plan.id, plan.name)
+
+    # 6. Amount logic — wallet credit applies first, overage is replaced
+    plan_price = float(plan.price) if plan else 0.0
     effective_amount = fields.trans_amount + float(customer.wallet_credit_kes or 0)
 
     if plan_price > 0 and effective_amount < plan_price:
-        # Not enough even with wallet. Don't activate; bucket for human triage.
         txn = await _archive(
             db, fields,
             status=C2BTransactionStatus.UNMATCHED,
@@ -297,9 +322,9 @@ async def handle_confirmation(
         )
         return SUCCESS_RESPONSE
 
-    # 6. Activate: extend expiry, record payment, update wallet
-    plan_duration_value = customer.plan.duration_value
-    plan_duration_unit = customer.plan.duration_unit.value.upper()
+    # 7. Activate: extend expiry, record payment, update wallet
+    plan_duration_value = plan.duration_value
+    plan_duration_unit = plan.duration_unit.value.upper()
 
     if plan_duration_unit == "MINUTES":
         days_paid_for = max(1, plan_duration_value // (24 * 60))
@@ -307,6 +332,11 @@ async def handle_confirmation(
         days_paid_for = max(1, plan_duration_value // 24)
     else:  # DAYS
         days_paid_for = plan_duration_value
+
+    collection = (
+        CollectionMode.SYSTEM_COLLECTED if is_platform
+        else CollectionMode.DIRECT
+    )
 
     await record_customer_payment(
         db=db,
@@ -319,7 +349,10 @@ async def handle_confirmation(
         notes=f"M-Pesa C2B Paybill (shortcode {fields.business_shortcode})",
         duration_value=plan_duration_value,
         duration_unit=plan_duration_unit,
+        collection_mode=collection,
     )
+
+    customer.pending_update_data = None
 
     # Wallet replacement: effective_amount was made up of (paid + old_wallet).
     # We applied plan_price to grant the period; the remainder is the new wallet.
@@ -339,10 +372,10 @@ async def handle_confirmation(
         customer.id, fields.trans_amount, plan_price, customer.wallet_credit_kes, fields.trans_id,
     )
 
-    # 7. Provision (PPPoE only)
+    # 8. Provision (PPPoE only)
     if (
-        customer.plan
-        and customer.plan.connection_type == ConnectionType.PPPOE
+        plan
+        and plan.connection_type == ConnectionType.PPPOE
         and customer.pppoe_username
         and customer.router
     ):
@@ -365,7 +398,7 @@ async def handle_confirmation(
             "[C2B] Skipping auto-provisioning for customer %s "
             "(connection_type=%s, pppoe_username=%s, router_id=%s)",
             customer.id,
-            customer.plan.connection_type.value if customer.plan and customer.plan.connection_type else None,
+            plan.connection_type.value if plan and plan.connection_type else None,
             customer.pppoe_username,
             customer.router_id,
         )

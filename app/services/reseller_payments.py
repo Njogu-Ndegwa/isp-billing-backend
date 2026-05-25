@@ -3,7 +3,7 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta
 from fastapi import HTTPException
-from app.db.models import Customer, CustomerPayment, ResellerFinancials, PaymentMethod, CustomerStatus, PaymentStatus
+from app.db.models import CollectionMode, Customer, CustomerPayment, ResellerFinancials, PaymentMethod, CustomerStatus, PaymentStatus
 
 async def record_customer_payment(
     db: AsyncSession,
@@ -15,13 +15,15 @@ async def record_customer_payment(
     payment_reference: str = None,
     notes: str = None,
     duration_value: int = None,
-    duration_unit: str = None
+    duration_unit: str = None,
+    collection_mode: CollectionMode = None,
 ) -> CustomerPayment:
     """Record a payment made by customer to reseller
-    
+
     Args:
         duration_value: Override plan duration value (for pending plan changes)
         duration_unit: Override plan duration unit (MINUTES, HOURS, DAYS)
+        collection_mode: DIRECT if reseller collected, SYSTEM_COLLECTED if platform collected
     """
     
     # Load customer with plan to calculate proper expiry
@@ -44,6 +46,7 @@ async def record_customer_payment(
         days_paid_for=days_paid_for,
         notes=notes,
         customer_name=customer.name,
+        collection_mode=collection_mode,
     )
     
     db.add(payment)

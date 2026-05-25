@@ -296,6 +296,13 @@ async def attribute_unmatched_c2b(
     else:
         days_paid_for = plan_duration_value
 
+    is_platform_paybill = txn.business_shortcode == settings.MPESA_SHORTCODE
+    from app.db.models import CollectionMode
+    collection = (
+        CollectionMode.SYSTEM_COLLECTED if is_platform_paybill
+        else CollectionMode.DIRECT
+    )
+
     await record_customer_payment(
         db=db,
         customer_id=customer.id,
@@ -307,6 +314,7 @@ async def attribute_unmatched_c2b(
         notes=f"C2B manually attributed by user {user.id}: {request.notes or ''}".strip(),
         duration_value=plan_duration_value,
         duration_unit=plan_duration_unit,
+        collection_mode=collection,
     )
 
     new_wallet = int(round(effective_amount - plan_price)) if plan_price > 0 else 0
