@@ -10,6 +10,7 @@ from app.db.models import (
     Router, Customer, Plan, MpesaTransaction, MpesaTransactionStatus,
     CustomerStatus, CustomerPayment, ConnectionType, User, PaymentMethod,
     ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
+    C2BTransaction, C2BTransactionStatus,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -1171,6 +1172,76 @@ async def get_mpesa_transactions(
                     "_delivery_source_pk": pay.id,
                 })
                 customer_payment_source_ids.append(pay.id)
+
+        # --- Query 3: C2B Paybill transactions (customer pays via paybill) ---
+        if want_mpesa:
+            c2b_stmt = (
+                select(C2BTransaction, Customer, Router, Plan)
+                .outerjoin(Customer, C2BTransaction.matched_customer_id == Customer.id)
+                .outerjoin(Router, Customer.router_id == Router.id)
+                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                .where(C2BTransaction.matched_reseller_id == user.id)
+            )
+            if router_id:
+                c2b_stmt = c2b_stmt.where(Router.id == router_id)
+            if date_start:
+                c2b_stmt = c2b_stmt.where(C2BTransaction.received_at >= date_start)
+            if date_end:
+                c2b_stmt = c2b_stmt.where(C2BTransaction.received_at <= date_end)
+            if status:
+                s = status.lower()
+                if s == "completed":
+                    c2b_stmt = c2b_stmt.where(C2BTransaction.status == C2BTransactionStatus.PROCESSED)
+                elif s == "failed":
+                    c2b_stmt = c2b_stmt.where(C2BTransaction.status.in_([
+                        C2BTransactionStatus.UNMATCHED, C2BTransactionStatus.REJECTED,
+                    ]))
+
+            c2b_rows = (await db.execute(c2b_stmt)).all()
+
+            for tx, customer, rtr, plan in c2b_rows:
+                results.append({
+                    "transaction_id": tx.id,
+                    "checkout_request_id": None,
+                    "phone_number": tx.msisdn,
+                    "amount": float(tx.trans_amount),
+                    "reference": tx.bill_ref_number,
+                    "lipay_tx_no": None,
+                    "status": "completed" if tx.status == C2BTransactionStatus.PROCESSED else tx.status.value,
+                    "payment_method": "mobile_money",
+                    "payment_reference": tx.trans_id,
+                    "mpesa_receipt_number": tx.trans_id,
+                    "result_code": None,
+                    "result_desc": None,
+                    "failure_source": None,
+                    "transaction_date": tx.received_at.isoformat() if tx.received_at else None,
+                    "created_at": tx.received_at.isoformat() if tx.received_at else None,
+                    "source": "c2b_paybill",
+                    "customer": {
+                        "id": customer.id,
+                        "name": customer.name,
+                        "phone": customer.phone,
+                        "mac_address": customer.mac_address,
+                        "status": customer.status.value,
+                    } if customer else None,
+                    "router": {
+                        "id": rtr.id,
+                        "name": rtr.name,
+                        "ip_address": rtr.ip_address,
+                        "auth_method": _router_auth_value(rtr),
+                    } if rtr else None,
+                    "plan": {
+                        "id": plan.id,
+                        "name": plan.name,
+                        "price": plan.price,
+                        "duration_value": plan.duration_value,
+                        "duration_unit": plan.duration_unit.value,
+                        "connection_type": plan.connection_type.value if plan.connection_type else None,
+                    } if plan else None,
+                    "manual_provision_supported": False,
+                    "manual_provision_reason": "C2B payments are auto-provisioned",
+                    "delivery": None,
+                })
 
         attempt_map = await load_delivery_attempts_by_source(
             db,
