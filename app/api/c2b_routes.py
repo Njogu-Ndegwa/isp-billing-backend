@@ -356,7 +356,7 @@ async def _call_daraja_registerurl(
     validation_url: str,
     response_type: str = "Completed",
 ) -> dict:
-    """Call Safaricom Daraja /mpesa/c2b/v1/registerurl. Returns Safaricom's
+    """Call Safaricom Daraja /mpesa/c2b/v2/registerurl. Returns Safaricom's
     response verbatim so the caller can show ResponseDescription / errors
     back to the operator."""
     access_token = await get_access_token(
@@ -375,7 +375,7 @@ async def _call_daraja_registerurl(
     }
     async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
         resp = await client.post(
-            f"{base_url}/mpesa/c2b/v1/registerurl",
+            f"{base_url}/mpesa/c2b/v2/registerurl",
             json=payload,
             headers={
                 "Authorization": f"Bearer {access_token}",

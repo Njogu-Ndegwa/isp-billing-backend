@@ -54,8 +54,8 @@ logger = logging.getLogger(__name__)
 # Safaricom response shapes (per Daraja docs)
 # ---------------------------------------------------------------------------
 
-ACCEPT_RESPONSE = {"ResultCode": 0, "ResultDesc": "Accepted"}
-SUCCESS_RESPONSE = {"ResultCode": 0, "ResultDesc": "Success"}
+ACCEPT_RESPONSE = {"ResultCode": "0", "ResultDesc": "Accepted"}
+SUCCESS_RESPONSE = {"ResultCode": "0", "ResultDesc": "Success"}
 
 # https://developer.safaricom.co.ke/c2b — Validation URL rejection codes
 REJECT_INVALID_ACCOUNT = {"ResultCode": "C2B00012", "ResultDesc": "Invalid Account Number"}
