@@ -1403,7 +1403,7 @@ class C2BTransaction(Base):
     trans_id = Column(String(64), unique=True, nullable=False, index=True)
     bill_ref_number = Column(String(64), nullable=True, index=True)
     trans_amount = Column(Float, nullable=False)
-    msisdn = Column(String(20), nullable=True)
+    msisdn = Column(String(128), nullable=True)
     business_shortcode = Column(String(20), nullable=True, index=True)
     payload_json = Column(JSON, nullable=True)  # raw Safaricom payload for audit
     status = Column(
