@@ -769,9 +769,14 @@ class MikroTikAPI:
     # ------------------------------------------------------------------
     # Anti-tethering (TTL-based hotspot sharing prevention)
     #
-    # Strategy: use mangle PREROUTING (sees original TTL before the router
-    # decrements it) to mark packets from tethered devices, then drop the
-    # marked packets in filter FORWARD.
+    # Strategy:
+    # 1. Use mangle PREROUTING (sees original TTL before the router decrements
+    #    it) to mark packets that already came through another router, then
+    #    drop the marked packets in filter FORWARD.
+    # 2. Clamp return traffic heading back to hotspot clients to TTL=1. The
+    #    paying phone/laptop can still consume those packets as the endpoint,
+    #    but a phone acting as a hotspot router must decrement TTL before
+    #    forwarding and therefore drops the packet instead of sharing it.
     #
     # A direct device sends TTL=64 (Linux/Android/iOS) or 128 (Windows).
     # A tethered device behind a phone hotspot arrives with TTL=63 or 127
@@ -782,52 +787,100 @@ class MikroTikAPI:
     # ------------------------------------------------------------------
     ANTI_TETHER_COMMENT = "ISP_BILLING_ANTI_TETHERING"
     ANTI_TETHER_PACKET_MARK = "isp_tethered_traffic"
+    ANTI_TETHER_TTL_MATCHES = ("equal:63", "equal:127", "equal:254")
 
     def enable_anti_tethering(self) -> Dict[str, Any]:
-        """Mark tethered traffic in mangle prerouting, then drop in filter forward."""
+        """Ensure hotspot anti-tethering rules exist and are ordered before FastTrack.
+
+        This method deliberately recreates the managed rules instead of returning
+        early when any old rule is present. Older deployments appended the drop
+        rule after generic forward accepts/FastTrack, which made the feature look
+        enabled while still allowing tethered traffic through.
+        """
         if not self.connected:
             return {"error": "Not connected"}
         try:
-            existing_mangle = self._get_anti_tether_mangle_rules()
-            existing_filter = self._get_anti_tether_filter_rules()
-            if existing_mangle or existing_filter:
-                return {"success": True, "already_present": True}
-
             interfaces = self._get_hotspot_interfaces()
             if not interfaces:
                 return {"error": "No hotspot server interfaces found on this router"}
 
-            for iface in interfaces:
-                # TTL=63: tethered Linux/Android/iOS (original 64, phone decremented)
-                self.send_command("/ip/firewall/mangle/add", {
-                    "chain": "prerouting",
-                    "action": "mark-packet",
-                    "new-packet-mark": self.ANTI_TETHER_PACKET_MARK,
-                    "passthrough": "no",
-                    "in-interface": iface,
-                    "ttl": "equal:63",
-                    "comment": self.ANTI_TETHER_COMMENT,
-                })
-                # TTL=127: tethered Windows (original 128, phone decremented)
-                self.send_command("/ip/firewall/mangle/add", {
-                    "chain": "prerouting",
-                    "action": "mark-packet",
-                    "new-packet-mark": self.ANTI_TETHER_PACKET_MARK,
-                    "passthrough": "no",
-                    "in-interface": iface,
-                    "ttl": "equal:127",
-                    "comment": self.ANTI_TETHER_COMMENT,
-                })
+            cleanup = self._remove_anti_tethering_rules()
+            if cleanup.get("error"):
+                return cleanup
 
-            # Single filter rule drops all marked packets
-            self.send_command("/ip/firewall/filter/add", {
+            mangle_result = self._get_firewall_mangle_rules()
+            if not mangle_result.get("success"):
+                return {
+                    "error": f"Failed to read firewall mangle rules: {mangle_result.get('error', 'unknown error')}"
+                }
+            filter_result = self._get_firewall_filter_rules()
+            if not filter_result.get("success"):
+                return {
+                    "error": f"Failed to read firewall filter rules: {filter_result.get('error', 'unknown error')}"
+                }
+
+            mangle_rules = mangle_result.get("data", [])
+            filter_rules = filter_result.get("data", [])
+            prerouting_insert_id = self._first_active_chain_rule_id(mangle_rules, "prerouting")
+            postrouting_insert_id = self._first_active_chain_rule_id(mangle_rules, "postrouting")
+            filter_insert_id = self._first_forward_fasttrack_or_accept_rule_id(filter_rules)
+
+            added_mangle = 0
+            for iface in interfaces:
+                for ttl_match in self.ANTI_TETHER_TTL_MATCHES:
+                    args = {
+                        "chain": "prerouting",
+                        "action": "mark-packet",
+                        "new-packet-mark": self.ANTI_TETHER_PACKET_MARK,
+                        "passthrough": "no",
+                        "in-interface": iface,
+                        "ttl": ttl_match,
+                        "comment": self.ANTI_TETHER_COMMENT,
+                    }
+                    if prerouting_insert_id:
+                        args["place-before"] = prerouting_insert_id
+                    result = self.send_command("/ip/firewall/mangle/add", args)
+                    if result.get("error"):
+                        return {"error": f"Failed to add anti-tether TTL marker on {iface}: {result['error']}"}
+                    added_mangle += 1
+
+                clamp_args = {
+                    "chain": "postrouting",
+                    "action": "change-ttl",
+                    "new-ttl": "set:1",
+                    "passthrough": "yes",
+                    "out-interface": iface,
+                    "comment": self.ANTI_TETHER_COMMENT,
+                }
+                if postrouting_insert_id:
+                    clamp_args["place-before"] = postrouting_insert_id
+                result = self.send_command("/ip/firewall/mangle/add", clamp_args)
+                if result.get("error"):
+                    return {"error": f"Failed to add anti-tether return TTL clamp on {iface}: {result['error']}"}
+                added_mangle += 1
+
+            filter_args = {
                 "chain": "forward",
                 "action": "drop",
                 "packet-mark": self.ANTI_TETHER_PACKET_MARK,
                 "comment": self.ANTI_TETHER_COMMENT,
-            })
+            }
+            if filter_insert_id:
+                filter_args["place-before"] = filter_insert_id
+            result = self.send_command("/ip/firewall/filter/add", filter_args)
+            if result.get("error"):
+                return {"error": f"Failed to add anti-tether forward drop rule: {result['error']}"}
 
-            return {"success": True, "interfaces": interfaces}
+            return {
+                "success": True,
+                "interfaces": interfaces,
+                "ttl_matches": list(self.ANTI_TETHER_TTL_MATCHES),
+                "added_mangle": added_mangle,
+                "added_filter": 1,
+                "removed_mangle": cleanup.get("removed_mangle", 0),
+                "removed_filter": cleanup.get("removed_filter", 0),
+                "mode": "ttl-marker-plus-return-ttl-clamp",
+            }
         except Exception as e:
             logger.error(f"Error enabling anti-tethering: {e}")
             return {"error": str(e)}
@@ -837,15 +890,7 @@ class MikroTikAPI:
         if not self.connected:
             return {"error": "Not connected"}
         try:
-            mangle_rules = self._get_anti_tether_mangle_rules()
-            for rule in mangle_rules:
-                self.send_command("/ip/firewall/mangle/remove", {"numbers": rule[".id"]})
-
-            filter_rules = self._get_anti_tether_filter_rules()
-            for rule in filter_rules:
-                self.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]})
-
-            return {"success": True, "removed_mangle": len(mangle_rules), "removed_filter": len(filter_rules)}
+            return self._remove_anti_tethering_rules()
         except Exception as e:
             logger.error(f"Error disabling anti-tethering: {e}")
             return {"error": str(e)}
@@ -863,29 +908,117 @@ class MikroTikAPI:
                 interfaces.append(hs["interface"])
         return list(set(interfaces))
 
-    def _get_anti_tether_mangle_rules(self) -> List[Dict]:
-        result = self.send_command_optimized(
+    def _remove_anti_tethering_rules(self) -> Dict[str, Any]:
+        mangle_result = self._get_firewall_mangle_rules()
+        if not mangle_result.get("success"):
+            return {
+                "error": f"Failed to read firewall mangle rules: {mangle_result.get('error', 'unknown error')}"
+            }
+
+        mangle_rules = [
+            r for r in mangle_result.get("data", [])
+            if self._is_anti_tether_rule(r)
+        ]
+        removed_mangle = 0
+        for rule in mangle_rules:
+            rule_id = rule.get(".id")
+            if not rule_id:
+                continue
+            result = self.send_command("/ip/firewall/mangle/remove", {"numbers": rule_id})
+            if result.get("error"):
+                return {"error": f"Failed to remove old anti-tether mangle rule {rule_id}: {result['error']}"}
+            removed_mangle += 1
+
+        filter_result = self._get_firewall_filter_rules()
+        if not filter_result.get("success"):
+            return {
+                "error": f"Failed to read firewall filter rules: {filter_result.get('error', 'unknown error')}"
+            }
+
+        filter_rules = [
+            r for r in filter_result.get("data", [])
+            if self._is_anti_tether_rule(r)
+        ]
+        removed_filter = 0
+        for rule in filter_rules:
+            rule_id = rule.get(".id")
+            if not rule_id:
+                continue
+            result = self.send_command("/ip/firewall/filter/remove", {"numbers": rule_id})
+            if result.get("error"):
+                return {"error": f"Failed to remove old anti-tether filter rule {rule_id}: {result['error']}"}
+            removed_filter += 1
+
+        return {"success": True, "removed_mangle": removed_mangle, "removed_filter": removed_filter}
+
+    def _get_firewall_mangle_rules(self) -> Dict[str, Any]:
+        return self.send_command_optimized(
             "/ip/firewall/mangle/print",
-            proplist=[".id", "comment"]
+            proplist=[
+                ".id",
+                "chain",
+                "action",
+                "disabled",
+                "comment",
+                "in-interface",
+                "out-interface",
+                "ttl",
+                "new-packet-mark",
+                "packet-mark",
+                "new-ttl",
+                "passthrough",
+            ]
         )
+
+    def _get_anti_tether_mangle_rules(self) -> List[Dict]:
+        result = self._get_firewall_mangle_rules()
         if not result.get("success"):
             return []
         return [
             r for r in result.get("data", [])
-            if r.get("comment") == self.ANTI_TETHER_COMMENT
+            if self._is_anti_tether_rule(r)
         ]
 
-    def _get_anti_tether_filter_rules(self) -> List[Dict]:
-        result = self.send_command_optimized(
+    def _get_firewall_filter_rules(self) -> Dict[str, Any]:
+        return self.send_command_optimized(
             "/ip/firewall/filter/print",
-            proplist=[".id", "comment"]
+            proplist=[".id", "chain", "action", "disabled", "comment", "packet-mark"]
         )
+
+    def _get_anti_tether_filter_rules(self) -> List[Dict]:
+        result = self._get_firewall_filter_rules()
         if not result.get("success"):
             return []
         return [
             r for r in result.get("data", [])
-            if r.get("comment") == self.ANTI_TETHER_COMMENT
+            if self._is_anti_tether_rule(r)
         ]
+
+    def _is_anti_tether_rule(self, rule: Dict[str, Any]) -> bool:
+        return str(rule.get("comment", "")).startswith(self.ANTI_TETHER_COMMENT)
+
+    def _first_active_chain_rule_id(self, rules: List[Dict[str, Any]], chain: str) -> Optional[str]:
+        for rule in rules:
+            if (
+                rule.get("chain") == chain
+                and str(rule.get("disabled", "false")).lower() != "true"
+                and not self._is_anti_tether_rule(rule)
+                and rule.get(".id")
+            ):
+                return rule[".id"]
+        return None
+
+    def _first_forward_fasttrack_or_accept_rule_id(self, rules: List[Dict[str, Any]]) -> Optional[str]:
+        for rule in rules:
+            if (
+                rule.get("chain") == "forward"
+                and rule.get("action") in {"fasttrack-connection", "accept"}
+                and str(rule.get("disabled", "false")).lower() != "true"
+                and not self._is_anti_tether_rule(rule)
+                and rule.get(".id")
+            ):
+                return rule[".id"]
+        return None
 
     def _parse_speed_to_mikrotik(self, speed: str) -> str:
         """

@@ -888,13 +888,7 @@ async def enable_anti_tethering(
 
         router_obj = await _get_owned_router(db, request.router_id, user.id)
 
-        if getattr(router_obj, "hotspot_sharing_blocked", False):
-            return {
-                "success": True,
-                "router_id": router_obj.id,
-                "hotspot_sharing_blocked": True,
-                "message": "Anti-tethering is already enabled",
-            }
+        was_already_enabled = getattr(router_obj, "hotspot_sharing_blocked", False)
 
         from app.services.mikrotik_api import MikroTikAPI
 
@@ -926,7 +920,12 @@ async def enable_anti_tethering(
             "success": True,
             "router_id": router_obj.id,
             "hotspot_sharing_blocked": True,
-            "message": "Anti-tethering enabled — hotspot sharing is now blocked",
+            "message": (
+                "Anti-tethering rules repaired - hotspot sharing remains blocked"
+                if was_already_enabled
+                else "Anti-tethering enabled - hotspot sharing is now blocked"
+            ),
+            "mikrotik": result,
         }
 
     except HTTPException:
@@ -951,13 +950,7 @@ async def disable_anti_tethering(
 
         router_obj = await _get_owned_router(db, request.router_id, user.id)
 
-        if not getattr(router_obj, "hotspot_sharing_blocked", False):
-            return {
-                "success": True,
-                "router_id": router_obj.id,
-                "hotspot_sharing_blocked": False,
-                "message": "Anti-tethering is already disabled",
-            }
+        was_already_disabled = not getattr(router_obj, "hotspot_sharing_blocked", False)
 
         from app.services.mikrotik_api import MikroTikAPI
 
@@ -989,7 +982,12 @@ async def disable_anti_tethering(
             "success": True,
             "router_id": router_obj.id,
             "hotspot_sharing_blocked": False,
-            "message": "Anti-tethering disabled — hotspot sharing is now allowed",
+            "message": (
+                "Anti-tethering rules cleared - hotspot sharing was already allowed"
+                if was_already_disabled
+                else "Anti-tethering disabled - hotspot sharing is now allowed"
+            ),
+            "mikrotik": result,
         }
 
     except HTTPException:
