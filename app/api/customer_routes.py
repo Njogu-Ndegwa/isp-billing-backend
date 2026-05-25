@@ -512,6 +512,8 @@ async def get_active_customers(
                 "created_at": c.created_at.isoformat() if c.created_at else None,
                 "plan_id": c.plan_id,
                 "router_id": c.router_id,
+                "account_number": c.account_number,
+                "wallet_credit_kes": c.wallet_credit_kes,
                 "plan": {
                     "id": c.plan.id,
                     "name": c.plan.name,

@@ -1008,6 +1008,7 @@ async def pppoe_users(
                 "plan": cust.plan.name if cust.plan else None,
                 "plan_speed": cust.plan.speed if cust.plan else None,
                 "expiry": cust.expiry.isoformat() if cust.expiry else None,
+                "account_number": cust.account_number,
             }
         else:
             u["customer"] = None
