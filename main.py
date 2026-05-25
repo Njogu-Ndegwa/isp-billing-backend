@@ -1528,6 +1528,19 @@ async def run_c2b_migrations():
         )
         await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_unmatched_c2b_assigned_reseller ON unmatched_c2b_payments(assigned_reseller_id)"))
 
+        # -- Widen msisdn column: Safaricom C2B v1 returns a 64-char SHA256 hash
+        result = await conn.execute(sa_text("""
+            SELECT character_maximum_length
+            FROM information_schema.columns
+            WHERE table_name = 'c2b_transactions' AND column_name = 'msisdn'
+        """))
+        row = result.fetchone()
+        if row and row[0] and row[0] < 128:
+            await conn.execute(sa_text(
+                "ALTER TABLE c2b_transactions ALTER COLUMN msisdn TYPE VARCHAR(128)"
+            ))
+            logger.info("C2B migration: widened msisdn column to VARCHAR(128)")
+
     logger.info("C2B Paybill migrations complete")
 
 
