@@ -372,6 +372,7 @@ class Router(Base):
     availability_successes = Column(Integer, nullable=False, default=0, server_default="0")
     emergency_active = Column(Boolean, nullable=False, default=False, server_default="false")
     emergency_message = Column(String(500), nullable=True)
+    hotspot_sharing_blocked = Column(Boolean, nullable=False, default=False, server_default="false")
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 

@@ -1544,6 +1544,26 @@ async def run_c2b_migrations():
     logger.info("C2B Paybill migrations complete")
 
 
+async def run_anti_tethering_migrations():
+    """Add hotspot_sharing_blocked column to routers table.
+
+    When enabled, the backend pushes TTL-based firewall rules to the
+    MikroTik router that block tethered traffic. Defaults to false so
+    existing routers are unaffected.
+    """
+    async with async_engine.begin() as conn:
+        result = await conn.execute(sa_text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'routers' AND column_name = 'hotspot_sharing_blocked'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE routers
+                ADD COLUMN hotspot_sharing_blocked BOOLEAN NOT NULL DEFAULT false
+            """))
+            logger.info("Anti-tethering migration: added routers.hotspot_sharing_blocked")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -1641,6 +1661,12 @@ async def startup_event():
         logger.info("C2B Paybill migrations completed successfully")
     except Exception as e:
         logger.error(f"C2B migration failed (non-fatal): {e}")
+
+    try:
+        await run_anti_tethering_migrations()
+        logger.info("Anti-tethering migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Anti-tethering migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

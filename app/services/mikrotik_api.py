@@ -766,6 +766,62 @@ class MikroTikAPI:
             logger.error(f"Error ensuring FastTrack bypass for queued clients: {e}")
             return {"error": str(e)}
 
+    # ------------------------------------------------------------------
+    # Anti-tethering (TTL-based hotspot sharing prevention)
+    # ------------------------------------------------------------------
+    ANTI_TETHER_COMMENT = "ISP_BILLING_ANTI_TETHERING"
+
+    def enable_anti_tethering(self) -> Dict[str, Any]:
+        """Add firewall rules that drop forwarded packets with TTL=63 (tethered traffic)."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            existing = self._get_anti_tether_rules()
+            if existing:
+                return {"success": True, "already_present": True}
+
+            self.send_command("/ip/firewall/filter/add", {
+                "chain": "forward",
+                "action": "drop",
+                "ttl": "equal:63",
+                "comment": self.ANTI_TETHER_COMMENT,
+            })
+            self.send_command("/ip/firewall/filter/add", {
+                "chain": "forward",
+                "action": "drop",
+                "ttl": "equal:127",
+                "comment": self.ANTI_TETHER_COMMENT,
+            })
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Error enabling anti-tethering: {e}")
+            return {"error": str(e)}
+
+    def disable_anti_tethering(self) -> Dict[str, Any]:
+        """Remove the anti-tethering firewall rules."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            rules = self._get_anti_tether_rules()
+            for rule in rules:
+                self.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]})
+            return {"success": True, "removed": len(rules)}
+        except Exception as e:
+            logger.error(f"Error disabling anti-tethering: {e}")
+            return {"error": str(e)}
+
+    def _get_anti_tether_rules(self) -> List[Dict]:
+        result = self.send_command_optimized(
+            "/ip/firewall/filter/print",
+            proplist=[".id", "comment"]
+        )
+        if not result.get("success"):
+            return []
+        return [
+            r for r in result.get("data", [])
+            if r.get("comment") == self.ANTI_TETHER_COMMENT
+        ]
+
     def _parse_speed_to_mikrotik(self, speed: str) -> str:
         """
         Convert speed string (e.g., '2Mbps', '5 Mbps', '512Kbps') to MikroTik format (e.g., '2M/2M').

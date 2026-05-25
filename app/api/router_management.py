@@ -128,6 +128,7 @@ async def get_routers(
             "dual_ports": getattr(router_obj, "dual_ports", None),
             "emergency_active": getattr(router_obj, "emergency_active", False),
             "emergency_message": getattr(router_obj, "emergency_message", None),
+            "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
         }
         router_payload.update(build_router_status(router_obj, now=now))
         response.append(router_payload)
@@ -387,10 +388,10 @@ async def update_router(
                 router_obj.emergency_message = None
         if request.emergency_message is not None:
             router_obj.emergency_message = request.emergency_message
-        
+
         await db.commit()
         await db.refresh(router_obj)
-        
+
         return {
             "id": router_obj.id,
             "name": router_obj.name,
@@ -405,6 +406,7 @@ async def update_router(
             "dual_ports": router_obj.dual_ports,
             "emergency_active": router_obj.emergency_active,
             "emergency_message": router_obj.emergency_message,
+            "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
             "updated_at": datetime.utcnow().isoformat()
         }
         
@@ -862,3 +864,146 @@ async def remediate_captive_portal(
         f"({router_obj.ip_address}): html-directory now '{target_dir}'"
     )
     return report
+
+
+# ---------------------------------------------------------------------------
+# Anti-tethering (block hotspot sharing via TTL firewall rules)
+# ---------------------------------------------------------------------------
+
+class AntiTetherRequest(BaseModel):
+    router_id: int
+
+
+@router.post("/api/routers/anti-tethering/enable")
+async def enable_anti_tethering(
+    request: AntiTetherRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Enable anti-tethering on a router: persist the flag and push TTL
+    drop rules to MikroTik so tethered devices cannot reach the internet."""
+    try:
+        user = await get_current_user(token, db)
+        enforce_active_subscription(user)
+
+        router_obj = await _get_owned_router(db, request.router_id, user.id)
+
+        if getattr(router_obj, "hotspot_sharing_blocked", False):
+            return {
+                "success": True,
+                "router_id": router_obj.id,
+                "hotspot_sharing_blocked": True,
+                "message": "Anti-tethering is already enabled",
+            }
+
+        from app.services.mikrotik_api import MikroTikAPI
+
+        host, usr, pwd, port = (
+            router_obj.ip_address,
+            router_obj.username,
+            router_obj.password,
+            router_obj.port,
+        )
+
+        def _push_rules():
+            api = MikroTikAPI(host, usr, pwd, port)
+            if not api.connect():
+                return {"error": api.last_connect_error or "Failed to connect to router"}
+            try:
+                return api.enable_anti_tethering()
+            finally:
+                api.disconnect()
+
+        result = await asyncio.get_event_loop().run_in_executor(None, _push_rules)
+        if result.get("error"):
+            raise HTTPException(status_code=502, detail=result["error"])
+
+        router_obj.hotspot_sharing_blocked = True
+        await db.commit()
+
+        logger.info(f"Anti-tethering enabled on router {router_obj.id} by user {user.id}")
+        return {
+            "success": True,
+            "router_id": router_obj.id,
+            "hotspot_sharing_blocked": True,
+            "message": "Anti-tethering enabled — hotspot sharing is now blocked",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error enabling anti-tethering: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to enable anti-tethering: {e}")
+
+
+@router.post("/api/routers/anti-tethering/disable")
+async def disable_anti_tethering(
+    request: AntiTetherRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Disable anti-tethering on a router: remove the TTL drop rules from
+    MikroTik and clear the flag in the database."""
+    try:
+        user = await get_current_user(token, db)
+        enforce_active_subscription(user)
+
+        router_obj = await _get_owned_router(db, request.router_id, user.id)
+
+        if not getattr(router_obj, "hotspot_sharing_blocked", False):
+            return {
+                "success": True,
+                "router_id": router_obj.id,
+                "hotspot_sharing_blocked": False,
+                "message": "Anti-tethering is already disabled",
+            }
+
+        from app.services.mikrotik_api import MikroTikAPI
+
+        host, usr, pwd, port = (
+            router_obj.ip_address,
+            router_obj.username,
+            router_obj.password,
+            router_obj.port,
+        )
+
+        def _remove_rules():
+            api = MikroTikAPI(host, usr, pwd, port)
+            if not api.connect():
+                return {"error": api.last_connect_error or "Failed to connect to router"}
+            try:
+                return api.disable_anti_tethering()
+            finally:
+                api.disconnect()
+
+        result = await asyncio.get_event_loop().run_in_executor(None, _remove_rules)
+        if result.get("error"):
+            raise HTTPException(status_code=502, detail=result["error"])
+
+        router_obj.hotspot_sharing_blocked = False
+        await db.commit()
+
+        logger.info(f"Anti-tethering disabled on router {router_obj.id} by user {user.id}")
+        return {
+            "success": True,
+            "router_id": router_obj.id,
+            "hotspot_sharing_blocked": False,
+            "message": "Anti-tethering disabled — hotspot sharing is now allowed",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error disabling anti-tethering: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to disable anti-tethering: {e}")
+
+
+async def _get_owned_router(db: AsyncSession, router_id: int, user_id: int) -> Router:
+    stmt = select(Router).where(Router.id == router_id, Router.user_id == user_id)
+    result = await db.execute(stmt)
+    router_obj = result.scalar_one_or_none()
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found or does not belong to you")
+    return router_obj
