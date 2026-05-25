@@ -1203,7 +1203,7 @@ async def get_mpesa_transactions(
                 results.append({
                     "transaction_id": tx.id,
                     "checkout_request_id": None,
-                    "phone_number": customer.phone if customer else None,
+                    "phone_number": tx.msisdn,
                     "amount": float(tx.trans_amount),
                     "reference": tx.bill_ref_number,
                     "lipay_tx_no": None,
