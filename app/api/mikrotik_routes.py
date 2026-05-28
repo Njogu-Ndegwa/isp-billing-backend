@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import Optional
 from datetime import datetime, timedelta
-from app.db.database import get_db
+from app.db.database import async_session, get_db
 from app.db.models import Router, Customer, BandwidthSnapshot, UserBandwidthUsage
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -22,6 +22,7 @@ router = APIRouter(tags=["mikrotik"])
 # MikroTik health cache per router
 _health_cache = {}  # router_id -> {"data": ..., "timestamp": ...}
 _health_cache_ttl = 300  # 5 minutes - reduces router connection load significantly
+_health_refresh_inflight = set()  # cache keys currently being refreshed after a fast snapshot response
 
 # MikroTik dashboard cache (avoid hammering the router)
 _mikrotik_cache = {"data": None, "timestamp": None}
@@ -296,10 +297,184 @@ def _health_payload_from_snapshot(
     }
 
 
+def _health_payload_from_live_result(
+    *,
+    mikrotik_result: dict,
+    latest_snapshot: Optional[BandwidthSnapshot],
+    router_id: Optional[int],
+    router_name: str,
+) -> dict:
+    """Build the public health payload from live RouterOS data plus DB snapshot counters."""
+    resources = mikrotik_result.get("resources", {})
+    health = mikrotik_result.get("health", {})
+    pppoe_active = mikrotik_result.get("pppoe_active", {}) or {}
+
+    if resources.get("error"):
+        raise ValueError(resources["error"])
+
+    res_data = resources.get("data", {})
+    total_mem = res_data.get("total_memory", 1)
+    free_mem = res_data.get("free_memory", 0)
+    total_hdd = res_data.get("total_hdd_space", 1)
+    free_hdd = res_data.get("free_hdd_space", 0)
+
+    # Active users come from two different clocks:
+    #   * Hotspot count   -> persisted on the snapshot (background job, ~min stale)
+    #   * PPPoE count     -> live from ``/ppp/active/print`` on this very request
+    # We do NOT derive hotspot from ``active_queues - live_pppoe`` anymore: the
+    # combined ``active_queues`` is from time T, while live PPPoE is from now,
+    # so subtraction can flip negative if PPPoE sessions reconnected in between
+    # (that is the "pppoe(16) > total(14)" symptom). Instead we trust the
+    # snapshot's persisted hotspot figure and add the live PPPoE on top, which
+    # always yields a self-consistent total = hotspot + pppoe.
+    snapshot_hotspot_users = 0
+    current_download_mbps = 0.0
+    current_upload_mbps = 0.0
+    snapshot_age = None
+
+    if latest_snapshot:
+        persisted_hotspot = getattr(latest_snapshot, "active_hotspot_users", None)
+        if persisted_hotspot is None:
+            snapshot_hotspot_users = max(0, latest_snapshot.active_queues or 0)
+        else:
+            snapshot_hotspot_users = max(0, int(persisted_hotspot))
+        current_download_mbps = round((latest_snapshot.avg_download_bps or 0) / 1000000, 2)
+        current_upload_mbps = round((latest_snapshot.avg_upload_bps or 0) / 1000000, 2)
+        snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
+
+    active_hotspot_users = snapshot_hotspot_users
+    if pppoe_active.get("skipped") and latest_snapshot:
+        active_pppoe_users = max(0, (latest_snapshot.active_queues or 0) - active_hotspot_users)
+    else:
+        active_pppoe_users = (
+            pppoe_active.get("count", len(pppoe_active.get("data", []) or []))
+            if not pppoe_active.get("error")
+            else 0
+        )
+    active_pppoe_sessions = (
+        pppoe_active.get("data", []) if not pppoe_active.get("error") else []
+    )
+    total_active_users = active_hotspot_users + active_pppoe_users
+
+    return {
+        "system": {
+            "uptime": res_data.get("uptime", ""),
+            "version": res_data.get("version", ""),
+            "platform": res_data.get("platform", ""),
+            "board_name": res_data.get("board_name", ""),
+            "architecture": res_data.get("architecture_name", ""),
+            "cpu": res_data.get("cpu", ""),
+            "cpu_count": res_data.get("cpu_count", 1),
+            "cpu_frequency_mhz": res_data.get("cpu_frequency", 0),
+        },
+        "cpu_load_percent": res_data.get("cpu_load", 0),
+        "memory": {
+            "total_bytes": total_mem,
+            "free_bytes": free_mem,
+            "used_bytes": total_mem - free_mem,
+            "used_percent": round(((total_mem - free_mem) / total_mem) * 100, 1) if total_mem > 0 else 0,
+        },
+        "storage": {
+            "total_bytes": total_hdd,
+            "free_bytes": free_hdd,
+            "used_bytes": total_hdd - free_hdd,
+            "used_percent": round(((total_hdd - free_hdd) / total_hdd) * 100, 1) if total_hdd > 0 else 0,
+        },
+        "health_sensors": health.get("data", {}),
+        "active_users": active_hotspot_users,
+        "active_hotspot_users": active_hotspot_users,
+        "active_pppoe_users": active_pppoe_users,
+        "active_total_users": total_active_users,
+        "_full_pppoe_sessions": active_pppoe_sessions,
+        "bandwidth": {
+            "download_mbps": current_download_mbps,
+            "upload_mbps": current_upload_mbps,
+        },
+        "snapshot_age_seconds": round(snapshot_age, 1) if snapshot_age else None,
+        "router_id": router_id,
+        "router_name": router_name,
+        "generated_at": datetime.utcnow().isoformat(),
+        "live": True,
+    }
+
+
+async def _refresh_health_cache_from_router(
+    router_id: Optional[int],
+    router_info: dict,
+    router_name: str,
+    cache_key,
+) -> None:
+    """Refresh a cold dashboard health cache without blocking the response."""
+    global _health_cache
+    try:
+        async with async_session() as db:
+            snapshot_query = select(BandwidthSnapshot).order_by(BandwidthSnapshot.recorded_at.desc()).limit(1)
+            if router_id:
+                snapshot_query = snapshot_query.where(BandwidthSnapshot.router_id == router_id)
+            latest_snapshot = (await db.execute(snapshot_query)).scalar_one_or_none()
+
+            try:
+                mikrotik_result = await asyncio.wait_for(
+                    run_mikrotik_health_async(router_info),
+                    timeout=10,
+                )
+            except asyncio.TimeoutError:
+                if router_id and not latest_snapshot:
+                    await record_router_availability(db, router_id, False, "mikrotik_health_timeout")
+                    await db.commit()
+                return
+
+            if mikrotik_result.get("error"):
+                if router_id and not latest_snapshot:
+                    await record_router_availability(db, router_id, False, "mikrotik_health")
+                    await db.commit()
+                return
+
+            if router_id:
+                await record_router_availability(db, router_id, True, "mikrotik_health")
+
+            result = _health_payload_from_live_result(
+                mikrotik_result=mikrotik_result,
+                latest_snapshot=latest_snapshot,
+                router_id=router_id,
+                router_name=router_name,
+            )
+            _health_cache[cache_key] = {
+                "data": result,
+                "timestamp": datetime.utcnow(),
+            }
+            await db.commit()
+    except Exception as exc:
+        logger.warning("Background MikroTik health refresh failed for %s: %s", router_name, exc)
+    finally:
+        _health_refresh_inflight.discard(cache_key)
+
+
+def _queue_health_cache_refresh(
+    background_tasks: BackgroundTasks,
+    router_id: Optional[int],
+    router_info: dict,
+    router_name: str,
+    cache_key,
+) -> None:
+    if cache_key in _health_refresh_inflight:
+        return
+    _health_refresh_inflight.add(cache_key)
+    background_tasks.add_task(
+        _refresh_health_cache_from_router,
+        router_id,
+        router_info,
+        router_name,
+        cache_key,
+    )
+
+
 @router.get("/api/mikrotik/health")
 async def get_mikrotik_health(
+    background_tasks: BackgroundTasks,
     router_id: Optional[int] = None,
     include_sessions: bool = False,
+    prefer_snapshot: bool = False,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
@@ -316,6 +491,10 @@ async def get_mikrotik_health(
     session array on this endpoint for backward compatibility. The array is
     capped at ``_HEALTH_MAX_INLINE_SESSIONS`` entries; ``sessions_truncated``
     indicates when callers should switch to the drill-down endpoint.
+
+    Pass ``prefer_snapshot=true`` from dashboard tiles to return the latest
+    background bandwidth snapshot immediately on a cold cache. The live RouterOS
+    health cache is then refreshed after the response.
     
     Active users and bandwidth come from background job data (more reliable).
     Cached for 5 min per router to prevent overloading MikroTik.
@@ -367,6 +546,28 @@ async def get_mikrotik_health(
 
         snapshot_result = await db.execute(snapshot_query)
         latest_snapshot = snapshot_result.scalar_one_or_none()
+
+        if prefer_snapshot and latest_snapshot and not include_sessions:
+            _queue_health_cache_refresh(
+                background_tasks,
+                router_id,
+                router_info,
+                router_name,
+                cache_key,
+            )
+            snapshot_payload = _health_payload_from_snapshot(
+                latest_snapshot=latest_snapshot,
+                router_id=router_id,
+                router_name=router_name,
+                reason="dashboard_fast_snapshot",
+            )
+            return _shape_health_response(
+                snapshot_payload,
+                include_sessions=False,
+                cached=False,
+                cache_age_seconds=None,
+                stale=True,
+            )
         
         # Run MikroTik operations in thread pool (non-blocking!)
         try:
@@ -439,108 +640,15 @@ async def get_mikrotik_health(
         if router_id:
             await record_router_availability(db, router_id, True, "mikrotik_health")
         
-        resources = mikrotik_result.get("resources", {})
-        health = mikrotik_result.get("health", {})
-        pppoe_active = mikrotik_result.get("pppoe_active", {}) or {}
-        
-        if resources.get("error"):
-            raise HTTPException(status_code=500, detail=resources["error"])
-        
-        res_data = resources.get("data", {})
-        total_mem = res_data.get("total_memory", 1)
-        free_mem = res_data.get("free_memory", 0)
-        total_hdd = res_data.get("total_hdd_space", 1)
-        free_hdd = res_data.get("free_hdd_space", 0)
-        
-        # Active users come from two different clocks:
-        #   * Hotspot count   -> persisted on the snapshot (background job, ~min stale)
-        #   * PPPoE count     -> live from ``/ppp/active/print`` on this very request
-        # We do NOT derive hotspot from ``active_queues - live_pppoe`` anymore: the
-        # combined ``active_queues`` is from time T, while live PPPoE is from now,
-        # so subtraction can flip negative if PPPoE sessions reconnected in between
-        # (that is the "pppoe(16) > total(14)" symptom). Instead we trust the
-        # snapshot's persisted hotspot figure and add the live PPPoE on top, which
-        # always yields a self-consistent total = hotspot + pppoe.
-        snapshot_hotspot_users = 0
-        snapshot_active_queues = 0
-        current_download_mbps = 0.0
-        current_upload_mbps = 0.0
-        snapshot_age = None
-
-        if latest_snapshot:
-            snapshot_active_queues = latest_snapshot.active_queues or 0
-            # active_hotspot_users column was added later; fall back to deriving
-            # it from the legacy combined value for snapshots written before the
-            # column existed. Clamp to 0 to stay safe.
-            persisted_hotspot = getattr(latest_snapshot, "active_hotspot_users", None)
-            if persisted_hotspot is None:
-                snapshot_hotspot_users = max(0, snapshot_active_queues)
-            else:
-                snapshot_hotspot_users = max(0, int(persisted_hotspot))
-            current_download_mbps = round(latest_snapshot.avg_download_bps / 1000000, 2)
-            current_upload_mbps = round(latest_snapshot.avg_upload_bps / 1000000, 2)
-            snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
-        
-        active_hotspot_users = snapshot_hotspot_users
-        if pppoe_active.get("skipped") and latest_snapshot:
-            active_pppoe_users = max(0, (latest_snapshot.active_queues or 0) - active_hotspot_users)
-        else:
-            active_pppoe_users = (
-                pppoe_active.get("count", len(pppoe_active.get("data", []) or []))
-                if not pppoe_active.get("error")
-                else 0
+        try:
+            result = _health_payload_from_live_result(
+                mikrotik_result=mikrotik_result,
+                latest_snapshot=latest_snapshot,
+                router_id=router_id,
+                router_name=router_name,
             )
-        active_pppoe_sessions = (
-            pppoe_active.get("data", []) if not pppoe_active.get("error") else []
-        )
-        total_active_users = active_hotspot_users + active_pppoe_users
-        
-        result = {
-            "system": {
-                "uptime": res_data.get("uptime", ""),
-                "version": res_data.get("version", ""),
-                "platform": res_data.get("platform", ""),
-                "board_name": res_data.get("board_name", ""),
-                "architecture": res_data.get("architecture_name", ""),
-                "cpu": res_data.get("cpu", ""),
-                "cpu_count": res_data.get("cpu_count", 1),
-                "cpu_frequency_mhz": res_data.get("cpu_frequency", 0)
-            },
-            "cpu_load_percent": res_data.get("cpu_load", 0),
-            "memory": {
-                "total_bytes": total_mem,
-                "free_bytes": free_mem,
-                "used_bytes": total_mem - free_mem,
-                "used_percent": round(((total_mem - free_mem) / total_mem) * 100, 1) if total_mem > 0 else 0
-            },
-            "storage": {
-                "total_bytes": total_hdd,
-                "free_bytes": free_hdd,
-                "used_bytes": total_hdd - free_hdd,
-                "used_percent": round(((total_hdd - free_hdd) / total_hdd) * 100, 1) if total_hdd > 0 else 0
-            },
-            "health_sensors": health.get("data", {}),
-            # ``active_users`` is hotspot-only per DASHBOARD_MIKROTIK_API.md.
-            # ``active_hotspot_users`` is an explicit alias so frontends don't
-            # have to know that historical name. ``active_total_users`` is the
-            # combined hotspot + PPPoE figure for callers that want it.
-            "active_users": active_hotspot_users,
-            "active_hotspot_users": active_hotspot_users,
-            "active_pppoe_users": active_pppoe_users,
-            "active_total_users": total_active_users,
-            # Per-session arrays are stashed under a private key on the cached
-            # payload and only surfaced by the response shaper when the caller
-            # asks for them via ?include_sessions=true. See _shape_health_response.
-            "_full_pppoe_sessions": active_pppoe_sessions,
-            "bandwidth": {
-                "download_mbps": current_download_mbps,
-                "upload_mbps": current_upload_mbps
-            },
-            "snapshot_age_seconds": round(snapshot_age, 1) if snapshot_age else None,
-            "router_id": router_id,
-            "router_name": router_name,
-            "generated_at": datetime.utcnow().isoformat()
-        }
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         
         # Always cache - we're using reliable DB data now
         _health_cache[cache_key] = {
