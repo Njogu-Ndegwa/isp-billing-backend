@@ -84,6 +84,48 @@ def _date_label(d: date) -> str:
     return d.strftime("%b %d")
 
 
+def _coerce_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return datetime.strptime(str(value), "%Y-%m-%d").date()
+
+
+def _subscription_revenue_granularity(period: str) -> str:
+    if period == "1y":
+        return "month"
+    if period == "90d":
+        return "week"
+    return "day"
+
+
+def _bucket_start(d: date, granularity: str) -> date:
+    if granularity == "month":
+        return date(d.year, d.month, 1)
+    if granularity == "week":
+        return d - timedelta(days=d.weekday())
+    return d
+
+
+def _next_bucket_start(d: date, granularity: str) -> date:
+    if granularity == "month":
+        if d.month == 12:
+            return date(d.year + 1, 1, 1)
+        return date(d.year, d.month + 1, 1)
+    if granularity == "week":
+        return d + timedelta(days=7)
+    return d + timedelta(days=1)
+
+
+def _bucket_label(d: date, granularity: str) -> str:
+    if granularity == "month":
+        return d.strftime("%b %Y")
+    if granularity == "week":
+        return f"Week of {d.strftime('%b %d')}"
+    return _date_label(d)
+
+
 def _trunc_unit_for_days(days: int) -> str:
     if days <= 7:
         return "day"
@@ -492,6 +534,7 @@ async def compute_subscription_revenue_history(
     db: AsyncSession, period: str = "30d",
 ) -> dict[str, Any]:
     cur_start, cur_end, prev_start, prev_end = _days_period_range(period)
+    granularity = _subscription_revenue_granularity(period)
 
     async def _series(start: datetime, end: datetime):
         rows = (await db.execute(
@@ -507,15 +550,44 @@ async def compute_subscription_revenue_history(
             .group_by(func.date(SubscriptionPayment.created_at))
             .order_by(text("1"))
         )).all()
-        return [
-            {"date": str(r.d), "label": _date_label(r.d), "revenue": round(float(r.rev), 2)}
-            for r in rows
-        ]
+
+        revenue_by_bucket: dict[date, float] = {}
+        for row in rows:
+            bucket = _bucket_start(_coerce_date(row.d), granularity)
+            revenue_by_bucket[bucket] = revenue_by_bucket.get(bucket, 0.0) + float(row.rev or 0)
+
+        first_bucket = _bucket_start(start.date(), granularity)
+        last_bucket = _bucket_start((end - timedelta(microseconds=1)).date(), granularity)
+
+        series = []
+        cumulative = 0.0
+        bucket = first_bucket
+        while bucket <= last_bucket:
+            revenue = round(revenue_by_bucket.get(bucket, 0.0), 2)
+            cumulative = round(cumulative + revenue, 2)
+            series.append({
+                "date": bucket.isoformat(),
+                "label": _bucket_label(bucket, granularity),
+                "revenue": revenue,
+                "cumulative_revenue": cumulative,
+            })
+            bucket = _next_bucket_start(bucket, granularity)
+        return series
+
+    current_series = await _series(cur_start, cur_end)
+    previous_series = await _series(prev_start, prev_end)
+    total_revenue = round(current_series[-1]["cumulative_revenue"], 2) if current_series else 0
+    previous_total_revenue = round(previous_series[-1]["cumulative_revenue"], 2) if previous_series else 0
 
     return {
         "period": period,
-        "subscription_revenue_over_time": await _series(cur_start, cur_end),
-        "previous_period": await _series(prev_start, prev_end),
+        "granularity": granularity,
+        "total_revenue": total_revenue,
+        "previous_total_revenue": previous_total_revenue,
+        "change_percent": _pct_change(total_revenue, previous_total_revenue),
+        "average_revenue_per_bucket": _safe_div(total_revenue, len(current_series)),
+        "subscription_revenue_over_time": current_series,
+        "previous_period": previous_series,
     }
 
 
