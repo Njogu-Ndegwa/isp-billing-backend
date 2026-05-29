@@ -21,8 +21,11 @@ router = APIRouter(tags=["mikrotik"])
 
 # MikroTik health cache per router
 _health_cache = {}  # router_id -> {"data": ..., "timestamp": ...}
-_health_cache_ttl = 300  # 5 minutes - reduces router connection load significantly
+_health_cache_ttl = 60  # Fresh live health TTL. Stale dashboard calls revalidate in background.
+_health_cache_stale_ttl = 1800  # Keep last live system details for 30 min instead of showing blanks.
+_health_refresh_retry_floor = 20  # Minimum seconds between background live refresh starts per router.
 _health_refresh_inflight = set()  # cache keys currently being refreshed after a fast snapshot response
+_health_refresh_last_started = {}  # cache_key -> datetime of last live refresh attempt
 
 # MikroTik dashboard cache (avoid hammering the router)
 _mikrotik_cache = {"data": None, "timestamp": None}
@@ -195,6 +198,8 @@ def _shape_health_response(
     cached: bool,
     cache_age_seconds: Optional[float],
     stale: bool = False,
+    refresh_in_progress: bool = False,
+    retry_after_seconds: Optional[float] = None,
 ) -> dict:
     """Project the cached, full health payload into the public response shape.
 
@@ -222,6 +227,10 @@ def _shape_health_response(
         result["cache_age_seconds"] = round(cache_age_seconds, 1)
     if stale:
         result["stale"] = True
+    if refresh_in_progress:
+        result["refresh_in_progress"] = True
+    if retry_after_seconds is not None:
+        result["retry_after_seconds"] = max(1, round(retry_after_seconds, 1))
     return result
 
 
@@ -456,10 +465,22 @@ def _queue_health_cache_refresh(
     router_info: dict,
     router_name: str,
     cache_key,
-) -> None:
+) -> dict:
     if cache_key in _health_refresh_inflight:
-        return
+        return {"refresh_in_progress": True, "retry_after_seconds": 5}
+
+    last_started = _health_refresh_last_started.get(cache_key)
+    if last_started:
+        elapsed = (datetime.utcnow() - last_started).total_seconds()
+        retry_after = _health_refresh_retry_floor - elapsed
+        if retry_after > 0:
+            return {
+                "refresh_in_progress": False,
+                "retry_after_seconds": retry_after,
+            }
+
     _health_refresh_inflight.add(cache_key)
+    _health_refresh_last_started[cache_key] = datetime.utcnow()
     background_tasks.add_task(
         _refresh_health_cache_from_router,
         router_id,
@@ -467,6 +488,7 @@ def _queue_health_cache_refresh(
         router_name,
         cache_key,
     )
+    return {"refresh_in_progress": True, "retry_after_seconds": 5}
 
 
 @router.get("/api/mikrotik/health")
@@ -492,28 +514,33 @@ async def get_mikrotik_health(
     capped at ``_HEALTH_MAX_INLINE_SESSIONS`` entries; ``sessions_truncated``
     indicates when callers should switch to the drill-down endpoint.
 
-    Pass ``prefer_snapshot=true`` from dashboard tiles to return the latest
-    background bandwidth snapshot immediately on a cold cache. The live RouterOS
-    health cache is then refreshed after the response.
+    Pass ``prefer_snapshot=true`` from dashboard tiles to return immediately.
+    If live health cache is only stale, it is served with refresh metadata while
+    one throttled RouterOS refresh runs in the background. On a cold cache, the
+    latest bandwidth snapshot is returned with the same refresh metadata.
     
     Active users and bandwidth come from background job data (more reliable).
-    Cached for 5 min per router to prevent overloading MikroTik.
+    Fresh live health is cached briefly per router, then served stale while the
+    dashboard revalidates in the background to avoid overloading MikroTik.
     """
     user = await get_current_user(token, db)
     global _health_cache
     
     cache_key = router_id if router_id else "default"
     
-    # Check cache first
-    if cache_key in _health_cache:
-        cached = _health_cache[cache_key]
-        age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
-        if age < _health_cache_ttl:
+    # Fresh cache returns immediately. Stale cache is handled below after we
+    # know the router credentials, so dashboard calls can revalidate in the
+    # background without dropping back to blank snapshot-only system fields.
+    cached_entry = _health_cache.get(cache_key)
+    cached_age = None
+    if cached_entry:
+        cached_age = (datetime.utcnow() - cached_entry["timestamp"]).total_seconds()
+        if cached_age < _health_cache_ttl:
             return _shape_health_response(
-                cached["data"],
+                cached_entry["data"],
                 include_sessions=include_sessions,
                 cached=True,
-                cache_age_seconds=age,
+                cache_age_seconds=cached_age,
             )
     
     try:
@@ -547,27 +574,42 @@ async def get_mikrotik_health(
         snapshot_result = await db.execute(snapshot_query)
         latest_snapshot = snapshot_result.scalar_one_or_none()
 
-        if prefer_snapshot and latest_snapshot and not include_sessions:
-            _queue_health_cache_refresh(
+        if prefer_snapshot and not include_sessions:
+            refresh_meta = _queue_health_cache_refresh(
                 background_tasks,
                 router_id,
                 router_info,
                 router_name,
                 cache_key,
             )
-            snapshot_payload = _health_payload_from_snapshot(
-                latest_snapshot=latest_snapshot,
-                router_id=router_id,
-                router_name=router_name,
-                reason="dashboard_fast_snapshot",
-            )
-            return _shape_health_response(
-                snapshot_payload,
-                include_sessions=False,
-                cached=False,
-                cache_age_seconds=None,
-                stale=True,
-            )
+
+            if cached_entry and cached_age is not None and cached_age < _health_cache_stale_ttl:
+                return _shape_health_response(
+                    cached_entry["data"],
+                    include_sessions=False,
+                    cached=True,
+                    cache_age_seconds=cached_age,
+                    stale=True,
+                    refresh_in_progress=refresh_meta.get("refresh_in_progress", False),
+                    retry_after_seconds=refresh_meta.get("retry_after_seconds"),
+                )
+
+            if latest_snapshot:
+                snapshot_payload = _health_payload_from_snapshot(
+                    latest_snapshot=latest_snapshot,
+                    router_id=router_id,
+                    router_name=router_name,
+                    reason="dashboard_fast_snapshot",
+                )
+                return _shape_health_response(
+                    snapshot_payload,
+                    include_sessions=False,
+                    cached=False,
+                    cache_age_seconds=None,
+                    stale=True,
+                    refresh_in_progress=refresh_meta.get("refresh_in_progress", False),
+                    retry_after_seconds=refresh_meta.get("retry_after_seconds"),
+                )
         
         # Run MikroTik operations in thread pool (non-blocking!)
         try:
