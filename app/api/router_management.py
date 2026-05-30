@@ -7,11 +7,21 @@ from typing import Optional, List
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User, RouterAvailabilityCheck, ProvisioningToken, Voucher, RouterLogEntry
+from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User, UserRole, RouterAvailabilityCheck, ProvisioningToken, Voucher, RouterLogEntry
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.router_availability import build_router_status
 from app.services.provisioning import provision_base_url_for_vpn
+from app.services.router_helpers import connect_to_router
+from app.services.insurance_wireguard import (
+    InsuranceWireGuardError,
+    build_plan,
+    configure_router_backup_wireguard,
+    derive_insurance_ip,
+    register_insurance_peer,
+    validate_insurance_settings,
+    verify_insurance_router,
+)
 import logging
 import asyncio
 import time
@@ -90,6 +100,20 @@ class RouterIdentityUpdate(BaseModel):
     identity: str
 
 
+class InsuranceWireGuardRequest(BaseModel):
+    apply: bool = False
+    force_rotate: bool = False
+    backup_ip: Optional[str] = None
+
+    @field_validator("backup_ip", mode="before")
+    @classmethod
+    def strip_backup_ip(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            return v if v else None
+        return v
+
+
 @router.get("/api/routers")
 async def get_routers(
     db: AsyncSession = Depends(get_db),
@@ -133,6 +157,164 @@ async def get_routers(
         router_payload.update(build_router_status(router_obj, now=now))
         response.append(router_payload)
     return response
+
+
+@router.post("/api/admin/routers/{router_id}/insurance-wireguard")
+async def configure_router_insurance_wireguard(
+    router_id: int,
+    request: InsuranceWireGuardRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Superadmin-only creation of a secondary WireGuard management tunnel.
+
+    Normal operations continue over the router's existing 10.0.0.0/16 tunnel.
+    This endpoint connects through that current path and adds/repairs wg-aws2
+    so the new server can reach the router on 10.250.X.Y.
+    """
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    result = await db.execute(select(Router).where(Router.id == router_id))
+    router_obj = result.scalar_one_or_none()
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    try:
+        backup_ip = request.backup_ip or derive_insurance_ip(router_obj.ip_address)
+    except InsuranceWireGuardError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    missing_settings = validate_insurance_settings()
+    plan = build_plan(router_obj.ip_address, backup_ip)
+    if not request.apply:
+        return {
+            "success": True,
+            "applied": False,
+            "router_id": router_obj.id,
+            "router_name": router_obj.name,
+            "current_ip": router_obj.ip_address,
+            "backup_ip": backup_ip,
+            "missing_settings": missing_settings,
+            "plan": plan,
+        }
+
+    if missing_settings:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing insurance WireGuard setting(s): {', '.join(missing_settings)}",
+        )
+
+    # Release the DB connection before router/API network work. No database
+    # writes happen in this endpoint after this point.
+    await db.commit()
+
+    def _configure_router():
+        api = connect_to_router(router_obj, connect_timeout=5, timeout=20)
+        if not api.connect():
+            raise InsuranceWireGuardError(api.last_connect_error or "Failed to connect to router")
+        try:
+            return configure_router_backup_wireguard(
+                api,
+                backup_ip=backup_ip,
+                force_rotate=request.force_rotate,
+            )
+        finally:
+            api.disconnect()
+
+    try:
+        router_config = await asyncio.to_thread(_configure_router)
+        manager_result = await register_insurance_peer(
+            router_config["router_public_key"],
+            backup_ip,
+        )
+        verify_result = await verify_insurance_router(backup_ip, port=router_obj.port)
+    except InsuranceWireGuardError as exc:
+        logger.error(
+            "Insurance WireGuard setup failed for router %s (%s): %s",
+            router_obj.id,
+            router_obj.ip_address,
+            exc,
+        )
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Unexpected insurance WireGuard setup error for router %s", router_obj.id)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "success": True,
+        "applied": True,
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "current_ip": router_obj.ip_address,
+        "backup_ip": backup_ip,
+        "router_public_key": router_config["router_public_key"],
+        "router_actions": router_config["actions"],
+        "manager": manager_result,
+        "verification": verify_result,
+    }
+
+
+@router.get("/api/admin/routers/{router_id}/insurance-wireguard/status")
+async def get_router_insurance_wireguard_status(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Read-only check that the new server can reach a router over wg-aws2."""
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    result = await db.execute(select(Router).where(Router.id == router_id))
+    router_obj = result.scalar_one_or_none()
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    try:
+        backup_ip = derive_insurance_ip(router_obj.ip_address)
+    except InsuranceWireGuardError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    missing_settings = validate_insurance_settings()
+    if missing_settings:
+        return {
+            "success": False,
+            "active": False,
+            "router_id": router_obj.id,
+            "router_name": router_obj.name,
+            "current_ip": router_obj.ip_address,
+            "backup_ip": backup_ip,
+            "missing_settings": missing_settings,
+        }
+
+    await db.commit()
+
+    try:
+        verification = await verify_insurance_router(backup_ip, port=router_obj.port)
+    except InsuranceWireGuardError as exc:
+        return {
+            "success": False,
+            "active": False,
+            "router_id": router_obj.id,
+            "router_name": router_obj.name,
+            "current_ip": router_obj.ip_address,
+            "backup_ip": backup_ip,
+            "error": str(exc),
+        }
+
+    active = bool(verification.get("ping_success") and verification.get("tcp_success"))
+    return {
+        "success": True,
+        "active": active,
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "current_ip": router_obj.ip_address,
+        "backup_ip": backup_ip,
+        "verification": verification,
+    }
 
 
 @router.get("/api/routers/{router_id}/uptime")
