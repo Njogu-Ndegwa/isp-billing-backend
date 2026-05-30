@@ -1,0 +1,83 @@
+name: Deploy Insurance WG Manager
+
+on:
+  push:
+    branches: [migration-new-server]
+    paths:
+      - "wg-manager/**"
+      - ".github/workflows/deploy-insurance-wg-manager.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy-insurance-wg-manager:
+    if: github.ref == 'refs/heads/migration-new-server'
+    runs-on: ubuntu-latest
+    env:
+      NEW_SERVER_APP_DIR: ~/apps/isp-billing-insurance-wg-manager
+      WG_MANAGER_SECRET: ${{ secrets.NEW_SERVER_WG_MANAGER_SECRET }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package wg-manager
+        run: tar -czf wg-manager.tar.gz wg-manager
+
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Upload wg-manager package
+        run: |
+          sshpass -p "${{ secrets.NEW_SERVER_PASSWORD }}" scp \
+            -o StrictHostKeyChecking=no \
+            wg-manager.tar.gz \
+            ${{ secrets.NEW_SERVER_USER }}@${{ secrets.NEW_SERVER_HOST }}:/tmp/isp-billing-wg-manager.tar.gz
+
+      - name: Deploy to new AWS server
+        run: |
+          sshpass -p "${{ secrets.NEW_SERVER_PASSWORD }}" ssh \
+            -o StrictHostKeyChecking=no \
+            ${{ secrets.NEW_SERVER_USER }}@${{ secrets.NEW_SERVER_HOST }} \
+            "WG_MANAGER_SECRET='${WG_MANAGER_SECRET}' bash -s" << 'ENDSSH'
+          set -e
+
+          if [ -z "$WG_MANAGER_SECRET" ]; then
+            echo "ERROR: WG_MANAGER_SECRET is empty"
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo "Deploying insurance wg-manager at $(date)"
+          echo "=========================================="
+
+          mkdir -p ~/apps/isp-billing-insurance-wg-manager
+          rm -rf ~/apps/isp-billing-insurance-wg-manager/wg-manager
+          tar -xzf /tmp/isp-billing-wg-manager.tar.gz -C ~/apps/isp-billing-insurance-wg-manager
+          cd ~/apps/isp-billing-insurance-wg-manager
+
+          echo "[1/4] Building wg-manager image..."
+          docker build -t isp-insurance-wg-manager:latest ./wg-manager
+
+          echo "[2/4] Recreating insurance_wg_manager..."
+          docker rm -f insurance_wg_manager 2>/dev/null || true
+          docker run -d \
+            --name insurance_wg_manager \
+            --network host \
+            --cap-add NET_ADMIN \
+            -e WG_INTERFACE=wg1 \
+            -e WG_MANAGER_SECRET="$WG_MANAGER_SECRET" \
+            --restart unless-stopped \
+            isp-insurance-wg-manager:latest \
+            uvicorn main:app --host 0.0.0.0 --port 8729
+
+          echo "[3/4] Verifying container..."
+          docker ps --filter name=insurance_wg_manager
+
+          echo "[4/4] Verifying wg-manager health..."
+          sleep 2
+          curl -fsS -H "X-API-Key: $WG_MANAGER_SECRET" http://127.0.0.1:8729/health
+          curl -fsS -H "X-API-Key: $WG_MANAGER_SECRET" http://127.0.0.1:8729/server-info
+
+          echo "Deployment complete"
+          ENDSSH

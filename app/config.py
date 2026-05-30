@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     # another device can use it.
     ACCESS_CRED_IDLE_RELEASE_MINUTES: int = 15
 
+    # Secondary/insurance WireGuard endpoint. The old app can use these values
+    # to add a backup tunnel to an existing router while normal operations keep
+    # using the current 10.0.0.0/16 management network.
+    INSURANCE_WG_MANAGER_URL: str = ""
+    INSURANCE_WG_MANAGER_SECRET: str = ""
+    INSURANCE_SERVER_PUBLIC_IP: str = ""
+    INSURANCE_SERVER_WG_PUBLIC_KEY: str = ""
+    INSURANCE_SERVER_VPN_IP: str = "10.250.0.1"
+    INSURANCE_WG_PORT: int = 51821
+    INSURANCE_ROUTER_INTERFACE: str = "wg-aws2"
+    INSURANCE_WG_SUBNET: str = "10.250.0.0/16"
+    INSURANCE_MANAGER_TIMEOUT: int = 10
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

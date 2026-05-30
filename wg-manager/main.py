@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import subprocess
 import os
 import logging
+import socket
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,6 +40,13 @@ class AddL2tpPeerRequest(BaseModel):
 
 class RemoveL2tpPeerRequest(BaseModel):
     username: str
+
+
+class TestRouterRequest(BaseModel):
+    ip: str
+    port: int = 8728
+    timeout: int = 5
+    ping_count: int = 3
 
 
 @app.post("/add-l2tp-peer")
@@ -143,6 +151,38 @@ def list_peers(_=Depends(verify_secret)):
         return {"peers": peers}
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=500, detail="wg command timed out")
+
+
+@app.post("/test-router")
+def test_router(req: TestRouterRequest, _=Depends(verify_secret)):
+    """Verify that this server can reach a router through the insurance VPN."""
+    ping_count = max(1, min(req.ping_count, 5))
+    timeout = max(1, min(req.timeout, 15))
+
+    ping_result = subprocess.run(
+        ["ping", "-c", str(ping_count), "-W", str(timeout), req.ip],
+        capture_output=True,
+        text=True,
+        timeout=(ping_count * timeout) + 3,
+    )
+
+    tcp_success = False
+    tcp_error = None
+    try:
+        with socket.create_connection((req.ip, req.port), timeout=timeout):
+            tcp_success = True
+    except OSError as exc:
+        tcp_error = str(exc)
+
+    return {
+        "ip": req.ip,
+        "port": req.port,
+        "ping_success": ping_result.returncode == 0,
+        "ping_stdout": ping_result.stdout[-2000:],
+        "ping_stderr": ping_result.stderr[-1000:],
+        "tcp_success": tcp_success,
+        "tcp_error": tcp_error,
+    }
 
 
 @app.get("/server-info")
