@@ -7,6 +7,7 @@ provides order status querying.
 
 import json
 import logging
+import asyncio
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -178,41 +179,63 @@ async def zenopay_webhook(
         customer.pending_update_data = None
         logger.info("[ZENOPAY WEBHOOK] Payment recorded: ID %s", payment.id)
 
+        pppoe_payload = None
+        hotspot_payload = None
+        hotspot_context = None
+
         # Provision based on connection type
         if customer.plan and customer.router:
             if customer.plan.connection_type == ConnectionType.PPPOE:
                 if customer.pppoe_username:
-                    from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
+                    from app.services.pppoe_provisioning import build_pppoe_payload
                     pppoe_payload = build_pppoe_payload(customer, customer.router)
-                    # Fire-and-forget is not available here without BackgroundTasks,
-                    # but the payment is already recorded. Provisioning happens on next poll.
                     logger.info("[ZENOPAY WEBHOOK] PPPoE provisioning queued for customer %s", customer.id)
             elif customer.mac_address:
                 from app.services.hotspot_provisioning import (
                     build_hotspot_payload,
-                    log_provisioning_event,
-                    provision_hotspot_customer,
                 )
                 hotspot_payload = build_hotspot_payload(
                     customer, plan, customer.router,
                     comment=f"ZenoPay payment for {customer.name}",
                 )
+                hotspot_context = {
+                    "customer_id": customer.id,
+                    "router_id": customer.router.id,
+                    "mac_address": customer.mac_address,
+                    "order_id": order_id,
+                }
+
+        await db.commit()
+
+        if pppoe_payload:
+            from app.services.pppoe_provisioning import call_pppoe_provision
+
+            asyncio.create_task(call_pppoe_provision(pppoe_payload))
+
+        if hotspot_payload and hotspot_context:
+            from app.services.hotspot_provisioning import (
+                log_provisioning_event,
+                provision_hotspot_customer,
+            )
+
+            async def _provision_hotspot_after_zenopay():
                 await log_provisioning_event(
-                    customer_id=customer.id,
-                    router_id=customer.router.id,
-                    mac_address=customer.mac_address,
+                    customer_id=hotspot_context["customer_id"],
+                    router_id=hotspot_context["router_id"],
+                    mac_address=hotspot_context["mac_address"],
                     action="zenopay_payment",
                     status="scheduled",
-                    details=f"Queued after ZenoPay webhook for order {order_id}",
+                    details=f"Queued after ZenoPay webhook for order {hotspot_context['order_id']}",
                 )
                 await provision_hotspot_customer(
-                    customer.id,
-                    customer.router.id,
+                    hotspot_context["customer_id"],
+                    hotspot_context["router_id"],
                     hotspot_payload,
                     "zenopay_payment",
                 )
 
-        await db.commit()
+            asyncio.create_task(_provision_hotspot_after_zenopay())
+
         return {"status": "received"}
 
     elif payment_status == "FAILED":

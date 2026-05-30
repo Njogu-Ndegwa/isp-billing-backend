@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -235,9 +236,17 @@ async def _record_successful_payment(
                 payment.id, txn.reference_id)
 
     # Provisioning dispatch — same split as the ZenoPay handler.
+    pppoe_payload = None
+    hotspot_payload = None
+    hotspot_context = None
+
+    # Provisioning dispatch - never wait on MikroTik in this payment path.
     if customer.plan and customer.router:
         if customer.plan.connection_type == ConnectionType.PPPOE:
             if customer.pppoe_username:
+                from app.services.pppoe_provisioning import build_pppoe_payload
+
+                pppoe_payload = build_pppoe_payload(customer, customer.router)
                 logger.info(
                     "[MTN MOMO] PPPoE provisioning queued for customer %s",
                     customer.id,
@@ -245,27 +254,48 @@ async def _record_successful_payment(
         elif customer.mac_address:
             from app.services.hotspot_provisioning import (
                 build_hotspot_payload,
-                log_provisioning_event,
-                provision_hotspot_customer,
             )
             hotspot_payload = build_hotspot_payload(
                 customer, plan, customer.router,
                 comment=f"MTN MoMo payment for {customer.name}",
             )
+            hotspot_context = {
+                "customer_id": customer.id,
+                "router_id": customer.router.id,
+                "mac_address": customer.mac_address,
+                "reference_id": txn.reference_id,
+            }
+
+    await db.commit()
+
+    if pppoe_payload:
+        from app.services.pppoe_provisioning import call_pppoe_provision
+
+        asyncio.create_task(call_pppoe_provision(pppoe_payload))
+
+    if hotspot_payload and hotspot_context:
+        from app.services.hotspot_provisioning import (
+            log_provisioning_event,
+            provision_hotspot_customer,
+        )
+
+        async def _provision_hotspot_after_momo():
             await log_provisioning_event(
-                customer_id=customer.id,
-                router_id=customer.router.id,
-                mac_address=customer.mac_address,
+                customer_id=hotspot_context["customer_id"],
+                router_id=hotspot_context["router_id"],
+                mac_address=hotspot_context["mac_address"],
                 action="mtn_momo_payment",
                 status="scheduled",
-                details=f"Queued after MTN MoMo callback for reference {txn.reference_id}",
+                details=f"Queued after MTN MoMo callback for reference {hotspot_context['reference_id']}",
             )
             await provision_hotspot_customer(
-                customer.id,
-                customer.router.id,
+                hotspot_context["customer_id"],
+                hotspot_context["router_id"],
                 hotspot_payload,
                 "mtn_momo_payment",
             )
+
+        asyncio.create_task(_provision_hotspot_after_momo())
 
 
 # ---------------------------------------------------------------------------

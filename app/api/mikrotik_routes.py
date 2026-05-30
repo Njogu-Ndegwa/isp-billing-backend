@@ -416,48 +416,52 @@ async def _refresh_health_cache_from_router(
     """Refresh a cold dashboard health cache without blocking the response."""
     global _health_cache
     try:
+        latest_snapshot = None
         async with async_session() as db:
             snapshot_query = select(BandwidthSnapshot).order_by(BandwidthSnapshot.recorded_at.desc()).limit(1)
             if router_id:
                 snapshot_query = snapshot_query.where(BandwidthSnapshot.router_id == router_id)
             latest_snapshot = (await db.execute(snapshot_query)).scalar_one_or_none()
+            await db.commit()
 
-            try:
-                mikrotik_result = await asyncio.wait_for(
-                    run_mikrotik_health_async(router_info),
-                    timeout=10,
-                )
-            except asyncio.TimeoutError:
-                if router_id and not latest_snapshot:
+        try:
+            mikrotik_result = await asyncio.wait_for(
+                run_mikrotik_health_async(router_info),
+                timeout=10,
+            )
+        except asyncio.TimeoutError:
+            if router_id and not latest_snapshot:
+                async with async_session() as db:
                     await record_router_availability(db, router_id, False, "mikrotik_health_timeout")
                     await db.commit()
-                return
+            return
 
-            if mikrotik_result.get("error"):
-                if router_id and not latest_snapshot:
+        if mikrotik_result.get("error"):
+            if router_id and not latest_snapshot:
+                async with async_session() as db:
                     await record_router_availability(db, router_id, False, "mikrotik_health")
                     await db.commit()
-                return
+            return
 
-            if router_id:
+        if router_id:
+            async with async_session() as db:
                 await record_router_availability(db, router_id, True, "mikrotik_health")
+                await db.commit()
 
-            result = _health_payload_from_live_result(
-                mikrotik_result=mikrotik_result,
-                latest_snapshot=latest_snapshot,
-                router_id=router_id,
-                router_name=router_name,
-            )
-            _health_cache[cache_key] = {
-                "data": result,
-                "timestamp": datetime.utcnow(),
-            }
-            await db.commit()
+        result = _health_payload_from_live_result(
+            mikrotik_result=mikrotik_result,
+            latest_snapshot=latest_snapshot,
+            router_id=router_id,
+            router_name=router_name,
+        )
+        _health_cache[cache_key] = {
+            "data": result,
+            "timestamp": datetime.utcnow(),
+        }
     except Exception as exc:
         logger.warning("Background MikroTik health refresh failed for %s: %s", router_name, exc)
     finally:
         _health_refresh_inflight.discard(cache_key)
-
 
 def _queue_health_cache_refresh(
     background_tasks: BackgroundTasks,
@@ -496,7 +500,7 @@ async def get_mikrotik_health(
     background_tasks: BackgroundTasks,
     router_id: Optional[int] = None,
     include_sessions: bool = False,
-    prefer_snapshot: bool = False,
+    prefer_snapshot: bool = True,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
@@ -514,7 +518,7 @@ async def get_mikrotik_health(
     capped at ``_HEALTH_MAX_INLINE_SESSIONS`` entries; ``sessions_truncated``
     indicates when callers should switch to the drill-down endpoint.
 
-    Pass ``prefer_snapshot=true`` from dashboard tiles to return immediately.
+    ``prefer_snapshot`` defaults to true so dashboard tiles return immediately.
     If live health cache is only stale, it is served with refresh metadata while
     one throttled RouterOS refresh runs in the background. On a cold cache, the
     latest bandwidth snapshot is returned with the same refresh metadata.
@@ -611,6 +615,11 @@ async def get_mikrotik_health(
                     retry_after_seconds=refresh_meta.get("retry_after_seconds"),
                 )
         
+        # Release the request's DB connection before slow RouterOS I/O. The
+        # session can acquire a new connection below only if availability needs
+        # to be persisted.
+        await db.commit()
+
         # Run MikroTik operations in thread pool (non-blocking!)
         try:
             mikrotik_result = await asyncio.wait_for(

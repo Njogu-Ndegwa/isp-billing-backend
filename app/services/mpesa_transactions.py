@@ -369,6 +369,10 @@ async def _handle_successful_reconciliation(
     from app.db.database import async_session
     import json
 
+    pppoe_payload = None
+    hotspot_payload = None
+    hotspot_context = None
+
     async with async_session() as db:
         # Re-fetch the transaction inside this session (avoid detached instance)
         stmt = select(MpesaTransaction).where(
@@ -461,7 +465,6 @@ async def _handle_successful_reconciliation(
         if customer.plan and customer.plan.connection_type == ConnectionType.PPPOE:
             if customer.pppoe_username and customer.router:
                 pppoe_payload = build_pppoe_payload(customer, customer.router)
-                await call_pppoe_provision(pppoe_payload)
             else:
                 logger.error(
                     "[RECONCILE] Skipping PPPoE provisioning for customer %s - "
@@ -486,25 +489,37 @@ async def _handle_successful_reconciliation(
             )
             await schedule_provisioning_attempt(db, attempt)
             await db.commit()
-            await log_provisioning_event(
-                customer_id=customer.id,
-                router_id=router_obj.id,
-                mac_address=customer.mac_address,
-                action="hotspot_reconciliation",
-                status="scheduled",
-                details=f"Queued after M-Pesa reconciliation for router {router_obj.ip_address}",
-                attempt_id=attempt.id,
-            )
-            await provision_hotspot_customer(
-                customer.id,
-                router_obj.id,
-                hotspot_payload,
-                "hotspot_reconciliation",
-                attempt.id,
-            )
+            hotspot_context = {
+                "customer_id": customer.id,
+                "router_id": router_obj.id,
+                "mac_address": customer.mac_address,
+                "router_ip": router_obj.ip_address,
+                "attempt_id": attempt.id,
+            }
         else:
             logger.error(
                 "[RECONCILE] Skipping provisioning for customer %s - "
                 "missing mac_address or router",
                 customer.id,
             )
+
+    if pppoe_payload:
+        await call_pppoe_provision(pppoe_payload)
+
+    if hotspot_payload and hotspot_context:
+        await log_provisioning_event(
+            customer_id=hotspot_context["customer_id"],
+            router_id=hotspot_context["router_id"],
+            mac_address=hotspot_context["mac_address"],
+            action="hotspot_reconciliation",
+            status="scheduled",
+            details=f"Queued after M-Pesa reconciliation for router {hotspot_context['router_ip']}",
+            attempt_id=hotspot_context["attempt_id"],
+        )
+        await provision_hotspot_customer(
+            hotspot_context["customer_id"],
+            hotspot_context["router_id"],
+            hotspot_payload,
+            "hotspot_reconciliation",
+            hotspot_context["attempt_id"],
+        )

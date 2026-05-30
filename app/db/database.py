@@ -12,12 +12,23 @@ if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 
 # Create async engine with NullPool for SQLite to avoid connection issues
-async_engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    future=True,
-    poolclass=NullPool if DATABASE_URL.startswith("sqlite") else None
-)
+engine_kwargs = {
+    "echo": False,
+    "future": True,
+}
+
+if DATABASE_URL.startswith("sqlite"):
+    engine_kwargs["poolclass"] = NullPool
+else:
+    engine_kwargs.update(
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_timeout=settings.DB_POOL_TIMEOUT,
+        pool_recycle=settings.DB_POOL_RECYCLE_SECONDS,
+        pool_pre_ping=True,
+    )
+
+async_engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 
 # Create sessionmaker for async sessions
 AsyncSessionLocal = sessionmaker(

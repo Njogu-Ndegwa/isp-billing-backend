@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
-from app.db.database import get_db, async_engine, async_session
+from app.db.database import async_engine, async_session
 from app.db.models import (
     Router,
     Customer,
@@ -643,6 +643,10 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
                 now=datetime.utcnow(),
             )
 
+        # Router scans below can take many seconds across multiple routers.
+        # Release the caller's DB connection until we need to write again.
+        await db.commit()
+
         # Payment callbacks can activate a MAC while this cleanup run is still
         # working, so every candidate is re-checked before removal.
         async def _bypass_task(r):
@@ -750,7 +754,7 @@ async def cleanup_expired_users_background():
     cleanup_running = True
     start_time = datetime.utcnow()
     try:
-        async with AsyncSession(async_engine) as db:
+        async with async_session() as db:
             now = datetime.utcnow()
             from sqlalchemy import or_
             stmt = select(Customer).options(
@@ -860,6 +864,10 @@ async def cleanup_expired_users_background():
             hotspot_count = sum(len(rd["customers"]) for rd in router_customers_map.values())
             logger.info(f"[CRON] Grouped: {hotspot_count} hotspot across {len(router_customers_map)} router(s), "
                         f"{pppoe_count} PPPoE across {len(router_pppoe_map)} router(s)")
+
+            # Do not keep a DB connection checked out while RouterOS cleanup
+            # runs in worker threads.
+            await db.commit()
 
             # --- Hotspot cleanup (concurrent per-router) ---
             mikrotik_results = {"removed": [], "failed": [], "routers_connected": 0}
@@ -1162,6 +1170,8 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
 
     if not by_router:
         return 0
+
+    await db.commit()
 
     async def _scan(rid: int, bundle: dict):
         async with router_locks.acquire(f"{bundle['router_info']['ip']}:{bundle['router_info']['port']}"):
@@ -1832,12 +1842,13 @@ def _fetch_bandwidth_data_sync():
 async def collect_bandwidth_snapshot():
     try:
         now = datetime.utcnow()
-        async for db in get_db():
+        async with async_session() as db:
             routers_result = await db.execute(select(Router))
             routers = routers_result.scalars().all()
             if not routers:
                 logger.warning("No routers found in database for bandwidth collection")
                 return
+            await db.commit()
 
             for router in routers:
                 if getattr(router, 'auth_method', None) == 'RADIUS':
@@ -1848,11 +1859,13 @@ async def collect_bandwidth_snapshot():
                         "username": router.username, "password": router.password, "port": router.port
                     }
                     router_key = f"{router.ip_address}:{router.port}"
+                    await db.commit()
                     async with router_locks.acquire(router_key):
                         raw = await asyncio.to_thread(_fetch_bandwidth_data_sync_for_router, router_info)
                     if not raw:
                         logger.warning(f"Failed to connect to router {router.name} ({router.ip_address}) for bandwidth snapshot")
                         await record_router_availability(db, router.id, False, "bandwidth_snapshot", checked_at=now)
+                        await db.commit()
                         continue
 
                     active_sessions = raw["active_sessions"]
@@ -2109,6 +2122,7 @@ async def collect_bandwidth_snapshot():
                                         )
 
                     logger.debug(f"Collected bandwidth snapshot for router {router.name} (ID: {router_id})")
+                    await db.commit()
                 except Exception as router_error:
                     logger.error(f"Error collecting bandwidth from router {router.name}: {router_error}")
                     # Roll the session back so a single failed query (e.g. a missing
@@ -2125,7 +2139,6 @@ async def collect_bandwidth_snapshot():
             await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
             await prune_router_availability_history(db, now=now)
             await db.commit()
-            break
 
         logger.info(f"Bandwidth snapshot collected for {len(routers)} router(s)")
     except Exception as e:
