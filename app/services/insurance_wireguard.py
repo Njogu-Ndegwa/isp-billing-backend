@@ -230,6 +230,7 @@ def _ensure_firewall_rule(
         "protocol": protocol,
         "dst-port": dst_port,
         "comment": comment,
+        "disabled": "no",
     }
     if src_address:
         params["src-address"] = src_address
@@ -243,6 +244,42 @@ def _ensure_firewall_rule(
     else:
         _require_success(api.send_command("/ip/firewall/filter/add", params), f"Add firewall rule {comment}")
         actions.append(f"Added firewall rule: {comment}")
+
+    _move_firewall_rule_before_input_drop(api, comment, actions)
+
+
+def _move_firewall_rule_before_input_drop(api: MikroTikAPI, comment: str, actions: List[str]) -> None:
+    rows = _rows(api.send_command("/ip/firewall/filter/print"), "List firewall filters")
+    target_index = next((index for index, row in enumerate(rows) if row.get("comment") == comment), None)
+    if target_index is None:
+        raise InsuranceWireGuardError(f"Firewall rule {comment} was not found after update")
+
+    drop_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if row.get("chain") == "input"
+            and row.get("disabled") != "true"
+            and row.get("action") in {"drop", "reject"}
+        ),
+        None,
+    )
+    if drop_index is None or target_index < drop_index:
+        return
+
+    target = rows[target_index]
+    destination = rows[drop_index]
+    _require_success(
+        api.send_command(
+            "/ip/firewall/filter/move",
+            {
+                "numbers": target[".id"],
+                "destination": destination[".id"],
+            },
+        ),
+        f"Move firewall rule {comment} before input drop",
+    )
+    actions.append(f"Moved firewall rule before input drop: {comment}")
 
 
 def _ensure_walled_garden(api: MikroTikAPI, actions: List[str]) -> None:
