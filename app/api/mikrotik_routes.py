@@ -756,6 +756,7 @@ async def get_walled_garden(
             finally:
                 api.disconnect()
 
+        await db.commit()
         result = await asyncio.get_event_loop().run_in_executor(None, _fetch)
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])
@@ -792,6 +793,7 @@ async def add_walled_garden_ip_entry(
             finally:
                 api.disconnect()
 
+        await db.commit()
         result = await asyncio.get_event_loop().run_in_executor(None, _add)
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])
@@ -828,6 +830,7 @@ async def add_walled_garden_domain_entry(
             finally:
                 api.disconnect()
 
+        await db.commit()
         result = await asyncio.get_event_loop().run_in_executor(None, _add)
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])
@@ -864,6 +867,7 @@ async def remove_walled_garden_ip_entry(
             finally:
                 api.disconnect()
 
+        await db.commit()
         result = await asyncio.get_event_loop().run_in_executor(None, _remove)
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])
@@ -900,6 +904,7 @@ async def remove_walled_garden_domain_entry(
             finally:
                 api.disconnect()
 
+        await db.commit()
         result = await asyncio.get_event_loop().run_in_executor(None, _remove)
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])
@@ -944,6 +949,7 @@ async def update_wireguard_endpoint(
             finally:
                 api.disconnect()
 
+        await db.commit()
         result = await asyncio.get_event_loop().run_in_executor(None, _update)
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])
@@ -1081,6 +1087,7 @@ async def get_mikrotik_traffic(
             router_name = "Default Router"
         
         # Run MikroTik operations in thread pool (non-blocking!)
+        await db.commit()
         result = await asyncio.to_thread(_get_mikrotik_traffic_sync, router_info, interface)
         
         if result.get("error") == "connection_failed":
@@ -1131,6 +1138,7 @@ async def get_mikrotik_active_sessions(
             router_name = "Default Router"
         
         # Run MikroTik operations in thread pool (non-blocking!)
+        await db.commit()
         result = await asyncio.to_thread(_get_mikrotik_active_sessions_sync, router_info)
         
         if result.get("error") == "connection_failed":
@@ -1256,7 +1264,7 @@ async def get_top_bandwidth_users(
             owned_router_ids = select(Router.id).where(Router.user_id == user.id)
             owned_router_filter = Customer.router_id.in_(owned_router_ids)
 
-        base_join = select(UserBandwidthUsage).join(
+        base_join = select(UserBandwidthUsage, Customer).join(
             Customer, UserBandwidthUsage.customer_id == Customer.id
         )
 
@@ -1274,24 +1282,11 @@ async def get_top_bandwidth_users(
             ).limit(limit)
         
         result = await db.execute(query)
-        usage_records = result.scalars().all()
+        usage_records = result.all()
         
         users = []
-        for u in usage_records:
+        for u, customer in usage_records:
             total_bytes = u.upload_bytes + u.download_bytes
-            
-            customer_name = None
-            customer_phone = None
-            customer_router_id = None
-            if u.customer_id:
-                cust_result = await db.execute(
-                    select(Customer).where(Customer.id == u.customer_id)
-                )
-                customer = cust_result.scalar_one_or_none()
-                if customer:
-                    customer_name = customer.name
-                    customer_phone = customer.phone
-                    customer_router_id = customer.router_id
             
             users.append({
                 "mac": u.mac_address,
@@ -1307,9 +1302,9 @@ async def get_top_bandwidth_users(
                 "maxLimit": u.max_limit,
                 "lastUpdated": u.last_updated.isoformat() if u.last_updated else None,
                 "customerId": u.customer_id,
-                "customerName": customer_name,
-                "customerPhone": customer_phone,
-                "routerId": customer_router_id
+                "customerName": customer.name,
+                "customerPhone": customer.phone,
+                "routerId": customer.router_id
             })
         
         if router_id:
@@ -1321,7 +1316,9 @@ async def get_top_bandwidth_users(
                 Customer, UserBandwidthUsage.customer_id == Customer.id
             ).where(owned_router_filter)
         else:
-            count_query = select(func.count()).select_from(UserBandwidthUsage)
+            count_query = select(func.count()).select_from(UserBandwidthUsage).join(
+                Customer, UserBandwidthUsage.customer_id == Customer.id
+            )
         count_result = await db.execute(count_query)
         total_count = count_result.scalar() or 0
         
@@ -1377,6 +1374,8 @@ async def get_active_pppoe_sessions(
             "port": router_obj.port,
         }
 
+        router_name = router_obj.name
+        await db.commit()
         result = await asyncio.to_thread(_get_active_pppoe_sync, router_info)
 
         if result.get("error"):
@@ -1384,7 +1383,7 @@ async def get_active_pppoe_sessions(
 
         return {
             "router_id": router_id,
-            "router_name": router_obj.name,
+            "router_name": router_name,
             "sessions": result.get("data", []),
             "count": result.get("count", 0),
             "generated_at": datetime.utcnow().isoformat(),

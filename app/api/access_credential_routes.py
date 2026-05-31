@@ -161,6 +161,7 @@ async def create_credential(
     db.add(cred)
     await db.commit()
     await db.refresh(cred)
+    await db.commit()
 
     provision_result = await provision_credential(db, cred, router_obj)
     if provision_result.get("error"):
@@ -256,6 +257,7 @@ async def get_credential(
     cred = await _own_or_admin(db, cred_id, user)
 
     router_obj = await db.get(Router, cred.router_id)
+    await db.commit()
     live = await fetch_live_usage(cred, router_obj) if router_obj else {"online": False}
 
     return serialize_credential(cred, include_password=reveal, live=live)
@@ -302,6 +304,7 @@ async def update_credential(
 
     payload_out = serialize_credential(cred)
     if rate_changed and cred.status == AccessCredStatus.ACTIVE:
+        await db.commit()
         prov = await provision_credential(db, cred, router_obj)
         if prov.get("error"):
             logger.warning(f"Re-provision after rate change failed for cred {cred.id}: {prov}")
@@ -336,6 +339,7 @@ async def rotate_password(
     warning: Optional[str] = None
     provisioned = True
     if cred.status == AccessCredStatus.ACTIVE:
+        await db.commit()
         prov = await provision_credential(db, cred, router_obj)
         if prov.get("error"):
             logger.warning(f"Re-provision after password rotation failed for cred {cred.id}: {prov}")
@@ -361,6 +365,7 @@ async def revoke_credential(
     router_obj = await db.get(Router, cred.router_id)
 
     if router_obj:
+        await db.commit()
         await deprovision_credential(db, cred, router_obj)
 
     cred.status = AccessCredStatus.REVOKED
@@ -389,6 +394,7 @@ async def restore_credential(
     cred.revoked_at = None
     await db.commit()
     await db.refresh(cred)
+    await db.commit()
 
     prov = await provision_credential(db, cred, router_obj)
     payload = serialize_credential(cred)
@@ -431,6 +437,7 @@ async def sync_credential(
             detail="Credential is revoked; use /restore to re-activate it",
         )
 
+    await db.commit()
     prov = await provision_credential(db, cred, router_obj)
 
     payload = serialize_credential(cred, include_password=True)
@@ -469,6 +476,7 @@ async def force_logout(
     router_obj = await db.get(Router, cred.router_id)
 
     if cred.bound_mac_address and router_obj:
+        await db.commit()
         await release_mac(cred, router_obj, cred.bound_mac_address)
 
     cred.bound_mac_address = None
@@ -490,6 +498,7 @@ async def delete_credential(
     router_obj = await db.get(Router, cred.router_id)
 
     if router_obj:
+        await db.commit()
         await deprovision_credential(db, cred, router_obj)
 
     await db.delete(cred)

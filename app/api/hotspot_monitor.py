@@ -291,6 +291,7 @@ async def hotspot_overview(
         "ip": router_obj.ip_address, "username": router_obj.username,
         "password": router_obj.password, "port": router_obj.port,
     }
+    await db.commit()
     result = await run_with_guard(
         router_id, _hotspot_overview_sync, router_info,
         router_obj.pppoe_ports or [], router_obj.plain_ports or [],
@@ -353,6 +354,7 @@ async def hotspot_logs(
         "ip": router_obj.ip_address, "username": router_obj.username,
         "password": router_obj.password, "port": router_obj.port,
     }
+    await db.commit()
     result = await run_with_guard(router_id, _hotspot_logs_sync, router_info, search or "", limit)
 
     if result.get("error") == "connect_failed":
@@ -425,6 +427,7 @@ async def hotspot_users(
         "ip": router_obj.ip_address, "username": router_obj.username,
         "password": router_obj.password, "port": router_obj.port,
     }
+    await db.commit()
     result = await run_with_guard(router_id, _hotspot_users_sync, router_info)
 
     if result.get("error") == "connect_failed":

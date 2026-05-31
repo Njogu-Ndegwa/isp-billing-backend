@@ -243,6 +243,7 @@ async def edit_customer(
 
         provision_status = None
         if pppoe_changed and customer.router and customer.plan:
+            remove_payload = None
             if old_pppoe_username and old_router_id:
                 try:
                     old_router_stmt = select(Router).where(Router.id == old_router_id)
@@ -251,11 +252,16 @@ async def edit_customer(
                     if old_router_obj:
                         remove_payload = build_pppoe_remove_payload(customer, old_router_obj)
                         remove_payload["pppoe_username"] = old_pppoe_username
-                        await call_pppoe_remove(remove_payload)
                 except Exception as e:
-                    logger.warning(f"Failed to remove old PPPoE secret during edit: {e}")
+                    logger.warning(f"Failed to prepare old PPPoE secret removal during edit: {e}")
 
             pppoe_payload = build_pppoe_payload(customer, customer.router)
+            await db.commit()
+            if remove_payload:
+                try:
+                    await call_pppoe_remove(remove_payload)
+                except Exception as e:
+                    logger.warning(f"Failed to remove old PPPoE secret during edit: {e}")
             provision_result = await call_pppoe_provision(pppoe_payload)
             provision_status = "ok" if provision_result and provision_result.get("success") else "failed"
 
@@ -322,6 +328,7 @@ async def delete_customer(
         if customer.status == CustomerStatus.ACTIVE and customer.pppoe_username and customer.router:
             try:
                 payload = build_pppoe_remove_payload(customer, customer.router)
+                await db.commit()
                 remove_result = await call_pppoe_remove(payload)
                 deprovision_result = "ok" if remove_result and remove_result.get("success") else "failed"
             except Exception as e:
@@ -719,9 +726,10 @@ async def activate_pppoe_customer(
             )
 
         await db.commit()
-        await db.refresh(customer)
+        await db.refresh(customer, attribute_names=["plan", "router"])
 
         pppoe_payload = build_pppoe_payload(customer, customer.router)
+        await db.commit()
         provision_result = await call_pppoe_provision(pppoe_payload)
 
         return {
@@ -772,6 +780,7 @@ async def deactivate_pppoe_customer(
         remove_result = None
         if customer.router:
             payload = build_pppoe_remove_payload(customer, customer.router)
+            await db.commit()
             remove_result = await call_pppoe_remove(payload)
 
         customer.status = CustomerStatus.INACTIVE
@@ -866,6 +875,7 @@ async def regenerate_pppoe_password(
         router_updated = False
         if customer.status == CustomerStatus.ACTIVE and customer.router and customer.plan:
             pppoe_payload = build_pppoe_payload(customer, customer.router)
+            await db.commit()
             provision_result = await call_pppoe_provision(pppoe_payload)
             router_updated = bool(provision_result and provision_result.get("success"))
 

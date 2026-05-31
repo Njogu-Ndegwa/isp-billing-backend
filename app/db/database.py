@@ -1,7 +1,11 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import NullPool
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ✅ Required for defining models
 Base = declarative_base()
@@ -30,6 +34,14 @@ else:
 
 async_engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 
+
+def db_pool_status() -> str:
+    pool = async_engine.sync_engine.pool
+    status = getattr(pool, "status", None)
+    if not callable(status):
+        return type(pool).__name__
+    return status()
+
 # Create sessionmaker for async sessions
 AsyncSessionLocal = sessionmaker(
     bind=async_engine,
@@ -45,8 +57,10 @@ async def get_db():
         try:
             yield session
             await session.commit()
-        except Exception:
+        except Exception as exc:
             await session.rollback()
+            if isinstance(exc, SQLAlchemyTimeoutError):
+                logger.error("Database pool checkout timed out: %s", db_pool_status())
             raise
         finally:
             await session.close()

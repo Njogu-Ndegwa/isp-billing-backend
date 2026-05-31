@@ -747,11 +747,20 @@ async def unpair_device(
         router_obj = (await db.execute(select(Router).where(Router.id == pairing.router_id))).scalar_one_or_none()
         removal_result = None
         if router_obj:
+            device_mac = pairing.device_mac
+            router_info = {
+                "ip": router_obj.ip_address,
+                "username": router_obj.username,
+                "password": router_obj.password,
+                "port": router_obj.port,
+            }
+            await db.commit()
+
             def _remove_device_from_router_sync() -> str:
-                username = pairing.device_mac.replace(":", "")
+                username = device_mac.replace(":", "")
                 api = MikroTikAPI(
-                    router_obj.ip_address, router_obj.username,
-                    router_obj.password, router_obj.port,
+                    router_info["ip"], router_info["username"],
+                    router_info["password"], router_info["port"],
                     timeout=15, connect_timeout=5,
                 )
                 if not api.connect():
@@ -766,7 +775,7 @@ async def unpair_device(
 
                     bindings = api.send_command("/ip/hotspot/ip-binding/print")
                     if bindings.get("success") and bindings.get("data"):
-                        mac_normalized = pairing.device_mac.upper()
+                        mac_normalized = device_mac.upper()
                         for b in bindings["data"]:
                             binding_mac = b.get("mac-address", "").upper()
                             if binding_mac == mac_normalized:
@@ -780,7 +789,7 @@ async def unpair_device(
             try:
                 removal_result = await asyncio.to_thread(_remove_device_from_router_sync)
             except Exception as ex:
-                logger.warning("Failed to remove device %s from router: %s", pairing.device_mac, ex)
+                logger.warning("Failed to remove device %s from router: %s", device_mac, ex)
                 removal_result = f"removal_error: {str(ex)}"
 
         await db.commit()

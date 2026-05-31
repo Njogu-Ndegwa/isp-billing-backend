@@ -133,6 +133,7 @@ async def apply_throttle(
     if not router:
         return {"error": "no_router"}
     info = _router_info(router)
+    await db.commit()
     return await asyncio.to_thread(
         _set_secret_profile_sync, info, customer.pppoe_username, profile
     )
@@ -146,6 +147,7 @@ async def apply_block(db: AsyncSession, customer: Customer) -> dict:
     if not router:
         return {"error": "no_router"}
     info = _router_info(router)
+    await db.commit()
     return await asyncio.to_thread(
         _disable_secret_sync, info, customer.pppoe_username
     )
@@ -162,6 +164,7 @@ async def restore_normal_profile(
     if not router:
         return {"error": "no_router"}
     info = _router_info(router)
+    await db.commit()
     return await asyncio.to_thread(
         _set_secret_profile_sync, info, customer.pppoe_username, profile
     )

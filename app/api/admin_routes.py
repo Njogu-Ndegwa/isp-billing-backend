@@ -53,6 +53,8 @@ async def cleanup_all_inactive_users(
         removed_count = 0
         failed_count = 0
         details = []
+
+        await db.commit()
         
         # Connect once to MikroTik
         api = MikroTikAPI(
@@ -525,6 +527,7 @@ async def cleanup_recently_expired_users(
         ]
         
         # Run MikroTik operations in thread pool (non-blocking!)
+        await db.commit()
         mikrotik_results = await asyncio.to_thread(
             _cleanup_recently_expired_sync,
             customers_data,

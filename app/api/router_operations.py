@@ -974,6 +974,7 @@ async def get_router_users(
     }
     
     # Run MikroTik operations in thread pool (non-blocking!)
+    await db.commit()
     result = await asyncio.to_thread(_get_router_users_sync, router_info)
     
     if result.get("error"):
@@ -1011,6 +1012,7 @@ async def remove_router_user(
     }
     
     # Run MikroTik operations in thread pool (non-blocking!)
+    await db.commit()
     result = await asyncio.to_thread(_remove_router_user_sync, router_info, username)
     
     if result.get("error") == "connection_failed":
@@ -1050,6 +1052,7 @@ async def get_router_stats(
     }
     
     # Run MikroTik operations in thread pool (non-blocking!)
+    await db.commit()
     result = await asyncio.to_thread(_get_router_stats_sync, router_info)
     
     if result.get("error"):
@@ -1088,6 +1091,7 @@ async def sync_router_users_with_database(
     }
     
     # Run MikroTik operations in thread pool (non-blocking!)
+    await db.commit()
     mikrotik_result = await asyncio.to_thread(_sync_router_users_sync, router_info)
     
     if mikrotik_result.get("error"):
@@ -1189,6 +1193,7 @@ async def cleanup_expired_customers_for_router(
         from app.services.mikrotik_background import router_locks, _cleanup_single_router_hotspot_sync
         
         router_key = f"{router_obj.ip_address}:{router_obj.port}"
+        await db.commit()
         async with router_locks.acquire(router_key):
             mikrotik_results = await asyncio.to_thread(
                 _cleanup_single_router_hotspot_sync,
@@ -1270,6 +1275,7 @@ async def check_bandwidth_limits(
             "password": router_obj.password,
             "port": router_obj.port
         }
+        await db.commit()
         router_data = await asyncio.to_thread(_get_bandwidth_check_data_sync, router_info)
         
         if router_data.get("error") == "connect_failed":
@@ -1448,6 +1454,7 @@ async def check_illegal_connections(
             "password": router_obj.password,
             "port": router_obj.port
         }
+        await db.commit()
         router_data = await asyncio.to_thread(_get_illegal_connections_data_sync, router_info)
         
         if router_data.get("error") == "connect_failed":
@@ -1748,6 +1755,7 @@ async def remove_all_illegal_users(
             "port": router_obj.port,
             "name": router_obj.name
         }
+        await db.commit()
         scan_result = await asyncio.to_thread(_scan_connected_devices_sync, router_info)
         
         if scan_result.get("error") == "connect_failed":
@@ -1816,6 +1824,7 @@ async def remove_all_illegal_users(
         
         # Run bulk removal in thread pool (non-blocking)
         loop = asyncio.get_event_loop()
+        await db.commit()
         removal_results = await loop.run_in_executor(
             None,
             _bulk_remove_illegal_users_sync,
@@ -2145,6 +2154,7 @@ async def diagnose_mac_address(
         "password": router_obj.password,
         "port": router_obj.port
     }
+    await db.commit()
     diag_result = await asyncio.to_thread(_diagnose_mac_sync, router_info, normalized_mac, username)
     
     if diag_result.get("error") == "connect_failed":
@@ -2216,6 +2226,7 @@ async def force_remove_mac_address(
         "password": router_obj.password,
         "port": router_obj.port
     }
+    await db.commit()
     result = await asyncio.to_thread(_force_remove_mac_sync, router_info, normalized_mac, username)
     
     if result.get("error") == "connect_failed":
@@ -2288,6 +2299,7 @@ async def cleanup_all_bypassing_users(
         "password": router_obj.password,
         "port": router_obj.port
     }
+    await db.commit()
     cleanup_result = await asyncio.to_thread(_cleanup_bypassing_sync, router_info, active_macs, customer_by_mac, dry_run)
     
     if cleanup_result.get("error") == "connect_failed":
@@ -2369,6 +2381,7 @@ async def remove_single_illegal_user(
         "password": router_obj.password,
         "port": router_obj.port
     }
+    await db.commit()
     result = await asyncio.to_thread(_remove_single_illegal_user_sync, router_info, mac_address, normalized_mac, customer_info)
     
     if result.get("error") == "connect_failed":
@@ -2518,6 +2531,7 @@ async def get_router_port_status(
         "password": router_obj.password,
         "port": router_obj.port,
     }
+    await db.commit()
     result = await asyncio.to_thread(_get_port_status_sync, router_info)
 
     if result.get("error") == "connect_failed":
@@ -2627,6 +2641,7 @@ async def get_router_interfaces(
         "password": router_obj.password,
         "port": router_obj.port,
     }
+    await db.commit()
     result = await asyncio.to_thread(_get_ethernet_interfaces_sync, router_info)
 
     if result.get("error") == "connect_failed":
@@ -2896,6 +2911,7 @@ async def set_pppoe_ports(
         "port": router_obj.port,
     }
     started_at = time.perf_counter()
+    await db.commit()
     result = await asyncio.to_thread(
         _apply_pppoe_ports_sync,
         router_info,
@@ -3145,6 +3161,7 @@ async def set_plain_ports(
         "port": router_obj.port,
     }
     started_at = time.perf_counter()
+    await db.commit()
     result = await asyncio.to_thread(
         _apply_plain_ports_sync,
         router_info,
@@ -3354,6 +3371,7 @@ async def set_dual_ports(
         "port": router_obj.port,
     }
     started_at = time.perf_counter()
+    await db.commit()
     result = await asyncio.to_thread(
         _apply_dual_ports_sync,
         router_info,
@@ -3540,6 +3558,7 @@ async def diagnose_dual_port_endpoint(
         "password": router_obj.password,
         "port": router_obj.port,
     }
+    await db.commit()
     result = await asyncio.to_thread(
         _run_dual_diagnostic_sync,
         router_info,
@@ -3823,6 +3842,7 @@ async def get_hotspot_diagnostics_by_identity(
         "expected_identity": router_obj.identity or router_obj.name,
     }
 
+    await db.commit()
     result = await asyncio.to_thread(_get_hotspot_diagnostics_sync, router_info)
 
     if result.get("error") == "connection_failed":
@@ -4048,6 +4068,7 @@ async def get_device_mode(
         "password": router_obj.password,
         "port": router_obj.port,
     }
+    await db.commit()
     result = await asyncio.to_thread(_get_device_mode_sync, router_info)
 
     if result.get("error") == "connection_failed":
@@ -4120,6 +4141,7 @@ async def update_device_mode(
         "password": router_obj.password,
         "port": router_obj.port,
     }
+    await db.commit()
     result = await asyncio.to_thread(_update_device_mode_sync, router_info, mode, flags)
 
     if result.get("error") == "connection_failed":
@@ -4258,6 +4280,7 @@ async def list_router_files(
         "password": router_obj.password,
         "port": router_obj.port,
     }
+    await db.commit()
     result = await asyncio.to_thread(
         _list_router_files_sync, router_info, path_prefix or None
     )
@@ -4462,6 +4485,7 @@ async def toggle_winbox_access(
         "password": router_obj.password,
         "port": router_obj.port,
     }
+    await db.commit()
     result = await asyncio.to_thread(
         _toggle_winbox_access_sync, router_info, request.enable, request.wg_source
     )
@@ -4682,6 +4706,7 @@ async def sync_hotspot_files(
     dst_info = {"ip": dst_router.ip_address, "username": dst_router.username,
                 "password": dst_router.password, "port": dst_router.port}
 
+    await db.commit()
     result = await asyncio.to_thread(
         _sync_hotspot_files_sync, src_info, dst_info, request.overwrite_existing
     )

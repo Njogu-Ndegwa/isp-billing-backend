@@ -687,6 +687,7 @@ async def delete_router(
                         customers_data.append((normalized, normalized.replace(":", "")))
                 
                 try:
+                    await db.commit()
                     mikrotik_cleaned = await asyncio.to_thread(_cleanup_router_users, router_info, customers_data)
                     logger.info(f"Cleaned {mikrotik_cleaned} users from MikroTik router {router_name}")
                 except Exception as e:
@@ -1025,6 +1026,7 @@ async def remediate_captive_portal(
             api.disconnect()
 
     try:
+        await db.commit()
         report = await asyncio.to_thread(_remediate_blocking)
     except Exception as e:
         logger.error(
@@ -1090,6 +1092,7 @@ async def enable_anti_tethering(
             finally:
                 api.disconnect()
 
+        await db.commit()
         result = await asyncio.get_event_loop().run_in_executor(None, _push_rules)
         if result.get("error"):
             raise HTTPException(status_code=502, detail=result["error"])
@@ -1152,6 +1155,7 @@ async def disable_anti_tethering(
             finally:
                 api.disconnect()
 
+        await db.commit()
         result = await asyncio.get_event_loop().run_in_executor(None, _remove_rules)
         if result.get("error"):
             raise HTTPException(status_code=502, detail=result["error"])

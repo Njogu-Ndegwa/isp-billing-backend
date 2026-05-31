@@ -620,6 +620,7 @@ async def pppoe_overview(
         "ip": router_obj.ip_address, "username": router_obj.username,
         "password": router_obj.password, "port": router_obj.port,
     }
+    await db.commit()
     result = await run_with_guard(
         router_id, _pppoe_overview_sync, router_info,
         router_obj.pppoe_ports or [],
@@ -706,6 +707,7 @@ async def pppoe_diagnose(
         "ip": router_obj.ip_address, "username": router_obj.username,
         "password": router_obj.password, "port": router_obj.port,
     }
+    await db.commit()
     diag = await run_with_guard(
         router_id, _pppoe_diagnose_sync, router_info, username, router_obj.pppoe_ports or [],
     )
@@ -772,6 +774,7 @@ async def pppoe_logs(
         "ip": router_obj.ip_address, "username": router_obj.username,
         "password": router_obj.password, "port": router_obj.port,
     }
+    await db.commit()
     result = await run_with_guard(router_id, _pppoe_logs_sync, router_info, username or "", limit)
 
     if result.get("error") == "connect_failed":
@@ -815,6 +818,7 @@ async def pppoe_secrets(
         "ip": router_obj.ip_address, "username": router_obj.username,
         "password": router_obj.password, "port": router_obj.port,
     }
+    await db.commit()
     result = await run_with_guard(router_id, _pppoe_secrets_sync, router_info)
 
     if result.get("error") == "connect_failed":
@@ -959,6 +963,7 @@ async def pppoe_users(
         "ip": router_obj.ip_address, "username": router_obj.username,
         "password": router_obj.password, "port": router_obj.port,
     }
+    await db.commit()
     result = await run_with_guard(router_id, _pppoe_users_sync, router_info)
 
     if result.get("error") == "connect_failed":
@@ -1047,6 +1052,7 @@ async def pppoe_client_details(
         "password": router_obj.password, "port": router_obj.port,
     }
 
+    await db.commit()
     diag = await run_with_guard(
         router_id, _pppoe_diagnose_sync, router_info, username, router_obj.pppoe_ports or [],
     )

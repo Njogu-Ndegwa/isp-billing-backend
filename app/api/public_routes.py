@@ -320,6 +320,8 @@ async def register_mac_address(
         "name": router_obj.name,
         "user_id": router_obj.user_id
     }
+    router_name = router_obj.name
+    router_owner_id = router_obj.user_id
     
     registration_data = {
         "normalized_mac": normalized_mac,
@@ -328,6 +330,8 @@ async def register_mac_address(
         "time_limit": registration.get("time_limit"),
         "comment": comment
     }
+
+    await db.commit()
     
     # Run MikroTik operations in thread pool (non-blocking!)
     result = await asyncio.to_thread(_register_mac_on_mikrotik_sync, router_info, registration_data)
@@ -338,10 +342,10 @@ async def register_mac_address(
         error_message = result.get("message", "Unknown error")
         
         if error_type == "connection_failed":
-            logger.error(f"Failed to connect to router {router_obj.name} at {router_obj.ip_address}")
+            logger.error(f"Failed to connect to router {router_name} at {router_info['ip']}")
             raise HTTPException(status_code=500, detail="Failed to connect to router")
         elif error_type == "already_registered":
-            logger.warning(f"MAC address {normalized_mac} already registered on router {router_obj.name}")
+            logger.warning(f"MAC address {normalized_mac} already registered on router {router_name}")
             raise HTTPException(status_code=409, detail="MAC address already registered")
         elif error_type == "user_creation_failed":
             logger.error(f"Failed to create hotspot user: {error_message}")
@@ -349,7 +353,7 @@ async def register_mac_address(
         else:
             raise HTTPException(status_code=500, detail=f"Registration failed: {error_message}")
 
-    logger.info(f"MAC {normalized_mac} registered on router {router_obj.name} (ID: {router_id}, Owner: {router_obj.user_id})")
+    logger.info(f"MAC {normalized_mac} registered on router {router_name} (ID: {router_id}, Owner: {router_owner_id})")
 
     return {
         "success": True,
@@ -358,8 +362,8 @@ async def register_mac_address(
             "username": username,
             "mac_address": normalized_mac,
             "router_id": router_id,
-            "router_name": router_obj.name,
-            "router_owner_id": router_obj.user_id,
+            "router_name": router_name,
+            "router_owner_id": router_owner_id,
             "registered_at": datetime.utcnow().isoformat(),
             "expires_at": expires_at.isoformat() if expires_at else None,
             "bandwidth_limit": registration.get("bandwidth_limit"),
@@ -426,12 +430,14 @@ async def check_mac_registration_status(
         "port": router_obj.port,
         "name": router_obj.name
     }
+    router_name = router_obj.name
+    await db.commit()
     
     # Run MikroTik operations in thread pool (non-blocking!)
     result = await asyncio.to_thread(_check_mac_status_sync, router_info, normalized_mac, username, router_id)
     
     if result.get("error"):
-        logger.error(f"Failed to connect to router {router_obj.name} at {router_obj.ip_address}")
+        logger.error(f"Failed to connect to router {router_name} at {router_info['ip']}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
     return result
@@ -465,12 +471,14 @@ async def disconnect_user_session(
         "port": router_obj.port,
         "name": router_obj.name
     }
+    router_name = router_obj.name
+    await db.commit()
     
     # Run MikroTik operations in thread pool (non-blocking!)
     result = await asyncio.to_thread(_disconnect_user_session_sync, router_info, username)
     
     if result.get("error"):
-        logger.error(f"Failed to connect to router {router_obj.name} at {router_obj.ip_address}")
+        logger.error(f"Failed to connect to router {router_name} at {router_info['ip']}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
     return {
@@ -609,6 +617,11 @@ async def sync_customer_queue(
         router_username = customer.router.username if customer.router else settings.MIKROTIK_USERNAME
         router_password = customer.router.password if customer.router else settings.MIKROTIK_PASSWORD
         router_port = customer.router.port if customer.router else settings.MIKROTIK_PORT
+        customer_name = customer.name
+        customer_mac = customer.mac_address
+        plan_speed = customer.plan.speed
+
+        await db.commit()
 
         api = MikroTikAPI(
             router_ip,
@@ -623,9 +636,9 @@ async def sync_customer_queue(
             raise HTTPException(status_code=500, detail="Failed to connect to router")
         
         try:
-            normalized_mac = normalize_mac_address(customer.mac_address)
+            normalized_mac = normalize_mac_address(customer_mac)
             username = normalized_mac.replace(":", "")
-            rate_limit = api._parse_speed_to_mikrotik(customer.plan.speed)
+            rate_limit = api._parse_speed_to_mikrotik(plan_speed)
             
             # Find client IP from multiple sources
             client_ip = None
@@ -662,7 +675,7 @@ async def sync_customer_queue(
                     "success": False,
                     "message": "Client not currently connected. Queue will be applied when they connect.",
                     "customer_id": customer_id,
-                    "mac_address": customer.mac_address
+                    "mac_address": customer_mac
                 }
             
             # Create or update queue
@@ -670,7 +683,7 @@ async def sync_customer_queue(
                 "name": f"queue_{username}",
                 "target": f"{client_ip}/32",
                 "max-limit": rate_limit,
-                "comment": f"Bandwidth limit for MAC: {customer.mac_address} -> IP: {client_ip}"
+                "comment": f"Bandwidth limit for MAC: {customer_mac} -> IP: {client_ip}"
             }
             
             # Try update first, then add
@@ -687,9 +700,9 @@ async def sync_customer_queue(
             
             return {
                 "success": True,
-                "message": f"Queue synced for customer {customer.name}",
+                "message": f"Queue synced for customer {customer_name}",
                 "customer_id": customer_id,
-                "mac_address": customer.mac_address,
+                "mac_address": customer_mac,
                 "client_ip": client_ip,
                 "rate_limit": rate_limit,
                 "queue_result": queue_result
@@ -732,11 +745,16 @@ async def get_portal_data(
 
     router_obj, reseller = row
 
-    plans, all_plans_for_flags, ads_data, portal_settings_result = await asyncio.gather(
-        get_plans_cached(db, router_obj.user_id, connection_type),
-        get_plans_cached(db, router_obj.user_id, connection_type, include_hidden=True),
-        _fetch_active_ads(db),
-        db.execute(select(PortalSettings).where(PortalSettings.user_id == router_obj.user_id)),
+    plans = await get_plans_cached(db, router_obj.user_id, connection_type)
+    all_plans_for_flags = await get_plans_cached(
+        db,
+        router_obj.user_id,
+        connection_type,
+        include_hidden=True,
+    )
+    ads_data = await _fetch_active_ads(db)
+    portal_settings_result = await db.execute(
+        select(PortalSettings).where(PortalSettings.user_id == router_obj.user_id)
     )
 
     has_emergency = any(p.get("plan_type") == "emergency" for p in all_plans_for_flags)
@@ -931,6 +949,7 @@ async def access_credential_login_public(
     logger.info(
         f"[ACCESS-LOGIN] cred={cred.id} user={username} router={rid} mac={normalized_mac} -> binding"
     )
+    await db.commit()
     bind_result = await bind_mac_for_login(cred, router_obj, normalized_mac)
     if bind_result.get("error"):
         logger.warning(
@@ -1270,16 +1289,6 @@ async def reconnect_self_service(
             conflicting.mac_address = None
             await db.flush()
 
-        if mac_changed:
-            cleanup_result = await asyncio.to_thread(
-                _cleanup_old_mac_from_router_sync, router_info, old_mac
-            )
-            if cleanup_result.get("error"):
-                logger.warning(
-                    "[RECONNECT] Old MAC cleanup failed for customer %s: %s",
-                    customer.id, cleanup_result["error"],
-                )
-
         customer.mac_address = normalized_mac
         await db.flush()
         logger.info(
@@ -1336,6 +1345,27 @@ async def reconnect_self_service(
     await db.commit()
 
     # Fire provisioning in background — respond to user instantly
+    if mac_changed:
+        async def _background_cleanup_old_mac():
+            try:
+                cleanup_result = await asyncio.to_thread(
+                    _cleanup_old_mac_from_router_sync,
+                    router_info,
+                    old_mac,
+                )
+                if cleanup_result.get("error"):
+                    logger.warning(
+                        "[RECONNECT] Old MAC cleanup failed for customer %s: %s",
+                        customer_id,
+                        cleanup_result["error"],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[RECONNECT] Old MAC cleanup crashed for customer %s: %s",
+                    customer_id,
+                    exc,
+                )
+
     async def _background_provision():
         try:
             result = await provision_hotspot_customer(
@@ -1358,6 +1388,8 @@ async def reconnect_self_service(
             logger.error("[RECONNECT] Background provisioning error for customer %s: %s", customer_id, exc)
 
     background_tasks.add_task(_background_provision)
+    if mac_changed:
+        background_tasks.add_task(_background_cleanup_old_mac)
 
     remaining = customer.expiry - now
     return {

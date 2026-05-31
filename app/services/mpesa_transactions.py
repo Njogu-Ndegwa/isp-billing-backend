@@ -348,7 +348,12 @@ async def reconcile_pending_mpesa_transactions():
             await asyncio.sleep(2)
 
     except Exception as outer_err:
+        from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+        from app.db.database import db_pool_status
+
         logger.exception("[RECONCILE] Reconciliation job failed: %s", outer_err)
+        if isinstance(outer_err, SQLAlchemyTimeoutError):
+            logger.error("[RECONCILE] DB pool status at failure: %s", db_pool_status())
     finally:
         _reconcile_running = False
 

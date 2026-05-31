@@ -971,7 +971,12 @@ async def cleanup_expired_users_background():
                 logger.error(f"[CRON] Access credential reaper failed: {reap_err}")
 
     except Exception as e:
+        from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+        from app.db.database import db_pool_status
+
         logger.error(f"[CRON] Cleanup job failed: {e}")
+        if isinstance(e, SQLAlchemyTimeoutError):
+            logger.error("[CRON] DB pool status at cleanup failure: %s", db_pool_status())
     finally:
         cleanup_running = False
 
@@ -1694,6 +1699,7 @@ async def sync_active_user_queues():
             }
 
             if pending_router_items:
+                await db.commit()
                 outcomes = await asyncio.gather(
                     *[_sync_router_task(rk, rd) for rk, rd in pending_router_items],
                     return_exceptions=True,
@@ -2142,4 +2148,9 @@ async def collect_bandwidth_snapshot():
 
         logger.info(f"Bandwidth snapshot collected for {len(routers)} router(s)")
     except Exception as e:
+        from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+        from app.db.database import db_pool_status
+
         logger.error(f"Error collecting bandwidth snapshot: {e}")
+        if isinstance(e, SQLAlchemyTimeoutError):
+            logger.error("[BANDWIDTH] DB pool status at failure: %s", db_pool_status())
