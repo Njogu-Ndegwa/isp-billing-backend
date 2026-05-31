@@ -858,6 +858,150 @@ async def get_revenue_over_time(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/api/dashboard/transactions-daily")
+async def get_daily_transaction_counts(
+    period: Optional[str] = "30d",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    router_id: Optional[int] = None,
+    payment_method: Optional[str] = None,
+    status: Optional[str] = "completed",
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """
+    Daily transaction counts for charting.
+
+    Uses customer_payments as the authoritative completed-payment ledger.
+    period: 7d | 30d | 90d | 6m | 1y (ignored when start_date+end_date provided)
+    status: completed | pending | failed | refunded | all
+    """
+    try:
+        user = await get_current_user(token, db)
+        now = datetime.utcnow()
+
+        if start_date and end_date:
+            try:
+                range_start = datetime.strptime(start_date, "%Y-%m-%d")
+                range_end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Use YYYY-MM-DD for start_date / end_date")
+            period_label = "custom"
+        else:
+            period_map = {
+                "7d": 7, "30d": 30, "90d": 90, "6m": 180, "1y": 365,
+            }
+            days = period_map.get(period or "30d")
+            if not days:
+                raise HTTPException(status_code=400, detail="period must be one of: 7d, 30d, 90d, 6m, 1y")
+            range_start = datetime(now.year, now.month, now.day) - timedelta(days=days - 1)
+            range_end = datetime(now.year, now.month, now.day) + timedelta(days=1)
+            period_label = period or "30d"
+
+        if range_end <= range_start:
+            raise HTTPException(status_code=400, detail="end_date must be after start_date")
+
+        total_days_requested = (range_end.date() - range_start.date()).days
+        if total_days_requested > 366:
+            raise HTTPException(status_code=400, detail="Daily transaction range cannot exceed 366 days")
+
+        filters = [
+            CustomerPayment.reseller_id == user.id,
+            CustomerPayment.created_at >= range_start,
+            CustomerPayment.created_at < range_end,
+        ]
+
+        status_filter = (status or "completed").lower()
+        if status_filter != "all":
+            try:
+                filters.append(CustomerPayment.status == PaymentStatus(status_filter))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="status must be one of: completed, pending, failed, refunded, all")
+
+        if payment_method:
+            try:
+                filters.append(CustomerPayment.payment_method == PaymentMethod(payment_method.lower()))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid payment_method")
+
+        day_bucket = func.date(CustomerPayment.created_at).label("day")
+        stmt = (
+            select(
+                day_bucket,
+                func.count(CustomerPayment.id).label("transactions"),
+                func.coalesce(func.sum(CustomerPayment.amount), 0).label("revenue"),
+            )
+            .where(*filters)
+            .group_by(day_bucket)
+            .order_by(day_bucket)
+        )
+
+        if router_id:
+            stmt = stmt.join(Customer, CustomerPayment.customer_id == Customer.id).where(Customer.router_id == router_id)
+
+        rows = (await db.execute(stmt)).all()
+        await db.commit()
+
+        buckets = {}
+        for row in rows:
+            raw_day = row.day
+            if isinstance(raw_day, datetime):
+                day_key = raw_day.date().isoformat()
+            elif isinstance(raw_day, date):
+                day_key = raw_day.isoformat()
+            else:
+                day_key = str(raw_day)
+            buckets[day_key] = {
+                "transactions": int(row.transactions or 0),
+                "revenue": round(float(row.revenue or 0), 2),
+            }
+
+        data = []
+        total_transactions = 0
+        total_revenue = 0.0
+        cursor = range_start.date()
+        final_day = (range_end - timedelta(days=1)).date()
+        while cursor <= final_day:
+            key = cursor.isoformat()
+            bucket = buckets.get(key, {"transactions": 0, "revenue": 0.0})
+            total_transactions += bucket["transactions"]
+            total_revenue += bucket["revenue"]
+            data.append({
+                "date": key,
+                "label": cursor.strftime("%b %d"),
+                "transactions": bucket["transactions"],
+                "revenue": bucket["revenue"],
+            })
+            cursor += timedelta(days=1)
+
+        active_days = len([point for point in data if point["transactions"] > 0])
+        total_days = len(data)
+
+        return {
+            "period": period_label,
+            "start_date": range_start.strftime("%Y-%m-%d"),
+            "end_date": final_day.strftime("%Y-%m-%d"),
+            "router_id": router_id,
+            "payment_method": payment_method,
+            "status": status_filter,
+            "data": data,
+            "totals": {
+                "transactions": total_transactions,
+                "revenue": round(total_revenue, 2),
+                "active_days": active_days,
+                "avg_transactions_per_day": round(total_transactions / total_days, 2) if total_days else 0,
+                "avg_transactions_per_active_day": round(total_transactions / active_days, 2) if active_days else 0,
+            },
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching daily transaction counts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/dashboard/daily-revenue")
 async def get_daily_revenue_metrics(
     router_id: Optional[int] = None,
