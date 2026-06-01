@@ -25,12 +25,19 @@ _diagnostic_pool = ThreadPoolExecutor(
 )
 
 
-async def run_with_guard(router_id: int, sync_func, *args):
+async def run_with_guard(
+    router_id: int,
+    sync_func,
+    *args,
+    acquire_timeout_seconds: float | None = None,
+    timeout_seconds: float = DIAGNOSTIC_TIMEOUT_SECONDS,
+):
     """
     Run a synchronous MikroTik diagnostic function with:
     1. Per-router concurrency limit (max 2 simultaneous connections per router)
-    2. Hard timeout (45s) so a hung router doesn't block workers forever
-    3. Dedicated thread pool (6 workers) separate from the default pool
+    2. Optional acquire timeout so callers can fail fast instead of queueing
+    3. Hard timeout (45s default) so a hung router doesn't block workers forever
+    4. Dedicated thread pool (6 workers) separate from the default pool
 
     Usage:
         result = await run_with_guard(router_id, _pppoe_overview_sync, router_info, ports)
@@ -47,7 +54,25 @@ async def run_with_guard(router_id: int, sync_func, *args):
     except Exception:
         pass
 
-    async with sem:
+    try:
+        if acquire_timeout_seconds is None:
+            await sem.acquire()
+        else:
+            await asyncio.wait_for(sem.acquire(), timeout=acquire_timeout_seconds)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"Router {router_id}: diagnostic slot unavailable after "
+            f"{acquire_timeout_seconds}s"
+        )
+        return {
+            "error": "busy",
+            "detail": (
+                "Router diagnostic slots are busy; retry shortly "
+                f"(waited {acquire_timeout_seconds}s)"
+            ),
+        }
+
+    try:
         loop = asyncio.get_running_loop()
         try:
             result = await asyncio.wait_for(
@@ -55,11 +80,13 @@ async def run_with_guard(router_id: int, sync_func, *args):
                     _diagnostic_pool,
                     functools.partial(sync_func, *args),
                 ),
-                timeout=DIAGNOSTIC_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
             )
             return result
         except asyncio.TimeoutError:
             logger.error(
-                f"Router {router_id}: diagnostic timed out after {DIAGNOSTIC_TIMEOUT_SECONDS}s"
+                f"Router {router_id}: diagnostic timed out after {timeout_seconds}s"
             )
-            return {"error": "timeout", "detail": f"Diagnostic timed out after {DIAGNOSTIC_TIMEOUT_SECONDS}s"}
+            return {"error": "timeout", "detail": f"Diagnostic timed out after {timeout_seconds}s"}
+    finally:
+        sem.release()

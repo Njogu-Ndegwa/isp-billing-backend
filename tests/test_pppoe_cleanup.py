@@ -137,3 +137,92 @@ async def test_cleanup_pppoe_user_endpoint_refuses_existing_customer_without_for
 
     assert exc.value.status_code == 409
     assert exc.value.detail["customer"]["name"] == "Festus"
+
+
+async def test_pppoe_customer_presence_uses_db_values_and_reports_offline(db, monkeypatch):
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+    calls = []
+
+    async def _run_with_guard(router_id, fn, router_info, username, **kwargs):
+        calls.append({
+            "router_id": router_id,
+            "helper": fn.__name__,
+            "router_ip": router_info["ip"],
+            "router_port": router_info["port"],
+            "username": username,
+            "acquire_timeout_seconds": kwargs.get("acquire_timeout_seconds"),
+        })
+        return {
+            "success": True,
+            "username": username,
+            "present_on_router": True,
+            "online": False,
+            "state": "offline",
+            "secret": {
+                "name": username,
+                "service": "pppoe",
+                "profile": "pppoe_5M_5M",
+                "disabled": False,
+                "comment": f"CID:{customer.id}|Festus|2026-06-01",
+                "last_logged_out": "1970-01-01 00:00:00",
+                "last_disconnect_reason": "",
+                "last_caller_id": "",
+            },
+            "active_session": None,
+            "profile_detail": {"name": "pppoe_5M_5M", "rate_limit": "5000000/5000000"},
+            "profile_lookup_success": True,
+            "profile_lookup_error": None,
+            "session_lookup_success": True,
+            "session_lookup_error": None,
+        }
+
+    monkeypatch.setattr(pppoe_monitor, "run_with_guard", _run_with_guard)
+
+    response = await pppoe_monitor.pppoe_customer_presence(customer.id, db, _token(reseller))
+
+    assert response["success"] is True
+    assert response["customer"]["id"] == customer.id
+    assert response["lookup"] == {
+        "source": "customers.pppoe_username",
+        "value": "Festo",
+    }
+    assert response["mikrotik"]["present_on_router"] is True
+    assert response["mikrotik"]["online"] is False
+    assert response["verdict"]["code"] == "router_account_exists_but_customer_offline"
+    assert response["verdict"]["our_side_confirmed"] is True
+    assert calls == [{
+        "router_id": router.id,
+        "helper": "_pppoe_customer_presence_sync",
+        "router_ip": router.ip_address,
+        "router_port": router.port,
+        "username": "Festo",
+        "acquire_timeout_seconds": pppoe_monitor._PRESENCE_ACQUIRE_TIMEOUT_SECONDS,
+    }]
+
+
+async def test_pppoe_customer_presence_requires_pppoe_username(db, monkeypatch):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    router = await make_router(db, reseller)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=1),
+        mac_address=None,
+        pppoe_username=None,
+        name="No PPPoE",
+    )
+
+    async def _run_with_guard(*_args, **_kwargs):
+        raise AssertionError("router lookup should not run without a PPPoE username")
+
+    monkeypatch.setattr(pppoe_monitor, "run_with_guard", _run_with_guard)
+
+    with pytest.raises(HTTPException) as exc:
+        await pppoe_monitor.pppoe_customer_presence(customer.id, db, _token(reseller))
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "Customer does not have a PPPoE username"

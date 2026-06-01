@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import datetime
 
 from app.db.database import get_db
-from app.db.models import Customer
+from app.db.models import Customer, Plan, Router
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.pppoe_provisioning import call_pppoe_remove
@@ -24,6 +24,10 @@ router = APIRouter(tags=["pppoe-monitor"])
 
 _pppoe_overview_cache: dict = {}  # router_id -> {"data": ..., "timestamp": datetime}
 _OVERVIEW_CACHE_TTL = 60  # 60 seconds -- overview changes slowly, no need to hit router every refresh
+_pppoe_presence_cache: dict = {}  # (customer_id, router_id, username) -> {"data": ..., "timestamp": datetime}
+_PRESENCE_CACHE_TTL = 15  # Postman/manual retry guard; this endpoint still stays near-live
+_PRESENCE_CACHE_MAX_ENTRIES = 512
+_PRESENCE_ACQUIRE_TIMEOUT_SECONDS = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +572,114 @@ def _pppoe_users_sync(router_info: dict) -> dict:
         api.disconnect()
 
 
+def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
+    """Check whether one DB-owned PPPoE username exists on the MikroTik."""
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"],
+        router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        secret_data = api.get_pppoe_secret_detail(username)
+        if secret_data.get("error"):
+            return {"error": secret_data["error"]}
+
+        secret = secret_data.get("data") if secret_data.get("found") else None
+        if not secret:
+            return {
+                "success": True,
+                "username": username,
+                "present_on_router": False,
+                "online": None,
+                "state": "missing",
+                "secret": None,
+                "active_session": None,
+                "profile_detail": None,
+                "profile_lookup_success": None,
+                "profile_lookup_error": None,
+                "session_lookup_success": None,
+                "session_found": None,
+                "session_lookup_error": None,
+            }
+
+        if secret.get("disabled"):
+            return {
+                "success": True,
+                "username": username,
+                "present_on_router": True,
+                "online": None,
+                "state": "disabled",
+                "secret": secret,
+                "active_session": None,
+                "profile_detail": None,
+                "profile_lookup_success": None,
+                "profile_lookup_error": None,
+                "session_lookup_success": None,
+                "session_found": None,
+                "session_lookup_error": None,
+            }
+
+        session_lookup = api.get_pppoe_session_with_bandwidth(username)
+        session_lookup_success = bool(session_lookup.get("success"))
+        active_session = session_lookup.get("data") if session_lookup.get("found") else None
+
+        profile_data = api.get_ppp_profile_detail(secret.get("profile", ""))
+        profile_lookup_success = bool(profile_data.get("success"))
+        profile_lookup_error = profile_data.get("error") if not profile_lookup_success else None
+        profile_detail = profile_data.get("data") if profile_data.get("found") else None
+
+        if active_session:
+            state = "online"
+        elif session_lookup_success:
+            state = "offline"
+        else:
+            state = "session_unknown"
+
+        return {
+            "success": True,
+            "username": username,
+            "present_on_router": True,
+            "online": bool(active_session) if session_lookup_success else None,
+            "state": state,
+            "secret": secret,
+            "active_session": active_session,
+            "profile_detail": profile_detail,
+            "profile_lookup_success": profile_lookup_success,
+            "profile_lookup_error": profile_lookup_error,
+            "session_lookup_success": session_lookup_success,
+            "session_found": bool(session_lookup.get("found")) if session_lookup_success else None,
+            "session_lookup_error": session_lookup.get("error") if not session_lookup_success else None,
+        }
+    except Exception as e:
+        logger.error(f"PPPoE customer presence error for {username}: {e}")
+        return {"error": str(e)}
+    finally:
+        api.disconnect()
+
+
+def _prune_pppoe_presence_cache(now: datetime) -> None:
+    """Keep the short-lived presence cache bounded."""
+    stale_keys = [
+        key for key, cached in _pppoe_presence_cache.items()
+        if (now - cached["timestamp"]).total_seconds() >= _PRESENCE_CACHE_TTL
+    ]
+    for key in stale_keys:
+        _pppoe_presence_cache.pop(key, None)
+
+    overflow = len(_pppoe_presence_cache) - _PRESENCE_CACHE_MAX_ENTRIES
+    if overflow <= 0:
+        return
+
+    oldest_keys = sorted(
+        _pppoe_presence_cache,
+        key=lambda key: _pppoe_presence_cache[key]["timestamp"],
+    )[:overflow]
+    for key in oldest_keys:
+        _pppoe_presence_cache.pop(key, None)
+
+
 def _parse_rate_to_bps(rate_str: str) -> int:
     """Convert a MikroTik rate string like '1500000' or '1.5M' to bits per second."""
     if not rate_str:
@@ -593,6 +705,195 @@ def _parse_rate_to_bps(rate_str: str) -> int:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@router.get("/api/pppoe/customers/{customer_id}/presence")
+async def pppoe_customer_presence(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+    refresh: bool = Query(False, description="Bypass the short duplicate-request cache"),
+):
+    """Check whether a DB customer's PPPoE account exists on their MikroTik router."""
+    user = await get_current_user(token, db)
+
+    stmt = (
+        select(
+            Customer.id.label("customer_id"),
+            Customer.name.label("customer_name"),
+            Customer.phone.label("customer_phone"),
+            Customer.status.label("customer_status"),
+            Customer.expiry.label("customer_expiry"),
+            Customer.account_number.label("customer_account_number"),
+            Customer.pppoe_username.label("pppoe_username"),
+            Customer.user_id.label("customer_user_id"),
+            Customer.router_id.label("customer_router_id"),
+            Router.id.label("router_id"),
+            Router.user_id.label("router_user_id"),
+            Router.name.label("router_name"),
+            Router.ip_address.label("router_ip_address"),
+            Router.username.label("router_username"),
+            Router.password.label("router_password"),
+            Router.port.label("router_port"),
+            Plan.name.label("plan_name"),
+            Plan.speed.label("plan_speed"),
+        )
+        .outerjoin(Router, Customer.router_id == Router.id)
+        .outerjoin(Plan, Customer.plan_id == Plan.id)
+        .where(Customer.id == customer_id)
+    )
+    if user.role.value != "admin":
+        stmt = stmt.where(Customer.user_id == user.id)
+
+    result = await db.execute(stmt)
+    row = result.mappings().one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    if not row["pppoe_username"]:
+        raise HTTPException(status_code=400, detail="Customer does not have a PPPoE username")
+
+    if not row["router_id"]:
+        raise HTTPException(status_code=400, detail="Customer has no router assigned")
+
+    if user.role.value != "admin" and row["router_user_id"] != user.id:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+
+    now = datetime.utcnow()
+    customer_status = row["customer_status"].value if row["customer_status"] else "unknown"
+    customer_expiry = row["customer_expiry"]
+    db_customer = {
+        "id": row["customer_id"],
+        "name": row["customer_name"],
+        "phone": row["customer_phone"],
+        "status": customer_status,
+        "expiry": customer_expiry.isoformat() if customer_expiry else None,
+        "is_expired": customer_expiry < now if customer_expiry else False,
+        "plan": row["plan_name"],
+        "plan_speed": row["plan_speed"],
+        "account_number": row["customer_account_number"],
+        "pppoe_username": row["pppoe_username"],
+    }
+    router_info = {
+        "ip": row["router_ip_address"],
+        "username": row["router_username"],
+        "password": row["router_password"],
+        "port": row["router_port"],
+    }
+    router_id = row["router_id"]
+    router_name = row["router_name"]
+    cache_key = (db_customer["id"], router_id, db_customer["pppoe_username"])
+    cache_now = datetime.utcnow()
+    _prune_pppoe_presence_cache(cache_now)
+
+    if not refresh and cache_key in _pppoe_presence_cache:
+        cached = _pppoe_presence_cache[cache_key]
+        age = (cache_now - cached["timestamp"]).total_seconds()
+        if age < _PRESENCE_CACHE_TTL:
+            response = cached["data"].copy()
+            response["cached"] = True
+            response["cache_age_seconds"] = round(age, 1)
+            return response
+
+    await db.commit()
+    presence = await run_with_guard(
+        router_id,
+        _pppoe_customer_presence_sync,
+        router_info,
+        row["pppoe_username"],
+        acquire_timeout_seconds=_PRESENCE_ACQUIRE_TIMEOUT_SECONDS,
+    )
+
+    if presence.get("error") == "busy":
+        raise HTTPException(status_code=429, detail=presence.get("detail", "Router diagnostic slots are busy"))
+    if presence.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "pppoe_customer_presence")
+        raise HTTPException(status_code=503, detail="Failed to connect to router")
+    if presence.get("error") == "timeout":
+        await record_router_availability(db, router_id, False, "pppoe_customer_presence")
+        raise HTTPException(status_code=504, detail=presence.get("detail", "Operation timed out"))
+    if presence.get("error"):
+        raise HTTPException(status_code=500, detail=presence["error"])
+
+    await record_router_availability(db, router_id, True, "pppoe_customer_presence")
+
+    present = bool(presence.get("present_on_router"))
+    online = presence.get("online")
+    secret = presence.get("secret") or {}
+    profile_missing = (
+        presence.get("profile_lookup_success") is True
+        and bool(secret.get("profile"))
+        and presence.get("profile_detail") is None
+    )
+    billing_active = (
+        db_customer["status"] == "active"
+        and not db_customer["is_expired"]
+    )
+
+    if not present:
+        verdict = {
+            "code": "missing_from_mikrotik",
+            "message": "The DB customer has PPPoE credentials, but the PPP secret was not found on the router.",
+            "our_side_confirmed": False,
+        }
+    elif secret.get("disabled"):
+        verdict = {
+            "code": "present_but_disabled",
+            "message": "The PPP secret exists on the router but is disabled.",
+            "our_side_confirmed": False,
+        }
+    elif profile_missing:
+        verdict = {
+            "code": "present_but_profile_missing",
+            "message": "The PPP secret exists, but its referenced PPP profile was not found on the router.",
+            "our_side_confirmed": False,
+        }
+    elif online is True:
+        verdict = {
+            "code": "present_and_online",
+            "message": "The PPP secret exists on the router and the customer has an active PPPoE session.",
+            "our_side_confirmed": True,
+        }
+    elif online is False:
+        verdict = {
+            "code": "router_account_exists_but_customer_offline",
+            "message": "The PPP secret exists and is enabled, but there is no active PPPoE session right now.",
+            "our_side_confirmed": billing_active,
+        }
+    else:
+        verdict = {
+            "code": "present_session_unknown",
+            "message": "The PPP secret exists, but active session lookup did not complete.",
+            "our_side_confirmed": billing_active,
+        }
+
+    response = {
+        "cached": False,
+        "success": True,
+        "generated_at": datetime.utcnow().isoformat(),
+        "customer": db_customer,
+        "router": {
+            "id": router_id,
+            "name": router_name,
+            "ip_address": router_info["ip"],
+            "port": router_info["port"],
+        },
+        "lookup": {
+            "source": "customers.pppoe_username",
+            "value": row["pppoe_username"],
+        },
+        "billing_active": billing_active,
+        "mikrotik": presence,
+        "verdict": verdict,
+    }
+
+    _pppoe_presence_cache[cache_key] = {
+        "data": response,
+        "timestamp": datetime.utcnow(),
+    }
+    _prune_pppoe_presence_cache(datetime.utcnow())
+
+    return response
+
 
 @router.get("/api/pppoe/{router_id}/overview")
 async def pppoe_overview(

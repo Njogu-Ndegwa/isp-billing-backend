@@ -2366,7 +2366,18 @@ class MikroTikAPI:
         if not self.connected:
             return {"error": "Not connected"}
         try:
-            result = self.send_command("/ppp/profile/print")
+            result = self.send_command_optimized(
+                "/ppp/profile/print",
+                proplist=[
+                    "name",
+                    "local-address",
+                    "remote-address",
+                    "rate-limit",
+                    "dns-server",
+                    "change-tcp-mss",
+                ],
+                query=f"?name={profile_name}",
+            )
             if not result.get("success"):
                 return result
 
@@ -2739,6 +2750,84 @@ class MikroTikAPI:
             return {"success": True, "data": sessions, "count": len(sessions)}
         except Exception as e:
             logger.error(f"Error getting PPPoE sessions with bandwidth: {e}")
+            return {"error": str(e)}
+
+    def get_pppoe_session_with_bandwidth(self, username: str) -> Dict[str, Any]:
+        """Get one active PPPoE session, enriched with its dynamic queue if present."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            active = self.send_command_optimized(
+                "/ppp/active/print",
+                proplist=[
+                    ".id",
+                    "name",
+                    "service",
+                    "caller-id",
+                    "address",
+                    "uptime",
+                    "encoding",
+                    "session-id",
+                ],
+                query=f"?name={username}",
+            )
+            if not active.get("success"):
+                return active
+
+            session = next(
+                (s for s in active.get("data", []) if s.get("name") == username),
+                None,
+            )
+            if not session:
+                return {"success": True, "found": False, "data": None}
+
+            queue_result = self.send_command_optimized(
+                "/queue/simple/print",
+                proplist=[".id", "name", "target", "max-limit", "rate", "bytes", "dynamic", "disabled"],
+                query=f"?name=<pppoe-{username}>",
+            )
+            q = {}
+            if queue_result.get("success"):
+                q = next(
+                    (
+                        queue
+                        for queue in queue_result.get("data", [])
+                        if queue.get("name") == f"<pppoe-{username}>"
+                    ),
+                    {},
+                )
+
+            bytes_str = q.get("bytes", "0/0")
+            parts = bytes_str.split("/")
+            upload_bytes = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+            download_bytes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+            rate_str = q.get("rate", "0/0")
+            rate_parts = rate_str.split("/")
+            upload_rate = rate_parts[0] if len(rate_parts) > 0 else "0"
+            download_rate = rate_parts[1] if len(rate_parts) > 1 else "0"
+
+            return {
+                "success": True,
+                "found": True,
+                "data": {
+                    "user": username,
+                    "service": session.get("service", ""),
+                    "caller_id": session.get("caller-id", ""),
+                    "address": session.get("address", ""),
+                    "uptime": session.get("uptime", ""),
+                    "encoding": session.get("encoding", ""),
+                    "session_id": session.get("session-id", ""),
+                    "upload_bytes": upload_bytes,
+                    "download_bytes": download_bytes,
+                    "upload_rate": upload_rate,
+                    "download_rate": download_rate,
+                    "max_limit": q.get("max-limit", ""),
+                    "has_queue": bool(q),
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error getting PPPoE session with bandwidth for {username}: {e}")
             return {"error": str(e)}
 
     def get_pppoe_secrets_minimal(self) -> Dict[str, Any]:
@@ -5104,7 +5193,20 @@ class MikroTikAPI:
         if not self.connected:
             return {"error": "Not connected"}
         try:
-            result = self.send_command("/ppp/secret/print")
+            result = self.send_command_optimized(
+                "/ppp/secret/print",
+                proplist=[
+                    "name",
+                    "service",
+                    "profile",
+                    "disabled",
+                    "comment",
+                    "last-logged-out",
+                    "last-disconnect-reason",
+                    "last-caller-id",
+                ],
+                query=f"?name={username}",
+            )
             if not result.get("success"):
                 return result
             for s in result.get("data", []):
