@@ -639,6 +639,7 @@ async def provision_credential(db: AsyncSession, cred: AccessCredential, router:
         "rate_limit": cred.rate_limit or "",
         "comment": comment_for_credential(cred),
     }
+    await db.commit()
     return await asyncio.to_thread(_provision_direct_api_sync, _router_info(router), payload)
 
 
@@ -652,6 +653,7 @@ async def deprovision_credential(db: AsyncSession, cred: AccessCredential, route
         "username": cred.username,
         "bound_mac_address": cred.bound_mac_address,
     }
+    await db.commit()
     return await asyncio.to_thread(_deprovision_direct_api_sync, _router_info(router), payload)
 
 

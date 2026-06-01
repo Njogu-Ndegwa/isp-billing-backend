@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -9,6 +9,7 @@ from app.db.database import get_db
 from app.db.models import Customer
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI
+from app.services.pppoe_provisioning import call_pppoe_remove
 from app.services.router_helpers import get_router_by_id
 from app.services.log_persistence import persist_notable_logs
 from app.services.router_concurrency import run_with_guard
@@ -1032,6 +1033,89 @@ async def pppoe_users(
     }
 
     return response
+
+
+@router.delete("/api/pppoe/{router_id}/users/{username}")
+async def cleanup_pppoe_user(
+    router_id: int,
+    username: str,
+    force: bool = Query(
+        False,
+        description="Allow removal even when the PPPoE username still belongs to a DB customer",
+    ),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Disconnect and remove a PPPoE user from the router.
+
+    Intended for cleaning orphaned router secrets that no longer have a DB
+    customer. If a DB customer still owns the username, the endpoint refuses
+    the cleanup unless ``force=true`` is supplied.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+
+    stmt = (
+        select(Customer)
+        .options(selectinload(Customer.plan))
+        .where(
+            Customer.router_id == router_id,
+            Customer.pppoe_username == username,
+        )
+    )
+    result = await db.execute(stmt)
+    customer = result.scalars().first()
+
+    if customer and not force:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "PPPoE username still belongs to a customer. "
+                    "Delete/deactivate the customer, or retry with force=true."
+                ),
+                "customer": {
+                    "id": customer.id,
+                    "name": customer.name,
+                    "phone": customer.phone,
+                    "status": customer.status.value if customer.status else "unknown",
+                    "plan": customer.plan.name if customer.plan else None,
+                    "expiry": customer.expiry.isoformat() if customer.expiry else None,
+                },
+            },
+        )
+
+    payload = {
+        "pppoe_username": username,
+        "router_ip": router_obj.ip_address,
+        "router_username": router_obj.username,
+        "router_password": router_obj.password,
+        "router_port": router_obj.port,
+    }
+
+    await db.commit()
+    cleanup_result = await call_pppoe_remove(payload)
+
+    if not cleanup_result or cleanup_result.get("error"):
+        await record_router_availability(db, router_id, False, "pppoe_cleanup_user")
+        error = cleanup_result.get("error") if cleanup_result else "Unknown cleanup error"
+        status_code = 503 if "connect" in error.lower() else 502
+        raise HTTPException(status_code=status_code, detail=f"Failed to cleanup PPPoE user: {error}")
+
+    await record_router_availability(db, router_id, True, "pppoe_cleanup_user")
+    _pppoe_users_cache.pop(router_id, None)
+
+    return {
+        "success": True,
+        "router_id": router_id,
+        "router_name": router_obj.name,
+        "username": username,
+        "customer_present": customer is not None,
+        "forced": bool(force),
+        "cleanup": cleanup_result,
+    }
 
 
 @router.get("/api/pppoe/{router_id}/client-details/{username}")

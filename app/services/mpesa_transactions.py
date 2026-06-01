@@ -509,6 +509,7 @@ async def _handle_successful_reconciliation(
             )
 
     if pppoe_payload:
+        await db.commit()
         await call_pppoe_provision(pppoe_payload)
 
     if hotspot_payload and hotspot_context:

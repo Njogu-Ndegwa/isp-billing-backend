@@ -314,6 +314,7 @@ async def update_credential(
             payload_out["provisioned"] = True
         # If a MAC is currently bound, refresh its queue too
         if cred.bound_mac_address and not prov.get("error"):
+            await db.commit()
             await bind_mac_for_login(cred, router_obj, cred.bound_mac_address)
 
     return payload_out
@@ -451,6 +452,7 @@ async def sync_credential(
     # If a MAC is currently bound, refresh its binding/queue too so the user
     # sees the new password / rate-limit immediately without re-login.
     if not prov.get("error") and cred.bound_mac_address:
+        await db.commit()
         bind_result = await bind_mac_for_login(cred, router_obj, cred.bound_mac_address)
         if bind_result.get("error"):
             logger.warning(

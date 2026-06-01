@@ -401,6 +401,7 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                 if customer.pppoe_username and customer.router:
                     pppoe_payload = build_pppoe_payload(customer, customer.router)
                     logger.info(f"Prepared PPPoE Payload for customer {customer.id} -> Router: {customer.router.ip_address}")
+                    await db.commit()
                     background_tasks.add_task(call_pppoe_provision, pppoe_payload)
                 else:
                     logger.error(
@@ -1716,5 +1717,4 @@ async def get_failed_mpesa_transactions(
     except Exception as e:
         logger.error(f"Error fetching failed transactions: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch failed transactions: {str(e)}")
-
 

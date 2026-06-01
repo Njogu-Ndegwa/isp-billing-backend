@@ -307,7 +307,12 @@ async def delete_customer(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Delete a customer and all related data. Removes PPPoE secret from router if active."""
+    """Delete a customer and all related data.
+
+    PPPoE customers must be removed from the router before the DB row is
+    deleted. If RouterOS cleanup fails, the customer is kept so the cleanup can
+    be retried instead of leaving an orphaned online secret.
+    """
     try:
         user = await get_current_user(token, db)
         enforce_active_subscription(user)
@@ -325,15 +330,33 @@ async def delete_customer(
         customer_name = customer.name
         deprovision_result = None
 
-        if customer.status == CustomerStatus.ACTIVE and customer.pppoe_username and customer.router:
-            try:
-                payload = build_pppoe_remove_payload(customer, customer.router)
-                await db.commit()
-                remove_result = await call_pppoe_remove(payload)
-                deprovision_result = "ok" if remove_result and remove_result.get("success") else "failed"
-            except Exception as e:
-                logger.warning(f"Failed to remove PPPoE secret for customer {customer_id} during delete: {e}")
-                deprovision_result = "failed"
+        if customer.pppoe_username:
+            if not customer.router:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Cannot delete PPPoE customer before router cleanup because "
+                        "the customer has no router assigned. Cleanup the router "
+                        "secret first or restore the router assignment."
+                    ),
+                )
+
+            payload = build_pppoe_remove_payload(customer, customer.router)
+            await db.commit()
+            remove_result = await call_pppoe_remove(payload)
+            if not remove_result or remove_result.get("error"):
+                error = remove_result.get("error") if remove_result else "Unknown PPPoE cleanup error"
+                logger.warning(
+                    "Refusing to delete customer %s because PPPoE cleanup failed: %s",
+                    customer_id,
+                    error,
+                )
+                status_code = 503 if "connect" in error.lower() else 502
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"Failed to remove PPPoE user from MikroTik; customer was not deleted: {error}",
+                )
+            deprovision_result = "ok"
 
         # -----------------------------------------------------------------
         # Snapshot the customer name into every payment row BEFORE we null

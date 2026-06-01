@@ -172,7 +172,19 @@ def _remove_pppoe_sync(payload: dict) -> dict:
 
     try:
         disconnect_result = api.disconnect_pppoe_session(pppoe_username)
+        if disconnect_result.get("error"):
+            return {
+                "error": f"Session disconnect failed: {disconnect_result['error']}",
+                "disconnect_result": disconnect_result,
+            }
+
         remove_result = api.remove_pppoe_secret(pppoe_username)
+        if remove_result.get("error"):
+            return {
+                "error": f"Secret removal failed: {remove_result['error']}",
+                "disconnect_result": disconnect_result,
+                "remove_result": remove_result,
+            }
 
         logger.info(
             f"[PPPoE] Removed {pppoe_username}: "
