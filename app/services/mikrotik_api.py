@@ -27,6 +27,11 @@ DUAL_HOTSPOT_PROFILE_NAME = "hsprof-dual"
 DUAL_HOTSPOT_SERVER_NAME = "hotspot-dual"
 DUAL_HOTSPOT_NAT_COMMENT = "NAT for dual hotspot clients"
 
+DEFAULT_PPPOE_KEEPALIVE_TIMEOUT = "10"
+DEFAULT_PPPOE_ONE_SESSION_PER_HOST = "yes"
+DEFAULT_PPPOE_PROFILE_ONLY_ONE = "yes"
+DEFAULT_HOTSPOT_KEEPALIVE_TIMEOUT = "2m"
+
 
 def _router_error_is_duplicate(error: str) -> bool:
     """Return True when RouterOS is reporting an idempotent duplicate/existing object."""
@@ -2299,6 +2304,7 @@ class MikroTikAPI:
         pool_name: str = "",
         dns_server: str = "",
         change_tcp_mss: str = "",
+        only_one: str = DEFAULT_PPPOE_PROFILE_ONLY_ONE,
     ) -> Dict[str, Any]:
         """
         Ensure a PPPoE profile exists with the specified rate limit.
@@ -2335,6 +2341,8 @@ class MikroTikAPI:
                 profile_args["dns-server"] = dns_server
             if change_tcp_mss:
                 profile_args["change-tcp-mss"] = change_tcp_mss
+            if only_one:
+                profile_args["only-one"] = only_one
 
             if profile_exists:
                 profile_args["numbers"] = profile_id
@@ -2375,6 +2383,7 @@ class MikroTikAPI:
                     "rate-limit",
                     "dns-server",
                     "change-tcp-mss",
+                    "only-one",
                 ],
                 query=f"?name={profile_name}",
             )
@@ -2392,6 +2401,7 @@ class MikroTikAPI:
                             "remote_address": profile.get("remote-address", ""),
                             "dns_server": profile.get("dns-server", ""),
                             "change_tcp_mss": profile.get("change-tcp-mss", ""),
+                            "only_one": profile.get("only-one", ""),
                             "rate_limit": profile.get("rate-limit", ""),
                         },
                     }
@@ -3412,6 +3422,8 @@ class MikroTikAPI:
         profile_name: str = "default-pppoe",
         service_name_prefix: str = "pppoe-server",
         verify: bool = True,
+        keepalive_timeout: str = DEFAULT_PPPOE_KEEPALIVE_TIMEOUT,
+        one_session_per_host: str = DEFAULT_PPPOE_ONE_SESSION_PER_HOST,
     ) -> Dict[str, Any]:
         """Ensure a PPPoE server exists and is enabled on a specific interface."""
         if not self.connected:
@@ -3420,7 +3432,15 @@ class MikroTikAPI:
             desired_service_name = f"{service_name_prefix}-{interface}".replace("/", "-")
             servers = self.send_command_optimized(
                 "/interface/pppoe-server/server/print",
-                proplist=[".id", "interface", "disabled", "service-name", "default-profile"],
+                proplist=[
+                    ".id",
+                    "interface",
+                    "disabled",
+                    "service-name",
+                    "default-profile",
+                    "keepalive-timeout",
+                    "one-session-per-host",
+                ],
                 query=f"?interface={interface}",
             )
             if servers.get("error"):
@@ -3437,13 +3457,19 @@ class MikroTikAPI:
                 if not server_id:
                     return {"error": f"PPPoE server on {interface} has no identifier"}
 
-                result = self.send_command("/interface/pppoe-server/server/set", {
+                server_args = {
                     "numbers": server_id,
                     "service-name": desired_service_name,
                     "interface": interface,
                     "default-profile": profile_name,
                     "disabled": "no",
-                })
+                }
+                if keepalive_timeout:
+                    server_args["keepalive-timeout"] = keepalive_timeout
+                if one_session_per_host:
+                    server_args["one-session-per-host"] = one_session_per_host
+
+                result = self.send_command("/interface/pppoe-server/server/set", server_args)
                 if result.get("error"):
                     return {"error": f"Failed to update PPPoE server on {interface}: {result['error']}"}
 
@@ -3476,12 +3502,18 @@ class MikroTikAPI:
 
                 return {"success": True, "action": "updated", "interface": interface}
 
-            result = self.send_command("/interface/pppoe-server/server/add", {
+            server_args = {
                 "service-name": desired_service_name,
                 "interface": interface,
                 "default-profile": profile_name,
                 "disabled": "no",
-            })
+            }
+            if keepalive_timeout:
+                server_args["keepalive-timeout"] = keepalive_timeout
+            if one_session_per_host:
+                server_args["one-session-per-host"] = one_session_per_host
+
+            result = self.send_command("/interface/pppoe-server/server/add", server_args)
             if result.get("error"):
                 return {"error": f"Failed to create PPPoE server on {interface}: {result['error']}"}
 
@@ -3730,6 +3762,7 @@ class MikroTikAPI:
         profile_name: str,
         address_pool: str,
         verify: bool = True,
+        keepalive_timeout: str = DEFAULT_HOTSPOT_KEEPALIVE_TIMEOUT,
     ) -> Dict[str, Any]:
         """Ensure a hotspot server exists and is enabled on the requested interface."""
         if not self.connected:
@@ -3750,14 +3783,18 @@ class MikroTikAPI:
                 if not server_id:
                     return {"error": f"Hotspot server '{server_name}' has no identifier"}
 
-                update = self.send_command("/ip/hotspot/set", {
+                server_args = {
                     "numbers": server_id,
                     "name": server_name,
                     "interface": interface,
                     "address-pool": address_pool,
                     "profile": profile_name,
                     "disabled": "no",
-                })
+                }
+                if keepalive_timeout:
+                    server_args["keepalive-timeout"] = keepalive_timeout
+
+                update = self.send_command("/ip/hotspot/set", server_args)
                 if update.get("error"):
                     return {"error": f"Failed to update hotspot server '{server_name}': {update['error']}"}
 
@@ -3772,13 +3809,17 @@ class MikroTikAPI:
                                 duplicate_remove["error"],
                             )
             else:
-                create = self.send_command("/ip/hotspot/add", {
+                server_args = {
                     "name": server_name,
                     "interface": interface,
                     "address-pool": address_pool,
                     "profile": profile_name,
                     "disabled": "no",
-                })
+                }
+                if keepalive_timeout:
+                    server_args["keepalive-timeout"] = keepalive_timeout
+
+                create = self.send_command("/ip/hotspot/add", server_args)
                 if create.get("error"):
                     return {"error": f"Failed to create hotspot server '{server_name}': {create['error']}"}
 
@@ -3797,6 +3838,219 @@ class MikroTikAPI:
         except Exception as e:
             logger.error("Error ensuring hotspot server %s on %s: %s", server_name, interface, e)
             return {"error": str(e)}
+
+    def apply_pppoe_reconnect_defaults(
+        self,
+        keepalive_timeout: str = DEFAULT_PPPOE_KEEPALIVE_TIMEOUT,
+        one_session_per_host: str = DEFAULT_PPPOE_ONE_SESSION_PER_HOST,
+        only_one: str = DEFAULT_PPPOE_PROFILE_ONLY_ONE,
+    ) -> Dict[str, Any]:
+        """Apply PPPoE reconnect-safe defaults to existing servers/profiles."""
+        if not self.connected:
+            return {"error": "Not connected"}
+
+        warnings = []
+        updated_servers = []
+        updated_profiles = []
+        profile_names: set[str] = set()
+
+        try:
+            servers = self.send_command_optimized(
+                "/interface/pppoe-server/server/print",
+                proplist=[
+                    ".id",
+                    "interface",
+                    "service-name",
+                    "default-profile",
+                    "disabled",
+                    "keepalive-timeout",
+                    "one-session-per-host",
+                ],
+            )
+            if not servers.get("success"):
+                return {"error": servers.get("error", "Could not read PPPoE servers")}
+
+            for server in servers.get("data", []):
+                server_id = server.get(".id")
+                interface = server.get("interface", "")
+                if not server_id:
+                    warnings.append(f"PPPoE server on {interface or '(unknown)'} has no identifier")
+                    continue
+
+                args = {"numbers": server_id}
+                if keepalive_timeout:
+                    args["keepalive-timeout"] = keepalive_timeout
+                if one_session_per_host:
+                    args["one-session-per-host"] = one_session_per_host
+
+                result = self.send_command("/interface/pppoe-server/server/set", args)
+                if result.get("error"):
+                    warnings.append(
+                        f"PPPoE server {interface or server_id}: {result['error']}"
+                    )
+                else:
+                    updated_servers.append({
+                        "id": server_id,
+                        "interface": interface,
+                        "service_name": server.get("service-name", ""),
+                        "keepalive_timeout": keepalive_timeout,
+                        "one_session_per_host": one_session_per_host,
+                    })
+
+                default_profile = server.get("default-profile", "")
+                if default_profile and (
+                    default_profile == "default-pppoe"
+                    or default_profile.startswith("pppoe")
+                ):
+                    profile_names.add(default_profile)
+
+            secrets = self.send_command_optimized(
+                "/ppp/secret/print",
+                proplist=["name", "service", "profile"],
+            )
+            if secrets.get("success"):
+                for secret in secrets.get("data", []):
+                    service = (secret.get("service") or "").lower()
+                    profile = secret.get("profile", "")
+                    if profile and service in {"pppoe", "any", ""}:
+                        profile_names.add(profile)
+            else:
+                warnings.append(
+                    f"Could not read PPP secrets for profile defaults: "
+                    f"{secrets.get('error', 'unknown error')}"
+                )
+
+            for profile_name in sorted(profile_names):
+                profile = self.send_command_optimized(
+                    "/ppp/profile/print",
+                    proplist=[".id", "name", "only-one"],
+                    query=f"?name={profile_name}",
+                )
+                if not profile.get("success"):
+                    warnings.append(
+                        f"PPP profile {profile_name}: {profile.get('error', 'lookup failed')}"
+                    )
+                    continue
+
+                matches = [
+                    item for item in profile.get("data", [])
+                    if item.get("name") == profile_name
+                ]
+                if not matches:
+                    warnings.append(f"PPP profile {profile_name}: not found")
+                    continue
+
+                profile_id = matches[0].get(".id")
+                if not profile_id:
+                    warnings.append(f"PPP profile {profile_name}: no identifier")
+                    continue
+
+                result = self.send_command(
+                    "/ppp/profile/set",
+                    {"numbers": profile_id, "only-one": only_one},
+                )
+                if result.get("error"):
+                    warnings.append(f"PPP profile {profile_name}: {result['error']}")
+                else:
+                    updated_profiles.append({
+                        "name": profile_name,
+                        "only_one": only_one,
+                    })
+
+            return {
+                "success": True,
+                "servers_updated": len(updated_servers),
+                "profiles_updated": len(updated_profiles),
+                "servers": updated_servers,
+                "profiles": updated_profiles,
+                "warnings": warnings,
+            }
+        except Exception as e:
+            logger.error("Error applying PPPoE reconnect defaults: %s", e)
+            return {"error": str(e)}
+
+    def apply_hotspot_reconnect_defaults(
+        self,
+        keepalive_timeout: str = DEFAULT_HOTSPOT_KEEPALIVE_TIMEOUT,
+    ) -> Dict[str, Any]:
+        """Apply hotspot server keepalive defaults to existing hotspot servers."""
+        if not self.connected:
+            return {"error": "Not connected"}
+
+        warnings = []
+        updated_servers = []
+        try:
+            servers = self.send_command_optimized(
+                "/ip/hotspot/print",
+                proplist=[
+                    ".id",
+                    "name",
+                    "interface",
+                    "disabled",
+                    "keepalive-timeout",
+                ],
+            )
+            if not servers.get("success"):
+                return {"error": servers.get("error", "Could not read hotspot servers")}
+
+            for server in servers.get("data", []):
+                server_id = server.get(".id")
+                name = server.get("name", "")
+                if not server_id:
+                    warnings.append(f"Hotspot server {name or '(unknown)'} has no identifier")
+                    continue
+
+                result = self.send_command(
+                    "/ip/hotspot/set",
+                    {
+                        "numbers": server_id,
+                        "keepalive-timeout": keepalive_timeout,
+                    },
+                )
+                if result.get("error"):
+                    warnings.append(f"Hotspot server {name or server_id}: {result['error']}")
+                else:
+                    updated_servers.append({
+                        "id": server_id,
+                        "name": name,
+                        "interface": server.get("interface", ""),
+                        "keepalive_timeout": keepalive_timeout,
+                    })
+
+            return {
+                "success": True,
+                "servers_updated": len(updated_servers),
+                "servers": updated_servers,
+                "warnings": warnings,
+            }
+        except Exception as e:
+            logger.error("Error applying hotspot reconnect defaults: %s", e)
+            return {"error": str(e)}
+
+    def apply_access_reconnect_defaults(
+        self,
+        include_pppoe: bool = True,
+        include_hotspot: bool = True,
+    ) -> Dict[str, Any]:
+        """Apply reconnect-safe defaults for subscriber access services."""
+        if not self.connected:
+            return {"error": "Not connected"}
+
+        result = {"success": True}
+
+        if include_pppoe:
+            pppoe = self.apply_pppoe_reconnect_defaults()
+            result["pppoe"] = pppoe
+            if pppoe.get("error"):
+                result["success"] = False
+
+        if include_hotspot:
+            hotspot = self.apply_hotspot_reconnect_defaults()
+            result["hotspot"] = hotspot
+            if hotspot.get("error"):
+                result["success"] = False
+
+        return result
 
     def remove_pppoe_servers(self, interfaces: Optional[List[str]] = None) -> Dict[str, Any]:
         """Remove PPPoE server entries, optionally filtering by interface."""
@@ -5164,6 +5418,8 @@ class MikroTikAPI:
                     "interface",
                     "disabled",
                     "default-profile",
+                    "keepalive-timeout",
+                    "one-session-per-host",
                     "max-sessions",
                     "max-mtu",
                     "max-mru",
@@ -5179,6 +5435,8 @@ class MikroTikAPI:
                     "interface": s.get("interface", ""),
                     "disabled": s.get("disabled") == "true",
                     "default_profile": s.get("default-profile", ""),
+                    "keepalive_timeout": s.get("keepalive-timeout", ""),
+                    "one_session_per_host": s.get("one-session-per-host", ""),
                     "max_sessions": self._safe_int(s.get("max-sessions")),
                     "max_mtu": self._safe_int(s.get("max-mtu")),
                     "max_mru": self._safe_int(s.get("max-mru")),
@@ -5246,6 +5504,7 @@ class MikroTikAPI:
                     "remote_address": p.get("remote-address", ""),
                     "rate_limit": p.get("rate-limit", ""),
                     "dns_server": p.get("dns-server", ""),
+                    "only_one": p.get("only-one", ""),
                 })
             return {"success": True, "data": profiles}
         except Exception as e:
@@ -5295,6 +5554,7 @@ class MikroTikAPI:
                     "disabled": s.get("disabled") == "true",
                     "profile": s.get("profile", ""),
                     "address_pool": s.get("address-pool", ""),
+                    "keepalive_timeout": s.get("keepalive-timeout", ""),
                     "idle_timeout": s.get("idle-timeout", ""),
                     "addresses_per_mac": s.get("addresses-per-mac", ""),
                 })

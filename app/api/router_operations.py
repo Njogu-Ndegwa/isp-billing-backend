@@ -13,6 +13,7 @@ from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normali
 from app.services.router_helpers import get_router_by_id, get_router_by_identity, connect_to_router
 from app.core.protected_devices import is_protected_device
 from app.services.router_availability import record_router_availability
+from app.services.router_concurrency import run_with_guard
 from app.config import settings
 
 import logging
@@ -2657,6 +2658,103 @@ async def get_router_interfaces(
         "pppoe_ports": router_obj.pppoe_ports or [],
         "plain_ports": router_obj.plain_ports or [],
         "dual_ports": router_obj.dual_ports or [],
+    }
+
+
+class ApplyAccessDefaultsRequest(BaseModel):
+    pppoe: bool = True
+    hotspot: bool = True
+
+
+def _apply_access_defaults_sync(
+    router_info: dict,
+    include_pppoe: bool = True,
+    include_hotspot: bool = True,
+) -> dict:
+    """Apply reconnect-safe defaults to existing access services on one router."""
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=20,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {
+            "error": "connect_failed",
+            "message": api.last_connect_error or "Failed to connect to router",
+        }
+    try:
+        return api.apply_access_reconnect_defaults(
+            include_pppoe=include_pppoe,
+            include_hotspot=include_hotspot,
+        )
+    finally:
+        api.disconnect()
+
+
+@router.post("/api/routers/{router_id}/apply-access-defaults")
+async def apply_access_defaults(
+    router_id: int,
+    request: Optional[ApplyAccessDefaultsRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Apply safe PPPoE/hotspot reconnect defaults without changing ports/users."""
+    request = request or ApplyAccessDefaultsRequest()
+    if not request.pppoe and not request.hotspot:
+        raise HTTPException(status_code=400, detail="At least one of pppoe or hotspot must be true")
+
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    await db.commit()
+
+    result = await run_with_guard(
+        router_id,
+        _apply_access_defaults_sync,
+        router_info,
+        request.pppoe,
+        request.hotspot,
+        timeout_seconds=35,
+    )
+
+    if result.get("error") == "busy":
+        raise HTTPException(status_code=429, detail=result.get("detail", "Router operation slots are busy"))
+    if result.get("error") == "timeout":
+        await record_router_availability(db, router_id, False, "apply_access_defaults")
+        raise HTTPException(status_code=504, detail=result.get("detail", "Router operation timed out"))
+    if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "apply_access_defaults")
+        raise HTTPException(
+            status_code=503,
+            detail=result.get("message", f"Failed to connect to router: {router_obj.name}"),
+        )
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    await record_router_availability(db, router_id, True, "apply_access_defaults")
+    _port_status_cache.pop(router_id, None)
+
+    return {
+        "success": bool(result.get("success", True)),
+        "router_id": router_id,
+        "router_name": router_obj.name,
+        "applied": {
+            "pppoe": request.pppoe,
+            "hotspot": request.hotspot,
+        },
+        "result": result,
+        "message": "Access defaults applied to router",
     }
 
 
