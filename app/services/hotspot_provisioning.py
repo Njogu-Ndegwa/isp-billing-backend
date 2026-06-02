@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 HOTSPOT_PROVISIONING_TIMEOUT_SECONDS = 75
 HOTSPOT_RETRY_STALE_IN_PROGRESS_SECONDS = 90
 HOTSPOT_RETRY_BATCH_SIZE = 25
+HOTSPOT_RETRY_MAX_CONCURRENT_ROUTER_GROUPS = 4
 HOTSPOT_RETRY_MAX_ATTEMPTS = 5
 HOTSPOT_RETRY_MAX_AGE = timedelta(hours=4)
 HOTSPOT_VERIFY_REFRESH_WINDOW = timedelta(minutes=15)
@@ -772,6 +773,37 @@ async def provision_hotspot_customer(
         return {"success": False, "error": str(exc), "delivery": None}
 
 
+async def _process_hotspot_retry_router_groups(router_groups: dict[str, list]) -> None:
+    retry_group_sem = asyncio.Semaphore(HOTSPOT_RETRY_MAX_CONCURRENT_ROUTER_GROUPS)
+
+    async def _process_router_group(items):
+        async with retry_group_sem:
+            for attempt, customer, plan, router, verify_only in items:
+                hotspot_payload = build_hotspot_payload(
+                    customer,
+                    plan,
+                    router,
+                    comment=(
+                        f"Verify direct hotspot delivery for {customer.name}"
+                        if verify_only
+                        else f"Retry provisioning for {customer.name}"
+                    ),
+                )
+                await provision_hotspot_customer(
+                    customer_id=customer.id,
+                    router_id=router.id,
+                    hotspot_payload=hotspot_payload,
+                    action="hotspot_retry_verify" if verify_only else "hotspot_retry",
+                    attempt_id=attempt.id,
+                    verify_only=verify_only,
+                )
+
+    await asyncio.gather(
+        *[_process_router_group(items) for items in router_groups.values()],
+        return_exceptions=True,
+    )
+
+
 async def retry_pending_hotspot_provisioning_background():
     """
     Retry or verify direct API hotspot delivery using provisioning attempts.
@@ -933,31 +965,7 @@ async def retry_pending_hotspot_provisioning_background():
                 rk = f"{_router.ip_address}:{_router.port}"
                 router_groups[rk].append(item)
 
-        async def _process_router_group(items):
-            for attempt, customer, plan, router, verify_only in items:
-                hotspot_payload = build_hotspot_payload(
-                    customer,
-                    plan,
-                    router,
-                    comment=(
-                        f"Verify direct hotspot delivery for {customer.name}"
-                        if verify_only
-                        else f"Retry provisioning for {customer.name}"
-                    ),
-                )
-                await provision_hotspot_customer(
-                    customer_id=customer.id,
-                    router_id=router.id,
-                    hotspot_payload=hotspot_payload,
-                    action="hotspot_retry_verify" if verify_only else "hotspot_retry",
-                    attempt_id=attempt.id,
-                    verify_only=verify_only,
-                )
-
-        await asyncio.gather(
-            *[_process_router_group(items) for items in router_groups.values()],
-            return_exceptions=True,
-        )
+        await _process_hotspot_retry_router_groups(router_groups)
 
     except Exception as exc:
         logger.error("[PROVISION-RETRY] Background retry job failed: %s", exc)

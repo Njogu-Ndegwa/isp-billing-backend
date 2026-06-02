@@ -648,8 +648,10 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
         await db.commit()
 
         # Payment callbacks can activate a MAC while this cleanup run is still
-        # working, so every candidate is re-checked before removal.
-        async def _bypass_task(r):
+        # working. Scan routers first, then re-check all candidate MACs with a
+        # single DB session before any removal, avoiding one checkout per
+        # concurrent router task.
+        async def _find_candidates_task(r):
             rk = f"{r.ip_address}:{r.port}"
             ri = {
                 "ip": r.ip_address, "username": r.username,
@@ -661,21 +663,53 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
                     ri,
                     active_macs,
                 )
-                confirmed_orphans = await _filter_current_orphan_bypass_macs(candidates)
-                return await asyncio.to_thread(
-                    _remove_router_bindings_sync,
-                    ri,
-                    confirmed_orphans,
-                )
+                return {
+                    "router_key": rk,
+                    "router_info": ri,
+                    "candidates": {normalize_mac_address(mac) for mac in candidates if mac},
+                }
 
         eligible = [r for r in routers if getattr(r, "auth_method", None) != "RADIUS"]
-        outcomes = await asyncio.gather(
-            *[_bypass_task(r) for r in eligible],
+        candidate_outcomes = await asyncio.gather(
+            *[_find_candidates_task(r) for r in eligible],
             return_exceptions=True,
         )
-        for i, outcome in enumerate(outcomes):
+        candidate_groups = []
+        all_candidates: set[str] = set()
+        for i, outcome in enumerate(candidate_outcomes):
             if isinstance(outcome, Exception):
-                logger.error(f"[SAFETY-NET] Error processing router {eligible[i].name}: {outcome}")
+                logger.error(f"[SAFETY-NET] Error scanning router {eligible[i].name}: {outcome}")
+                continue
+            candidates = outcome.get("candidates", set())
+            if candidates:
+                candidate_groups.append(outcome)
+                all_candidates.update(candidates)
+
+        if not all_candidates:
+            return 0
+
+        confirmed_orphans = await _filter_current_orphan_bypass_macs(all_candidates)
+        if not confirmed_orphans:
+            return 0
+
+        async def _remove_task(group: dict):
+            to_remove = group["candidates"] & confirmed_orphans
+            if not to_remove:
+                return 0
+            async with router_locks.acquire(group["router_key"]):
+                return await asyncio.to_thread(
+                    _remove_router_bindings_sync,
+                    group["router_info"],
+                    to_remove,
+                )
+
+        removal_outcomes = await asyncio.gather(
+            *[_remove_task(group) for group in candidate_groups],
+            return_exceptions=True,
+        )
+        for i, outcome in enumerate(removal_outcomes):
+            if isinstance(outcome, Exception):
+                logger.error(f"[SAFETY-NET] Error removing bindings on router {candidate_groups[i]['router_info']['name']}: {outcome}")
             else:
                 total_removed += outcome
     except Exception as e:
@@ -1858,6 +1892,17 @@ async def collect_bandwidth_snapshot():
 
             for router in routers:
                 if getattr(router, 'auth_method', None) == 'RADIUS':
+                    continue
+                if (
+                    getattr(router, "last_status", None) is False
+                    and getattr(router, "last_checked_at", None)
+                    and (now - router.last_checked_at) < timedelta(minutes=5)
+                ):
+                    logger.debug(
+                        "[BANDWIDTH] Skipping recently-offline router %s (%s)",
+                        router.id,
+                        router.ip_address,
+                    )
                     continue
                 try:
                     router_info = {

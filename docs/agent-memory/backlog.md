@@ -23,7 +23,7 @@ Project-level items that should survive across agent sessions.
 - Status: started
 - Problem: production pool exhaustion was hard to attribute quickly.
 - Why it matters: future incidents need router ID, endpoint, background job, DB pool status, and router-call duration in one trail.
-- Done so far: backend exposes `GET /api/admin/db-pool` for live SQLAlchemy pool counters and a small Postgres `pg_stat_activity` summary.
+- Done so far: backend exposes `GET /api/admin/db-pool` for live SQLAlchemy pool counters, observed checkout peaks, recent 5-minute peak pressure, and an optional Postgres `pg_stat_activity` summary.
 - Proposed next step: add structured logs and lightweight metrics for request duration, background job duration, and MikroTik call duration by router ID.
 
 ### RADIUS Expansion

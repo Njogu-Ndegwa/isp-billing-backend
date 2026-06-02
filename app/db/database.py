@@ -1,3 +1,8 @@
+from collections import deque
+from datetime import datetime, timedelta
+from threading import Lock
+
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import NullPool
@@ -35,6 +40,58 @@ else:
 async_engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 
 
+_POOL_PRESSURE_HISTORY_MAX = 200
+_POOL_RECENT_WINDOW = timedelta(minutes=5)
+_pool_pressure_lock = Lock()
+_pool_pressure_history = deque(maxlen=_POOL_PRESSURE_HISTORY_MAX)
+_pool_pressure_peak = {
+    "checked_out": None,
+    "observed_at": None,
+}
+
+
+def _pool_counter(pool, method_name: str):
+    method = getattr(pool, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        return method()
+    except Exception:
+        return None
+
+
+def _record_pool_pressure(event_name: str) -> None:
+    pool = async_engine.sync_engine.pool
+    checked_out = _pool_counter(pool, "checkedout")
+    if not isinstance(checked_out, int):
+        return
+
+    sample = {
+        "event": event_name,
+        "checked_out": checked_out,
+        "checked_in": _pool_counter(pool, "checkedin"),
+        "overflow": _pool_counter(pool, "overflow"),
+        "observed_at": datetime.utcnow(),
+    }
+
+    with _pool_pressure_lock:
+        _pool_pressure_history.append(sample)
+        peak_checked_out = _pool_pressure_peak.get("checked_out")
+        if not isinstance(peak_checked_out, int) or checked_out > peak_checked_out:
+            _pool_pressure_peak["checked_out"] = checked_out
+            _pool_pressure_peak["observed_at"] = sample["observed_at"]
+
+
+@event.listens_for(async_engine.sync_engine.pool, "checkout")
+def _track_pool_checkout(dbapi_connection, connection_record, connection_proxy):
+    _record_pool_pressure("checkout")
+
+
+@event.listens_for(async_engine.sync_engine.pool, "checkin")
+def _track_pool_checkin(dbapi_connection, connection_record):
+    _record_pool_pressure("checkin")
+
+
 def db_pool_status() -> str:
     pool = async_engine.sync_engine.pool
     status = getattr(pool, "status", None)
@@ -52,6 +109,7 @@ def _classify_db_pool_pressure(snapshot: dict) -> dict:
     checkout_headroom = snapshot.get("checkout_headroom")
     overflow = snapshot.get("overflow")
     max_connections = snapshot.get("configured_max_app_connections")
+    recent_peak = snapshot.get("recent_peak_5m_checked_out")
 
     if isinstance(checked_out, int) and isinstance(max_connections, int) and checked_out >= max_connections:
         patterns.append("pool_exhausted")
@@ -59,6 +117,11 @@ def _classify_db_pool_pressure(snapshot: dict) -> dict:
     elif checkout_headroom == 0:
         patterns.append("pool_exhausted")
         level = "critical"
+
+    if isinstance(recent_peak, int) and isinstance(max_connections, int) and recent_peak >= max_connections:
+        patterns.append("recent_pool_exhaustion_peak")
+        if level == "healthy":
+            level = "warning"
 
     if isinstance(checked_out_percent, (int, float)):
         if checked_out_percent >= 85:
@@ -96,6 +159,8 @@ def _classify_db_pool_pressure(snapshot: dict) -> dict:
         "read": (
             "Pool is exhausted or close to exhaustion."
             if level == "critical"
+            else "Pool looks better now, but a recent sample hit exhaustion."
+            if "recent_pool_exhaustion_peak" in patterns
             else "Pool pressure is elevated; watch for sustained growth."
             if level == "warning"
             else "Pool pressure is rising but still has room."
@@ -140,6 +205,32 @@ def db_pool_snapshot() -> dict:
     checked_in = snapshot.get("checked_in")
     if isinstance(checked_in, int) and isinstance(checked_out, int):
         snapshot["open_connections_estimate"] = checked_in + checked_out
+
+    now = datetime.utcnow()
+    with _pool_pressure_lock:
+        peak_checked_out = _pool_pressure_peak.get("checked_out")
+        peak_observed_at = _pool_pressure_peak.get("observed_at")
+        recent_samples = [
+            sample for sample in _pool_pressure_history
+            if now - sample["observed_at"] <= _POOL_RECENT_WINDOW
+        ]
+
+    if isinstance(peak_checked_out, int):
+        snapshot["observed_peak_checked_out"] = peak_checked_out
+        snapshot["observed_peak_checked_out_percent"] = (
+            round((peak_checked_out / max_connections) * 100, 2)
+            if max_connections else None
+        )
+        snapshot["observed_peak_at"] = peak_observed_at.isoformat() if peak_observed_at else None
+
+    if recent_samples:
+        recent_peak = max(sample["checked_out"] for sample in recent_samples)
+        snapshot["recent_peak_5m_checked_out"] = recent_peak
+        snapshot["recent_peak_5m_checked_out_percent"] = (
+            round((recent_peak / max_connections) * 100, 2)
+            if max_connections else None
+        )
+        snapshot["recent_samples_5m"] = len(recent_samples)
 
     snapshot["pressure"] = _classify_db_pool_pressure(snapshot)
 
