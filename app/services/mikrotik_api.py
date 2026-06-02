@@ -396,6 +396,76 @@ class MikroTikAPI:
             logger.error(f"Command execution error on {self.host}: {e}")
             return {"error": str(e)}
 
+    def reboot_router(self) -> Dict[str, Any]:
+        """
+        Send /system/reboot and tolerate the expected API socket close.
+
+        RouterOS may close the management connection immediately after accepting
+        the reboot command, before the client reads a final !done sentence. Once
+        the full command sentence has been sent, a closed socket is treated as a
+        successful command dispatch.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+
+        command_sent = False
+        try:
+            self.send_sentence(["/system/reboot"])
+            command_sent = True
+
+            while True:
+                sentence = self.read_sentence()
+                if not sentence:
+                    if not self.connected:
+                        return {
+                            "success": True,
+                            "status": "sent_connection_closed",
+                            "command_sent": True,
+                            "connection_closed": True,
+                            "message": "Reboot command sent; router closed the API connection.",
+                        }
+                    return {
+                        "success": True,
+                        "status": "sent_no_response",
+                        "command_sent": True,
+                        "connection_closed": False,
+                        "message": "Reboot command sent; router did not return a final response.",
+                    }
+
+                if sentence[0] == "!done":
+                    return {
+                        "success": True,
+                        "status": "accepted",
+                        "command_sent": True,
+                        "connection_closed": False,
+                        "message": "Reboot command accepted by router.",
+                    }
+
+                if sentence[0] in ("!trap", "!fatal"):
+                    error_msg = "Reboot command failed"
+                    for item in sentence[1:]:
+                        if item.startswith("=message="):
+                            error_msg = item[9:]
+                            break
+                    return {
+                        "error": "command_failed",
+                        "message": error_msg,
+                        "command_sent": True,
+                    }
+        except (socket.timeout, ConnectionError, OSError) as e:
+            if command_sent:
+                return {
+                    "success": True,
+                    "status": "sent_connection_closed",
+                    "command_sent": True,
+                    "connection_closed": True,
+                    "message": f"Reboot command sent; API connection closed: {e}",
+                }
+            return {"error": "send_failed", "message": str(e), "command_sent": False}
+        except Exception as e:
+            logger.error(f"Router reboot command error on {self.host}: {e}")
+            return {"error": str(e), "command_sent": command_sent}
+
     def send_command_optimized(self, command: str, proplist: list = None, query: str = None) -> Dict[str, Any]:
         """
         Send command with optimization options for large datasets.

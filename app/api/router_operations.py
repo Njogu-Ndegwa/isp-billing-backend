@@ -2666,6 +2666,11 @@ class ApplyAccessDefaultsRequest(BaseModel):
     hotspot: bool = True
 
 
+class RebootRouterRequest(BaseModel):
+    confirm: bool = False
+    reason: Optional[str] = None
+
+
 def _apply_access_defaults_sync(
     router_info: dict,
     include_pppoe: bool = True,
@@ -2690,6 +2695,27 @@ def _apply_access_defaults_sync(
             include_pppoe=include_pppoe,
             include_hotspot=include_hotspot,
         )
+    finally:
+        api.disconnect()
+
+
+def _reboot_router_sync(router_info: dict) -> dict:
+    """Send a remote reboot command to a router."""
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=8,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {
+            "error": "connect_failed",
+            "message": api.last_connect_error or "Failed to connect to router",
+        }
+    try:
+        return api.reboot_router()
     finally:
         api.disconnect()
 
@@ -2755,6 +2781,87 @@ async def apply_access_defaults(
         },
         "result": result,
         "message": "Access defaults applied to router",
+    }
+
+
+@router.post("/api/routers/{router_id}/reboot")
+async def reboot_router(
+    router_id: int,
+    request: Optional[RebootRouterRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Remotely reboot an owned MikroTik router."""
+    request = request or RebootRouterRequest()
+    if not request.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to reboot this router")
+
+    reason = (request.reason or "").strip() or None
+    if reason and len(reason) > 500:
+        raise HTTPException(status_code=400, detail="Reason must be 500 characters or less")
+
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    await db.commit()
+
+    result = await run_with_guard(
+        router_id,
+        _reboot_router_sync,
+        router_info,
+        acquire_timeout_seconds=5,
+        timeout_seconds=20,
+    )
+
+    if result.get("error") == "busy":
+        raise HTTPException(status_code=429, detail=result.get("detail", "Router operation slots are busy"))
+    if result.get("error") == "timeout":
+        await record_router_availability(db, router_id, False, "router_reboot")
+        raise HTTPException(status_code=504, detail=result.get("detail", "Router reboot timed out"))
+    if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "router_reboot")
+        raise HTTPException(
+            status_code=503,
+            detail=result.get("message", f"Failed to connect to router: {router_obj.name}"),
+        )
+    if result.get("error") == "command_failed":
+        await record_router_availability(db, router_id, True, "router_reboot")
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("message", "Router rejected reboot command"),
+        )
+    if result.get("error"):
+        await record_router_availability(db, router_id, False, "router_reboot")
+        raise HTTPException(status_code=500, detail=result.get("message") or result["error"])
+
+    await record_router_availability(db, router_id, True, "router_reboot")
+
+    logger.info(
+        "Remote reboot sent for router %s (id=%s) by user_id=%s%s",
+        router_obj.name,
+        router_id,
+        user.id,
+        f"; reason={reason}" if reason else "",
+    )
+
+    return {
+        "success": True,
+        "router_id": router_id,
+        "router_name": router_obj.name,
+        "status": result.get("status", "accepted"),
+        "command_sent": bool(result.get("command_sent", True)),
+        "connection_closed": bool(result.get("connection_closed", False)),
+        "message": result.get("message", "Reboot command sent to router"),
+        "reason": reason,
+        "requested_at": datetime.utcnow().isoformat(),
     }
 
 
