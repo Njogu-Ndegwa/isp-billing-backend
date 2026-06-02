@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable
 from sqlalchemy import and_, or_, select, text
 
 from app.config import settings
-from app.db.database import async_session
+from app.db.database import async_session, db_pool_snapshot
 from app.services.router_availability import derive_router_status, record_router_availability
 from app.db.models import (
     ConnectionType,
@@ -40,6 +40,7 @@ HOTSPOT_VERIFY_REFRESH_WINDOW = timedelta(minutes=15)
 HOTSPOT_RECENT_DELIVERY_WINDOW = timedelta(minutes=30)
 HOTSPOT_ONLINE_POLL_INTERVAL_SECONDS = 2
 HOTSPOT_ONLINE_POLL_TIMEOUT_SECONDS = 8
+HOTSPOT_RETRY_DB_BUSY_THRESHOLD_PERCENT = 70
 
 _hotspot_provision_pool = ThreadPoolExecutor(
     max_workers=8,
@@ -49,6 +50,22 @@ _hotspot_provision_pool = ThreadPoolExecutor(
 
 def _enum_value(value: Any) -> Any:
     return value.value if hasattr(value, "value") else value
+
+
+def _retry_db_pool_is_busy() -> bool:
+    snapshot = db_pool_snapshot()
+    checked_out_percent = snapshot.get("checked_out_percent")
+    if isinstance(checked_out_percent, (int, float)) and checked_out_percent >= HOTSPOT_RETRY_DB_BUSY_THRESHOLD_PERCENT:
+        logger.warning(
+            "[PROVISION-RETRY] Skipping background retry because DB pool is busy: "
+            "checked_out=%s/%s (%.2f%%), status=%s",
+            snapshot.get("checked_out"),
+            snapshot.get("configured_max_app_connections"),
+            checked_out_percent,
+            snapshot.get("status"),
+        )
+        return True
+    return False
 
 
 def build_hotspot_payload(customer: Customer, plan: Plan, router: Router, comment: str) -> Dict[str, Any]:
@@ -819,6 +836,9 @@ async def retry_pending_hotspot_provisioning_background():
       get an attempt created so payment success never remains invisible.
     """
     try:
+        if _retry_db_pool_is_busy():
+            return
+
         now = datetime.utcnow()
         stale_cutoff = now - timedelta(seconds=HOTSPOT_RETRY_STALE_IN_PROGRESS_SECONDS)
         verify_cutoff = now - HOTSPOT_VERIFY_REFRESH_WINDOW
@@ -953,6 +973,9 @@ async def retry_pending_hotspot_provisioning_background():
 
         if not work_items:
             logger.debug("[PROVISION-RETRY] No direct hotspot delivery attempts need work")
+            return
+
+        if _retry_db_pool_is_busy():
             return
 
         logger.warning("[PROVISION-RETRY] Processing %d direct hotspot delivery attempt(s)", len(work_items))

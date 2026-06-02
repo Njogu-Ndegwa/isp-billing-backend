@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
-from app.db.database import async_engine, async_session
+from app.db.database import async_engine, async_session, db_pool_snapshot
 from app.db.models import (
     Router,
     Customer,
@@ -40,6 +40,10 @@ import time
 logger = logging.getLogger(__name__)
 
 SAFETY_NET_BYPASS_GRACE_PERIOD = timedelta(minutes=5)
+BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 70
+ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = timedelta(minutes=30)
+SAFETY_NET_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
+ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL = timedelta(minutes=5)
 
 
 class RouterLockManager:
@@ -49,7 +53,7 @@ class RouterLockManager:
     up to *max_concurrent* at a time (to avoid exhausting the thread pool).
     """
 
-    def __init__(self, max_concurrent: int = 6):
+    def __init__(self, max_concurrent: int = 3):
         self._locks: dict[str, asyncio.Lock] = {}
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
@@ -67,11 +71,47 @@ router_locks = RouterLockManager()
 # Shared state for background jobs
 cleanup_running = False
 queue_sync_running = False
+_last_safety_net_cleanup_at: datetime | None = None
+_last_access_credential_reaper_at: datetime | None = None
 
 # Rate limiting constants for queue sync
 SYNC_DELAY_BETWEEN_COMMANDS = 0.1
 SYNC_DELAY_BETWEEN_CUSTOMERS = 0.05
 SYNC_MAX_QUEUE_OPERATIONS_PER_RUN = 50
+
+
+def _router_recently_offline(
+    router,
+    now: datetime,
+    threshold: timedelta = ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD,
+) -> bool:
+    last_checked = getattr(router, "last_checked_at", None)
+    return (
+        getattr(router, "last_status", None) is False
+        and last_checked is not None
+        and (now - last_checked) < threshold
+    )
+
+
+def _background_db_pool_is_busy(job_name: str) -> bool:
+    snapshot = db_pool_snapshot()
+    checked_out_percent = snapshot.get("checked_out_percent")
+    if isinstance(checked_out_percent, (int, float)) and checked_out_percent >= BACKGROUND_DB_BUSY_THRESHOLD_PERCENT:
+        logger.warning(
+            "[%s] Skipping optional background work because DB pool is busy: "
+            "checked_out=%s/%s (%.2f%%), status=%s",
+            job_name,
+            snapshot.get("checked_out"),
+            snapshot.get("configured_max_app_connections"),
+            checked_out_percent,
+            snapshot.get("status"),
+        )
+        return True
+    return False
+
+
+def _interval_due(last_run_at: datetime | None, now: datetime, interval: timedelta) -> bool:
+    return last_run_at is None or (now - last_run_at) >= interval
 
 
 # =============================================================================
@@ -637,11 +677,11 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
         result = await db.execute(stmt)
         routers = result.scalars().all()
 
-        async with async_session() as fresh_db:
-            active_macs = await _load_authorized_bypass_macs(
-                fresh_db,
-                now=datetime.utcnow(),
-            )
+        now = datetime.utcnow()
+        active_macs = await _load_authorized_bypass_macs(
+            db,
+            now=now,
+        )
 
         # Router scans below can take many seconds across multiple routers.
         # Release the caller's DB connection until we need to write again.
@@ -669,7 +709,17 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
                     "candidates": {normalize_mac_address(mac) for mac in candidates if mac},
                 }
 
-        eligible = [r for r in routers if getattr(r, "auth_method", None) != "RADIUS"]
+        eligible = []
+        skipped_offline = 0
+        for r in routers:
+            if getattr(r, "auth_method", None) == "RADIUS":
+                continue
+            if _router_recently_offline(r, now):
+                skipped_offline += 1
+                continue
+            eligible.append(r)
+        if skipped_offline:
+            logger.info("[SAFETY-NET] Skipping %d recently-offline router(s)", skipped_offline)
         candidate_outcomes = await asyncio.gather(
             *[_find_candidates_task(r) for r in eligible],
             return_exceptions=True,
@@ -781,9 +831,11 @@ def _cleanup_pppoe_customers_sync(router_pppoe_map: dict) -> dict:
 
 
 async def cleanup_expired_users_background():
-    global cleanup_running
+    global cleanup_running, _last_safety_net_cleanup_at, _last_access_credential_reaper_at
     if cleanup_running:
         logger.warning("[CRON] Previous cleanup still running, skipping this run")
+        return
+    if _background_db_pool_is_busy("CRON"):
         return
     cleanup_running = True
     start_time = datetime.utcnow()
@@ -812,6 +864,7 @@ async def cleanup_expired_users_background():
             router_customers_map = {}
             router_pppoe_map = {}
             no_router_customers = []
+            offline_skipped = []
 
             for c in expired_customers:
                 is_pppoe = c.pppoe_username and (
@@ -823,10 +876,14 @@ async def cleanup_expired_users_background():
                     if not c.router:
                         c.status = CustomerStatus.INACTIVE
                         continue
+                    if _router_recently_offline(c.router, now):
+                        offline_skipped.append(c.id)
+                        continue
                     router_key = f"{c.router.ip_address}:{c.router.port}"
                     if router_key not in router_pppoe_map:
                         router_pppoe_map[router_key] = {
                             "router": {
+                                "id": c.router.id,
                                 "ip": c.router.ip_address, "username": c.router.username,
                                 "password": c.router.password, "port": c.router.port, "name": c.router.name
                             },
@@ -843,6 +900,9 @@ async def cleanup_expired_users_background():
                 if c.router and getattr(c.router, 'auth_method', None) == 'RADIUS':
                     c.status = CustomerStatus.INACTIVE
                     continue
+                if c.router and _router_recently_offline(c.router, now):
+                    offline_skipped.append(c.id)
+                    continue
                 customer_data = {
                     "id": c.id, "name": c.name, "mac_address": c.mac_address,
                     "expiry": c.expiry, "router_id": c.router_id
@@ -852,6 +912,7 @@ async def cleanup_expired_users_background():
                     if router_key not in router_customers_map:
                         router_customers_map[router_key] = {
                             "router": {
+                                "id": c.router.id,
                                 "ip": c.router.ip_address, "username": c.router.username,
                                 "password": c.router.password, "port": c.router.port, "name": c.router.name
                             },
@@ -866,27 +927,6 @@ async def cleanup_expired_users_background():
 
             if no_router_customers:
                 logger.warning(f"[CRON] Skipping {len(no_router_customers)} customer(s) with no router assigned: {[c['id'] for c in no_router_customers]}")
-
-            offline_skipped = []
-            offline_stale_threshold = timedelta(minutes=5)
-            for router_key in list(router_customers_map.keys()):
-                rd = router_customers_map[router_key]
-                cust_sample = rd["customers"][0] if rd["customers"] else None
-                if not cust_sample:
-                    continue
-                sample_customer = next(
-                    (c for c in expired_customers if c.id == cust_sample["id"]), None
-                )
-                if sample_customer and sample_customer.router:
-                    r = sample_customer.router
-                    if (
-                        getattr(r, "last_status", None) is False
-                        and getattr(r, "last_checked_at", None)
-                        and (now - r.last_checked_at) < offline_stale_threshold
-                    ):
-                        for cust in rd["customers"]:
-                            offline_skipped.append(cust["id"])
-                        del router_customers_map[router_key]
 
             if offline_skipped:
                 logger.warning(
@@ -905,6 +945,7 @@ async def cleanup_expired_users_background():
 
             # --- Hotspot cleanup (concurrent per-router) ---
             mikrotik_results = {"removed": [], "failed": [], "routers_connected": 0}
+            offline_router_ids: set[int] = set()
             if router_customers_map:
                 async def _hotspot_task(rk, rd):
                     async with router_locks.acquire(rk):
@@ -912,11 +953,12 @@ async def cleanup_expired_users_background():
                             _cleanup_single_router_hotspot_sync, rd["router"], rd["customers"],
                         )
 
+                hotspot_items = list(router_customers_map.items())
                 hotspot_outcomes = await asyncio.gather(
-                    *[_hotspot_task(rk, rd) for rk, rd in router_customers_map.items()],
+                    *[_hotspot_task(rk, rd) for rk, rd in hotspot_items],
                     return_exceptions=True,
                 )
-                for outcome in hotspot_outcomes:
+                for (_rk, rd), outcome in zip(hotspot_items, hotspot_outcomes):
                     if isinstance(outcome, Exception):
                         logger.error("[CRON] Hotspot cleanup task error: %s", outcome)
                         continue
@@ -924,6 +966,8 @@ async def cleanup_expired_users_background():
                     mikrotik_results["failed"].extend(outcome["failed"])
                     if outcome["connected"]:
                         mikrotik_results["routers_connected"] += 1
+                    elif rd["router"].get("id"):
+                        offline_router_ids.add(rd["router"]["id"])
 
             # --- PPPoE cleanup (concurrent per-router) ---
             pppoe_results = {"removed": [], "failed": [], "routers_connected": 0}
@@ -934,11 +978,12 @@ async def cleanup_expired_users_background():
                             _cleanup_single_router_pppoe_sync, rd["router"], rd["customers"],
                         )
 
+                pppoe_items = list(router_pppoe_map.items())
                 pppoe_outcomes = await asyncio.gather(
-                    *[_pppoe_task(rk, rd) for rk, rd in router_pppoe_map.items()],
+                    *[_pppoe_task(rk, rd) for rk, rd in pppoe_items],
                     return_exceptions=True,
                 )
-                for outcome in pppoe_outcomes:
+                for (_rk, rd), outcome in zip(pppoe_items, pppoe_outcomes):
                     if isinstance(outcome, Exception):
                         logger.error("[CRON] PPPoE cleanup task error: %s", outcome)
                         continue
@@ -946,6 +991,8 @@ async def cleanup_expired_users_background():
                     pppoe_results["failed"].extend(outcome["failed"])
                     if outcome["connected"]:
                         pppoe_results["routers_connected"] += 1
+                    elif rd["router"].get("id"):
+                        offline_router_ids.add(rd["router"]["id"])
 
             all_successful_ids = set(
                 [r["id"] for r in mikrotik_results["removed"]] +
@@ -959,6 +1006,21 @@ async def cleanup_expired_users_background():
             now_after_cleanup = datetime.utcnow()
             deactivated_count = 0
             skipped_repaid_count = 0
+            for router_id in offline_router_ids:
+                try:
+                    await record_router_availability(
+                        db,
+                        router_id,
+                        False,
+                        "expired_cleanup",
+                        checked_at=now_after_cleanup,
+                    )
+                except Exception as availability_err:
+                    logger.warning(
+                        "[CRON] Failed to record router %s offline after cleanup failure: %s",
+                        router_id,
+                        availability_err,
+                    )
             for customer in expired_customers:
                 if customer.id in all_successful_ids:
                     await db.refresh(customer)
@@ -989,18 +1051,31 @@ async def cleanup_expired_users_background():
                         f"(hotspot={len(mikrotik_results['removed'])}, pppoe={len(pppoe_results['removed'])}), "
                         f"{failed_total} failed")
 
+            now_optional = datetime.utcnow()
+            if _background_db_pool_is_busy("CRON-SAFETY-NET"):
+                logger.warning("[CRON] Skipping safety net and access credential reaper due to DB pool pressure")
+                return
+
             try:
                 logger.info(f"[CRON] Running safety net bypass cleanup...")
-                bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
-                if bypass_cleaned > 0:
-                    logger.warning(f"[CRON] Safety net removed {bypass_cleaned} orphaned IP bindings!")
+                if _interval_due(_last_safety_net_cleanup_at, now_optional, SAFETY_NET_CLEANUP_MIN_INTERVAL):
+                    _last_safety_net_cleanup_at = now_optional
+                    bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
+                    if bypass_cleaned > 0:
+                        logger.warning(f"[CRON] Safety net removed {bypass_cleaned} orphaned IP bindings!")
+                else:
+                    logger.debug("[CRON] Safety net cleanup not due yet")
             except Exception as bypass_err:
                 logger.error(f"[CRON] Safety net cleanup failed: {bypass_err}")
 
             try:
-                released = await _reap_idle_access_credentials(db)
-                if released:
-                    logger.info(f"[CRON] Released {released} idle access credential(s)")
+                if _interval_due(_last_access_credential_reaper_at, now_optional, ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL):
+                    _last_access_credential_reaper_at = now_optional
+                    released = await _reap_idle_access_credentials(db)
+                    if released:
+                        logger.info(f"[CRON] Released {released} idle access credential(s)")
+                else:
+                    logger.debug("[CRON] Access credential reaper not due yet")
             except Exception as reap_err:
                 logger.error(f"[CRON] Access credential reaper failed: {reap_err}")
 
@@ -1182,12 +1257,17 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
         return 0
 
     by_router: dict[int, dict] = {}
+    now = datetime.utcnow()
+    skipped_offline = 0
     for c in creds:
         if not c.router:
             continue
         # RADIUS routers manage sessions externally; we just trust DB state.
         am = getattr(c.router, "auth_method", None)
         if am is not None and getattr(am, "value", None) == "RADIUS":
+            continue
+        if _router_recently_offline(c.router, now):
+            skipped_offline += 1
             continue
         rid = c.router.id
         if rid not in by_router:
@@ -1208,7 +1288,11 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
         })
 
     if not by_router:
+        if skipped_offline:
+            logger.info("[REAPER] Skipping %d credential(s) on recently-offline routers", skipped_offline)
         return 0
+    if skipped_offline:
+        logger.info("[REAPER] Skipping %d credential(s) on recently-offline routers", skipped_offline)
 
     await db.commit()
 
@@ -1881,6 +1965,8 @@ def _fetch_bandwidth_data_sync():
 
 async def collect_bandwidth_snapshot():
     try:
+        if _background_db_pool_is_busy("BANDWIDTH"):
+            return
         now = datetime.utcnow()
         async with async_session() as db:
             routers_result = await db.execute(select(Router))
@@ -1893,11 +1979,7 @@ async def collect_bandwidth_snapshot():
             for router in routers:
                 if getattr(router, 'auth_method', None) == 'RADIUS':
                     continue
-                if (
-                    getattr(router, "last_status", None) is False
-                    and getattr(router, "last_checked_at", None)
-                    and (now - router.last_checked_at) < timedelta(minutes=5)
-                ):
+                if _router_recently_offline(router, now):
                     logger.debug(
                         "[BANDWIDTH] Skipping recently-offline router %s (%s)",
                         router.id,

@@ -17,6 +17,7 @@ The captured log in `pool-exhausted.md` showed failures across login, public por
 - `Collect bandwidth statistics` was already long-running; APScheduler skipped its next run because `max_instances=1` was still occupied.
 - Many RouterOS calls were failing or timing out against offline/unreachable routers before the pool errors.
 - A point-in-time `/api/admin/db-pool` check can look healthy before or after the spike, even when a recent spike reached exhaustion.
+- A later recurrence showed the pool at about `90%` while normal app requests degraded. The logs showed expired-user cleanup repeatedly finding about `98-99` expired customers and hitting many of the same unreachable routers every `67s`.
 
 ## Suspected Cause
 
@@ -25,6 +26,7 @@ The recurrence was not explained by normal user traffic alone. The likely trigge
 - safety-net bypass cleanup scanned many routers and rechecked orphan candidates with fresh DB sessions inside each concurrent router task;
 - hotspot provisioning retry could process up to 25 work items across many router groups at once, with each item opening short DB sessions before and after RouterOS work;
 - bandwidth collection kept the background process busy by repeatedly probing recently-offline routers.
+- the expired-user cleanup job kept retrying recently failed routers too quickly, so failures against the same offline routers were amplified every minute.
 
 Each individual DB session was short-lived, but the concurrent burst could hit all 30 configured application connections.
 
@@ -32,9 +34,14 @@ Each individual DB session was short-lived, but the concurrent burst could hit a
 
 - `app/services/mikrotik_background.py`
   - safety-net cleanup now scans routers first, performs one batched DB authorization recheck for all candidate MACs, then removes confirmed orphans;
-  - bandwidth collection skips routers marked offline within the last 5 minutes.
+  - expired-user cleanup records failed router connections as offline and skips recently-offline routers for 30 minutes;
+  - safety-net cleanup skips recently-offline routers, runs at most every 10 minutes, and is skipped when DB pool checkout is already high;
+  - idle access credential reaping skips recently-offline routers, runs at most every 5 minutes, and is skipped together with safety-net cleanup under DB pressure;
+  - bandwidth collection skips when DB pool checkout is high and skips routers marked offline within the last 30 minutes;
+  - shared background router concurrency was lowered from 6 to 3.
 - `app/services/hotspot_provisioning.py`
-  - retry provisioning router groups are capped at 4 concurrent groups.
+  - retry provisioning router groups are capped at 4 concurrent groups;
+  - background retry skips when DB pool checkout is already high.
 - `app/db/database.py`
   - pool checkout/checkin events now track observed peak checked-out connections and recent 5-minute peak;
   - `/api/admin/db-pool` can now report a recent exhaustion peak even if current usage has dropped.
