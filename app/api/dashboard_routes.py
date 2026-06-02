@@ -11,7 +11,7 @@ from app.db.models import (
     Router, Customer, Plan, CustomerStatus, CustomerPayment, PaymentStatus,
     MpesaTransaction, MpesaTransactionStatus,
     ResellerPayout, ResellerTransactionCharge, PaymentMethod,
-    ShopOrder, ShopOrderPaymentStatus,
+    ShopOrder, ShopOrderPaymentStatus, UserRole,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import get_invoice_alert_for_user
@@ -764,11 +764,12 @@ async def get_revenue_over_time(
 
         # Fetch all completed payments in the range
         base_where = [
-            CustomerPayment.reseller_id == user_id,
             CustomerPayment.created_at >= range_start,
             CustomerPayment.created_at < range_end,
             CustomerPayment.status == PaymentStatus.COMPLETED,
         ]
+        if user.role != UserRole.ADMIN:
+            base_where.append(CustomerPayment.reseller_id == user_id)
         if router_id:
             payments_q = (
                 select(CustomerPayment.amount, CustomerPayment.created_at)
@@ -906,10 +907,11 @@ async def get_daily_transaction_counts(
             raise HTTPException(status_code=400, detail="Daily transaction range cannot exceed 366 days")
 
         filters = [
-            CustomerPayment.reseller_id == user.id,
             CustomerPayment.created_at >= range_start,
             CustomerPayment.created_at < range_end,
         ]
+        if user.role != UserRole.ADMIN:
+            filters.append(CustomerPayment.reseller_id == user.id)
 
         status_filter = (status or "completed").lower()
         if status_filter != "all":
