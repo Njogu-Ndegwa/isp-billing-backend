@@ -52,6 +52,7 @@ Backlog items this implements:
 | Invariants enforced | All four: no-DB-session-across-I/O, offline-skip + circuit breaker, global concurrency cap, DB-pressure gating |
 | Rollout | Phased migration, then hard-lock the old API |
 | Execution model | Keep `MikroTikAPI` synchronous; gateway owns a dedicated bounded thread pool + semaphore (not the shared default executor) |
+| Execution sizing | **Pinned to pre-refactor behaviour for v1.** Global cap mirrors the prior default-executor limit `min(32, cpu+4)`; existing nested caps (background = 3, retry groups = 4) kept as-is. Hardcoded for now; may become env-configurable/tunable in a future release. |
 | Interface shape | Approach C — thin closure-based facade now, promote hot operations to typed methods later |
 | Circuit breaker | Consolidated into the gateway's health registry; removed from `mikrotik_api.py` as a separate source of truth |
 | Test environment | Getting `pytest` runnable in `myEnv` is a hard Phase-0 prerequisite |
@@ -105,8 +106,13 @@ The gateway signature **never accepts an `AsyncSession`** — that alone makes
   of truth for offline-skip + circuit breaker.
 - **Execution internals** — one `ThreadPoolExecutor(max_workers=N)` and one
   `asyncio.Semaphore(cap)` owned by the gateway module. The semaphore is the true global
-  in-flight cap (web + background combined); the executor is sized ≥ cap. `N` and `cap`
-  are env-configurable with conservative defaults.
+  in-flight cap (web + background combined); the executor is sized ≥ cap. **For v1 the
+  values are pinned to preserve pre-refactor behaviour:** the global `cap` mirrors the prior
+  default-executor limit `min(32, cpu+4)`, so aggregate router concurrency is unchanged, and
+  the existing per-subsystem semaphores (background = 3, retry groups = 4) are kept nested
+  as-is rather than replaced by a new single number. These are hardcoded for now; a future
+  release may expose them as env-configurable knobs and/or tune the global cap down to a
+  deliberately chosen value.
 - **DB-pressure source** — reuse the pool counters already exposed by
   `app/db/database.py` (the same data behind `/api/admin/db-pool`).
 
@@ -114,8 +120,13 @@ The gateway signature **never accepts an `AsyncSession`** — that alone makes
 
 Pre-flight, before acquiring a thread (cheap fast-fail), in order:
 
-1. Circuit open → `SKIPPED_CIRCUIT_OPEN` (both priorities).
-2. Router offline within last 30 min → `SKIPPED_OFFLINE` (both priorities).
+1. Circuit open (60s breaker) → `SKIPPED_CIRCUIT_OPEN` (both priorities — matches today's
+   behaviour, where the breaker applied to all calls).
+2. Router offline within last 30 min → `SKIPPED_OFFLINE` (**`BACKGROUND` only**).
+   `INTERACTIVE` is *not* subject to the 30-min offline skip: today's offline window lives
+   only in background cleanup, and blocking a customer-facing reconnect for up to 30 min
+   after a router recovers would be a regression. Interactive calls are still protected by
+   the 60s circuit breaker in step 1.
 3. DB pressure high → for `BACKGROUND` only → `SKIPPED_DB_PRESSURE`. `INTERACTIVE` is
    never gated here.
 4. Otherwise acquire semaphore → run `op` in pool → record health → return result.
@@ -178,8 +189,10 @@ back a future metrics endpoint. This partially satisfies the backlog observabili
 - **Behaviour drift while wrapping closures.** Mitigation: closures' command bodies are
   copied verbatim; only connection/dispatch boilerplate is removed; migrate in small
   reviewable batches; verify each phase in prod.
-- **Concurrency cap set too low → throughput regression.** Mitigation: env-configurable;
-  start conservative, watch `/api/admin/db-pool` and router-call duration, tune.
+- **Concurrency cap set too low → throughput regression.** Mitigation: v1 pins the cap to
+  the prior default-executor limit so aggregate concurrency is unchanged; any tuning to a
+  lower value is a deliberate, separately-shipped future change, watched via
+  `/api/admin/db-pool` and router-call duration.
 - **Per-process state under multiple workers.** Mitigation: documented limitation; ties to
   the existing "Scheduler Isolation" backlog item; no regression vs today's per-process
   circuit breaker.
@@ -192,8 +205,9 @@ back a future metrics endpoint. This partially satisfies the backlog observabili
 - All router I/O flows through `run_router_op`; `MikroTikAPI`/`connect_to_router` are
   import-locked to the gateway (enforced by test).
 - No code path can hold a DB session across router I/O (enforced by signature).
-- Offline-skip, circuit breaker, global concurrency cap, and BACKGROUND pressure-gating are
-  applied uniformly, defined in exactly one place.
+- The circuit breaker, global concurrency cap, BACKGROUND offline-skip, and BACKGROUND
+  pressure-gating are each defined in exactly one place and applied consistently per their
+  documented priority scope (§7).
 - No `QueuePool limit` exhaustion attributable to router fan-out for a sustained window
   after Phase 1 ships.
 - `pytest` runs locally; gateway and migrated-path tests pass.
