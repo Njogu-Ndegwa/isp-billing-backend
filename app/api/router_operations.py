@@ -1,25 +1,36 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func
 from sqlalchemy.orm import selectinload
 from typing import Optional, List
 from datetime import datetime, timedelta
+from dataclasses import asdict
+from pathlib import Path
 
 from app.db.database import get_db
-from app.db.models import Router, Customer, Plan, CustomerStatus, ConnectionType
+from app.db.models import Router, Customer, Plan, CustomerStatus, ConnectionType, ProvisioningToken
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.router_helpers import get_router_by_id, get_router_by_identity, connect_to_router
 from app.core.protected_devices import is_protected_device
 from app.services.router_availability import record_router_availability
 from app.services.router_concurrency import run_with_guard
+from app.services.provisioning import provision_base_url_for_vpn, fetch_certificate_flag_for_url
+from app.services.pppoe_customer_import import (
+    read_pppoe_workbook,
+    normalize_workbook_rows,
+    import_pppoe_customers,
+)
 from app.config import settings
 
 import logging
 import time
 import asyncio
 import hashlib
+import json
+import os
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -3474,6 +3485,31 @@ class HealDualModeRequest(BaseModel):
     apply_access_defaults: bool = True
 
 
+async def _router_login_fetch_options(db: AsyncSession, router_id: int) -> dict:
+    """Build the RouterOS /tool fetch options for this router's login page."""
+    pt_result = await db.execute(
+        select(ProvisioningToken)
+        .where(ProvisioningToken.router_id == router_id)
+        .order_by(ProvisioningToken.created_at.desc())
+    )
+    token_obj = pt_result.scalars().first()
+    if not token_obj:
+        return {
+            "login_page_url": None,
+            "fetch_check_certificate": False,
+            "provisioning_token_found": False,
+        }
+
+    base_url = provision_base_url_for_vpn(token_obj.vpn_type)
+    login_page_url = f"{base_url}/api/provision/{token_obj.token}/login-page"
+    cert_flag = fetch_certificate_flag_for_url(login_page_url, token_obj.vpn_type)
+    return {
+        "login_page_url": login_page_url,
+        "fetch_check_certificate": "check-certificate=no" in cert_flag,
+        "provisioning_token_found": True,
+    }
+
+
 def _apply_dual_ports_sync(
     router_info: dict,
     new_ports: list,
@@ -3545,7 +3581,11 @@ def _apply_dual_ports_sync(
             }
 
         # Set up or ensure the dual-mode PPPoE server on the hotspot bridge.
-        setup_result = api.setup_dual_infrastructure(dual_ports=target_ports)
+        setup_result = api.setup_dual_infrastructure(
+            dual_ports=target_ports,
+            login_page_url=router_info.get("login_page_url"),
+            fetch_check_certificate=bool(router_info.get("fetch_check_certificate")),
+        )
         if setup_result.get("error"):
             setup_result["current_ports"] = old_ports
             return setup_result
@@ -3603,6 +3643,7 @@ async def set_dual_ports(
         "password": router_obj.password,
         "port": router_obj.port,
     }
+    router_info.update(await _router_login_fetch_options(db, router_id))
     started_at = time.perf_counter()
     await db.commit()
     result = await asyncio.to_thread(
@@ -3731,7 +3772,11 @@ def _heal_dual_mode_sync(
                 "message": "No dual ports found to heal",
             }
 
-        setup_result = api.setup_dual_infrastructure(dual_ports=target_ports)
+        setup_result = api.setup_dual_infrastructure(
+            dual_ports=target_ports,
+            login_page_url=router_info.get("login_page_url"),
+            fetch_check_certificate=bool(router_info.get("fetch_check_certificate")),
+        )
         if setup_result.get("error"):
             setup_result["target_ports"] = target_ports
             setup_result["legacy_bridge_dual_ports"] = legacy_bridge_dual_ports
@@ -3863,6 +3908,7 @@ async def heal_dual_mode(
         "port": router_obj.port,
         "dual_ports": current_dual,
     }
+    router_info.update(await _router_login_fetch_options(db, router_id))
 
     await db.commit()
     result = await run_with_guard(
@@ -3926,6 +3972,143 @@ async def heal_dual_mode(
             else result.get("message", "No dual ports found to heal")
         ),
     }
+
+
+# =========================================================================
+# PPPoE CUSTOMER WORKBOOK IMPORT
+# =========================================================================
+
+def _pppoe_import_report_payload(report, *, success: Optional[bool] = None) -> dict:
+    payload = asdict(report)
+    payload["success"] = (not report.errors) if success is None else success
+    payload["has_errors"] = bool(report.errors)
+    return payload
+
+
+def _parse_package_plan_mapping(package_plan_json: Optional[str]) -> Optional[dict]:
+    if not package_plan_json:
+        return None
+    try:
+        raw = json.loads(package_plan_json)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"package_plan_json must be valid JSON: {exc.msg}",
+        ) from exc
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="package_plan_json must be an object")
+
+    out = {}
+    for package, plan_id in raw.items():
+        try:
+            out[str(package)] = int(plan_id)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid plan id for package '{package}': {plan_id}",
+            ) from exc
+    return out
+
+
+@router.post("/api/routers/{router_id}/pppoe-customers/import")
+async def import_router_pppoe_customers(
+    router_id: int,
+    file: UploadFile = File(...),
+    sheet: str = Form("Items"),
+    apply_changes: bool = Form(False, alias="apply"),
+    source_timezone: str = Form("Africa/Nairobi"),
+    create_missing_plans: bool = Form(False),
+    default_plan_price: int = Form(0),
+    reassign_existing: bool = Form(False),
+    package_plan_json: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Preview or import PPPoE customers from an exported .xlsx workbook."""
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    if create_missing_plans and default_plan_price <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="create_missing_plans requires default_plan_price greater than 0",
+        )
+
+    filename = Path(file.filename or "pppoe_customers.xlsx").name
+    if not filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Upload an .xlsx workbook")
+
+    package_plan_ids = _parse_package_plan_mapping(package_plan_json)
+    await db.commit()
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+            temp_path = tmp.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+
+        if not temp_path or os.path.getsize(temp_path) == 0:
+            raise HTTPException(status_code=400, detail="Uploaded workbook is empty")
+
+        try:
+            records = await asyncio.to_thread(read_pppoe_workbook, temp_path, sheet_name=sheet)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not read workbook: {type(exc).__name__}: {exc}",
+            ) from exc
+
+        rows, parse_report = normalize_workbook_rows(
+            records,
+            source_timezone=source_timezone,
+        )
+        if parse_report.errors:
+            return {
+                "success": False,
+                "stage": "parse",
+                "router_id": router_id,
+                "router_name": router_obj.name,
+                "source_file": filename,
+                "dry_run": not apply_changes,
+                "parse_report": _pppoe_import_report_payload(parse_report, success=False),
+            }
+
+        report = await import_pppoe_customers(
+            db,
+            rows,
+            reseller_id=router_obj.user_id,
+            router_id=router_id,
+            source_file=filename,
+            dry_run=not apply_changes,
+            create_missing_plans=create_missing_plans,
+            default_plan_price=default_plan_price,
+            reassign_existing=reassign_existing,
+            package_plan_ids=package_plan_ids,
+        )
+
+        return {
+            "success": not report.errors,
+            "stage": "import",
+            "router_id": router_id,
+            "router_name": router_obj.name,
+            "reseller_id": router_obj.user_id,
+            "source_file": filename,
+            "dry_run": report.dry_run,
+            "report": _pppoe_import_report_payload(report),
+        }
+    finally:
+        await file.close()
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                logger.warning("Could not delete temporary PPPoE import workbook %s", temp_path)
 
 
 # =========================================================================

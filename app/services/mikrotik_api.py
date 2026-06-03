@@ -8,6 +8,7 @@ import ipaddress
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import json  # Ensure you import json for serializing logs
+from urllib.parse import urlsplit
 
 # Initialize logger
 logger = logging.getLogger("mikrotik_api")
@@ -3751,35 +3752,30 @@ class MikroTikAPI:
             logger.error("Error ensuring DHCP server %s: %s", name, e)
             return {"error": str(e)}
 
-    def _resolve_hotspot_html_dir(self) -> str:
-        """Pick a persistent hotspot html-directory path for this device.
+    def _resolve_hotspot_html_dir(self, prefer_routerboard_flash: bool = False) -> str:
+        """Pick the hotspot html-directory used by live API repairs.
 
-        RouterBOARD devices (hEX, hEX S, hEX lite, hEX PoE, CCR, etc.) have
-        a split filesystem: the root /file tree is RAM-backed (tmpfs) and
-        only the `flash/` folder is NAND-persistent. Files written to a
-        root-level `hotspot/` directory therefore disappear on reboot and
-        RouterOS falls back to the built-in default login page, which is
-        why clients end up on the stock MikroTik hotspot login instead of
-        our captive portal. CHR / x86 have no `flash/` folder and their
-        whole filesystem is already persistent, so plain `hotspot` is fine.
-
-        We detect the platform via `/system/resource` `board-name`, which
-        returns "CHR" on Cloud Hosted, "x86" on x86 installs, and a real
-        model string (e.g. "hEX S", "CCR2004-...") on every RouterBOARD
-        device. A denylist of just CHR + x86 stays valid forever since
-        those are the only two non-persistent-root platforms MikroTik
-        ships. Works identically on RouterOS v6 and v7.
+        The provisioning script defaults to plain `hotspot`, which is correct
+        for RouterOS v7 and for our normal v6 fleet. `flash/hotspot` is only a
+        legacy v6 RouterBOARD opt-in; inferring it from board-name caused the
+        v7 hEX regression where clients were sent to the wrong login files.
         """
+        if not prefer_routerboard_flash:
+            return "hotspot"
+
         try:
             result = self.send_command("/system/resource/print")
             if result.get("success"):
                 data_list = result.get("data") or []
                 data = data_list[0] if data_list else {}
                 board = (data.get("board-name") or "").strip()
-                if board and board.lower() not in {"chr", "x86"}:
+                version = (data.get("version") or "").strip()
+                version_match = re.match(r"^(\d+)", version)
+                major_version = int(version_match.group(1)) if version_match else None
+                if major_version == 6 and board and board.lower() not in {"chr", "x86"}:
                     return "flash/hotspot"
         except Exception as exc:
-            logger.debug("Could not probe system resource for board-name: %s", exc)
+            logger.debug("Could not probe system resource for hotspot html directory: %s", exc)
         return "hotspot"
 
     def reset_hotspot_profile_html_directory(self, profile_name: str) -> Dict[str, Any]:
@@ -3828,11 +3824,10 @@ class MikroTikAPI:
     ) -> Dict[str, Any]:
         """Ensure a hotspot server profile exists with the expected gateway address.
 
-        When `html_directory` is None (the recommended default), we auto-detect
-        the right path for the device: `flash/hotspot` on RouterBOARD boards
-        that have a NAND `flash/` partition, `hotspot` everywhere else. This
-        prevents the hEX-series regression where uploaded captive-portal HTML
-        was silently written to volatile RAM and wiped on reboot.
+        When `html_directory` is None (the recommended default), use the same
+        default path as new provisioning: plain `hotspot`. `flash/hotspot`
+        remains an explicit legacy v6 RouterBOARD provisioning opt-in, not a
+        live board-name inference.
 
         If `reset_html` is True (default), we also invoke RouterOS's
         `reset-html-directory` after create/update so the profile's
@@ -3975,6 +3970,241 @@ class MikroTikAPI:
         except Exception as e:
             logger.error("Error ensuring hotspot server %s on %s: %s", server_name, interface, e)
             return {"error": str(e)}
+
+    def ensure_existing_hotspot_captive_portal(
+        self,
+        *,
+        interface: str = "bridge",
+        profile_name: str = "hsprof1",
+        server_name: str = "hotspot1",
+        hotspot_address: str = "192.168.88.1",
+        address_pool: str = "dhcp-pool",
+        html_directory: Optional[str] = None,
+        login_page_url: Optional[str] = None,
+        fetch_check_certificate: bool = False,
+    ) -> Dict[str, Any]:
+        """Ensure dual mode uses the standard hotspot profile/files.
+
+        This deliberately repairs or creates `hsprof1` + `hotspot1` on the
+        normal hotspot bridge instead of creating a parallel dual hotspot.
+        When a provisioning login URL is available, it also refreshes the
+        custom login.html into the profile's configured html-directory.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+
+        report: Dict[str, Any] = {
+            "success": False,
+            "interface": interface,
+            "profile": profile_name,
+            "server": server_name,
+            "steps": [],
+            "warnings": [],
+        }
+
+        def step(name: str, ok: bool, detail: object = None) -> None:
+            report["steps"].append({"step": name, "ok": ok, "detail": detail})
+
+        try:
+            target_dir = (html_directory or self._resolve_hotspot_html_dir()).rstrip("/") or "hotspot"
+
+            hotspots = self.send_command("/ip/hotspot/print")
+            if hotspots.get("error"):
+                return {"error": f"Could not read hotspot servers: {hotspots['error']}", **report}
+
+            hotspot_rows = hotspots.get("data", []) or []
+            server = next(
+                (
+                    item for item in hotspot_rows
+                    if item.get("name") == server_name or item.get("interface") == interface
+                ),
+                None,
+            )
+            if server:
+                server_name = server.get("name") or server_name
+                profile_name = server.get("profile") or profile_name
+                step("hotspot.find", True, {
+                    "name": server_name,
+                    "interface": server.get("interface"),
+                    "profile": profile_name,
+                })
+            else:
+                step("hotspot.find", False, f"hotspot server '{server_name}' was missing")
+
+            existing_profiles = self.send_command("/ip/hotspot/profile/print")
+            if existing_profiles.get("error"):
+                return {"error": f"Could not read hotspot profiles: {existing_profiles['error']}", **report}
+
+            existing_profile = next(
+                (
+                    item for item in (existing_profiles.get("data", []) or [])
+                    if item.get("name") == profile_name
+                ),
+                None,
+            )
+            if not login_page_url and html_directory is None and existing_profile:
+                existing_dir = (existing_profile.get("html-directory") or "").rstrip("/")
+                if existing_dir:
+                    target_dir = existing_dir
+                    step("profile.preserve_html_directory", True, existing_dir)
+
+            login_dst = f"{target_dir}/login.html"
+
+            profile_result = self.ensure_hotspot_server_profile(
+                profile_name=profile_name,
+                hotspot_address=hotspot_address,
+                html_directory=target_dir,
+                reset_html=False,
+            )
+            if profile_result.get("error"):
+                return {"error": f"Hotspot profile repair failed: {profile_result['error']}", **report}
+            step("profile.ensure", True, {
+                "name": profile_name,
+                "html_directory": profile_result.get("html_directory", target_dir),
+            })
+
+            if not server:
+                server_result = self.ensure_hotspot_server_on_interface(
+                    interface=interface,
+                    server_name=server_name,
+                    profile_name=profile_name,
+                    address_pool=address_pool,
+                    verify=True,
+                )
+                if server_result.get("error"):
+                    return {"error": f"Hotspot server repair failed: {server_result['error']}", **report}
+                step("hotspot.ensure", True, server_result)
+
+            profiles = self.send_command("/ip/hotspot/profile/print")
+            if profiles.get("error"):
+                return {"error": f"Could not verify hotspot profiles: {profiles['error']}", **report}
+
+            profile = next(
+                (item for item in (profiles.get("data", []) or []) if item.get("name") == profile_name),
+                None,
+            )
+            if not profile:
+                return {"error": f"Hotspot profile '{profile_name}' not found after repair", **report}
+
+            actual_dir = (profile.get("html-directory") or "").rstrip("/")
+            if actual_dir != target_dir:
+                profile_id = profile.get(".id")
+                if not profile_id:
+                    return {"error": f"Hotspot profile '{profile_name}' has no identifier", **report}
+                update = self.send_command(
+                    "/ip/hotspot/profile/set",
+                    {"numbers": profile_id, "html-directory": target_dir},
+                )
+                if update.get("error"):
+                    return {"error": f"Could not set hotspot html-directory: {update['error']}", **report}
+                step("profile.set_html_directory", True, f"{actual_dir or '(unset)'} -> {target_dir}")
+            else:
+                step("profile.set_html_directory", True, "already correct")
+
+            if login_page_url:
+                reset = self.reset_hotspot_profile_html_directory(profile_name)
+                if reset.get("error"):
+                    report["warnings"].append(f"reset-html-directory: {reset['error']}")
+                    step("profile.reset_html_directory", False, reset["error"])
+                else:
+                    step("profile.reset_html_directory", True)
+
+                fetch_mode = urlsplit(login_page_url).scheme.lower() or "http"
+                fetch_params = {
+                    "url": login_page_url,
+                    "dst-path": login_dst,
+                    "mode": fetch_mode,
+                }
+                if fetch_check_certificate:
+                    fetch_params["check-certificate"] = "no"
+
+                fetch = self.send_command("/tool/fetch", fetch_params)
+                if fetch.get("error"):
+                    return {
+                        "error": f"Could not fetch hotspot login page: {fetch['error']}",
+                        "login_page_url": login_page_url,
+                        "login_path": login_dst,
+                        **report,
+                    }
+                step("tool.fetch_login_page", True, {"url": login_page_url, "dst": login_dst})
+
+                login_size = -1
+                for attempt in range(2):
+                    if attempt:
+                        time.sleep(1.0)
+                    files = self.send_command("/file/print")
+                    if files.get("error"):
+                        report["warnings"].append(f"file verify: {files['error']}")
+                        continue
+                    file_row = next(
+                        (item for item in (files.get("data", []) or []) if item.get("name") == login_dst),
+                        None,
+                    )
+                    if not file_row:
+                        continue
+                    try:
+                        login_size = int(file_row.get("size") or 0)
+                    except (TypeError, ValueError):
+                        login_size = 0
+                    if login_size > 0:
+                        break
+
+                if login_size <= 0:
+                    return {
+                        "error": "login.html missing or empty after fetch",
+                        "login_page_url": login_page_url,
+                        "login_path": login_dst,
+                        **report,
+                    }
+                step("file.verify_login_html", True, {"path": login_dst, "size": login_size})
+            else:
+                report["warnings"].append(
+                    "No provisioning login-page URL was found; custom hotspot login.html was not refreshed"
+                )
+                step("profile.reset_html_directory", False, "skipped because custom login URL was unavailable")
+                step("tool.fetch_login_page", False, "no provisioning token linked to router")
+
+            hotspots_after = self.send_command("/ip/hotspot/print")
+            if hotspots_after.get("error"):
+                report["warnings"].append(f"hotspot bounce skipped: {hotspots_after['error']}")
+            else:
+                server_after = next(
+                    (
+                        item for item in (hotspots_after.get("data", []) or [])
+                        if item.get("name") == server_name or item.get("interface") == interface
+                    ),
+                    None,
+                )
+                server_id = server_after.get(".id") if server_after else None
+                if server_id:
+                    disable = self.send_command("/ip/hotspot/set", {"numbers": server_id, "disabled": "yes"})
+                    if disable.get("error"):
+                        report["warnings"].append(f"hotspot disable: {disable['error']}")
+                        step("hotspot.disable", False, disable["error"])
+                    else:
+                        step("hotspot.disable", True)
+
+                    time.sleep(0.5)
+                    enable = self.send_command("/ip/hotspot/set", {"numbers": server_id, "disabled": "no"})
+                    if enable.get("error"):
+                        return {"error": f"Could not re-enable hotspot server: {enable['error']}", **report}
+                    step("hotspot.enable", True)
+                else:
+                    report["warnings"].append("hotspot bounce skipped: server identifier was not found")
+                    step("hotspot.find_after", False, f"hotspot server '{server_name}' not found after repair")
+
+            report.update({
+                "success": True,
+                "profile": profile_name,
+                "server": server_name,
+                "html_directory": target_dir,
+                "login_path": login_dst,
+                "custom_login_refreshed": bool(login_page_url),
+            })
+            return report
+        except Exception as exc:
+            logger.error("Error ensuring hotspot captive portal on %s: %s", interface, exc)
+            return {"error": str(exc), **report}
 
     def apply_pppoe_reconnect_defaults(
         self,
@@ -4737,11 +4967,21 @@ class MikroTikAPI:
         pppoe_pool_name: str = "pppoe-pool",
         pppoe_pool_range: str = "192.168.89.2-192.168.89.254",
         pppoe_local_address: str = "192.168.89.1/24",
+        hotspot_profile_name: str = "hsprof1",
+        hotspot_server_name: str = "hotspot1",
+        hotspot_address: str = "192.168.88.1",
+        hotspot_address_pool: str = "dhcp-pool",
+        hotspot_html_directory: Optional[str] = None,
+        login_page_url: Optional[str] = None,
+        fetch_check_certificate: bool = False,
+        repair_hotspot: bool = True,
     ) -> Dict[str, Any]:
         """
-        Set up dual-mode (PPPoE + Hotspot) on a dedicated access bridge.
+        Set up dual-mode (PPPoE + Hotspot) on the normal hotspot bridge.
 
-        The shared infrastructure is constant-cost; only changed ports are moved.
+        This keeps access ports on the standard hotspot bridge and binds PPPoE
+        to that bridge. It also repairs the standard hotspot profile/files so
+        dual mode does not create or depend on a separate dual hotspot.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -4815,6 +5055,29 @@ class MikroTikAPI:
                     "partial_errors": errors,
                 }
 
+            hotspot_portal_result = None
+            if repair_hotspot:
+                hotspot_portal_result = self.ensure_existing_hotspot_captive_portal(
+                    interface=hotspot_bridge,
+                    profile_name=hotspot_profile_name,
+                    server_name=hotspot_server_name,
+                    hotspot_address=hotspot_address,
+                    address_pool=hotspot_address_pool,
+                    html_directory=hotspot_html_directory,
+                    login_page_url=login_page_url,
+                    fetch_check_certificate=fetch_check_certificate,
+                )
+                if hotspot_portal_result.get("error"):
+                    return {
+                        "error": f"Hotspot captive portal: {hotspot_portal_result['error']}",
+                        "partial_errors": errors + hotspot_portal_result.get("warnings", []),
+                        "hotspot_portal_result": hotspot_portal_result,
+                    }
+                errors.extend(
+                    f"Hotspot captive portal: {warning}"
+                    for warning in hotspot_portal_result.get("warnings", [])
+                )
+
             result = self.send_command("/ip/pool/add", {
                 "name": pppoe_pool_name,
                 "ranges": pppoe_pool_range,
@@ -4883,10 +5146,16 @@ class MikroTikAPI:
                     "warnings": errors,
                     "ports": target_ports,
                     "mode": "shared_hotspot_bridge",
+                    "hotspot_portal_result": hotspot_portal_result,
                 }
 
             logger.info("Dual-mode infrastructure setup completed on hotspot bridge")
-            return {"success": True, "ports": target_ports, "mode": "shared_hotspot_bridge"}
+            return {
+                "success": True,
+                "ports": target_ports,
+                "mode": "shared_hotspot_bridge",
+                "hotspot_portal_result": hotspot_portal_result,
+            }
         except Exception as e:
             logger.error(f"Error setting up dual infrastructure: {e}")
             return {"error": str(e), "partial_errors": errors}

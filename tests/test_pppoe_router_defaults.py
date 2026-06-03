@@ -8,6 +8,26 @@ def _connected_api():
     return api
 
 
+def test_hotspot_html_dir_defaults_to_hotspot_for_live_repairs():
+    api = _connected_api()
+    api.send_command = lambda command, args=None: {
+        "success": True,
+        "data": [{"board-name": "hEX S", "version": "7.15"}],
+    }
+
+    assert api._resolve_hotspot_html_dir() == "hotspot"
+
+
+def test_hotspot_html_dir_flash_is_only_v6_routerboard_opt_in():
+    api = _connected_api()
+    api.send_command = lambda command, args=None: {
+        "success": True,
+        "data": [{"board-name": "hEX S", "version": "6.49.10"}],
+    }
+
+    assert api._resolve_hotspot_html_dir(prefer_routerboard_flash=True) == "flash/hotspot"
+
+
 def test_ensure_pppoe_profile_sets_only_one_on_create():
     api = _connected_api()
     calls = []
@@ -285,6 +305,7 @@ def test_setup_dual_infrastructure_keeps_ports_on_hotspot_bridge():
     api = _connected_api()
     commands = []
     pppoe_servers = []
+    hotspot_portal_calls = []
 
     api.get_bridge_ports_status = lambda: {
         "success": True,
@@ -294,6 +315,9 @@ def test_setup_dual_infrastructure_keeps_ports_on_hotspot_bridge():
     api.verify_port_bridges = lambda expected, retries=1, delay=0.0: {"success": True}
     api.ensure_pppoe_profile = lambda **kwargs: {"success": True}
     api.ensure_pppoe_fasttrack_bypass = lambda **kwargs: {"success": True}
+    api.ensure_existing_hotspot_captive_portal = lambda **kwargs: (
+        hotspot_portal_calls.append(kwargs) or {"success": True, "warnings": []}
+    )
     api.get_pppoe_access_state = lambda **kwargs: {
         "success": True,
         "has_hotspot_bridge_pppoe": True,
@@ -314,6 +338,16 @@ def test_setup_dual_infrastructure_keeps_ports_on_hotspot_bridge():
 
     assert result["success"] is True
     assert result["mode"] == "shared_hotspot_bridge"
+    assert hotspot_portal_calls == [{
+        "interface": "bridge",
+        "profile_name": "hsprof1",
+        "server_name": "hotspot1",
+        "hotspot_address": "192.168.88.1",
+        "address_pool": "dhcp-pool",
+        "html_directory": None,
+        "login_page_url": None,
+        "fetch_check_certificate": False,
+    }]
     assert pppoe_servers == [(
         "bridge",
         {
@@ -356,6 +390,7 @@ def test_setup_dual_infrastructure_restores_legacy_bridge_dual_ports():
     api.ensure_pppoe_profile = lambda **kwargs: {"success": True}
     api.ensure_pppoe_server_on_interface = lambda *args, **kwargs: {"success": True}
     api.ensure_pppoe_fasttrack_bypass = lambda **kwargs: {"success": True}
+    api.ensure_existing_hotspot_captive_portal = lambda **kwargs: {"success": True, "warnings": []}
     api.get_pppoe_access_state = lambda **kwargs: {
         "success": True,
         "has_hotspot_bridge_pppoe": True,
@@ -403,8 +438,9 @@ def test_heal_dual_mode_sync_uses_db_and_legacy_dual_ports(monkeypatch):
                 ],
             }
 
-        def setup_dual_infrastructure(self, dual_ports):
+        def setup_dual_infrastructure(self, dual_ports, **kwargs):
             self.setup_ports = dual_ports
+            self.setup_kwargs = kwargs
             self.healed = True
             return {"success": True, "mode": "shared_hotspot_bridge"}
 

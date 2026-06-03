@@ -33,6 +33,12 @@ the normal hotspot `bridge` and bind PPPoE to that same bridge.
   as `dual` in port status.
 - Added `POST /api/routers/{router_id}/heal-dual-mode` to repair existing
   routers without changing customer billing, expiry, or passwords.
+- Follow-up: live dual-mode apply/heal now also repairs the standard hotspot
+  profile/server (`hsprof1` + `hotspot1`) on the normal `bridge`, aligns the
+  live API html-directory default with provisioning (`hotspot`, not inferred
+  `flash/hotspot`), and refreshes custom `login.html` from the router's linked
+  provisioning token when available. PPPoE-only provisioning remains on the
+  existing direct-port PPPoE path.
 
 ## Verification
 
@@ -41,6 +47,9 @@ the normal hotspot `bridge` and bind PPPoE to that same bridge.
 - Import check passed for `app.api.router_operations`.
 - Focused pytest could not run because the local virtualenv does not have
   `pytest` installed.
+- Follow-up compile/import checks passed again after adding the hotspot repair
+  and PPPoE workbook upload endpoint. Frontend `npm run build` passed after
+  adding the customer import UI.
 
 ## Follow-Up Work
 
