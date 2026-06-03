@@ -2440,7 +2440,13 @@ def _get_port_status_sync(router_info: dict) -> dict:
         access_state = api.get_pppoe_access_state()
         pppoe_ports = set(access_state.get("ports", [])) if access_state.get("success") else set()
         has_dual = access_state.get("has_dual", False) if access_state.get("success") else False
+        has_hotspot_bridge_pppoe = (
+            access_state.get("has_hotspot_bridge_pppoe", False)
+            if access_state.get("success") else False
+        )
         attachment_map = access_state.get("attachment_map", {}) if access_state.get("success") else {}
+        configured_dual_ports = set(router_info.get("dual_ports") or [])
+        has_dual = bool(has_dual or (has_hotspot_bridge_pppoe and configured_dual_ports))
 
         ifaces_data = api.get_all_interfaces_detail()
         ifaces_list = ifaces_data.get("data", []) if ifaces_data.get("success") else []
@@ -2453,7 +2459,12 @@ def _get_port_status_sync(router_info: dict) -> dict:
             bridge = port_bridge_map.get(name)
             attachment = attachment_map.get(name, {})
             attachment_mode = attachment.get("mode")
-            if attachment_mode == "dual":
+            shared_bridge_dual = (
+                name in configured_dual_ports
+                and bridge == "bridge"
+                and has_hotspot_bridge_pppoe
+            )
+            if attachment_mode == "dual" or shared_bridge_dual:
                 service = "dual"
             elif name in pppoe_ports:
                 service = "pppoe"
@@ -2468,8 +2479,12 @@ def _get_port_status_sync(router_info: dict) -> dict:
                 "port": name,
                 "bridge": bridge or "(none)",
                 "service": service,
-                "pppoe_attachment_mode": attachment.get("mode"),
-                "pppoe_server_interface": attachment.get("server_interface"),
+                "pppoe_attachment_mode": (
+                    "shared_hotspot_bridge" if shared_bridge_dual else attachment.get("mode")
+                ),
+                "pppoe_server_interface": (
+                    "bridge" if shared_bridge_dual else attachment.get("server_interface")
+                ),
                 "link_up": iface.get("running", False),
                 "disabled": iface.get("disabled", False),
                 "rx_byte": iface.get("rx_byte", 0),
@@ -2492,7 +2507,13 @@ def _get_port_status_sync(router_info: dict) -> dict:
                 "port_count": sum(1 for p in bridge_ports if p["bridge"] == bname),
             })
 
-        return {"success": True, "ports": ports, "bridges": bridge_info, "has_dual": has_dual}
+        return {
+            "success": True,
+            "ports": ports,
+            "bridges": bridge_info,
+            "has_dual": has_dual,
+            "has_hotspot_bridge_pppoe": has_hotspot_bridge_pppoe,
+        }
     except Exception as e:
         logger.error(f"Error getting port status: {e}")
         return {"error": str(e)}
@@ -2531,6 +2552,7 @@ async def get_router_port_status(
         "username": router_obj.username,
         "password": router_obj.password,
         "port": router_obj.port,
+        "dual_ports": router_obj.dual_ports or [],
     }
     await db.commit()
     result = await asyncio.to_thread(_get_port_status_sync, router_info)
@@ -2586,6 +2608,7 @@ async def get_router_port_status(
         "cached": False,
         "ports": result["ports"],
         "bridges": result["bridges"],
+        "has_hotspot_bridge_pppoe": result.get("has_hotspot_bridge_pppoe", False),
     }
 
     if db_corrected:
@@ -3446,6 +3469,11 @@ class SetDualPortsRequest(BaseModel):
     ports: List[str]
 
 
+class HealDualModeRequest(BaseModel):
+    ports: Optional[List[str]] = None
+    apply_access_defaults: bool = True
+
+
 def _apply_dual_ports_sync(
     router_info: dict,
     new_ports: list,
@@ -3457,9 +3485,9 @@ def _apply_dual_ports_sync(
 ) -> dict:
     """Apply dual-mode port configuration to the live router (sync, runs in thread pool).
 
-    Dual-mode moves selected ports onto a dedicated dual bridge that runs
-    both hotspot and PPPoE. Cross-mode migrations from PPPoE or plain are handled
-    within the same connection to avoid extra connect/disconnect cycles.
+    Dual-mode keeps selected ports on the normal hotspot bridge and runs a
+    PPPoE server on that same bridge. Cross-mode migrations from PPPoE or plain
+    are handled within the same connection to avoid extra connect/disconnect cycles.
     """
     api = MikroTikAPI(
         router_info["ip"],
@@ -3539,9 +3567,9 @@ async def set_dual_ports(
 ):
     """
     Configure which ethernet ports run in dual mode (PPPoE + Hotspot).
-    Selected ports are moved to a dedicated dual bridge where a hotspot
-    server and PPPoE server coexist, so PPPoE clients get a PPP session and non-PPPoE clients
-    (e.g. WiFi users behind an AP) hit the hotspot captive portal.
+    Selected ports stay on the normal hotspot bridge while a PPPoE server is
+    enabled on that same bridge, so PPPoE clients get a PPP session and
+    non-PPPoE clients hit the hotspot captive portal.
     Pass an empty list to remove dual mode and revert to hotspot-only.
     """
     user = await get_current_user(token, db)
@@ -3646,6 +3674,258 @@ async def set_dual_ports(
         resp["migrated_from_plain"] = sorted(plain_overlap)
         resp["plain_ports"] = router_obj.plain_ports
     return resp
+
+
+def _heal_dual_mode_sync(
+    router_info: dict,
+    requested_ports: Optional[list] = None,
+    apply_defaults: bool = True,
+) -> dict:
+    """Repair legacy dual-mode layout in one MikroTik API session."""
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=35,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {
+            "error": "connect_failed",
+            "message": api.last_connect_error or "Failed to connect to router",
+        }
+
+    try:
+        bridge_data = api.get_bridge_ports_status()
+        if bridge_data.get("error"):
+            return {"error": f"Could not read bridge ports: {bridge_data['error']}"}
+
+        bridge_ports = bridge_data.get("ports", []) if bridge_data.get("success") else []
+        bridge_map = {
+            port.get("interface", ""): port.get("bridge", "")
+            for port in bridge_ports
+        }
+        legacy_bridge_dual_ports = sorted(
+            port for port, bridge in bridge_map.items()
+            if bridge == "bridge-dual"
+        )
+
+        if requested_ports is None:
+            target_ports = list(dict.fromkeys(
+                list(router_info.get("dual_ports") or []) + legacy_bridge_dual_ports
+            ))
+        else:
+            target_ports = list(dict.fromkeys(requested_ports or []))
+
+        if not target_ports:
+            access_state = api.get_pppoe_access_state()
+            return {
+                "success": True,
+                "target_ports": [],
+                "legacy_bridge_dual_ports": legacy_bridge_dual_ports,
+                "has_hotspot_bridge_pppoe": bool(
+                    access_state.get("has_hotspot_bridge_pppoe")
+                    if access_state.get("success") else False
+                ),
+                "message": "No dual ports found to heal",
+            }
+
+        setup_result = api.setup_dual_infrastructure(dual_ports=target_ports)
+        if setup_result.get("error"):
+            setup_result["target_ports"] = target_ports
+            setup_result["legacy_bridge_dual_ports"] = legacy_bridge_dual_ports
+            return setup_result
+
+        warnings = list(setup_result.get("warnings") or [])
+        defaults_result = None
+        if apply_defaults:
+            defaults_result = api.apply_access_reconnect_defaults(
+                include_pppoe=True,
+                include_hotspot=True,
+            )
+            if defaults_result.get("error"):
+                warnings.append(f"Access defaults: {defaults_result['error']}")
+
+        final_bridge_data = api.get_bridge_ports_status()
+        if final_bridge_data.get("error"):
+            return {
+                "error": f"Could not verify healed bridge ports: {final_bridge_data['error']}",
+                "target_ports": target_ports,
+                "legacy_bridge_dual_ports": legacy_bridge_dual_ports,
+                "partial_errors": warnings,
+            }
+
+        final_bridge_ports = (
+            final_bridge_data.get("ports", [])
+            if final_bridge_data.get("success") else []
+        )
+        final_bridge_map = {
+            port.get("interface", ""): port.get("bridge", "")
+            for port in final_bridge_ports
+        }
+
+        failed_ports = []
+        for port in target_ports:
+            actual_bridge = final_bridge_map.get(port)
+            if actual_bridge != "bridge":
+                failed_ports.append({
+                    "port": port,
+                    "expected_bridge": "bridge",
+                    "actual_bridge": actual_bridge or "(none)",
+                })
+
+        final_access_state = api.get_pppoe_access_state()
+        if final_access_state.get("error"):
+            return {
+                "error": f"Could not verify healed PPPoE state: {final_access_state['error']}",
+                "target_ports": target_ports,
+                "legacy_bridge_dual_ports": legacy_bridge_dual_ports,
+                "failed_ports": failed_ports,
+                "partial_errors": warnings,
+            }
+
+        if not final_access_state.get("has_hotspot_bridge_pppoe"):
+            return {
+                "error": "PPPoE server is not active on the hotspot bridge after heal",
+                "target_ports": target_ports,
+                "legacy_bridge_dual_ports": legacy_bridge_dual_ports,
+                "failed_ports": failed_ports,
+                "partial_errors": warnings,
+            }
+
+        if failed_ports:
+            return {
+                "error": "One or more dual ports did not return to the hotspot bridge",
+                "target_ports": target_ports,
+                "legacy_bridge_dual_ports": legacy_bridge_dual_ports,
+                "failed_ports": failed_ports,
+                "partial_errors": warnings,
+            }
+
+        bridge_counts = {}
+        for bridge in final_bridge_map.values():
+            if bridge:
+                bridge_counts[bridge] = bridge_counts.get(bridge, 0) + 1
+
+        return {
+            "success": True,
+            "target_ports": target_ports,
+            "legacy_bridge_dual_ports": legacy_bridge_dual_ports,
+            "mode": "shared_hotspot_bridge",
+            "has_hotspot_bridge_pppoe": True,
+            "warnings": warnings,
+            "setup_result": setup_result,
+            "defaults_result": defaults_result,
+            "bridge_counts": bridge_counts,
+        }
+    finally:
+        api.disconnect()
+
+
+@router.post("/api/routers/{router_id}/heal-dual-mode")
+async def heal_dual_mode(
+    router_id: int,
+    request: Optional[HealDualModeRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Heal PPPoE + Hotspot dual-mode access without changing billing or passwords.
+
+    This repairs the legacy state where access ports were moved to
+    ``bridge-dual``. Healed ports are returned to the normal hotspot ``bridge``
+    while PPPoE is enabled on that same bridge.
+    """
+    request = request or HealDualModeRequest()
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    requested_ports = request.ports
+    if requested_ports is not None:
+        requested_ports = list(dict.fromkeys(requested_ports))
+        for port in requested_ports:
+            if port == "ether1":
+                raise HTTPException(
+                    status_code=400,
+                    detail="ether1 is the WAN port and cannot be used for dual mode",
+                )
+
+    current_pppoe = list(router_obj.pppoe_ports or [])
+    current_plain = list(router_obj.plain_ports or [])
+    current_dual = list(router_obj.dual_ports or [])
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+        "dual_ports": current_dual,
+    }
+
+    await db.commit()
+    result = await run_with_guard(
+        router_id,
+        _heal_dual_mode_sync,
+        router_info,
+        requested_ports,
+        request.apply_access_defaults,
+        timeout_seconds=55,
+    )
+
+    _port_status_cache.pop(router_id, None)
+
+    if result.get("error") == "busy":
+        raise HTTPException(status_code=429, detail=result.get("detail", "Router operation slots are busy"))
+    if result.get("error") == "timeout":
+        await record_router_availability(db, router_id, False, "heal_dual_mode")
+        raise HTTPException(status_code=504, detail=result.get("detail", "Router operation timed out"))
+    if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "heal_dual_mode")
+        raise HTTPException(
+            status_code=503,
+            detail=result.get("message", f"Failed to connect to router: {router_obj.name}"),
+        )
+    if result.get("error"):
+        await record_router_availability(db, router_id, False, "heal_dual_mode")
+        detail = {
+            "message": result["error"],
+            "target_ports": result.get("target_ports", []),
+            "legacy_bridge_dual_ports": result.get("legacy_bridge_dual_ports", []),
+            "failed_ports": result.get("failed_ports", []),
+        }
+        if result.get("partial_errors"):
+            detail["partial_errors"] = result["partial_errors"]
+        raise HTTPException(status_code=500, detail=detail)
+
+    healed_ports = list(result.get("target_ports") or [])
+    if healed_ports:
+        healed_set = set(healed_ports)
+        router_obj.dual_ports = healed_ports
+        router_obj.pppoe_ports = [p for p in current_pppoe if p not in healed_set] or None
+        router_obj.plain_ports = [p for p in current_plain if p not in healed_set] or None
+        await db.commit()
+
+    await record_router_availability(db, router_id, True, "heal_dual_mode")
+
+    return {
+        "success": True,
+        "router_id": router_id,
+        "router_name": router_obj.name,
+        "dual_ports": healed_ports if healed_ports else current_dual,
+        "legacy_bridge_dual_ports": result.get("legacy_bridge_dual_ports", []),
+        "mode": result.get("mode"),
+        "has_hotspot_bridge_pppoe": result.get("has_hotspot_bridge_pppoe", False),
+        "bridge_counts": result.get("bridge_counts", {}),
+        "warnings": result.get("warnings", []),
+        "defaults_applied": bool(request.apply_access_defaults),
+        "message": (
+            "Dual mode healed: ports are on hotspot bridge and PPPoE is active on that bridge"
+            if healed_ports
+            else result.get("message", "No dual ports found to heal")
+        ),
+    }
 
 
 # =========================================================================

@@ -1,3 +1,4 @@
+from app.api.router_operations import _heal_dual_mode_sync
 from app.services.mikrotik_api import MikroTikAPI
 
 
@@ -249,3 +250,188 @@ def test_apply_hotspot_reconnect_defaults_updates_existing_servers():
             "keepalive-timeout": "2m",
         },
     )]
+
+
+def test_hotspot_bridge_pppoe_server_does_not_make_all_bridge_ports_dedicated_pppoe():
+    api = _connected_api()
+
+    api.get_pppoe_server_status = lambda: {
+        "success": True,
+        "data": [{
+            "interface": "bridge",
+            "disabled": False,
+            "service_name": "pppoe-dual-bridge",
+        }],
+    }
+    api.get_bridge_ports_status = lambda: {
+        "success": True,
+        "bridges": {"bridge": {"name": "bridge"}},
+        "ports": [
+            {"interface": "ether2", "bridge": "bridge"},
+            {"interface": "ether3", "bridge": "bridge"},
+        ],
+    }
+
+    result = api.get_pppoe_access_state()
+
+    assert result["success"] is True
+    assert result["mode"] == "shared_hotspot_bridge"
+    assert result["ports"] == []
+    assert result["has_hotspot_bridge_pppoe"] is True
+    assert result["hotspot_bridge_servers"][0]["ports"] == ["ether2", "ether3"]
+
+
+def test_setup_dual_infrastructure_keeps_ports_on_hotspot_bridge():
+    api = _connected_api()
+    commands = []
+    pppoe_servers = []
+
+    api.get_bridge_ports_status = lambda: {
+        "success": True,
+        "bridges": {"bridge": {"name": "bridge"}},
+        "ports": [{"interface": "ether3", "bridge": "bridge"}],
+    }
+    api.verify_port_bridges = lambda expected, retries=1, delay=0.0: {"success": True}
+    api.ensure_pppoe_profile = lambda **kwargs: {"success": True}
+    api.ensure_pppoe_fasttrack_bypass = lambda **kwargs: {"success": True}
+    api.get_pppoe_access_state = lambda **kwargs: {
+        "success": True,
+        "has_hotspot_bridge_pppoe": True,
+    }
+
+    def ensure_pppoe_server_on_interface(interface, **kwargs):
+        pppoe_servers.append((interface, kwargs))
+        return {"success": True}
+
+    def send_command(command, args=None):
+        commands.append((command, args or {}))
+        return {"success": True}
+
+    api.ensure_pppoe_server_on_interface = ensure_pppoe_server_on_interface
+    api.send_command = send_command
+
+    result = api.setup_dual_infrastructure(["ether3"])
+
+    assert result["success"] is True
+    assert result["mode"] == "shared_hotspot_bridge"
+    assert pppoe_servers == [(
+        "bridge",
+        {
+            "profile_name": "default-pppoe",
+            "service_name_prefix": "pppoe-dual",
+            "verify": True,
+        },
+    )]
+    assert (
+        "/interface/bridge/add",
+        {"name": "bridge-dual"},
+    ) not in commands
+    assert not any(command == "/ip/hotspot/add" for command, _ in commands)
+    assert not any(
+        command == "/interface/bridge/port/add" and args.get("bridge") == "bridge-dual"
+        for command, args in commands
+    )
+
+
+def test_setup_dual_infrastructure_restores_legacy_bridge_dual_ports():
+    api = _connected_api()
+    teardown_calls = []
+
+    def get_bridge_ports_status():
+        return {
+            "success": True,
+            "bridges": {"bridge": {"name": "bridge"}},
+            "ports": [{"interface": "ether3", "bridge": "bridge-dual"}],
+        }
+
+    def teardown_dual_infrastructure(**kwargs):
+        teardown_calls.append(kwargs)
+        return {"success": True}
+
+    api.get_bridge_ports_status = get_bridge_ports_status
+    api.teardown_dual_infrastructure = teardown_dual_infrastructure
+    api.add_bridge_port = lambda *args, **kwargs: {"success": True}
+    api.verify_port_bridges = lambda expected, retries=1, delay=0.0: {"success": True}
+    api.send_command = lambda command, args=None: {"success": True}
+    api.ensure_pppoe_profile = lambda **kwargs: {"success": True}
+    api.ensure_pppoe_server_on_interface = lambda *args, **kwargs: {"success": True}
+    api.ensure_pppoe_fasttrack_bypass = lambda **kwargs: {"success": True}
+    api.get_pppoe_access_state = lambda **kwargs: {
+        "success": True,
+        "has_hotspot_bridge_pppoe": True,
+    }
+
+    result = api.setup_dual_infrastructure(["ether3"])
+
+    assert result["success"] is True
+    assert teardown_calls
+    assert teardown_calls[0]["ports_to_restore"] == ["ether3"]
+    assert teardown_calls[0]["remove_hotspot_bridge_pppoe"] is False
+
+
+def test_heal_dual_mode_sync_uses_db_and_legacy_dual_ports(monkeypatch):
+    created = []
+
+    class FakeAPI:
+        def __init__(self, *args, **kwargs):
+            self.connected = False
+            self.setup_ports = None
+            self.healed = False
+            created.append(self)
+
+        def connect(self):
+            self.connected = True
+            return True
+
+        def disconnect(self):
+            self.connected = False
+
+        def get_bridge_ports_status(self):
+            if self.healed:
+                return {
+                    "success": True,
+                    "ports": [
+                        {"interface": "ether2", "bridge": "bridge"},
+                        {"interface": "ether3", "bridge": "bridge"},
+                    ],
+                }
+            return {
+                "success": True,
+                "ports": [
+                    {"interface": "ether2", "bridge": "bridge-dual"},
+                    {"interface": "ether3", "bridge": "bridge"},
+                ],
+            }
+
+        def setup_dual_infrastructure(self, dual_ports):
+            self.setup_ports = dual_ports
+            self.healed = True
+            return {"success": True, "mode": "shared_hotspot_bridge"}
+
+        def apply_access_reconnect_defaults(self, include_pppoe=True, include_hotspot=True):
+            return {
+                "success": True,
+                "include_pppoe": include_pppoe,
+                "include_hotspot": include_hotspot,
+            }
+
+        def get_pppoe_access_state(self):
+            return {"success": True, "has_hotspot_bridge_pppoe": True}
+
+    monkeypatch.setattr("app.api.router_operations.MikroTikAPI", FakeAPI)
+
+    result = _heal_dual_mode_sync(
+        {
+            "ip": "10.0.0.1",
+            "username": "admin",
+            "password": "secret",
+            "port": 8728,
+            "dual_ports": ["ether3"],
+        }
+    )
+
+    assert result["success"] is True
+    assert result["target_ports"] == ["ether3", "ether2"]
+    assert result["legacy_bridge_dual_ports"] == ["ether2"]
+    assert result["mode"] == "shared_hotspot_bridge"
+    assert created[0].setup_ports == ["ether3", "ether2"]

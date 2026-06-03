@@ -2667,11 +2667,51 @@ class MikroTikAPI:
                          service: str = "pppoe", comment: str = "") -> Dict[str, Any]:
         """
         Add a PPPoE secret (customer credentials) on the router.
-        If the secret already exists, update it instead.
+        If the secret already exists, update it instead. When password is blank
+        or unknown, only an existing secret can be updated; its RouterOS password
+        is preserved.
         """
         if not self.connected:
             return {"error": "Not connected"}
         try:
+            password_known = password is not None and str(password) != ""
+            if not password_known:
+                secrets = self.send_command("/ppp/secret/print")
+                if not secrets.get("success") or not secrets.get("data"):
+                    return {
+                        "error": (
+                            f"PPPoE password is missing and existing secret '{username}' "
+                            "could not be verified"
+                        )
+                    }
+
+                existing_secret = None
+                for secret in secrets["data"]:
+                    if secret.get("name") == username:
+                        existing_secret = secret
+                        break
+
+                if not existing_secret:
+                    return {
+                        "error": (
+                            f"PPPoE password is missing and secret '{username}' does not "
+                            "already exist on the router"
+                        )
+                    }
+
+                update_args = {
+                    "numbers": existing_secret.get(".id") or username,
+                    "profile": profile,
+                    "service": service,
+                }
+                if comment:
+                    update_args["comment"] = comment
+                result = self.send_command("/ppp/secret/set", update_args)
+                if result.get("error"):
+                    return result
+                logger.info(f"Updated existing PPPoE secret for '{username}' without changing password")
+                return result
+
             args = {
                 "name": username,
                 "password": password,
@@ -3349,6 +3389,7 @@ class MikroTikAPI:
         self,
         legacy_bridge_name: str = "bridge-pppoe",
         dual_bridge_name: str = DUAL_BRIDGE_NAME,
+        hotspot_bridge_name: str = "bridge",
     ) -> Dict[str, Any]:
         """
         Discover how PPPoE access is attached on the router.
@@ -3357,6 +3398,7 @@ class MikroTikAPI:
         - direct: PPPoE server bound directly to physical interfaces
         - legacy_bridge: PPPoE server bound to a bridge such as bridge-pppoe
         - dual: PPPoE server bound to a dedicated dual bridge (both services coexist)
+        - shared_hotspot_bridge: PPPoE server bound to the normal hotspot bridge
         - mixed: a combination of direct and bridge-bound
         """
         if not self.connected:
@@ -3391,6 +3433,7 @@ class MikroTikAPI:
             direct_servers = []
             bridge_servers = []
             dual_servers = []
+            hotspot_bridge_servers = []
             attachment_map: Dict[str, Dict[str, Any]] = {}
 
             for server in enabled_servers:
@@ -3424,6 +3467,18 @@ class MikroTikAPI:
                         }
                     continue
 
+                if interface == hotspot_bridge_name:
+                    member_ports = bridge_ports_by_name.get(interface)
+                    if member_ports is None:
+                        member_result = self.get_ports_in_bridge(interface)
+                        member_ports = [] if member_result.get("error") else member_result.get("ports", [])
+
+                    hotspot_bridge_servers.append({
+                        **server,
+                        "ports": sorted(member_ports),
+                    })
+                    continue
+
                 if is_bridge_server:
                     member_ports = bridge_ports_by_name.get(interface)
                     if member_ports is None:
@@ -3454,8 +3509,16 @@ class MikroTikAPI:
             has_direct = bool(direct_ports)
             has_legacy = bool(bridge_ports_set)
             has_dual = bool(dual_servers)
+            has_hotspot_bridge_pppoe = bool(hotspot_bridge_servers)
 
-            if has_direct and has_legacy:
+            mode_count = sum(1 for present in (
+                has_direct,
+                has_legacy,
+                has_dual,
+                has_hotspot_bridge_pppoe,
+            ) if present)
+
+            if mode_count > 1:
                 mode = "mixed"
             elif has_direct:
                 mode = "direct"
@@ -3463,6 +3526,8 @@ class MikroTikAPI:
                 mode = "legacy_bridge"
             elif has_dual:
                 mode = "dual"
+            elif has_hotspot_bridge_pppoe:
+                mode = "shared_hotspot_bridge"
             else:
                 mode = "none"
 
@@ -3476,7 +3541,9 @@ class MikroTikAPI:
                 "direct_servers": direct_servers,
                 "bridge_servers": bridge_servers,
                 "dual_servers": dual_servers,
+                "hotspot_bridge_servers": hotspot_bridge_servers,
                 "has_dual": has_dual,
+                "has_hotspot_bridge_pppoe": has_hotspot_bridge_pppoe,
                 "attachment_map": attachment_map,
                 "enabled_servers": enabled_servers,
                 "bridge_map": bridge_map,
@@ -4689,80 +4756,64 @@ class MikroTikAPI:
                 p["interface"]: p["bridge"]
                 for p in bridge_data.get("ports", [])
             } if bridge_data.get("success") else {}
-            current_dual_ports = sorted(
+
+            # Older dual-mode code moved customer ports into a separate
+            # bridge-dual subnet. That can strand customer APs/ONTs outside the
+            # router's normal hotspot bridge/firewall/interface-list behavior.
+            # Treat bridge-dual as legacy and move any such ports back first.
+            legacy_dual_ports = sorted(
                 port for port, bridge in port_bridge_map.items()
                 if bridge == dual_bridge_name
             )
-            ports_to_restore = [
-                port for port in current_dual_ports
-                if port not in target_ports
-            ]
+            if legacy_dual_ports:
+                teardown = self.teardown_dual_infrastructure(
+                    hotspot_bridge=hotspot_bridge,
+                    dual_bridge_name=dual_bridge_name,
+                    dual_bridge_ip=dual_bridge_ip,
+                    dual_pool_name=dual_pool_name,
+                    dual_dhcp_server_name=dual_dhcp_server_name,
+                    dual_hotspot_profile_name=dual_hotspot_profile_name,
+                    dual_hotspot_server_name=dual_hotspot_server_name,
+                    dual_nat_comment=dual_nat_comment,
+                    ports_to_restore=legacy_dual_ports,
+                    remove_hotspot_bridge_pppoe=False,
+                )
+                if teardown.get("error"):
+                    return {"error": f"Failed to restore legacy dual bridge ports: {teardown['error']}"}
+                errors.extend(teardown.get("warnings", []))
 
-            result = self.send_command("/interface/bridge/add", {"name": dual_bridge_name})
-            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                return {"error": f"Dual bridge create: {result['error']}"}
+                bridge_data = self.get_bridge_ports_status()
+                port_bridge_map = {
+                    p["interface"]: p["bridge"]
+                    for p in bridge_data.get("ports", [])
+                } if bridge_data.get("success") else {}
 
-            dual_gateway = dual_bridge_ip.split("/")[0]
-            dual_subnet = dual_pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
+            port_errors = []
+            for port in target_ports:
+                current_bridge = port_bridge_map.get(port, "")
+                if current_bridge == hotspot_bridge:
+                    continue
+                move_result = self.add_bridge_port(port, hotspot_bridge, verify=False)
+                if move_result.get("error"):
+                    port_errors.append(f"{port}: {move_result['error']}")
 
-            result = self.send_command("/ip/address/add", {
-                "address": dual_bridge_ip,
-                "interface": dual_bridge_name,
-                "comment": "Dual bridge address",
-            })
-            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                errors.append(f"Dual bridge address: {result['error']}")
+            if port_errors:
+                return {
+                    "error": "Some ports failed while restoring dual mode to the hotspot bridge",
+                    "partial_errors": port_errors + errors,
+                }
 
-            result = self.send_command("/ip/pool/add", {
-                "name": dual_pool_name,
-                "ranges": dual_pool_range,
-            })
-            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                errors.append(f"Dual hotspot pool: {result['error']}")
-
-            dhcp_result = self.ensure_dhcp_server_on_interface(
-                name=dual_dhcp_server_name,
-                interface=dual_bridge_name,
-                address_pool=dual_pool_name,
-                verify=True,
+            verify_bridge = self.verify_port_bridges(
+                {port: hotspot_bridge for port in target_ports},
+                retries=3,
+                delay=0.3,
             )
-            if dhcp_result.get("error"):
-                return {"error": f"Dual DHCP: {dhcp_result['error']}"}
-
-            result = self.send_command("/ip/dhcp-server/network/add", {
-                "address": dual_subnet,
-                "gateway": dual_gateway,
-                "dns-server": "8.8.8.8,8.8.4.4",
-            })
-            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                errors.append(f"Dual DHCP network: {result['error']}")
-
-            hotspot_profile = self.ensure_hotspot_server_profile(
-                profile_name=dual_hotspot_profile_name,
-                hotspot_address=dual_gateway,
-            )
-            if hotspot_profile.get("error"):
-                return {"error": f"Dual hotspot profile: {hotspot_profile['error']}"}
-
-            hotspot_server = self.ensure_hotspot_server_on_interface(
-                interface=dual_bridge_name,
-                server_name=dual_hotspot_server_name,
-                profile_name=dual_hotspot_profile_name,
-                address_pool=dual_pool_name,
-                verify=True,
-            )
-            if hotspot_server.get("error"):
-                return {"error": f"Dual hotspot server: {hotspot_server['error']}"}
-
-            result = self.send_command("/ip/firewall/nat/add", {
-                "chain": "srcnat",
-                "src-address": dual_subnet,
-                "out-interface": "ether1",
-                "action": "masquerade",
-                "comment": dual_nat_comment,
-            })
-            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                errors.append(f"Dual hotspot NAT: {result['error']}")
+            if verify_bridge.get("error"):
+                return {
+                    "error": f"Dual ports were not restored to hotspot bridge: {verify_bridge['error']}",
+                    "failed_ports": verify_bridge.get("failed_ports", []),
+                    "partial_errors": errors,
+                }
 
             result = self.send_command("/ip/pool/add", {
                 "name": pppoe_pool_name,
@@ -4781,13 +4832,13 @@ class MikroTikAPI:
                 return {"error": f"PPPoE profile: {profile_result['error']}"}
 
             bind_result = self.ensure_pppoe_server_on_interface(
-                dual_bridge_name,
+                hotspot_bridge,
                 profile_name="default-pppoe",
                 service_name_prefix="pppoe-dual",
                 verify=True,
             )
             if bind_result.get("error"):
-                return {"error": f"PPPoE server on {dual_bridge_name}: {bind_result['error']}"}
+                return {"error": f"PPPoE server on {hotspot_bridge}: {bind_result['error']}"}
 
             pppoe_subnet = pppoe_pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
             result = self.send_command("/ip/firewall/nat/add", {
@@ -4801,44 +4852,17 @@ class MikroTikAPI:
                 errors.append(f"NAT: {result['error']}")
 
             bypass_result = self.ensure_pppoe_fasttrack_bypass(
-                bridge_name=dual_bridge_name,
+                bridge_name=hotspot_bridge,
                 pool_name=pppoe_pool_name,
                 fallback_pool_ranges=pppoe_pool_range,
             )
             if bypass_result.get("error"):
                 errors.append(f"FastTrack bypass: {bypass_result['error']}")
 
-            for port in ports_to_restore:
-                restore_result = self.add_bridge_port(port, hotspot_bridge, verify=False)
-                if restore_result.get("error"):
-                    errors.append(f"Restore {port} to {hotspot_bridge}: {restore_result['error']}")
-
-            for port in target_ports:
-                if port_bridge_map.get(port) == dual_bridge_name:
-                    continue
-                move_result = self.add_bridge_port(port, dual_bridge_name, verify=False)
-                if move_result.get("error"):
-                    errors.append(f"Move {port} to {dual_bridge_name}: {move_result['error']}")
-
-            expected = {port: dual_bridge_name for port in target_ports}
-            if ports_to_restore:
-                expected.update({port: hotspot_bridge for port in ports_to_restore})
-            verify = self.verify_port_bridges(expected, retries=3, delay=0.3)
-            if verify.get("error"):
-                failed = verify.get("failed_ports", [])
-                details = "; ".join(
-                    f"{item['port']} is in '{item['actual_bridge']}' (expected '{item['expected_bridge']}')"
-                    for item in failed
-                ) if failed else verify["error"]
-                return {
-                    "error": f"Dual bridge layout does not match the request: {details}",
-                    "failed_ports": failed,
-                    "partial_errors": errors,
-                }
-
             access_state = self.get_pppoe_access_state(
                 legacy_bridge_name="bridge-pppoe",
                 dual_bridge_name=dual_bridge_name,
+                hotspot_bridge_name=hotspot_bridge,
             )
             if access_state.get("error"):
                 return {
@@ -4846,21 +4870,23 @@ class MikroTikAPI:
                     "partial_errors": errors,
                 }
 
-            actual_dual_ports = set(access_state.get("dual_bridge_ports", []))
-            missing_dual = [port for port in target_ports if port not in actual_dual_ports]
-            if missing_dual:
+            if not access_state.get("has_hotspot_bridge_pppoe"):
                 return {
-                    "error": f"Dual PPPoE was not active on: {', '.join(missing_dual)}",
-                    "failed_ports": [{"port": port, "expected_mode": "dual"} for port in missing_dual],
+                    "error": f"Dual PPPoE server was not active on hotspot bridge '{hotspot_bridge}'",
                     "partial_errors": errors,
                 }
 
             if errors:
                 logger.warning(f"Dual infrastructure setup completed with warnings: {errors}")
-                return {"success": True, "warnings": errors, "ports": target_ports}
+                return {
+                    "success": True,
+                    "warnings": errors,
+                    "ports": target_ports,
+                    "mode": "shared_hotspot_bridge",
+                }
 
-            logger.info("Dual-mode infrastructure setup completed successfully")
-            return {"success": True, "ports": target_ports}
+            logger.info("Dual-mode infrastructure setup completed on hotspot bridge")
+            return {"success": True, "ports": target_ports, "mode": "shared_hotspot_bridge"}
         except Exception as e:
             logger.error(f"Error setting up dual infrastructure: {e}")
             return {"error": str(e), "partial_errors": errors}
@@ -4915,8 +4941,14 @@ class MikroTikAPI:
         dual_hotspot_server_name: str = DUAL_HOTSPOT_SERVER_NAME,
         dual_nat_comment: str = DUAL_HOTSPOT_NAT_COMMENT,
         ports_to_restore: Optional[List[str]] = None,
+        remove_hotspot_bridge_pppoe: bool = True,
     ) -> Dict[str, Any]:
-        """Remove the dual bridge infrastructure and optionally restore its ports."""
+        """Remove dual-mode infrastructure and optionally restore its ports.
+
+        Removes both the legacy dedicated bridge-dual PPPoE server and, when
+        requested, the shared hotspot-bridge PPPoE server used by the safer
+        dual-mode layout.
+        """
         if not self.connected:
             return {"error": "Not connected"}
         try:
@@ -4927,7 +4959,10 @@ class MikroTikAPI:
                 if restore.get("error"):
                     warnings.append(f"Restore {port}: {restore['error']}")
 
-            remove_result = self.remove_pppoe_servers([dual_bridge_name])
+            pppoe_interfaces = [dual_bridge_name]
+            if remove_hotspot_bridge_pppoe:
+                pppoe_interfaces.append(hotspot_bridge)
+            remove_result = self.remove_pppoe_servers(pppoe_interfaces)
             if remove_result.get("error"):
                 warnings.append(remove_result["error"])
 
