@@ -4,6 +4,7 @@ from sqlalchemy import select, func, text, delete, update, case
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta, date
+import asyncio
 
 from app.db.database import get_db
 from app.db.models import (
@@ -22,7 +23,7 @@ from app.db.models import (
     Lead, LeadActivity, LeadFollowUp, LeadSource,
     MtnMomoTransaction, AccessCredential,
 )
-from app.services.auth import verify_token, get_current_user
+from app.services.auth import verify_token, get_current_user, pwd_context
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
 from app.services.admin_metrics import compute_dashboard_v2_extras
 
@@ -35,6 +36,11 @@ router = APIRouter(tags=["admin-resellers"])
 # Only mobile_money payments flow through the admin's M-Pesa shortcode.
 # Cash and voucher payments are collected directly by the reseller.
 MPESA_FILTER = CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY
+
+
+class AdminPasswordResetRequest(BaseModel):
+    email: str
+    new_password: str
 
 
 def _parse_date(value: str, param_name: str = "date") -> datetime:
@@ -59,6 +65,37 @@ async def _get_reseller_or_404(db: AsyncSession, reseller_id: int) -> User:
     if not reseller:
         raise HTTPException(status_code=404, detail="Reseller not found")
     return reseller
+
+
+@router.post("/api/admin/users/password-reset")
+async def admin_reset_user_password(
+    request: AdminPasswordResetRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    await _require_admin(token, db)
+
+    email = request.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    if len(request.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    target.password_hash = await asyncio.to_thread(pwd_context.hash, request.new_password)
+    await db.commit()
+
+    return {
+        "success": True,
+        "user_id": target.id,
+        "email": target.email,
+        "role": target.role.value if target.role else None,
+        "message": "Password reset successfully",
+    }
 
 
 async def _total_payouts(db: AsyncSession, reseller_id: int) -> float:
