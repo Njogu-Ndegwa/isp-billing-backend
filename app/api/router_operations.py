@@ -37,6 +37,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["router-operations"])
 
 
+async def _run_locked_router_thread(router_obj: Router, sync_func, *args, **kwargs) -> dict:
+    """Run one live router mutation at a time per router."""
+    from app.services.mikrotik_background import router_locks
+
+    router_key = f"{router_obj.ip_address}:{router_obj.port}"
+    async with router_locks.acquire(router_key):
+        return await asyncio.to_thread(sync_func, *args, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Helper functions (sync, run in thread pool)
 # ---------------------------------------------------------------------------
@@ -2927,6 +2936,10 @@ def _apply_pppoe_ports_sync(
         return {"error": "connect_failed"}
     try:
         target_ports = list(dict.fromkeys(new_ports or []))
+        remaining_dual_after_request = [
+            p for p in (current_dual_ports or [])
+            if p not in (dual_ports_to_remove or [])
+        ]
 
         # Cross-mode migration: tear down plain on overlapping ports first.
         if plain_ports_to_remove:
@@ -2969,7 +2982,10 @@ def _apply_pppoe_ports_sync(
         # Clearing PPPoE entirely: restore actual current PPPoE ports and remove infra.
         if not target_ports:
             if current_ports:
-                teardown = api.teardown_pppoe_infrastructure(ports_to_restore=current_ports)
+                teardown = api.teardown_pppoe_infrastructure(
+                    ports_to_restore=current_ports,
+                    remove_shared_resources=not bool(remaining_dual_after_request),
+                )
                 if teardown.get("error"):
                     teardown["current_ports"] = current_ports
                     return teardown
@@ -3151,7 +3167,8 @@ async def set_pppoe_ports(
     }
     started_at = time.perf_counter()
     await db.commit()
-    result = await asyncio.to_thread(
+    result = await _run_locked_router_thread(
+        router_obj,
         _apply_pppoe_ports_sync,
         router_info,
         new_ports,
@@ -3260,6 +3277,10 @@ def _apply_plain_ports_sync(
         # Cross-mode migration: tear down PPPoE on overlapping ports first.
         if pppoe_ports_to_remove:
             remaining_pppoe = [p for p in (current_pppoe_ports or []) if p not in pppoe_ports_to_remove]
+            remaining_dual = [
+                p for p in (current_dual_ports or [])
+                if p not in (dual_ports_to_remove or [])
+            ]
             current_state = api.get_pppoe_access_state()
             if not current_state.get("error"):
                 restore = api.restore_ports_from_pppoe(
@@ -3268,7 +3289,10 @@ def _apply_plain_ports_sync(
                 if restore.get("error"):
                     return {"error": f"Failed to remove PPPoE before plain setup: {restore['error']}"}
                 if not remaining_pppoe:
-                    api.teardown_pppoe_infrastructure(ports_to_restore=[])
+                    api.teardown_pppoe_infrastructure(
+                        ports_to_restore=[],
+                        remove_shared_resources=not bool(remaining_dual),
+                    )
             else:
                 return {"error": f"Failed to read PPPoE state: {current_state['error']}"}
 
@@ -3401,7 +3425,8 @@ async def set_plain_ports(
     }
     started_at = time.perf_counter()
     await db.commit()
-    result = await asyncio.to_thread(
+    result = await _run_locked_router_thread(
+        router_obj,
         _apply_plain_ports_sync,
         router_info,
         new_ports,
@@ -3478,6 +3503,7 @@ async def set_plain_ports(
 
 class SetDualPortsRequest(BaseModel):
     ports: List[str]
+    repair_hotspot: Optional[bool] = None
 
 
 class HealDualModeRequest(BaseModel):
@@ -3518,6 +3544,7 @@ def _apply_dual_ports_sync(
     current_pppoe_ports: list = None,
     plain_ports_to_remove: list = None,
     current_plain_ports: list = None,
+    repair_hotspot: bool = True,
 ) -> dict:
     """Apply dual-mode port configuration to the live router (sync, runs in thread pool).
 
@@ -3549,7 +3576,10 @@ def _apply_dual_ports_sync(
                 if restore.get("error"):
                     return {"error": f"Failed to remove PPPoE before dual setup: {restore['error']}"}
                 if not remaining_pppoe:
-                    api.teardown_pppoe_infrastructure(ports_to_restore=[])
+                    api.teardown_pppoe_infrastructure(
+                        ports_to_restore=[],
+                        remove_shared_resources=not bool(target_ports),
+                    )
             else:
                 return {"error": f"Failed to read PPPoE state: {current_state['error']}"}
 
@@ -3585,6 +3615,7 @@ def _apply_dual_ports_sync(
             dual_ports=target_ports,
             login_page_url=router_info.get("login_page_url"),
             fetch_check_certificate=bool(router_info.get("fetch_check_certificate")),
+            repair_hotspot=repair_hotspot,
         )
         if setup_result.get("error"):
             setup_result["current_ports"] = old_ports
@@ -3644,9 +3675,15 @@ async def set_dual_ports(
         "port": router_obj.port,
     }
     router_info.update(await _router_login_fetch_options(db, router_id))
+    repair_hotspot = (
+        request.repair_hotspot
+        if request.repair_hotspot is not None
+        else bool(not old_ports or pppoe_overlap or plain_overlap)
+    )
     started_at = time.perf_counter()
     await db.commit()
-    result = await asyncio.to_thread(
+    result = await _run_locked_router_thread(
+        router_obj,
         _apply_dual_ports_sync,
         router_info,
         new_ports,
@@ -3655,6 +3692,7 @@ async def set_dual_ports(
         current_pppoe_ports=current_pppoe,
         plain_ports_to_remove=plain_ports_to_remove,
         current_plain_ports=current_plain,
+        repair_hotspot=repair_hotspot,
     )
     logger.info(
         "Dual port sync for router %s completed in %.2fs (requested=%s)",

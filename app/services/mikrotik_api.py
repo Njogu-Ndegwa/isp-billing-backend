@@ -4876,6 +4876,7 @@ class MikroTikAPI:
         bridge_name: str = "bridge-pppoe",
         pool_name: str = "pppoe-pool",
         service_name: str = "pppoe-server1",
+        remove_shared_resources: bool = True,
     ) -> Dict[str, Any]:
         """
         Tear down PPPoE infrastructure and move ports back to hotspot bridge:
@@ -4883,8 +4884,10 @@ class MikroTikAPI:
         2. Move ports back to hotspot bridge
         3. Remove bridge-pppoe IP address
         4. Remove bridge-pppoe
-        5. Remove PPPoE IP pool
-        6. Remove NAT rule for PPPoE
+        5. Optionally remove PPPoE IP pool and NAT rule
+
+        The pool/NAT are shared by dedicated PPPoE and dual mode. Keep them
+        when dual ports remain active.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -4921,25 +4924,28 @@ class MikroTikAPI:
                             self.send_command("/interface/bridge/remove", {"numbers": bid})
                             logger.info(f"Removed bridge '{bridge_name}'")
 
-            # 5. Remove PPPoE pool
-            pools = self.send_command("/ip/pool/print")
-            if pools.get("success") and pools.get("data"):
-                for pool in pools["data"]:
-                    if pool.get("name") == pool_name:
-                        pid = pool.get(".id")
-                        if pid:
-                            self.send_command("/ip/pool/remove", {"numbers": pid})
-                            logger.info(f"Removed IP pool '{pool_name}'")
+            if remove_shared_resources:
+                # 5. Remove PPPoE pool
+                pools = self.send_command("/ip/pool/print")
+                if pools.get("success") and pools.get("data"):
+                    for pool in pools["data"]:
+                        if pool.get("name") == pool_name:
+                            pid = pool.get(".id")
+                            if pid:
+                                self.send_command("/ip/pool/remove", {"numbers": pid})
+                                logger.info(f"Removed IP pool '{pool_name}'")
 
-            # 6. Remove NAT rule for PPPoE
-            nats = self.send_command("/ip/firewall/nat/print")
-            if nats.get("success") and nats.get("data"):
-                for nat in nats["data"]:
-                    if nat.get("comment") == "NAT for PPPoE clients":
-                        nid = nat.get(".id")
-                        if nid:
-                            self.send_command("/ip/firewall/nat/remove", {"numbers": nid})
-                            logger.info("Removed PPPoE NAT rule")
+                # 6. Remove NAT rule for PPPoE
+                nats = self.send_command("/ip/firewall/nat/print")
+                if nats.get("success") and nats.get("data"):
+                    for nat in nats["data"]:
+                        if nat.get("comment") == "NAT for PPPoE clients":
+                            nid = nat.get(".id")
+                            if nid:
+                                self.send_command("/ip/firewall/nat/remove", {"numbers": nid})
+                                logger.info("Removed PPPoE NAT rule")
+            else:
+                logger.info("Preserved shared PPPoE pool/NAT because dual mode remains active")
 
             if errors:
                 return {"success": True, "warnings": errors}
@@ -5378,33 +5384,85 @@ class MikroTikAPI:
             else:
                 logger.info(f"Plain infrastructure: created bridge '{bridge_name}'")
 
-            if not already_setup:
-                plain_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
-                infra_cmds = [
-                    ("/ip/address/add", {
-                        "address": bridge_ip, "interface": bridge_name,
-                        "comment": "Plain bridge address",
-                    }, "IP address"),
-                    ("/ip/pool/add", {"name": pool_name, "ranges": pool_range}, "Pool"),
-                    ("/ip/dhcp-server/add", {
-                        "name": "dhcp-plain", "interface": bridge_name,
-                        "address-pool": pool_name, "disabled": "no",
-                    }, "DHCP server"),
-                    ("/ip/dhcp-server/network/add", {
-                        "address": plain_subnet,
-                        "gateway": bridge_ip.split("/")[0],
-                        "dns-server": "8.8.8.8,8.8.4.4",
-                    }, "DHCP network"),
-                    ("/ip/firewall/nat/add", {
-                        "chain": "srcnat", "src-address": plain_subnet,
-                        "out-interface": "ether1", "action": "masquerade",
-                        "comment": "NAT for plain clients",
-                    }, "NAT"),
-                ]
-                for cmd, args, label in infra_cmds:
-                    result = self.send_command(cmd, args)
-                    if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                        errors.append(f"{label}: {result['error']}")
+            plain_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
+            gateway = bridge_ip.split("/")[0]
+
+            addrs = self.send_command("/ip/address/print")
+            existing_address = False
+            if addrs.get("success"):
+                existing_address = any(
+                    addr.get("interface") == bridge_name
+                    and (addr.get("address") or "").startswith(f"{gateway}/")
+                    for addr in addrs.get("data", []) or []
+                )
+            if not existing_address:
+                result = self.send_command("/ip/address/add", {
+                    "address": bridge_ip,
+                    "interface": bridge_name,
+                    "comment": "Plain bridge address",
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"IP address: {result['error']}")
+
+            pools = self.send_command("/ip/pool/print")
+            existing_pool = False
+            if pools.get("success"):
+                existing_pool = any(
+                    pool.get("name") == pool_name
+                    for pool in pools.get("data", []) or []
+                )
+            if not existing_pool:
+                result = self.send_command("/ip/pool/add", {"name": pool_name, "ranges": pool_range})
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"Pool: {result['error']}")
+
+            dhcp_result = self.ensure_dhcp_server_on_interface(
+                name="dhcp-plain",
+                interface=bridge_name,
+                address_pool=pool_name,
+                verify=False,
+            )
+            if dhcp_result.get("error"):
+                errors.append(f"DHCP server: {dhcp_result['error']}")
+
+            networks = self.send_command("/ip/dhcp-server/network/print")
+            existing_network = False
+            if networks.get("success"):
+                existing_network = any(
+                    net.get("gateway") == gateway or net.get("address") == plain_subnet
+                    for net in networks.get("data", []) or []
+                )
+            if not existing_network:
+                result = self.send_command("/ip/dhcp-server/network/add", {
+                    "address": plain_subnet,
+                    "gateway": gateway,
+                    "dns-server": "8.8.8.8,8.8.4.4",
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"DHCP network: {result['error']}")
+
+            nats = self.send_command("/ip/firewall/nat/print")
+            existing_nat = False
+            if nats.get("success"):
+                existing_nat = any(
+                    nat.get("comment") == "NAT for plain clients"
+                    or (
+                        nat.get("chain") == "srcnat"
+                        and nat.get("src-address") == plain_subnet
+                        and nat.get("action") == "masquerade"
+                    )
+                    for nat in nats.get("data", []) or []
+                )
+            if not existing_nat:
+                result = self.send_command("/ip/firewall/nat/add", {
+                    "chain": "srcnat",
+                    "src-address": plain_subnet,
+                    "out-interface": "ether1",
+                    "action": "masquerade",
+                    "comment": "NAT for plain clients",
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    errors.append(f"NAT: {result['error']}")
 
             port_errors = []
             for port in target_ports:

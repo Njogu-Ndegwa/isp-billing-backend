@@ -132,6 +132,90 @@ def test_ensure_pppoe_server_sets_reconnect_defaults_on_update():
     )
 
 
+def test_teardown_pppoe_can_preserve_shared_pool_and_nat_for_dual_mode():
+    api = _connected_api()
+    commands = []
+
+    def send_command_optimized(command, proplist=None, query=None):
+        if command == "/interface/pppoe-server/server/print":
+            return {
+                "success": True,
+                "data": [
+                    {".id": "*1", "interface": "ether2", "service-name": "pppoe-server1-ether2"},
+                    {".id": "*2", "interface": "bridge", "service-name": "pppoe-dual-bridge"},
+                ],
+            }
+        return {"success": True, "data": []}
+
+    def send_command(command, args=None):
+        commands.append((command, args or {}))
+        if command == "/ip/address/print":
+            return {"success": True, "data": [{".id": "*3", "interface": "bridge-pppoe"}]}
+        if command == "/interface/bridge/print":
+            return {"success": True, "data": [{".id": "*4", "name": "bridge-pppoe"}]}
+        if command == "/ip/pool/print":
+            return {"success": True, "data": [{".id": "*5", "name": "pppoe-pool"}]}
+        if command == "/ip/firewall/nat/print":
+            return {"success": True, "data": [{".id": "*6", "comment": "NAT for PPPoE clients"}]}
+        return {"success": True}
+
+    api.send_command_optimized = send_command_optimized
+    api.send_command = send_command
+    api.add_bridge_port = lambda *args, **kwargs: {"success": True}
+
+    result = api.teardown_pppoe_infrastructure(
+        ports_to_restore=["ether2"],
+        remove_shared_resources=False,
+    )
+
+    assert result["success"] is True
+    assert (
+        "/interface/pppoe-server/server/remove",
+        {"numbers": "*1"},
+    ) in commands
+    assert not any(command == "/ip/pool/remove" for command, _ in commands)
+    assert not any(command == "/ip/firewall/nat/remove" for command, _ in commands)
+
+
+def test_setup_plain_infrastructure_repairs_existing_bridge_stack():
+    api = _connected_api()
+    commands = []
+
+    def send_command_optimized(command, proplist=None, query=None):
+        if command == "/ip/dhcp-server/print":
+            return {"success": True, "data": []}
+        return {"success": True, "data": []}
+
+    def send_command(command, args=None):
+        commands.append((command, args or {}))
+        if command == "/interface/bridge/port/print":
+            return {"success": True, "data": [{"interface": "ether5", "bridge": "bridge"}]}
+        if command == "/interface/bridge/add":
+            return {"error": "failure: already have bridge with such name"}
+        if command in {
+            "/ip/address/print",
+            "/ip/pool/print",
+            "/ip/dhcp-server/network/print",
+            "/ip/firewall/nat/print",
+        }:
+            return {"success": True, "data": []}
+        return {"success": True}
+
+    api.send_command_optimized = send_command_optimized
+    api.send_command = send_command
+    api.remove_bridge_port = lambda *args, **kwargs: {"success": True}
+    api.add_bridge_port = lambda *args, **kwargs: {"success": True}
+
+    result = api.setup_plain_infrastructure(["ether5"])
+
+    assert result["success"] is True
+    assert any(command == "/ip/address/add" for command, _ in commands)
+    assert any(command == "/ip/pool/add" for command, _ in commands)
+    assert any(command == "/ip/dhcp-server/add" for command, _ in commands)
+    assert any(command == "/ip/dhcp-server/network/add" for command, _ in commands)
+    assert any(command == "/ip/firewall/nat/add" for command, _ in commands)
+
+
 def test_ensure_hotspot_server_sets_keepalive_default_on_create():
     api = _connected_api()
     calls = []
