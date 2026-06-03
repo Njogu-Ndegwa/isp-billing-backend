@@ -15,6 +15,15 @@ This file is the handoff map for coding agents working in this repository. Keep 
 - If working on a production incident or recurring bug, read the relevant note in `docs/agent-memory/incidents/`.
 - Preserve unrelated user changes in the worktree.
 
+## Production Reliability Guardrails
+
+- For DB pool or app-unresponsive incidents, check background jobs first, especially MikroTik cleanup, safety-net scans, bandwidth snapshots, and provisioning retry.
+- Never hold DB sessions while waiting on RouterOS, payment-provider, or other slow network I/O.
+- Optional background work must shed load when the DB pool is busy and must back off recently-offline routers instead of retrying the same unreachable devices every scheduler tick.
+- Avoid per-router concurrent DB rechecks after router scans; batch DB verification before fan-out or after fan-in.
+- Keep customer-facing request paths and payment provisioning higher priority than cleanup, snapshots, and retry safety nets.
+- Current detailed lesson: `docs/agent-memory/incidents/2026-06-02-db-pool-exhaustion-recurrence.md`.
+
 ## After Incidents
 
 When an error teaches us something useful, add or update an incident note under:
