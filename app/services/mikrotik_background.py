@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 SAFETY_NET_BYPASS_GRACE_PERIOD = timedelta(minutes=5)
 BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 70
 ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = timedelta(minutes=30)
-EXPIRED_ROUTER_CLEANUP_RETRY_WINDOW = timedelta(days=7)
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN = 60
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER = 15
 SAFETY_NET_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
@@ -847,71 +846,28 @@ async def cleanup_expired_users_background():
             now = datetime.utcnow()
             from sqlalchemy import or_
 
-            active_stmt = select(Customer).options(
+            stmt = select(Customer).options(
                 selectinload(Customer.router),
                 selectinload(Customer.plan),
             ).where(
                 Customer.status == CustomerStatus.ACTIVE,
                 Customer.expiry.isnot(None),
                 Customer.expiry <= now,
-            )
-            active_result = await db.execute(active_stmt)
-            active_expired_customers = active_result.scalars().all()
-
-            retry_cutoff = now - EXPIRED_ROUTER_CLEANUP_RETRY_WINDOW
-            inactive_retry_stmt = select(Customer).options(
-                selectinload(Customer.router),
-                selectinload(Customer.plan),
-            ).where(
-                Customer.status == CustomerStatus.INACTIVE,
-                Customer.expiry.isnot(None),
-                Customer.expiry <= now,
-                Customer.expiry >= retry_cutoff,
                 or_(
                     Customer.mac_address.isnot(None),
                     Customer.pppoe_username.isnot(None),
-                ),
-            )
-            inactive_retry_result = await db.execute(inactive_retry_stmt)
-            inactive_retry_customers = inactive_retry_result.scalars().all()
-
-            router_cleanup_candidates: dict[int, Customer] = {}
-            for customer in active_expired_customers:
-                customer.status = CustomerStatus.INACTIVE
-                if customer.mac_address or customer.pppoe_username:
-                    router_cleanup_candidates[customer.id] = customer
-
-            inactive_retry_count = 0
-            for customer in inactive_retry_customers:
-                if customer.id not in router_cleanup_candidates:
-                    inactive_retry_count += 1
-                router_cleanup_candidates.setdefault(customer.id, customer)
-
-            expired_customers = list(router_cleanup_candidates.values())
-            newly_deactivated_count = len(active_expired_customers)
-
-            if newly_deactivated_count:
-                logger.warning(
-                    "[CRON] Marked %d expired ACTIVE customer(s) INACTIVE before router cleanup",
-                    newly_deactivated_count,
                 )
-
-            if not expired_customers:
-                await db.commit()
-                return
-
-            logger.info(
-                "[CRON] Found %d expired customer(s) for router cleanup "
-                "(newly_deactivated=%d, inactive_retry=%d, retry_window_hours=%.1f)",
-                len(expired_customers),
-                newly_deactivated_count,
-                inactive_retry_count,
-                EXPIRED_ROUTER_CLEANUP_RETRY_WINDOW.total_seconds() / 3600,
             )
+            result = await db.execute(stmt)
+            expired_customers = result.scalars().all()
+            if not expired_customers:
+                return
+            logger.info(f"[CRON] Found {len(expired_customers)} expired ACTIVE customers to cleanup")
 
-            # Persist expiry-state self-healing before slow RouterOS work. Then
-            # do one short recheck so a customer renewed during this DB phase is
-            # not removed from the router with stale expiry data.
+            # Do not keep a DB connection checked out while RouterOS cleanup
+            # runs. Recheck expiry after releasing the first transaction so a
+            # customer renewed during this DB phase is not removed from the
+            # router with stale expiry data.
             await db.commit()
 
             candidate_ids = [customer.id for customer in expired_customers]
@@ -923,35 +879,17 @@ async def cleanup_expired_users_background():
             now_before_router_cleanup = datetime.utcnow()
             still_expired_ids: set[int] = set()
             renewed_ids: list[int] = []
-            renewed_ids_to_activate: list[int] = []
             for customer_id, status, expiry in current_state.all():
-                if expiry and expiry <= now_before_router_cleanup:
+                if status == CustomerStatus.ACTIVE and expiry and expiry <= now_before_router_cleanup:
                     still_expired_ids.add(customer_id)
                 else:
                     renewed_ids.append(customer_id)
-                    if expiry and expiry > now_before_router_cleanup and status != CustomerStatus.ACTIVE:
-                        renewed_ids_to_activate.append(customer_id)
 
             if renewed_ids:
                 logger.warning(
-                    "[CRON] Skipping %d customer(s) renewed before router cleanup: %s",
+                    "[CRON] Skipping %d customer(s) renewed or already deactivated before router cleanup: %s",
                     len(renewed_ids),
                     renewed_ids,
-                )
-
-            if renewed_ids_to_activate:
-                renewed_result = await db.execute(
-                    select(Customer).where(
-                        Customer.id.in_(renewed_ids_to_activate),
-                        Customer.expiry > now_before_router_cleanup,
-                    )
-                )
-                for customer in renewed_result.scalars().all():
-                    customer.status = CustomerStatus.ACTIVE
-                logger.warning(
-                    "[CRON] Restored ACTIVE status for %d renewed customer(s) before router cleanup: %s",
-                    len(renewed_ids_to_activate),
-                    renewed_ids_to_activate,
                 )
 
             expired_customers = [
@@ -1060,7 +998,7 @@ async def cleanup_expired_users_background():
             if batch_deferred:
                 logger.warning(
                     "[CRON] Deferred router cleanup for %d expired customer(s) due to batch limits "
-                    "(max_per_run=%d, max_per_router=%d); DB rows are already inactive and will retry: %s",
+                    "(max_per_run=%d, max_per_router=%d); DB rows remain ACTIVE until router cleanup succeeds: %s",
                     len(batch_deferred),
                     EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN,
                     EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER,
@@ -1181,13 +1119,7 @@ async def cleanup_expired_users_background():
                 )
 
             if all_failed_ids:
-                logger.warning(
-                    "[CRON] Router cleanup failed for %d expired customer(s); "
-                    "DB rows remain expired/inactive and will be retried while within the %.1fh retry window: %s",
-                    len(all_failed_ids),
-                    EXPIRED_ROUTER_CLEANUP_RETRY_WINDOW.total_seconds() / 3600,
-                    list(all_failed_ids),
-                )
+                logger.warning(f"[CRON] {len(all_failed_ids)} customers kept ACTIVE for retry: {list(all_failed_ids)}")
 
             duration = (datetime.utcnow() - start_time).total_seconds()
             removed_total = len(mikrotik_results["removed"]) + len(pppoe_results["removed"])

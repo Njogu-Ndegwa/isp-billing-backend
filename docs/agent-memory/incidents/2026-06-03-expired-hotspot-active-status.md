@@ -2,7 +2,7 @@
 
 ## Summary
 
-Expired hotspot customers continued appearing in the active-customer list after expiry. The affected rows had `status='active'`, past `expiry` values, and `hours_remaining=0`, so dashboard/API consumers still treated them as active even though billing time had elapsed.
+Expired hotspot customers continued appearing in the active-customer list after expiry. In this project `status='active'` is intended to mean the customer is still present/allowed on MikroTik; `INACTIVE` should only be set after router-side removal is confirmed.
 
 ## Symptoms
 
@@ -13,24 +13,19 @@ Expired hotspot customers continued appearing in the active-customer list after 
 
 ## Suspected Cause
 
-The expired cleanup job only marked a customer inactive after router-side MikroTik removal succeeded. After the pool-pressure changes, router cleanup was more conservative around slow/offline routers, which protected DB connections but exposed the latent coupling: when router cleanup was delayed, skipped, or failed, the billing row remained `ACTIVE`.
-
-The active-customer endpoint also filtered by `status` only, not `expiry`, so any stale `ACTIVE` row with a past expiry was returned.
+The expired cleanup job correctly marked a customer inactive only after router-side MikroTik removal succeeded, but cleanup could fall behind when RouterOS work exceeded the 67-second interval or a router was slow/offline. The bug to investigate is router-side cleanup reliability, not changing the meaning of `ACTIVE`/`INACTIVE`.
 
 ## Fix Applied
 
 - `app/services/mikrotik_background.py`
-  - Mark expired `ACTIVE` customers `INACTIVE` before any RouterOS cleanup.
-  - Retry MikroTik cleanup for recently expired inactive hotspot/PPPoE customers for a bounded 7-day window.
-  - Cap scheduled router cleanup work to 60 customers per run and 15 customers per router per run, while still deactivating all expired DB rows immediately.
-  - Recheck expiry before router cleanup and restore `ACTIVE` if a customer renewed during the cleanup race window.
-  - Update logs so failed router cleanup no longer says customers are kept active.
-- `app/api/customer_routes.py`
-  - Exclude expired rows from `/api/customers/active` even if status is stale.
+  - Preserve `ACTIVE` until router cleanup succeeds.
+  - Cap scheduled router cleanup work to 60 customers per run and 15 customers per router per run so automatic cleanup cannot overload routers/server.
+  - Recheck expiry/status before router cleanup so a renewed or already-deactivated customer is not removed with stale data.
+  - Keep failed/deferred customers `ACTIVE` for retry and operator visibility.
 - `app/api/router_operations.py`
-  - Apply the same status-first behavior to manual per-router expired cleanup.
+  - Preserve the same success-gated inactive transition for manual per-router expired cleanup.
 - `tests/test_expired_hotspot_cleanup.py`
-  - Added regression tests for failed router cleanup, retrying inactive expired rows, router cleanup batching, and active-list filtering.
+  - Added regression tests for failed router cleanup staying active, successful router cleanup marking inactive, router cleanup batching, and active-list visibility for expired active rows.
 
 ## Verification
 

@@ -28,7 +28,7 @@ async def _async_none(*_args, **_kwargs):
     return None
 
 
-async def test_cleanup_marks_expired_customer_inactive_even_when_router_cleanup_fails(
+async def test_cleanup_keeps_expired_customer_active_when_router_cleanup_fails(
     db,
     session_factory,
     monkeypatch,
@@ -67,11 +67,11 @@ async def test_cleanup_marks_expired_customer_inactive_even_when_router_cleanup_
     await mikrotik_background.cleanup_expired_users_background()
     await db.refresh(customer)
 
-    assert customer.status == CustomerStatus.INACTIVE
+    assert customer.status == CustomerStatus.ACTIVE
     assert cleanup_calls == [[customer.id]]
 
 
-async def test_cleanup_retries_recent_inactive_expired_customer(
+async def test_cleanup_marks_customer_inactive_after_router_cleanup_succeeds(
     db,
     session_factory,
     monkeypatch,
@@ -86,7 +86,7 @@ async def test_cleanup_retries_recent_inactive_expired_customer(
         reseller,
         plan,
         router,
-        status=CustomerStatus.INACTIVE,
+        status=CustomerStatus.ACTIVE,
         expiry=datetime.utcnow() - timedelta(minutes=30),
         mac_address="8E:B3:63:D7:1D:05",
     )
@@ -108,11 +108,13 @@ async def test_cleanup_retries_recent_inactive_expired_customer(
     )
 
     await mikrotik_background.cleanup_expired_users_background()
+    await db.refresh(customer)
 
+    assert customer.status == CustomerStatus.INACTIVE
     assert cleanup_calls == [[customer.id]]
 
 
-async def test_cleanup_deactivates_all_but_batches_router_removal(
+async def test_cleanup_batches_router_removal_and_leaves_deferred_customers_active(
     db,
     session_factory,
     monkeypatch,
@@ -159,11 +161,14 @@ async def test_cleanup_deactivates_all_but_batches_router_removal(
     for customer in customers:
         await db.refresh(customer)
 
-    assert [customer.status for customer in customers] == [CustomerStatus.INACTIVE] * 4
-    assert cleanup_calls == [[customers[0].id, customers[1].id]]
+    attempted_ids = set(cleanup_calls[0])
+    assert len(attempted_ids) == 2
+    for customer in customers:
+        expected = CustomerStatus.INACTIVE if customer.id in attempted_ids else CustomerStatus.ACTIVE
+        assert customer.status == expected
 
 
-async def test_active_customers_endpoint_excludes_expired_rows(db, monkeypatch):
+async def test_active_customers_endpoint_includes_expired_active_rows(db, monkeypatch):
     reseller = await make_reseller(db)
     plan = await make_plan(db, reseller)
     router = await make_router(db, reseller)
@@ -193,5 +198,5 @@ async def test_active_customers_endpoint_excludes_expired_rows(db, monkeypatch):
 
     response = await customer_routes.get_active_customers(db=db, token="token")
 
-    assert [item["id"] for item in response] == [current.id]
-    assert expired.id not in [item["id"] for item in response]
+    assert [item["id"] for item in response] == [expired.id, current.id]
+    assert response[0]["hours_remaining"] == 0
