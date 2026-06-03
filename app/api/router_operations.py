@@ -1167,14 +1167,20 @@ async def cleanup_expired_customers_for_router(
             raise HTTPException(status_code=404, detail="Router not found or not accessible")
         
         now = datetime.utcnow()
+        from app.services.mikrotik_background import EXPIRED_ROUTER_CLEANUP_RETRY_WINDOW
+        retry_cutoff = now - EXPIRED_ROUTER_CLEANUP_RETRY_WINDOW
         
         # Find expired customers for this router
         stmt = select(Customer).where(
             Customer.router_id == router_id,
-            Customer.status == CustomerStatus.ACTIVE,
+            Customer.status.in_([CustomerStatus.ACTIVE, CustomerStatus.INACTIVE]),
             Customer.expiry.isnot(None),
             Customer.expiry <= now,
-            Customer.mac_address.isnot(None)
+            Customer.mac_address.isnot(None),
+            or_(
+                Customer.status == CustomerStatus.ACTIVE,
+                Customer.expiry >= retry_cutoff,
+            )
         )
         
         result = await db.execute(stmt)
@@ -1189,6 +1195,66 @@ async def cleanup_expired_customers_for_router(
                 "cleaned_up": 0
             }
         
+        newly_deactivated_count = 0
+        for customer in expired_customers:
+            if customer.status == CustomerStatus.ACTIVE:
+                customer.status = CustomerStatus.INACTIVE
+                newly_deactivated_count += 1
+
+        if newly_deactivated_count:
+            logger.warning(
+                "[ROUTER-CLEANUP] Marked %d expired customer(s) INACTIVE before router cleanup",
+                newly_deactivated_count,
+            )
+
+        await db.commit()
+
+        current_state = await db.execute(
+            select(Customer.id, Customer.status, Customer.expiry).where(
+                Customer.id.in_([customer.id for customer in expired_customers])
+            )
+        )
+        now_before_router_cleanup = datetime.utcnow()
+        still_expired_ids = set()
+        renewed_ids_to_activate = []
+        for customer_id, status, expiry in current_state.all():
+            if expiry and expiry <= now_before_router_cleanup:
+                still_expired_ids.add(customer_id)
+            elif expiry and expiry > now_before_router_cleanup and status != CustomerStatus.ACTIVE:
+                renewed_ids_to_activate.append(customer_id)
+
+        if renewed_ids_to_activate:
+            renewed_result = await db.execute(
+                select(Customer).where(
+                    Customer.id.in_(renewed_ids_to_activate),
+                    Customer.expiry > now_before_router_cleanup,
+                )
+            )
+            for customer in renewed_result.scalars().all():
+                customer.status = CustomerStatus.ACTIVE
+            logger.warning(
+                "[ROUTER-CLEANUP] Restored ACTIVE status for %d renewed customer(s) before router cleanup: %s",
+                len(renewed_ids_to_activate),
+                renewed_ids_to_activate,
+            )
+
+        expired_customers = [
+            customer for customer in expired_customers
+            if customer.id in still_expired_ids
+        ]
+
+        await db.commit()
+
+        if not expired_customers:
+            return {
+                "success": True,
+                "message": "Expired customers were renewed before router cleanup",
+                "router_id": router_id,
+                "router_name": router_obj.name,
+                "cleaned_up": 0,
+                "deactivated": newly_deactivated_count
+            }
+
         # Prepare data for sync cleanup
         router_customers_map = {
             f"{router_obj.ip_address}:{router_obj.port}": {
@@ -1214,20 +1280,13 @@ async def cleanup_expired_customers_for_router(
         from app.services.mikrotik_background import router_locks, _cleanup_single_router_hotspot_sync
         
         router_key = f"{router_obj.ip_address}:{router_obj.port}"
-        await db.commit()
         async with router_locks.acquire(router_key):
             mikrotik_results = await asyncio.to_thread(
                 _cleanup_single_router_hotspot_sync,
                 router_customers_map[router_key]["router"],
                 router_customers_map[router_key]["customers"],
             )
-        
-        # Update database
-        successful_ids = [r["id"] for r in mikrotik_results["removed"]]
-        for customer in expired_customers:
-            if customer.id in successful_ids:
-                customer.status = CustomerStatus.INACTIVE
-        
+
         await db.commit()
         
         return {
@@ -1236,6 +1295,7 @@ async def cleanup_expired_customers_for_router(
             "router_id": router_id,
             "router_name": router_obj.name,
             "expired_found": len(expired_customers),
+            "deactivated": newly_deactivated_count,
             "cleaned_up": len(mikrotik_results["removed"]),
             "failed": len(mikrotik_results["failed"]),
             "details": mikrotik_results

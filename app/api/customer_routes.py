@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, update, text
+from sqlalchemy import select, delete, update, text, or_
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
@@ -512,9 +512,11 @@ async def get_active_customers(
     """Get all currently active guests, optionally filtered by router."""
     try:
         user = await get_current_user(token, db)
+        now = datetime.utcnow()
         stmt = select(Customer).where(
             Customer.user_id == user.id,
-            Customer.status == CustomerStatus.ACTIVE
+            Customer.status == CustomerStatus.ACTIVE,
+            or_(Customer.expiry.is_(None), Customer.expiry > now),
         ).options(
             selectinload(Customer.plan),
             selectinload(Customer.router)
@@ -524,8 +526,6 @@ async def get_active_customers(
         
         result = await db.execute(stmt)
         customers = result.scalars().all()
-        
-        now = datetime.utcnow()
         
         return [
             {

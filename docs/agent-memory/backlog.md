@@ -26,6 +26,13 @@ Project-level items that should survive across agent sessions.
 - Done so far: backend exposes `GET /api/admin/db-pool` for live SQLAlchemy pool counters, observed checkout peaks, recent 5-minute peak pressure, and an optional Postgres `pg_stat_activity` summary.
 - Proposed next step: add structured logs and lightweight metrics for request duration, background job duration, and MikroTik call duration by router ID.
 
+### Expired Cleanup Job Health
+
+- Status: planned
+- Problem: expired hotspot cleanup can fall behind when RouterOS calls are slow, and APScheduler only logs `max_instances` skips.
+- Why it matters: expired billing state must not depend on live router availability, and operators need an early signal before stale router access accumulates.
+- Proposed next step: record cleanup job duration, skipped-run count, expired rows deactivated, router cleanup failures, and retry backlog age in a DB-backed or metrics-backed health record.
+
 ### RADIUS Expansion
 
 - Status: planned
