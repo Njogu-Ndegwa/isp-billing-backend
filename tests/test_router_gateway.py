@@ -1,4 +1,6 @@
+import asyncio
 import dataclasses
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -149,3 +151,93 @@ def test_preflight_returns_none_when_clear(monkeypatch):
     monkeypatch.setattr(gw, "_is_circuit_open", lambda host, port: False)
     monkeypatch.setattr(gw, "_db_pool_busy", lambda: False)
     assert gw._preflight_skip(_snap(), Priority.BACKGROUND) is None
+
+
+class _FakeApi:
+    def __init__(self, connect_ok=True, raise_exc=None):
+        self._connect_ok = connect_ok
+        self._raise = raise_exc
+        self.disconnected = False
+        self.last_connect_error = "boom" if not connect_ok else None
+
+    def connect(self):
+        return self._connect_ok
+
+    def disconnect(self):
+        self.disconnected = True
+
+
+def _install_fake_connect(monkeypatch, api):
+    monkeypatch.setattr(gw, "connect_to_router", lambda snapshot: api)
+    monkeypatch.setattr(gw, "_is_circuit_open", lambda host, port: False)
+    monkeypatch.setattr(gw, "_db_pool_busy", lambda: False)
+
+
+async def test_run_router_op_ok_runs_op_with_connected_api(monkeypatch):
+    api = _FakeApi(connect_ok=True)
+    _install_fake_connect(monkeypatch, api)
+    result = await gw.run_router_op(
+        _snap(), lambda a: {"ran": True}, priority=Priority.INTERACTIVE, purpose="unit"
+    )
+    assert result.is_ok
+    assert result.value == {"ran": True}
+    assert api.disconnected is True
+
+
+async def test_run_router_op_connect_failure_maps_to_failed_connect(monkeypatch):
+    api = _FakeApi(connect_ok=False)
+    _install_fake_connect(monkeypatch, api)
+    result = await gw.run_router_op(
+        _snap(), lambda a: {"ran": True}, priority=Priority.INTERACTIVE, purpose="unit"
+    )
+    assert result.status is RouterOpStatus.FAILED_CONNECT
+    assert result.error == "boom"
+
+
+async def test_run_router_op_op_exception_maps_to_failed_op(monkeypatch):
+    api = _FakeApi(connect_ok=True)
+    _install_fake_connect(monkeypatch, api)
+    def boom(a):
+        raise ValueError("kaboom")
+    result = await gw.run_router_op(_snap(), boom, priority=Priority.BACKGROUND, purpose="unit")
+    assert result.status is RouterOpStatus.FAILED_OP
+    assert "kaboom" in result.error
+    assert api.disconnected is True
+
+
+async def test_run_router_op_honours_preflight_skip(monkeypatch):
+    api = _FakeApi(connect_ok=True)
+    _install_fake_connect(monkeypatch, api)
+    monkeypatch.setattr(gw, "_db_pool_busy", lambda: True)
+    result = await gw.run_router_op(
+        _snap(), lambda a: {"ran": True}, priority=Priority.BACKGROUND, purpose="unit"
+    )
+    assert result.status is RouterOpStatus.SKIPPED_DB_PRESSURE
+    assert api.disconnected is False
+
+
+async def test_run_router_op_respects_global_semaphore(monkeypatch):
+    monkeypatch.setattr(gw, "_SEMAPHORE", asyncio.Semaphore(2))
+    monkeypatch.setattr(gw, "_is_circuit_open", lambda host, port: False)
+    monkeypatch.setattr(gw, "_db_pool_busy", lambda: False)
+    active = 0
+    max_seen = 0
+
+    class _SleepApi(_FakeApi):
+        pass
+
+    monkeypatch.setattr(gw, "connect_to_router", lambda snapshot: _SleepApi())
+
+    def slow_op(a):
+        nonlocal active, max_seen
+        active += 1
+        max_seen = max(max_seen, active)
+        time.sleep(0.03)
+        active -= 1
+        return True
+
+    await asyncio.gather(*[
+        gw.run_router_op(_snap(), slow_op, priority=Priority.BACKGROUND, purpose="unit")
+        for _ in range(6)
+    ])
+    assert max_seen <= 2

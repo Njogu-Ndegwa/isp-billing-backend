@@ -11,11 +11,14 @@ See docs/superpowers/specs/2026-06-03-router-io-gateway-design.md
 """
 from __future__ import annotations
 
+import asyncio
 import enum
 import logging
 import os
 import socket
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Generic, Optional, TypeVar
@@ -23,6 +26,7 @@ from typing import Any, Callable, Generic, Optional, TypeVar
 from app.services.router_availability import router_recently_offline
 from app.services.mikrotik_api import _is_circuit_open  # circuit breaker stays here in Phases 0-2
 from app.db.database import db_pool_snapshot
+from app.services.router_helpers import connect_to_router
 
 logger = logging.getLogger("router_gateway")
 
@@ -132,3 +136,83 @@ def _preflight_skip(snapshot: RouterSnapshot, priority: Priority) -> Optional[Ro
         if _db_pool_busy():
             return RouterOpStatus.SKIPPED_DB_PRESSURE
     return None
+
+
+# Pinned global cap: the limit the asyncio default executor imposed before this gateway.
+_GLOBAL_CAP = min(32, (os.cpu_count() or 1) + 4)
+_EXECUTOR = ThreadPoolExecutor(max_workers=_GLOBAL_CAP, thread_name_prefix="router-io")
+_SEMAPHORE = asyncio.Semaphore(_GLOBAL_CAP)
+
+# Lightweight in-memory metrics for a future endpoint (purpose|status -> count).
+_metrics: "Counter[str]" = Counter()
+
+
+def _run_op_sync(snapshot: RouterSnapshot, op: Callable[[Any], T]) -> RouterOpResult:
+    started = time.monotonic()
+    api = connect_to_router(snapshot)
+    if not api.connect():
+        return RouterOpResult.failed(
+            RouterOpStatus.FAILED_CONNECT,
+            error=getattr(api, "last_connect_error", None) or "connection failed",
+            router_id=snapshot.id,
+            duration_ms=(time.monotonic() - started) * 1000,
+        )
+    try:
+        value = op(api)
+        return RouterOpResult.ok(
+            value=value, router_id=snapshot.id,
+            duration_ms=(time.monotonic() - started) * 1000,
+        )
+    except socket.timeout as exc:
+        return RouterOpResult.failed(
+            RouterOpStatus.TIMEOUT, error=str(exc) or "operation timed out",
+            router_id=snapshot.id, duration_ms=(time.monotonic() - started) * 1000,
+        )
+    except Exception as exc:  # noqa: BLE001 - boundary: any op error becomes a typed result
+        return RouterOpResult.failed(
+            RouterOpStatus.FAILED_OP, error=repr(exc),
+            router_id=snapshot.id, duration_ms=(time.monotonic() - started) * 1000,
+        )
+    finally:
+        try:
+            api.disconnect()
+        except Exception:
+            pass
+
+
+async def run_router_op(
+    snapshot: RouterSnapshot,
+    op: Callable[[Any], T],
+    *,
+    priority: Priority,
+    purpose: str,
+) -> RouterOpResult:
+    """Run `op(connected_api)` for one router under all gateway invariants.
+
+    `op` MUST NOT accept or touch a DB session. Build the snapshot and release
+    the session before calling.
+    """
+    skip = _preflight_skip(snapshot, priority)
+    if skip is not None:
+        _metrics[f"{purpose}|{skip.value}"] += 1
+        logger.info(
+            "router op skipped router_id=%s purpose=%s priority=%s status=%s",
+            snapshot.id, purpose, priority.value, skip.value,
+        )
+        return RouterOpResult.skipped(skip, router_id=snapshot.id)
+
+    loop = asyncio.get_event_loop()
+    async with _SEMAPHORE:
+        result = await loop.run_in_executor(_EXECUTOR, _run_op_sync, snapshot, op)
+
+    _metrics[f"{purpose}|{result.status.value}"] += 1
+    logger.info(
+        "router op done router_id=%s purpose=%s priority=%s status=%s duration_ms=%.1f",
+        snapshot.id, purpose, priority.value, result.status.value, result.duration_ms or 0.0,
+    )
+    return result
+
+
+def metrics_snapshot() -> dict:
+    """Copy of the in-memory purpose|status counters (for a future admin endpoint)."""
+    return dict(_metrics)
