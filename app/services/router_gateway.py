@@ -42,6 +42,18 @@ class RouterOpStatus(enum.Enum):
     TIMEOUT = "timeout"
 
 
+_SKIP_STATUSES = frozenset({
+    RouterOpStatus.SKIPPED_OFFLINE,
+    RouterOpStatus.SKIPPED_CIRCUIT_OPEN,
+    RouterOpStatus.SKIPPED_DB_PRESSURE,
+})
+_FAIL_STATUSES = frozenset({
+    RouterOpStatus.FAILED_CONNECT,
+    RouterOpStatus.FAILED_OP,
+    RouterOpStatus.TIMEOUT,
+})
+
+
 @dataclass(frozen=True)
 class RouterSnapshot:
     id: int
@@ -55,6 +67,8 @@ class RouterSnapshot:
 
     @classmethod
     def from_router(cls, router, now: Optional[datetime] = None) -> "RouterSnapshot":
+        # Non-nullable Router columns are accessed directly so a missing field fails
+        # loudly; only `identity` is nullable, hence getattr(..., None).
         return cls(
             id=router.id,
             name=router.name,
@@ -80,13 +94,17 @@ class RouterOpResult(Generic[T]):
         return self.status is RouterOpStatus.OK
 
     @classmethod
-    def ok(cls, value, router_id=None, duration_ms=None) -> "RouterOpResult":
+    def ok(cls, value, router_id=None, duration_ms=None) -> "RouterOpResult[T]":
         return cls(RouterOpStatus.OK, router_id=router_id, value=value, duration_ms=duration_ms)
 
     @classmethod
-    def skipped(cls, status: RouterOpStatus, router_id=None) -> "RouterOpResult":
+    def skipped(cls, status: RouterOpStatus, router_id=None) -> "RouterOpResult[None]":
+        if status not in _SKIP_STATUSES:
+            raise ValueError(f"skipped() requires a SKIPPED_* status, got {status}")
         return cls(status, router_id=router_id)
 
     @classmethod
-    def failed(cls, status: RouterOpStatus, error: str, router_id=None, duration_ms=None) -> "RouterOpResult":
+    def failed(cls, status: RouterOpStatus, error: str, router_id=None, duration_ms=None) -> "RouterOpResult[None]":
+        if status not in _FAIL_STATUSES:
+            raise ValueError(f"failed() requires a FAILED_*/TIMEOUT status, got {status}")
         return cls(status, router_id=router_id, error=error, duration_ms=duration_ms)

@@ -1,5 +1,8 @@
+import dataclasses
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+
+import pytest
 
 from app.services.router_availability import router_recently_offline
 
@@ -70,12 +73,8 @@ def test_router_snapshot_is_frozen():
         id=1, name="x", ip_address="1.1.1.1", port=8728,
         username="u", password="p", identity=None, recently_offline=False,
     )
-    import dataclasses
-    try:
+    with pytest.raises(dataclasses.FrozenInstanceError):
         snap.password = "leak"
-        assert False, "snapshot must be immutable"
-    except dataclasses.FrozenInstanceError:
-        pass
 
 
 def test_result_ok_helper_sets_status_and_value():
@@ -89,3 +88,27 @@ def test_result_skipped_helper_is_not_ok():
     r = RouterOpResult.skipped(RouterOpStatus.SKIPPED_OFFLINE, router_id=3)
     assert r.is_ok is False
     assert r.value is None
+
+
+def test_result_failed_helper_carries_error_and_is_not_ok():
+    r = RouterOpResult.failed(RouterOpStatus.FAILED_CONNECT, error="boom", router_id=5)
+    assert r.is_ok is False
+    assert r.error == "boom"
+    assert r.value is None
+
+
+def test_result_factories_reject_wrong_status():
+    with pytest.raises(ValueError):
+        RouterOpResult.skipped(RouterOpStatus.OK)
+    with pytest.raises(ValueError):
+        RouterOpResult.failed(RouterOpStatus.OK, error="x")
+
+
+def test_router_snapshot_identity_defaults_to_none_when_absent():
+    now = datetime(2026, 6, 3, 12, 0, 0)
+    router = SimpleNamespace(
+        id=9, name="R9", ip_address="10.0.0.9", port=8728,
+        username="u", password="p", last_status=True, last_checked_at=now,
+    )  # no `identity` attribute at all
+    snap = RouterSnapshot.from_router(router, now=now)
+    assert snap.identity is None
