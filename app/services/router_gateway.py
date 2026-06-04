@@ -116,7 +116,7 @@ class RouterOpResult(Generic[T]):
         return cls(status, router_id=router_id, error=error, duration_ms=duration_ms)
 
 
-# Pinned to pre-refactor behaviour (the prior asyncio default-executor limit).
+# BACKGROUND router work is skipped when DB pool checkout reaches this percent.
 BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 70
 
 
@@ -201,7 +201,7 @@ async def run_router_op(
         )
         return RouterOpResult.skipped(skip, router_id=snapshot.id)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     async with _SEMAPHORE:
         result = await loop.run_in_executor(_EXECUTOR, _run_op_sync, snapshot, op)
 
@@ -213,6 +213,6 @@ async def run_router_op(
     return result
 
 
-def metrics_snapshot() -> dict:
+def metrics_snapshot() -> dict[str, int]:
     """Copy of the in-memory purpose|status counters (for a future admin endpoint)."""
     return dict(_metrics)

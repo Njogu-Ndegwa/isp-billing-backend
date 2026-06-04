@@ -154,9 +154,8 @@ def test_preflight_returns_none_when_clear(monkeypatch):
 
 
 class _FakeApi:
-    def __init__(self, connect_ok=True, raise_exc=None):
+    def __init__(self, connect_ok=True):
         self._connect_ok = connect_ok
-        self._raise = raise_exc
         self.disconnected = False
         self.last_connect_error = "boom" if not connect_ok else None
 
