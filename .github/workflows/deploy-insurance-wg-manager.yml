@@ -67,6 +67,8 @@ jobs:
             --cap-add NET_ADMIN \
             -e WG_INTERFACE=wg1 \
             -e WG_MANAGER_SECRET="$WG_MANAGER_SECRET" \
+            -e L2TP_CHAP_SECRETS_PATH=/etc/ppp/chap-secrets \
+            -v /etc/ppp:/etc/ppp \
             --restart unless-stopped \
             isp-insurance-wg-manager:latest \
             uvicorn main:app --host 0.0.0.0 --port 8729
