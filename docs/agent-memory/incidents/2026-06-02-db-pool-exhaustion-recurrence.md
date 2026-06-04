@@ -18,6 +18,7 @@ The captured log in `pool-exhausted.md` showed failures across login, public por
 - Many RouterOS calls were failing or timing out against offline/unreachable routers before the pool errors.
 - A point-in-time `/api/admin/db-pool` check can look healthy before or after the spike, even when a recent spike reached exhaustion.
 - A later recurrence showed the pool at about `90%` while normal app requests degraded. The logs showed expired-user cleanup repeatedly finding about `98-99` expired customers and hitting many of the same unreachable routers every `67s`.
+- On 2026-06-04 the pool was observed around `63%` during active admin/portal/payment traffic. This was not exhausted, but it was too high for comfort because bandwidth collection was still overrunning its interval and APScheduler skipped follow-up bandwidth runs due to `max_instances=1`.
 
 ## Suspected Cause
 
@@ -39,7 +40,7 @@ Each individual DB session was short-lived, but the concurrent burst could hit a
   - expired-user cleanup records failed router connections as offline and skips recently-offline routers for 30 minutes;
   - safety-net cleanup skips recently-offline routers, runs at most every 10 minutes, and is skipped when DB pool checkout is already high;
   - idle access credential reaping skips recently-offline routers, runs at most every 5 minutes, and is skipped together with safety-net cleanup under DB pressure;
-  - bandwidth collection skips when DB pool checkout is high and skips routers marked offline within the last 30 minutes;
+  - bandwidth collection skips when DB pool checkout is high, skips routers marked offline within the last 30 minutes, and processes a bounded rotating router batch per run;
   - shared background router concurrency was lowered from 6 to 3.
 - `app/services/hotspot_provisioning.py`
   - retry provisioning router groups are capped at 4 concurrent groups;
