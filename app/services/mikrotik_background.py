@@ -29,6 +29,7 @@ from app.db.models import (
 )
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.router_availability import record_router_availability, prune_router_availability_history
+from app.services.router_availability import router_recently_offline as _shared_router_recently_offline
 from app.services.usage_tracking import record_usage
 from app.core.protected_devices import is_protected_device
 from app.config import settings
@@ -87,12 +88,7 @@ def _router_recently_offline(
     now: datetime,
     threshold: timedelta = ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD,
 ) -> bool:
-    last_checked = getattr(router, "last_checked_at", None)
-    return (
-        getattr(router, "last_status", None) is False
-        and last_checked is not None
-        and (now - last_checked) < threshold
-    )
+    return _shared_router_recently_offline(router, now, threshold)
 
 
 def _background_db_pool_is_busy(job_name: str) -> bool:

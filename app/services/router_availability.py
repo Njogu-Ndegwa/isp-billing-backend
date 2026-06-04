@@ -1,11 +1,32 @@
 from datetime import datetime, timedelta
-from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Router, RouterAvailabilityCheck
+
+
+ROUTER_OFFLINE_SKIP_PERIOD = timedelta(minutes=30)
+
+
+def router_recently_offline(
+    router,
+    now: Optional[datetime] = None,
+    threshold: timedelta = ROUTER_OFFLINE_SKIP_PERIOD,
+) -> bool:
+    """True when the router's persisted status is offline and the failure is recent.
+
+    Mirrors the previous private helper in mikrotik_background so the gateway and
+    background jobs share one definition. Reads only already-loaded ORM fields.
+    """
+    now = now or datetime.utcnow()
+    last_checked = getattr(router, "last_checked_at", None)
+    return (
+        getattr(router, "last_status", None) is False
+        and last_checked is not None
+        and (now - last_checked) < threshold
+    )
 
 
 ROUTER_STATUS_STALE_AFTER_SECONDS = 600
