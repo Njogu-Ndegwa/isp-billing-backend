@@ -42,12 +42,14 @@ import time
 logger = logging.getLogger(__name__)
 
 SAFETY_NET_BYPASS_GRACE_PERIOD = timedelta(minutes=5)
-BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 70
+BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 60
 ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = ROUTER_OFFLINE_SKIP_PERIOD  # single source: see router_availability
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN = 60
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER = 15
 SAFETY_NET_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
 ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL = timedelta(minutes=5)
+BANDWIDTH_MAX_ROUTERS_PER_RUN = 8
+BANDWIDTH_RUN_TIME_BUDGET_SECONDS = 90
 
 
 class RouterLockManager:
@@ -77,6 +79,7 @@ cleanup_running = False
 queue_sync_running = False
 _last_safety_net_cleanup_at: datetime | None = None
 _last_access_credential_reaper_at: datetime | None = None
+_bandwidth_router_cursor = 0
 
 # Rate limiting constants for queue sync
 SYNC_DELAY_BETWEEN_COMMANDS = 0.1
@@ -1132,8 +1135,8 @@ async def cleanup_expired_users_background():
                 return
 
             try:
-                logger.info(f"[CRON] Running safety net bypass cleanup...")
                 if _interval_due(_last_safety_net_cleanup_at, now_optional, SAFETY_NET_CLEANUP_MIN_INTERVAL):
+                    logger.info("[CRON] Running safety net bypass cleanup...")
                     _last_safety_net_cleanup_at = now_optional
                     bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
                     if bypass_cleaned > 0:
@@ -1995,19 +1998,34 @@ def _fetch_bandwidth_data_sync_for_router(router_info: dict):
     api.disconnect()
 
     pppoe_count = len(pppoe_sessions.get("data", [])) if pppoe_sessions.get("success") else 0
-    logger.info(f"[BANDWIDTH] Router {router_info['id']} raw data:")
-    logger.info(f"  - Hotspot active sessions: {len(active_sessions.get('data', []))}")
-    logger.info(f"  - PPPoE active sessions: {pppoe_count}")
-    logger.info(f"  - Hotspot hosts total: {hotspot_hosts.get('total', 0)}, bypassed: {hotspot_hosts.get('bypassed', 0)}")
-    logger.info(f"  - ARP entries: {arp_entries.get('count', 0)}")
-    logger.info(f"  - Queue stats: active_queues={speed_stats.get('data', {}).get('active_queues', 0)}, total_queues={speed_stats.get('data', {}).get('total_queues', 0)}")
+    interface_count = len(traffic.get("data", [])) if traffic.get("success") else 0
+    logger.info(
+        "[BANDWIDTH] Router %s summary: hotspot_sessions=%s, pppoe_sessions=%s, "
+        "hotspot_hosts=%s, bypassed=%s, arp_entries=%s, active_queues=%s, "
+        "total_queues=%s, interfaces=%s",
+        router_info["id"],
+        len(active_sessions.get("data", [])),
+        pppoe_count,
+        hotspot_hosts.get("total", 0),
+        hotspot_hosts.get("bypassed", 0),
+        arp_entries.get("count", 0),
+        speed_stats.get("data", {}).get("active_queues", 0),
+        speed_stats.get("data", {}).get("total_queues", 0),
+        interface_count,
+    )
 
     if traffic.get("success"):
-        logger.info(f"  - Interfaces found:")
+        logger.debug("[BANDWIDTH] Router %s interfaces:", router_info["id"])
         for iface in traffic.get("data", []):
             rx_mb = round(iface.get("rx_byte", 0) / 1048576, 2)
             tx_mb = round(iface.get("tx_byte", 0) / 1048576, 2)
-            logger.info(f"    * {iface.get('name')}: running={iface.get('running')}, rx={rx_mb}MB, tx={tx_mb}MB")
+            logger.debug(
+                "[BANDWIDTH]   * %s: running=%s, rx=%sMB, tx=%sMB",
+                iface.get("name"),
+                iface.get("running"),
+                rx_mb,
+                tx_mb,
+            )
     else:
         logger.warning(f"  - Interface traffic fetch failed: {traffic.get('error', 'unknown')}")
 
@@ -2039,10 +2057,12 @@ def _fetch_bandwidth_data_sync():
 
 
 async def collect_bandwidth_snapshot():
+    global _bandwidth_router_cursor
     try:
         if _background_db_pool_is_busy("BANDWIDTH"):
             return
         now = datetime.utcnow()
+        run_started = time.monotonic()
         async with async_session() as db:
             routers_result = await db.execute(select(Router))
             routers = routers_result.scalars().all()
@@ -2051,16 +2071,62 @@ async def collect_bandwidth_snapshot():
                 return
             await db.commit()
 
+            eligible_routers = []
+            skipped_radius = 0
+            skipped_offline = 0
             for router in routers:
                 if getattr(router, 'auth_method', None) == 'RADIUS':
+                    skipped_radius += 1
                     continue
                 if _router_recently_offline(router, now):
+                    skipped_offline += 1
                     logger.debug(
                         "[BANDWIDTH] Skipping recently-offline router %s (%s)",
                         router.id,
                         router.ip_address,
                     )
                     continue
+                eligible_routers.append(router)
+
+            if not eligible_routers:
+                logger.info(
+                    "[BANDWIDTH] No eligible routers this run (total=%d, radius=%d, recently_offline=%d)",
+                    len(routers),
+                    skipped_radius,
+                    skipped_offline,
+                )
+                return
+
+            start_index = _bandwidth_router_cursor % len(eligible_routers)
+            ordered_routers = eligible_routers[start_index:] + eligible_routers[:start_index]
+            routers_to_process = ordered_routers[:BANDWIDTH_MAX_ROUTERS_PER_RUN]
+            processed_count = 0
+            logger.info(
+                "[BANDWIDTH] Processing %d/%d eligible router(s) this run "
+                "(total=%d, radius=%d, recently_offline=%d, cursor=%d)",
+                len(routers_to_process),
+                len(eligible_routers),
+                len(routers),
+                skipped_radius,
+                skipped_offline,
+                start_index,
+            )
+
+            for router in routers_to_process:
+                if time.monotonic() - run_started >= BANDWIDTH_RUN_TIME_BUDGET_SECONDS:
+                    logger.warning(
+                        "[BANDWIDTH] Stopping run after %.1fs budget; processed %d router(s)",
+                        time.monotonic() - run_started,
+                        processed_count,
+                    )
+                    break
+                if _background_db_pool_is_busy("BANDWIDTH"):
+                    logger.warning(
+                        "[BANDWIDTH] Stopping run due to DB pool pressure after %d router(s)",
+                        processed_count,
+                    )
+                    break
+                processed_count += 1
                 try:
                     router_info = {
                         "id": router.id, "ip_address": router.ip_address,
@@ -2343,12 +2409,19 @@ async def collect_bandwidth_snapshot():
                         logger.error(f"[BANDWIDTH] Rollback after router error failed: {rb_err}")
                     continue
 
+            _bandwidth_router_cursor = (start_index + processed_count) % len(eligible_routers)
+
             cutoff = now - timedelta(days=1)
             await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
             await prune_router_availability_history(db, now=now)
             await db.commit()
 
-        logger.info(f"Bandwidth snapshot collected for {len(routers)} router(s)")
+        logger.info(
+            "Bandwidth snapshot run processed %d/%d eligible router(s) out of %d total router(s)",
+            processed_count,
+            len(eligible_routers),
+            len(routers),
+        )
     except Exception as e:
         from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
         from app.db.database import db_pool_status
