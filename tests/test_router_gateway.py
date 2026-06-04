@@ -24,3 +24,9 @@ def test_router_recently_offline_false_when_online_or_unknown():
     assert router_recently_offline(
         SimpleNamespace(last_status=None, last_checked_at=None), now
     ) is False
+
+
+def test_router_recently_offline_false_at_exact_threshold():
+    now = datetime(2026, 6, 3, 12, 0, 0)
+    router = SimpleNamespace(last_status=False, last_checked_at=now - timedelta(minutes=30))
+    assert router_recently_offline(router, now) is False

@@ -30,6 +30,7 @@ from app.db.models import (
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.router_availability import record_router_availability, prune_router_availability_history
 from app.services.router_availability import router_recently_offline as _shared_router_recently_offline
+from app.services.router_availability import ROUTER_OFFLINE_SKIP_PERIOD
 from app.services.usage_tracking import record_usage
 from app.core.protected_devices import is_protected_device
 from app.config import settings
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 SAFETY_NET_BYPASS_GRACE_PERIOD = timedelta(minutes=5)
 BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 70
-ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = timedelta(minutes=30)
+ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = ROUTER_OFFLINE_SKIP_PERIOD  # single source: see router_availability
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN = 60
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER = 15
 SAFETY_NET_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
@@ -88,6 +89,7 @@ def _router_recently_offline(
     now: datetime,
     threshold: timedelta = ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD,
 ) -> bool:
+    # Wrapper exists solely to keep a non-optional `now` signature for existing call sites; delegates to the shared helper.
     return _shared_router_recently_offline(router, now, threshold)
 
 
