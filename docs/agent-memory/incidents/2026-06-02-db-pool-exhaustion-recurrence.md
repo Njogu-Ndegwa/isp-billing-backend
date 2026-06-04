@@ -29,6 +29,7 @@ The recurrence was not explained by normal user traffic alone. The likely trigge
 - bandwidth collection kept the background process busy by repeatedly probing recently-offline routers.
 - the expired-user cleanup job kept retrying recently failed routers too quickly, so failures against the same offline routers were amplified every minute.
 - bandwidth collection still did full-fleet polling, so a growing router fleet could keep the job running longer than its scheduler interval even after offline-router backoff.
+- the frontend customer list was also polling PPPoE users for every router in the account every 30 seconds, which turned normal dashboard browsing into repeated live RouterOS fleet scans.
 
 Each individual DB session was short-lived, but the concurrent burst could hit all 30 configured application connections.
 
@@ -44,9 +45,15 @@ Each individual DB session was short-lived, but the concurrent burst could hit a
 - `app/services/hotspot_provisioning.py`
   - retry provisioning router groups are capped at 4 concurrent groups;
   - background retry skips when DB pool checkout is already high.
+- `app/api/pppoe_monitor.py`
+  - PPPoE users responses are cached longer for dashboard polling;
+  - normal requests serve stale cache, or a DB-only fallback, when the router was recently offline or DB pool checkout is high;
+  - live RouterOS refresh remains available through explicit refresh requests.
 - `app/db/database.py`
   - pool checkout/checkin events now track observed peak checked-out connections and recent 5-minute peak;
   - `/api/admin/db-pool` can now report a recent exhaustion peak even if current usage has dropped.
+- Frontend customer list
+  - PPPoE live-status polling is scoped to routers represented by the currently visible customer rows instead of every router in the account.
 - `tests/test_safety_net_bypass_cleanup.py` and `tests/test_hotspot_retry_concurrency.py`
   - added focused regression coverage for the batched recheck and retry concurrency cap.
 
