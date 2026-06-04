@@ -21,6 +21,8 @@ from datetime import datetime
 from typing import Any, Callable, Generic, Optional, TypeVar
 
 from app.services.router_availability import router_recently_offline
+from app.services.mikrotik_api import _is_circuit_open  # circuit breaker stays here in Phases 0-2
+from app.db.database import db_pool_snapshot
 
 logger = logging.getLogger("router_gateway")
 
@@ -108,3 +110,25 @@ class RouterOpResult(Generic[T]):
         if status not in _FAIL_STATUSES:
             raise ValueError(f"failed() requires a FAILED_*/TIMEOUT status, got {status}")
         return cls(status, router_id=router_id, error=error, duration_ms=duration_ms)
+
+
+# Pinned to pre-refactor behaviour (the prior asyncio default-executor limit).
+BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 70
+
+
+def _db_pool_busy() -> bool:
+    snapshot = db_pool_snapshot()
+    pct = snapshot.get("checked_out_percent")
+    return isinstance(pct, (int, float)) and pct >= BACKGROUND_DB_BUSY_THRESHOLD_PERCENT
+
+
+def _preflight_skip(snapshot: RouterSnapshot, priority: Priority) -> Optional[RouterOpStatus]:
+    """Return a SKIPPED_* status if the call should not run, else None."""
+    if _is_circuit_open(snapshot.ip_address, snapshot.port):
+        return RouterOpStatus.SKIPPED_CIRCUIT_OPEN
+    if priority is Priority.BACKGROUND:
+        if snapshot.recently_offline:
+            return RouterOpStatus.SKIPPED_OFFLINE
+        if _db_pool_busy():
+            return RouterOpStatus.SKIPPED_DB_PRESSURE
+    return None

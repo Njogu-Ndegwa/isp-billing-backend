@@ -112,3 +112,40 @@ def test_router_snapshot_identity_defaults_to_none_when_absent():
     )  # no `identity` attribute at all
     snap = RouterSnapshot.from_router(router, now=now)
     assert snap.identity is None
+
+
+import app.services.router_gateway as gw
+
+
+def _snap(recently_offline=False, ip="10.0.0.9", port=8728):
+    return RouterSnapshot(
+        id=9, name="R9", ip_address=ip, port=port, username="u",
+        password="p", identity=None, recently_offline=recently_offline,
+    )
+
+
+def test_preflight_skips_circuit_open(monkeypatch):
+    monkeypatch.setattr(gw, "_is_circuit_open", lambda host, port: True)
+    monkeypatch.setattr(gw, "_db_pool_busy", lambda: False)
+    assert gw._preflight_skip(_snap(), Priority.INTERACTIVE) is RouterOpStatus.SKIPPED_CIRCUIT_OPEN
+    assert gw._preflight_skip(_snap(), Priority.BACKGROUND) is RouterOpStatus.SKIPPED_CIRCUIT_OPEN
+
+
+def test_preflight_offline_skips_background_only(monkeypatch):
+    monkeypatch.setattr(gw, "_is_circuit_open", lambda host, port: False)
+    monkeypatch.setattr(gw, "_db_pool_busy", lambda: False)
+    assert gw._preflight_skip(_snap(recently_offline=True), Priority.BACKGROUND) is RouterOpStatus.SKIPPED_OFFLINE
+    assert gw._preflight_skip(_snap(recently_offline=True), Priority.INTERACTIVE) is None
+
+
+def test_preflight_pressure_skips_background_only(monkeypatch):
+    monkeypatch.setattr(gw, "_is_circuit_open", lambda host, port: False)
+    monkeypatch.setattr(gw, "_db_pool_busy", lambda: True)
+    assert gw._preflight_skip(_snap(), Priority.BACKGROUND) is RouterOpStatus.SKIPPED_DB_PRESSURE
+    assert gw._preflight_skip(_snap(), Priority.INTERACTIVE) is None
+
+
+def test_preflight_returns_none_when_clear(monkeypatch):
+    monkeypatch.setattr(gw, "_is_circuit_open", lambda host, port: False)
+    monkeypatch.setattr(gw, "_db_pool_busy", lambda: False)
+    assert gw._preflight_skip(_snap(), Priority.BACKGROUND) is None
