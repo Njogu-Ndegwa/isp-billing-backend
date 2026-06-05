@@ -1,3 +1,7 @@
+# Project conventions
+- Before changing code, read and follow AGENTS.md — the single source of truth for this repo's conventions and reliability guardrails (shared with Claude Code and Codex).
+- CRITICAL: any code that touches the database and also does I/O must follow the "Database Session Discipline" section of AGENTS.md (short transactions; never hold a DB session across RouterOS/payment/HTTP I/O; telemetry commits in its own session). It is the #1 cause of production outages here.
+
 You are in CONCISE MODE.
 - Output = code or diff only, unless I explicitly write "explain".
 - Explanations, if asked, must be under 80 words.
