@@ -58,9 +58,9 @@ idle-in-transaction, so a wedged session held its lock + connection indefinitely
     The `db` parameter is retained for call-site compatibility but is unused.
 - `app/db/database.py` + `app/config.py`
   - Added app-scoped asyncpg `connect_args` guardrails:
-    `idle_in_transaction_session_timeout` (`DB_IDLE_TX_TIMEOUT_MS`, default 30s)
+    `idle_in_transaction_session_timeout` (`DB_IDLE_TX_TIMEOUT_MS`, default 60s)
     and `lock_timeout` (`DB_LOCK_TIMEOUT_MS`, default 5s). A future wedged
-    transaction self-aborts at 30s instead of marching to exhaustion, and lock
+    transaction self-aborts at 60s instead of marching to exhaustion, and lock
     waiters bail at 5s instead of pinning a connection. Scoped to the app role in
     code, so it survives DB volume recreation and never affects FreeRADIUS.
 - Live mitigation already applied on the running DB (kept as defense-in-depth):
@@ -99,6 +99,15 @@ exhausting the pool.
 
 ## Follow-Up Work
 
+- Deferred (revenue-critical, needs dedicated tests): two payment-initiation
+  endpoints — `initiate_mpesa_payment_api` and `register_hotspot_and_pay_api` in
+  `app/api/payment_routes.py` — hold a DB transaction open across the synchronous
+  M-Pesa STK-push HTTP call. The 60s `idle_in_transaction_session_timeout` gives
+  them ample headroom (the push normally returns in 1-5s), but the proper fix is
+  to commit the customer write before the STK push and record the
+  `MpesaTransaction` in a fresh short session (mirror the reconcile jobs). Timeout
+  raised 30s→60s specifically to avoid false-aborting these under Safaricom
+  slowness until that refactor is done.
 - Optional: throttle availability writes (skip same-status records within ~60s)
   to cut redundant write volume on the 1 GB box. Not required to fix the convoy.
 - Consider whether read-path dashboard polling should record availability at all,

@@ -16,7 +16,10 @@ class Settings(BaseSettings):
     # releasing its locks + pooled connection; and a writer gives up after
     # DB_LOCK_TIMEOUT_MS instead of pinning a connection while it waits.
     # Scoped to the app's connections only (does not affect FreeRADIUS).
-    DB_IDLE_TX_TIMEOUT_MS: int = 30000
+    # 60s (not 30s): comfortably covers the synchronous M-Pesa STK-push API
+    # handshake — two payment endpoints hold a tx across it — while still being
+    # ~43x tighter than the wedge this guards against. See incident note.
+    DB_IDLE_TX_TIMEOUT_MS: int = 60000
     DB_LOCK_TIMEOUT_MS: int = 5000
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
