@@ -35,6 +35,17 @@ else:
         pool_timeout=settings.DB_POOL_TIMEOUT,
         pool_recycle=settings.DB_POOL_RECYCLE_SECONDS,
         pool_pre_ping=True,
+        # App-scoped guardrails (asyncpg sends these as session GUCs on connect).
+        # A wedged transaction self-clears at DB_IDLE_TX_TIMEOUT_MS and lock
+        # waiters bail at DB_LOCK_TIMEOUT_MS, preventing the routers-row lock
+        # convoy that drained the pool (incident 2026-06-05). Lives in code so it
+        # survives DB volume recreation and never touches the shared RADIUS role.
+        connect_args={
+            "server_settings": {
+                "idle_in_transaction_session_timeout": str(settings.DB_IDLE_TX_TIMEOUT_MS),
+                "lock_timeout": str(settings.DB_LOCK_TIMEOUT_MS),
+            }
+        },
     )
 
 async_engine = create_async_engine(DATABASE_URL, **engine_kwargs)
