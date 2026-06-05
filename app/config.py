@@ -11,6 +11,13 @@ class Settings(BaseSettings):
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10
     DB_POOL_RECYCLE_SECONDS: int = 1800
+    # Per-connection guardrails against lock convoys / wedged transactions.
+    # Postgres auto-aborts any app session left idle-in-transaction past this,
+    # releasing its locks + pooled connection; and a writer gives up after
+    # DB_LOCK_TIMEOUT_MS instead of pinning a connection while it waits.
+    # Scoped to the app's connections only (does not affect FreeRADIUS).
+    DB_IDLE_TX_TIMEOUT_MS: int = 30000
+    DB_LOCK_TIMEOUT_MS: int = 5000
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440

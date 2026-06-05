@@ -4,6 +4,7 @@ from typing import Dict, Any, Optional
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db import database
 from app.db.models import Router, RouterAvailabilityCheck
 
 
@@ -73,29 +74,46 @@ async def record_router_availability(
     source: str,
     checked_at: Optional[datetime] = None,
 ) -> None:
-    """Persist a single availability check and update the router summary columns."""
+    """Persist a single availability check and update the router summary columns.
+
+    This telemetry write runs in its OWN short, immediately-committed session and
+    deliberately does NOT use the caller's ``db``/transaction. Router availability
+    is recorded from ~40 request and background paths, all targeting the same hot
+    ``routers`` row. When the write rode the caller's transaction (previous
+    behaviour: mutate + ``flush()`` only), any caller that stalled after the flush
+    (e.g. while waiting on slow RouterOS I/O, or one that was cancelled mid-flight)
+    held the ``routers`` row lock open until it eventually committed. Concurrent
+    availability writers then queued behind that lock, each pinning a pooled DB
+    connection while it waited — a lock convoy that drained the connection pool
+    (see docs/agent-memory/incidents/2026-06-05-db-pool-lock-convoy.md).
+
+    Committing in a dedicated session bounds the row lock to milliseconds. The
+    ``db`` parameter is retained for call-site compatibility and is intentionally
+    unused.
+    """
     checked_at = checked_at or datetime.utcnow()
-    router = await db.get(Router, router_id)
-    if not router:
-        return
+    async with database.async_session() as adb:
+        router = await adb.get(Router, router_id)
+        if not router:
+            return
 
-    router.last_status = is_online
-    router.last_checked_at = checked_at
-    router.last_status_source = source
-    router.availability_checks = int(router.availability_checks or 0) + 1
-    if is_online:
-        router.last_online_at = checked_at
-        router.availability_successes = int(router.availability_successes or 0) + 1
+        router.last_status = is_online
+        router.last_checked_at = checked_at
+        router.last_status_source = source
+        router.availability_checks = int(router.availability_checks or 0) + 1
+        if is_online:
+            router.last_online_at = checked_at
+            router.availability_successes = int(router.availability_successes or 0) + 1
 
-    db.add(
-        RouterAvailabilityCheck(
-            router_id=router_id,
-            checked_at=checked_at,
-            is_online=is_online,
-            source=source,
+        adb.add(
+            RouterAvailabilityCheck(
+                router_id=router_id,
+                checked_at=checked_at,
+                is_online=is_online,
+                source=source,
+            )
         )
-    )
-    await db.flush()
+        await adb.commit()
 
 
 async def prune_router_availability_history(
