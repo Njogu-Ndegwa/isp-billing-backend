@@ -18,9 +18,23 @@ from app.services.insurance_wireguard import (
     build_plan,
     configure_router_backup_wireguard,
     derive_insurance_ip,
+    parse_routeros_major_version,
+    read_routeros_version,
     register_insurance_peer,
     validate_insurance_settings,
     verify_insurance_router,
+)
+from app.services.insurance_l2tp import (
+    build_l2tp_plan,
+    configure_router_backup_l2tp,
+    register_insurance_l2tp_peer,
+    validate_insurance_l2tp_settings,
+)
+from app.services.insurance_tunnel_batch import (
+    get_current_insurance_tunnel_batch,
+    get_insurance_tunnel_batch,
+    preview_insurance_tunnel_batch,
+    start_insurance_tunnel_batch,
 )
 import logging
 import asyncio
@@ -114,6 +128,163 @@ class InsuranceWireGuardRequest(BaseModel):
         return v
 
 
+class InsuranceTunnelBatchRequest(BaseModel):
+    apply: bool = False
+    router_ids: Optional[List[int]] = None
+    limit: Optional[int] = None
+    max_concurrency: int = 2
+    force_rotate: bool = False
+
+    @field_validator("router_ids", mode="before")
+    @classmethod
+    def clean_router_ids(cls, v):
+        if v is None:
+            return None
+        cleaned = [int(item) for item in v if item is not None]
+        return cleaned or None
+
+    @field_validator("limit", mode="before")
+    @classmethod
+    def clean_limit(cls, v):
+        if v in (None, ""):
+            return None
+        value = int(v)
+        return value if value > 0 else None
+
+
+async def _latest_router_provisioning_token(db: AsyncSession, router_id: int) -> Optional[ProvisioningToken]:
+    result = await db.execute(
+        select(ProvisioningToken)
+        .where(ProvisioningToken.router_id == router_id)
+        .order_by(ProvisioningToken.created_at.desc())
+    )
+    return result.scalars().first()
+
+
+def _token_tunnel_type(token: Optional[ProvisioningToken]) -> Optional[str]:
+    vpn_type = (getattr(token, "vpn_type", None) or "").lower()
+    if vpn_type == "l2tp":
+        return "l2tp"
+    if vpn_type == "wireguard":
+        return "wireguard"
+    return None
+
+
+def _planned_tunnel_type_from_token(token: Optional[ProvisioningToken]) -> str:
+    return _token_tunnel_type(token) or "auto"
+
+
+def _insurance_plan_for_tunnel(tunnel_type: str, router_ip: str, backup_ip: str) -> List[str]:
+    if tunnel_type == "l2tp":
+        return build_l2tp_plan(router_ip, backup_ip)
+    if tunnel_type == "auto":
+        return [
+            f"Connect to router over current management IP {router_ip}",
+            "Read RouterOS version live",
+            "Use WireGuard insurance tunnel for RouterOS v7+",
+            "Use L2TP/IPsec insurance tunnel for RouterOS v6",
+            f"Map backup management IP to {backup_ip}",
+            "Ask new server to verify ping and TCP 8728 over the backup tunnel",
+        ]
+    return build_plan(router_ip, backup_ip)
+
+
+def _missing_insurance_settings_for_tunnel(tunnel_type: str) -> List[str]:
+    if tunnel_type == "l2tp":
+        return validate_insurance_l2tp_settings()
+    if tunnel_type == "auto":
+        return sorted(set(validate_insurance_settings("wireguard") + validate_insurance_l2tp_settings()))
+    return validate_insurance_settings("wireguard")
+
+
+def _inspect_routeros_version(router_obj: Router) -> dict:
+    api = connect_to_router(router_obj, connect_timeout=5, timeout=20)
+    if not api.connect():
+        raise InsuranceWireGuardError(api.last_connect_error or "Failed to connect to router")
+    try:
+        version = read_routeros_version(api)
+        major_version = parse_routeros_major_version(version)
+        if major_version is None:
+            raise InsuranceWireGuardError(f"Could not determine RouterOS major version from '{version}'")
+        return {
+            "version": version,
+            "major_version": major_version,
+            "tunnel_type": "wireguard" if major_version >= 7 else "l2tp",
+        }
+    finally:
+        api.disconnect()
+
+
+@router.post("/api/admin/insurance-tunnels/batch")
+async def create_insurance_tunnel_batch(
+    request: InsuranceTunnelBatchRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Preview or start a throttled background insurance-tunnel rollout.
+
+    Empty body is a preview. Use {"apply": true} to start the background job.
+    The job skips recently-offline routers and uses low-priority router I/O.
+    """
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    await db.commit()
+
+    if not request.apply:
+        return await preview_insurance_tunnel_batch(
+            router_ids=request.router_ids,
+            limit=request.limit,
+        )
+
+    try:
+        return await start_insurance_tunnel_batch(
+            router_ids=request.router_ids,
+            limit=request.limit,
+            max_concurrency=request.max_concurrency,
+            force_rotate=request.force_rotate,
+        )
+    except InsuranceWireGuardError as exc:
+        detail = str(exc)
+        status_code = 409 if "already running" in detail else 400
+        raise HTTPException(status_code=status_code, detail=detail)
+
+
+@router.get("/api/admin/insurance-tunnels/batch")
+async def get_current_insurance_tunnel_batch_status(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role required")
+    await db.commit()
+
+    job = await get_current_insurance_tunnel_batch()
+    if not job:
+        return {"success": True, "job": None}
+    return {"success": True, "job": job}
+
+
+@router.get("/api/admin/insurance-tunnels/batch/{job_id}")
+async def get_insurance_tunnel_batch_status(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role required")
+    await db.commit()
+
+    job = await get_insurance_tunnel_batch(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Insurance tunnel batch not found")
+    return {"success": True, "job": job}
+
+
 @router.get("/api/routers")
 async def get_routers(
     db: AsyncSession = Depends(get_db),
@@ -128,10 +299,22 @@ async def get_routers(
     )
     result = await db.execute(stmt)
     routers = result.scalars().all()
+    token_by_router = {}
+    if routers:
+        token_result = await db.execute(
+            select(ProvisioningToken)
+            .where(ProvisioningToken.router_id.in_([router_obj.id for router_obj in routers]))
+            .order_by(ProvisioningToken.router_id, ProvisioningToken.created_at.desc())
+        )
+        for token_obj in token_result.scalars().all():
+            token_by_router.setdefault(token_obj.router_id, token_obj)
+
     response = []
     now = datetime.utcnow()
     for router_obj in routers:
         pm = router_obj.assigned_payment_method
+        token_obj = token_by_router.get(router_obj.id)
+        token_tunnel_type = _token_tunnel_type(token_obj)
         router_payload = {
             "id": router_obj.id,
             "name": router_obj.name,
@@ -153,12 +336,15 @@ async def get_routers(
             "emergency_active": getattr(router_obj, "emergency_active", False),
             "emergency_message": getattr(router_obj, "emergency_message", None),
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
+            "token_vpn_type": token_tunnel_type,
+            "planned_insurance_tunnel_type": _planned_tunnel_type_from_token(token_obj),
         }
         router_payload.update(build_router_status(router_obj, now=now))
         response.append(router_payload)
     return response
 
 
+@router.post("/api/admin/routers/{router_id}/insurance-tunnel")
 @router.post("/api/admin/routers/{router_id}/insurance-wireguard")
 async def configure_router_insurance_wireguard(
     router_id: int,
@@ -167,11 +353,11 @@ async def configure_router_insurance_wireguard(
     token: str = Depends(verify_token),
 ):
     """
-    Superadmin-only creation of a secondary WireGuard management tunnel.
+    Superadmin-only creation of a secondary management tunnel.
 
     Normal operations continue over the router's existing 10.0.0.0/16 tunnel.
-    This endpoint connects through that current path and adds/repairs wg-aws2
-    so the new server can reach the router on 10.250.X.Y.
+    This endpoint connects through that current path and adds/repairs the
+    correct insurance tunnel for the router's RouterOS version.
     """
     user = await get_current_user(token, db)
     if user.role != UserRole.ADMIN:
@@ -181,14 +367,17 @@ async def configure_router_insurance_wireguard(
     router_obj = result.scalar_one_or_none()
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
+    token_obj = await _latest_router_provisioning_token(db, router_obj.id)
+    token_tunnel_type = _token_tunnel_type(token_obj)
 
     try:
         backup_ip = request.backup_ip or derive_insurance_ip(router_obj.ip_address)
     except InsuranceWireGuardError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    missing_settings = validate_insurance_settings()
-    plan = build_plan(router_obj.ip_address, backup_ip)
+    dry_run_tunnel_type = token_tunnel_type or "auto"
+    missing_settings = _missing_insurance_settings_for_tunnel(dry_run_tunnel_type)
+    plan = _insurance_plan_for_tunnel(dry_run_tunnel_type, router_obj.ip_address, backup_ip)
     if not request.apply:
         return {
             "success": True,
@@ -197,21 +386,39 @@ async def configure_router_insurance_wireguard(
             "router_name": router_obj.name,
             "current_ip": router_obj.ip_address,
             "backup_ip": backup_ip,
+            "tunnel_type": dry_run_tunnel_type,
+            "token_vpn_type": getattr(token_obj, "vpn_type", None),
             "missing_settings": missing_settings,
             "plan": plan,
         }
-
-    if missing_settings:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Missing insurance WireGuard setting(s): {', '.join(missing_settings)}",
-        )
 
     # Release the DB connection before router/API network work. No database
     # writes happen in this endpoint after this point.
     await db.commit()
 
-    def _configure_router():
+    try:
+        inspection = await asyncio.to_thread(_inspect_routeros_version, router_obj)
+    except InsuranceWireGuardError as exc:
+        logger.error(
+            "Insurance tunnel version inspection failed for router %s (%s): %s",
+            router_obj.id,
+            router_obj.ip_address,
+            exc,
+        )
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Unexpected insurance tunnel inspection error for router %s", router_obj.id)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    tunnel_type = inspection["tunnel_type"]
+    missing_settings = _missing_insurance_settings_for_tunnel(tunnel_type)
+    if missing_settings:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing insurance {tunnel_type} setting(s): {', '.join(missing_settings)}",
+        )
+
+    def _configure_wireguard_router():
         api = connect_to_router(router_obj, connect_timeout=5, timeout=20)
         if not api.connect():
             raise InsuranceWireGuardError(api.last_connect_error or "Failed to connect to router")
@@ -224,46 +431,85 @@ async def configure_router_insurance_wireguard(
         finally:
             api.disconnect()
 
+    def _configure_l2tp_router(username: str, password: str):
+        api = connect_to_router(router_obj, connect_timeout=5, timeout=20)
+        if not api.connect():
+            raise InsuranceWireGuardError(api.last_connect_error or "Failed to connect to router")
+        try:
+            return configure_router_backup_l2tp(
+                api,
+                backup_ip=backup_ip,
+                username=username,
+                password=password,
+            )
+        finally:
+            api.disconnect()
+
     try:
-        router_config = await asyncio.to_thread(_configure_router)
-        manager_result = await register_insurance_peer(
-            router_config["router_public_key"],
-            backup_ip,
-        )
+        if tunnel_type == "l2tp":
+            if not token_obj or not token_obj.l2tp_username or not token_obj.l2tp_password:
+                raise InsuranceWireGuardError(
+                    "RouterOS v6 insurance tunnel requires the linked L2TP provisioning token "
+                    "so the backup server can reuse the router's L2TP credentials."
+                )
+            manager_result = await register_insurance_l2tp_peer(
+                token_obj.l2tp_username,
+                token_obj.l2tp_password,
+                backup_ip,
+            )
+            router_config = await asyncio.to_thread(
+                _configure_l2tp_router,
+                token_obj.l2tp_username,
+                token_obj.l2tp_password,
+            )
+        else:
+            router_config = await asyncio.to_thread(_configure_wireguard_router)
+            manager_result = await register_insurance_peer(
+                router_config["router_public_key"],
+                backup_ip,
+            )
         verify_result = await verify_insurance_router(backup_ip, port=router_obj.port)
     except InsuranceWireGuardError as exc:
         logger.error(
-            "Insurance WireGuard setup failed for router %s (%s): %s",
+            "Insurance tunnel setup failed for router %s (%s): %s",
             router_obj.id,
             router_obj.ip_address,
             exc,
         )
         raise HTTPException(status_code=502, detail=str(exc))
     except Exception as exc:
-        logger.exception("Unexpected insurance WireGuard setup error for router %s", router_obj.id)
+        logger.exception("Unexpected insurance tunnel setup error for router %s", router_obj.id)
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return {
+    response = {
         "success": True,
         "applied": True,
         "router_id": router_obj.id,
         "router_name": router_obj.name,
         "current_ip": router_obj.ip_address,
         "backup_ip": backup_ip,
-        "router_public_key": router_config["router_public_key"],
+        "tunnel_type": tunnel_type,
+        "token_vpn_type": getattr(token_obj, "vpn_type", None),
+        "routeros_version": router_config.get("routeros_version") or inspection["version"],
         "router_actions": router_config["actions"],
         "manager": manager_result,
         "verification": verify_result,
     }
+    if tunnel_type == "wireguard":
+        response["router_public_key"] = router_config["router_public_key"]
+    if tunnel_type == "l2tp":
+        response["l2tp_username"] = router_config["l2tp_username"]
+    return response
 
 
+@router.get("/api/admin/routers/{router_id}/insurance-tunnel/status")
 @router.get("/api/admin/routers/{router_id}/insurance-wireguard/status")
 async def get_router_insurance_wireguard_status(
     router_id: int,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Read-only check that the new server can reach a router over wg-aws2."""
+    """Read-only check that the new server can reach a router over its insurance tunnel."""
     user = await get_current_user(token, db)
     if user.role != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -272,13 +518,15 @@ async def get_router_insurance_wireguard_status(
     router_obj = result.scalar_one_or_none()
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
+    token_obj = await _latest_router_provisioning_token(db, router_obj.id)
+    token_tunnel_type = _token_tunnel_type(token_obj)
 
     try:
         backup_ip = derive_insurance_ip(router_obj.ip_address)
     except InsuranceWireGuardError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    missing_settings = validate_insurance_settings()
+    missing_settings = validate_insurance_settings("status")
     if missing_settings:
         return {
             "success": False,
@@ -287,6 +535,8 @@ async def get_router_insurance_wireguard_status(
             "router_name": router_obj.name,
             "current_ip": router_obj.ip_address,
             "backup_ip": backup_ip,
+            "tunnel_type": token_tunnel_type,
+            "token_vpn_type": getattr(token_obj, "vpn_type", None),
             "missing_settings": missing_settings,
         }
 
@@ -302,6 +552,8 @@ async def get_router_insurance_wireguard_status(
             "router_name": router_obj.name,
             "current_ip": router_obj.ip_address,
             "backup_ip": backup_ip,
+            "tunnel_type": token_tunnel_type,
+            "token_vpn_type": getattr(token_obj, "vpn_type", None),
             "error": str(exc),
         }
 
@@ -313,6 +565,8 @@ async def get_router_insurance_wireguard_status(
         "router_name": router_obj.name,
         "current_ip": router_obj.ip_address,
         "backup_ip": backup_ip,
+        "tunnel_type": token_tunnel_type,
+        "token_vpn_type": getattr(token_obj, "vpn_type", None),
         "verification": verification,
     }
 

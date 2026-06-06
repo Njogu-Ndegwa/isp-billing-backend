@@ -76,6 +76,8 @@ class Settings(BaseSettings):
     INSURANCE_WG_PORT: int = 51821
     INSURANCE_ROUTER_INTERFACE: str = "wg-aws2"
     INSURANCE_WG_SUBNET: str = "10.250.0.0/16"
+    INSURANCE_L2TP_INTERFACE: str = "l2tp-aws2"
+    INSURANCE_L2TP_IPSEC_PSK: str = ""
     INSURANCE_MANAGER_TIMEOUT: int = 10
 
     class Config:

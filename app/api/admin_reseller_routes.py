@@ -956,9 +956,23 @@ async def get_reseller_routers(
 
     stmt = stmt.order_by(Router.created_at.desc())
     routers = (await db.execute(stmt)).scalars().all()
+    token_by_router = {}
+    if routers:
+        token_result = await db.execute(
+            select(ProvisioningToken)
+            .where(ProvisioningToken.router_id.in_([rt.id for rt in routers]))
+            .order_by(ProvisioningToken.router_id, ProvisioningToken.created_at.desc())
+        )
+        for token_obj in token_result.scalars().all():
+            token_by_router.setdefault(token_obj.router_id, token_obj)
 
     items = []
     for rt in routers:
+        token_obj = token_by_router.get(rt.id)
+        token_vpn_type = None
+        if token_obj and token_obj.vpn_type in {"wireguard", "l2tp"}:
+            token_vpn_type = token_obj.vpn_type
+
         total_customers = (await db.execute(
             select(func.count(Customer.id)).where(Customer.router_id == rt.id)
         )).scalar() or 0
@@ -1016,6 +1030,8 @@ async def get_reseller_routers(
             "uptime_pct": uptime_pct,
             "emergency_active": rt.emergency_active,
             "emergency_message": rt.emergency_message,
+            "token_vpn_type": token_vpn_type,
+            "planned_insurance_tunnel_type": token_vpn_type or "auto",
             "created_at": rt.created_at.isoformat() if rt.created_at else None,
             "total_customers": total_customers,
             "active_customers": active_count,

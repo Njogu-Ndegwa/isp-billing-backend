@@ -1,5 +1,6 @@
 import ipaddress
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -40,14 +41,17 @@ def derive_insurance_ip(router_ip: str, target_subnet: str | None = None) -> str
     return str(mapped)
 
 
-def validate_insurance_settings() -> List[str]:
+def validate_insurance_settings(tunnel_type: str = "wireguard") -> List[str]:
     missing = []
-    for name in (
+    required = [
         "INSURANCE_WG_MANAGER_URL",
         "INSURANCE_WG_MANAGER_SECRET",
         "INSURANCE_SERVER_PUBLIC_IP",
-        "INSURANCE_SERVER_WG_PUBLIC_KEY",
-    ):
+    ]
+    if tunnel_type == "wireguard":
+        required.append("INSURANCE_SERVER_WG_PUBLIC_KEY")
+
+    for name in required:
         if not (getattr(settings, name, "") or "").strip():
             missing.append(name)
     return missing
@@ -56,6 +60,7 @@ def validate_insurance_settings() -> List[str]:
 def build_plan(router_ip: str, backup_ip: str) -> List[str]:
     return [
         f"Connect to router over current management IP {router_ip}",
+        "Confirm RouterOS version supports WireGuard insurance tunnel",
         f"Ensure {settings.INSURANCE_ROUTER_INTERFACE} exists on RouterOS",
         f"Ensure backup address {backup_ip}/16 is assigned",
         f"Ensure peer to {settings.INSURANCE_SERVER_PUBLIC_IP}:{settings.INSURANCE_WG_PORT} exists",
@@ -86,6 +91,36 @@ def _find_by(rows: List[Dict[str, str]], **matches: str) -> Optional[Dict[str, s
         if all(row.get(k) == v for k, v in matches.items()):
             return row
     return None
+
+
+def parse_routeros_major_version(version: str) -> Optional[int]:
+    match = re.match(r"^\s*(\d+)", version or "")
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def read_routeros_version(api: MikroTikAPI) -> str:
+    rows = _rows(api.send_command("/system/resource/print"), "Read RouterOS version")
+    if not rows:
+        raise InsuranceWireGuardError("Could not read RouterOS version")
+    return (rows[0].get("version") or "").strip()
+
+
+def _ensure_routeros_supports_wireguard(api: MikroTikAPI, actions: List[str]) -> str:
+    version = read_routeros_version(api)
+    major_version = parse_routeros_major_version(version)
+    if major_version is None:
+        raise InsuranceWireGuardError(f"Could not determine RouterOS major version from '{version}'")
+
+    if major_version < 7:
+        raise InsuranceWireGuardError(
+            f"Insurance WireGuard requires RouterOS v7. Router is running RouterOS {version}. "
+            "Use the L2TP/IPsec insurance tunnel flow for RouterOS v6."
+        )
+
+    actions.append(f"Confirmed RouterOS {version} supports WireGuard")
+    return version
 
 
 def _ensure_wireguard_interface(
@@ -300,6 +335,7 @@ def configure_router_backup_wireguard(
     actions: List[str] = []
     interface_name = settings.INSURANCE_ROUTER_INTERFACE
 
+    routeros_version = _ensure_routeros_supports_wireguard(api, actions)
     router_public_key = _ensure_wireguard_interface(
         api,
         interface_name=interface_name,
@@ -329,6 +365,7 @@ def configure_router_backup_wireguard(
 
     return {
         "router_public_key": router_public_key,
+        "routeros_version": routeros_version,
         "actions": actions,
     }
 
