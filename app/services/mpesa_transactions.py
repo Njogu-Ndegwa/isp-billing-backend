@@ -325,10 +325,14 @@ async def reconcile_pending_mpesa_transactions():
                     call_pppoe_provision,
                     build_pppoe_payload,
                 )
-            elif result_code == -1:
+            elif result_code in (-1, 4999):
+                # -1   = ResultCode missing from Safaricom's response
+                # 4999 = "The transaction is still under processing"
+                # Either way the payment is not final — leave it pending and
+                # let the next sweep / callback / on-demand check resolve it.
                 logger.debug(
-                    "[RECONCILE] %s still processing at Safaricom, will retry later",
-                    txn.checkout_request_id,
+                    "[RECONCILE] %s still processing at Safaricom (code=%s), will retry later",
+                    txn.checkout_request_id, result_code,
                 )
             else:
                 async with async_session() as db:
