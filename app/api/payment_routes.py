@@ -32,6 +32,9 @@ import json
 
 logger = logging.getLogger(__name__)
 
+# How long a pending M-Pesa txn blocks a second STK push for the same customer
+DUP_GUARD_WINDOW = timedelta(minutes=3)
+
 router = APIRouter(tags=["payments"])
 
 
@@ -741,7 +744,7 @@ async def register_hotspot_and_pay_api(
         # M-Pesa payment, don't charge them again — point the portal back at
         # the existing transaction's polling loop instead.
         if existing_customer and payment_method_enum == PaymentMethod.MOBILE_MONEY:
-            recent_cutoff = datetime.utcnow() - timedelta(minutes=3)
+            recent_cutoff = datetime.utcnow() - DUP_GUARD_WINDOW
             dup_stmt = (
                 select(MpesaTransaction)
                 .where(

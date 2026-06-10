@@ -153,3 +153,26 @@ async def test_payment_allowed_when_pending_txn_is_stale(engine, db, client):
     assert resp.status_code == 200, resp.text
     assert resp.json()["id"] == customer.id
     assert stk.await_count == 1
+
+
+async def test_new_customer_with_no_record_is_unaffected(engine, db, client):
+    """Guard is skipped when existing_customer is None (brand-new MAC).
+
+    A MAC that has never been seen before must NOT be caught by the dup-guard —
+    existing_customer will be None, so the guard branch is never entered and
+    the STK push fires normally."""
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    router = await make_router(db, reseller)
+    # Deliberately do NOT create a customer for this MAC
+    unknown_mac = "AA:BB:CC:DD:EE:99"
+
+    stk = AsyncMock(return_value=_FakeStk())
+    gw_patch, stk_patch = _patch_payment_path(stk)
+    with gw_patch, stk_patch:
+        resp = await client.post(
+            "/api/hotspot/register-and-pay", json=_pay_body(plan, router, mac=unknown_mac)
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert stk.await_count == 1
