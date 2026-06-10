@@ -393,9 +393,8 @@ async def _handle_successful_reconciliation(
     hotspot_context = None
 
     async with async_session() as db:
-        # Atomically claim the pending -> completed transition. If another path
-        # (callback, concurrent sweep, on-demand check) already finalized this
-        # transaction, the UPDATE matches zero rows and we bail out.
+        # Atomically claim the pending -> completed transition.
+        # The UPDATE matches zero rows if the transaction is not in pending state.
         claim = await db.execute(
             update(MpesaTransaction)
             .where(
@@ -416,6 +415,7 @@ async def _handle_successful_reconciliation(
             return
         await db.commit()
 
+        # Re-fetch to read fields not on the caller's copy (e.g. mpesa_receipt_number set by the callback).
         stmt = select(MpesaTransaction).where(
             MpesaTransaction.checkout_request_id == txn.checkout_request_id
         )
@@ -536,7 +536,6 @@ async def _handle_successful_reconciliation(
             )
 
     if pppoe_payload:
-        await db.commit()
         await call_pppoe_provision(pppoe_payload)
 
     if hotspot_payload and hotspot_context:
