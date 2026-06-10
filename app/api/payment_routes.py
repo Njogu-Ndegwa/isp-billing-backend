@@ -283,10 +283,24 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                 logger.error(f"Transaction not found for CheckoutRequestID: {checkout_request_id}")
                 return {"ResultCode": 1, "ResultDesc": "Transaction not found"}
         
-        # DUPLICATE CALLBACK PROTECTION: Skip if already processed
-        if mpesa_txn.status in (MpesaTransactionStatus.completed, MpesaTransactionStatus.failed):
+        # DUPLICATE CALLBACK PROTECTION:
+        # - completed is FINAL: ignore any further callbacks.
+        # - failed/expired + a SUCCESS callback means an earlier reconcile pass
+        #   misclassified the txn (e.g. old 4999 handling) or it expired during
+        #   a Safaricom outage. Safaricom is the source of truth for money —
+        #   process it so the customer gets what they paid for.
+        if mpesa_txn.status == MpesaTransactionStatus.completed:
             logger.warning(f"Duplicate callback ignored for {checkout_request_id} - status: {mpesa_txn.status.value}")
             return {"ResultCode": 0, "ResultDesc": "Already processed"}
+        if mpesa_txn.status in (MpesaTransactionStatus.failed, MpesaTransactionStatus.expired):
+            if result_code == 0:
+                logger.warning(
+                    f"[REVIVAL] SUCCESS callback for previously-{mpesa_txn.status.value} "
+                    f"txn {checkout_request_id} — processing it"
+                )
+            else:
+                logger.warning(f"Duplicate callback ignored for {checkout_request_id} - status: {mpesa_txn.status.value}")
+                return {"ResultCode": 0, "ResultDesc": "Already processed"}
         
         # Extract callback metadata
         callback_metadata = stk_callback.get("CallbackMetadata", {})
