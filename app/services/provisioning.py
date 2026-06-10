@@ -282,26 +282,52 @@ def _rsc_header(token: ProvisioningToken) -> str:
 # ============================================================"""
 
 
-def _rsc_preflight_v7() -> str:
-    return """
-# ---- PRE-FLIGHT: DEVICE-MODE CHECK (RouterOS v7 only) ----
-{
-    :local mode [/system/device-mode/get mode]
-    :if ($mode = "enterprise") do={
-        :log info "Provisioning: device-mode=enterprise, hotspot permitted"
-    } else={
-        :do {
-            :local dm [/system/device-mode/get hotspot]
-            :if ($dm != true) do={
-                :log error "PROVISION ABORTED: device-mode hotspot is disabled. Run: /system/device-mode/update hotspot=yes  then press the physical reset button within 60s. After that, re-run this script."
-                :error "device-mode hotspot not enabled -- aborting (see log)"
-            }
-            :log info "Provisioning: device-mode hotspot=yes confirmed"
-        } on-error={
-            :log warning "Provisioning: could not read device-mode hotspot flag, proceeding anyway (mode=$mode)"
-        }
-    }
-}"""
+def _rsc_preflight_hotspot(token: ProvisioningToken) -> str:
+    # When the hotspot feature is unavailable (blocked by device-mode on
+    # v7.13+ RouterBOARDs, or the package disabled on v6) its console menus
+    # do not exist at all, and any DIRECT `/ip hotspot ... [find where ...]`
+    # reference fails at PARSE time -- `:do on-error` cannot catch that, so
+    # the import dies mid-way and leaves the router half-provisioned with no
+    # hotspot, no API user, and no /complete callback (incident
+    # 2026-06-10-provision-import-parse-abort). Referencing the menu only
+    # inside a [:parse "..."] string defers resolution to runtime, where the
+    # failure IS catchable -- same trick as the v6 use-ipsec block below.
+    #
+    # The previous device-mode preflight had a hole: on preset modes like
+    # `home` the per-feature `hotspot` flag is not readable, the read failed,
+    # and the script "proceeded anyway" straight into the parse crash. It
+    # also referenced /system/device-mode directly, which is itself a parse
+    # error on v7 builds older than 7.13. Probing the hotspot menu covers
+    # every cause and every version, so it replaces the device-mode check.
+    if token.vpn_type == "l2tp":
+        remedy = (
+            "on RouterOS v6 this usually means the hotspot package is missing or "
+            "disabled. Check: /system package print  -- enable the hotspot "
+            "package, reboot, then re-run this provisioning command"
+        )
+    else:
+        remedy = (
+            "this is usually device-mode blocking hotspot (newer RouterBOARDs "
+            "ship this way). Run: /system/device-mode/update hotspot=yes  -- "
+            "then press the physical reset button briefly (or power-cycle) "
+            "within 5 minutes when prompted, wait for the router to come back, "
+            "then re-run this provisioning command"
+        )
+    return f"""
+# ---- PRE-FLIGHT: HOTSPOT AVAILABILITY CHECK ----
+# If the hotspot feature is unavailable its console menus do not exist and
+# direct /ip hotspot references are PARSE errors that abort the import
+# mid-way (half-provisioned router). Probe the menu via [:parse] so the
+# failure happens at runtime, where it can be caught and turned into a
+# clean abort BEFORE any configuration is applied.
+:do {{
+    :local bwHsProbe [:parse "/ip hotspot profile find"]
+    $bwHsProbe
+    :log info "Provisioning: hotspot feature available"
+}} on-error={{
+    :log error "PROVISION ABORTED: the hotspot feature is not available on this router -- {remedy}."
+    :error "hotspot feature unavailable -- aborting before any config is applied (see /log print)"
+}}"""
 
 
 def _rsc_wan_setup() -> str:
@@ -360,9 +386,20 @@ def _rsc_vpn_wireguard(token: ProvisioningToken) -> str:
     return f"""
 # ---- STEP 3: WIREGUARD VPN (RouterOS v7) ----
 
-/interface wireguard add name=wg-aws listen-port=51820 private-key="{token.wg_private_key}"
-/ip address add address={token.wireguard_ip}/16 interface=wg-aws
-/interface wireguard peers add interface=wg-aws public-key="{token.server_wg_pubkey}" endpoint-address={token.server_public_ip} endpoint-port=51820 allowed-address=10.0.0.0/16 persistent-keepalive=25
+# add-then-set (like the L2TP block) so re-running this script -- e.g.
+# after enabling device-mode hotspot and re-importing -- converges instead
+# of aborting the import with "already have such name".
+:do {{
+    /interface wireguard add name=wg-aws listen-port=51820 private-key="{token.wg_private_key}"
+}} on-error={{
+    /interface wireguard set [find where name=wg-aws] listen-port=51820 private-key="{token.wg_private_key}"
+}}
+:do {{ /ip address add address={token.wireguard_ip}/16 interface=wg-aws }} on-error={{}}
+:do {{
+    /interface wireguard peers add interface=wg-aws public-key="{token.server_wg_pubkey}" endpoint-address={token.server_public_ip} endpoint-port=51820 allowed-address=10.0.0.0/16 persistent-keepalive=25
+}} on-error={{
+    /interface wireguard peers set [find where interface=wg-aws] public-key="{token.server_wg_pubkey}" endpoint-address={token.server_public_ip} endpoint-port=51820 allowed-address=10.0.0.0/16 persistent-keepalive=25
+}}
 :do {{ /ip firewall filter add chain=input protocol=udp dst-port=51820 action=accept comment="Allow WireGuard" }} on-error={{}}
 
 :log info "Provisioning: WireGuard tunnel configured"
@@ -585,6 +622,7 @@ def _rsc_walled_garden(token: ProvisioningToken) -> str:
 /ip hotspot walled-garden add dst-host="*.vercel.app" action=allow comment="Vercel CDN"
 /ip hotspot walled-garden add dst-host=isp.bitwavetechnologies.net action=allow comment="Backend API (.net)"
 /ip hotspot walled-garden add dst-host=isp.bitwavetechnologies.com action=allow comment="Backend API (.com)"
+/ip hotspot walled-garden add dst-host=ispp.bitwavetechnologies.com action=allow comment="Backend API direct (not Cloudflare-proxied)"
 :do {{ /ip hotspot walled-garden ip add dst-address={token.server_public_ip}/32 action=accept comment="Backend API IP" }} on-error={{}}
 
 :log info "Provisioning: Walled garden configured" """
@@ -635,9 +673,9 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     """Generate the MikroTik .rsc auto-provisioning script, adapting for v6 or v7."""
     parts = [_rsc_header(token)]
 
-    if token.vpn_type == "wireguard":
-        parts.append(_rsc_preflight_v7())
-    # v6 (l2tp) has no device-mode concept -- skip preflight
+    # Both v6 and v7 can be missing the hotspot feature (disabled package on
+    # v6, device-mode on v7) -- always probe before touching any config.
+    parts.append(_rsc_preflight_hotspot(token))
 
     parts.append(_rsc_wan_setup())
     parts.append(_rsc_lan_setup())
