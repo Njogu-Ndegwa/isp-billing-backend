@@ -69,3 +69,10 @@ Project-level items that should survive across agent sessions.
 - Problem: learnings can disappear between agent sessions.
 - Why it matters: repeated debugging wastes time and risks regressions.
 - Proposed next step: after significant production incidents, add a note under `docs/agent-memory/incidents/` and link follow-ups here.
+
+### B2B initiate_b2b_payment Session Across Safaricom Call
+
+- Status: planned
+- Problem: `initiate_b2b_payment` holds its DB session open across the Safaricom B2B HTTP call (httpx POST), violating the Database Session Discipline pattern; the 2026-06-10 payout fix limited the blast radius to one reseller per session but did not remove the cross-I/O hold.
+- Why it matters: a slow Safaricom response pins one pool connection per in-flight payout; under provider outages (e.g. their nightly 23:00-01:00 UTC window) this still wastes pool capacity.
+- Proposed next step: restructure to read inputs and commit before the HTTP call, then persist the result in a fresh session (same pattern as `kick_pending_payment_check`). Also consider moving the daily payout schedule out of 23:59 UTC, which sits inside Safaricom's recurring maintenance window.
