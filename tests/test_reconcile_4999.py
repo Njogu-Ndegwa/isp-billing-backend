@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import select
 
+pytestmark = pytest.mark.asyncio
+
 from app.db.models import MpesaTransaction, MpesaTransactionStatus
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
@@ -26,7 +28,6 @@ async def _make_pending_txn(db, customer, *, age_minutes=5) -> MpesaTransaction:
     return txn
 
 
-@pytest.mark.asyncio
 async def test_4999_keeps_transaction_pending(engine, session_factory):
     async with session_factory() as db:
         reseller = await make_reseller(db)
@@ -35,7 +36,6 @@ async def test_4999_keeps_transaction_pending(engine, session_factory):
         customer = await make_customer(db, reseller, plan, router)
         txn = await _make_pending_txn(db, customer)
         txn_id = txn.id
-        checkout_id = txn.checkout_request_id
 
     from app.services import mpesa_transactions as mt
 
@@ -58,7 +58,6 @@ async def test_4999_keeps_transaction_pending(engine, session_factory):
     assert refreshed.status == MpesaTransactionStatus.pending  # NOT failed
 
 
-@pytest.mark.asyncio
 async def test_terminal_code_still_marks_failed(engine, session_factory):
     """Regression guard: genuine failures (e.g. 1032 cancelled) must still fail."""
     async with session_factory() as db:
