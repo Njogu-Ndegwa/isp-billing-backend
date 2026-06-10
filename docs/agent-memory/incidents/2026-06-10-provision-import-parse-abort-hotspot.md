@@ -29,8 +29,15 @@ reported position.)
 
 Hotspot is unavailable when:
 
-- RouterOS v7.13+ device-mode blocks it — newer RouterBOARDs ship in
-  `mode=home`, which disables hotspot; or
+- **smips devices (hAP lite/mini) on RouterOS 7.20+** — CONFIRMED cause for
+  this incident's router (hAP lite, 7.23.1, device-mode showed `hotspot: yes`).
+  Official 7.20 changelog: "smips - reduced package size, removed hotspot
+  feature and provide it as a separate package". The separate package is NOT
+  installed by default; fetch the exact-version npk and reboot:
+  `/tool fetch url="https://download.mikrotik.com/routeros/<ver>/hotspot-<ver>-smips.npk"`
+  then `/system reboot`. Verified working on the field unit 2026-06-10.
+- RouterOS v7.13+ device-mode blocks it (e.g. `mode=home`); requires
+  `/system/device-mode/update hotspot=yes` + physical button press; or
 - RouterOS v6 with the hotspot package disabled/missing.
 
 The old v7 preflight was supposed to abort early but had a hole: for any mode
@@ -85,6 +92,20 @@ probe, re-run-safe wireguard step, per-platform remedy text).
 2. Re-run the same provisioning one-liner — the token stays PENDING/valid for
    24h and the script now converges on a half-provisioned router.
 
+## Resolution on the field unit (Router-0497, 2026-06-10)
+
+1. Installed the smips hotspot package
+   (`/tool fetch url="https://download.mikrotik.com/routeros/7.23.1/hotspot-7.23.1-smips.npk"`,
+   reboot), removed the half-applied wg-aws interface/address/firewall rules,
+   re-ran the same provisioning one-liner. Hotspot + captive portal came up.
+2. The script's STEP 9 `/complete` callback never reached the server (app logs
+   show script + login-page fetches but no `/complete` request), so the token
+   stayed `pending` and customers got `GET /api/public/portal/Router-0497 →
+   404` at the portal. Fixed by calling the endpoint manually — it is exactly
+   what the router would have called and needs no auth:
+   `curl https://isp.bitwavetechnologies.net/api/provision/<token>/complete`
+   → router_id 194 registered to the owner account; portal lookups resolve.
+
 ## Follow-Up Work
 
 - STEP 4–6 still reference `/ip hotspot` directly; they are only reached when
@@ -94,4 +115,13 @@ probe, re-run-safe wireguard step, per-platform remedy text).
 - Walled-garden `add` lines create duplicate rows on re-runs (harmless, no
   unique key). Consider find-before-add if dupes get noisy.
 - Consider surfacing "token PENDING > N hours after script fetch" in the admin
-  UI as a hint that an import died on the router.
+  UI as a hint that an import died on the router — Router-0497 sat
+  half-registered while live customers hit portal 404s, and only the operator
+  noticing surfaced it. A "register manually" button calling `/complete` would
+  have closed it in one click.
+- The script's `/complete` notify has no retry (single fetch, then reboot
+  5s later); consider retrying like the login-page fetch does, or moving the
+  reboot before the notify is abandoned.
+- Preflight auto-install of the smips hotspot npk was prototyped and reverted
+  on operator request (keep provisioning script changes minimal); revisit if
+  more hAP lite/mini units enter the fleet.
