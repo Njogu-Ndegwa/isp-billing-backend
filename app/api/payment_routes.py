@@ -197,6 +197,11 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
         checkout_request_id = stk_callback.get("CheckoutRequestID")
         merchant_request_id = stk_callback.get("MerchantRequestID")
         result_code = stk_callback.get("ResultCode")
+        if result_code is not None:
+            try:
+                result_code = int(result_code)
+            except (TypeError, ValueError):
+                logger.error(f"Non-numeric ResultCode {result_code!r} in callback for {checkout_request_id}")
         result_desc = stk_callback.get("ResultDesc")
         
         if not checkout_request_id:

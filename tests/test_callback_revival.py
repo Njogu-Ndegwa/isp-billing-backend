@@ -279,3 +279,60 @@ async def test_failed_callback_for_failed_txn_still_ignored(
         assert payments == []
 
     assert provision_calls == []
+
+
+async def test_string_result_code_zero_still_processes(
+    session_factory, client, patched_provisioning, provision_calls
+):
+    """ResultCode delivered as string "0" must be treated as success (int 0).
+
+    Safaricom may deliver ResultCode as a JSON string rather than a number.
+    The int-cast added to mpesa_direct_callback ensures "0" == 0 comparisons
+    work correctly so the transaction is completed and the customer is provisioned.
+    """
+    customer_id, checkout_id = await _seed_txn(
+        session_factory,
+        status=MpesaTransactionStatus.pending,
+    )
+
+    # Build a success payload but with ResultCode as a string "0".
+    payload = {
+        "Body": {
+            "stkCallback": {
+                "MerchantRequestID": "mr-string-rc",
+                "CheckoutRequestID": checkout_id,
+                "ResultCode": "0",          # <-- string, not int
+                "ResultDesc": "The service request is processed successfully.",
+                "CallbackMetadata": {"Item": [
+                    {"Name": "Amount", "Value": 10},
+                    {"Name": "MpesaReceiptNumber", "Value": "SGRTEST456"},
+                    {"Name": "PhoneNumber", "Value": 254712345678},
+                ]},
+            }
+        }
+    }
+
+    resp = await client.post("/api/mpesa/callback", json=payload)
+    assert resp.status_code == 200
+
+    # Fresh session — must see completed status.
+    txn = await _fetch_txn(session_factory, checkout_id)
+    assert txn.status == MpesaTransactionStatus.completed
+    assert txn.mpesa_receipt_number == "SGRTEST456"
+
+    async with session_factory() as s:
+        refreshed_customer = (
+            await s.execute(select(Customer).where(Customer.id == customer_id))
+        ).scalar_one()
+        assert refreshed_customer.status == CustomerStatus.ACTIVE
+
+        payments = (
+            await s.execute(
+                select(CustomerPayment).where(CustomerPayment.customer_id == customer_id)
+            )
+        ).scalars().all()
+        assert len(payments) == 1
+        assert payments[0].payment_reference == "SGRTEST456"
+
+    hotspot_calls = [c for c in provision_calls if c[0] == "hotspot"]
+    assert len(hotspot_calls) == 1, f"Expected one hotspot provision; got {provision_calls!r}"
