@@ -606,13 +606,21 @@ async def run_daily_payouts():
     skip_count = 0
     fail_count = 0
 
+    # Snapshot plain ids first: one reseller's failure must never poison the
+    # ORM state (or session) used for the resellers that follow. A rollback
+    # expires every object in the session, and touching an expired attribute
+    # on an AsyncSession raises — which is how a single mid-run failure used
+    # to kill the whole job (2026-06-09 incident).
     async with AsyncSessionLocal() as db:
-        resellers_stmt = select(User).where(User.role == UserRole.RESELLER)
-        resellers = (await db.execute(resellers_stmt)).scalars().all()
+        resellers_stmt = select(User.id).where(User.role == UserRole.RESELLER)
+        reseller_ids = list((await db.execute(resellers_stmt)).scalars().all())
 
-        for reseller in resellers:
-            try:
-                balance = await get_unpaid_balance(db, reseller.id)
+    for reseller_id in reseller_ids:
+        try:
+            # Fresh short session per reseller: a failure (or aborted
+            # transaction) for one reseller cannot leak into the next.
+            async with AsyncSessionLocal() as db:
+                balance = await get_unpaid_balance(db, reseller_id)
                 if balance < 1:
                     skip_count += 1
                     continue
@@ -620,7 +628,7 @@ async def run_daily_payouts():
                 today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
                 existing_today = await db.execute(
                     select(func.count(B2BTransaction.id)).where(
-                        B2BTransaction.reseller_id == reseller.id,
+                        B2BTransaction.reseller_id == reseller_id,
                         B2BTransaction.created_at >= today_start,
                         B2BTransaction.triggered_by == "scheduled",
                         B2BTransaction.status.in_([
@@ -630,31 +638,31 @@ async def run_daily_payouts():
                     )
                 )
                 if existing_today.scalar() > 0:
-                    logger.info("Reseller %s already has a scheduled B2B tx today, skipping", reseller.id)
+                    logger.info("Reseller %s already has a scheduled B2B tx today, skipping", reseller_id)
                     skip_count += 1
                     continue
 
-                pm = await resolve_b2b_payment_method(db, reseller.id)
+                pm = await resolve_b2b_payment_method(db, reseller_id)
                 if not pm:
                     skip_count += 1
                     continue
 
-                txn = await payout_reseller(db, reseller.id, pm, balance, triggered_by="scheduled")
+                txn = await payout_reseller(db, reseller_id, pm, balance, triggered_by="scheduled")
                 await db.commit()
 
                 if txn.status == B2BTransactionStatus.PENDING:
                     paid_count += 1
                     logger.info(
                         "B2B payout initiated: reseller=%s amount=%s net=%s fee=%s -> %s",
-                        reseller.id, txn.amount, txn.net_amount, txn.fee, txn.party_b,
+                        reseller_id, txn.amount, txn.net_amount, txn.fee, txn.party_b,
                     )
                 else:
                     fail_count += 1
 
-            except Exception as e:
-                fail_count += 1
-                logger.error("B2B payout failed for reseller %s: %s", reseller.id, e)
-                await db.rollback()
+        except Exception as e:
+            fail_count += 1
+            # reseller_id is a plain int — safe to log even after a DB error.
+            logger.error("B2B payout failed for reseller %s: %s", reseller_id, e)
 
     logger.info(
         "Daily B2B payout run complete: initiated=%d skipped=%d failed=%d",
