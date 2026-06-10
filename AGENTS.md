@@ -79,6 +79,19 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
 - Keep customer-facing request paths and payment provisioning higher priority than cleanup, snapshots, and retry safety nets.
 - Current detailed lesson: `docs/agent-memory/incidents/2026-06-05-db-pool-lock-convoy.md`.
 
+## Router Provisioning Gotchas
+
+- Provisioning import dies with `Script Error: expected end of command` at an
+  `/ip hotspot` line → the router lacks the hotspot feature. Most common: hAP
+  lite/mini (smips) on RouterOS 7.20+ ship hotspot as a separate, uninstalled
+  package (`/tool fetch` the exact-version npk from download.mikrotik.com, reboot,
+  re-run); also caused by a device-mode lock (needs physical button press).
+  Full diagnosis, field-verified fix, and manual `/complete` registration for a
+  router that works but never appeared in the admin panel:
+  `docs/agent-memory/incidents/2026-06-10-provision-import-parse-abort-hotspot.md`.
+  The admin frontend shows this runbook in the add-router flow
+  (`../isp-billing-admin/app/components/HotspotPackageTroubleshoot.tsx`).
+
 ## After Incidents
 
 When an error teaches us something useful, add or update an incident note under:
