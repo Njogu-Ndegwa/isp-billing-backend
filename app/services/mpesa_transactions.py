@@ -221,7 +221,7 @@ async def reconcile_pending_mpesa_transactions():
         from app.services.mpesa import query_stk_push_status, get_access_token
 
         now = datetime.utcnow()
-        query_min_age = timedelta(minutes=2)
+        query_min_age = timedelta(seconds=60)
         expire_threshold = timedelta(hours=2)
 
         async with async_session() as db:
