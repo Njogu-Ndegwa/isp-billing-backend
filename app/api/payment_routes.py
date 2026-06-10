@@ -953,6 +953,7 @@ async def register_hotspot_and_pay_api(
 @router.get("/api/hotspot/payment-status/{customerId}")
 async def get_payment_status(
     customerId: int,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """Get payment status for a customer"""
@@ -962,9 +963,15 @@ async def get_payment_status(
         ).where(Customer.id == customerId)
         result = await db.execute(stmt)
         customer = result.scalar_one_or_none()
-        
+
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
+
+        # Customer still waiting? Schedule an on-demand Safaricom check
+        # (no-op unless their txn is >25s old; runs AFTER this response).
+        if customer.status == CustomerStatus.PENDING:
+            from app.services.mpesa_transactions import kick_pending_payment_check
+            background_tasks.add_task(kick_pending_payment_check, customerId)
 
         attempt = await get_recent_delivery_attempt_for_customer(db, customer.id)
         

@@ -11,6 +11,7 @@ from app.db.models import (
 from datetime import datetime, timedelta
 import asyncio
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +342,93 @@ async def reconcile_pending_mpesa_transactions():
             logger.error("[RECONCILE] DB pool status at failure: %s", db_pool_status())
     finally:
         _reconcile_running = False
+
+
+# ---------------------------------------------------------------------------
+# On-demand payment check — driven by the portal's payment-status polling.
+# Single-worker app, so module-level state is safe.
+# ---------------------------------------------------------------------------
+
+_ondemand_last_query: dict = {}          # checkout_request_id -> time.monotonic()
+_ondemand_cooldown_until: float = 0.0    # circuit breaker after a Safaricom error
+_ONDEMAND_MIN_AGE_SECONDS = 25           # give the normal callback first shot
+_ONDEMAND_MIN_INTERVAL_SECONDS = 20      # max 1 Safaricom query per txn per 20s
+_ONDEMAND_BREAKER_SECONDS = 60
+
+
+async def kick_pending_payment_check(customer_id: int) -> None:
+    """If this customer's newest pending M-Pesa txn is old enough that its
+    callback is probably lost, ask Safaricom for the status directly.
+
+    Runs as a FastAPI background task. Never holds a DB session across the
+    Safaricom HTTP call (see AGENTS.md "Database Session Discipline").
+    """
+    global _ondemand_cooldown_until
+
+    now_ts = time.monotonic()
+    if now_ts < _ondemand_cooldown_until:
+        return  # Safaricom recently erroring — don't pile on
+
+    from app.db.database import async_session
+    from app.services.mpesa import query_stk_push_status
+
+    now = datetime.utcnow()
+    async with async_session() as db:
+        stmt = (
+            select(MpesaTransaction)
+            .where(
+                MpesaTransaction.customer_id == customer_id,
+                MpesaTransaction.status == MpesaTransactionStatus.pending,
+                MpesaTransaction.created_at > now - timedelta(hours=2),
+                ~MpesaTransaction.checkout_request_id.startswith("FAILED-"),
+            )
+            .order_by(MpesaTransaction.created_at.desc())
+            .limit(1)
+        )
+        txn = (await db.execute(stmt)).scalar_one_or_none()
+        if txn is None:
+            return
+        checkout_request_id = txn.checkout_request_id
+        age_seconds = (now - txn.created_at).total_seconds()
+    # session closed here — nothing held across the network call below
+
+    if age_seconds < _ONDEMAND_MIN_AGE_SECONDS:
+        return
+    last = _ondemand_last_query.get(checkout_request_id, 0.0)
+    if now_ts - last < _ONDEMAND_MIN_INTERVAL_SECONDS:
+        return
+    if len(_ondemand_last_query) > 500:
+        _ondemand_last_query.clear()  # bounded memory; entries are short-lived
+    _ondemand_last_query[checkout_request_id] = now_ts
+
+    try:
+        stk_result = await query_stk_push_status(checkout_request_id)
+    except Exception as err:
+        _ondemand_cooldown_until = time.monotonic() + _ONDEMAND_BREAKER_SECONDS
+        logger.warning("[ONDEMAND] Safaricom query failed for %s, backing off %ss: %s",
+                       checkout_request_id, _ONDEMAND_BREAKER_SECONDS, err)
+        return
+
+    result_code = stk_result["result_code"]
+    result_desc = stk_result["result_desc"]
+
+    if result_code == 0:
+        logger.info("[ONDEMAND] %s confirmed paid via on-demand query", checkout_request_id)
+        await complete_and_provision_transaction(txn, result_desc)
+    elif result_code in (-1, 4999):
+        logger.debug("[ONDEMAND] %s still processing (code=%s)", checkout_request_id, result_code)
+    else:
+        async with async_session() as db:
+            await update_mpesa_transaction_status(
+                db,
+                checkout_request_id,
+                MpesaTransactionStatus.failed,
+                result_code=str(result_code),
+                result_desc=result_desc,
+                failure_source=FailureSource.CLIENT,
+            )
+        logger.info("[ONDEMAND] Marked %s failed (code=%s, desc=%s)",
+                    checkout_request_id, result_code, result_desc)
 
 
 async def complete_and_provision_transaction(txn: MpesaTransaction, result_desc: str) -> None:
