@@ -32,6 +32,9 @@ import json
 
 logger = logging.getLogger(__name__)
 
+# How long a pending M-Pesa txn blocks a second STK push for the same customer
+DUP_GUARD_WINDOW = timedelta(minutes=3)
+
 router = APIRouter(tags=["payments"])
 
 
@@ -194,6 +197,11 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
         checkout_request_id = stk_callback.get("CheckoutRequestID")
         merchant_request_id = stk_callback.get("MerchantRequestID")
         result_code = stk_callback.get("ResultCode")
+        if result_code is not None:
+            try:
+                result_code = int(result_code)
+            except (TypeError, ValueError):
+                logger.error(f"Non-numeric ResultCode {result_code!r} in callback for {checkout_request_id}")
         result_desc = stk_callback.get("ResultDesc")
         
         if not checkout_request_id:
@@ -280,10 +288,24 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                 logger.error(f"Transaction not found for CheckoutRequestID: {checkout_request_id}")
                 return {"ResultCode": 1, "ResultDesc": "Transaction not found"}
         
-        # DUPLICATE CALLBACK PROTECTION: Skip if already processed
-        if mpesa_txn.status in (MpesaTransactionStatus.completed, MpesaTransactionStatus.failed):
+        # DUPLICATE CALLBACK PROTECTION:
+        # - completed is FINAL: ignore any further callbacks.
+        # - failed/expired + a SUCCESS callback means an earlier reconcile pass
+        #   misclassified the txn (e.g. old 4999 handling) or it expired during
+        #   a Safaricom outage. Safaricom is the source of truth for money —
+        #   process it so the customer gets what they paid for.
+        if mpesa_txn.status == MpesaTransactionStatus.completed:
             logger.warning(f"Duplicate callback ignored for {checkout_request_id} - status: {mpesa_txn.status.value}")
             return {"ResultCode": 0, "ResultDesc": "Already processed"}
+        if mpesa_txn.status in (MpesaTransactionStatus.failed, MpesaTransactionStatus.expired):
+            if result_code == 0:
+                logger.warning(
+                    f"[REVIVAL] SUCCESS callback for previously-{mpesa_txn.status.value} "
+                    f"txn {checkout_request_id} — processing it"
+                )
+            else:
+                logger.warning(f"Duplicate callback ignored for {checkout_request_id} - status: {mpesa_txn.status.value}")
+                return {"ResultCode": 0, "ResultDesc": "Already processed"}
         
         # Extract callback metadata
         callback_metadata = stk_callback.get("CallbackMetadata", {})
@@ -736,6 +758,38 @@ async def register_hotspot_and_pay_api(
         )
         customer_result = await db.execute(customer_stmt)
         existing_customer = customer_result.scalar_one_or_none()
+
+        # DUPLICATE-PAYMENT GUARD: if this customer already has an in-flight
+        # M-Pesa payment, don't charge them again — point the portal back at
+        # the existing transaction's polling loop instead.
+        if existing_customer and payment_method_enum == PaymentMethod.MOBILE_MONEY:
+            recent_cutoff = datetime.utcnow() - DUP_GUARD_WINDOW
+            dup_stmt = (
+                select(MpesaTransaction)
+                .where(
+                    MpesaTransaction.customer_id == existing_customer.id,
+                    MpesaTransaction.status == MpesaTransactionStatus.pending,
+                    MpesaTransaction.created_at >= recent_cutoff,
+                    ~MpesaTransaction.checkout_request_id.startswith("FAILED-"),
+                )
+                .limit(1)
+            )
+            in_flight = (await db.execute(dup_stmt)).scalar_one_or_none()
+            if in_flight:
+                logger.info(
+                    "[DUP GUARD] Customer %s already has pending txn %s — refusing second STK push",
+                    existing_customer.id, in_flight.checkout_request_id,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "status": "payment_in_progress",
+                        "customer_id": existing_customer.id,
+                        "message": "Your payment is still being processed. "
+                                   "Please wait — do not pay again.",
+                    },
+                )
+
         if existing_customer:
             # Store intended change in pending_update_data
             pending_data = {
@@ -899,6 +953,7 @@ async def register_hotspot_and_pay_api(
 @router.get("/api/hotspot/payment-status/{customerId}")
 async def get_payment_status(
     customerId: int,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """Get payment status for a customer"""
@@ -908,9 +963,15 @@ async def get_payment_status(
         ).where(Customer.id == customerId)
         result = await db.execute(stmt)
         customer = result.scalar_one_or_none()
-        
+
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
+
+        # Customer still waiting? Schedule an on-demand Safaricom check
+        # (no-op unless their txn is >25s old; runs AFTER this response).
+        if customer.status == CustomerStatus.PENDING:
+            from app.services.mpesa_transactions import kick_pending_payment_check
+            background_tasks.add_task(kick_pending_payment_check, customerId)
 
         attempt = await get_recent_delivery_attempt_for_customer(db, customer.id)
         

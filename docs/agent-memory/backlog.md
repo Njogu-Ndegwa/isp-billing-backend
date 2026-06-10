@@ -4,6 +4,20 @@ Project-level items that should survive across agent sessions.
 
 ## Reliability And Architecture
 
+### M-Pesa Callback Handler Atomic Completion Claim
+
+- Status: planned
+- Problem: the STK callback handler (`mpesa_direct_callback`) marks transactions completed via read-check-write (ORM read, then unconditional write), while the reconcile sweep and on-demand check use an atomic `UPDATE ... WHERE status = 'pending'` claim (`complete_and_provision_transaction`). A success callback racing the on-demand/sweep claim in a millisecond window can record a duplicate CustomerPayment (doubled expiry extension — money moves only once).
+- Why it matters: the 2026-06 payment-resilience branch added the on-demand rescue path, which marginally increases how often a late callback and a query resolution can coincide.
+- Proposed next step: route the callback's pending→completed transition through the same atomic claim (or an UPDATE guarded on `status = 'pending'`), keeping the revival branch's failed/expired→completed transition as a separate guarded claim.
+
+### M-Pesa Transactions Customer Index
+
+- Status: planned
+- Problem: the duplicate-payment guard and on-demand check filter `mpesa_transactions` by `customer_id` + `status` + `created_at`, but the table has no index on `customer_id` (only PK and `checkout_request_id`).
+- Why it matters: the guard runs on every repeat payment attempt; at ~1,600 txns/day the table reaches ~600k rows/year and each lookup becomes a sequential scan.
+- Proposed next step: apply manually in production (no migrations framework): `CREATE INDEX CONCURRENTLY ix_mpesa_txn_customer_pending ON mpesa_transactions (customer_id, status, created_at DESC) WHERE status = 'pending';`
+
 ### Router Command Outbox
 
 - Status: planned
