@@ -736,6 +736,38 @@ async def register_hotspot_and_pay_api(
         )
         customer_result = await db.execute(customer_stmt)
         existing_customer = customer_result.scalar_one_or_none()
+
+        # DUPLICATE-PAYMENT GUARD: if this customer already has an in-flight
+        # M-Pesa payment, don't charge them again — point the portal back at
+        # the existing transaction's polling loop instead.
+        if existing_customer and payment_method_enum == PaymentMethod.MOBILE_MONEY:
+            recent_cutoff = datetime.utcnow() - timedelta(minutes=3)
+            dup_stmt = (
+                select(MpesaTransaction)
+                .where(
+                    MpesaTransaction.customer_id == existing_customer.id,
+                    MpesaTransaction.status == MpesaTransactionStatus.pending,
+                    MpesaTransaction.created_at >= recent_cutoff,
+                    ~MpesaTransaction.checkout_request_id.startswith("FAILED-"),
+                )
+                .limit(1)
+            )
+            in_flight = (await db.execute(dup_stmt)).scalar_one_or_none()
+            if in_flight:
+                logger.info(
+                    "[DUP GUARD] Customer %s already has pending txn %s — refusing second STK push",
+                    existing_customer.id, in_flight.checkout_request_id,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "status": "payment_in_progress",
+                        "customer_id": existing_customer.id,
+                        "message": "Your payment is still being processed. "
+                                   "Please wait — do not pay again.",
+                    },
+                )
+
         if existing_customer:
             # Store intended change in pending_update_data
             pending_data = {
