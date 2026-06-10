@@ -79,6 +79,13 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
 - Keep customer-facing request paths and payment provisioning higher priority than cleanup, snapshots, and retry safety nets.
 - Current detailed lesson: `docs/agent-memory/incidents/2026-06-05-db-pool-lock-convoy.md`.
 
+## Server Access And Deploys
+
+- SSH access to production (key-based, non-interactive for agents), the backend
+  deploy runbook, and the one-time procedure to grant the same capability on any
+  new server: [`docs/agent-memory/server-access.md`](docs/agent-memory/server-access.md).
+- Never commit SSH private keys, passwords, or credentials — public keys only.
+
 ## Router Provisioning Gotchas
 
 - Provisioning import dies with `Script Error: expected end of command` at an
@@ -91,6 +98,107 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   `docs/agent-memory/incidents/2026-06-10-provision-import-parse-abort-hotspot.md`.
   The admin frontend shows this runbook in the add-router flow
   (`../isp-billing-admin/app/components/HotspotPackageTroubleshoot.tsx`).
+
+## AWS Migration / Insurance Tunnel Handoff
+
+The migration strategy is deliberately staged. The first milestone is not to move
+traffic or users; it is to make every reachable, eligible router reachable from
+the new AWS server through a secondary management tunnel while the old production
+server remains the primary control plane. Only after this safety layer exists
+should the platform/database/application cutover be attempted.
+
+### Intended Migration Phases
+
+1. Prepare the new AWS server with a static Elastic IP and the same required
+   network services: HTTP/HTTPS routing, Docker, Apache, WireGuard, and L2TP/IPsec.
+2. Deploy only the small "insurance manager" service to the new server first. It
+   registers backup peers/credentials and verifies ping/API reachability over the
+   backup network; it is not the full billing platform.
+3. From the old production admin app, add secondary tunnels to routers remotely.
+   Old operations keep using the existing `10.0.0.0/16` management path.
+4. Batch the backup rollout slowly across active/trial routers only. Confirm
+   backup status before expanding the batch size.
+5. After enough routers have verified backup reachability, deploy the full
+   platform to the new server on a separate branch/CI path and test it against a
+   replicated or restored database.
+6. Cut over public DNS/API/frontend traffic only after router control, payments,
+   background jobs, Apache routing, and database restore/replication are proven.
+   Keep the old server available for rollback until the new server is stable.
+
+### Current Server/Tunnel Facts
+
+- Old server remains the current production app path.
+- New AWS Elastic IP is `35.170.199.141`.
+- Backup management network is `10.250.0.0/16`; new server side is `10.250.0.1`.
+- New server WireGuard insurance interface is `wg1`, listening on UDP `51821`,
+  used by RouterOS v7 routers.
+- New server also has strongSwan/xl2tpd prepared for RouterOS v6 L2TP/IPsec
+  insurance tunnels.
+- Do not commit manager API keys, L2TP PSKs, private keys, or router credentials.
+  Keep those in server env files and GitHub secrets only.
+
+### What Has Been Proved
+
+- Manual proof succeeded on `Router-0244`: the primary tunnel stayed up, a
+  secondary WireGuard tunnel reached `10.250.0.1`, and the new server could verify
+  backup reachability.
+- RouterOS v7 path: secondary WireGuard is supported.
+- RouterOS v6 path: secondary L2TP/IPsec is supported, using credentials from the
+  linked provisioning token where available.
+- The admin frontend can show planned tunnel type and backup status/progress.
+
+### Current Implementation
+
+- Backend implementation lives mainly in:
+  `app/api/router_management.py`, `app/services/insurance_wireguard.py`,
+  `app/services/insurance_l2tp.py`, and `app/services/insurance_tunnel_batch.py`.
+- Frontend admin controls live in `../isp-billing-admin/app/routers/page.tsx`
+  with API/types in `../isp-billing-admin/app/lib/api.ts` and `types.ts`.
+- Single-router endpoint can preview or apply the correct insurance tunnel.
+  Preview uses token metadata; apply still reads RouterOS version live before
+  deciding WireGuard vs L2TP.
+- Batch rollout is admin-only and conservative: preview first, confirmation
+  required, default UI limit `5`, default concurrency `1`, backend raw-start
+  fallback limit `10`, max limit `50`, max concurrency `3`.
+- Batch eligibility: admin-owned routers may be processed; reseller-owned routers
+  are eligible only when owner subscription is `active` or `trial`. Suspended,
+  inactive, missing-owner, recently-offline, and invalid-backup-IP routers are
+  skipped before router access.
+- Batch progress is in backend memory, not DB schema. It stores recent job/item
+  status only, caps completed job history, and truncates large stored text/list
+  values. No DB migration is needed for progress display.
+- DB/session rule for this rollout: load routers/tokens/owners in a short DB
+  section, release the session, then perform RouterOS/manager/ping/TCP work.
+  Background router work skips when DB pool pressure is warning/critical.
+
+### Tests And Safety Checks
+
+- Focused tests for this area include:
+  `tests/test_insurance_wireguard.py`, `tests/test_insurance_l2tp.py`, and
+  `tests/test_insurance_tunnel_batch.py`.
+- Before pushing migration/insurance changes, run those focused tests and a
+  frontend build in `../isp-billing-admin`.
+
+### Related Docs For Perusal
+
+- Overall agent memory index: [`docs/agent-memory/README.md`](docs/agent-memory/README.md).
+- Deferred reliability/architecture work: [`docs/agent-memory/backlog.md`](docs/agent-memory/backlog.md).
+- DB pool incident that drives the short-session/no-I/O-with-DB rule:
+  [`docs/agent-memory/incidents/2026-06-05-db-pool-lock-convoy.md`](docs/agent-memory/incidents/2026-06-05-db-pool-lock-convoy.md).
+- Earlier DB pool incidents:
+  [`docs/agent-memory/incidents/2026-05-31-db-pool-exhaustion.md`](docs/agent-memory/incidents/2026-05-31-db-pool-exhaustion.md) and
+  [`docs/agent-memory/incidents/2026-06-02-db-pool-exhaustion-recurrence.md`](docs/agent-memory/incidents/2026-06-02-db-pool-exhaustion-recurrence.md).
+- Router provisioning/hotspot package incident:
+  [`docs/agent-memory/incidents/2026-06-10-provision-import-parse-abort-hotspot.md`](docs/agent-memory/incidents/2026-06-10-provision-import-parse-abort-hotspot.md).
+- Router/VPN setup background:
+  [`MIKROTIK_VPN_README.md`](MIKROTIK_VPN_README.md),
+  [`WIREGUARD_SETUP.md`](WIREGUARD_SETUP.md),
+  [`WIREGUARD_QUICK_START.md`](WIREGUARD_QUICK_START.md), and
+  [`ROUTER_SETUP_GUIDE.md`](ROUTER_SETUP_GUIDE.md).
+- Docker/server setup background:
+  [`DOCKER_SETUP.md`](DOCKER_SETUP.md).
+- DB pool frontend/ops monitor:
+  [`DB_POOL_MONITORING_FRONTEND.md`](DB_POOL_MONITORING_FRONTEND.md).
 
 ## After Incidents
 
