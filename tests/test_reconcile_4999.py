@@ -87,3 +87,36 @@ async def test_terminal_code_still_marks_failed(engine, session_factory):
             select(MpesaTransaction).where(MpesaTransaction.id == txn_id)
         )).scalar_one()
     assert refreshed.status == MpesaTransactionStatus.failed
+
+
+async def test_completion_claim_is_idempotent(engine, db, session_factory):
+    """Calling the success handler twice must record exactly one payment."""
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    router = await make_router(db, reseller)
+    customer = await make_customer(db, reseller, plan, router)
+    txn = await _make_pending_txn(db, customer)
+
+    from app.services import mpesa_transactions as mt
+    from app.db.models import CustomerPayment
+
+    with patch(
+        "app.services.hotspot_provisioning.provision_hotspot_customer",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "app.services.hotspot_provisioning.schedule_provisioning_attempt",
+        new=AsyncMock(return_value=None),
+    ):
+        await mt.complete_and_provision_transaction(txn, "The service request is processed successfully.")
+        await mt.complete_and_provision_transaction(txn, "The service request is processed successfully.")
+
+    # Use a fresh session so we see the committed DB state, not stale identity map
+    async with session_factory() as fresh:
+        payments = (await fresh.execute(
+            select(CustomerPayment).where(CustomerPayment.customer_id == customer.id)
+        )).scalars().all()
+        refreshed_txn = (await fresh.execute(
+            select(MpesaTransaction).where(MpesaTransaction.id == txn.id)
+        )).scalar_one()
+    assert len(payments) == 1
+    assert refreshed_txn.status == MpesaTransactionStatus.completed

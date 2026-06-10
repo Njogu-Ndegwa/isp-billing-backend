@@ -218,15 +218,6 @@ async def reconcile_pending_mpesa_transactions():
     try:
         from app.db.database import async_session
         from app.services.mpesa import query_stk_push_status, get_access_token
-        from app.services.reseller_payments import record_customer_payment
-        from app.services.hotspot_provisioning import (
-            build_hotspot_payload,
-            get_or_create_provisioning_attempt,
-            log_provisioning_event,
-            provision_hotspot_customer,
-            schedule_provisioning_attempt,
-        )
-        from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
 
         now = datetime.utcnow()
         query_min_age = timedelta(minutes=2)
@@ -314,17 +305,7 @@ async def reconcile_pending_mpesa_transactions():
             result_desc = stk_result["result_desc"]
 
             if result_code == 0:
-                await _handle_successful_reconciliation(
-                    txn, result_desc,
-                    record_customer_payment,
-                    build_hotspot_payload,
-                    get_or_create_provisioning_attempt,
-                    log_provisioning_event,
-                    provision_hotspot_customer,
-                    schedule_provisioning_attempt,
-                    call_pppoe_provision,
-                    build_pppoe_payload,
-                )
+                await complete_and_provision_transaction(txn, result_desc)
             elif result_code in (-1, 4999):
                 # -1   = ResultCode missing from Safaricom's response
                 # 4999 = "The transaction is still under processing"
@@ -362,6 +343,35 @@ async def reconcile_pending_mpesa_transactions():
         _reconcile_running = False
 
 
+async def complete_and_provision_transaction(txn: MpesaTransaction, result_desc: str) -> None:
+    """Mark a Safaricom-confirmed transaction completed and provision the customer.
+
+    Shared by the reconcile sweep and the on-demand payment check. Safe to call
+    twice: the pending->completed claim inside is atomic.
+    """
+    from app.services.reseller_payments import record_customer_payment
+    from app.services.hotspot_provisioning import (
+        build_hotspot_payload,
+        get_or_create_provisioning_attempt,
+        log_provisioning_event,
+        provision_hotspot_customer,
+        schedule_provisioning_attempt,
+    )
+    from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
+
+    await _handle_successful_reconciliation(
+        txn, result_desc,
+        record_customer_payment,
+        build_hotspot_payload,
+        get_or_create_provisioning_attempt,
+        log_provisioning_event,
+        provision_hotspot_customer,
+        schedule_provisioning_attempt,
+        call_pppoe_provision,
+        build_pppoe_payload,
+    )
+
+
 async def _handle_successful_reconciliation(
     txn: MpesaTransaction,
     result_desc: str,
@@ -383,21 +393,34 @@ async def _handle_successful_reconciliation(
     hotspot_context = None
 
     async with async_session() as db:
-        # Re-fetch the transaction inside this session (avoid detached instance)
+        # Atomically claim the pending -> completed transition. If another path
+        # (callback, concurrent sweep, on-demand check) already finalized this
+        # transaction, the UPDATE matches zero rows and we bail out.
+        claim = await db.execute(
+            update(MpesaTransaction)
+            .where(
+                MpesaTransaction.checkout_request_id == txn.checkout_request_id,
+                MpesaTransaction.status == MpesaTransactionStatus.pending,
+            )
+            .values(
+                status=MpesaTransactionStatus.completed,
+                result_code="0",
+                result_desc=result_desc,
+                failure_source=None,
+                updated_at=datetime.utcnow(),
+            )
+        )
+        if claim.rowcount == 0:
+            # Another path (callback, concurrent sweep, on-demand check)
+            # already finalized this transaction.
+            return
+        await db.commit()
+
         stmt = select(MpesaTransaction).where(
             MpesaTransaction.checkout_request_id == txn.checkout_request_id
         )
         res = await db.execute(stmt)
-        mpesa_txn = res.scalar_one_or_none()
-        if not mpesa_txn or mpesa_txn.status != MpesaTransactionStatus.pending:
-            return
-
-        mpesa_txn.status = MpesaTransactionStatus.completed
-        mpesa_txn.result_code = "0"
-        mpesa_txn.result_desc = result_desc
-        mpesa_txn.failure_source = None
-        mpesa_txn.updated_at = datetime.utcnow()
-        await db.commit()
+        mpesa_txn = res.scalar_one()
 
         logger.info(
             "[RECONCILE] Marked %s as completed via STK Query",
