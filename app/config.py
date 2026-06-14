@@ -80,6 +80,15 @@ class Settings(BaseSettings):
     INSURANCE_L2TP_IPSEC_PSK: str = ""
     INSURANCE_MANAGER_TIMEOUT: int = 10
 
+    # --- Messaging / SMS -------------------------------------------------
+    SMS_PROVIDER: str = "africastalking"
+    AT_USERNAME: str = ""
+    AT_API_KEY: str = ""
+    AT_SENDER_ID: str = ""
+    AT_BASE_URL: str = "https://api.africastalking.com"
+    SMS_DISPATCH_CHUNK_SIZE: int = 100
+    SMS_DISPATCH_ENABLED: bool = True
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
