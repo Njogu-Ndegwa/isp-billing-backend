@@ -54,6 +54,7 @@ from app.services.insurance_tunnel_batch import (
 import logging
 import asyncio
 import time
+import re
 from urllib.parse import urlencode, urlsplit
 
 logger = logging.getLogger(__name__)
@@ -839,18 +840,26 @@ def _copy_webfig_response_headers(upstream: httpx.Response, router_id: int) -> d
 
 
 def _rewrite_webfig_location(location: str, router_id: int) -> str:
-    prefix = f"/api/admin/routers/{router_id}/webfig"
-    if not location:
-        return prefix + "/"
-    if location.startswith("/"):
-        return prefix + location
+    return _rewrite_webfig_url(location, router_id)
 
-    parsed = urlsplit(location)
+
+def _rewrite_webfig_url(url: str, router_id: int) -> str:
+    prefix = f"/api/admin/routers/{router_id}/webfig"
+    if not url:
+        return prefix + "/"
+    if url.startswith(prefix):
+        return url
+    parsed = urlsplit(url)
     if parsed.scheme in {"http", "https"}:
         path = parsed.path or "/"
         query = f"?{parsed.query}" if parsed.query else ""
-        return f"{prefix}{path}{query}"
-    return location
+        fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+        if path.startswith(prefix):
+            return f"{path}{query}{fragment}"
+        return f"{prefix}{path}{query}{fragment}"
+    if url.startswith("/"):
+        return prefix + url
+    return url
 
 
 def _rewrite_webfig_set_cookie(cookie: str, router_id: int) -> str:
@@ -896,21 +905,56 @@ def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -
         text = content.decode(encoding, errors="replace")
 
     prefix = f"/api/admin/routers/{router_id}/webfig"
-    replacements = (
-        ('href="/', f'href="{prefix}/'),
-        ("href='/", f"href='{prefix}/"),
-        ('src="/', f'src="{prefix}/'),
-        ("src='/", f"src='{prefix}/"),
-        ('action="/', f'action="{prefix}/'),
-        ("action='/", f"action='{prefix}/"),
-        ('url(/', f'url({prefix}/'),
-        ('fetch("/', f'fetch("{prefix}/'),
-        ("fetch('/", f"fetch('{prefix}/"),
-        ('XMLHttpRequest.open("GET","/', f'XMLHttpRequest.open("GET","{prefix}/'),
-        ("XMLHttpRequest.open('GET','/", f"XMLHttpRequest.open('GET','{prefix}/"),
+
+    def rewrite(url: str) -> str:
+        rewritten = _rewrite_webfig_url(url, router_id)
+        if rewritten.startswith(prefix):
+            return rewritten
+        return url
+
+    quoted_attr = re.compile(
+        r"(?i)(?P<lead>\b(?:href|src|action|data-url)\s*=\s*)"
+        r"(?P<quote>[\"'])(?P<url>https?://[^\"']+|/[^\"']*)(?P=quote)"
     )
-    for old, new in replacements:
-        text = text.replace(old, new)
+    text = quoted_attr.sub(
+        lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
+        text,
+    )
+
+    unquoted_attr = re.compile(
+        r"(?i)(?P<lead>\b(?:href|src|action|data-url)\s*=\s*)"
+        r"(?P<url>https?://[^\s>\"']+|/[^\s>\"']+)"
+    )
+    text = unquoted_attr.sub(lambda m: f"{m.group('lead')}{rewrite(m.group('url'))}", text)
+
+    css_url = re.compile(
+        r"(?i)(?P<lead>\burl\(\s*)(?P<quote>[\"']?)"
+        r"(?P<url>https?://[^)\"']+|/[^)\"']+)(?P=quote)(?P<trail>\s*\))"
+    )
+    text = css_url.sub(
+        lambda m: (
+            f"{m.group('lead')}{m.group('quote')}"
+            f"{rewrite(m.group('url'))}{m.group('quote')}{m.group('trail')}"
+        ),
+        text,
+    )
+
+    # RouterOS WebFig can redirect after login through JavaScript or meta
+    # refresh strings instead of HTTP Location headers.
+    quoted_webfig_path = re.compile(
+        r"(?P<quote>[\"'])(?P<url>https?://[^\"']+/webfig[^\"']*|/webfig[^\"']*)(?P=quote)",
+        re.IGNORECASE,
+    )
+    text = quoted_webfig_path.sub(
+        lambda m: f"{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
+        text,
+    )
+
+    meta_refresh_url = re.compile(
+        r"(?i)(?P<lead>\burl\s*=\s*)(?P<url>https?://[^\s;\"'>]+|/webfig[^\s;\"'>]*)"
+    )
+    text = meta_refresh_url.sub(lambda m: f"{m.group('lead')}{rewrite(m.group('url'))}", text)
+
     return text.encode(encoding, errors="replace")
 
 
