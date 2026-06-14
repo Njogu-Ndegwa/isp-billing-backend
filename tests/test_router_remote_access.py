@@ -96,9 +96,10 @@ class FakeMikroTikAPI:
     def send_command(self, command, arguments=None):
         arguments = arguments or {}
         if command == "/ip/service/print":
-            name = arguments.get("?name")
-            service = self.services.get(name)
-            return {"success": True, "data": [dict(service)] if service else []}
+            if arguments:
+                unsupported = next(iter(arguments))
+                return {"error": f"unknown parameter {unsupported}"}
+            return {"success": True, "data": [dict(service) for service in self.services.values()]}
         if command == "/ip/service/set":
             service = self._service_by_id(arguments["numbers"])
             for key, value in arguments.items():
