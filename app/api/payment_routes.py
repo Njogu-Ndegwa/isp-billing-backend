@@ -1125,6 +1125,7 @@ async def get_mpesa_transactions(
                     } if plan else None,
                     "manual_provision_supported": manual_supported,
                     "manual_provision_reason": manual_reason,
+                    "counts_as_revenue": True,
                     "_delivery_source_table": ProvisioningAttemptSource.MPESA_TRANSACTION.value,
                     "_delivery_source_pk": tx.id,
                 })
@@ -1230,6 +1231,7 @@ async def get_mpesa_transactions(
                     } if plan else None,
                     "manual_provision_supported": manual_supported,
                     "manual_provision_reason": manual_reason,
+                    "counts_as_revenue": bool(pay.counts_as_revenue),
                     "_delivery_source_table": ProvisioningAttemptSource.CUSTOMER_PAYMENT.value,
                     "_delivery_source_pk": pay.id,
                 })
@@ -1551,6 +1553,7 @@ async def get_mpesa_transactions_summary(
                     "method": "mobile_money",
                     "router_name": rtr.name if rtr else None,
                     "router_id": rtr.id if rtr else None,
+                    "counts_as_revenue": True,
                 })
 
         if want_other:
@@ -1583,26 +1586,31 @@ async def get_mpesa_transactions_summary(
                     "method": pay.payment_method.value,
                     "router_name": rtr.name if rtr else None,
                     "router_id": rtr.id if rtr else None,
+                    "counts_as_revenue": bool(pay.counts_as_revenue),
                 })
 
         total_transactions = len(rows)
-        total_amount = sum(r["amount"] for r in rows)
+        # Only sum amounts for rows that count as revenue (exclude compensation)
+        total_amount = sum(r["amount"] for r in rows if r["counts_as_revenue"])
+        compensation_total = round(sum(r["amount"] for r in rows if not r["counts_as_revenue"]), 2)
 
         status_breakdown: dict = {}
         for r in rows:
             s = r["status"]
             if s not in status_breakdown:
                 status_breakdown[s] = {"count": 0, "amount": 0}
-            status_breakdown[s]["count"] += 1
-            status_breakdown[s]["amount"] += r["amount"]
+            status_breakdown[s]["count"] += 1  # always count
+            if r["counts_as_revenue"]:
+                status_breakdown[s]["amount"] += r["amount"]
 
         method_breakdown: dict = {}
         for r in rows:
             m = r["method"]
             if m not in method_breakdown:
                 method_breakdown[m] = {"count": 0, "amount": 0}
-            method_breakdown[m]["count"] += 1
-            method_breakdown[m]["amount"] += r["amount"]
+            method_breakdown[m]["count"] += 1  # always count
+            if r["counts_as_revenue"]:
+                method_breakdown[m]["amount"] += r["amount"]
 
         router_breakdown: dict = {}
         for r in rows:
@@ -1610,12 +1618,14 @@ async def get_mpesa_transactions_summary(
                 rname = r["router_name"]
                 if rname not in router_breakdown:
                     router_breakdown[rname] = {"count": 0, "amount": 0, "router_id": r["router_id"]}
-                router_breakdown[rname]["count"] += 1
-                router_breakdown[rname]["amount"] += r["amount"]
+                router_breakdown[rname]["count"] += 1  # always count
+                if r["counts_as_revenue"]:
+                    router_breakdown[rname]["amount"] += r["amount"]
 
         return {
             "total_transactions": total_transactions,
             "total_amount": total_amount,
+            "compensation_total": compensation_total,
             "status_breakdown": status_breakdown,
             "method_breakdown": method_breakdown,
             "router_breakdown": router_breakdown,

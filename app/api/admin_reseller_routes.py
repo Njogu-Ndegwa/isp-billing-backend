@@ -297,13 +297,16 @@ async def list_resellers(
             )
         )).scalar() or 0
 
-        # Revenue in the requested period (all methods)
+        # Revenue in the requested period (all methods, excluding compensation)
         rev_filters = [CustomerPayment.reseller_id == r.id] + date_filters
         total_revenue = float((await db.execute(
-            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*rev_filters)
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+                *rev_filters, CustomerPayment.counts_as_revenue == True
+            )
         )).scalar())
 
         # M-Pesa-only revenue in the requested period (what admin collected)
+        # MPESA_FILTER already excludes CASH (and therefore compensation), so no extra filter needed
         mpesa_rev = float((await db.execute(
             select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*rev_filters, MPESA_FILTER)
         )).scalar())
@@ -549,10 +552,17 @@ async def get_reseller_detail(
     base = [CustomerPayment.reseller_id == reseller_id]
 
     async def _rev(extra_filters=None) -> dict:
-        """Return {total, mpesa} revenue for given filters."""
+        """Return {total, mpesa} revenue for given filters.
+
+        total excludes compensation vouchers (counts_as_revenue=False).
+        mpesa is already safe — MPESA_FILTER limits to MOBILE_MONEY which can
+        never be a compensation payment (those are CASH).
+        """
         f = base + (extra_filters or [])
         total = float((await db.execute(
-            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*f)
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+                *f, CustomerPayment.counts_as_revenue == True
+            )
         )).scalar())
         mpesa = float((await db.execute(
             select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*f, MPESA_FILTER)
@@ -804,10 +814,18 @@ async def get_reseller_payments(
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid end_date format")
 
-    # Summary
+    # Summary: count includes all rows (including compensation); amount excludes compensation
     summary_stmt = select(
         func.count(CustomerPayment.id),
-        func.coalesce(func.sum(CustomerPayment.amount), 0),
+        func.coalesce(
+            func.sum(
+                case(
+                    (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
+                    else_=0,
+                )
+            ),
+            0,
+        ),
     ).where(*base_filter)
     summary = (await db.execute(summary_stmt)).one()
     total_count, total_amount = int(summary[0]), float(summary[1])
@@ -1117,19 +1135,24 @@ async def admin_dashboard(
         )
     )).scalar() or 0
 
-    # Revenue across all resellers
+    # Revenue across all resellers (excluding compensation vouchers)
     async def _total_revenue_since(since: datetime) -> dict:
         f = [CustomerPayment.created_at >= since]
         total = float((await db.execute(
-            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*f)
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+                *f, CustomerPayment.counts_as_revenue == True
+            )
         )).scalar())
+        # MPESA_FILTER (payment_method==MOBILE_MONEY) already excludes CASH comp payments
         mpesa = float((await db.execute(
             select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*f, MPESA_FILTER)
         )).scalar())
         return {"total": total, "mpesa": mpesa}
 
     all_time_revenue = float((await db.execute(
-        select(func.coalesce(func.sum(CustomerPayment.amount), 0))
+        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+            CustomerPayment.counts_as_revenue == True
+        )
     )).scalar())
     all_time_mpesa_revenue = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(MPESA_FILTER)
@@ -1147,7 +1170,7 @@ async def admin_dashboard(
         select(func.count(Router.id)).where(Router.last_status == True)
     )).scalar() or 0
 
-    # Top 10 resellers by revenue this month
+    # Top 10 resellers by revenue this month (excluding compensation vouchers)
     top_stmt = (
         select(
             User.id,
@@ -1156,7 +1179,11 @@ async def admin_dashboard(
             func.coalesce(func.sum(CustomerPayment.amount), 0).label("month_revenue"),
         )
         .join(CustomerPayment, CustomerPayment.reseller_id == User.id)
-        .where(User.role == UserRole.RESELLER, CustomerPayment.created_at >= month_start)
+        .where(
+            User.role == UserRole.RESELLER,
+            CustomerPayment.created_at >= month_start,
+            CustomerPayment.counts_as_revenue == True,
+        )
         .group_by(User.id, User.email, User.organization_name)
         .order_by(func.sum(CustomerPayment.amount).desc())
         .limit(10)

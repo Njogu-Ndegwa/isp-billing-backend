@@ -127,40 +127,44 @@ async def get_dashboard_overview(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                Customer.router_id == router_id
+                Customer.router_id == router_id,
+                CustomerPayment.counts_as_revenue == True
             )
             total_revenue_result = await db.execute(total_revenue_stmt)
             total_revenue = float(total_revenue_result.scalar() or 0)
-            
+
             # Today's revenue
             today_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
                 Customer.router_id == router_id,
-                CustomerPayment.created_at >= today_start
+                CustomerPayment.created_at >= today_start,
+                CustomerPayment.counts_as_revenue == True
             )
             today_revenue_result = await db.execute(today_revenue_stmt)
             today_revenue = float(today_revenue_result.scalar() or 0)
-            
+
             # This week's revenue
             week_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
                 Customer.router_id == router_id,
-                CustomerPayment.created_at >= week_start
+                CustomerPayment.created_at >= week_start,
+                CustomerPayment.counts_as_revenue == True
             )
             week_revenue_result = await db.execute(week_revenue_stmt)
             week_revenue = float(week_revenue_result.scalar() or 0)
-            
+
             # This month's revenue
             month_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
                 Customer.router_id == router_id,
-                CustomerPayment.created_at >= month_start
+                CustomerPayment.created_at >= month_start,
+                CustomerPayment.counts_as_revenue == True
             )
             month_revenue_result = await db.execute(month_revenue_stmt)
             month_revenue = float(month_revenue_result.scalar() or 0)
@@ -168,31 +172,35 @@ async def get_dashboard_overview(
             # No router filter - original behavior
             # Total revenue all time
             total_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
-                CustomerPayment.reseller_id == user_id
+                CustomerPayment.reseller_id == user_id,
+                CustomerPayment.counts_as_revenue == True
             )
             total_revenue_result = await db.execute(total_revenue_stmt)
             total_revenue = float(total_revenue_result.scalar() or 0)
-            
+
             # Today's revenue
             today_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= today_start
+                CustomerPayment.created_at >= today_start,
+                CustomerPayment.counts_as_revenue == True
             )
             today_revenue_result = await db.execute(today_revenue_stmt)
             today_revenue = float(today_revenue_result.scalar() or 0)
-            
+
             # This week's revenue
             week_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= week_start
+                CustomerPayment.created_at >= week_start,
+                CustomerPayment.counts_as_revenue == True
             )
             week_revenue_result = await db.execute(week_revenue_stmt)
             week_revenue = float(week_revenue_result.scalar() or 0)
-            
+
             # This month's revenue
             month_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= month_start
+                CustomerPayment.created_at >= month_start,
+                CustomerPayment.counts_as_revenue == True
             )
             month_revenue_result = await db.execute(month_revenue_stmt)
             month_revenue = float(month_revenue_result.scalar() or 0)
@@ -208,7 +216,8 @@ async def get_dashboard_overview(
         ).join(
             CustomerPayment, CustomerPayment.customer_id == Customer.id
         ).where(
-            Router.user_id == user_id
+            Router.user_id == user_id,
+            CustomerPayment.counts_as_revenue == True
         )
         if router_id:
             router_revenue_stmt = router_revenue_stmt.where(Router.id == router_id)
@@ -237,7 +246,8 @@ async def get_dashboard_overview(
         ).join(
             CustomerPayment, CustomerPayment.customer_id == Customer.id
         ).where(
-            Plan.user_id == user_id
+            Plan.user_id == user_id,
+            CustomerPayment.counts_as_revenue == True
         )
         if router_id:
             plan_revenue_stmt = plan_revenue_stmt.where(Customer.router_id == router_id)
@@ -931,7 +941,15 @@ async def get_daily_transaction_counts(
             select(
                 day_bucket,
                 func.count(CustomerPayment.id).label("transactions"),
-                func.coalesce(func.sum(CustomerPayment.amount), 0).label("revenue"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("revenue"),
             )
             .where(*filters)
             .group_by(day_bucket)
