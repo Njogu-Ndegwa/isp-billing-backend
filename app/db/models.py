@@ -247,6 +247,7 @@ class CustomerPayment(Base):
              values_callable=lambda e: [x.value for x in e]),
         nullable=True,
     )
+    counts_as_revenue = Column(Boolean, nullable=False, default=True, server_default="1")
     created_at = Column(DateTime, default=datetime.utcnow)
     customer = relationship("Customer", backref="customer_payments")
     reseller = relationship("User", backref="received_payments", foreign_keys=[reseller_id])
@@ -561,6 +562,11 @@ class VoucherStatus(str, enum.Enum):
     DISABLED = "disabled"
 
 
+class VoucherType(str, enum.Enum):
+    SALE = "sale"
+    COMPENSATION = "compensation"
+
+
 class AdBadgeType(str, enum.Enum):
     HOT = "hot"
     NEW = "new"
@@ -581,6 +587,12 @@ class Voucher(Base):
     status = Column(
         Enum(VoucherStatus, name="voucherstatus", values_callable=lambda e: [x.value for x in e]),
         nullable=False, default=VoucherStatus.AVAILABLE
+    )
+    voucher_type = Column(
+        Enum(VoucherType, name="vouchertype", values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=VoucherType.SALE,
+        server_default=VoucherType.SALE.value,
     )
     batch_id = Column(String(36), nullable=True, index=True)
     redeemed_by = Column(Integer, ForeignKey("customers.id"), nullable=True)

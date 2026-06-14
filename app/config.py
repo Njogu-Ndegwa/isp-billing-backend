@@ -31,7 +31,9 @@ class Settings(BaseSettings):
     MIKROTIK_USERNAME: str = "admin"
     MIKROTIK_PASSWORD: str = "mvnm"  # Set in .env file
     PPPOE_RATE_LIMIT_HEADROOM: float = 1.08
-    
+    # Max compensation (zero-revenue) vouchers a reseller may issue per UTC day.
+    COMPENSATION_DAILY_LIMIT: int = 10
+
     # M-Pesa Configuration
     MPESA_CONSUMER_KEY: str
     MPESA_CONSUMER_SECRET: str
