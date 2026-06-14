@@ -34,7 +34,11 @@ REMOTE_ACCESS_SERVICES: dict[str, dict[str, Any]] = {
     "webfig": {
         "label": "WebFig",
         "routeros_service": "www",
+        "routeros_services": ["www", "www-ssl"],
         "port": 80,
+        "default_port_by_routeros_service": {"www": 80, "www-ssl": 443},
+        "scheme": "http",
+        "scheme_by_routeros_service": {"www": "http", "www-ssl": "https"},
         "protocol": "tcp",
         "client": "browser",
     },
@@ -42,8 +46,10 @@ REMOTE_ACCESS_SERVICES: dict[str, dict[str, Any]] = {
 
 SERVICE_ALIASES = {
     "www": "webfig",
+    "www-ssl": "webfig",
     "web": "webfig",
     "webfig-http": "webfig",
+    "webfig-https": "webfig",
 }
 
 
@@ -55,12 +61,16 @@ class WebFigProxySession:
     router_ip: str
     created_by_user_id: int
     expires_at: datetime
+    webfig_scheme: str = "http"
+    webfig_port: int = 80
 
     def as_public_dict(self) -> dict[str, Any]:
         return {
             "router_id": self.router_id,
             "router_name": self.router_name,
             "expires_at": self.expires_at.isoformat(),
+            "webfig_scheme": self.webfig_scheme,
+            "webfig_port": self.webfig_port,
         }
 
 
@@ -84,9 +94,12 @@ def create_webfig_proxy_session(
     router_ip: str,
     created_by_user_id: int,
     ttl_minutes: int | None = None,
+    webfig_scheme: str = "http",
+    webfig_port: int | str | None = None,
 ) -> WebFigProxySession:
     _prune_expired_webfig_sessions()
     ttl = max(1, int(ttl_minutes or settings.ROUTER_WEBFIG_SESSION_MINUTES))
+    scheme = _normalize_webfig_scheme(webfig_scheme)
     session = WebFigProxySession(
         token=secrets.token_urlsafe(32),
         router_id=router_id,
@@ -94,6 +107,11 @@ def create_webfig_proxy_session(
         router_ip=router_ip,
         created_by_user_id=created_by_user_id,
         expires_at=datetime.utcnow() + timedelta(minutes=ttl),
+        webfig_scheme=scheme,
+        webfig_port=_coerce_service_port(
+            webfig_port,
+            443 if scheme == "https" else 80,
+        ),
     )
     _WEBFIG_PROXY_SESSIONS[session.token] = session
     return session
@@ -196,26 +214,7 @@ def build_remote_access_targets(
 
     for key in service_keys:
         service = REMOTE_ACCESS_SERVICES[key]
-        port = service["port"]
-        target: dict[str, Any] = {
-            "service": key,
-            "label": service["label"],
-            "routeros_service": service["routeros_service"],
-            "host": router_ip,
-            "port": port,
-            "protocol": service["protocol"],
-            "access_path": "management_vpn",
-            "source_cidrs": source_list,
-            "credentials_note": "Use the router's stored admin credentials; the password is not returned by this API.",
-        }
-        if key == "winbox":
-            target["winbox_address"] = f"{router_ip}:{port}"
-            target["operator_hint"] = f"Open WinBox and connect to {router_ip}:{port} from the trusted management source."
-        elif key == "ssh":
-            target["ssh_command"] = f"ssh {username}@{router_ip} -p {port}"
-        elif key == "webfig":
-            target["url"] = f"http://{router_ip}:{port}/"
-        targets.append(target)
+        targets.append(_build_remote_access_target(router_ip, username, source_list, key, service))
 
     return targets
 
@@ -252,12 +251,16 @@ def configure_router_remote_access_sync(
             "enabled": enable,
             "services": service_results,
             "source_cidrs": source_list,
-            "targets": build_remote_access_targets(
-                router_info["ip"],
-                router_info["username"],
-                source_list,
-                service_keys,
-            ),
+            "targets": [
+                _build_remote_access_target(
+                    router_info["ip"],
+                    router_info["username"],
+                    source_list,
+                    result["service"],
+                    result,
+                )
+                for result in service_results
+            ],
             "message": f"Remote {labels} access {state} over the management VPN.",
         }
         if service_keys == ["winbox"] and service_results:
@@ -277,11 +280,11 @@ def _apply_remote_access_service(
     enable: bool,
     source_cidrs: list[str],
 ) -> dict[str, Any]:
-    service = REMOTE_ACCESS_SERVICES[service_key]
+    service = _resolve_remote_access_service(api, service_key)
     steps: list[dict[str, Any]] = []
 
     if enable:
-        steps.extend(_sync_firewall_rules(api, service_key, source_cidrs))
+        steps.extend(_sync_firewall_rules(api, service_key, service, source_cidrs))
         service_after = _set_routeros_service(api, service, True, source_cidrs)
     else:
         steps.extend(_remove_managed_firewall_rules(api, service_key))
@@ -291,11 +294,97 @@ def _apply_remote_access_service(
         "service": service_key,
         "label": service["label"],
         "routeros_service": service["routeros_service"],
+        "port": service["port"],
+        "protocol": service["protocol"],
+        "scheme": service.get("scheme"),
         "enabled": enable,
         "steps": steps,
         "service_after": service_after,
         "firewall_rules_after": _read_managed_firewall_rules(api, service_key),
     }
+
+
+def _build_remote_access_target(
+    router_ip: str,
+    username: str,
+    source_cidrs: list[str],
+    service_key: str,
+    service: dict[str, Any],
+) -> dict[str, Any]:
+    port = _coerce_service_port(service.get("port"), REMOTE_ACCESS_SERVICES[service_key]["port"])
+    target: dict[str, Any] = {
+        "service": service_key,
+        "label": service["label"],
+        "routeros_service": service["routeros_service"],
+        "host": router_ip,
+        "port": port,
+        "protocol": service["protocol"],
+        "access_path": "management_vpn",
+        "source_cidrs": source_cidrs,
+        "credentials_note": "Use the router's stored admin credentials; the password is not returned by this API.",
+    }
+    if service_key == "winbox":
+        target["winbox_address"] = f"{router_ip}:{port}"
+        target["operator_hint"] = f"Open WinBox and connect to {router_ip}:{port} from the trusted management source."
+    elif service_key == "ssh":
+        target["ssh_command"] = f"ssh {username}@{router_ip} -p {port}"
+    elif service_key == "webfig":
+        scheme = _normalize_webfig_scheme(str(service.get("scheme") or "http"))
+        target["scheme"] = scheme
+        target["url"] = f"{scheme}://{router_ip}:{port}/"
+    return target
+
+
+def _resolve_remote_access_service(api: MikroTikAPI, service_key: str) -> dict[str, Any]:
+    base_service = REMOTE_ACCESS_SERVICES[service_key]
+    candidates = base_service.get("routeros_services") or [base_service["routeros_service"]]
+    failures: list[str] = []
+
+    for service_name in candidates:
+        try:
+            service_row = _read_routeros_service(api, service_name)
+        except RouterRemoteAccessError as exc:
+            failures.append(str(exc))
+            continue
+
+        resolved = dict(base_service)
+        resolved["routeros_service"] = service_name
+        resolved["port"] = _coerce_service_port(
+            service_row.get("port"),
+            _default_port_for_routeros_service(base_service, service_name),
+        )
+        scheme_by_name = base_service.get("scheme_by_routeros_service") or {}
+        if service_name in scheme_by_name:
+            resolved["scheme"] = scheme_by_name[service_name]
+        return resolved
+
+    tried = ", ".join(str(candidate) for candidate in candidates)
+    detail = f": {'; '.join(failures)}" if failures else ""
+    raise RouterRemoteAccessError(
+        f"RouterOS service for {base_service['label']} not found; tried {tried}{detail}"
+    )
+
+
+def _default_port_for_routeros_service(service: dict[str, Any], service_name: str) -> int:
+    by_name = service.get("default_port_by_routeros_service") or {}
+    return _coerce_service_port(by_name.get(service_name), service["port"])
+
+
+def _coerce_service_port(value: Any, fallback: int) -> int:
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return int(fallback)
+    if port < 1 or port > 65535:
+        return int(fallback)
+    return port
+
+
+def _normalize_webfig_scheme(value: str) -> str:
+    scheme = (value or "http").strip().lower()
+    if scheme not in {"http", "https"}:
+        return "http"
+    return scheme
 
 
 def _rows(response: dict[str, Any], context: str) -> list[dict[str, Any]]:
@@ -342,9 +431,9 @@ def _read_managed_firewall_rules(api: MikroTikAPI, service_key: str) -> list[dic
 def _sync_firewall_rules(
     api: MikroTikAPI,
     service_key: str,
+    service: dict[str, Any],
     source_cidrs: list[str],
 ) -> list[dict[str, Any]]:
-    service = REMOTE_ACCESS_SERVICES[service_key]
     wanted = set(source_cidrs)
     current = _read_managed_firewall_rules(api, service_key)
     steps: list[dict[str, Any]] = []

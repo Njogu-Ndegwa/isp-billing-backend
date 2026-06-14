@@ -409,10 +409,24 @@ async def configure_router_remote_access(
             source_cidrs,
         )
     except RouterRemoteAccessError as exc:
+        logger.exception(
+            "Remote access configuration failed for router_id=%s name=%s ip=%s services=%s",
+            router_obj.id,
+            router_obj.name,
+            router_obj.ip_address,
+            services,
+        )
         await record_router_availability(db, router_obj.id, True, "remote_access")
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502, detail=f"Router remote-access setup failed: {exc}")
 
     if remote_result.get("error") == "connection_failed":
+        logger.warning(
+            "Remote access connection failed for router_id=%s name=%s ip=%s reason=%s",
+            router_obj.id,
+            router_obj.name,
+            router_obj.ip_address,
+            remote_result.get("reason"),
+        )
         await record_router_availability(db, router_obj.id, False, "remote_access")
         raise HTTPException(
             status_code=503,
@@ -474,10 +488,27 @@ async def open_router_webfig(
             source_cidrs,
         )
     except RouterRemoteAccessError as exc:
+        logger.exception(
+            "WebFig open failed while configuring RouterOS for router_id=%s name=%s ip=%s source_cidrs=%s",
+            router_id,
+            router_name,
+            router_ip,
+            source_cidrs,
+        )
         await record_router_availability(db, router_id, True, "webfig_open")
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=f"RouterOS WebFig setup failed for '{router_name}' ({router_ip}): {exc}",
+        )
 
     if remote_result.get("error") == "connection_failed":
+        logger.warning(
+            "WebFig open connection failed for router_id=%s name=%s ip=%s reason=%s",
+            router_id,
+            router_name,
+            router_ip,
+            remote_result.get("reason"),
+        )
         await record_router_availability(db, router_id, False, "webfig_open")
         raise HTTPException(
             status_code=503,
@@ -488,12 +519,15 @@ async def open_router_webfig(
         raise HTTPException(status_code=500, detail=remote_result.get("reason") or remote_result["error"])
 
     await record_router_availability(db, router_id, True, "webfig_open")
+    webfig_scheme, webfig_port = _webfig_endpoint_from_remote_result(remote_result)
 
     session = create_webfig_proxy_session(
         router_id=router_id,
         router_name=router_name,
         router_ip=router_ip,
         created_by_user_id=user.id,
+        webfig_scheme=webfig_scheme,
+        webfig_port=webfig_port,
     )
     proxy_path = build_webfig_proxy_path(router_id, session.token)
     return {
@@ -503,6 +537,10 @@ async def open_router_webfig(
         "management_ip": router_ip,
         "proxy_path": proxy_path,
         "expires_at": session.expires_at.isoformat(),
+        "webfig_target": {
+            "scheme": session.webfig_scheme,
+            "port": session.webfig_port,
+        },
         "message": "WebFig access opened. Use the proxy URL in a browser.",
         "remote_access": remote_result,
     }
@@ -542,10 +580,26 @@ async def close_router_webfig(
             default_remote_access_source_cidrs(),
         )
     except RouterRemoteAccessError as exc:
+        logger.exception(
+            "WebFig close failed while configuring RouterOS for router_id=%s name=%s ip=%s",
+            router_id,
+            router_name,
+            router_ip,
+        )
         await record_router_availability(db, router_id, True, "webfig_close")
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=f"RouterOS WebFig close failed for '{router_name}' ({router_ip}): {exc}",
+        )
 
     if remote_result.get("error") == "connection_failed":
+        logger.warning(
+            "WebFig close connection failed for router_id=%s name=%s ip=%s reason=%s",
+            router_id,
+            router_name,
+            router_ip,
+            remote_result.get("reason"),
+        )
         await record_router_availability(db, router_id, False, "webfig_close")
         raise HTTPException(
             status_code=503,
@@ -597,9 +651,10 @@ async def proxy_router_webfig(
         )
 
     query = _forward_webfig_query(request)
-    target_url = f"http://{session.router_ip}/{proxy_path.lstrip('/')}"
+    target_url = _build_webfig_upstream_url(session, proxy_path)
     if query:
         target_url = f"{target_url}?{query}"
+    host_header = _webfig_upstream_host_header(session)
 
     try:
         async with httpx.AsyncClient(
@@ -610,14 +665,22 @@ async def proxy_router_webfig(
                 write=10.0,
                 pool=5.0,
             ),
+            verify=False if session.webfig_scheme == "https" else True,
         ) as client:
             upstream = await client.request(
                 request.method,
                 target_url,
-                headers=_forward_webfig_headers(request, session.router_ip),
+                headers=_forward_webfig_headers(request, host_header),
                 content=await request.body(),
             )
     except httpx.RequestError as exc:
+        logger.warning(
+            "WebFig proxy could not reach router_id=%s name=%s target=%s error=%s",
+            router_id,
+            session.router_name,
+            target_url,
+            exc,
+        )
         return Response(
             content=f"Could not reach router WebFig over the management VPN: {exc}",
             status_code=502,
@@ -678,7 +741,7 @@ def _forward_webfig_query(request: Request) -> str:
     return urlencode(items, doseq=True)
 
 
-def _forward_webfig_headers(request: Request, router_ip: str) -> dict[str, str]:
+def _forward_webfig_headers(request: Request, host_header: str) -> dict[str, str]:
     headers = {}
     for key, value in request.headers.items():
         lower = key.lower()
@@ -689,8 +752,67 @@ def _forward_webfig_headers(request: Request, router_ip: str) -> dict[str, str]:
             if not value:
                 continue
         headers[key] = value
-    headers["host"] = router_ip
+    headers["host"] = host_header
     return headers
+
+
+def _webfig_endpoint_from_remote_result(remote_result: dict) -> tuple[str, int]:
+    for service in remote_result.get("services") or []:
+        if service.get("service") != "webfig":
+            continue
+        scheme = _normalize_webfig_proxy_scheme(
+            service.get("scheme") or ("https" if service.get("routeros_service") == "www-ssl" else "http")
+        )
+        return scheme, _coerce_webfig_proxy_port(
+            service.get("port"),
+            443 if scheme == "https" else 80,
+        )
+
+    for target in remote_result.get("targets") or []:
+        if target.get("service") != "webfig":
+            continue
+        parsed = urlsplit(str(target.get("url") or ""))
+        scheme = _normalize_webfig_proxy_scheme(parsed.scheme)
+        return scheme, _coerce_webfig_proxy_port(
+            parsed.port or target.get("port"),
+            443 if scheme == "https" else 80,
+        )
+
+    return "http", 80
+
+
+def _build_webfig_upstream_url(session, proxy_path: str) -> str:
+    scheme = _normalize_webfig_proxy_scheme(session.webfig_scheme)
+    port = _coerce_webfig_proxy_port(session.webfig_port, 443 if scheme == "https" else 80)
+    default_port = 443 if scheme == "https" else 80
+    port_part = "" if port == default_port else f":{port}"
+    return f"{scheme}://{session.router_ip}{port_part}/{proxy_path.lstrip('/')}"
+
+
+def _webfig_upstream_host_header(session) -> str:
+    scheme = _normalize_webfig_proxy_scheme(session.webfig_scheme)
+    port = _coerce_webfig_proxy_port(session.webfig_port, 443 if scheme == "https" else 80)
+    default_port = 443 if scheme == "https" else 80
+    if port == default_port:
+        return session.router_ip
+    return f"{session.router_ip}:{port}"
+
+
+def _coerce_webfig_proxy_port(value, fallback: int) -> int:
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return int(fallback)
+    if port < 1 or port > 65535:
+        return int(fallback)
+    return port
+
+
+def _normalize_webfig_proxy_scheme(value) -> str:
+    scheme = str(value or "http").strip().lower()
+    if scheme not in {"http", "https"}:
+        return "http"
+    return scheme
 
 
 def _strip_webfig_proxy_cookies(cookie_header: str) -> str:
