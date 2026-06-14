@@ -1565,6 +1565,55 @@ async def run_anti_tethering_migrations():
             logger.info("Anti-tethering migration: added routers.hotspot_sharing_blocked")
 
 
+async def run_compensation_voucher_migrations():
+    """Add compensation-voucher schema automatically on startup.
+
+    Adds vouchers.voucher_type (enum sale|compensation, default sale),
+    customer_payments.counts_as_revenue (bool, default true), and the
+    app_settings key/value table used for the admin-editable global
+    compensation daily limit. Idempotent: mirrors
+    migrations/add_voucher_compensation.py and migrations/add_app_settings.py
+    and checks information_schema / uses checkfirst before every change.
+    """
+    async with async_engine.begin() as conn:
+        # -- vouchertype enum + vouchers.voucher_type column
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                CREATE TYPE vouchertype AS ENUM ('sale', 'compensation');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;
+        """))
+        result = await conn.execute(sa_text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'vouchers' AND column_name = 'voucher_type'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE vouchers
+                ADD COLUMN voucher_type vouchertype NOT NULL DEFAULT 'sale'
+            """))
+            logger.info("Compensation voucher migration: added vouchers.voucher_type")
+
+        # -- customer_payments.counts_as_revenue (NOT NULL DEFAULT true)
+        result = await conn.execute(sa_text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'customer_payments' AND column_name = 'counts_as_revenue'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE customer_payments
+                ADD COLUMN counts_as_revenue BOOLEAN NOT NULL DEFAULT true
+            """))
+            logger.info("Compensation voucher migration: added customer_payments.counts_as_revenue")
+
+        # -- app_settings table (admin-editable global settings)
+        from app.db.models import AppSetting
+        await conn.run_sync(
+            lambda c: AppSetting.__table__.create(c, checkfirst=True)
+        )
+
+    logger.info("Compensation voucher migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -1668,6 +1717,12 @@ async def startup_event():
         logger.info("Anti-tethering migrations completed successfully")
     except Exception as e:
         logger.error(f"Anti-tethering migration failed (non-fatal): {e}")
+
+    try:
+        await run_compensation_voucher_migrations()
+        logger.info("Compensation voucher migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Compensation voucher migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,
