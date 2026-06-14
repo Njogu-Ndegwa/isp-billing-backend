@@ -57,6 +57,7 @@ from app.api.usage_routes import router as usage_router
 from app.api.access_credential_routes import router as access_credential_router
 from app.api.shop_routes import router as shop_router
 from app.api.portal_routes import router as portal_router
+from app.api.messaging_routes import router as messaging_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -92,6 +93,7 @@ app.include_router(usage_router)
 app.include_router(access_credential_router)
 app.include_router(shop_router)
 app.include_router(portal_router)
+app.include_router(messaging_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
