@@ -15,7 +15,6 @@ from app.db.database import get_db
 from app.db.models import Voucher, VoucherStatus, VoucherType, Plan, Router
 from app.services.auth import verify_token, get_current_user
 from app.services.voucher_service import generate_vouchers, compensation_used_today, get_compensation_daily_limit
-from app.config import settings
 
 import logging
 
