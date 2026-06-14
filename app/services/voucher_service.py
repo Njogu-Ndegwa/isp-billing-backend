@@ -29,6 +29,15 @@ from app.services.mikrotik_api import normalize_mac_address
 
 logger = logging.getLogger(__name__)
 
+COMPENSATION_DAILY_LIMIT_KEY = "compensation_daily_limit"
+
+
+async def get_compensation_daily_limit(db: AsyncSession) -> int:
+    """Effective per-reseller daily compensation-voucher limit: DB override if set,
+    otherwise the COMPENSATION_DAILY_LIMIT config default."""
+    from app.services.app_settings import get_int_setting
+    return await get_int_setting(db, COMPENSATION_DAILY_LIMIT_KEY, settings.COMPENSATION_DAILY_LIMIT)
+
 
 def generate_voucher_code() -> str:
     """Generate a cryptographically random 8-digit voucher code (no separators).
@@ -112,14 +121,15 @@ async def generate_vouchers(
             return {"error": "Router not found or does not belong to this user"}
 
     if voucher_type == VoucherType.COMPENSATION:
+        limit = await get_compensation_daily_limit(db)
         used = await compensation_used_today(db, user_id)
-        remaining = settings.COMPENSATION_DAILY_LIMIT - used
+        remaining = limit - used
         if quantity > remaining:
             return {
                 "error": (
                     f"Daily compensation limit reached. You can issue "
                     f"{max(0, remaining)} more compensation voucher(s) today "
-                    f"(limit {settings.COMPENSATION_DAILY_LIMIT}/day)."
+                    f"(limit {limit}/day)."
                 )
             }
 

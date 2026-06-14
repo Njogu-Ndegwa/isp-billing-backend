@@ -1433,6 +1433,18 @@ class C2BTransaction(Base):
     matched_reseller = relationship("User")
 
 
+class AppSetting(Base):
+    """Generic key/value table for platform-wide admin-editable settings.
+
+    Keys are short ASCII identifiers (e.g. "compensation_daily_limit").
+    Values are always stored as text and cast to the required type at read time.
+    """
+    __tablename__ = "app_settings"
+    key = Column(String(100), primary_key=True)
+    value = Column(String(500), nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class UnmatchedC2BPayment(Base):
     """Buffer for C2B payments that couldn't be auto-applied.
 
