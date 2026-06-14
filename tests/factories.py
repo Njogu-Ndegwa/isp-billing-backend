@@ -97,6 +97,16 @@ async def make_router(db: AsyncSession, reseller: User, **overrides) -> Router:
     return router
 
 
+async def make_sms_account(db: AsyncSession, reseller: "User", *, balance: int = 0):
+    from app.db.models import SmsCreditAccount
+    acct = SmsCreditAccount(user_id=reseller.id, balance=balance,
+                            total_purchased=balance)
+    db.add(acct)
+    await db.commit()
+    await db.refresh(acct)
+    return acct
+
+
 async def make_customer(
     db: AsyncSession,
     reseller: User,
