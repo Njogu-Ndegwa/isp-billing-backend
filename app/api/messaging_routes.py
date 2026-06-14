@@ -138,7 +138,12 @@ async def credits_callback(request: Request, db: AsyncSession = Depends(get_db))
         body = await request.json()
         cb = body.get("Body", {}).get("stkCallback", {})
         checkout_id = cb.get("CheckoutRequestID")
-        result_code = cb.get("ResultCode")
+        # Safaricom usually sends ResultCode as an int, but coerce defensively
+        # (a string "0" otherwise silently skips the grant).
+        try:
+            result_code = int(cb.get("ResultCode"))
+        except (TypeError, ValueError):
+            result_code = -1
         if not checkout_id:
             return {"ResultCode": 0, "ResultDesc": "Accepted"}
 
@@ -214,15 +219,18 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
             "shortfall": total - acct.balance,
         })
 
-    ok = await sms_credits.try_deduct(db, user.id, total, reference="campaign:pending")
-    if not ok:
-        raise HTTPException(status_code=400, detail="Insufficient SMS credits")
     sender_id = s.sender_id or settings.AT_SENDER_ID
     camp = SmsCampaign(user_id=user.id, body=req.body, recipient_count=len(recips),
                        segments_per_message=segments, total_credits=total,
                        sender_id=sender_id, status=SmsCampaignStatus.QUEUED)
     db.add(camp)
     await db.flush()
+    # Reserve credits with the campaign id as the ledger reference, so the
+    # send_debit and any later refunds share one reference for clean auditing.
+    ok = await sms_credits.try_deduct(db, user.id, total,
+                                      reference=f"campaign:{camp.id}")
+    if not ok:
+        raise HTTPException(status_code=400, detail="Insufficient SMS credits")
     for r in recips:
         db.add(SmsMessage(campaign_id=camp.id, user_id=user.id,
                           customer_id=r["customer_id"], recipient_phone=r["phone"],

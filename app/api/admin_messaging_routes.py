@@ -147,10 +147,16 @@ async def send_inbox(req: InboxSendIn, background: BackgroundTasks,
             body=req.body, sent_sms=req.also_sms, broadcast_id=broadcast_id))
         if req.also_sms and r.support_phone:
             targets.append(r.support_phone)
+
+    # Honor the admin-configured sender id (same fallback the reseller send
+    # path uses), not just the env default.
+    settings_row = await db.get(MessagingSettings, 1)
+    sender_id = (settings_row.sender_id if settings_row and settings_row.sender_id
+                 else settings.AT_SENDER_ID)
     await db.commit()
 
     if req.also_sms and targets:
-        background.add_task(_send_admin_sms, targets, req.body, settings.AT_SENDER_ID)
+        background.add_task(_send_admin_sms, targets, req.body, sender_id)
 
     return {"message": "Inbox message sent", "recipients": len(resellers)}
 
