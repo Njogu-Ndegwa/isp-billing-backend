@@ -82,6 +82,12 @@ class Settings(BaseSettings):
     INSURANCE_L2TP_IPSEC_PSK: str = ""
     INSURANCE_MANAGER_TIMEOUT: int = 10
 
+    # Just-in-time RouterOS operator access. This is the source allowed to
+    # reach WinBox/SSH/WebFig when an admin opens remote access for a router.
+    ROUTER_REMOTE_ACCESS_SOURCE_CIDRS: str = "10.0.0.1/32"
+    ROUTER_WEBFIG_SESSION_MINUTES: int = 15
+    ROUTER_WEBFIG_PROXY_TIMEOUT_SECONDS: int = 20
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -1,18 +1,33 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, case
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
 from datetime import datetime, timedelta
+import httpx
 
+from app.config import settings
 from app.db.database import get_db
 from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User, UserRole, RouterAvailabilityCheck, ProvisioningToken, Voucher, RouterLogEntry
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
-from app.services.router_availability import build_router_status
+from app.services.router_availability import build_router_status, record_router_availability
 from app.services.provisioning import provision_base_url_for_vpn
 from app.services.router_helpers import connect_to_router
+from app.services.router_remote_access import (
+    RouterRemoteAccessError,
+    build_remote_access_targets,
+    build_webfig_proxy_path,
+    configure_router_remote_access_sync,
+    create_webfig_proxy_session,
+    default_remote_access_source_cidrs,
+    get_webfig_proxy_session,
+    normalize_remote_access_services,
+    normalize_source_cidrs,
+    revoke_webfig_proxy_sessions,
+    webfig_access_cookie_name,
+)
 from app.services.insurance_wireguard import (
     InsuranceWireGuardError,
     build_plan,
@@ -39,7 +54,7 @@ from app.services.insurance_tunnel_batch import (
 import logging
 import asyncio
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +167,19 @@ class InsuranceTunnelBatchRequest(BaseModel):
         return value if value > 0 else None
 
 
+class RouterRemoteAccessRequest(BaseModel):
+    enable: bool = True
+    services: Optional[List[str]] = None
+    source_cidrs: Optional[List[str]] = None
+
+    @field_validator("services", "source_cidrs", mode="before")
+    @classmethod
+    def split_csv_values(cls, v):
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+
 async def _latest_router_provisioning_token(db: AsyncSession, router_id: int) -> Optional[ProvisioningToken]:
     result = await db.execute(
         select(ProvisioningToken)
@@ -159,6 +187,14 @@ async def _latest_router_provisioning_token(db: AsyncSession, router_id: int) ->
         .order_by(ProvisioningToken.created_at.desc())
     )
     return result.scalars().first()
+
+
+async def _router_accessible_to_user(db: AsyncSession, router_id: int, user: User) -> Optional[Router]:
+    stmt = select(Router).where(Router.id == router_id)
+    if user.role != UserRole.ADMIN:
+        stmt = stmt.where(Router.user_id == user.id)
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 def _token_tunnel_type(token: Optional[ProvisioningToken]) -> Optional[str]:
@@ -283,6 +319,599 @@ async def get_insurance_tunnel_batch_status(
     if not job:
         raise HTTPException(status_code=404, detail="Insurance tunnel batch not found")
     return {"success": True, "job": job}
+
+
+@router.get("/api/admin/routers/{router_id}/remote-access")
+async def get_router_remote_access_options(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Return operator access targets for RouterOS GUI/terminal access.
+
+    This does not contact the router. It only describes the management-VPN
+    addresses an operator can use after the POST endpoint opens access.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await _router_accessible_to_user(db, router_id, user)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    try:
+        source_cidrs = default_remote_access_source_cidrs()
+        services = normalize_remote_access_services(None)
+        targets = build_remote_access_targets(
+            router_obj.ip_address,
+            router_obj.username,
+            source_cidrs,
+            services,
+        )
+    except RouterRemoteAccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    await db.commit()
+    return {
+        "success": True,
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "management_ip": router_obj.ip_address,
+        "access_path": "management_vpn",
+        "default_source_cidrs": source_cidrs,
+        "available_services": ["winbox", "ssh", "webfig"],
+        "targets": targets,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+@router.post("/api/admin/routers/{router_id}/remote-access")
+async def configure_router_remote_access(
+    router_id: int,
+    request: RouterRemoteAccessRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Open or close just-in-time RouterOS operator access over the management VPN.
+
+    The access itself is WinBox, SSH, or WebFig; the API is used only to change
+    RouterOS service/firewall configuration. No DB transaction is held while the
+    router is contacted.
+    """
+    user = await get_current_user(token, db)
+
+    try:
+        services = normalize_remote_access_services(request.services)
+        source_cidrs = normalize_source_cidrs(request.source_cidrs)
+    except RouterRemoteAccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    router_obj = await _router_accessible_to_user(db, router_id, user)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+
+    # Release the DB connection before RouterOS network work.
+    await db.commit()
+
+    try:
+        remote_result = await asyncio.to_thread(
+            configure_router_remote_access_sync,
+            router_info,
+            services,
+            request.enable,
+            source_cidrs,
+        )
+    except RouterRemoteAccessError as exc:
+        logger.exception(
+            "Remote access configuration failed for router_id=%s name=%s ip=%s services=%s",
+            router_obj.id,
+            router_obj.name,
+            router_obj.ip_address,
+            services,
+        )
+        await record_router_availability(db, router_obj.id, True, "remote_access")
+        raise HTTPException(status_code=502, detail=f"Router remote-access setup failed: {exc}")
+
+    if remote_result.get("error") == "connection_failed":
+        logger.warning(
+            "Remote access connection failed for router_id=%s name=%s ip=%s reason=%s",
+            router_obj.id,
+            router_obj.name,
+            router_obj.ip_address,
+            remote_result.get("reason"),
+        )
+        await record_router_availability(db, router_obj.id, False, "remote_access")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to router '{router_obj.name}' "
+                   f"({router_obj.ip_address}): {remote_result.get('reason') or 'unknown'}",
+        )
+    if remote_result.get("error"):
+        raise HTTPException(status_code=500, detail=remote_result.get("reason") or remote_result["error"])
+
+    await record_router_availability(db, router_obj.id, True, "remote_access")
+
+    return {
+        "success": True,
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "management_ip": router_obj.ip_address,
+        "generated_at": datetime.utcnow().isoformat(),
+        **remote_result,
+    }
+
+
+@router.post("/api/admin/routers/{router_id}/webfig/open")
+async def open_router_webfig(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Enable WebFig from the management source and return a short-lived proxy URL.
+
+    The returned URL is meant to be opened in a browser tab. It carries a
+    temporary proxy token because a browser tab cannot attach the app's bearer
+    token to WebFig asset/form requests.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await _router_accessible_to_user(db, router_id, user)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    source_cidrs = default_remote_access_source_cidrs()
+    router_name = router_obj.name
+    router_ip = router_obj.ip_address
+
+    # Release the DB connection before RouterOS network work.
+    await db.commit()
+
+    try:
+        remote_result = await asyncio.to_thread(
+            configure_router_remote_access_sync,
+            router_info,
+            ["webfig"],
+            True,
+            source_cidrs,
+        )
+    except RouterRemoteAccessError as exc:
+        logger.exception(
+            "WebFig open failed while configuring RouterOS for router_id=%s name=%s ip=%s source_cidrs=%s",
+            router_id,
+            router_name,
+            router_ip,
+            source_cidrs,
+        )
+        await record_router_availability(db, router_id, True, "webfig_open")
+        raise HTTPException(
+            status_code=502,
+            detail=f"RouterOS WebFig setup failed for '{router_name}' ({router_ip}): {exc}",
+        )
+
+    if remote_result.get("error") == "connection_failed":
+        logger.warning(
+            "WebFig open connection failed for router_id=%s name=%s ip=%s reason=%s",
+            router_id,
+            router_name,
+            router_ip,
+            remote_result.get("reason"),
+        )
+        await record_router_availability(db, router_id, False, "webfig_open")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to router '{router_name}' "
+                   f"({router_ip}): {remote_result.get('reason') or 'unknown'}",
+        )
+    if remote_result.get("error"):
+        raise HTTPException(status_code=500, detail=remote_result.get("reason") or remote_result["error"])
+
+    await record_router_availability(db, router_id, True, "webfig_open")
+    webfig_scheme, webfig_port = _webfig_endpoint_from_remote_result(remote_result)
+
+    session = create_webfig_proxy_session(
+        router_id=router_id,
+        router_name=router_name,
+        router_ip=router_ip,
+        created_by_user_id=user.id,
+        webfig_scheme=webfig_scheme,
+        webfig_port=webfig_port,
+    )
+    proxy_path = build_webfig_proxy_path(router_id, session.token)
+    return {
+        "success": True,
+        "router_id": router_id,
+        "router_name": router_name,
+        "management_ip": router_ip,
+        "proxy_path": proxy_path,
+        "expires_at": session.expires_at.isoformat(),
+        "webfig_target": {
+            "scheme": session.webfig_scheme,
+            "port": session.webfig_port,
+        },
+        "message": "WebFig access opened. Use the proxy URL in a browser.",
+        "remote_access": remote_result,
+    }
+
+
+@router.post("/api/admin/routers/{router_id}/webfig/close")
+async def close_router_webfig(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Disable WebFig access and revoke active in-memory proxy sessions."""
+    user = await get_current_user(token, db)
+    router_obj = await _router_accessible_to_user(db, router_id, user)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+
+    router_info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    router_name = router_obj.name
+    router_ip = router_obj.ip_address
+    revoked_sessions = revoke_webfig_proxy_sessions(router_id)
+
+    # Release the DB connection before RouterOS network work.
+    await db.commit()
+
+    try:
+        remote_result = await asyncio.to_thread(
+            configure_router_remote_access_sync,
+            router_info,
+            ["webfig"],
+            False,
+            default_remote_access_source_cidrs(),
+        )
+    except RouterRemoteAccessError as exc:
+        logger.exception(
+            "WebFig close failed while configuring RouterOS for router_id=%s name=%s ip=%s",
+            router_id,
+            router_name,
+            router_ip,
+        )
+        await record_router_availability(db, router_id, True, "webfig_close")
+        raise HTTPException(
+            status_code=502,
+            detail=f"RouterOS WebFig close failed for '{router_name}' ({router_ip}): {exc}",
+        )
+
+    if remote_result.get("error") == "connection_failed":
+        logger.warning(
+            "WebFig close connection failed for router_id=%s name=%s ip=%s reason=%s",
+            router_id,
+            router_name,
+            router_ip,
+            remote_result.get("reason"),
+        )
+        await record_router_availability(db, router_id, False, "webfig_close")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to router '{router_name}' "
+                   f"({router_ip}): {remote_result.get('reason') or 'unknown'}",
+        )
+    if remote_result.get("error"):
+        raise HTTPException(status_code=500, detail=remote_result.get("reason") or remote_result["error"])
+
+    await record_router_availability(db, router_id, True, "webfig_close")
+    return {
+        "success": True,
+        "router_id": router_id,
+        "router_name": router_name,
+        "revoked_sessions": revoked_sessions,
+        "message": "WebFig access closed.",
+        "remote_access": remote_result,
+    }
+
+
+@router.api_route(
+    "/api/admin/routers/{router_id}/webfig",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@router.api_route(
+    "/api/admin/routers/{router_id}/webfig/{proxy_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def proxy_router_webfig(
+    router_id: int,
+    request: Request,
+    proxy_path: str = "",
+):
+    """Proxy a short-lived browser session to RouterOS WebFig over management VPN."""
+    provided_token = (
+        request.query_params.get("remote_access_token")
+        or request.cookies.get(webfig_access_cookie_name(router_id))
+    )
+    session = get_webfig_proxy_session(router_id, provided_token)
+    if not session:
+        return Response(
+            content=(
+                "<!doctype html><title>WebFig access expired</title>"
+                "<h1>WebFig access expired</h1>"
+                "<p>Close this tab and open WebFig again from the router dashboard.</p>"
+            ),
+            status_code=403,
+            media_type="text/html",
+        )
+
+    query = _forward_webfig_query(request)
+    target_url = _build_webfig_upstream_url(session, proxy_path)
+    if query:
+        target_url = f"{target_url}?{query}"
+    host_header = _webfig_upstream_host_header(session)
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=httpx.Timeout(
+                connect=5.0,
+                read=float(settings.ROUTER_WEBFIG_PROXY_TIMEOUT_SECONDS),
+                write=10.0,
+                pool=5.0,
+            ),
+            verify=False if session.webfig_scheme == "https" else True,
+        ) as client:
+            upstream = await client.request(
+                request.method,
+                target_url,
+                headers=_forward_webfig_headers(request, host_header),
+                content=await request.body(),
+            )
+    except httpx.RequestError as exc:
+        logger.warning(
+            "WebFig proxy could not reach router_id=%s name=%s target=%s error=%s",
+            router_id,
+            session.router_name,
+            target_url,
+            exc,
+        )
+        return Response(
+            content=f"Could not reach router WebFig over the management VPN: {exc}",
+            status_code=502,
+            media_type="text/plain",
+        )
+
+    response_headers = _copy_webfig_response_headers(upstream, router_id)
+    content = upstream.content
+    content_type = upstream.headers.get("content-type", "")
+    if _should_rewrite_webfig_content(content_type):
+        content = _rewrite_webfig_content(content, content_type, router_id)
+
+    response = Response(
+        content=content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
+    for cookie in upstream.headers.get_list("set-cookie"):
+        response.headers.append("set-cookie", _rewrite_webfig_set_cookie(cookie, router_id))
+
+    if request.query_params.get("remote_access_token"):
+        max_age = max(1, int((session.expires_at - datetime.utcnow()).total_seconds()))
+        response.set_cookie(
+            webfig_access_cookie_name(router_id),
+            session.token,
+            max_age=max_age,
+            httponly=True,
+            samesite="lax",
+            path=f"/api/admin/routers/{router_id}/webfig",
+        )
+    return response
+
+
+_WEBFIG_HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+_WEBFIG_DROP_RESPONSE_HEADERS = _WEBFIG_HOP_BY_HOP_HEADERS | {
+    "content-encoding",
+    "content-length",
+    "set-cookie",
+}
+
+
+def _forward_webfig_query(request: Request) -> str:
+    items = [
+        (key, value)
+        for key, value in request.query_params.multi_items()
+        if key != "remote_access_token"
+    ]
+    return urlencode(items, doseq=True)
+
+
+def _forward_webfig_headers(request: Request, host_header: str) -> dict[str, str]:
+    headers = {}
+    for key, value in request.headers.items():
+        lower = key.lower()
+        if lower in _WEBFIG_HOP_BY_HOP_HEADERS or lower in {"host", "authorization"}:
+            continue
+        if lower == "cookie":
+            value = _strip_webfig_proxy_cookies(value)
+            if not value:
+                continue
+        headers[key] = value
+    headers["host"] = host_header
+    return headers
+
+
+def _webfig_endpoint_from_remote_result(remote_result: dict) -> tuple[str, int]:
+    for service in remote_result.get("services") or []:
+        if service.get("service") != "webfig":
+            continue
+        scheme = _normalize_webfig_proxy_scheme(
+            service.get("scheme") or ("https" if service.get("routeros_service") == "www-ssl" else "http")
+        )
+        return scheme, _coerce_webfig_proxy_port(
+            service.get("port"),
+            443 if scheme == "https" else 80,
+        )
+
+    for target in remote_result.get("targets") or []:
+        if target.get("service") != "webfig":
+            continue
+        parsed = urlsplit(str(target.get("url") or ""))
+        scheme = _normalize_webfig_proxy_scheme(parsed.scheme)
+        return scheme, _coerce_webfig_proxy_port(
+            parsed.port or target.get("port"),
+            443 if scheme == "https" else 80,
+        )
+
+    return "http", 80
+
+
+def _build_webfig_upstream_url(session, proxy_path: str) -> str:
+    scheme = _normalize_webfig_proxy_scheme(session.webfig_scheme)
+    port = _coerce_webfig_proxy_port(session.webfig_port, 443 if scheme == "https" else 80)
+    default_port = 443 if scheme == "https" else 80
+    port_part = "" if port == default_port else f":{port}"
+    return f"{scheme}://{session.router_ip}{port_part}/{proxy_path.lstrip('/')}"
+
+
+def _webfig_upstream_host_header(session) -> str:
+    scheme = _normalize_webfig_proxy_scheme(session.webfig_scheme)
+    port = _coerce_webfig_proxy_port(session.webfig_port, 443 if scheme == "https" else 80)
+    default_port = 443 if scheme == "https" else 80
+    if port == default_port:
+        return session.router_ip
+    return f"{session.router_ip}:{port}"
+
+
+def _coerce_webfig_proxy_port(value, fallback: int) -> int:
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return int(fallback)
+    if port < 1 or port > 65535:
+        return int(fallback)
+    return port
+
+
+def _normalize_webfig_proxy_scheme(value) -> str:
+    scheme = str(value or "http").strip().lower()
+    if scheme not in {"http", "https"}:
+        return "http"
+    return scheme
+
+
+def _strip_webfig_proxy_cookies(cookie_header: str) -> str:
+    cookies = []
+    for part in cookie_header.split(";"):
+        cookie = part.strip()
+        if not cookie or cookie.lower().startswith("webfig_access_"):
+            continue
+        cookies.append(cookie)
+    return "; ".join(cookies)
+
+
+def _copy_webfig_response_headers(upstream: httpx.Response, router_id: int) -> dict[str, str]:
+    headers = {}
+    for key, value in upstream.headers.items():
+        lower = key.lower()
+        if lower in _WEBFIG_DROP_RESPONSE_HEADERS:
+            continue
+        if lower == "location":
+            headers[key] = _rewrite_webfig_location(value, router_id)
+            continue
+        headers[key] = value
+    return headers
+
+
+def _rewrite_webfig_location(location: str, router_id: int) -> str:
+    prefix = f"/api/admin/routers/{router_id}/webfig"
+    if not location:
+        return prefix + "/"
+    if location.startswith("/"):
+        return prefix + location
+
+    parsed = urlsplit(location)
+    if parsed.scheme in {"http", "https"}:
+        path = parsed.path or "/"
+        query = f"?{parsed.query}" if parsed.query else ""
+        return f"{prefix}{path}{query}"
+    return location
+
+
+def _rewrite_webfig_set_cookie(cookie: str, router_id: int) -> str:
+    proxy_path = f"/api/admin/routers/{router_id}/webfig"
+    parts = [part.strip() for part in cookie.split(";")]
+    if not parts:
+        return cookie
+
+    rewritten = [parts[0]]
+    path_seen = False
+    for part in parts[1:]:
+        lower = part.lower()
+        if lower.startswith("domain="):
+            continue
+        if lower.startswith("path="):
+            rewritten.append(f"Path={proxy_path}")
+            path_seen = True
+            continue
+        rewritten.append(part)
+    if not path_seen:
+        rewritten.append(f"Path={proxy_path}")
+    return "; ".join(rewritten)
+
+
+def _should_rewrite_webfig_content(content_type: str) -> bool:
+    content_type = (content_type or "").lower()
+    return any(
+        marker in content_type
+        for marker in ("text/html", "text/css", "javascript", "application/json")
+    )
+
+
+def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -> bytes:
+    encoding = "utf-8"
+    lower = (content_type or "").lower()
+    if "charset=" in lower:
+        encoding = lower.split("charset=", 1)[1].split(";", 1)[0].strip() or "utf-8"
+
+    try:
+        text = content.decode(encoding, errors="replace")
+    except LookupError:
+        encoding = "utf-8"
+        text = content.decode(encoding, errors="replace")
+
+    prefix = f"/api/admin/routers/{router_id}/webfig"
+    replacements = (
+        ('href="/', f'href="{prefix}/'),
+        ("href='/", f"href='{prefix}/"),
+        ('src="/', f'src="{prefix}/'),
+        ("src='/", f"src='{prefix}/"),
+        ('action="/', f'action="{prefix}/'),
+        ("action='/", f"action='{prefix}/"),
+        ('url(/', f'url({prefix}/'),
+        ('fetch("/', f'fetch("{prefix}/'),
+        ("fetch('/", f"fetch('{prefix}/"),
+        ('XMLHttpRequest.open("GET","/', f'XMLHttpRequest.open("GET","{prefix}/'),
+        ("XMLHttpRequest.open('GET','/", f"XMLHttpRequest.open('GET','{prefix}/"),
+    )
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text.encode(encoding, errors="replace")
 
 
 @router.get("/api/routers")

@@ -1121,6 +1121,17 @@ async def run_fup_usage_migrations():
             "ADD COLUMN IF NOT EXISTS last_download_bytes BIGINT NOT NULL DEFAULT 0"
         ))
 
+        for col_name in (
+            "hotspot_upload_bytes",
+            "hotspot_download_bytes",
+            "pppoe_upload_bytes",
+            "pppoe_download_bytes",
+        ):
+            await conn.execute(sa_text(
+                f"ALTER TABLE bandwidth_snapshots "
+                f"ADD COLUMN IF NOT EXISTS {col_name} BIGINT NOT NULL DEFAULT 0"
+            ))
+
         await conn.execute(sa_text(
             """
             CREATE TABLE IF NOT EXISTS customer_usage_periods (
@@ -1161,7 +1172,7 @@ async def run_fup_usage_migrations():
         ))
         logger.info(
             "Migration: Ensured FUP enum, plans/user_bandwidth_usage columns, "
-            "and customer_usage_periods table"
+            "bandwidth snapshot service counters, and customer_usage_periods table"
         )
 
 

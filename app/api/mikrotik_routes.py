@@ -5,7 +5,7 @@ from sqlalchemy import select, func
 from typing import Optional
 from datetime import datetime, timedelta
 from app.db.database import async_session, get_db
-from app.db.models import Router, Customer, BandwidthSnapshot, UserBandwidthUsage
+from app.db.models import Router, Customer, Plan, BandwidthSnapshot, UserBandwidthUsage
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.mikrotik_api import MikroTikAPI
@@ -30,6 +30,10 @@ _health_refresh_last_started = {}  # cache_key -> datetime of last live refresh 
 # MikroTik dashboard cache (avoid hammering the router)
 _mikrotik_cache = {"data": None, "timestamp": None}
 _mikrotik_cache_ttl = 300  # seconds - limit to once per 5 minutes
+
+
+def _bytes_to_mb(value: int) -> float:
+    return round(int(value or 0) / (1024 * 1024), 2)
 
 
 # =============================================================================
@@ -1207,6 +1211,12 @@ async def get_bandwidth_history(
         
         data = []
         for s in snapshots:
+            hotspot_upload_mb = _bytes_to_mb(getattr(s, "hotspot_upload_bytes", 0))
+            hotspot_download_mb = _bytes_to_mb(getattr(s, "hotspot_download_bytes", 0))
+            pppoe_upload_mb = _bytes_to_mb(getattr(s, "pppoe_upload_bytes", 0))
+            pppoe_download_mb = _bytes_to_mb(getattr(s, "pppoe_download_bytes", 0))
+            active_hotspot = int(getattr(s, "active_hotspot_users", 0) or 0)
+            active_pppoe = max(0, int(s.active_queues or 0) - active_hotspot)
             data.append({
                 "timestamp": s.recorded_at.isoformat(),
                 "routerId": s.router_id,
@@ -1215,7 +1225,21 @@ async def get_bandwidth_history(
                 "avgUploadMbps": round(s.avg_upload_bps / 1000000, 2),
                 "avgDownloadMbps": round(s.avg_download_bps / 1000000, 2),
                 "activeQueues": s.active_queues,
-                "activeSessions": s.active_sessions
+                "activeSessions": s.active_sessions,
+                "activeHotspotUsers": active_hotspot,
+                "activePppoeUsers": active_pppoe,
+                "hotspotUploadMB": hotspot_upload_mb,
+                "hotspotDownloadMB": hotspot_download_mb,
+                "hotspotTotalMB": round(hotspot_upload_mb + hotspot_download_mb, 2),
+                "pppoeUploadMB": pppoe_upload_mb,
+                "pppoeDownloadMB": pppoe_download_mb,
+                "pppoeTotalMB": round(pppoe_upload_mb + pppoe_download_mb, 2),
+                "trackedUploadMB": round(hotspot_upload_mb + pppoe_upload_mb, 2),
+                "trackedDownloadMB": round(hotspot_download_mb + pppoe_download_mb, 2),
+                "trackedTotalMB": round(
+                    hotspot_upload_mb + hotspot_download_mb + pppoe_upload_mb + pppoe_download_mb,
+                    2,
+                ),
             })
         
         return {
@@ -1264,9 +1288,13 @@ async def get_top_bandwidth_users(
             owned_router_ids = select(Router.id).where(Router.user_id == user.id)
             owned_router_filter = Customer.router_id.in_(owned_router_ids)
 
-        base_join = select(UserBandwidthUsage, Customer).join(
+        base_join = select(
+            UserBandwidthUsage,
+            Customer,
+            Plan.connection_type.label("connection_type"),
+        ).join(
             Customer, UserBandwidthUsage.customer_id == Customer.id
-        )
+        ).outerjoin(Plan, Customer.plan_id == Plan.id)
 
         if router_id:
             query = base_join.where(
@@ -1285,13 +1313,28 @@ async def get_top_bandwidth_users(
         usage_records = result.all()
         
         users = []
-        for u, customer in usage_records:
+        for u, customer, connection_type in usage_records:
             total_bytes = u.upload_bytes + u.download_bytes
+            connection_value = (
+                connection_type.value
+                if hasattr(connection_type, "value")
+                else connection_type
+            )
+            if not connection_value:
+                connection_value = "pppoe" if str(u.mac_address or "").startswith("pppoe:") else "hotspot"
+            identifier = (
+                customer.pppoe_username
+                if connection_value == "pppoe"
+                else customer.mac_address
+            )
             
             users.append({
                 "mac": u.mac_address,
                 "target": u.target_ip,
                 "queueName": u.queue_name,
+                "connectionType": connection_value,
+                "serviceLabel": "PPPoE" if connection_value == "pppoe" else "Hotspot",
+                "identifier": identifier,
                 "uploadBytes": u.upload_bytes,
                 "downloadBytes": u.download_bytes,
                 "totalBytes": total_bytes,
@@ -1327,6 +1370,7 @@ async def get_top_bandwidth_users(
             "router_name": router_name,
             "topUsers": users,
             "totalTracked": total_count,
+            "totalQueues": total_count,
             "generatedAt": datetime.utcnow().isoformat()
         }
     except HTTPException:
