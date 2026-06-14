@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import pytest
 from fastapi import HTTPException
 import httpx
@@ -630,7 +632,7 @@ async def test_webfig_jsproxy_escape_proxy_uses_active_session_cookie(monkeypatc
     assert captured["request"]["url"] == "http://10.0.81.1/jsproxy?action=login"
     assert captured["request"]["content"] == b"username=admin&password=secret"
     assert captured["request"]["headers"]["cookie"] == "mikrotik_session=abc"
-    assert captured["client_kwargs"]["timeout"].read == 120.0
+    assert captured["client_kwargs"]["timeout"].read == 300.0
     assert b'"/api/admin/routers/81/webfig/#Interface"' in response.body
     assert b'"/api/admin/routers/81/webfig/?tab=system"' in response.body
     router_remote_access.revoke_webfig_proxy_sessions(81)
@@ -681,8 +683,54 @@ async def test_webfig_jsproxy_escape_degrades_upstream_timeout_without_502(monke
     assert response.status_code == 200
     assert response.body == b""
     assert captured["calls"] == 2
-    assert captured["client_kwargs"]["timeout"].read == 120.0
+    assert captured["client_kwargs"]["timeout"].read == 300.0
     router_remote_access.revoke_webfig_proxy_sessions(82)
+
+
+@pytest.mark.asyncio
+async def test_webfig_activity_refreshes_proxy_session_cookie(monkeypatch):
+    session = router_remote_access.create_webfig_proxy_session(
+        router_id=84,
+        router_name="Router-84",
+        router_ip="10.0.84.1",
+        created_by_user_id=1,
+        ttl_minutes=1,
+    )
+    session.expires_at = datetime.utcnow() + timedelta(seconds=2)
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def request(self, method, url, headers=None, content=None):
+            return httpx.Response(200, headers={"content-type": "text/html"}, content=b"ok")
+
+    monkeypatch.setattr(router_management.httpx, "AsyncClient", FakeAsyncClient)
+
+    response = await router_management.proxy_router_webfig_jsproxy_escape(
+        _request(
+            "/jsproxy",
+            method="POST",
+            headers=[(b"host", b"testserver"), (b"cookie", f"webfig_active_proxy=84:{session.token}".encode())],
+        ),
+        "",
+    )
+
+    assert response.status_code == 200
+    assert session.expires_at > datetime.utcnow() + timedelta(minutes=60)
+    set_cookie_headers = [
+        value.decode()
+        for key, value in response.raw_headers
+        if key.lower() == b"set-cookie"
+    ]
+    assert any("webfig_active_proxy=84:" in header and "Path=/" in header for header in set_cookie_headers)
+    router_remote_access.revoke_webfig_proxy_sessions(84)
 
 
 @pytest.mark.asyncio

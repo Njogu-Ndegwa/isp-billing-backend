@@ -117,6 +117,16 @@ def create_webfig_proxy_session(
     return session
 
 
+def refresh_webfig_proxy_session(
+    session: WebFigProxySession,
+    ttl_minutes: int | None = None,
+) -> WebFigProxySession:
+    ttl = max(1, int(ttl_minutes or settings.ROUTER_WEBFIG_SESSION_MINUTES))
+    session.expires_at = datetime.utcnow() + timedelta(minutes=ttl)
+    _WEBFIG_PROXY_SESSIONS[session.token] = session
+    return session
+
+
 def get_webfig_proxy_session(router_id: int, token: str | None) -> WebFigProxySession | None:
     if not token:
         return None

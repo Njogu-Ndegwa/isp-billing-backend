@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     # Just-in-time RouterOS operator access. This is the source allowed to
     # reach WinBox/SSH/WebFig when an admin opens remote access for a router.
     ROUTER_REMOTE_ACCESS_SOURCE_CIDRS: str = "10.0.0.1/32"
-    ROUTER_WEBFIG_SESSION_MINUTES: int = 15
+    ROUTER_WEBFIG_SESSION_MINUTES: int = 120
     ROUTER_WEBFIG_PROXY_TIMEOUT_SECONDS: int = 20
 
     class Config:

@@ -25,6 +25,7 @@ from app.services.router_remote_access import (
     get_webfig_proxy_session,
     normalize_remote_access_services,
     normalize_source_cidrs,
+    refresh_webfig_proxy_session,
     revoke_webfig_proxy_sessions,
     webfig_access_cookie_name,
 )
@@ -809,12 +810,14 @@ async def _proxy_webfig_request(
             exc,
         )
         if is_jsproxy:
-            return Response(
+            response = Response(
                 content=b"",
                 status_code=200,
                 media_type="application/octet-stream",
                 headers={"cache-control": "no-store"},
             )
+            _set_webfig_access_cookies(response, router_id, session)
+            return response
         return Response(
             content=f"Could not reach router WebFig over the management VPN: {exc}",
             status_code=502,
@@ -835,8 +838,7 @@ async def _proxy_webfig_request(
     for cookie in upstream.headers.get_list("set-cookie"):
         response.headers.append("set-cookie", _rewrite_webfig_set_cookie(cookie, router_id))
 
-    if refresh_access_cookies:
-        _set_webfig_access_cookies(response, router_id, session)
+    _set_webfig_access_cookies(response, router_id, session)
     return response
 
 
@@ -918,7 +920,7 @@ def _build_webfig_upstream_url(session, proxy_path: str) -> str:
 def _webfig_proxy_read_timeout(proxy_path: str) -> float:
     configured = float(settings.ROUTER_WEBFIG_PROXY_TIMEOUT_SECONDS)
     if _is_webfig_jsproxy_path(proxy_path):
-        return max(configured, 120.0)
+        return max(configured, 300.0)
     return configured
 
 
@@ -968,6 +970,7 @@ def _strip_webfig_proxy_cookies(cookie_header: str) -> str:
 
 
 def _set_webfig_access_cookies(response: Response, router_id: int, session) -> None:
+    refresh_webfig_proxy_session(session)
     max_age = max(1, int((session.expires_at - datetime.utcnow()).total_seconds()))
     response.set_cookie(
         webfig_access_cookie_name(router_id),
