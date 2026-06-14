@@ -114,7 +114,7 @@ async def adjust_credits(reseller_id: int, body: AdjustIn,
 
 class InboxSendIn(BaseModel):
     recipient: str = Field(..., description='reseller id (as string) or "all"')
-    subject: Optional[str] = None
+    subject: Optional[str] = Field(None, max_length=200)
     body: str = Field(..., min_length=1, max_length=2000)
     also_sms: bool = False
 

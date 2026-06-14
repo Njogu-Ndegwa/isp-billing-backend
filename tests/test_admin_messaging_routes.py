@@ -70,10 +70,19 @@ async def test_admin_adjust_grants_credits(db, client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reseller_is_rejected_from_admin_endpoint(db, client, monkeypatch):
+@pytest.mark.parametrize("method,path,payload", [
+    ("GET", "/api/admin/messaging/settings", None),
+    ("PUT", "/api/admin/messaging/settings", {"price_per_sms_kes": 1.0}),
+    ("GET", "/api/admin/messaging/credits/orders", None),
+    ("POST", "/api/admin/messaging/resellers/999/credits/adjust", {"delta": 1}),
+    ("POST", "/api/admin/messaging/inbox", {"recipient": "all", "body": "hi"}),
+])
+async def test_reseller_is_rejected_from_all_admin_endpoints(
+        db, client, monkeypatch, method, path, payload):
     reseller = await make_reseller(db)
     _auth_as(monkeypatch, reseller)
-    resp = await client.get("/api/admin/messaging/settings")
+    fn = getattr(client, method.lower())
+    resp = await (fn(path, json=payload) if payload is not None else fn(path))
     assert resp.status_code == 403
 
 
