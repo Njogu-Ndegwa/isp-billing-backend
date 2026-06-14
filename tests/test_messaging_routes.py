@@ -7,7 +7,7 @@ import app.api.messaging_routes as mr
 from app.api.messaging_routes import router as messaging_router
 from app.db.database import get_db
 from app.services.auth import verify_token
-from app.db.models import SmsCreditOrder, SmsCreditOrderStatus
+from app.db.models import SmsCreditOrder, SmsCreditOrderStatus, UserRole
 from app.services import sms_credits
 from tests.factories import make_reseller, make_plan, make_customer, make_sms_account
 
@@ -115,3 +115,49 @@ async def test_recipients_count_scoped(db, client, monkeypatch):
     _auth_as(monkeypatch, r)
     resp = await client.get("/api/messaging/recipients?filter=all")
     assert resp.json()["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_callback_failed_result_does_not_grant(db, client, monkeypatch):
+    r = await make_reseller(db)
+    _auth_as(monkeypatch, r)
+    db.add(SmsCreditOrder(user_id=r.id, quantity=50, unit_price=1, amount=50,
+                          phone_number="254712345678",
+                          status=SmsCreditOrderStatus.PENDING,
+                          mpesa_checkout_request_id="ws_CO_FAIL"))
+    await db.commit()
+
+    resp = await client.post("/api/messaging/credits/mpesa/callback", json={
+        "Body": {"stkCallback": {"CheckoutRequestID": "ws_CO_FAIL",
+                                 "ResultCode": 1032, "ResultDesc": "Cancelled"}}})
+    assert resp.status_code == 200
+    acct = await sms_credits.get_or_create_account(db, r.id)
+    assert acct.balance == 0   # no grant on non-zero ResultCode
+
+
+@pytest.mark.asyncio
+async def test_callback_is_idempotent_on_duplicate(db, client, monkeypatch):
+    r = await make_reseller(db)
+    _auth_as(monkeypatch, r)
+    db.add(SmsCreditOrder(user_id=r.id, quantity=20, unit_price=1, amount=20,
+                          phone_number="254712345678",
+                          status=SmsCreditOrderStatus.PENDING,
+                          mpesa_checkout_request_id="ws_CO_DUP"))
+    await db.commit()
+    payload = {"Body": {"stkCallback": {"CheckoutRequestID": "ws_CO_DUP",
+               "ResultCode": 0, "CallbackMetadata": {"Item": [
+                   {"Name": "MpesaReceiptNumber", "Value": "QDUP1"}]}}}}
+
+    first = await client.post("/api/messaging/credits/mpesa/callback", json=payload)
+    second = await client.post("/api/messaging/credits/mpesa/callback", json=payload)
+    assert first.status_code == 200 and second.status_code == 200
+    acct = await sms_credits.get_or_create_account(db, r.id)
+    assert acct.balance == 20   # granted once, not twice
+
+
+@pytest.mark.asyncio
+async def test_admin_is_rejected_from_reseller_endpoint(db, client, monkeypatch):
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    _auth_as(monkeypatch, admin)
+    resp = await client.get("/api/messaging/credits")
+    assert resp.status_code == 403

@@ -114,46 +114,57 @@ async def purchase_credits(req: PurchaseRequest,
     if stk:
         order.mpesa_checkout_request_id = stk.checkout_request_id
         order.mpesa_merchant_request_id = stk.merchant_request_id
+    else:
+        # Provider returned no response object — no checkout id will ever
+        # match a callback, so fail the order now rather than leave it PENDING.
+        order.status = SmsCreditOrderStatus.FAILED
+        await db.commit()
+        raise HTTPException(status_code=502, detail="STK push returned no response")
     await db.commit()
     return {
         "message": "STK push sent. Confirm on your phone.",
         "order_id": order.id,
         "quantity": order.quantity,
         "amount": amount,
-        "checkout_request_id": stk.checkout_request_id if stk else None,
+        "checkout_request_id": stk.checkout_request_id,
     }
 
 
 @router.post("/api/messaging/credits/mpesa/callback")
 async def credits_callback(request: Request, db: AsyncSession = Depends(get_db)):
-    body = await request.json()
-    cb = body.get("Body", {}).get("stkCallback", {})
-    checkout_id = cb.get("CheckoutRequestID")
-    result_code = cb.get("ResultCode")
-    if not checkout_id:
-        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+    # Always ack with ResultCode 0 — any non-2xx makes Safaricom retry. Errors
+    # are logged and swallowed, mirroring subscription_mpesa_callback.
+    try:
+        body = await request.json()
+        cb = body.get("Body", {}).get("stkCallback", {})
+        checkout_id = cb.get("CheckoutRequestID")
+        result_code = cb.get("ResultCode")
+        if not checkout_id:
+            return {"ResultCode": 0, "ResultDesc": "Accepted"}
 
-    order = (await db.execute(
-        select(SmsCreditOrder).where(
-            SmsCreditOrder.mpesa_checkout_request_id == checkout_id)
-    )).scalar_one_or_none()
-    if not order or order.status != SmsCreditOrderStatus.PENDING:
-        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+        order = (await db.execute(
+            select(SmsCreditOrder).where(
+                SmsCreditOrder.mpesa_checkout_request_id == checkout_id)
+        )).scalar_one_or_none()
+        if not order or order.status != SmsCreditOrderStatus.PENDING:
+            return {"ResultCode": 0, "ResultDesc": "Accepted"}
 
-    if result_code == 0:
-        receipt = None
-        for item in cb.get("CallbackMetadata", {}).get("Item", []):
-            if item.get("Name") == "MpesaReceiptNumber":
-                receipt = item.get("Value")
-        order.status = SmsCreditOrderStatus.COMPLETED
-        order.payment_reference = receipt
-        await sms_credits.grant(db, order.user_id, order.quantity,
-                                SmsCreditTxnKind.PURCHASE,
-                                reference=f"SMS-{order.id}")
-        logger.info("SMS credits granted: order %s, qty %s", order.id, order.quantity)
-    else:
-        order.status = SmsCreditOrderStatus.FAILED
-    await db.commit()
+        if result_code == 0:
+            receipt = None
+            for item in cb.get("CallbackMetadata", {}).get("Item", []):
+                if item.get("Name") == "MpesaReceiptNumber":
+                    receipt = item.get("Value")
+            order.status = SmsCreditOrderStatus.COMPLETED
+            order.payment_reference = receipt
+            await sms_credits.grant(db, order.user_id, order.quantity,
+                                    SmsCreditTxnKind.PURCHASE,
+                                    reference=f"SMS-{order.id}")
+            logger.info("SMS credits granted: order %s, qty %s", order.id, order.quantity)
+        else:
+            order.status = SmsCreditOrderStatus.FAILED
+        await db.commit()
+    except Exception:
+        logger.exception("SMS credits callback error")
     return {"ResultCode": 0, "ResultDesc": "Accepted"}
 
 
@@ -230,8 +241,8 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
 # ---- Templates ------------------------------------------------------------
 
 class TemplateIn(BaseModel):
-    name: str = Field(..., max_length=120)
-    body: str = Field(..., max_length=1000)
+    name: str = Field(..., min_length=1, max_length=120)
+    body: str = Field(..., min_length=1, max_length=1000)
 
 
 @router.get("/api/messaging/templates")
