@@ -1,7 +1,6 @@
 """Africa's Talking bulk SMS provider."""
 
 import logging
-from typing import Optional
 
 import httpx
 
