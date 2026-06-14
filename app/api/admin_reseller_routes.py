@@ -458,7 +458,16 @@ async def reseller_stats(
     rev_stmt = (
         select(
             func.date_trunc(trunc_unit, CustomerPayment.created_at).label("bucket"),
-            func.coalesce(func.sum(CustomerPayment.amount), 0).label("revenue"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (CustomerPayment.counts_as_revenue == True,
+                         CustomerPayment.amount),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("revenue"),
             func.coalesce(
                 func.sum(
                     case(
@@ -1013,23 +1022,25 @@ async def get_reseller_routers(
         rev_join = select(func.coalesce(func.sum(CustomerPayment.amount), 0)).join(
             Customer, CustomerPayment.customer_id == Customer.id
         )
+        # All-method revenue excludes compensation vouchers (counts_as_revenue=False).
+        REVENUE_FILTER = CustomerPayment.counts_as_revenue == True
         period_revenue = float((await db.execute(
-            rev_join.where(*rev_base, *date_filters)
+            rev_join.where(*rev_base, *date_filters, REVENUE_FILTER)
         )).scalar())
 
-        # Period M-Pesa revenue
+        # Period M-Pesa revenue (MPESA_FILTER already excludes comp — those are CASH)
         period_mpesa = float((await db.execute(
             rev_join.where(*rev_base, *date_filters, MPESA_FILTER)
         )).scalar())
 
         # Today's revenue
         today_revenue = float((await db.execute(
-            rev_join.where(*rev_base, CustomerPayment.created_at >= today_start)
+            rev_join.where(*rev_base, CustomerPayment.created_at >= today_start, REVENUE_FILTER)
         )).scalar())
 
         # All-time revenue
         alltime_revenue = float((await db.execute(
-            rev_join.where(*rev_base)
+            rev_join.where(*rev_base, REVENUE_FILTER)
         )).scalar())
 
         # Uptime percentage from availability fields on the router

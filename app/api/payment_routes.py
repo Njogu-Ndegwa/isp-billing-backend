@@ -1591,7 +1591,7 @@ async def get_mpesa_transactions_summary(
 
         total_transactions = len(rows)
         # Only sum amounts for rows that count as revenue (exclude compensation)
-        total_amount = sum(r["amount"] for r in rows if r["counts_as_revenue"])
+        total_amount = round(sum(r["amount"] for r in rows if r["counts_as_revenue"]), 2)
         compensation_total = round(sum(r["amount"] for r in rows if not r["counts_as_revenue"]), 2)
 
         status_breakdown: dict = {}

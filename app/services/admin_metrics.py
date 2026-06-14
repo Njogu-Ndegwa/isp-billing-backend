@@ -10,7 +10,7 @@ import math
 from datetime import datetime, timedelta, date
 from typing import Any
 
-from sqlalchemy import select, func, text, and_, or_
+from sqlalchemy import select, func, text, and_, or_, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -433,13 +433,17 @@ async def compute_dashboard_v2_extras(db: AsyncSession) -> dict[str, Any]:
 
     cur_revenue = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0))
-        .where(CustomerPayment.created_at >= month_start)
+        .where(
+            CustomerPayment.created_at >= month_start,
+            CustomerPayment.counts_as_revenue == True,
+        )
     )).scalar())
     prev_revenue = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0))
         .where(
             CustomerPayment.created_at >= prev_month_start,
             CustomerPayment.created_at < prev_month_end,
+            CustomerPayment.counts_as_revenue == True,
         )
     )).scalar())
 
@@ -836,6 +840,9 @@ async def compute_revenue_concentration(db: AsyncSession) -> dict[str, Any]:
     now = datetime.utcnow()
     month_start = datetime(now.year, now.month, 1)
 
+    # Revenue concentration is a revenue metric: exclude compensation vouchers
+    # (counts_as_revenue=False) so free vouchers don't inflate contributor
+    # shares or count comp-only resellers as revenue contributors.
     rows = (await db.execute(
         select(
             CustomerPayment.reseller_id,
@@ -843,7 +850,10 @@ async def compute_revenue_concentration(db: AsyncSession) -> dict[str, Any]:
             func.coalesce(func.sum(CustomerPayment.amount), 0).label("rev"),
         )
         .join(User, User.id == CustomerPayment.reseller_id)
-        .where(CustomerPayment.created_at >= month_start)
+        .where(
+            CustomerPayment.created_at >= month_start,
+            CustomerPayment.counts_as_revenue == True,
+        )
         .group_by(CustomerPayment.reseller_id, User.organization_name)
         .order_by(func.sum(CustomerPayment.amount).desc())
     )).all()
@@ -900,7 +910,10 @@ async def compute_smart_alerts(db: AsyncSession) -> dict[str, Any]:
 
     month_revenue = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0))
-        .where(CustomerPayment.created_at >= month_start)
+        .where(
+            CustomerPayment.created_at >= month_start,
+            CustomerPayment.counts_as_revenue == True,
+        )
     )).scalar())
 
     for milestone in _REVENUE_MILESTONES:
@@ -1033,10 +1046,21 @@ async def compute_revenue_forecast(
     based_on = days_map.get(period, 30)
     hist_start = now - timedelta(days=based_on)
 
+    # Revenue history excludes compensation vouchers (counts_as_revenue=False)
+    # so free vouchers don't inflate the projection. Days that had only comp
+    # payments are kept as real zero-revenue points via case().
     rows = (await db.execute(
         select(
             func.date(CustomerPayment.created_at).label("d"),
-            func.coalesce(func.sum(CustomerPayment.amount), 0).label("rev"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("rev"),
         )
         .where(CustomerPayment.created_at >= hist_start)
         .group_by(func.date(CustomerPayment.created_at))

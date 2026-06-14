@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, case
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
@@ -391,7 +391,14 @@ async def get_plan_performance(
             Plan.duration_unit,
             func.count(Customer.id.distinct()).label('total_customers'),
             func.count(CustomerPayment.id).label('total_sales'),
-            func.sum(CustomerPayment.amount).label('total_revenue')
+            # Count every sale, but exclude compensation vouchers
+            # (counts_as_revenue=False) from the revenue amount.
+            func.sum(
+                case(
+                    (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
+                    else_=0,
+                )
+            ).label('total_revenue')
         ).outerjoin(
             Customer, Customer.plan_id == Plan.id
         ).outerjoin(

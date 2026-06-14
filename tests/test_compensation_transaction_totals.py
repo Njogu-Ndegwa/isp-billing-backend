@@ -176,3 +176,87 @@ async def test_reseller_dashboard_total_revenue_excludes_comp(db, monkeypatch):
     assert all_time == 200.0, (
         f"Expected all_time revenue==200 (comp excluded), got {all_time}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 3: revenue-over-time chart excludes comp from money, counts it
+# ---------------------------------------------------------------------------
+
+async def test_revenue_over_time_excludes_comp_keeps_transaction_count(db, monkeypatch):
+    """
+    Seed one SALE payment (amount 300, counts_as_revenue=True) and one
+    COMPENSATION payment (amount 80, counts_as_revenue=False) for the same
+    reseller on the current day, then call get_revenue_over_time.
+
+    Expected (the comp must NOT inflate money, but MUST be counted):
+      totals.revenue       == 300    (comp excluded from money)
+      totals.transactions  == 2      (both counted)
+      today's bucket revenue       == 300
+      today's bucket transactions  == 2
+    """
+    from datetime import datetime
+
+    from app.api import dashboard_routes
+
+    reseller = await make_reseller(db, email="rot-reseller@example.com")
+    plan = await make_plan(db, reseller, price=300)
+    router = await make_router(db, reseller, ip_address="10.0.3.1")
+    customer = await make_customer(
+        db, reseller, plan, router,
+        phone="254700000030",
+        mac_address="AA:BB:CC:DD:00:03",
+    )
+
+    # Normal sale (counts as revenue)
+    await _add_payment(
+        db, customer, reseller,
+        amount=300.0,
+        payment_method=PaymentMethod.CASH,
+        counts_as_revenue=True,
+    )
+
+    # Compensation voucher (free — must NOT count toward revenue, but IS a txn)
+    await _add_payment(
+        db, customer, reseller,
+        amount=80.0,
+        payment_method=PaymentMethod.CASH,
+        counts_as_revenue=False,
+    )
+
+    async def fake_current_user(token, db):
+        return SimpleNamespace(id=reseller.id, role=UserRole.RESELLER)
+
+    monkeypatch.setattr(dashboard_routes, "get_current_user", fake_current_user)
+
+    result = await dashboard_routes.get_revenue_over_time(
+        period="30d",
+        start_date=None,
+        end_date=None,
+        router_id=None,
+        db=db,
+        token="test-token",
+    )
+
+    # Totals: revenue excludes comp, transactions count both
+    assert result["totals"]["revenue"] == 300.0, (
+        f"Expected totals.revenue==300 (comp excluded), got {result['totals']['revenue']}"
+    )
+    assert result["totals"]["transactions"] == 2, (
+        f"Expected totals.transactions==2 (comp counted), got {result['totals']['transactions']}"
+    )
+
+    # The day bucket for "today" must show the same: revenue 300, 2 transactions
+    today_key = datetime.utcnow().strftime("%Y-%m-%d")
+    today_bucket = next(
+        (p for p in result["data"] if p["date"] == today_key), None
+    )
+    assert today_bucket is not None, (
+        f"Expected a data bucket for today ({today_key}); got dates "
+        f"{[p['date'] for p in result['data']]}"
+    )
+    assert today_bucket["revenue"] == 300.0, (
+        f"Expected today's bucket revenue==300 (comp excluded), got {today_bucket['revenue']}"
+    )
+    assert today_bucket["transactions"] == 2, (
+        f"Expected today's bucket transactions==2 (comp counted), got {today_bucket['transactions']}"
+    )

@@ -782,12 +782,20 @@ async def get_revenue_over_time(
             base_where.append(CustomerPayment.reseller_id == user_id)
         if router_id:
             payments_q = (
-                select(CustomerPayment.amount, CustomerPayment.created_at)
+                select(
+                    CustomerPayment.amount,
+                    CustomerPayment.created_at,
+                    CustomerPayment.counts_as_revenue,
+                )
                 .join(Customer, CustomerPayment.customer_id == Customer.id)
                 .where(*base_where, Customer.router_id == router_id)
             )
         else:
-            payments_q = select(CustomerPayment.amount, CustomerPayment.created_at).where(*base_where)
+            payments_q = select(
+                CustomerPayment.amount,
+                CustomerPayment.created_at,
+                CustomerPayment.counts_as_revenue,
+            ).where(*base_where)
 
         rows = (await db.execute(payments_q)).all()
 
@@ -817,7 +825,10 @@ async def get_revenue_over_time(
             key = bucket_key(row.created_at)
             if key not in buckets:
                 buckets[key] = {"revenue": 0.0, "transactions": 0}
-            buckets[key]["revenue"] += float(row.amount)
+            # Count every payment, but only add to revenue when it counts as
+            # revenue (compensation vouchers have counts_as_revenue=False).
+            if row.counts_as_revenue:
+                buckets[key]["revenue"] += float(row.amount)
             buckets[key]["transactions"] += 1
 
         # Build complete date sequence (no gaps)
@@ -1057,7 +1068,8 @@ async def get_daily_revenue_metrics(
         if router_id:
             payments_stmt = select(
                 CustomerPayment.amount,
-                CustomerPayment.created_at
+                CustomerPayment.created_at,
+                CustomerPayment.counts_as_revenue
             ).join(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
@@ -1069,7 +1081,8 @@ async def get_daily_revenue_metrics(
         else:
             payments_stmt = select(
                 CustomerPayment.amount,
-                CustomerPayment.created_at
+                CustomerPayment.created_at,
+                CustomerPayment.counts_as_revenue
             ).where(
                 CustomerPayment.reseller_id == user_id,
                 CustomerPayment.created_at >= day_start,
@@ -1097,7 +1110,10 @@ async def get_daily_revenue_metrics(
         for payment in payments:
             hour = payment.created_at.hour
             amount = float(payment.amount)
-            hourly_data[hour]["revenue"] += amount
+            # Count every payment, but only add to revenue when it counts as
+            # revenue (compensation vouchers have counts_as_revenue=False).
+            if payment.counts_as_revenue:
+                hourly_data[hour]["revenue"] += amount
             hourly_data[hour]["transactions"] += 1
         
         # Calculate cumulative values
@@ -1161,12 +1177,13 @@ async def get_dashboard_stats(
         
         # Build queries with optional router filtering
         if router_id:
-            # Total revenue in period (with router filter)
+            # Total revenue in period (with router filter) — exclude comp vouchers
             period_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
                 CustomerPayment.created_at >= period_start,
+                CustomerPayment.counts_as_revenue == True,
                 Customer.router_id == router_id
             )
             period_revenue = float((await db.execute(period_revenue_stmt)).scalar() or 0)
@@ -1191,12 +1208,13 @@ async def get_dashboard_stats(
             )
             period_unique_customers = (await db.execute(period_customers_stmt)).scalar() or 0
             
-            # Today's stats
+            # Today's stats — exclude comp vouchers from revenue
             today_revenue_stmt = select(func.sum(CustomerPayment.amount)).join(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
                 CustomerPayment.created_at >= today_start,
+                CustomerPayment.counts_as_revenue == True,
                 Customer.router_id == router_id
             )
             today_revenue = float((await db.execute(today_revenue_stmt)).scalar() or 0)
@@ -1211,10 +1229,11 @@ async def get_dashboard_stats(
             today_transactions = (await db.execute(today_txn_stmt)).scalar() or 0
         else:
             # Original queries without router filter
-            # Total revenue in period
+            # Total revenue in period — exclude comp vouchers
             period_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= period_start
+                CustomerPayment.created_at >= period_start,
+                CustomerPayment.counts_as_revenue == True
             )
             period_revenue = float((await db.execute(period_revenue_stmt)).scalar() or 0)
             
@@ -1232,10 +1251,11 @@ async def get_dashboard_stats(
             )
             period_unique_customers = (await db.execute(period_customers_stmt)).scalar() or 0
             
-            # Today's stats
+            # Today's stats — exclude comp vouchers from revenue
             today_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= today_start
+                CustomerPayment.created_at >= today_start,
+                CustomerPayment.counts_as_revenue == True
             )
             today_revenue = float((await db.execute(today_revenue_stmt)).scalar() or 0)
             
