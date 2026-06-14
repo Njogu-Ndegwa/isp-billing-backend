@@ -21,6 +21,7 @@ from app.services.router_helpers import get_router_by_id, get_router_by_identity
 from app.core.protected_devices import is_protected_device
 from app.services.router_availability import record_router_availability
 from app.services.router_concurrency import run_with_guard
+from app.services.router_remote_access import configure_router_remote_access_sync
 from app.services.provisioning import provision_base_url_for_vpn, fetch_certificate_flag_for_url
 from app.services.pppoe_customer_import import (
     read_pppoe_workbook,
@@ -5088,9 +5089,6 @@ async def list_router_files(
 # {"enable": false} when done.
 # ---------------------------------------------------------------------------
 
-_WINBOX_FW_COMMENT = "API-managed: Allow Winbox from WG"
-
-
 class WinboxAccessRequest(BaseModel):
     enable: bool
     wg_source: str = "10.0.0.1/32"  # AWS server's WG address by default
@@ -5099,130 +5097,12 @@ class WinboxAccessRequest(BaseModel):
 def _toggle_winbox_access_sync(
     router_info: dict, enable: bool, wg_source: str
 ) -> dict:
-    api = MikroTikAPI(
-        router_info["ip"],
-        router_info["username"],
-        router_info["password"],
-        router_info["port"],
-        timeout=15,
-        connect_timeout=5,
+    return configure_router_remote_access_sync(
+        router_info,
+        services=["winbox"],
+        enable=enable,
+        source_cidrs=[wg_source],
     )
-    if not api.connect():
-        return {"error": "connection_failed", "reason": api.last_connect_error}
-    try:
-        steps: list = []
-
-        # 1. Find the input filter rule we own (by comment), if any.
-        existing_fw = api.send_command_optimized(
-            "/ip/firewall/filter/print",
-            proplist=[".id", "chain", "comment"],
-            query=f"?comment={_WINBOX_FW_COMMENT}",
-        )
-        existing_rules = existing_fw.get("data") or []
-
-        # 2. Find the Winbox service entry.
-        svc_resp = api.send_command(
-            "/ip/service/print",
-            {"?name": "winbox"},
-        )
-        winbox_svc = (svc_resp.get("data") or [{}])[0]
-        winbox_id = winbox_svc.get(".id")
-
-        if enable:
-            # Add firewall rule if missing. Place it before any defconf
-            # drop rule so it actually has an effect.
-            if not existing_rules:
-                # Locate the "drop all not coming from LAN" rule to place before it
-                defconf = api.send_command_optimized(
-                    "/ip/firewall/filter/print",
-                    proplist=[".id", "chain", "action", "comment"],
-                    query="?comment=defconf: drop all not coming from LAN",
-                )
-                defconf_rules = defconf.get("data") or []
-                add_args = {
-                    "chain": "input",
-                    "protocol": "tcp",
-                    "dst-port": "8291",
-                    "src-address": wg_source,
-                    "action": "accept",
-                    "comment": _WINBOX_FW_COMMENT,
-                }
-                if defconf_rules:
-                    add_args["place-before"] = defconf_rules[0][".id"]
-                add_resp = api.send_command(
-                    "/ip/firewall/filter/add",
-                    add_args,
-                )
-                steps.append({"step": "add_firewall_rule", "result": add_resp})
-            else:
-                steps.append({
-                    "step": "firewall_rule_exists",
-                    "result": {"existing_count": len(existing_rules)},
-                })
-
-            # Enable Winbox service restricted to the WG source.
-            if winbox_id:
-                set_resp = api.send_command(
-                    "/ip/service/set",
-                    {
-                        "numbers": winbox_id,
-                        "address": wg_source,
-                        "disabled": "no",
-                    },
-                )
-                steps.append({"step": "enable_winbox_service", "result": set_resp})
-            else:
-                steps.append({
-                    "step": "enable_winbox_service",
-                    "result": {"error": "Winbox service entry not found"},
-                })
-
-            human = (
-                f"Winbox now reachable on the router at port 8291 from {wg_source}. "
-                f"From the AWS server (10.0.0.1) on the WG mesh you can connect: "
-                f"`winbox {router_info['ip']}:8291`. Remember to call this endpoint "
-                f"with {{\"enable\": false}} when done."
-            )
-        else:
-            # Disable: remove our firewall rule(s) and turn the service off.
-            for rule in existing_rules:
-                rule_id = rule.get(".id")
-                if rule_id:
-                    rm = api.send_command(
-                        "/ip/firewall/filter/remove",
-                        {"numbers": rule_id},
-                    )
-                    steps.append({"step": "remove_firewall_rule",
-                                  "rule_id": rule_id, "result": rm})
-
-            if winbox_id:
-                set_resp = api.send_command(
-                    "/ip/service/set",
-                    {"numbers": winbox_id, "disabled": "yes"},
-                )
-                steps.append({"step": "disable_winbox_service", "result": set_resp})
-
-            human = "Winbox service disabled and our firewall rule removed."
-
-        # Re-read state for confirmation.
-        after_svc = api.send_command("/ip/service/print", {"?name": "winbox"})
-        after_winbox = (after_svc.get("data") or [{}])[0]
-        after_fw = api.send_command_optimized(
-            "/ip/firewall/filter/print",
-            proplist=[".id", "chain", "action", "protocol", "dst-port",
-                      "src-address", "comment", "disabled"],
-            query=f"?comment={_WINBOX_FW_COMMENT}",
-        )
-
-        return {
-            "success": True,
-            "message": human,
-            "steps": steps,
-            "winbox_service_after": after_winbox,
-            "firewall_rules_after": after_fw.get("data") or [],
-        }
-    finally:
-        api.disconnect()
 
 
 @router.post("/api/routers/by-identity/{identity}/winbox-access")
