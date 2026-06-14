@@ -488,6 +488,13 @@ class BandwidthSnapshot(Base):
     # Interface-based counters for accurate averaging
     interface_rx_bytes = Column(BigInteger, default=0)
     interface_tx_bytes = Column(BigInteger, default=0)
+    # Per-snapshot byte deltas from managed user queues. These are interval
+    # counters, not lifetime counters, and let dashboards split usage by access
+    # type without adding a separate time-series table.
+    hotspot_upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    hotspot_download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    pppoe_upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    pppoe_download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
