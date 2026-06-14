@@ -62,6 +62,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["routers"])
 
 
+_WEBFIG_ROOT_ACCESS_COOKIE = "webfig_active_proxy"
+
+
 VALID_PAYMENT_METHODS = {"mpesa", "voucher"}
 
 
@@ -641,15 +644,63 @@ async def proxy_router_webfig(
     )
     session = get_webfig_proxy_session(router_id, provided_token)
     if not session:
-        return Response(
-            content=(
-                "<!doctype html><title>WebFig access expired</title>"
-                "<h1>WebFig access expired</h1>"
-                "<p>Close this tab and open WebFig again from the router dashboard.</p>"
-            ),
-            status_code=403,
-            media_type="text/html",
-        )
+        return _webfig_expired_response()
+
+    return await _proxy_webfig_request(
+        router_id,
+        request,
+        proxy_path,
+        session,
+        refresh_access_cookies=bool(request.query_params.get("remote_access_token")),
+    )
+
+
+@router.api_route(
+    "/webfig",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@router.api_route(
+    "/webfig/{proxy_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def proxy_router_webfig_root_escape(
+    request: Request,
+    proxy_path: str = "",
+):
+    """
+    Catch RouterOS WebFig redirects/forms that escape to /webfig at our domain root.
+
+    WebFig sometimes posts or redirects to an absolute /webfig/ path after login.
+    The root-scoped fallback cookie is only issued after a valid proxy token has
+    opened the short-lived session.
+    """
+    router_id, session = _webfig_session_from_root_cookie(request)
+    if not session:
+        return _webfig_expired_response()
+
+    escaped_path = "webfig"
+    if request.url.path.endswith("/") and not proxy_path:
+        escaped_path += "/"
+    if proxy_path:
+        escaped_path += "/" + proxy_path.lstrip("/")
+
+    return await _proxy_webfig_request(
+        router_id,
+        request,
+        escaped_path,
+        session,
+        refresh_access_cookies=False,
+    )
+
+
+async def _proxy_webfig_request(
+    router_id: int,
+    request: Request,
+    proxy_path: str,
+    session,
+    refresh_access_cookies: bool,
+) -> Response:
+    """Proxy a request to RouterOS WebFig using an already validated session."""
 
     query = _forward_webfig_query(request)
     target_url = _build_webfig_upstream_url(session, proxy_path)
@@ -702,16 +753,8 @@ async def proxy_router_webfig(
     for cookie in upstream.headers.get_list("set-cookie"):
         response.headers.append("set-cookie", _rewrite_webfig_set_cookie(cookie, router_id))
 
-    if request.query_params.get("remote_access_token"):
-        max_age = max(1, int((session.expires_at - datetime.utcnow()).total_seconds()))
-        response.set_cookie(
-            webfig_access_cookie_name(router_id),
-            session.token,
-            max_age=max_age,
-            httponly=True,
-            samesite="lax",
-            path=f"/api/admin/routers/{router_id}/webfig",
-        )
+    if refresh_access_cookies:
+        _set_webfig_access_cookies(response, router_id, session)
     return response
 
 
@@ -820,10 +863,58 @@ def _strip_webfig_proxy_cookies(cookie_header: str) -> str:
     cookies = []
     for part in cookie_header.split(";"):
         cookie = part.strip()
-        if not cookie or cookie.lower().startswith("webfig_access_"):
+        cookie_name = cookie.split("=", 1)[0].strip().lower()
+        if (
+            not cookie
+            or cookie_name.startswith("webfig_access_")
+            or cookie_name == _WEBFIG_ROOT_ACCESS_COOKIE
+        ):
             continue
         cookies.append(cookie)
     return "; ".join(cookies)
+
+
+def _set_webfig_access_cookies(response: Response, router_id: int, session) -> None:
+    max_age = max(1, int((session.expires_at - datetime.utcnow()).total_seconds()))
+    response.set_cookie(
+        webfig_access_cookie_name(router_id),
+        session.token,
+        max_age=max_age,
+        httponly=True,
+        samesite="lax",
+        path=f"/api/admin/routers/{router_id}/webfig",
+    )
+    response.set_cookie(
+        _WEBFIG_ROOT_ACCESS_COOKIE,
+        f"{router_id}:{session.token}",
+        max_age=max_age,
+        httponly=True,
+        samesite="lax",
+        path="/webfig",
+    )
+
+
+def _webfig_session_from_root_cookie(request: Request):
+    raw = request.cookies.get(_WEBFIG_ROOT_ACCESS_COOKIE) or ""
+    router_text, separator, token = raw.partition(":")
+    if not separator or not router_text.isdigit() or not token:
+        return None, None
+    router_id = int(router_text)
+    return router_id, get_webfig_proxy_session(router_id, token)
+
+
+def _webfig_expired_response() -> Response:
+    response = Response(
+        content=(
+            "<!doctype html><title>WebFig access expired</title>"
+            "<h1>WebFig access expired</h1>"
+            "<p>Close this tab and open WebFig again from the router dashboard.</p>"
+        ),
+        status_code=403,
+        media_type="text/html",
+    )
+    response.delete_cookie(_WEBFIG_ROOT_ACCESS_COOKIE, path="/webfig")
+    return response
 
 
 def _copy_webfig_response_headers(upstream: httpx.Response, router_id: int) -> dict[str, str]:
