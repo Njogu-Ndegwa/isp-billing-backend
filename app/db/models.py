@@ -247,7 +247,7 @@ class CustomerPayment(Base):
              values_callable=lambda e: [x.value for x in e]),
         nullable=True,
     )
-    counts_as_revenue = Column(Boolean, nullable=False, default=True, server_default="1")
+    counts_as_revenue = Column(Boolean, nullable=False, default=True, server_default="true")
     created_at = Column(DateTime, default=datetime.utcnow)
     customer = relationship("Customer", backref="customer_payments")
     reseller = relationship("User", backref="received_payments", foreign_keys=[reseller_id])

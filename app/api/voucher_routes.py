@@ -14,7 +14,7 @@ from app.services.subscription import enforce_active_subscription
 from app.db.database import get_db
 from app.db.models import Voucher, VoucherStatus, VoucherType, Plan, Router
 from app.services.auth import verify_token, get_current_user
-from app.services.voucher_service import generate_vouchers
+from app.services.voucher_service import generate_vouchers, compensation_used_today
 from app.config import settings
 
 import logging
@@ -196,16 +196,7 @@ async def compensation_allowance(
 ):
     """How many compensation vouchers the current reseller may still issue today."""
     user = await get_current_user(token, db)
-    now = datetime.utcnow()
-    day_start = datetime(now.year, now.month, now.day)
-    used = (await db.execute(
-        select(func.count(Voucher.id)).where(
-            Voucher.user_id == user.id,
-            Voucher.voucher_type == VoucherType.COMPENSATION,
-            Voucher.created_at >= day_start,
-            Voucher.status.in_([VoucherStatus.AVAILABLE, VoucherStatus.REDEEMED]),
-        )
-    )).scalar() or 0
+    used = await compensation_used_today(db, user.id)
     limit = settings.COMPENSATION_DAILY_LIMIT
     return {
         "daily_limit": limit,

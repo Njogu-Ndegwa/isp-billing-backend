@@ -71,6 +71,21 @@ def voucher_lookup_candidates(code: str) -> List[str]:
     return candidates
 
 
+async def compensation_used_today(db: AsyncSession, user_id: int) -> int:
+    """Count of COMPENSATION vouchers this reseller issued today (UTC) that still
+    consume the daily allowance. AVAILABLE/REDEEMED consume it; DISABLED/EXPIRED free it."""
+    now = datetime.utcnow()
+    day_start = datetime(now.year, now.month, now.day)
+    return (await db.execute(
+        select(func.count(Voucher.id)).where(
+            Voucher.user_id == user_id,
+            Voucher.voucher_type == VoucherType.COMPENSATION,
+            Voucher.created_at >= day_start,
+            Voucher.status.in_([VoucherStatus.AVAILABLE, VoucherStatus.REDEEMED]),
+        )
+    )).scalar() or 0
+
+
 async def generate_vouchers(
     db: AsyncSession,
     plan_id: int,
@@ -97,16 +112,7 @@ async def generate_vouchers(
             return {"error": "Router not found or does not belong to this user"}
 
     if voucher_type == VoucherType.COMPENSATION:
-        now = datetime.utcnow()
-        day_start = datetime(now.year, now.month, now.day)
-        used = (await db.execute(
-            select(func.count(Voucher.id)).where(
-                Voucher.user_id == user_id,
-                Voucher.voucher_type == VoucherType.COMPENSATION,
-                Voucher.created_at >= day_start,
-                Voucher.status.in_([VoucherStatus.AVAILABLE, VoucherStatus.REDEEMED]),
-            )
-        )).scalar() or 0
+        used = await compensation_used_today(db, user_id)
         remaining = settings.COMPENSATION_DAILY_LIMIT - used
         if quantity > remaining:
             return {

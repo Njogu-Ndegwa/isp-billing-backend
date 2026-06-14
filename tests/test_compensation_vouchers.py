@@ -190,6 +190,57 @@ async def test_disabled_comp_frees_daily_count(db):
     assert "error" not in result
 
 
+async def test_boundary_at_9_then_10(db):
+    from app.services.voucher_service import generate_vouchers
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+
+    # Build up 9 compensation vouchers (used == 9).
+    first_nine = await generate_vouchers(
+        db=db, plan_id=plan.id, user_id=reseller.id, quantity=9,
+        voucher_type=VoucherType.COMPENSATION,
+    )
+    assert "error" not in first_nine
+
+    # At used == 9, a quantity=1 call should succeed (the 10th).
+    tenth = await generate_vouchers(
+        db=db, plan_id=plan.id, user_id=reseller.id, quantity=1,
+        voucher_type=VoucherType.COMPENSATION,
+    )
+    assert "error" not in tenth
+
+    # At used == 10, a further quantity=1 call must be rejected.
+    eleventh = await generate_vouchers(
+        db=db, plan_id=plan.id, user_id=reseller.id, quantity=1,
+        voucher_type=VoucherType.COMPENSATION,
+    )
+    assert "error" in eleventh
+    assert "compensation" in eleventh["error"].lower()
+
+
+async def test_expired_comp_frees_daily_count(db):
+    from app.services.voucher_service import generate_vouchers
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+
+    await generate_vouchers(
+        db=db, plan_id=plan.id, user_id=reseller.id, quantity=10,
+        voucher_type=VoucherType.COMPENSATION,
+    )
+    # Set one comp voucher's status to EXPIRED -> frees one slot of today's count.
+    one = (await db.execute(select(Voucher).where(Voucher.user_id == reseller.id))).scalars().first()
+    one.status = VoucherStatus.EXPIRED
+    await db.commit()
+
+    result = await generate_vouchers(
+        db=db, plan_id=plan.id, user_id=reseller.id, quantity=1,
+        voucher_type=VoucherType.COMPENSATION,
+    )
+    assert "error" not in result
+
+
 @pytest.fixture
 def no_background_provisioning(monkeypatch):
     from app.services import voucher_service
