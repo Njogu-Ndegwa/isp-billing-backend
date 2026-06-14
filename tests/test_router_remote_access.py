@@ -262,8 +262,8 @@ async def test_configure_router_remote_access_commits_before_router_io(db, monke
 
 @pytest.mark.asyncio
 async def test_open_router_webfig_returns_short_lived_proxy_path_after_commit(db, monkeypatch):
-    admin = await make_reseller(db, role=UserRole.ADMIN)
-    router = await make_router(db, admin, ip_address="10.0.9.3", port=8729)
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller, ip_address="10.0.9.3", port=8729)
     calls = []
 
     async def inline_to_thread(fn, *args, **kwargs):
@@ -292,7 +292,7 @@ async def test_open_router_webfig_returns_short_lived_proxy_path_after_commit(db
     response = await router_management.open_router_webfig(
         router.id,
         db,
-        _token(admin),
+        _token(reseller),
     )
 
     assert response["success"] is True
@@ -390,15 +390,32 @@ async def test_webfig_proxy_rejects_missing_or_expired_session():
 
 
 @pytest.mark.asyncio
-async def test_remote_access_options_are_admin_only(db):
+async def test_remote_access_options_allow_router_owner(db):
     reseller = await make_reseller(db)
     router = await make_router(db, reseller)
+
+    response = await router_management.get_router_remote_access_options(
+        router.id,
+        db,
+        _token(reseller),
+    )
+
+    assert response["success"] is True
+    assert response["router_id"] == router.id
+    assert response["targets"][0]["service"] == "winbox"
+
+
+@pytest.mark.asyncio
+async def test_remote_access_options_hide_other_reseller_router(db):
+    owner = await make_reseller(db)
+    other = await make_reseller(db)
+    router = await make_router(db, owner)
 
     with pytest.raises(HTTPException) as exc:
         await router_management.get_router_remote_access_options(
             router.id,
             db,
-            _token(reseller),
+            _token(other),
         )
 
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 404

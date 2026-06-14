@@ -189,6 +189,14 @@ async def _latest_router_provisioning_token(db: AsyncSession, router_id: int) ->
     return result.scalars().first()
 
 
+async def _router_accessible_to_user(db: AsyncSession, router_id: int, user: User) -> Optional[Router]:
+    stmt = select(Router).where(Router.id == router_id)
+    if user.role != UserRole.ADMIN:
+        stmt = stmt.where(Router.user_id == user.id)
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
 def _token_tunnel_type(token: Optional[ProvisioningToken]) -> Optional[str]:
     vpn_type = (getattr(token, "vpn_type", None) or "").lower()
     if vpn_type == "l2tp":
@@ -326,11 +334,7 @@ async def get_router_remote_access_options(
     addresses an operator can use after the POST endpoint opens access.
     """
     user = await get_current_user(token, db)
-    if user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Admin role required")
-
-    result = await db.execute(select(Router).where(Router.id == router_id))
-    router_obj = result.scalar_one_or_none()
+    router_obj = await _router_accessible_to_user(db, router_id, user)
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
@@ -375,8 +379,6 @@ async def configure_router_remote_access(
     router is contacted.
     """
     user = await get_current_user(token, db)
-    if user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Admin role required")
 
     try:
         services = normalize_remote_access_services(request.services)
@@ -384,8 +386,7 @@ async def configure_router_remote_access(
     except RouterRemoteAccessError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    result = await db.execute(select(Router).where(Router.id == router_id))
-    router_obj = result.scalar_one_or_none()
+    router_obj = await _router_accessible_to_user(db, router_id, user)
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
@@ -447,11 +448,7 @@ async def open_router_webfig(
     token to WebFig asset/form requests.
     """
     user = await get_current_user(token, db)
-    if user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Admin role required")
-
-    result = await db.execute(select(Router).where(Router.id == router_id))
-    router_obj = result.scalar_one_or_none()
+    router_obj = await _router_accessible_to_user(db, router_id, user)
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
@@ -519,11 +516,7 @@ async def close_router_webfig(
 ):
     """Disable WebFig access and revoke active in-memory proxy sessions."""
     user = await get_current_user(token, db)
-    if user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Admin role required")
-
-    result = await db.execute(select(Router).where(Router.id == router_id))
-    router_obj = result.scalar_one_or_none()
+    router_obj = await _router_accessible_to_user(db, router_id, user)
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
