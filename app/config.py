@@ -31,7 +31,9 @@ class Settings(BaseSettings):
     MIKROTIK_USERNAME: str = "admin"
     MIKROTIK_PASSWORD: str = "mvnm"  # Set in .env file
     PPPOE_RATE_LIMIT_HEADROOM: float = 1.08
-    
+    # Max compensation (zero-revenue) vouchers a reseller may issue per UTC day.
+    COMPENSATION_DAILY_LIMIT: int = 10
+
     # M-Pesa Configuration
     MPESA_CONSUMER_KEY: str
     MPESA_CONSUMER_SECRET: str
@@ -88,6 +90,12 @@ class Settings(BaseSettings):
     AT_BASE_URL: str = "https://api.africastalking.com"
     SMS_DISPATCH_CHUNK_SIZE: int = 100
     SMS_DISPATCH_ENABLED: bool = True
+
+    # Just-in-time RouterOS operator access. This is the source allowed to
+    # reach WinBox/SSH/WebFig when an admin opens remote access for a router.
+    ROUTER_REMOTE_ACCESS_SOURCE_CIDRS: str = "10.0.0.1/32"
+    ROUTER_WEBFIG_SESSION_MINUTES: int = 15
+    ROUTER_WEBFIG_PROXY_TIMEOUT_SECONDS: int = 20
 
     class Config:
         env_file = ".env"

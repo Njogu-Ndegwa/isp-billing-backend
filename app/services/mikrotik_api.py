@@ -908,37 +908,56 @@ class MikroTikAPI:
     # ------------------------------------------------------------------
     # Anti-tethering (TTL-based hotspot sharing prevention)
     #
-    # Strategy:
-    # 1. Use mangle PREROUTING (sees original TTL before the router decrements
-    #    it) to mark packets that already came through another router, then
-    #    drop the marked packets in filter FORWARD.
-    # 2. Clamp return traffic heading back to hotspot clients to TTL=1. The
-    #    paying phone/laptop can still consume those packets as the endpoint,
-    #    but a phone acting as a hotspot router must decrement TTL before
-    #    forwarding and therefore drops the packet instead of sharing it.
+    # Default strategy:
+    # Use RAW PREROUTING, which sees packets before connection tracking and
+    # before the router decrements TTL, to drop traffic that already passed
+    # through another router. This avoids the older managed mangle packet-mark
+    # rules and postrouting TTL clamp, which were too expensive on small CPUs.
     #
     # A direct device sends TTL=64 (Linux/Android/iOS) or 128 (Windows).
     # A tethered device behind a phone hotspot arrives with TTL=63 or 127
     # because the phone already decremented it once.
     #
-    # We scope the mangle rules to the hotspot interface(s) so we don't
-    # accidentally mark WAN or other traffic.
+    # We scope the raw rules to the hotspot interface(s) so we don't
+    # accidentally drop WAN or other traffic.
     # ------------------------------------------------------------------
     ANTI_TETHER_COMMENT = "ISP_BILLING_ANTI_TETHERING"
     ANTI_TETHER_PACKET_MARK = "isp_tethered_traffic"
     ANTI_TETHER_TTL_MATCHES = ("equal:63", "equal:127", "equal:254")
+    ANTI_TETHER_RAW_TTL_MODE = "raw-ttl-drop"
+    ANTI_TETHER_STRICT_TTL_MODE = "ttl-marker-plus-return-ttl-clamp"
+    ANTI_TETHER_DEFAULT_MODE = ANTI_TETHER_RAW_TTL_MODE
+    ANTI_TETHER_MODE_ALIASES = {
+        "raw": ANTI_TETHER_RAW_TTL_MODE,
+        "light": ANTI_TETHER_RAW_TTL_MODE,
+        "raw-ttl": ANTI_TETHER_RAW_TTL_MODE,
+        "raw-ttl-drop": ANTI_TETHER_RAW_TTL_MODE,
+        "strict": ANTI_TETHER_STRICT_TTL_MODE,
+        "legacy": ANTI_TETHER_STRICT_TTL_MODE,
+        "ttl-marker-plus-return-ttl-clamp": ANTI_TETHER_STRICT_TTL_MODE,
+    }
 
-    def enable_anti_tethering(self) -> Dict[str, Any]:
-        """Ensure hotspot anti-tethering rules exist and are ordered before FastTrack.
+    def enable_anti_tethering(self, mode: Optional[str] = None) -> Dict[str, Any]:
+        """Ensure hotspot anti-tethering rules exist.
 
         This method deliberately recreates the managed rules instead of returning
         early when any old rule is present. Older deployments appended the drop
         rule after generic forward accepts/FastTrack, which made the feature look
-        enabled while still allowing tethered traffic through.
+        enabled while still allowing tethered traffic through. The default mode is
+        RAW TTL drop, which is cheaper than the previous mangle/filter chain.
         """
         if not self.connected:
             return {"error": "Not connected"}
         try:
+            normalized_mode = self._normalize_anti_tether_mode(mode)
+            if not normalized_mode:
+                return {
+                    "error": (
+                        "Unsupported anti-tethering mode. "
+                        f"Use {self.ANTI_TETHER_RAW_TTL_MODE} or {self.ANTI_TETHER_STRICT_TTL_MODE}."
+                    )
+                }
+
             interfaces = self._get_hotspot_interfaces()
             if not interfaces:
                 return {"error": "No hotspot server interfaces found on this router"}
@@ -947,6 +966,71 @@ class MikroTikAPI:
             if cleanup.get("error"):
                 return cleanup
 
+            if normalized_mode == self.ANTI_TETHER_STRICT_TTL_MODE:
+                return self._enable_strict_ttl_anti_tethering(interfaces, cleanup)
+
+            return self._enable_raw_ttl_anti_tethering(interfaces, cleanup)
+        except Exception as e:
+            logger.error(f"Error enabling anti-tethering: {e}")
+            return {"error": str(e)}
+
+    def _normalize_anti_tether_mode(self, mode: Optional[str]) -> Optional[str]:
+        if not mode:
+            return self.ANTI_TETHER_DEFAULT_MODE
+        normalized = str(mode).strip().lower().replace("_", "-")
+        return self.ANTI_TETHER_MODE_ALIASES.get(normalized)
+
+    def _enable_raw_ttl_anti_tethering(
+        self,
+        interfaces: List[str],
+        cleanup: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        raw_result = self._get_firewall_raw_rules()
+        if not raw_result.get("success"):
+            return {
+                "error": f"Failed to read firewall raw rules: {raw_result.get('error', 'unknown error')}"
+            }
+
+        raw_rules = raw_result.get("data", [])
+        raw_insert_id = self._first_active_chain_rule_id(raw_rules, "prerouting")
+
+        added_raw = 0
+        for iface in interfaces:
+            for ttl_match in self.ANTI_TETHER_TTL_MATCHES:
+                args = {
+                    "chain": "prerouting",
+                    "action": "drop",
+                    "in-interface": iface,
+                    "ttl": ttl_match,
+                    "comment": self.ANTI_TETHER_COMMENT,
+                }
+                if raw_insert_id:
+                    args["place-before"] = raw_insert_id
+                result = self.send_command("/ip/firewall/raw/add", args)
+                if result.get("error"):
+                    return {"error": f"Failed to add raw anti-tether TTL drop on {iface}: {result['error']}"}
+                added_raw += 1
+
+        return {
+            "success": True,
+            "interfaces": interfaces,
+            "ttl_matches": list(self.ANTI_TETHER_TTL_MATCHES),
+            "added_raw": added_raw,
+            "added_mangle": 0,
+            "added_filter": 0,
+            "removed_raw": cleanup.get("removed_raw", 0),
+            "removed_mangle": cleanup.get("removed_mangle", 0),
+            "removed_filter": cleanup.get("removed_filter", 0),
+            "mode": self.ANTI_TETHER_RAW_TTL_MODE,
+        }
+
+    def _enable_strict_ttl_anti_tethering(
+        self,
+        interfaces: List[str],
+        cleanup: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Install the older stricter mangle/filter rules when explicitly requested."""
+        try:
             mangle_result = self._get_firewall_mangle_rules()
             if not mangle_result.get("success"):
                 return {
@@ -1016,16 +1100,18 @@ class MikroTikAPI:
                 "ttl_matches": list(self.ANTI_TETHER_TTL_MATCHES),
                 "added_mangle": added_mangle,
                 "added_filter": 1,
+                "added_raw": 0,
+                "removed_raw": cleanup.get("removed_raw", 0),
                 "removed_mangle": cleanup.get("removed_mangle", 0),
                 "removed_filter": cleanup.get("removed_filter", 0),
-                "mode": "ttl-marker-plus-return-ttl-clamp",
+                "mode": self.ANTI_TETHER_STRICT_TTL_MODE,
             }
         except Exception as e:
             logger.error(f"Error enabling anti-tethering: {e}")
             return {"error": str(e)}
 
     def disable_anti_tethering(self) -> Dict[str, Any]:
-        """Remove all anti-tethering mangle and filter rules."""
+        """Remove all anti-tethering raw, mangle, and filter rules."""
         if not self.connected:
             return {"error": "Not connected"}
         try:
@@ -1048,6 +1134,26 @@ class MikroTikAPI:
         return list(set(interfaces))
 
     def _remove_anti_tethering_rules(self) -> Dict[str, Any]:
+        raw_result = self._get_firewall_raw_rules()
+        if not raw_result.get("success"):
+            return {
+                "error": f"Failed to read firewall raw rules: {raw_result.get('error', 'unknown error')}"
+            }
+
+        raw_rules = [
+            r for r in raw_result.get("data", [])
+            if self._is_anti_tether_rule(r)
+        ]
+        removed_raw = 0
+        for rule in raw_rules:
+            rule_id = rule.get(".id")
+            if not rule_id:
+                continue
+            result = self.send_command("/ip/firewall/raw/remove", {"numbers": rule_id})
+            if result.get("error"):
+                return {"error": f"Failed to remove old anti-tether raw rule {rule_id}: {result['error']}"}
+            removed_raw += 1
+
         mangle_result = self._get_firewall_mangle_rules()
         if not mangle_result.get("success"):
             return {
@@ -1088,7 +1194,26 @@ class MikroTikAPI:
                 return {"error": f"Failed to remove old anti-tether filter rule {rule_id}: {result['error']}"}
             removed_filter += 1
 
-        return {"success": True, "removed_mangle": removed_mangle, "removed_filter": removed_filter}
+        return {
+            "success": True,
+            "removed_raw": removed_raw,
+            "removed_mangle": removed_mangle,
+            "removed_filter": removed_filter,
+        }
+
+    def _get_firewall_raw_rules(self) -> Dict[str, Any]:
+        return self.send_command_optimized(
+            "/ip/firewall/raw/print",
+            proplist=[
+                ".id",
+                "chain",
+                "action",
+                "disabled",
+                "comment",
+                "in-interface",
+                "ttl",
+            ]
+        )
 
     def _get_firewall_mangle_rules(self) -> Dict[str, Any]:
         return self.send_command_optimized(

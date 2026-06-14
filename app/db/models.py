@@ -247,6 +247,7 @@ class CustomerPayment(Base):
              values_callable=lambda e: [x.value for x in e]),
         nullable=True,
     )
+    counts_as_revenue = Column(Boolean, nullable=False, default=True, server_default="true")
     created_at = Column(DateTime, default=datetime.utcnow)
     customer = relationship("Customer", backref="customer_payments")
     reseller = relationship("User", backref="received_payments", foreign_keys=[reseller_id])
@@ -488,6 +489,13 @@ class BandwidthSnapshot(Base):
     # Interface-based counters for accurate averaging
     interface_rx_bytes = Column(BigInteger, default=0)
     interface_tx_bytes = Column(BigInteger, default=0)
+    # Per-snapshot byte deltas from managed user queues. These are interval
+    # counters, not lifetime counters, and let dashboards split usage by access
+    # type without adding a separate time-series table.
+    hotspot_upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    hotspot_download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    pppoe_upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    pppoe_download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
@@ -561,6 +569,11 @@ class VoucherStatus(str, enum.Enum):
     DISABLED = "disabled"
 
 
+class VoucherType(str, enum.Enum):
+    SALE = "sale"
+    COMPENSATION = "compensation"
+
+
 class AdBadgeType(str, enum.Enum):
     HOT = "hot"
     NEW = "new"
@@ -581,6 +594,12 @@ class Voucher(Base):
     status = Column(
         Enum(VoucherStatus, name="voucherstatus", values_callable=lambda e: [x.value for x in e]),
         nullable=False, default=VoucherStatus.AVAILABLE
+    )
+    voucher_type = Column(
+        Enum(VoucherType, name="vouchertype", values_callable=lambda e: [x.value for x in e]),
+        nullable=False,
+        default=VoucherType.SALE,
+        server_default=VoucherType.SALE.value,
     )
     batch_id = Column(String(36), nullable=True, index=True)
     redeemed_by = Column(Integer, ForeignKey("customers.id"), nullable=True)
@@ -1419,6 +1438,18 @@ class C2BTransaction(Base):
 
     matched_customer = relationship("Customer")
     matched_reseller = relationship("User")
+
+
+class AppSetting(Base):
+    """Generic key/value table for platform-wide admin-editable settings.
+
+    Keys are short ASCII identifiers (e.g. "compensation_daily_limit").
+    Values are always stored as text and cast to the required type at read time.
+    """
+    __tablename__ = "app_settings"
+    key = Column(String(100), primary_key=True)
+    value = Column(String(500), nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class UnmatchedC2BPayment(Base):

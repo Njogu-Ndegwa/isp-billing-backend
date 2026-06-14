@@ -71,6 +71,7 @@ async def calculate_reseller_charges(
         .where(
             CustomerPayment.reseller_id == user_id,
             CustomerPayment.status == PaymentStatus.COMPLETED,
+            CustomerPayment.counts_as_revenue == True,
             CustomerPayment.created_at >= period_start,
             CustomerPayment.created_at < period_end,
             Plan.connection_type == ConnectionType.HOTSPOT,

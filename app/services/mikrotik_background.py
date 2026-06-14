@@ -12,7 +12,7 @@ remove_user_from_mikrotik function used by multiple router files.
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, func, or_
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
 from app.db.database import async_session, db_pool_snapshot
@@ -1991,6 +1991,38 @@ def _parse_speed_value(speed_str: str) -> float:
         return 0.0
 
 
+def _parse_queue_bytes(bytes_str: str) -> tuple[int, int]:
+    parts = str(bytes_str or "0/0").split("/")
+    upload = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+    download = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return upload, download
+
+
+def _usage_counter_delta(
+    usage: UserBandwidthUsage,
+    upload_bytes: int,
+    download_bytes: int,
+) -> tuple[int, int, bool]:
+    """Return reset-safe deltas and whether the router counter reset.
+
+    Older hotspot rows predate ``last_*_bytes`` and have lifetime counters in
+    ``upload_bytes``/``download_bytes`` but zero baselines. Treat that state as
+    a baseline instead of charging all historical bytes into the first period.
+    """
+    prev_up = int(usage.last_upload_bytes or 0)
+    prev_dn = int(usage.last_download_bytes or 0)
+    legacy_baseline = (
+        prev_up == 0
+        and prev_dn == 0
+        and ((usage.upload_bytes or 0) > 0 or (usage.download_bytes or 0) > 0)
+    )
+    if legacy_baseline:
+        return 0, 0, False
+    if upload_bytes < prev_up or download_bytes < prev_dn:
+        return upload_bytes, download_bytes, True
+    return upload_bytes - prev_up, download_bytes - prev_dn, False
+
+
 def _bandwidth_reconnect(api, router_info: dict) -> bool:
     try:
         api.disconnect()
@@ -2296,6 +2328,10 @@ async def collect_bandwidth_snapshot():
                     # preserve the historical contract for graphs and other
                     # consumers (see app/api/mikrotik_routes.py bandwidth-history).
                     active_devices = active_hotspot_users + pppoe_active_count
+                    hotspot_delta_upload_bytes = 0
+                    hotspot_delta_download_bytes = 0
+                    pppoe_delta_upload_bytes = 0
+                    pppoe_delta_download_bytes = 0
 
                     snapshot = BandwidthSnapshot(
                         router_id=router_id,
@@ -2323,42 +2359,94 @@ async def collect_bandwidth_snapshot():
                             if "MAC:" in comment:
                                 mac = comment.split("MAC:")[1].split("|")[0].strip()
                             if mac:
-                                bytes_str = q.get("bytes", "0/0")
-                                bytes_parts = bytes_str.split("/")
-                                upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 and bytes_parts[0].isdigit() else 0
-                                download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 and bytes_parts[1].isdigit() else 0
+                                try:
+                                    normalized_mac = normalize_mac_address(mac)
+                                except Exception:
+                                    normalized_mac = mac.upper()
+                                compact_mac = normalized_mac.replace(":", "")
+                                mac_variants = list({mac, normalized_mac, compact_mac})
+                                upload_bytes, download_bytes = _parse_queue_bytes(q.get("bytes", "0/0"))
                                 cust_result = await db.execute(
-                                    select(Customer).where(Customer.mac_address.ilike(f"%{mac}%"))
+                                    select(Customer)
+                                    .options(selectinload(Customer.plan))
+                                    .where(
+                                        Customer.router_id == router_id,
+                                        or_(
+                                            Customer.mac_address.ilike(f"%{normalized_mac}%"),
+                                            Customer.mac_address.ilike(f"%{compact_mac}%"),
+                                            Customer.mac_address.ilike(f"%{mac}%"),
+                                        ),
+                                    )
                                 )
                                 customer = cust_result.scalars().first()
                                 existing = await db.execute(
-                                    select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == mac)
+                                    select(UserBandwidthUsage).where(
+                                        UserBandwidthUsage.mac_address.in_(mac_variants)
+                                    )
                                 )
                                 usage = existing.scalar_one_or_none()
                                 if usage:
+                                    delta_up, delta_dn, reset_detected = _usage_counter_delta(
+                                        usage, upload_bytes, download_bytes
+                                    )
+                                    if reset_detected:
+                                        logger.info(
+                                            "[USAGE] Hotspot counter reset for %s "
+                                            "(prev=%s/%s, now=%s/%s)",
+                                            normalized_mac,
+                                            usage.last_upload_bytes or 0,
+                                            usage.last_download_bytes or 0,
+                                            upload_bytes,
+                                            download_bytes,
+                                        )
+                                    usage.mac_address = normalized_mac
                                     usage.upload_bytes = upload_bytes
                                     usage.download_bytes = download_bytes
+                                    usage.last_upload_bytes = upload_bytes
+                                    usage.last_download_bytes = download_bytes
                                     usage.max_limit = q.get("max-limit", "")
+                                    usage.queue_name = qname
+                                    usage.target_ip = q.get("target", "")
                                     usage.last_updated = now
                                     if customer:
                                         usage.customer_id = customer.id
                                 else:
+                                    delta_up = 0
+                                    delta_dn = 0
                                     usage = UserBandwidthUsage(
-                                        mac_address=mac, customer_id=customer.id if customer else None,
+                                        mac_address=normalized_mac, customer_id=customer.id if customer else None,
                                         queue_name=qname, target_ip=q.get("target", ""),
                                         upload_bytes=upload_bytes, download_bytes=download_bytes,
+                                        last_upload_bytes=upload_bytes,
+                                        last_download_bytes=download_bytes,
                                         max_limit=q.get("max-limit", ""), last_updated=now
                                     )
                                     db.add(usage)
+
+                                hotspot_delta_upload_bytes += delta_up
+                                hotspot_delta_download_bytes += delta_dn
+                                if customer and customer.plan and customer.plan.connection_type == ConnectionType.HOTSPOT:
+                                    try:
+                                        await record_usage(
+                                            db,
+                                            customer,
+                                            delta_up,
+                                            delta_dn,
+                                            plan=customer.plan,
+                                            now=now,
+                                        )
+                                    except Exception as usage_err:
+                                        logger.error(
+                                            "[USAGE] Failed to record hotspot usage for %s: %s",
+                                            normalized_mac,
+                                            usage_err,
+                                        )
                                 continue
 
                             # --- PPPoE dynamic queues (<pppoe-USERNAME>) ---
                             if qname.startswith("<pppoe-") and qname.endswith(">"):
                                 pppoe_user = qname[7:-1]
-                                bytes_str = q.get("bytes", "0/0")
-                                bytes_parts = bytes_str.split("/")
-                                upload_bytes = int(bytes_parts[0]) if len(bytes_parts) > 0 and bytes_parts[0].isdigit() else 0
-                                download_bytes = int(bytes_parts[1]) if len(bytes_parts) > 1 and bytes_parts[1].isdigit() else 0
+                                upload_bytes, download_bytes = _parse_queue_bytes(q.get("bytes", "0/0"))
                                 pppoe_key = f"pppoe:{pppoe_user}"
 
                                 cust_result = await db.execute(
@@ -2378,19 +2466,15 @@ async def collect_bandwidth_snapshot():
 
                                 # --- Reset-safe delta computation ---
                                 if usage:
-                                    prev_up = usage.last_upload_bytes or 0
-                                    prev_dn = usage.last_download_bytes or 0
-                                    if upload_bytes < prev_up or download_bytes < prev_dn:
-                                        # Counter / queue reset detected. Treat current sample as delta.
-                                        delta_up = upload_bytes
-                                        delta_dn = download_bytes
+                                    delta_up, delta_dn, reset_detected = _usage_counter_delta(
+                                        usage, upload_bytes, download_bytes
+                                    )
+                                    if reset_detected:
                                         logger.info(
                                             f"[FUP] PPPoE counter reset for {pppoe_user} "
-                                            f"(prev={prev_up}/{prev_dn}, now={upload_bytes}/{download_bytes})"
+                                            f"(prev={usage.last_upload_bytes or 0}/{usage.last_download_bytes or 0}, "
+                                            f"now={upload_bytes}/{download_bytes})"
                                         )
-                                    else:
-                                        delta_up = upload_bytes - prev_up
-                                        delta_dn = download_bytes - prev_dn
                                     usage.upload_bytes = upload_bytes
                                     usage.download_bytes = download_bytes
                                     usage.last_upload_bytes = upload_bytes
@@ -2419,6 +2503,9 @@ async def collect_bandwidth_snapshot():
                                     )
                                     db.add(usage)
 
+                                pppoe_delta_upload_bytes += delta_up
+                                pppoe_delta_download_bytes += delta_dn
+
                                 # --- Roll deltas into the open period (PPPoE only) ---
                                 if customer and customer.plan and customer.plan.connection_type == ConnectionType.PPPOE:
                                     try:
@@ -2443,6 +2530,11 @@ async def collect_bandwidth_snapshot():
                                         logger.error(
                                             f"[FUP] Failed to record/enforce usage for {pppoe_user}: {fup_err}"
                                         )
+
+                    snapshot.hotspot_upload_bytes = hotspot_delta_upload_bytes
+                    snapshot.hotspot_download_bytes = hotspot_delta_download_bytes
+                    snapshot.pppoe_upload_bytes = pppoe_delta_upload_bytes
+                    snapshot.pppoe_download_bytes = pppoe_delta_download_bytes
 
                     logger.debug(f"Collected bandwidth snapshot for router {router.name} (ID: {router_id})")
                     await db.commit()

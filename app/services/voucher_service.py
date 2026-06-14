@@ -11,10 +11,11 @@ from sqlalchemy import select, update, func
 from sqlalchemy.orm import selectinload
 
 from app.db.models import (
-    Voucher, VoucherStatus, Plan, Router, Customer, CustomerStatus,
+    Voucher, VoucherStatus, VoucherType, Plan, Router, Customer, CustomerStatus,
     PaymentMethod, ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
     RouterAuthMethod, ConnectionType
 )
+from app.config import settings
 from app.services.hotspot_provisioning import (
     build_hotspot_payload,
     get_or_create_provisioning_attempt,
@@ -27,6 +28,15 @@ from app.services.reseller_payments import record_customer_payment
 from app.services.mikrotik_api import normalize_mac_address
 
 logger = logging.getLogger(__name__)
+
+COMPENSATION_DAILY_LIMIT_KEY = "compensation_daily_limit"
+
+
+async def get_compensation_daily_limit(db: AsyncSession) -> int:
+    """Effective per-reseller daily compensation-voucher limit: DB override if set,
+    otherwise the COMPENSATION_DAILY_LIMIT config default."""
+    from app.services.app_settings import get_int_setting
+    return await get_int_setting(db, COMPENSATION_DAILY_LIMIT_KEY, settings.COMPENSATION_DAILY_LIMIT)
 
 
 def generate_voucher_code() -> str:
@@ -70,6 +80,21 @@ def voucher_lookup_candidates(code: str) -> List[str]:
     return candidates
 
 
+async def compensation_used_today(db: AsyncSession, user_id: int) -> int:
+    """Count of COMPENSATION vouchers this reseller issued today (UTC) that still
+    consume the daily allowance. AVAILABLE/REDEEMED consume it; DISABLED/EXPIRED free it."""
+    now = datetime.utcnow()
+    day_start = datetime(now.year, now.month, now.day)
+    return (await db.execute(
+        select(func.count(Voucher.id)).where(
+            Voucher.user_id == user_id,
+            Voucher.voucher_type == VoucherType.COMPENSATION,
+            Voucher.created_at >= day_start,
+            Voucher.status.in_([VoucherStatus.AVAILABLE, VoucherStatus.REDEEMED]),
+        )
+    )).scalar() or 0
+
+
 async def generate_vouchers(
     db: AsyncSession,
     plan_id: int,
@@ -77,6 +102,7 @@ async def generate_vouchers(
     quantity: int,
     router_id: Optional[int] = None,
     expires_at: Optional[datetime] = None,
+    voucher_type: VoucherType = VoucherType.SALE,
 ) -> Dict[str, Any]:
     """
     Generate a batch of vouchers for a given plan.
@@ -93,6 +119,19 @@ async def generate_vouchers(
         router = await db.get(Router, router_id)
         if not router or router.user_id != user_id:
             return {"error": "Router not found or does not belong to this user"}
+
+    if voucher_type == VoucherType.COMPENSATION:
+        limit = await get_compensation_daily_limit(db)
+        used = await compensation_used_today(db, user_id)
+        remaining = limit - used
+        if quantity > remaining:
+            return {
+                "error": (
+                    f"Daily compensation limit reached. You can issue "
+                    f"{max(0, remaining)} more compensation voucher(s) today "
+                    f"(limit {limit}/day)."
+                )
+            }
 
     batch_id = str(uuid.uuid4())
     vouchers: List[Dict[str, Any]] = []
@@ -117,6 +156,7 @@ async def generate_vouchers(
             status=VoucherStatus.AVAILABLE,
             batch_id=batch_id,
             expires_at=expires_at,
+            voucher_type=voucher_type,
         )
         db.add(voucher)
         vouchers.append({
@@ -275,6 +315,7 @@ async def redeem_voucher(
         notes=f"Voucher redemption. Batch: {voucher.batch_id}",
         duration_value=plan.duration_value,
         duration_unit=plan.duration_unit.value,
+        counts_as_revenue=(voucher.voucher_type != VoucherType.COMPENSATION),
     )
 
     # Reload customer after payment recorded (expiry is now set)

@@ -12,9 +12,9 @@ import io
 from app.services.subscription import enforce_active_subscription
 
 from app.db.database import get_db
-from app.db.models import Voucher, VoucherStatus, Plan, Router
+from app.db.models import Voucher, VoucherStatus, VoucherType, Plan, Router
 from app.services.auth import verify_token, get_current_user
-from app.services.voucher_service import generate_vouchers
+from app.services.voucher_service import generate_vouchers, compensation_used_today, get_compensation_daily_limit
 
 import logging
 
@@ -28,6 +28,7 @@ class GenerateVouchersRequest(BaseModel):
     quantity: int = Field(ge=1, le=500, default=1)
     router_id: Optional[int] = None
     expires_at: Optional[datetime] = None
+    voucher_type: VoucherType = VoucherType.SALE
 
 
 @router.post("/generate")
@@ -47,6 +48,7 @@ async def generate_vouchers_api(
         quantity=request.quantity,
         router_id=request.router_id,
         expires_at=request.expires_at,
+        voucher_type=request.voucher_type,
     )
 
     if "error" in result:
@@ -146,12 +148,16 @@ async def voucher_stats(
         )
     )).scalar() or 0
 
-    # Revenue from redeemed vouchers
+    # Revenue from redeemed vouchers (compensation excluded)
     revenue_stmt = (
         select(func.sum(Plan.price))
         .select_from(Voucher)
         .join(Plan, Voucher.plan_id == Plan.id)
-        .where(Voucher.user_id == user.id, Voucher.status == VoucherStatus.REDEEMED)
+        .where(
+            Voucher.user_id == user.id,
+            Voucher.status == VoucherStatus.REDEEMED,
+            Voucher.voucher_type == VoucherType.SALE,
+        )
     )
     revenue = (await db.execute(revenue_stmt)).scalar() or 0
 
@@ -179,6 +185,22 @@ async def voucher_stats(
         "disabled": disabled,
         "revenue": float(revenue),
         "by_plan": plans_summary,
+    }
+
+
+@router.get("/compensation-allowance")
+async def compensation_allowance(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """How many compensation vouchers the current reseller may still issue today."""
+    user = await get_current_user(token, db)
+    used = await compensation_used_today(db, user.id)
+    limit = await get_compensation_daily_limit(db)
+    return {
+        "daily_limit": limit,
+        "used_today": used,
+        "remaining": max(0, limit - used),
     }
 
 
@@ -273,6 +295,7 @@ def _voucher_to_dict(v: Voucher) -> dict:
         "id": v.id,
         "code": v.code,
         "status": v.status.value,
+        "voucher_type": v.voucher_type.value,
         "plan": {
             "id": v.plan.id,
             "name": v.plan.name,

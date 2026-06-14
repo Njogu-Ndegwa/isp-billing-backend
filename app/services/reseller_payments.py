@@ -17,6 +17,7 @@ async def record_customer_payment(
     duration_value: int = None,
     duration_unit: str = None,
     collection_mode: CollectionMode = None,
+    counts_as_revenue: bool = True,
 ) -> CustomerPayment:
     """Record a payment made by customer to reseller
 
@@ -47,8 +48,9 @@ async def record_customer_payment(
         notes=notes,
         customer_name=customer.name,
         collection_mode=collection_mode,
+        counts_as_revenue=counts_as_revenue,
     )
-    
+
     db.add(payment)
     
     # Calculate expiry based on provided duration or plan's duration
@@ -119,7 +121,8 @@ async def update_reseller_financials(db: AsyncSession, reseller_id: int):
     
     total_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
         CustomerPayment.reseller_id == reseller_id,
-        CustomerPayment.status == PaymentStatus.COMPLETED
+        CustomerPayment.status == PaymentStatus.COMPLETED,
+        CustomerPayment.counts_as_revenue == True,
     )
     total_revenue_result = await db.execute(total_revenue_stmt)
     total_revenue = total_revenue_result.scalar() or 0

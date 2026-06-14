@@ -45,6 +45,7 @@ class PeriodOut(BaseModel):
 
 class UsageOut(BaseModel):
     customer_id: int
+    connection_type: Optional[str]
     pppoe_username: Optional[str]
     plan_name: Optional[str]
     plan_data_cap_mb: Optional[int]
@@ -55,7 +56,9 @@ class UsageOut(BaseModel):
 class TopUsageItem(BaseModel):
     customer_id: int
     customer_name: Optional[str]
+    connection_type: Optional[str]
     pppoe_username: Optional[str]
+    identifier: Optional[str]
     plan_name: Optional[str]
     cap_mb: Optional[int]
     total_mb: float
@@ -136,6 +139,7 @@ async def get_customer_usage(
 
     return UsageOut(
         customer_id=customer.id,
+        connection_type=plan.connection_type.value if (plan and plan.connection_type) else None,
         pppoe_username=customer.pppoe_username,
         plan_name=plan.name if plan else None,
         plan_data_cap_mb=plan.data_cap_mb if plan else None,
@@ -176,10 +180,10 @@ async def get_top_usage_for_reseller(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Top customers by current-period bandwidth (PPPoE only)."""
+    """Top customers by current-period bandwidth (hotspot + PPPoE)."""
     user = await get_current_user(token, db)
 
-    customer_filter = [Plan.connection_type == ConnectionType.PPPOE]
+    customer_filter = [Plan.connection_type.in_([ConnectionType.HOTSPOT, ConnectionType.PPPOE])]
     if user.role != UserRole.ADMIN:
         customer_filter.append(Customer.user_id == user.id)
 
@@ -187,7 +191,9 @@ async def get_top_usage_for_reseller(
         select(
             Customer.id.label("customer_id"),
             Customer.name.label("customer_name"),
+            Customer.mac_address.label("mac_address"),
             Customer.pppoe_username.label("pppoe_username"),
+            Plan.connection_type.label("connection_type"),
             Plan.name.label("plan_name"),
             CustomerUsagePeriod.cap_mb_snapshot.label("cap_mb"),
             CustomerUsagePeriod.total_bytes.label("total_bytes"),
@@ -209,11 +215,19 @@ async def get_top_usage_for_reseller(
     for r in rows:
         cap_mb = r.cap_mb
         total_bytes = int(r.total_bytes or 0)
+        connection_type = (
+            r.connection_type.value
+            if hasattr(r.connection_type, "value")
+            else r.connection_type
+        )
+        identifier = r.pppoe_username if connection_type == "pppoe" else r.mac_address
         out.append(
             TopUsageItem(
                 customer_id=r.customer_id,
                 customer_name=r.customer_name,
+                connection_type=connection_type,
                 pppoe_username=r.pppoe_username,
+                identifier=identifier,
                 plan_name=r.plan_name,
                 cap_mb=cap_mb,
                 total_mb=_bytes_to_mb(total_bytes),

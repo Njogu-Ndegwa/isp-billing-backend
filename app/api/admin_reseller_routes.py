@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text, delete, update, case
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta, date
 import asyncio
@@ -26,6 +26,9 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user, pwd_context
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
 from app.services.admin_metrics import compute_dashboard_v2_extras
+from app.config import settings
+from app.services.app_settings import get_setting, set_setting
+from app.services.voucher_service import COMPENSATION_DAILY_LIMIT_KEY
 
 import logging
 
@@ -2130,4 +2133,44 @@ async def repair_all_balances(
         "skipped_count": len(skipped),
         "repaired": repaired,
         "skipped": skipped,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Admin-editable global compensation-voucher daily limit
+# ---------------------------------------------------------------------------
+
+class CompensationLimitUpdate(BaseModel):
+    daily_limit: int = Field(ge=0, le=1000)
+
+
+@router.get("/api/admin/settings/compensation-limit")
+async def get_compensation_limit_setting(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Return the current effective per-reseller daily compensation-voucher limit."""
+    await _require_admin(token, db)
+    default = settings.COMPENSATION_DAILY_LIMIT
+    raw = await get_setting(db, COMPENSATION_DAILY_LIMIT_KEY)
+    try:
+        current = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        current = default
+    return {"daily_limit": current, "default": default, "is_overridden": raw is not None}
+
+
+@router.put("/api/admin/settings/compensation-limit")
+async def update_compensation_limit_setting(
+    payload: CompensationLimitUpdate,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Override the per-reseller daily compensation-voucher limit platform-wide."""
+    await _require_admin(token, db)
+    await set_setting(db, COMPENSATION_DAILY_LIMIT_KEY, payload.daily_limit)
+    return {
+        "daily_limit": payload.daily_limit,
+        "default": settings.COMPENSATION_DAILY_LIMIT,
+        "is_overridden": True,
     }
