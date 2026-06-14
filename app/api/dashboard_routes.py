@@ -210,14 +210,13 @@ async def get_dashboard_overview(
             Router.id,
             Router.name,
             func.count(CustomerPayment.id).label('transaction_count'),
-            func.sum(CustomerPayment.amount).label('revenue')
+            func.sum(case((CustomerPayment.counts_as_revenue == True, CustomerPayment.amount), else_=0)).label('revenue')
         ).join(
             Customer, Customer.router_id == Router.id
         ).join(
             CustomerPayment, CustomerPayment.customer_id == Customer.id
         ).where(
-            Router.user_id == user_id,
-            CustomerPayment.counts_as_revenue == True
+            Router.user_id == user_id
         )
         if router_id:
             router_revenue_stmt = router_revenue_stmt.where(Router.id == router_id)
@@ -240,14 +239,13 @@ async def get_dashboard_overview(
             Plan.name,
             Plan.price,
             func.count(CustomerPayment.id).label('sales_count'),
-            func.sum(CustomerPayment.amount).label('revenue')
+            func.sum(case((CustomerPayment.counts_as_revenue == True, CustomerPayment.amount), else_=0)).label('revenue')
         ).join(
             Customer, Customer.plan_id == Plan.id
         ).join(
             CustomerPayment, CustomerPayment.customer_id == Customer.id
         ).where(
-            Plan.user_id == user_id,
-            CustomerPayment.counts_as_revenue == True
+            Plan.user_id == user_id
         )
         if router_id:
             plan_revenue_stmt = plan_revenue_stmt.where(Customer.router_id == router_id)
