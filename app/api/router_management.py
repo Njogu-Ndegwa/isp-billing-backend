@@ -54,11 +54,15 @@ from app.services.insurance_tunnel_batch import (
 import logging
 import asyncio
 import time
+import re
 from urllib.parse import urlencode, urlsplit
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["routers"])
+
+
+_WEBFIG_ROOT_ACCESS_COOKIE = "webfig_active_proxy"
 
 
 VALID_PAYMENT_METHODS = {"mpesa", "voucher"}
@@ -640,15 +644,101 @@ async def proxy_router_webfig(
     )
     session = get_webfig_proxy_session(router_id, provided_token)
     if not session:
-        return Response(
-            content=(
-                "<!doctype html><title>WebFig access expired</title>"
-                "<h1>WebFig access expired</h1>"
-                "<p>Close this tab and open WebFig again from the router dashboard.</p>"
-            ),
-            status_code=403,
-            media_type="text/html",
-        )
+        return _webfig_expired_response()
+
+    return await _proxy_webfig_request(
+        router_id,
+        request,
+        proxy_path,
+        session,
+        refresh_access_cookies=bool(request.query_params.get("remote_access_token")),
+    )
+
+
+@router.api_route(
+    "/webfig",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@router.api_route(
+    "/webfig/{proxy_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def proxy_router_webfig_root_escape(
+    request: Request,
+    proxy_path: str = "",
+):
+    """
+    Catch RouterOS WebFig redirects/forms that escape to /webfig at our domain root.
+
+    WebFig sometimes posts or redirects to an absolute /webfig/ path after login.
+    The root-scoped fallback cookie is only issued after a valid proxy token has
+    opened the short-lived session.
+    """
+    router_id, session = _webfig_session_from_root_cookie(request)
+    if not session:
+        return _webfig_expired_response()
+
+    escaped_path = "webfig"
+    if request.url.path.endswith("/") and not proxy_path:
+        escaped_path += "/"
+    if proxy_path:
+        escaped_path += "/" + proxy_path.lstrip("/")
+
+    return await _proxy_webfig_request(
+        router_id,
+        request,
+        escaped_path,
+        session,
+        refresh_access_cookies=False,
+    )
+
+
+@router.api_route(
+    "/jsproxy",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@router.api_route(
+    "/jsproxy/{proxy_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def proxy_router_webfig_jsproxy_escape(
+    request: Request,
+    proxy_path: str = "",
+):
+    """
+    Catch RouterOS WebFig login RPC calls that escape to /jsproxy at our domain root.
+
+    RouterOS WebFig uses /jsproxy after the login page has loaded from /webfig.
+    That endpoint is outside our normal /api/admin/routers/{id}/webfig proxy
+    prefix, so it needs the same short-lived active-session fallback.
+    """
+    router_id, session = _webfig_session_from_root_cookie(request)
+    if not session:
+        return _webfig_expired_response()
+
+    escaped_path = "jsproxy"
+    if request.url.path.endswith("/") and not proxy_path:
+        escaped_path += "/"
+    if proxy_path:
+        escaped_path += "/" + proxy_path.lstrip("/")
+
+    return await _proxy_webfig_request(
+        router_id,
+        request,
+        escaped_path,
+        session,
+        refresh_access_cookies=False,
+    )
+
+
+async def _proxy_webfig_request(
+    router_id: int,
+    request: Request,
+    proxy_path: str,
+    session,
+    refresh_access_cookies: bool,
+) -> Response:
+    """Proxy a request to RouterOS WebFig using an already validated session."""
 
     query = _forward_webfig_query(request)
     target_url = _build_webfig_upstream_url(session, proxy_path)
@@ -701,16 +791,8 @@ async def proxy_router_webfig(
     for cookie in upstream.headers.get_list("set-cookie"):
         response.headers.append("set-cookie", _rewrite_webfig_set_cookie(cookie, router_id))
 
-    if request.query_params.get("remote_access_token"):
-        max_age = max(1, int((session.expires_at - datetime.utcnow()).total_seconds()))
-        response.set_cookie(
-            webfig_access_cookie_name(router_id),
-            session.token,
-            max_age=max_age,
-            httponly=True,
-            samesite="lax",
-            path=f"/api/admin/routers/{router_id}/webfig",
-        )
+    if refresh_access_cookies:
+        _set_webfig_access_cookies(response, router_id, session)
     return response
 
 
@@ -819,10 +901,58 @@ def _strip_webfig_proxy_cookies(cookie_header: str) -> str:
     cookies = []
     for part in cookie_header.split(";"):
         cookie = part.strip()
-        if not cookie or cookie.lower().startswith("webfig_access_"):
+        cookie_name = cookie.split("=", 1)[0].strip().lower()
+        if (
+            not cookie
+            or cookie_name.startswith("webfig_access_")
+            or cookie_name == _WEBFIG_ROOT_ACCESS_COOKIE
+        ):
             continue
         cookies.append(cookie)
     return "; ".join(cookies)
+
+
+def _set_webfig_access_cookies(response: Response, router_id: int, session) -> None:
+    max_age = max(1, int((session.expires_at - datetime.utcnow()).total_seconds()))
+    response.set_cookie(
+        webfig_access_cookie_name(router_id),
+        session.token,
+        max_age=max_age,
+        httponly=True,
+        samesite="lax",
+        path=f"/api/admin/routers/{router_id}/webfig",
+    )
+    response.set_cookie(
+        _WEBFIG_ROOT_ACCESS_COOKIE,
+        f"{router_id}:{session.token}",
+        max_age=max_age,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _webfig_session_from_root_cookie(request: Request):
+    raw = request.cookies.get(_WEBFIG_ROOT_ACCESS_COOKIE) or ""
+    router_text, separator, token = raw.partition(":")
+    if not separator or not router_text.isdigit() or not token:
+        return None, None
+    router_id = int(router_text)
+    return router_id, get_webfig_proxy_session(router_id, token)
+
+
+def _webfig_expired_response() -> Response:
+    response = Response(
+        content=(
+            "<!doctype html><title>WebFig access expired</title>"
+            "<h1>WebFig access expired</h1>"
+            "<p>Close this tab and open WebFig again from the router dashboard.</p>"
+        ),
+        status_code=403,
+        media_type="text/html",
+    )
+    response.delete_cookie(_WEBFIG_ROOT_ACCESS_COOKIE, path="/")
+    return response
 
 
 def _copy_webfig_response_headers(upstream: httpx.Response, router_id: int) -> dict[str, str]:
@@ -839,18 +969,26 @@ def _copy_webfig_response_headers(upstream: httpx.Response, router_id: int) -> d
 
 
 def _rewrite_webfig_location(location: str, router_id: int) -> str:
-    prefix = f"/api/admin/routers/{router_id}/webfig"
-    if not location:
-        return prefix + "/"
-    if location.startswith("/"):
-        return prefix + location
+    return _rewrite_webfig_url(location, router_id)
 
-    parsed = urlsplit(location)
+
+def _rewrite_webfig_url(url: str, router_id: int) -> str:
+    prefix = f"/api/admin/routers/{router_id}/webfig"
+    if not url:
+        return prefix + "/"
+    if url.startswith(prefix):
+        return url
+    parsed = urlsplit(url)
     if parsed.scheme in {"http", "https"}:
         path = parsed.path or "/"
         query = f"?{parsed.query}" if parsed.query else ""
-        return f"{prefix}{path}{query}"
-    return location
+        fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+        if path.startswith(prefix):
+            return f"{path}{query}{fragment}"
+        return f"{prefix}{path}{query}{fragment}"
+    if url.startswith("/"):
+        return prefix + url
+    return url
 
 
 def _rewrite_webfig_set_cookie(cookie: str, router_id: int) -> str:
@@ -896,21 +1034,74 @@ def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -
         text = content.decode(encoding, errors="replace")
 
     prefix = f"/api/admin/routers/{router_id}/webfig"
-    replacements = (
-        ('href="/', f'href="{prefix}/'),
-        ("href='/", f"href='{prefix}/"),
-        ('src="/', f'src="{prefix}/'),
-        ("src='/", f"src='{prefix}/"),
-        ('action="/', f'action="{prefix}/'),
-        ("action='/", f"action='{prefix}/"),
-        ('url(/', f'url({prefix}/'),
-        ('fetch("/', f'fetch("{prefix}/'),
-        ("fetch('/", f"fetch('{prefix}/"),
-        ('XMLHttpRequest.open("GET","/', f'XMLHttpRequest.open("GET","{prefix}/'),
-        ("XMLHttpRequest.open('GET','/", f"XMLHttpRequest.open('GET','{prefix}/"),
+
+    def rewrite(url: str) -> str:
+        rewritten = _rewrite_webfig_url(url, router_id)
+        if rewritten.startswith(prefix):
+            return rewritten
+        return url
+
+    quoted_attr = re.compile(
+        r"(?i)(?P<lead>\b(?:href|src|action|data-url)\s*=\s*)"
+        r"(?P<quote>[\"'])(?P<url>https?://[^\"']+|/[^\"']*)(?P=quote)"
     )
-    for old, new in replacements:
-        text = text.replace(old, new)
+    text = quoted_attr.sub(
+        lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
+        text,
+    )
+
+    unquoted_attr = re.compile(
+        r"(?i)(?P<lead>\b(?:href|src|action|data-url)\s*=\s*)"
+        r"(?P<url>https?://[^\s>\"']+|/[^\s>\"']+)"
+    )
+    text = unquoted_attr.sub(lambda m: f"{m.group('lead')}{rewrite(m.group('url'))}", text)
+
+    css_url = re.compile(
+        r"(?i)(?P<lead>\burl\(\s*)(?P<quote>[\"']?)"
+        r"(?P<url>https?://[^)\"']+|/[^)\"']+)(?P=quote)(?P<trail>\s*\))"
+    )
+    text = css_url.sub(
+        lambda m: (
+            f"{m.group('lead')}{m.group('quote')}"
+            f"{rewrite(m.group('url'))}{m.group('quote')}{m.group('trail')}"
+        ),
+        text,
+    )
+
+    # RouterOS WebFig can redirect after login through JavaScript or meta
+    # refresh strings instead of HTTP Location headers.
+    quoted_webfig_path = re.compile(
+        r"(?P<quote>[\"'])(?P<url>https?://[^\"']+/webfig[^\"']*|/webfig[^\"']*)(?P=quote)",
+        re.IGNORECASE,
+    )
+    text = quoted_webfig_path.sub(
+        lambda m: f"{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
+        text,
+    )
+
+    meta_refresh_url = re.compile(
+        r"(?i)(?P<lead>\burl\s*=\s*)(?P<url>https?://[^\s;\"'>]+|/webfig[^\s;\"'>]*)"
+    )
+    text = meta_refresh_url.sub(lambda m: f"{m.group('lead')}{rewrite(m.group('url'))}", text)
+
+    root_json_redirect = re.compile(
+        r"(?i)(?P<lead>[\"'](?:redirect|location|url|path|href)[\"']\s*:\s*)"
+        r"(?P<quote>[\"'])(?P<url>/)(?P=quote)"
+    )
+    text = root_json_redirect.sub(
+        lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
+        text,
+    )
+
+    root_js_redirect = re.compile(
+        r"(?i)(?P<lead>\b(?:window\.|top\.)?location(?:\.href)?\s*=\s*)"
+        r"(?P<quote>[\"'])(?P<url>/)(?P=quote)"
+    )
+    text = root_js_redirect.sub(
+        lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
+        text,
+    )
+
     return text.encode(encoding, errors="replace")
 
 

@@ -82,6 +82,15 @@ class Settings(BaseSettings):
     INSURANCE_L2TP_IPSEC_PSK: str = ""
     INSURANCE_MANAGER_TIMEOUT: int = 10
 
+    # --- Messaging / SMS -------------------------------------------------
+    SMS_PROVIDER: str = "africastalking"
+    AT_USERNAME: str = ""
+    AT_API_KEY: str = ""
+    AT_SENDER_ID: str = ""
+    AT_BASE_URL: str = "https://api.africastalking.com"
+    SMS_DISPATCH_CHUNK_SIZE: int = 100
+    SMS_DISPATCH_ENABLED: bool = True
+
     # Just-in-time RouterOS operator access. This is the source allowed to
     # reach WinBox/SSH/WebFig when an admin opens remote access for a router.
     ROUTER_REMOTE_ACCESS_SOURCE_CIDRS: str = "10.0.0.1/32"

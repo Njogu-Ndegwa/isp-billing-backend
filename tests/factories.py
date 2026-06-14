@@ -22,7 +22,7 @@ from app.db.models import (
 )
 
 
-_SEQ = {"user_code": 1000, "router_port": 8728}
+_SEQ = {"user_code": 1000, "router_port": 8728, "mac_seq": 0}
 
 
 def _next(key: str) -> int:
@@ -97,6 +97,16 @@ async def make_router(db: AsyncSession, reseller: User, **overrides) -> Router:
     return router
 
 
+async def make_sms_account(db: AsyncSession, reseller: "User", *, balance: int = 0):
+    from app.db.models import SmsCreditAccount
+    acct = SmsCreditAccount(user_id=reseller.id, balance=balance,
+                            total_purchased=balance)
+    db.add(acct)
+    await db.commit()
+    await db.refresh(acct)
+    return acct
+
+
 async def make_customer(
     db: AsyncSession,
     reseller: User,
@@ -105,12 +115,18 @@ async def make_customer(
     *,
     status: CustomerStatus = CustomerStatus.PENDING,
     expiry: Optional[datetime] = None,
-    mac_address: str = "AA:BB:CC:DD:EE:FF",
+    mac_address: Optional[str] = None,
     phone: str = "254712345678",
     name: str = "Test Customer",
     pppoe_username: Optional[str] = None,
     **overrides,
 ) -> Customer:
+    if mac_address is None:
+        _SEQ["mac_seq"] += 1
+        n = _SEQ["mac_seq"]
+        mac_address = "AA:BB:CC:{:02X}:{:02X}:{:02X}".format(
+            (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF
+        )
     defaults = dict(
         name=name,
         phone=phone,

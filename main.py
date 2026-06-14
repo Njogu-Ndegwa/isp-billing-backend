@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text as sa_text
-from app.db.database import get_db, async_engine
+from app.db.database import get_db, async_engine, Base
 from app.services.plan_cache import warm_plan_cache
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -57,6 +57,8 @@ from app.api.usage_routes import router as usage_router
 from app.api.access_credential_routes import router as access_credential_router
 from app.api.shop_routes import router as shop_router
 from app.api.portal_routes import router as portal_router
+from app.api.messaging_routes import router as messaging_router
+from app.api.admin_messaging_routes import router as admin_messaging_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -92,6 +94,8 @@ app.include_router(usage_router)
 app.include_router(access_credential_router)
 app.include_router(shop_router)
 app.include_router(portal_router)
+app.include_router(messaging_router)
+app.include_router(admin_messaging_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -1576,6 +1580,55 @@ async def run_anti_tethering_migrations():
             logger.info("Anti-tethering migration: added routers.hotspot_sharing_blocked")
 
 
+async def run_messaging_migrations():
+    """Create messaging/SMS enums, tables, indexes; seed settings. Idempotent."""
+    from sqlalchemy import text, inspect
+
+    enums = {
+        "smscredittxnkind": ["purchase", "send_debit", "refund", "admin_adjustment"],
+        "smscreditorderstatus": ["pending", "completed", "failed", "expired"],
+        "smscampaignstatus": ["queued", "sending", "completed", "partial", "failed", "canceled"],
+        "smsmessagestatus": ["queued", "sent", "delivered", "failed"],
+        "smsmessagekind": ["reseller_to_customer", "admin_to_reseller"],
+    }
+    async with async_engine.begin() as conn:
+        for name, values in enums.items():
+            vals = ", ".join(f"'{v}'" for v in values)
+            await conn.execute(text(
+                f"DO $$ BEGIN CREATE TYPE {name} AS ENUM ({vals}); "
+                f"EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+            ))
+
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+
+        from app.db.models import (
+            MessagingSettings, SmsCreditAccount, SmsCreditTransaction,
+            SmsCreditOrder, MessageTemplate, SmsCampaign, SmsMessage,
+            ResellerInboxMessage,
+        )
+        targets = [
+            MessagingSettings, SmsCreditAccount, SmsCreditTransaction,
+            SmsCreditOrder, MessageTemplate, SmsCampaign, SmsMessage,
+            ResellerInboxMessage,
+        ]
+        to_create = [m.__table__ for m in targets if m.__tablename__ not in tables]
+        if to_create:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
+
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_sms_messages_failed "
+            "ON sms_messages(created_at) WHERE status = 'failed'"
+        ))
+        await conn.execute(text(
+            "INSERT INTO messaging_settings (id) VALUES (1) "
+            "ON CONFLICT (id) DO NOTHING"
+        ))
+    logger.info("Migration: Messaging/SMS tables, enums, indexes ready")
+
+
 async def run_compensation_voucher_migrations():
     """Add compensation-voucher schema automatically on startup.
 
@@ -1730,6 +1783,12 @@ async def startup_event():
         logger.error(f"Anti-tethering migration failed (non-fatal): {e}")
 
     try:
+        await run_messaging_migrations()
+        logger.info("Messaging migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Messaging migration failed (non-fatal): {e}")
+
+    try:
         await run_compensation_voucher_migrations()
         logger.info("Compensation voucher migrations completed successfully")
     except Exception as e:
@@ -1840,6 +1899,25 @@ async def startup_event():
         trigger=CronTrigger(hour=0, minute=0),
         id='expire_stale_provisioning_tokens',
         name='Expire stale provisioning tokens (3:00 AM EAT)',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=900,
+    )
+
+    async def _prune_sms_messages_background():
+        from app.services.sms_dispatch import prune_old_messages
+        try:
+            pruned = await prune_old_messages()
+            if pruned:
+                logger.info(f"[MESSAGING] Retention pruned {pruned} rows")
+        except Exception as e:
+            logger.error(f"[MESSAGING] Retention prune failed: {e}")
+
+    scheduler.add_job(
+        _prune_sms_messages_background,
+        trigger=CronTrigger(hour=3, minute=30),
+        id='prune_sms_messages',
+        name='Prune old SMS message rows past retention window',
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=900,

@@ -545,10 +545,10 @@ def _set_routeros_service(
 
 def _read_routeros_service(api: MikroTikAPI, service_name: str) -> dict[str, Any]:
     rows = _rows(
-        api.send_command("/ip/service/print", {"?name": service_name}),
-        f"Read RouterOS service '{service_name}'",
+        api.send_command("/ip/service/print"),
+        "Read RouterOS services",
     )
     for row in rows:
-        if row.get("name") in (None, service_name):
+        if row.get("name") == service_name:
             return row
     raise RouterRemoteAccessError(f"RouterOS service '{service_name}' not found")

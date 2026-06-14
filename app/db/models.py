@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -1481,3 +1481,165 @@ class UnmatchedC2BPayment(Base):
     assigned_reseller = relationship("User", foreign_keys=[assigned_reseller_id])
     resolved_by = relationship("User", foreign_keys=[resolved_by_user_id])
     resolution_customer = relationship("Customer", foreign_keys=[resolution_customer_id])
+
+
+# ========================================
+# MESSAGING / SMS
+# ========================================
+
+class SmsCreditTxnKind(str, enum.Enum):
+    PURCHASE = "purchase"
+    SEND_DEBIT = "send_debit"
+    REFUND = "refund"
+    ADMIN_ADJUSTMENT = "admin_adjustment"
+
+
+class SmsCreditOrderStatus(str, enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    EXPIRED = "expired"
+
+
+class SmsCampaignStatus(str, enum.Enum):
+    QUEUED = "queued"
+    SENDING = "sending"
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
+class SmsMessageStatus(str, enum.Enum):
+    QUEUED = "queued"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+
+
+class SmsMessageKind(str, enum.Enum):
+    RESELLER_TO_CUSTOMER = "reseller_to_customer"
+    ADMIN_TO_RESELLER = "admin_to_reseller"
+
+
+class MessagingSettings(Base):
+    __tablename__ = "messaging_settings"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    price_per_sms_kes = Column(DECIMAL(6, 2), nullable=False, default=1, server_default="1")
+    min_purchase_credits = Column(Integer, nullable=False, default=10, server_default="10")
+    sender_id = Column(String(20), nullable=True)
+    provider = Column(String(50), nullable=False, default="africastalking", server_default="africastalking")
+    enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    message_retention_days = Column(Integer, nullable=False, default=60, server_default="60")
+    bundles = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SmsCreditAccount(Base):
+    __tablename__ = "sms_credit_accounts"
+    __table_args__ = (
+        CheckConstraint("balance >= 0", name="ck_sms_credit_balance_non_negative"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    balance = Column(Integer, nullable=False, default=0, server_default="0")
+    total_purchased = Column(Integer, nullable=False, default=0, server_default="0")
+    total_spent = Column(Integer, nullable=False, default=0, server_default="0")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SmsCreditTransaction(Base):
+    __tablename__ = "sms_credit_transactions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    change = Column(Integer, nullable=False)
+    balance_after = Column(Integer, nullable=False)
+    kind = Column(Enum(SmsCreditTxnKind, name="smscredittxnkind",
+                       values_callable=lambda e: [x.value for x in e]), nullable=False)
+    reference = Column(String(64), nullable=True)
+    note = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class SmsCreditOrder(Base):
+    __tablename__ = "sms_credit_orders"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    quantity = Column(Integer, nullable=False)
+    unit_price = Column(DECIMAL(6, 2), nullable=False)
+    amount = Column(Integer, nullable=False)
+    phone_number = Column(String(20), nullable=False)
+    status = Column(Enum(SmsCreditOrderStatus, name="smscreditorderstatus",
+                         values_callable=lambda e: [x.value for x in e]),
+                    nullable=False, default=SmsCreditOrderStatus.PENDING)
+    mpesa_checkout_request_id = Column(String(128), nullable=True, index=True)
+    mpesa_merchant_request_id = Column(String(128), nullable=True)
+    payment_reference = Column(String(128), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MessageTemplate(Base):
+    __tablename__ = "message_templates"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(120), nullable=False)
+    body = Column(String(1000), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SmsCampaign(Base):
+    __tablename__ = "sms_campaigns"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    body = Column(String(1000), nullable=False)
+    recipient_count = Column(Integer, nullable=False)
+    segments_per_message = Column(Integer, nullable=False)
+    total_credits = Column(Integer, nullable=False)
+    sent_count = Column(Integer, nullable=False, default=0, server_default="0")
+    failed_count = Column(Integer, nullable=False, default=0, server_default="0")
+    refunded_credits = Column(Integer, nullable=False, default=0, server_default="0")
+    sender_id = Column(String(20), nullable=True)
+    status = Column(Enum(SmsCampaignStatus, name="smscampaignstatus",
+                         values_callable=lambda e: [x.value for x in e]),
+                    nullable=False, default=SmsCampaignStatus.QUEUED)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SmsMessage(Base):
+    __tablename__ = "sms_messages"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    campaign_id = Column(Integer, ForeignKey("sms_campaigns.id"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    recipient_phone = Column(String(20), nullable=False)
+    body = Column(String(1000), nullable=False)
+    segments = Column(Integer, nullable=False)
+    credits_charged = Column(Integer, nullable=False)
+    kind = Column(Enum(SmsMessageKind, name="smsmessagekind",
+                       values_callable=lambda e: [x.value for x in e]), nullable=False)
+    provider = Column(String(50), nullable=True)
+    provider_message_id = Column(String(128), nullable=True)
+    status = Column(Enum(SmsMessageStatus, name="smsmessagestatus",
+                         values_callable=lambda e: [x.value for x in e]),
+                    nullable=False, default=SmsMessageStatus.QUEUED)
+    error = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ResellerInboxMessage(Base):
+    __tablename__ = "reseller_inbox_messages"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recipient_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    sender_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    subject = Column(String(200), nullable=True)
+    body = Column(String(2000), nullable=False)
+    is_read = Column(Boolean, nullable=False, default=False, server_default="false")
+    read_at = Column(DateTime, nullable=True)
+    sent_sms = Column(Boolean, nullable=False, default=False, server_default="false")
+    broadcast_id = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
