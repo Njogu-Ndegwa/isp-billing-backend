@@ -502,6 +502,8 @@ async def get_dashboard_analytics(
             date_key = payment.created_at.strftime("%Y-%m-%d")
             hour = payment.created_at.hour
             amount = float(payment.amount)
+            # Compensation vouchers are free: counted and listed, but never revenue.
+            rev_amount = amount if payment.counts_as_revenue else 0.0
             phone = customer.phone[-4:] if customer.phone else "unknown"
             plan_name = plan.name if plan else "Unknown"
             unique_customers_set.add(customer.id)
@@ -515,11 +517,11 @@ async def get_dashboard_analytics(
             })
             day["phones"].add(customer.phone)
             day["hourly_activity"][hour] += 1
-            day["hourly_revenue"][hour] += amount
+            day["hourly_revenue"][hour] += rev_amount
             day["plan_counts"][plan_name] += 1
-            day["plan_revenue"][plan_name] += amount
+            day["plan_revenue"][plan_name] += rev_amount
             day["hourly_by_plan"][plan_name][hour] += 1
-            day["phone_totals"][customer.phone] += amount
+            day["phone_totals"][customer.phone] += rev_amount
         
         # Build response for each day
         days_output = {}

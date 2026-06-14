@@ -260,3 +260,75 @@ async def test_revenue_over_time_excludes_comp_keeps_transaction_count(db, monke
     assert today_bucket["transactions"] == 2, (
         f"Expected today's bucket transactions==2 (comp counted), got {today_bucket['transactions']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: per-router analytics endpoint excludes comp from revenue, counts it
+# ---------------------------------------------------------------------------
+
+async def test_dashboard_analytics_excludes_comp_from_revenue_keeps_count(db, monkeypatch):
+    """
+    /api/dashboard/analytics (get_dashboard_analytics) accumulates revenue in
+    Python per payment across many figures (summary.totalRevenue, today.revenue,
+    planPerformance, topSpenders, hourly/daily revenue). A compensation voucher
+    must NOT inflate any of them, but MUST still be counted/listed.
+
+    Seed one SALE (amount 5, counts_as_revenue=True) and one COMPENSATION
+    (amount 1, counts_as_revenue=False) today on the same plan.
+
+    Expected:
+      summary.totalRevenue      == 5   (comp excluded)
+      summary.totalTransactions == 2   (both counted)
+      today.revenue == 5, today.transactions == 2
+      planPerformance[0]: revenue == 5, count == 2
+    """
+    from app.api import dashboard_routes
+
+    reseller = await make_reseller(db, email="analytics-reseller@example.com")
+    plan = await make_plan(db, reseller, price=5)
+    router = await make_router(db, reseller, ip_address="10.0.4.1")
+    customer = await make_customer(
+        db, reseller, plan, router,
+        phone="254700000040",
+        mac_address="AA:BB:CC:DD:00:04",
+    )
+
+    await _add_payment(
+        db, customer, reseller,
+        amount=5.0, payment_method=PaymentMethod.CASH, counts_as_revenue=True,
+    )
+    await _add_payment(
+        db, customer, reseller,
+        amount=1.0, payment_method=PaymentMethod.CASH, counts_as_revenue=False,
+    )
+
+    async def fake_current_user(token, db):
+        return SimpleNamespace(id=reseller.id, role=UserRole.RESELLER)
+
+    monkeypatch.setattr(dashboard_routes, "get_current_user", fake_current_user)
+
+    result = await dashboard_routes.get_dashboard_analytics(
+        router_id=None,
+        days=None,
+        start_date=None,
+        end_date=None,
+        preset="today",
+        db=db,
+        token="test-token",
+    )
+
+    assert result["summary"]["totalTransactions"] == 2, (
+        f"Expected 2 transactions (comp counted), got {result['summary']['totalTransactions']}"
+    )
+    assert result["summary"]["totalRevenue"] == 5.0, (
+        f"Expected totalRevenue==5 (comp excluded), got {result['summary']['totalRevenue']}"
+    )
+    assert result["today"]["revenue"] == 5.0, (
+        f"Expected today.revenue==5 (comp excluded), got {result['today']['revenue']}"
+    )
+    assert result["today"]["transactions"] == 2, (
+        f"Expected today.transactions==2 (comp counted), got {result['today']['transactions']}"
+    )
+    pp = result["planPerformance"][0]
+    assert pp["count"] == 2, f"Expected plan count==2 (comp counted), got {pp['count']}"
+    assert pp["revenue"] == 5.0, f"Expected plan revenue==5 (comp excluded), got {pp['revenue']}"
