@@ -731,6 +731,24 @@ async def proxy_router_webfig_jsproxy_escape(
     )
 
 
+@router.get("/")
+async def proxy_router_webfig_api_root_escape(request: Request):
+    """
+    Keep active WebFig sessions from falling through to the API root page.
+
+    Browsers do not send URL fragments to the server, so a WebFig navigation to
+    /#Interface arrives here as GET /. When no active WebFig session exists this
+    preserves the historical API root response.
+    """
+    router_id, session = _webfig_session_from_root_cookie(request)
+    if session:
+        return Response(
+            status_code=307,
+            headers={"location": f"/api/admin/routers/{router_id}/webfig/"},
+        )
+    return {"message": "ISP Billing SaaS API", "version": "1.0.0", "updated": "2025-11-02-v2"}
+
+
 async def _proxy_webfig_request(
     router_id: int,
     request: Request,
@@ -745,6 +763,8 @@ async def _proxy_webfig_request(
     if query:
         target_url = f"{target_url}?{query}"
     host_header = _webfig_upstream_host_header(session)
+    request_body = await request.body()
+    is_jsproxy = _is_webfig_jsproxy_path(proxy_path)
 
     try:
         async with httpx.AsyncClient(
@@ -757,20 +777,44 @@ async def _proxy_webfig_request(
             ),
             verify=False if session.webfig_scheme == "https" else True,
         ) as client:
-            upstream = await client.request(
-                request.method,
-                target_url,
-                headers=_forward_webfig_headers(request, host_header),
-                content=await request.body(),
-            )
+            last_exc = None
+            attempts = 2 if is_jsproxy else 1
+            for attempt in range(attempts):
+                try:
+                    upstream = await client.request(
+                        request.method,
+                        target_url,
+                        headers=_forward_webfig_headers(request, host_header),
+                        content=request_body,
+                    )
+                    break
+                except httpx.RequestError as exc:
+                    last_exc = exc
+                    if attempt + 1 < attempts:
+                        logger.warning(
+                            "WebFig proxy retrying router_id=%s name=%s target=%s after error=%s",
+                            router_id,
+                            session.router_name,
+                            target_url,
+                            repr(exc),
+                        )
+                        continue
+                    raise last_exc
     except httpx.RequestError as exc:
         logger.warning(
-            "WebFig proxy could not reach router_id=%s name=%s target=%s error=%s",
+            "WebFig proxy could not reach router_id=%s name=%s target=%s error=%r",
             router_id,
             session.router_name,
             target_url,
             exc,
         )
+        if is_jsproxy:
+            return Response(
+                content=b"",
+                status_code=200,
+                media_type="application/octet-stream",
+                headers={"cache-control": "no-store"},
+            )
         return Response(
             content=f"Could not reach router WebFig over the management VPN: {exc}",
             status_code=502,

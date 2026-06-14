@@ -637,6 +637,88 @@ async def test_webfig_jsproxy_escape_proxy_uses_active_session_cookie(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_webfig_jsproxy_escape_degrades_upstream_timeout_without_502(monkeypatch):
+    session = router_remote_access.create_webfig_proxy_session(
+        router_id=82,
+        router_name="Router-82",
+        router_ip="10.0.82.1",
+        created_by_user_id=1,
+    )
+    captured = {"calls": 0}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def request(self, method, url, headers=None, content=None):
+            captured["calls"] += 1
+            raise httpx.ReadTimeout(
+                "router jsproxy poll timed out",
+                request=httpx.Request(method, url),
+            )
+
+    monkeypatch.setattr(router_management.httpx, "AsyncClient", FakeAsyncClient)
+
+    response = await router_management.proxy_router_webfig_jsproxy_escape(
+        _request(
+            "/jsproxy",
+            method="POST",
+            body=b"poll=1",
+            headers=[
+                (b"host", b"testserver"),
+                (b"cookie", f"webfig_active_proxy=82:{session.token}".encode()),
+            ],
+        ),
+        "",
+    )
+
+    assert response.status_code == 200
+    assert response.body == b""
+    assert captured["calls"] == 2
+    assert captured["client_kwargs"]["timeout"].read == 120.0
+    router_remote_access.revoke_webfig_proxy_sessions(82)
+
+
+@pytest.mark.asyncio
+async def test_webfig_root_with_active_session_redirects_back_to_proxy():
+    session = router_remote_access.create_webfig_proxy_session(
+        router_id=83,
+        router_name="Router-83",
+        router_ip="10.0.83.1",
+        created_by_user_id=1,
+    )
+
+    response = await router_management.proxy_router_webfig_api_root_escape(
+        _request(
+            "/",
+            headers=[
+                (b"host", b"testserver"),
+                (b"cookie", f"webfig_active_proxy=83:{session.token}".encode()),
+            ],
+        )
+    )
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/api/admin/routers/83/webfig/"
+    router_remote_access.revoke_webfig_proxy_sessions(83)
+
+
+@pytest.mark.asyncio
+async def test_webfig_root_without_active_session_returns_api_root():
+    response = await router_management.proxy_router_webfig_api_root_escape(
+        _request("/"),
+    )
+
+    assert response["message"] == "ISP Billing SaaS API"
+
+
+@pytest.mark.asyncio
 async def test_webfig_root_escape_rejects_missing_active_session():
     response = await router_management.proxy_router_webfig_root_escape(
         _request("/webfig/"),
