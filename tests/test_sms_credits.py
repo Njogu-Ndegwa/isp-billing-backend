@@ -49,7 +49,8 @@ async def test_deduct_then_refund(db):
     await db.commit()
     acct = await sms_credits.get_or_create_account(db, r.id)
     assert acct.balance == 5
-    assert acct.total_spent == 8
+    # total_spent is NET of refunds: 8 deducted, 3 refunded for failures => 5
+    assert acct.total_spent == 5
 
 
 @pytest.mark.asyncio

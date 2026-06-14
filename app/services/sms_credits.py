@@ -74,6 +74,10 @@ async def refund(db: AsyncSession, user_id: int, amount: int,
         return (await get_or_create_account(db, user_id)).balance
     acct = await get_or_create_account(db, user_id)
     acct.balance += amount
+    # total_spent is NET of refunds — it should reflect only credits for
+    # messages that actually went out. Refunds are for FAILED recipients,
+    # so they reduce the lifetime "spent" stat (clamped at zero).
+    acct.total_spent = max(0, acct.total_spent - amount)
     await db.flush()
     await _ledger(db, user_id, amount, acct.balance,
                   SmsCreditTxnKind.REFUND, reference, note)
