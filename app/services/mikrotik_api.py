@@ -34,6 +34,69 @@ DEFAULT_PPPOE_PROFILE_ONLY_ONE = "yes"
 DEFAULT_HOTSPOT_KEEPALIVE_TIMEOUT = "2m"
 
 
+def is_hotspot_parent_queue_name(name: Any) -> bool:
+    """Return True for MikroTik hotspot dynamic parent queues.
+
+    RouterOS commonly reports these as either ``hs-...`` or ``<hs-...>``.
+    They are not the per-customer ``plan_...`` queues this app creates.
+    """
+    queue_name = str(name or "").strip().lower()
+    if queue_name.startswith("<") and queue_name.endswith(">"):
+        queue_name = queue_name[1:-1].strip()
+    return queue_name.startswith("hs-")
+
+
+def _normalize_mikrotik_rate_part(part: str, *, slash_context: bool = False) -> Optional[str]:
+    value = str(part or "").strip().upper().replace(" ", "")
+    if not value:
+        return None
+
+    match = re.match(r'^(\d+(?:\.\d+)?)(K|M|G)?(?:BPS)?$', value)
+    if not match:
+        return None
+
+    number = match.group(1)
+    unit = match.group(2)
+    if unit:
+        return f"{number}{unit}"
+
+    # In "5/5" plan strings, users generally mean Mbps. In existing RouterOS
+    # strings such as "5000000/5000000", values are already raw bps.
+    if slash_context:
+        try:
+            if float(number) >= 1000:
+                return number
+        except ValueError:
+            pass
+    return f"{number}M"
+
+
+def parse_speed_to_mikrotik(speed: str) -> str:
+    """
+    Convert speed strings like '2Mbps', '5 Mbps', '512Kbps', or '2M/5M'
+    to MikroTik rate-limit format.
+    """
+    if not speed:
+        return ""
+
+    speed_text = str(speed).strip()
+    if "/" in speed_text:
+        upload, download = [part.strip() for part in speed_text.split("/", 1)]
+        normalized_upload = _normalize_mikrotik_rate_part(upload, slash_context=True)
+        normalized_download = _normalize_mikrotik_rate_part(download, slash_context=True)
+        if normalized_upload and normalized_download:
+            return f"{normalized_upload}/{normalized_download}"
+        logger.warning(f"Could not parse speed '{speed}', using default 10M/10M")
+        return "10M/10M"
+
+    normalized = _normalize_mikrotik_rate_part(speed_text)
+    if normalized:
+        return f"{normalized}/{normalized}"
+
+    logger.warning(f"Could not parse speed '{speed}', using default 10M/10M")
+    return "10M/10M"
+
+
 def _router_error_is_duplicate(error: str) -> bool:
     """Return True when RouterOS is reporting an idempotent duplicate/existing object."""
     if not error:
@@ -689,18 +752,18 @@ class MikroTikAPI:
         Remove MikroTik's auto-generated hotspot parent simple queue(s).
 
         When the hotspot service (re)starts, MikroTik recreates a dynamic simple
-        queue named ``hs-<hotspot-server-name>`` whose target is the hotspot
+        queue named like ``hs-...`` or ``<hs-...>`` whose target is the hotspot
         bridge interface and whose max-limit defaults to ``unlimited/unlimited``.
         Because simple queues are matched top-down and this entry sits at
         position 0 on the bridge interface, it shadows every per-user
         ``plan_<username>`` queue we create for rate limiting - the net effect
         is that all hotspot users suddenly receive unlimited speeds.
 
-        This helper deletes any simple queue whose name starts with ``hs-`` so
-        the per-IP ``plan_<username>`` queues can match traffic again. It is
-        safe to call repeatedly; MikroTik will regenerate the queue on hotspot
-        service restart / router reboot, and the next provisioning or sync run
-        will clean it up again.
+        This helper deletes those dynamic hotspot parent queues so the per-IP
+        ``plan_<username>`` queues can match traffic again. It is safe to call
+        repeatedly; MikroTik will regenerate the queue on hotspot service
+        restart / router reboot, and the next provisioning or sync run will
+        clean it up again.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -713,7 +776,7 @@ class MikroTikAPI:
             errors: List[str] = []
             for q in queues.get("data", []) or []:
                 name = str(q.get("name", ""))
-                if not name.startswith("hs-"):
+                if not is_hotspot_parent_queue_name(name):
                     continue
                 qid = q.get(".id")
                 if not qid:
@@ -1099,33 +1162,8 @@ class MikroTikAPI:
     def _parse_speed_to_mikrotik(self, speed: str) -> str:
         """
         Convert speed string (e.g., '2Mbps', '5 Mbps', '512Kbps') to MikroTik format (e.g., '2M/2M').
-        Returns symmetric upload/download limit (uses download speed for both).
         """
-        if not speed:
-            return ""
-        
-        # If already in MikroTik format (contains /), make symmetric using download speed
-        if "/" in speed:
-            download = speed.split("/")[0].strip()
-            return f"{download}/{download}"
-        
-        # Clean and parse the speed string
-        speed_clean = speed.upper().replace(" ", "")
-        
-        # Extract numeric value and unit
-        match = re.match(r'^(\d+(?:\.\d+)?)\s*(K|M|G)?(?:BPS)?$', speed_clean)
-        if match:
-            value = match.group(1)
-            unit = match.group(2) or "M"  # Default to Mbps
-            mikrotik_speed = f"{value}{unit}"
-            return f"{mikrotik_speed}/{mikrotik_speed}"
-        
-        # Fallback: try to use as-is if it looks like a number
-        if speed_clean.replace(".", "").isdigit():
-            return f"{speed_clean}M/{speed_clean}M"
-        
-        logger.warning(f"Could not parse speed '{speed}', using default 10M/10M")
-        return "10M/10M"
+        return parse_speed_to_mikrotik(speed)
 
     def _ensure_hotspot_profile(self, profile_name: str, rate_limit: str) -> Dict[str, Any]:
         """
@@ -1319,7 +1357,7 @@ class MikroTikAPI:
                 # Single /queue/simple/print, reused for both tasks below.
                 # We scan once for:
                 #   - stale plan_<username> entries we must replace
-                #   - auto-generated hs-<hotspot> parent queues that would
+                #   - auto-generated hs-<hotspot> / <hs-...> parent queues that would
                 #     shadow our new per-user queue (see remove_hotspot_parent_queues)
                 # so we avoid paying for an extra list roundtrip per payment.
                 stale_plan_ids: List[str] = []
@@ -1331,7 +1369,7 @@ class MikroTikAPI:
                         qid = q.get(".id")
                         if not qid:
                             continue
-                        if name.startswith("hs-"):
+                        if is_hotspot_parent_queue_name(name):
                             stale_hs_queues.append(q)
                         elif name == f"plan_{username}" or f"MAC:{mac_address}" in q.get("comment", ""):
                             stale_plan_ids.append(qid)

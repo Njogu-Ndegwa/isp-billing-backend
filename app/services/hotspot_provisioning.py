@@ -137,6 +137,13 @@ def _extract_provisioning_error(result: Dict[str, Any]) -> str | None:
     if binding_error and not _is_idempotent_success(binding_error):
         return f"binding_error: {binding_error}"
 
+    queue_result = result.get("queue_result") or {}
+    queue_error = queue_result.get("error")
+    if queue_error:
+        return f"queue_error: {queue_error}"
+    if queue_result.get("pending"):
+        return f"queue_pending: {queue_result.get('message', 'Customer queue not yet created')}"
+
     return None
 
 

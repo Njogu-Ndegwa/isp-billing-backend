@@ -11,7 +11,12 @@ from pathlib import Path
 from app.db.database import get_db
 from app.db.models import Router, Customer, Plan, CustomerStatus, ConnectionType, ProvisioningToken
 from app.services.auth import verify_token, get_current_user
-from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
+from app.services.mikrotik_api import (
+    MikroTikAPI,
+    is_hotspot_parent_queue_name,
+    normalize_mac_address,
+    validate_mac_address,
+)
 from app.services.router_helpers import get_router_by_id, get_router_by_identity, connect_to_router
 from app.core.protected_devices import is_protected_device
 from app.services.router_availability import record_router_availability
@@ -1353,77 +1358,100 @@ async def check_bandwidth_limits(
             mac = lease.get("mac-address", "")
             if mac and lease.get("address"):
                 mac_to_ip[normalize_mac_address(mac)] = lease.get("address")
-            
-            # Build queue lookup by target IP
-            queue_by_ip = {}
-            queue_by_name = {}
-            for q in all_queues:
-                target = q.get("target", "")
-                # Extract IP from target (e.g., "192.168.1.100/32" -> "192.168.1.100")
-                if "/" in target:
-                    ip = target.split("/")[0]
-                    queue_by_ip[ip] = q
-                queue_by_name[q.get("name", "")] = q
-            
-            customers_with_queues = []
-            customers_without_queues = []
-            customer_macs = set()
-            
-            for customer in active_customers:
-                normalized_mac = normalize_mac_address(customer.mac_address)
-                customer_macs.add(normalized_mac)
-                username = normalized_mac.replace(":", "")
-                queue_name = f"plan_{username}"
-                
-                client_ip = mac_to_ip.get(normalized_mac)
-                has_queue = False
-                queue_info = None
-                
-                # Check by queue name or by IP
-                if queue_name in queue_by_name:
-                    has_queue = True
-                    queue_info = queue_by_name[queue_name]
-                elif client_ip and client_ip in queue_by_ip:
-                    has_queue = True
-                    queue_info = queue_by_ip[client_ip]
-                
-                customer_data = {
-                    "id": customer.id,
-                    "name": customer.name,
-                    "mac_address": customer.mac_address,
-                    "current_ip": client_ip,
-                    "is_connected": client_ip is not None,
-                    "plan_name": customer.plan.name if customer.plan else None,
-                    "plan_speed": customer.plan.speed if customer.plan else None,
-                    "expiry": customer.expiry.isoformat() if customer.expiry else None
-                }
-                
-                if has_queue:
-                    customer_data["queue_name"] = queue_info.get("name")
-                    customer_data["queue_limit"] = queue_info.get("max-limit")
-                    customer_data["queue_target"] = queue_info.get("target")
-                    customers_with_queues.append(customer_data)
-                else:
-                    customer_data["issue"] = "NO BANDWIDTH LIMIT - USER HAS UNLIMITED SPEED!" if client_ip else "Not connected"
+
+        # Build queue lookup by target IP/name once. Hotspot parent queues are
+        # reported separately because they can shadow otherwise-correct plan
+        # queues and make every hotspot customer effectively unlimited.
+        queue_by_ip = {}
+        queue_by_name = {}
+        hotspot_parent_queues = []
+        for q in all_queues:
+            queue_name = q.get("name", "")
+            if is_hotspot_parent_queue_name(queue_name):
+                hotspot_parent_queues.append({
+                    "name": queue_name,
+                    "target": q.get("target"),
+                    "limit": q.get("max-limit"),
+                    "disabled": q.get("disabled", "false"),
+                })
+                continue
+            target = q.get("target", "")
+            # Extract IP from target (e.g., "192.168.1.100/32" -> "192.168.1.100")
+            if "/" in target:
+                ip = target.split("/")[0]
+                queue_by_ip[ip] = q
+            queue_by_name[queue_name] = q
+
+        parent_queue_shadowing = any(
+            str(q.get("disabled", "false")).lower() != "true"
+            for q in hotspot_parent_queues
+        )
+
+        customers_with_queues = []
+        customers_without_queues = []
+        customer_macs = set()
+
+        for customer in active_customers:
+            normalized_mac = normalize_mac_address(customer.mac_address)
+            customer_macs.add(normalized_mac)
+            username = normalized_mac.replace(":", "")
+            queue_name = f"plan_{username}"
+
+            client_ip = mac_to_ip.get(normalized_mac)
+            has_queue = False
+            queue_info = None
+
+            # Check by queue name or by IP
+            if queue_name in queue_by_name:
+                has_queue = True
+                queue_info = queue_by_name[queue_name]
+            elif client_ip and client_ip in queue_by_ip:
+                has_queue = True
+                queue_info = queue_by_ip[client_ip]
+
+            customer_data = {
+                "id": customer.id,
+                "name": customer.name,
+                "mac_address": customer.mac_address,
+                "current_ip": client_ip,
+                "is_connected": client_ip is not None,
+                "plan_name": customer.plan.name if customer.plan else None,
+                "plan_speed": customer.plan.speed if customer.plan else None,
+                "expiry": customer.expiry.isoformat() if customer.expiry else None
+            }
+
+            if has_queue:
+                customer_data["queue_name"] = queue_info.get("name")
+                customer_data["queue_limit"] = queue_info.get("max-limit")
+                customer_data["queue_target"] = queue_info.get("target")
+                if parent_queue_shadowing:
+                    customer_data["issue"] = "HOTSPOT PARENT QUEUE MAY SHADOW PLAN QUEUE"
                     customers_without_queues.append(customer_data)
-            
-            # Find queues that don't belong to any known customer
-            unknown_queues = []
-            for q in all_queues:
-                queue_name = q.get("name", "")
-                # Skip if it's a known customer queue
-                if queue_name.startswith("plan_"):
-                    username = queue_name.replace("plan_", "")
-                    # Convert username back to MAC format
-                    if len(username) == 12:
-                        reconstructed_mac = ":".join(username[i:i+2] for i in range(0, 12, 2))
-                        if reconstructed_mac not in customer_macs:
-                            unknown_queues.append({
-                                "name": queue_name,
-                                "target": q.get("target"),
-                                "limit": q.get("max-limit"),
-                                "comment": q.get("comment", "")
-                            })
+                else:
+                    customers_with_queues.append(customer_data)
+            else:
+                customer_data["issue"] = "NO BANDWIDTH LIMIT - USER HAS UNLIMITED SPEED!" if client_ip else "Not connected"
+                customers_without_queues.append(customer_data)
+
+        # Find queues that don't belong to any known customer
+        unknown_queues = []
+        for q in all_queues:
+            queue_name = q.get("name", "")
+            if is_hotspot_parent_queue_name(queue_name):
+                continue
+            # Skip if it's a known customer queue
+            if queue_name.startswith("plan_"):
+                username = queue_name.replace("plan_", "")
+                # Convert username back to MAC format
+                if len(username) == 12:
+                    reconstructed_mac = ":".join(username[i:i+2] for i in range(0, 12, 2))
+                    if reconstructed_mac not in customer_macs:
+                        unknown_queues.append({
+                            "name": queue_name,
+                            "target": q.get("target"),
+                            "limit": q.get("max-limit"),
+                            "comment": q.get("comment", "")
+                        })
         
         return {
             "router_id": router_id,
@@ -1431,7 +1459,10 @@ async def check_bandwidth_limits(
             "total_active_customers": len(active_customers),
             "customers_with_queues": len(customers_with_queues),
             "customers_without_queues_count": len(customers_without_queues),
-            "has_unlimited_users": any(c.get("is_connected") for c in customers_without_queues),
+            "has_unlimited_users": parent_queue_shadowing or any(c.get("is_connected") for c in customers_without_queues),
+            "has_hotspot_parent_queues": bool(hotspot_parent_queues),
+            "has_shadowing_hotspot_parent_queues": parent_queue_shadowing,
+            "hotspot_parent_queues": hotspot_parent_queues,
             "customers_with_limits": customers_with_queues,
             "customers_WITHOUT_limits": customers_without_queues,
             "unknown_queues": unknown_queues

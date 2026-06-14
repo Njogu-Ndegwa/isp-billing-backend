@@ -4,7 +4,7 @@ MikroTik Background Operations
 
 All background job functions for MikroTik router management:
 - Expired user cleanup (runs every ~67s)
-- Queue sync for active users (currently disabled)
+- Queue sync for active users (rotating bounded router batch)
 - Bandwidth snapshot collection (runs every ~157s)
 
 Also contains shared MikroTik async wrappers and the
@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
-from app.db.database import async_engine, async_session, db_pool_snapshot
+from app.db.database import async_session, db_pool_snapshot
 from app.db.models import (
     Router,
     Customer,
@@ -24,10 +24,15 @@ from app.db.models import (
     UserBandwidthUsage,
     Plan,
     ConnectionType,
+    RouterAuthMethod,
     AccessCredential,
     AccessCredStatus,
 )
-from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.mikrotik_api import (
+    MikroTikAPI,
+    is_hotspot_parent_queue_name,
+    normalize_mac_address,
+)
 from app.services.router_availability import (
     ROUTER_OFFLINE_SKIP_PERIOD,
     record_router_availability,
@@ -82,11 +87,13 @@ queue_sync_running = False
 _last_safety_net_cleanup_at: datetime | None = None
 _last_access_credential_reaper_at: datetime | None = None
 _bandwidth_router_cursor = 0
+_queue_sync_router_cursor = 0
 
 # Rate limiting constants for queue sync
 SYNC_DELAY_BETWEEN_COMMANDS = 0.1
 SYNC_DELAY_BETWEEN_CUSTOMERS = 0.05
 SYNC_MAX_QUEUE_OPERATIONS_PER_RUN = 50
+QUEUE_SYNC_MAX_ROUTERS_PER_RUN = 4
 
 
 def _router_recently_offline(
@@ -1433,7 +1440,7 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
 
 
 # =============================================================================
-# QUEUE SYNC (background job, currently disabled)
+# QUEUE SYNC (background job, rotating bounded router batch)
 # =============================================================================
 
 def _sync_single_router_queues_sync(router_info: dict, customers_data: list) -> dict:
@@ -1577,7 +1584,7 @@ def _sync_single_router_queues_sync(router_info: dict, customers_data: list) -> 
         # prune it from the router so subsequent matching works.
         hs_parent_queues = [
             q for q in existing_queues
-            if str(q.get("name", "")).startswith("hs-")
+            if is_hotspot_parent_queue_name(q.get("name", ""))
         ]
         if hs_parent_queues:
             logger.warning(
@@ -1594,7 +1601,7 @@ def _sync_single_router_queues_sync(router_info: dict, customers_data: list) -> 
                 )
             existing_queues = [
                 q for q in existing_queues
-                if not str(q.get("name", "")).startswith("hs-")
+                if not is_hotspot_parent_queue_name(q.get("name", ""))
             ]
             time.sleep(SYNC_DELAY_BETWEEN_COMMANDS)
 
@@ -1818,7 +1825,7 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
 
 
 async def sync_active_user_queues():
-    global queue_sync_running
+    global queue_sync_running, _queue_sync_router_cursor
     if queue_sync_running:
         logger.warning("[SYNC] Previous queue sync still running, skipping this run")
         return
@@ -1826,13 +1833,25 @@ async def sync_active_user_queues():
     start_time = datetime.utcnow()
     logger.info("[SYNC] Starting queue sync job...")
     try:
-        async with AsyncSession(async_engine) as db:
+        if _background_db_pool_is_busy("QUEUE-SYNC"):
+            return
+
+        pending_router_items = []
+        async with async_session() as db:
             now = datetime.utcnow()
-            stmt = select(Customer).where(
-                Customer.status == CustomerStatus.ACTIVE,
-                Customer.mac_address.isnot(None),
-                Customer.expiry > now
-            ).options(selectinload(Customer.plan), selectinload(Customer.router))
+            stmt = (
+                select(Customer)
+                .join(Plan, Customer.plan_id == Plan.id)
+                .join(Router, Customer.router_id == Router.id)
+                .where(
+                    Customer.status == CustomerStatus.ACTIVE,
+                    Customer.mac_address.isnot(None),
+                    Customer.expiry > now,
+                    Plan.connection_type == ConnectionType.HOTSPOT,
+                    Router.auth_method == RouterAuthMethod.DIRECT_API,
+                )
+                .options(selectinload(Customer.plan), selectinload(Customer.router))
+            )
             result = await db.execute(stmt)
             active_customers = result.scalars().all()
             if not active_customers:
@@ -1841,88 +1860,112 @@ async def sync_active_user_queues():
             logger.info(f"[SYNC] Found {len(active_customers)} active customers to check")
 
             router_customers_map = {}
-            no_router_customers = []
+            no_router_customers = 0
+            skipped_offline_router_keys = set()
             for c in active_customers:
                 if not c.plan or not c.plan.speed or not c.mac_address:
                     continue
-                if c.router and getattr(c.router, 'auth_method', None) == 'RADIUS':
+                if not c.router:
+                    no_router_customers += 1
                     continue
+
+                router_key = f"{c.router.ip_address}:{c.router.port}"
+                if _router_recently_offline(c.router, now):
+                    skipped_offline_router_keys.add(router_key)
+                    continue
+
                 customer_data = {"id": c.id, "mac_address": c.mac_address, "plan_speed": c.plan.speed}
-                if c.router:
-                    router_key = f"{c.router.ip_address}:{c.router.port}"
-                    if router_key not in router_customers_map:
-                        router_customers_map[router_key] = {
-                            "router": {
-                                "ip": c.router.ip_address, "username": c.router.username,
-                                "password": c.router.password, "port": c.router.port, "name": c.router.name
-                            },
-                            "customers": []
-                        }
-                    router_customers_map[router_key]["customers"].append(customer_data)
-                else:
-                    no_router_customers.append(customer_data)
+                if router_key not in router_customers_map:
+                    router_customers_map[router_key] = {
+                        "router": {
+                            "ip": c.router.ip_address, "username": c.router.username,
+                            "password": c.router.password, "port": c.router.port, "name": c.router.name
+                        },
+                        "customers": []
+                    }
+                router_customers_map[router_key]["customers"].append(customer_data)
 
             if no_router_customers:
-                logger.warning(f"[SYNC] Skipping {len(no_router_customers)} customer(s) with no router assigned")
-            logger.info(f"[SYNC] Grouped customers across {len(router_customers_map)} router(s)")
+                logger.warning(f"[SYNC] Skipping {no_router_customers} customer(s) with no router assigned")
+            if skipped_offline_router_keys:
+                logger.info(
+                    "[SYNC] Skipping %d recently-offline router(s)",
+                    len(skipped_offline_router_keys),
+                )
+            logger.info(f"[SYNC] Grouped customers across {len(router_customers_map)} direct API router(s)")
 
-            # Fan out per-router sync concurrently. Each router gets its own
-            # task running in a thread pool, so one slow or broken router only
-            # delays its own task; the others still complete on time.
-            # `router_locks.acquire(rk)` serializes concurrent access to the
-            # same router (other jobs like cleanup use the same locks), while
-            # the semaphore inside it caps overall MikroTik connection load.
-            async def _sync_router_task(rk, rd):
-                try:
-                    async with router_locks.acquire(rk):
-                        return await asyncio.to_thread(
-                            _sync_single_router_queues_sync, rd["router"], rd["customers"],
-                        )
-                except Exception as exc:
-                    logger.error("[SYNC] Router task %s crashed: %s", rk, exc)
-                    return {
-                        "synced": 0,
-                        "errors": len(rd.get("customers", [])),
-                        "skipped": 0,
-                        "routers_connected": 0,
-                        "details": {"router": rd["router"].get("name", rk), "error": str(exc)},
-                    }
-
-            pending_router_items = [
+            all_router_items = [
                 (rk, rd) for rk, rd in router_customers_map.items() if rd.get("customers")
             ]
+            if not all_router_items:
+                logger.info("[SYNC] No eligible direct API routers need queue sync this run")
+                return
 
-            mikrotik_results = {
-                "synced": 0,
-                "errors": 0,
-                "skipped": 0,
-                "routers_connected": 0,
-                "details": [],
-            }
+            start_index = _queue_sync_router_cursor % len(all_router_items)
+            ordered_router_items = all_router_items[start_index:] + all_router_items[:start_index]
+            pending_router_items = ordered_router_items[:QUEUE_SYNC_MAX_ROUTERS_PER_RUN]
+            _queue_sync_router_cursor = (start_index + len(pending_router_items)) % len(all_router_items)
 
-            if pending_router_items:
-                await db.commit()
-                outcomes = await asyncio.gather(
-                    *[_sync_router_task(rk, rd) for rk, rd in pending_router_items],
-                    return_exceptions=True,
-                )
-                for outcome in outcomes:
-                    if isinstance(outcome, Exception):
-                        logger.error("[SYNC] Router sync task error: %s", outcome)
-                        continue
-                    mikrotik_results["synced"] += outcome.get("synced", 0)
-                    mikrotik_results["errors"] += outcome.get("errors", 0)
-                    mikrotik_results["skipped"] += outcome.get("skipped", 0)
-                    mikrotik_results["routers_connected"] += outcome.get("routers_connected", 0)
-                    if outcome.get("details"):
-                        mikrotik_results["details"].append(outcome["details"])
+            logger.info(
+                "[SYNC] Processing %d/%d eligible router(s) this run (cursor=%d)",
+                len(pending_router_items),
+                len(all_router_items),
+                start_index,
+            )
+            await db.commit()
 
-            duration = (datetime.utcnow() - start_time).total_seconds()
-            logger.info(f"[SYNC] Job completed in {duration:.2f}s: "
-                       f"{mikrotik_results['synced']} synced, "
-                       f"{mikrotik_results['errors']} errors, "
-                       f"{mikrotik_results['skipped']} skipped, "
-                       f"{mikrotik_results['routers_connected']} router(s) connected")
+        if _background_db_pool_is_busy("QUEUE-SYNC"):
+            return
+
+        # Fan out per-router sync concurrently. Each router gets its own
+        # task running in a thread pool, so one slow or broken router only
+        # delays its own task and never blocks the whole fleet. The shared
+        # `router_locks` manager serializes concurrent work for the same
+        # router and caps overall MikroTik connection load.
+        async def _sync_router_task(rk, rd):
+            try:
+                async with router_locks.acquire(rk):
+                    return await asyncio.to_thread(
+                        _sync_single_router_queues_sync, rd["router"], rd["customers"],
+                    )
+            except Exception as exc:
+                logger.error("[SYNC] Router task %s crashed: %s", rk, exc)
+                return {
+                    "synced": 0,
+                    "errors": len(rd.get("customers", [])),
+                    "skipped": 0,
+                    "routers_connected": 0,
+                    "details": {"router": rd["router"].get("name", rk), "error": str(exc)},
+                }
+
+        mikrotik_results = {
+            "synced": 0,
+            "errors": 0,
+            "skipped": 0,
+            "routers_connected": 0,
+            "details": [],
+        }
+        outcomes = await asyncio.gather(
+            *[_sync_router_task(rk, rd) for rk, rd in pending_router_items],
+            return_exceptions=True,
+        )
+        for outcome in outcomes:
+            if isinstance(outcome, Exception):
+                logger.error("[SYNC] Router sync task error: %s", outcome)
+                continue
+            mikrotik_results["synced"] += outcome.get("synced", 0)
+            mikrotik_results["errors"] += outcome.get("errors", 0)
+            mikrotik_results["skipped"] += outcome.get("skipped", 0)
+            mikrotik_results["routers_connected"] += outcome.get("routers_connected", 0)
+            if outcome.get("details"):
+                mikrotik_results["details"].append(outcome["details"])
+
+        duration = (datetime.utcnow() - start_time).total_seconds()
+        logger.info(f"[SYNC] Job completed in {duration:.2f}s: "
+                    f"{mikrotik_results['synced']} synced, "
+                    f"{mikrotik_results['errors']} errors, "
+                    f"{mikrotik_results['skipped']} skipped, "
+                    f"{mikrotik_results['routers_connected']} router(s) connected")
     except Exception as e:
         logger.error(f"[SYNC] Queue sync job failed: {e}", exc_info=True)
     finally:

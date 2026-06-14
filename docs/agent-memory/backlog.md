@@ -47,6 +47,13 @@ Project-level items that should survive across agent sessions.
 - Why it matters: expired billing state must not depend on live router availability, and operators need an early signal before stale router access accumulates.
 - Proposed next step: record cleanup job duration, skipped-run count, expired rows deactivated, router cleanup failures, and retry backlog age in a DB-backed or metrics-backed health record.
 
+### Hotspot Queue Repair Metrics
+
+- Status: planned
+- Problem: hotspot speed enforcement depends on removing RouterOS dynamic `hs-*` / `<hs-*>` parent queues and keeping per-customer `plan_<mac>` queues current, but the queue repair job currently only logs its activity.
+- Why it matters: operators need an early signal when parent queues are repeatedly regenerated or queue repair falls behind, before customers report unlimited speeds.
+- Proposed next step: record queue repair duration, routers processed, parent queues removed, queues created, queues updated, skipped recently-offline routers, and errors in job metrics or a small health endpoint.
+
 ### RADIUS Expansion
 
 - Status: planned

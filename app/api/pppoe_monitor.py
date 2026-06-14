@@ -8,7 +8,7 @@ from datetime import datetime
 from app.db.database import db_pool_snapshot, get_db
 from app.db.models import Customer, Plan, Router, UserBandwidthUsage
 from app.services.auth import verify_token, get_current_user
-from app.services.mikrotik_api import MikroTikAPI
+from app.services.mikrotik_api import MikroTikAPI, parse_speed_to_mikrotik
 from app.services.pppoe_provisioning import call_pppoe_remove
 from app.services.router_helpers import get_router_by_id
 from app.services.log_persistence import persist_notable_logs
@@ -702,6 +702,25 @@ def _parse_rate_to_bps(rate_str: str) -> int:
         return 0
 
 
+def _rate_limit_pair_bps(rate_limit: str) -> tuple[int, int] | None:
+    """Normalize a simple MikroTik rate-limit string into upload/download bps."""
+    if not rate_limit:
+        return None
+    first_token = str(rate_limit).strip().split(" ", 1)[0]
+    if not first_token:
+        return None
+    parts = first_token.split("/", 1)
+    upload = _parse_rate_to_bps(parts[0])
+    download = _parse_rate_to_bps(parts[1] if len(parts) > 1 else parts[0])
+    return upload, download
+
+
+def _rate_limits_match(actual: str, expected: str) -> bool:
+    actual_pair = _rate_limit_pair_bps(actual)
+    expected_pair = _rate_limit_pair_bps(expected)
+    return bool(actual_pair and expected_pair and actual_pair == expected_pair)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -824,6 +843,27 @@ async def pppoe_customer_presence(
         and bool(secret.get("profile"))
         and presence.get("profile_detail") is None
     )
+    expected_rate_limit = parse_speed_to_mikrotik(db_customer["plan_speed"] or "")
+    profile_rate_limit = (presence.get("profile_detail") or {}).get("rate_limit", "")
+    active_queue_limit = (presence.get("active_session") or {}).get("max_limit", "")
+    profile_rate_matches = (
+        _rate_limits_match(profile_rate_limit, expected_rate_limit)
+        if expected_rate_limit and profile_rate_limit
+        else None
+    )
+    active_queue_rate_matches = (
+        _rate_limits_match(active_queue_limit, expected_rate_limit)
+        if expected_rate_limit and active_queue_limit
+        else None
+    )
+    speed_enforcement = {
+        "plan_speed": db_customer["plan_speed"],
+        "expected_rate_limit": expected_rate_limit,
+        "profile_rate_limit": profile_rate_limit,
+        "profile_rate_matches_plan": profile_rate_matches,
+        "active_queue_limit": active_queue_limit,
+        "active_queue_matches_plan": active_queue_rate_matches,
+    }
     billing_active = (
         db_customer["status"] == "active"
         and not db_customer["is_expired"]
@@ -845,6 +885,18 @@ async def pppoe_customer_presence(
         verdict = {
             "code": "present_but_profile_missing",
             "message": "The PPP secret exists, but its referenced PPP profile was not found on the router.",
+            "our_side_confirmed": False,
+        }
+    elif profile_rate_matches is False:
+        verdict = {
+            "code": "rate_limit_mismatch",
+            "message": "The PPP secret profile rate-limit does not match the customer's selected plan speed.",
+            "our_side_confirmed": False,
+        }
+    elif active_queue_rate_matches is False:
+        verdict = {
+            "code": "active_queue_rate_mismatch",
+            "message": "The active PPPoE dynamic queue rate-limit does not match the selected plan; reconnect the PPPoE session.",
             "our_side_confirmed": False,
         }
     elif online is True:
@@ -882,6 +934,7 @@ async def pppoe_customer_presence(
             "value": row["pppoe_username"],
         },
         "billing_active": billing_active,
+        "speed_enforcement": speed_enforcement,
         "mikrotik": presence,
         "verdict": verdict,
     }

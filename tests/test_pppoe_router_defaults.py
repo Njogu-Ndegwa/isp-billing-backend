@@ -1,11 +1,18 @@
 from app.api.router_operations import _heal_dual_mode_sync
-from app.services.mikrotik_api import MikroTikAPI
+from app.services.mikrotik_api import MikroTikAPI, parse_speed_to_mikrotik
 
 
 def _connected_api():
     api = MikroTikAPI("10.0.0.1", "admin", "secret")
     api.connected = True
     return api
+
+
+def test_parse_speed_to_mikrotik_preserves_explicit_up_down_limits():
+    assert parse_speed_to_mikrotik("15Mbps") == "15M/15M"
+    assert parse_speed_to_mikrotik("2M/5M") == "2M/5M"
+    assert parse_speed_to_mikrotik("5/10") == "5M/10M"
+    assert parse_speed_to_mikrotik("5000000/10000000") == "5000000/10000000"
 
 
 def test_hotspot_html_dir_defaults_to_hotspot_for_live_repairs():

@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.api import customer_routes, pppoe_monitor
 from app.db.models import ConnectionType, Customer, CustomerStatus
@@ -37,6 +37,9 @@ async def _seed_pppoe_customer(db, *, status=CustomerStatus.INACTIVE):
 
 async def test_delete_customer_deprovisions_inactive_pppoe_before_db_delete(db, monkeypatch):
     reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.INACTIVE)
+    await db.execute(text("CREATE TABLE IF NOT EXISTS radius_check (customer_id INTEGER)"))
+    await db.execute(text("CREATE TABLE IF NOT EXISTS radius_reply (customer_id INTEGER)"))
+    await db.commit()
     calls = []
 
     async def _cleanup(payload):
@@ -198,6 +201,108 @@ async def test_pppoe_customer_presence_uses_db_values_and_reports_offline(db, mo
         "username": "Festo",
         "acquire_timeout_seconds": pppoe_monitor._PRESENCE_ACQUIRE_TIMEOUT_SECONDS,
     }]
+
+
+async def test_pppoe_customer_presence_flags_plan_rate_mismatch(db, monkeypatch):
+    pppoe_monitor._pppoe_presence_cache.clear()
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+
+    async def _run_with_guard(_router_id, _fn, _router_info, username, **_kwargs):
+        return {
+            "success": True,
+            "username": username,
+            "present_on_router": True,
+            "online": False,
+            "state": "offline",
+            "secret": {
+                "name": username,
+                "service": "pppoe",
+                "profile": "pppoe_10M_10M",
+                "disabled": False,
+            },
+            "active_session": None,
+            "profile_detail": {"name": "pppoe_10M_10M", "rate_limit": "10M/10M"},
+            "profile_lookup_success": True,
+            "profile_lookup_error": None,
+            "session_lookup_success": True,
+            "session_lookup_error": None,
+        }
+
+    monkeypatch.setattr(pppoe_monitor, "run_with_guard", _run_with_guard)
+
+    response = await pppoe_monitor.pppoe_customer_presence(customer.id, db, _token(reseller), refresh=True)
+
+    assert response["speed_enforcement"] == {
+        "plan_speed": "5M/5M",
+        "expected_rate_limit": "5M/5M",
+        "profile_rate_limit": "10M/10M",
+        "profile_rate_matches_plan": False,
+        "active_queue_limit": "",
+        "active_queue_matches_plan": None,
+    }
+    assert response["verdict"]["code"] == "rate_limit_mismatch"
+    assert response["verdict"]["our_side_confirmed"] is False
+
+
+async def test_edit_active_pppoe_plan_reprovisions_with_new_speed(db, monkeypatch):
+    reseller = await make_reseller(db)
+    old_plan = await make_plan(
+        db,
+        reseller,
+        connection_type=ConnectionType.PPPOE,
+        speed="20M/20M",
+    )
+    new_plan = await make_plan(
+        db,
+        reseller,
+        connection_type=ConnectionType.PPPOE,
+        speed="5M/5M",
+    )
+    router = await make_router(db, reseller)
+    customer = await make_customer(
+        db,
+        reseller,
+        old_plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=1),
+        mac_address=None,
+        pppoe_username="plan_change_user",
+        pppoe_password="secret",
+    )
+
+    async def fake_current_user(_token, _db):
+        return reseller
+
+    provision_calls = []
+    remove_calls = []
+
+    async def fake_provision(payload):
+        provision_calls.append(payload)
+        return {"success": True}
+
+    async def fake_remove(payload):
+        remove_calls.append(payload)
+        return {"success": True}
+
+    monkeypatch.setattr(customer_routes, "get_current_user", fake_current_user)
+    monkeypatch.setattr(customer_routes, "call_pppoe_provision", fake_provision)
+    monkeypatch.setattr(customer_routes, "call_pppoe_remove", fake_remove)
+
+    response = await customer_routes.edit_customer(
+        customer.id,
+        customer_routes.CustomerEditRequest(plan_id=new_plan.id),
+        db,
+        "token",
+    )
+
+    assert response["success"] is True
+    assert response["pppoe_reprovisioned"] == "ok"
+    assert response["customer"]["plan_id"] == new_plan.id
+    assert len(provision_calls) == 1
+    assert provision_calls[0]["pppoe_username"] == "plan_change_user"
+    assert provision_calls[0]["bandwidth_limit"] == "5M/5M"
+    assert remove_calls == []
 
 
 async def test_pppoe_customer_presence_requires_pppoe_username(db, monkeypatch):

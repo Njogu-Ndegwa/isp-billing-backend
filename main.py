@@ -97,6 +97,7 @@ app.include_router(portal_router)
 from app.services.mikrotik_background import (
     cleanup_expired_users_background,
     collect_bandwidth_snapshot,
+    sync_active_user_queues,
     # Exported for late-imports from router files
     remove_user_from_mikrotik,
     router_locks,
@@ -1685,6 +1686,14 @@ async def startup_event():
         max_instances=1
     )
     scheduler.add_job(
+        sync_active_user_queues,
+        trigger=IntervalTrigger(seconds=313),
+        id='sync_active_user_queues',
+        name='Repair hotspot plan queues',
+        replace_existing=True,
+        max_instances=1
+    )
+    scheduler.add_job(
         retry_pending_hotspot_provisioning_background,
         trigger=IntervalTrigger(seconds=97),
         id='retry_pending_hotspot_provisioning',
@@ -1788,7 +1797,8 @@ async def startup_event():
     scheduler.start()
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "
-        "hotspot provisioning retry every 97s, M-Pesa reconciliation every 90s, "
+        "queue repair every 313s, hotspot provisioning retry every 97s, "
+        "M-Pesa reconciliation every 90s, "
         "stale token cleanup daily at 00:00 UTC (3:00 AM EAT)"
     )
 

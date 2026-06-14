@@ -223,7 +223,9 @@ async def edit_customer(
         old_pppoe_username = customer.pppoe_username
         old_pppoe_password = customer.pppoe_password
         old_router_id = customer.router_id
+        old_plan_id = customer.plan_id
         pppoe_changed = False
+        pppoe_location_changed = False
 
         update_fields = request.model_dump(exclude_none=True)
         if "expiry" in update_fields and update_fields["expiry"] is not None:
@@ -236,15 +238,25 @@ async def edit_customer(
                 customer.pppoe_username != old_pppoe_username
                 or customer.pppoe_password != old_pppoe_password
                 or customer.router_id != old_router_id
+                or customer.plan_id != old_plan_id
+            )
+            pppoe_location_changed = (
+                customer.pppoe_username != old_pppoe_username
+                or customer.router_id != old_router_id
             )
 
         await db.commit()
         await db.refresh(customer, attribute_names=["plan", "router"])
 
         provision_status = None
-        if pppoe_changed and customer.router and customer.plan:
+        if (
+            pppoe_changed
+            and customer.router
+            and customer.plan
+            and customer.plan.connection_type == ConnectionType.PPPOE
+        ):
             remove_payload = None
-            if old_pppoe_username and old_router_id:
+            if pppoe_location_changed and old_pppoe_username and old_router_id:
                 try:
                     old_router_stmt = select(Router).where(Router.id == old_router_id)
                     old_router_result = await db.execute(old_router_stmt)
