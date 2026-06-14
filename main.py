@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text as sa_text
-from app.db.database import get_db, async_engine
+from app.db.database import get_db, async_engine, Base
 from app.services.plan_cache import warm_plan_cache
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -1565,6 +1565,55 @@ async def run_anti_tethering_migrations():
             logger.info("Anti-tethering migration: added routers.hotspot_sharing_blocked")
 
 
+async def run_messaging_migrations():
+    """Create messaging/SMS enums, tables, indexes; seed settings. Idempotent."""
+    from sqlalchemy import text, inspect
+
+    enums = {
+        "smscredittxnkind": ["purchase", "send_debit", "refund", "admin_adjustment"],
+        "smscreditorderstatus": ["pending", "completed", "failed", "expired"],
+        "smscampaignstatus": ["queued", "sending", "completed", "partial", "failed", "canceled"],
+        "smsmessagestatus": ["queued", "sent", "delivered", "failed"],
+        "smsmessagekind": ["reseller_to_customer", "admin_to_reseller"],
+    }
+    async with async_engine.begin() as conn:
+        for name, values in enums.items():
+            vals = ", ".join(f"'{v}'" for v in values)
+            await conn.execute(text(
+                f"DO $$ BEGIN CREATE TYPE {name} AS ENUM ({vals}); "
+                f"EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+            ))
+
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+
+        from app.db.models import (
+            MessagingSettings, SmsCreditAccount, SmsCreditTransaction,
+            SmsCreditOrder, MessageTemplate, SmsCampaign, SmsMessage,
+            ResellerInboxMessage,
+        )
+        targets = [
+            MessagingSettings, SmsCreditAccount, SmsCreditTransaction,
+            SmsCreditOrder, MessageTemplate, SmsCampaign, SmsMessage,
+            ResellerInboxMessage,
+        ]
+        to_create = [m.__table__ for m in targets if m.__tablename__ not in tables]
+        if to_create:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
+
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_sms_messages_failed "
+            "ON sms_messages(created_at) WHERE status = 'failed'"
+        ))
+        await conn.execute(text(
+            "INSERT INTO messaging_settings (id) VALUES (1) "
+            "ON CONFLICT (id) DO NOTHING"
+        ))
+    logger.info("Migration: Messaging/SMS tables, enums, indexes ready")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -1668,6 +1717,12 @@ async def startup_event():
         logger.info("Anti-tethering migrations completed successfully")
     except Exception as e:
         logger.error(f"Anti-tethering migration failed (non-fatal): {e}")
+
+    try:
+        await run_messaging_migrations()
+        logger.info("Messaging migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Messaging migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,
