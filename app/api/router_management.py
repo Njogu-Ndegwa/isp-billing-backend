@@ -751,7 +751,7 @@ async def _proxy_webfig_request(
             follow_redirects=False,
             timeout=httpx.Timeout(
                 connect=5.0,
-                read=float(settings.ROUTER_WEBFIG_PROXY_TIMEOUT_SECONDS),
+                read=_webfig_proxy_read_timeout(proxy_path),
                 write=10.0,
                 pool=5.0,
             ),
@@ -869,6 +869,17 @@ def _build_webfig_upstream_url(session, proxy_path: str) -> str:
     default_port = 443 if scheme == "https" else 80
     port_part = "" if port == default_port else f":{port}"
     return f"{scheme}://{session.router_ip}{port_part}/{proxy_path.lstrip('/')}"
+
+
+def _webfig_proxy_read_timeout(proxy_path: str) -> float:
+    configured = float(settings.ROUTER_WEBFIG_PROXY_TIMEOUT_SECONDS)
+    if _is_webfig_jsproxy_path(proxy_path):
+        return max(configured, 120.0)
+    return configured
+
+
+def _is_webfig_jsproxy_path(proxy_path: str) -> bool:
+    return proxy_path.lstrip("/").split("/", 1)[0].lower() == "jsproxy"
 
 
 def _webfig_upstream_host_header(session) -> str:
@@ -1080,13 +1091,13 @@ def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -
     )
 
     meta_refresh_url = re.compile(
-        r"(?i)(?P<lead>\burl\s*=\s*)(?P<url>https?://[^\s;\"'>]+|/webfig[^\s;\"'>]*)"
+        r"(?i)(?P<lead>\burl\s*=\s*)(?P<url>https?://[^\s;\"'>]+|/(?:webfig[^\s;\"'>]*|[#?][^\s;\"'>]*)?)"
     )
     text = meta_refresh_url.sub(lambda m: f"{m.group('lead')}{rewrite(m.group('url'))}", text)
 
     root_json_redirect = re.compile(
         r"(?i)(?P<lead>[\"'](?:redirect|location|url|path|href)[\"']\s*:\s*)"
-        r"(?P<quote>[\"'])(?P<url>/)(?P=quote)"
+        r"(?P<quote>[\"'])(?P<url>/(?:[#?][^\"']*)?)(?P=quote)"
     )
     text = root_json_redirect.sub(
         lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
@@ -1095,9 +1106,18 @@ def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -
 
     root_js_redirect = re.compile(
         r"(?i)(?P<lead>\b(?:window\.|top\.)?location(?:\.href)?\s*=\s*)"
-        r"(?P<quote>[\"'])(?P<url>/)(?P=quote)"
+        r"(?P<quote>[\"'])(?P<url>/(?:[#?][^\"']*)?)(?P=quote)"
     )
     text = root_js_redirect.sub(
+        lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
+        text,
+    )
+
+    root_location_methods = re.compile(
+        r"(?i)(?P<lead>\b(?:window\.|top\.)?location\.(?:assign|replace)\(\s*)"
+        r"(?P<quote>[\"'])(?P<url>/(?:[#?][^\"']*)?)(?P=quote)"
+    )
+    text = root_location_methods.sub(
         lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
         text,
     )

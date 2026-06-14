@@ -412,9 +412,12 @@ async def test_webfig_proxy_uses_session_cookie_and_rewrites_router_paths(monkey
                     b'<meta http-equiv="refresh" content="0;url=/webfig/">'
                     b'<script>'
                     b'window.location="/webfig/";'
+                    b'window.location="/#Interface";'
                     b"top.location.href='https://isp.bitwavetechnologies.com/webfig/';"
                     b'location.replace("/webfig/#interfaces");'
+                    b"location.assign('/#Routes');"
                     b'</script>'
+                    b'<meta http-equiv="refresh" content="0;url=/#QuickSet">'
                     b'<style>.logo{background:url(/webfig/logo.png)}</style>'
                     b'</html>'
                 ),
@@ -440,9 +443,12 @@ async def test_webfig_proxy_uses_session_cookie_and_rewrites_router_paths(monkey
     assert b'src="/api/admin/routers/77/webfig/webfig/app.js"' in response.body
     assert b"action=/api/admin/routers/77/webfig/webfig/" in response.body
     assert b"content=\"0;url=/api/admin/routers/77/webfig/webfig/\"" in response.body
+    assert b"content=\"0;url=/api/admin/routers/77/webfig/#QuickSet\"" in response.body
     assert b'window.location="/api/admin/routers/77/webfig/webfig/"' in response.body
+    assert b'window.location="/api/admin/routers/77/webfig/#Interface"' in response.body
     assert b"top.location.href='/api/admin/routers/77/webfig/webfig/'" in response.body
     assert b'location.replace("/api/admin/routers/77/webfig/webfig/#interfaces")' in response.body
+    assert b"location.assign('/api/admin/routers/77/webfig/#Routes')" in response.body
     assert b"url(/api/admin/routers/77/webfig/webfig/logo.png)" in response.body
     set_cookie_headers = [
         value.decode()
@@ -597,7 +603,7 @@ async def test_webfig_jsproxy_escape_proxy_uses_active_session_cookie(monkeypatc
             return httpx.Response(
                 200,
                 headers={"content-type": "application/json"},
-                content=b'{"redirect":"/"}',
+                content=b'{"redirect":"/#Interface","path":"/?tab=system"}',
             )
 
     monkeypatch.setattr(router_management.httpx, "AsyncClient", FakeAsyncClient)
@@ -624,7 +630,9 @@ async def test_webfig_jsproxy_escape_proxy_uses_active_session_cookie(monkeypatc
     assert captured["request"]["url"] == "http://10.0.81.1/jsproxy?action=login"
     assert captured["request"]["content"] == b"username=admin&password=secret"
     assert captured["request"]["headers"]["cookie"] == "mikrotik_session=abc"
-    assert b'"/api/admin/routers/81/webfig/"' in response.body
+    assert captured["client_kwargs"]["timeout"].read == 120.0
+    assert b'"/api/admin/routers/81/webfig/#Interface"' in response.body
+    assert b'"/api/admin/routers/81/webfig/?tab=system"' in response.body
     router_remote_access.revoke_webfig_proxy_sessions(81)
 
 
