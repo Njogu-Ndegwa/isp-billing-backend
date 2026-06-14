@@ -1838,6 +1838,25 @@ async def startup_event():
         misfire_grace_time=900,
     )
 
+    async def _prune_sms_messages_background():
+        from app.services.sms_dispatch import prune_old_messages
+        try:
+            pruned = await prune_old_messages()
+            if pruned:
+                logger.info(f"[MESSAGING] Retention pruned {pruned} rows")
+        except Exception as e:
+            logger.error(f"[MESSAGING] Retention prune failed: {e}")
+
+    scheduler.add_job(
+        _prune_sms_messages_background,
+        trigger=CronTrigger(hour=3, minute=30),
+        id='prune_sms_messages',
+        name='Prune old SMS message rows past retention window',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=900,
+    )
+
     from app.config import settings as app_settings
     if app_settings.MPESA_B2B_DAILY_PAYOUT_ENABLED:
         scheduler.add_job(
