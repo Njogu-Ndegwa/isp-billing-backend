@@ -693,6 +693,44 @@ async def proxy_router_webfig_root_escape(
     )
 
 
+@router.api_route(
+    "/jsproxy",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@router.api_route(
+    "/jsproxy/{proxy_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def proxy_router_webfig_jsproxy_escape(
+    request: Request,
+    proxy_path: str = "",
+):
+    """
+    Catch RouterOS WebFig login RPC calls that escape to /jsproxy at our domain root.
+
+    RouterOS WebFig uses /jsproxy after the login page has loaded from /webfig.
+    That endpoint is outside our normal /api/admin/routers/{id}/webfig proxy
+    prefix, so it needs the same short-lived active-session fallback.
+    """
+    router_id, session = _webfig_session_from_root_cookie(request)
+    if not session:
+        return _webfig_expired_response()
+
+    escaped_path = "jsproxy"
+    if request.url.path.endswith("/") and not proxy_path:
+        escaped_path += "/"
+    if proxy_path:
+        escaped_path += "/" + proxy_path.lstrip("/")
+
+    return await _proxy_webfig_request(
+        router_id,
+        request,
+        escaped_path,
+        session,
+        refresh_access_cookies=False,
+    )
+
+
 async def _proxy_webfig_request(
     router_id: int,
     request: Request,
@@ -890,7 +928,7 @@ def _set_webfig_access_cookies(response: Response, router_id: int, session) -> N
         max_age=max_age,
         httponly=True,
         samesite="lax",
-        path="/webfig",
+        path="/",
     )
 
 
@@ -913,7 +951,7 @@ def _webfig_expired_response() -> Response:
         status_code=403,
         media_type="text/html",
     )
-    response.delete_cookie(_WEBFIG_ROOT_ACCESS_COOKIE, path="/webfig")
+    response.delete_cookie(_WEBFIG_ROOT_ACCESS_COOKIE, path="/")
     return response
 
 
@@ -1045,6 +1083,24 @@ def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -
         r"(?i)(?P<lead>\burl\s*=\s*)(?P<url>https?://[^\s;\"'>]+|/webfig[^\s;\"'>]*)"
     )
     text = meta_refresh_url.sub(lambda m: f"{m.group('lead')}{rewrite(m.group('url'))}", text)
+
+    root_json_redirect = re.compile(
+        r"(?i)(?P<lead>[\"'](?:redirect|location|url|path|href)[\"']\s*:\s*)"
+        r"(?P<quote>[\"'])(?P<url>/)(?P=quote)"
+    )
+    text = root_json_redirect.sub(
+        lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
+        text,
+    )
+
+    root_js_redirect = re.compile(
+        r"(?i)(?P<lead>\b(?:window\.|top\.)?location(?:\.href)?\s*=\s*)"
+        r"(?P<quote>[\"'])(?P<url>/)(?P=quote)"
+    )
+    text = root_js_redirect.sub(
+        lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
+        text,
+    )
 
     return text.encode(encoding, errors="replace")
 

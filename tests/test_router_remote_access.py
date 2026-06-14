@@ -451,7 +451,7 @@ async def test_webfig_proxy_uses_session_cookie_and_rewrites_router_paths(monkey
     ]
     assert any("mikrotik_session=abc" in header and "Path=/api/admin/routers/77/webfig" in header for header in set_cookie_headers)
     assert any("webfig_access_77=" in header and "HttpOnly" in header for header in set_cookie_headers)
-    assert any("webfig_active_proxy=77:" in header and "Path=/webfig" in header for header in set_cookie_headers)
+    assert any("webfig_active_proxy=77:" in header and "Path=/" in header for header in set_cookie_headers)
     router_remote_access.revoke_webfig_proxy_sessions(77)
 
 
@@ -568,9 +568,81 @@ async def test_webfig_root_escape_proxy_uses_active_session_cookie(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_webfig_jsproxy_escape_proxy_uses_active_session_cookie(monkeypatch):
+    session = router_remote_access.create_webfig_proxy_session(
+        router_id=81,
+        router_name="Router-81",
+        router_ip="10.0.81.1",
+        created_by_user_id=1,
+    )
+    captured = {}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def request(self, method, url, headers=None, content=None):
+            captured["request"] = {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "content": content,
+            }
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=b'{"redirect":"/"}',
+            )
+
+    monkeypatch.setattr(router_management.httpx, "AsyncClient", FakeAsyncClient)
+
+    response = await router_management.proxy_router_webfig_jsproxy_escape(
+        _request(
+            "/jsproxy",
+            "action=login",
+            method="POST",
+            body=b"username=admin&password=secret",
+            headers=[
+                (b"host", b"testserver"),
+                (
+                    b"cookie",
+                    f"webfig_active_proxy=81:{session.token}; webfig_access_81={session.token}; mikrotik_session=abc".encode(),
+                ),
+            ],
+        ),
+        "",
+    )
+
+    assert response.status_code == 200
+    assert captured["request"]["method"] == "POST"
+    assert captured["request"]["url"] == "http://10.0.81.1/jsproxy?action=login"
+    assert captured["request"]["content"] == b"username=admin&password=secret"
+    assert captured["request"]["headers"]["cookie"] == "mikrotik_session=abc"
+    assert b'"/api/admin/routers/81/webfig/"' in response.body
+    router_remote_access.revoke_webfig_proxy_sessions(81)
+
+
+@pytest.mark.asyncio
 async def test_webfig_root_escape_rejects_missing_active_session():
     response = await router_management.proxy_router_webfig_root_escape(
         _request("/webfig/"),
+        "",
+    )
+
+    assert response.status_code == 403
+    assert b"WebFig access expired" in response.body
+
+
+@pytest.mark.asyncio
+async def test_webfig_jsproxy_escape_rejects_missing_active_session():
+    response = await router_management.proxy_router_webfig_jsproxy_escape(
+        _request("/jsproxy", method="POST"),
         "",
     )
 
