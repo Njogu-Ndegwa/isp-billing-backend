@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 import uuid
 import secrets
 import string
@@ -28,6 +30,7 @@ WG_SERVER_IP = ipaddress.IPv4Address("10.0.0.1")
 WG_IP_RANGE = (ipaddress.IPv4Address("10.0.0.2"), ipaddress.IPv4Address("10.0.99.255"))
 L2TP_IP_RANGE = (ipaddress.IPv4Address("10.0.100.0"), ipaddress.IPv4Address("10.0.199.255"))
 TOKEN_EXPIRY_HOURS = 24
+INSURANCE_KEY_CONTEXT = b"bitwave-insurance-wireguard-v1"
 
 LOGIN_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
@@ -91,6 +94,91 @@ def generate_wireguard_keypair() -> Tuple[str, str]:
         format=serialization.PublicFormat.Raw
     )
     return base64.b64encode(private_bytes).decode(), base64.b64encode(public_bytes).decode()
+
+
+def derive_insurance_ip(router_ip: str, target_subnet: str | None = None) -> str:
+    """Map a primary management IP in 10.0.0.0/16 into the backup management subnet."""
+    source_ip = ipaddress.IPv4Address(router_ip)
+    if source_ip not in WG_SUBNET:
+        raise ValueError(f"Router IP {router_ip} is outside {WG_SUBNET}; cannot derive backup IP")
+
+    target = ipaddress.IPv4Network(target_subnet or settings.INSURANCE_WG_SUBNET)
+    if target.prefixlen != WG_SUBNET.prefixlen:
+        raise ValueError(f"Insurance subnet {target} must use /16 to preserve router host offsets")
+
+    offset = int(source_ip) - int(WG_SUBNET.network_address)
+    mapped = ipaddress.IPv4Address(int(target.network_address) + offset)
+    if mapped not in target:
+        raise ValueError(f"Derived backup IP {mapped} is outside {target}")
+    return str(mapped)
+
+
+def derive_insurance_wireguard_keypair(
+    token_value: str,
+    identity: str,
+    primary_ip: str,
+    primary_private_key: str,
+) -> Tuple[str, str]:
+    """Derive stable backup WG keys so script re-fetches match manager registration.
+
+    The token stores only the primary router private key. A deterministic child
+    key avoids a schema change while still giving the backup interface its own
+    WireGuard public key.
+    """
+    if not primary_private_key:
+        raise ValueError("Cannot derive backup WireGuard key without primary private key")
+
+    message = f"{token_value}:{identity}:{primary_ip}".encode("utf-8")
+    private_bytes = hmac.new(
+        primary_private_key.encode("utf-8"),
+        INSURANCE_KEY_CONTEXT + b":" + message,
+        hashlib.sha256,
+    ).digest()
+    private_key = X25519PrivateKey.from_private_bytes(private_bytes)
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return base64.b64encode(private_bytes).decode(), base64.b64encode(public_bytes).decode()
+
+
+def _token_insurance_wireguard_keypair(token: ProvisioningToken) -> Tuple[str, str]:
+    return derive_insurance_wireguard_keypair(
+        token_value=token.token,
+        identity=token.identity,
+        primary_ip=token.wireguard_ip,
+        primary_private_key=token.wg_private_key,
+    )
+
+
+def _insurance_l2tp_psk() -> str:
+    return (settings.INSURANCE_L2TP_IPSEC_PSK or settings.L2TP_IPSEC_PSK or "").strip()
+
+
+def _missing_insurance_settings(vpn_type: str) -> list[str]:
+    required = [
+        "INSURANCE_WG_MANAGER_URL",
+        "INSURANCE_WG_MANAGER_SECRET",
+        "INSURANCE_SERVER_PUBLIC_IP",
+        "INSURANCE_SERVER_VPN_IP",
+        "INSURANCE_WG_SUBNET",
+    ]
+    if vpn_type == "wireguard":
+        required.append("INSURANCE_SERVER_WG_PUBLIC_KEY")
+
+    missing = [name for name in required if not (getattr(settings, name, "") or "").strip()]
+    if vpn_type == "l2tp" and not _insurance_l2tp_psk():
+        missing.append("INSURANCE_L2TP_IPSEC_PSK or L2TP_IPSEC_PSK")
+    return missing
+
+
+def _require_insurance_settings(vpn_type: str) -> None:
+    missing = _missing_insurance_settings(vpn_type)
+    if missing:
+        raise ValueError(
+            "Backup tunnel provisioning is enabled but insurance setting(s) are missing: "
+            + ", ".join(missing)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +494,30 @@ def _rsc_vpn_wireguard(token: ProvisioningToken) -> str:
 :delay 3s"""
 
 
+def _rsc_backup_wireguard(token: ProvisioningToken) -> str:
+    backup_ip = derive_insurance_ip(token.wireguard_ip)
+    backup_private_key, _backup_public_key = _token_insurance_wireguard_keypair(token)
+    interface_name = settings.INSURANCE_ROUTER_INTERFACE
+    return f"""
+# ---- STEP 3B: BACKUP WIREGUARD VPN (new server insurance tunnel) ----
+
+:do {{
+    /interface wireguard add name={interface_name} listen-port={settings.INSURANCE_WG_PORT} private-key="{backup_private_key}"
+}} on-error={{
+    /interface wireguard set [find where name={interface_name}] listen-port={settings.INSURANCE_WG_PORT} private-key="{backup_private_key}"
+}}
+:do {{ /ip address add address={backup_ip}/16 interface={interface_name} }} on-error={{}}
+:do {{
+    /interface wireguard peers add interface={interface_name} public-key="{settings.INSURANCE_SERVER_WG_PUBLIC_KEY}" endpoint-address={settings.INSURANCE_SERVER_PUBLIC_IP} endpoint-port={settings.INSURANCE_WG_PORT} allowed-address={settings.INSURANCE_WG_SUBNET} persistent-keepalive=25
+}} on-error={{
+    /interface wireguard peers set [find where interface={interface_name}] public-key="{settings.INSURANCE_SERVER_WG_PUBLIC_KEY}" endpoint-address={settings.INSURANCE_SERVER_PUBLIC_IP} endpoint-port={settings.INSURANCE_WG_PORT} allowed-address={settings.INSURANCE_WG_SUBNET} persistent-keepalive=25
+}}
+:do {{ /ip firewall filter add chain=input protocol=udp dst-port={settings.INSURANCE_WG_PORT} action=accept comment="Allow backup WireGuard" }} on-error={{}}
+
+:log info "Provisioning: backup WireGuard tunnel configured"
+:delay 3s"""
+
+
 def _rsc_vpn_l2tp(token: ProvisioningToken) -> str:
     return f"""
 # ---- STEP 3: L2TP/IPsec VPN (RouterOS v6) ----
@@ -437,6 +549,29 @@ def _rsc_vpn_l2tp(token: ProvisioningToken) -> str:
 }} else={{
     :log info "Provisioning: L2TP tunnel connected"
 }}"""
+
+
+def _rsc_backup_l2tp(token: ProvisioningToken) -> str:
+    interface_name = settings.INSURANCE_L2TP_INTERFACE
+    return f"""
+# ---- STEP 3B: BACKUP L2TP/IPsec VPN (new server insurance tunnel) ----
+
+:do {{
+    /interface l2tp-client add name={interface_name} connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=no allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Insurance tunnel to new AWS"
+}} on-error={{
+    /interface l2tp-client set [find where name={interface_name}] connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=no allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Insurance tunnel to new AWS"
+}}
+
+:do {{
+    :local bwSetInsuranceIpsec [:parse "/interface l2tp-client set [find where name={interface_name}] use-ipsec=yes ipsec-secret={_insurance_l2tp_psk()}"]
+    $bwSetInsuranceIpsec
+    :log info "Provisioning: backup L2TP IPsec settings applied"
+}} on-error={{
+    :log warning "Provisioning: RouterOS rejected backup L2TP use-ipsec/ipsec-secret settings"
+}}
+
+:log info "Provisioning: backup L2TP/IPsec tunnel configured"
+:delay 15s"""
 
 
 def _rsc_hotspot(token: ProvisioningToken) -> str:
@@ -615,6 +750,13 @@ def _rsc_login_page(token: ProvisioningToken) -> str:
 
 
 def _rsc_walled_garden(token: ProvisioningToken) -> str:
+    backup_ip_line = ""
+    insurance_public_ip = (settings.INSURANCE_SERVER_PUBLIC_IP or "").strip()
+    if insurance_public_ip and insurance_public_ip != token.server_public_ip:
+        backup_ip_line = (
+            f'\n:do {{ /ip hotspot walled-garden ip add dst-address={insurance_public_ip}/32 '
+            'action=accept comment="Backup backend API IP" } on-error={}'
+        )
     return f"""
 # ---- STEP 6: WALLED GARDEN ----
 
@@ -624,16 +766,31 @@ def _rsc_walled_garden(token: ProvisioningToken) -> str:
 /ip hotspot walled-garden add dst-host=isp.bitwavetechnologies.com action=allow comment="Backend API (.com)"
 /ip hotspot walled-garden add dst-host=ispp.bitwavetechnologies.com action=allow comment="Backend API direct (not Cloudflare-proxied)"
 :do {{ /ip hotspot walled-garden ip add dst-address={token.server_public_ip}/32 action=accept comment="Backend API IP" }} on-error={{}}
+{backup_ip_line}
 
 :log info "Provisioning: Walled garden configured" """
 
 
 def _rsc_api_access() -> str:
-    return """
-# ---- STEP 7: ENABLE MIKROTIK API (restricted to VPN server) ----
+    sources = [str(WG_SERVER_IP)]
+    backup_source = (settings.INSURANCE_SERVER_VPN_IP or "").strip()
+    if backup_source and backup_source not in sources:
+        sources.append(backup_source)
 
-/ip service set api address=10.0.0.1/32 port=8728 disabled=no
-:do { /ip firewall filter add chain=input protocol=tcp dst-port=8728 src-address=10.0.0.1 action=accept comment="Allow API from AWS" place-before=0 } on-error={}"""
+    address_list = ",".join(f"{source}/32" for source in sources)
+    firewall_lines = []
+    for source in sources:
+        comment = "Allow API from primary AWS" if source == str(WG_SERVER_IP) else "Allow API from backup AWS"
+        firewall_lines.append(
+            f':do {{ /ip firewall filter add chain=input protocol=tcp dst-port=8728 '
+            f'src-address={source} action=accept comment="{comment}" place-before=0 }} on-error={{}}'
+        )
+
+    return f"""
+# ---- STEP 7: ENABLE MIKROTIK API (restricted to VPN servers) ----
+
+/ip service set api address={address_list} port=8728 disabled=no
+{chr(10).join(firewall_lines)}"""
 
 
 def _rsc_identity_and_user(token: ProvisioningToken) -> str:
@@ -682,8 +839,10 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 
     if token.vpn_type == "l2tp":
         parts.append(_rsc_vpn_l2tp(token))
+        parts.append(_rsc_backup_l2tp(token))
     else:
         parts.append(_rsc_vpn_wireguard(token))
+        parts.append(_rsc_backup_wireguard(token))
 
     parts.append(_rsc_hotspot(token))
     parts.append(_rsc_login_page(token))
@@ -755,7 +914,7 @@ async def create_provisioning_token(
     1. Auto-generate router name and identity
     2. Generate VPN credentials (WG keypair or L2TP user/pass)
     3. Allocate next available VPN IP from the correct range
-    4. Register peer on server via wg-manager sidecar
+    4. Register primary and backup peers on their tunnel managers
     5. Auto-generate API service account password
     6. Save token to database
     """
@@ -768,30 +927,55 @@ async def create_provisioning_token(
             "Set it to your AWS server's public IP in .env"
         )
 
+    _require_insurance_settings(vpn_type)
+
     router_name = await _generate_router_name(db, user_id)
     identity = await _generate_identity(db)
     vpn_ip = await allocate_vpn_ip(db, vpn_type)
+    backup_ip = derive_insurance_ip(vpn_ip)
     api_password = generate_api_password()
+    token_value = uuid.uuid4().hex
 
     # --- VPN-specific setup ---
     wg_private_key = wg_public_key = server_wg_pubkey = None
+    backup_wg_public_key = None
     l2tp_username = l2tp_password = None
+    primary_registered = False
+    backup_registered = False
 
-    if vpn_type == "wireguard":
-        wg_private_key, wg_public_key = generate_wireguard_keypair()
-        await register_wireguard_peer(wg_public_key, vpn_ip)
-    else:
-        l2tp_username = generate_l2tp_username(identity)
-        l2tp_password = generate_api_password(20)
-        await register_l2tp_peer(l2tp_username, l2tp_password, vpn_ip)
+    # Release the transaction opened by the allocation SELECTs before the
+    # manager HTTP calls. A slow manager must not pin a pooled DB connection.
+    await db.commit()
 
     try:
         if vpn_type == "wireguard":
+            from app.services.insurance_wireguard import register_insurance_peer
+
+            wg_private_key, wg_public_key = generate_wireguard_keypair()
+            _backup_private_key, backup_wg_public_key = derive_insurance_wireguard_keypair(
+                token_value=token_value,
+                identity=identity,
+                primary_ip=vpn_ip,
+                primary_private_key=wg_private_key,
+            )
+            await register_wireguard_peer(wg_public_key, vpn_ip)
+            primary_registered = True
             server_wg_pubkey = await get_server_wg_public_key()
+            await register_insurance_peer(backup_wg_public_key, backup_ip)
+            backup_registered = True
+        else:
+            from app.services.insurance_l2tp import register_insurance_l2tp_peer
+
+            l2tp_username = generate_l2tp_username(identity)
+            l2tp_password = generate_api_password(20)
+            await register_l2tp_peer(l2tp_username, l2tp_password, vpn_ip)
+            primary_registered = True
+            await register_insurance_l2tp_peer(l2tp_username, l2tp_password, backup_ip)
+            backup_registered = True
 
         token_obj = ProvisioningToken(
             user_id=user_id,
-            token=uuid.uuid4().hex,
+            token=token_value,
             router_name=router_name,
             identity=identity,
             wireguard_ip=vpn_ip,
@@ -815,16 +999,42 @@ async def create_provisioning_token(
         await db.commit()
         await db.refresh(token_obj)
     except Exception as inner_err:
-        logger.error(f"Provisioning failed after VPN peer added: {type(inner_err).__name__}: {repr(inner_err)}", exc_info=True)
-        try:
-            if vpn_type == "wireguard" and wg_public_key:
-                await remove_wireguard_peer(wg_public_key)
-                logger.info(f"Rolled back WG peer for {vpn_ip} after failure")
-            elif vpn_type == "l2tp" and l2tp_username:
-                await remove_l2tp_peer(l2tp_username)
-                logger.info(f"Rolled back L2TP peer for {vpn_ip} after failure")
-        except Exception as cleanup_err:
-            logger.warning(f"Failed to roll back VPN peer for {vpn_ip}: {cleanup_err}")
+        await db.rollback()
+        logger.error(
+            "Provisioning failed after tunnel manager work: "
+            f"{type(inner_err).__name__}: {repr(inner_err)}",
+            exc_info=True,
+        )
+        if vpn_type == "wireguard":
+            try:
+                if backup_registered and backup_wg_public_key:
+                    from app.services.insurance_wireguard import remove_insurance_peer
+
+                    await remove_insurance_peer(backup_wg_public_key)
+                    logger.info(f"Rolled back backup WG peer for {backup_ip} after failure")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to roll back backup WG peer for {backup_ip}: {cleanup_err}")
+            try:
+                if primary_registered and wg_public_key:
+                    await remove_wireguard_peer(wg_public_key)
+                    logger.info(f"Rolled back primary WG peer for {vpn_ip} after failure")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to roll back primary WG peer for {vpn_ip}: {cleanup_err}")
+        else:
+            try:
+                if backup_registered and l2tp_username:
+                    from app.services.insurance_l2tp import remove_insurance_l2tp_peer
+
+                    await remove_insurance_l2tp_peer(l2tp_username)
+                    logger.info(f"Rolled back backup L2TP peer for {backup_ip} after failure")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to roll back backup L2TP peer for {backup_ip}: {cleanup_err}")
+            try:
+                if primary_registered and l2tp_username:
+                    await remove_l2tp_peer(l2tp_username)
+                    logger.info(f"Rolled back primary L2TP peer for {vpn_ip} after failure")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to roll back primary L2TP peer for {vpn_ip}: {cleanup_err}")
         raise
 
     logger.info(

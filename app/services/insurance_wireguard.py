@@ -401,6 +401,14 @@ async def register_insurance_peer(router_public_key: str, backup_ip: str) -> Dic
     )
 
 
+async def remove_insurance_peer(router_public_key: str) -> Dict[str, Any]:
+    return await insurance_manager_request(
+        "DELETE",
+        "/remove-peer",
+        json={"public_key": router_public_key},
+    )
+
+
 async def verify_insurance_router(backup_ip: str, port: int = 8728) -> Dict[str, Any]:
     return await insurance_manager_request(
         "POST",

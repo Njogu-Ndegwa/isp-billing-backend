@@ -150,3 +150,11 @@ async def register_insurance_l2tp_peer(username: str, password: str, backup_ip: 
         "/add-l2tp-peer",
         json={"username": username, "password": password, "ip": backup_ip},
     )
+
+
+async def remove_insurance_l2tp_peer(username: str) -> Dict[str, Any]:
+    return await insurance_manager_request(
+        "DELETE",
+        "/remove-l2tp-peer",
+        json={"username": username},
+    )

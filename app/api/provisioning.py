@@ -16,6 +16,7 @@ from app.services.provisioning import (
     get_login_page_html,
     complete_provisioning,
     is_token_expired,
+    derive_insurance_ip,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,7 @@ async def create_provision_token(
         "vpn_type": token_obj.vpn_type,
         "is_routerboard": token_obj.is_routerboard,
         "vpn_ip": token_obj.wireguard_ip,
+        "backup_vpn_ip": derive_insurance_ip(token_obj.wireguard_ip),
         "command": command,
         "note": note,
         "created_at": token_obj.created_at.isoformat(),
@@ -149,6 +151,7 @@ async def list_provision_tokens(
             "vpn_type": t.vpn_type,
             "is_routerboard": t.is_routerboard,
             "vpn_ip": t.wireguard_ip,
+            "backup_vpn_ip": derive_insurance_ip(t.wireguard_ip),
             "status": t.status.value if hasattr(t.status, "value") else t.status,
             "expired": is_token_expired(t) and t.status == ProvisioningTokenStatus.PENDING,
             "command": build_provision_command(t) if t.status == ProvisioningTokenStatus.PENDING and not is_token_expired(t) else None,
@@ -252,6 +255,7 @@ async def complete_provision(
         "router_id": router_obj.id,
         "identity": router_obj.identity,
         "vpn_ip": router_obj.ip_address,
+        "backup_vpn_ip": derive_insurance_ip(router_obj.ip_address),
         "vpn_type": token_obj.vpn_type,
         "message": f"Router '{router_obj.name}' registered successfully",
     }
