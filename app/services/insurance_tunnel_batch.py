@@ -286,6 +286,37 @@ async def get_current_insurance_tunnel_batch() -> Optional[Dict[str, Any]]:
         return _public_job(latest)
 
 
+async def get_latest_insurance_tunnel_items_by_router(
+    router_ids: Optional[Iterable[int]] = None,
+) -> Dict[int, Dict[str, Any]]:
+    """Return the latest stored batch item per router without doing network I/O."""
+    wanted = {int(router_id) for router_id in router_ids} if router_ids else None
+    latest: Dict[int, Dict[str, Any]] = {}
+
+    async with _jobs_lock:
+        jobs = sorted(
+            _jobs.values(),
+            key=lambda job: job.get("updated_at") or job.get("created_at") or "",
+            reverse=True,
+        )
+        for job in jobs:
+            for item in job.get("items", []):
+                router_id = item.get("router_id")
+                if router_id is None:
+                    continue
+                router_id = int(router_id)
+                if wanted is not None and router_id not in wanted:
+                    continue
+                if router_id in latest:
+                    continue
+                item_copy = dict(item)
+                item_copy["job_id"] = job.get("job_id")
+                item_copy["job_status"] = job.get("status")
+                item_copy["job_updated_at"] = job.get("updated_at")
+                latest[router_id] = item_copy
+    return latest
+
+
 async def start_insurance_tunnel_batch(
     *,
     router_ids: Optional[List[int]] = None,
