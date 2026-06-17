@@ -646,6 +646,32 @@ def _gateway_error(result) -> str:
     return result.error or result.status.value
 
 
+def _short_text(value: Any, max_length: int = 160) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text if len(text) <= max_length else f"{text[:max_length - 3]}..."
+
+
+def _verification_error(verification: Dict[str, Any]) -> str:
+    ping_success = bool(verification.get("ping_success"))
+    tcp_success = bool(verification.get("tcp_success"))
+    parts = [
+        f"ping={'ok' if ping_success else 'failed'}",
+        f"tcp={'ok' if tcp_success else 'failed'}",
+    ]
+    tcp_error = _short_text(verification.get("tcp_error"))
+    if tcp_error:
+        parts.append(f"tcp_error={tcp_error}")
+    if not ping_success:
+        ping_error = _short_text(verification.get("ping_stderr") or verification.get("ping_stdout"))
+        if ping_error:
+            parts.append(f"ping_output={ping_error}")
+    return f"Insurance tunnel applied but verification did not fully pass ({'; '.join(parts)})"
+
+
 async def _process_candidate(
     job_id: str,
     candidate: InsuranceTunnelCandidate,
@@ -795,6 +821,23 @@ async def _verify_candidate(
 ) -> None:
     verification = await verify_insurance_router(candidate.backup_ip, port=candidate.router.port)
     verified = bool(verification.get("ping_success") and verification.get("tcp_success"))
+    error = None if verified else _verification_error(verification)
+    if verified:
+        logger.info(
+            "Insurance tunnel verified for router %s (%s -> %s)",
+            candidate.router.id,
+            candidate.router.ip_address,
+            candidate.backup_ip,
+        )
+    else:
+        logger.warning(
+            "Insurance tunnel partial for router %s (%s -> %s): %s; verification=%s",
+            candidate.router.id,
+            candidate.router.ip_address,
+            candidate.backup_ip,
+            error,
+            verification,
+        )
     await _update_item(
         job_id,
         candidate.router.id,
@@ -803,5 +846,5 @@ async def _verify_candidate(
         router_actions=router_config.get("actions", []),
         verification=verification,
         finished_at=_now_iso(),
-        error=None if verified else "Insurance tunnel applied but verification did not fully pass",
+        error=error,
     )

@@ -127,3 +127,19 @@ def test_tunnel_type_filter_uses_planned_token_type():
     )
 
     assert [candidate.router.id for candidate in selected] == [3]
+
+
+def test_verification_error_includes_ping_and_tcp_details():
+    error = batch._verification_error({
+        "ip": "10.250.0.85",
+        "port": 8728,
+        "ping_success": False,
+        "ping_stderr": "3 packets transmitted, 0 received",
+        "tcp_success": False,
+        "tcp_error": "timed out",
+    })
+
+    assert "ping=failed" in error
+    assert "tcp=failed" in error
+    assert "tcp_error=timed out" in error
+    assert "3 packets transmitted" in error
