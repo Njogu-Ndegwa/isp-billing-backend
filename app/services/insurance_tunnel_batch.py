@@ -43,6 +43,8 @@ MAX_BATCH_LIMIT = 50
 MAX_BATCH_CONCURRENCY = 3
 ACTIVE_OWNER_STATUSES = {"active", "trial"}
 PAID_OWNER_STATUSES = {"active"}
+VERIFICATION_ATTEMPTS = 3
+VERIFICATION_RETRY_DELAY_SECONDS = 15
 SELECTION_MODES = {
     "all",
     "online",
@@ -819,22 +821,46 @@ async def _verify_candidate(
     manager_result: Dict[str, Any],
     router_config: Dict[str, Any],
 ) -> None:
-    verification = await verify_insurance_router(candidate.backup_ip, port=candidate.router.port)
-    verified = bool(verification.get("ping_success") and verification.get("tcp_success"))
+    verification: Dict[str, Any] = {}
+    verification_attempts = []
+    verified = False
+    for attempt in range(1, VERIFICATION_ATTEMPTS + 1):
+        verification = await verify_insurance_router(candidate.backup_ip, port=candidate.router.port)
+        verified = bool(verification.get("ping_success") and verification.get("tcp_success"))
+        verification_attempts.append({
+            "attempt": attempt,
+            "verified": verified,
+            "verification": verification,
+        })
+        if verified:
+            break
+        if attempt < VERIFICATION_ATTEMPTS:
+            await _update_item(
+                job_id,
+                candidate.router.id,
+                status="running",
+                error=_verification_error(verification),
+                verification=verification,
+                verification_attempts=verification_attempts,
+            )
+            await asyncio.sleep(VERIFICATION_RETRY_DELAY_SECONDS)
+
     error = None if verified else _verification_error(verification)
     if verified:
         logger.info(
-            "Insurance tunnel verified for router %s (%s -> %s)",
+            "Insurance tunnel verified for router %s (%s -> %s) after %s attempt(s)",
             candidate.router.id,
             candidate.router.ip_address,
             candidate.backup_ip,
+            len(verification_attempts),
         )
     else:
         logger.warning(
-            "Insurance tunnel partial for router %s (%s -> %s): %s; verification=%s",
+            "Insurance tunnel partial for router %s (%s -> %s) after %s attempt(s): %s; verification=%s",
             candidate.router.id,
             candidate.router.ip_address,
             candidate.backup_ip,
+            len(verification_attempts),
             error,
             verification,
         )
@@ -845,6 +871,7 @@ async def _verify_candidate(
         manager=manager_result,
         router_actions=router_config.get("actions", []),
         verification=verification,
+        verification_attempts=verification_attempts,
         finished_at=_now_iso(),
         error=error,
     )

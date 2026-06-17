@@ -143,3 +143,59 @@ def test_verification_error_includes_ping_and_tcp_details():
     assert "tcp=failed" in error
     assert "tcp_error=timed out" in error
     assert "3 packets transmitted" in error
+
+
+def test_verify_candidate_retries_until_backup_reachability_passes(monkeypatch):
+    candidate = make_candidate(82)
+    calls = []
+
+    async def fake_verify(_backup_ip, port=8728):
+        calls.append((candidate.backup_ip, port))
+        if len(calls) == 1:
+            return {
+                "ip": candidate.backup_ip,
+                "port": port,
+                "ping_success": False,
+                "tcp_success": False,
+                "tcp_error": "No route to host",
+            }
+        return {
+            "ip": candidate.backup_ip,
+            "port": port,
+            "ping_success": True,
+            "tcp_success": True,
+            "tcp_error": None,
+        }
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def run():
+        async with batch._jobs_lock:
+            batch._jobs.clear()
+            batch._active_job_id = None
+            batch._jobs["job"] = {
+                "job_id": "job",
+                "status": "running",
+                "created_at": "2026-06-17T00:00:00Z",
+                "updated_at": "2026-06-17T00:00:00Z",
+                "items": [batch._item_from_candidate(candidate)],
+            }
+
+        try:
+            await batch._verify_candidate("job", candidate, {}, {"actions": []})
+            item = (await batch.get_insurance_tunnel_batch("job"))["items"][0]
+        finally:
+            async with batch._jobs_lock:
+                batch._jobs.clear()
+                batch._active_job_id = None
+
+        assert item["status"] == "verified"
+        assert item["error"] is None
+        assert len(item["verification_attempts"]) == 2
+        assert len(calls) == 2
+
+    monkeypatch.setattr(batch, "verify_insurance_router", fake_verify)
+    monkeypatch.setattr(batch.asyncio, "sleep", no_sleep)
+
+    asyncio.run(run())
