@@ -2,6 +2,7 @@ import pytest
 
 from app.services.insurance_wireguard import (
     InsuranceWireGuardError,
+    backup_ips_from_manager_peers,
     configure_router_backup_wireguard,
     parse_routeros_major_version,
 )
@@ -65,6 +66,24 @@ def test_parse_routeros_major_version():
     assert parse_routeros_major_version("7.19.6 (stable)") == 7
     assert parse_routeros_major_version("6.49.10") == 6
     assert parse_routeros_major_version("") is None
+
+
+def test_backup_ips_from_manager_peers_extracts_router_backup_addresses():
+    payload = {
+        "peers": [
+            {"allowed_ips": "10.250.0.28/32"},
+            {"allowed_ips": "10.250.0.29/32, 192.168.1.0/24"},
+            {"allowed_ips": ["10.250.0.30/32", "not-a-cidr"]},
+            {"allowed_ips": ""},
+            {"public_key": "missing-allowed-ips"},
+        ]
+    }
+
+    assert backup_ips_from_manager_peers(payload) == {
+        "10.250.0.28",
+        "10.250.0.29",
+        "10.250.0.30",
+    }
 
 
 def test_insurance_wireguard_refuses_routeros_v6_before_writes():

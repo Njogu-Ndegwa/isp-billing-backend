@@ -31,9 +31,11 @@ from app.services.router_remote_access import (
 )
 from app.services.insurance_wireguard import (
     InsuranceWireGuardError,
+    backup_ips_from_manager_peers,
     build_plan,
     configure_router_backup_wireguard,
     derive_insurance_ip,
+    list_insurance_peers,
     parse_routeros_major_version,
     read_routeros_version,
     register_insurance_peer,
@@ -1180,18 +1182,19 @@ async def get_routers(
 ):
     """Get routers visible to the current user."""
     user = await get_current_user(token, db)
+    is_admin = user.role == UserRole.ADMIN
     stmt = (
         select(Router)
         .options(selectinload(Router.assigned_payment_method))
         .order_by(Router.id)
     )
-    if user.role != UserRole.ADMIN:
+    if not is_admin:
         stmt = stmt.where(Router.user_id == user.id)
     result = await db.execute(stmt)
     routers = result.scalars().all()
     token_by_router = {}
     owner_by_id = {}
-    if routers:
+    if routers and is_admin:
         token_result = await db.execute(
             select(ProvisioningToken)
             .where(ProvisioningToken.router_id.in_([router_obj.id for router_obj in routers]))
@@ -1200,33 +1203,34 @@ async def get_routers(
         for token_obj in token_result.scalars().all():
             token_by_router.setdefault(token_obj.router_id, token_obj)
 
-        if user.role == UserRole.ADMIN:
-            owner_ids = sorted({router_obj.user_id for router_obj in routers if router_obj.user_id})
-            if owner_ids:
-                owner_result = await db.execute(select(User).where(User.id.in_(owner_ids)))
-                owner_by_id = {owner.id: owner for owner in owner_result.scalars().all()}
+        owner_ids = sorted({router_obj.user_id for router_obj in routers if router_obj.user_id})
+        if owner_ids:
+            owner_result = await db.execute(select(User).where(User.id.in_(owner_ids)))
+            owner_by_id = {owner.id: owner for owner in owner_result.scalars().all()}
 
     latest_backup_by_router = (
         await get_latest_insurance_tunnel_items_by_router([router_obj.id for router_obj in routers])
-        if user.role == UserRole.ADMIN and routers
+        if is_admin and routers
         else {}
     )
+    await db.commit()
+
+    manager_backup_ips = set()
+    manager_lookup_error = None
+    if is_admin and routers:
+        try:
+            manager_backup_ips = backup_ips_from_manager_peers(await list_insurance_peers())
+        except InsuranceWireGuardError as exc:
+            manager_lookup_error = str(exc)
+            logger.warning("Could not list insurance WireGuard peers for admin router visibility: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - visibility should degrade instead of failing the page
+            manager_lookup_error = "Could not read insurance manager peer list"
+            logger.exception("Could not list insurance WireGuard peers for admin router visibility: %s", exc)
 
     response = []
     now = datetime.utcnow()
     for router_obj in routers:
         pm = router_obj.assigned_payment_method
-        token_obj = token_by_router.get(router_obj.id)
-        token_tunnel_type = _token_tunnel_type(token_obj)
-        owner = owner_by_id.get(router_obj.user_id)
-        try:
-            backup_ip = derive_insurance_ip(router_obj.ip_address)
-            backup_ip_error = None
-        except InsuranceWireGuardError as exc:
-            backup_ip = None
-            backup_ip_error = str(exc)
-        backup_item = latest_backup_by_router.get(router_obj.id) or {}
-        backup_status = "invalid_ip" if backup_ip_error else (backup_item.get("status") or "unknown")
         router_payload = {
             "id": router_obj.id,
             "name": router_obj.name,
@@ -1248,29 +1252,71 @@ async def get_routers(
             "emergency_active": getattr(router_obj, "emergency_active", False),
             "emergency_message": getattr(router_obj, "emergency_message", None),
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
-            "token_vpn_type": token_tunnel_type,
-            "planned_insurance_tunnel_type": _planned_tunnel_type_from_token(token_obj),
-            "owner_user_id": router_obj.user_id,
-            "owner_name": getattr(owner, "organization_name", None),
-            "owner_role": owner.role.value if owner and hasattr(owner.role, "value") else (str(owner.role) if owner else None),
-            "owner_subscription_status": (
-                owner.subscription_status.value
-                if owner and hasattr(owner.subscription_status, "value")
-                else (str(owner.subscription_status) if owner else None)
-            ),
-            "backup_ip": backup_ip,
-            "backup_ip_error": backup_ip_error,
-            "insurance_backup_status": backup_status,
-            "insurance_backup_active": backup_status == "verified",
-            "insurance_backup_checked_at": (
-                backup_item.get("finished_at")
-                or backup_item.get("updated_at")
-                or backup_item.get("job_updated_at")
-            ),
-            "insurance_backup_error": backup_ip_error or backup_item.get("error"),
-            "insurance_backup_job_id": backup_item.get("job_id"),
-            "insurance_backup_verification": backup_item.get("verification"),
         }
+        if is_admin:
+            token_obj = token_by_router.get(router_obj.id)
+            token_tunnel_type = _token_tunnel_type(token_obj)
+            owner = owner_by_id.get(router_obj.user_id)
+            try:
+                backup_ip = derive_insurance_ip(router_obj.ip_address)
+                backup_ip_error = None
+            except InsuranceWireGuardError as exc:
+                backup_ip = None
+                backup_ip_error = str(exc)
+            backup_item = latest_backup_by_router.get(router_obj.id) or {}
+            batch_status = backup_item.get("status")
+            backup_source = "batch" if batch_status else "manager"
+            backup_error = backup_ip_error or backup_item.get("error")
+
+            if backup_ip_error:
+                backup_status = "invalid_ip"
+                backup_source = "derived_ip"
+            elif batch_status in {"verified", "partial"}:
+                backup_status = batch_status
+            elif backup_ip and backup_ip in manager_backup_ips:
+                backup_status = "registered"
+                backup_source = "manager"
+                backup_error = None
+            elif token_tunnel_type == "l2tp":
+                backup_status = "unavailable"
+                backup_source = "l2tp"
+                backup_error = "L2TP backup status is only available after a batch verification result"
+            elif batch_status:
+                backup_status = batch_status
+            elif manager_lookup_error:
+                backup_status = "unavailable"
+                backup_source = "manager"
+                backup_error = manager_lookup_error
+            else:
+                backup_status = "missing"
+                backup_source = "manager"
+                backup_error = None
+
+            router_payload.update({
+                "token_vpn_type": token_tunnel_type,
+                "planned_insurance_tunnel_type": _planned_tunnel_type_from_token(token_obj),
+                "owner_user_id": router_obj.user_id,
+                "owner_name": getattr(owner, "organization_name", None),
+                "owner_role": owner.role.value if owner and hasattr(owner.role, "value") else (str(owner.role) if owner else None),
+                "owner_subscription_status": (
+                    owner.subscription_status.value
+                    if owner and hasattr(owner.subscription_status, "value")
+                    else (str(owner.subscription_status) if owner else None)
+                ),
+                "backup_ip": backup_ip,
+                "backup_ip_error": backup_ip_error,
+                "insurance_backup_status": backup_status,
+                "insurance_backup_source": backup_source,
+                "insurance_backup_active": backup_status in {"verified", "registered"},
+                "insurance_backup_checked_at": (
+                    backup_item.get("finished_at")
+                    or backup_item.get("updated_at")
+                    or backup_item.get("job_updated_at")
+                ),
+                "insurance_backup_error": backup_error,
+                "insurance_backup_job_id": backup_item.get("job_id"),
+                "insurance_backup_verification": backup_item.get("verification"),
+            })
         router_payload.update(build_router_status(router_obj, now=now))
         response.append(router_payload)
     return response

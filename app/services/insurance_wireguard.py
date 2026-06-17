@@ -1,7 +1,7 @@
 import ipaddress
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 
@@ -391,6 +391,41 @@ async def insurance_manager_request(
             f"Insurance wg-manager {path} returned {response.status_code}: {response.text}"
         )
     return response.json()
+
+
+def backup_ips_from_manager_peers(payload: Dict[str, Any]) -> Set[str]:
+    """Extract router backup /32 addresses from a wg-manager /peers response."""
+    backup_ips: Set[str] = set()
+    for peer in payload.get("peers") or []:
+        allowed_ips = peer.get("allowed_ips") if isinstance(peer, dict) else None
+        if isinstance(allowed_ips, str):
+            entries = allowed_ips.split(",")
+        elif isinstance(allowed_ips, list):
+            entries = allowed_ips
+        else:
+            continue
+
+        for entry in entries:
+            value = str(entry).strip()
+            if not value:
+                continue
+            if "/" not in value:
+                try:
+                    backup_ips.add(str(ipaddress.ip_address(value)))
+                except ValueError:
+                    logger.debug("Ignoring invalid wg-manager allowed IP value: %s", value)
+                continue
+            address, prefix = value.split("/", 1)
+            if prefix == "32" and address:
+                try:
+                    backup_ips.add(str(ipaddress.ip_address(address)))
+                except ValueError:
+                    logger.debug("Ignoring invalid wg-manager allowed IP value: %s", value)
+    return backup_ips
+
+
+async def list_insurance_peers() -> Dict[str, Any]:
+    return await insurance_manager_request("GET", "/peers")
 
 
 async def register_insurance_peer(router_public_key: str, backup_ip: str) -> Dict[str, Any]:
