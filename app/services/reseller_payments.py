@@ -4,6 +4,9 @@ from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta
 from fastapi import HTTPException
 from app.db.models import CollectionMode, Customer, CustomerPayment, ResellerFinancials, PaymentMethod, CustomerStatus, PaymentStatus
+import logging
+
+logger = logging.getLogger(__name__)
 
 async def record_customer_payment(
     db: AsyncSession,
@@ -97,6 +100,30 @@ async def record_customer_payment(
         logging.getLogger(__name__).error(
             f"[USAGE] on_renewal failed in reseller payment for customer {customer.id}: {renew_err}"
         )
+
+    if not customer.subscription_owner_id:
+        try:
+            from app.services.subscription_sharing import (
+                sync_shared_subscription_devices_after_owner_renewal,
+            )
+
+            synced_devices = await sync_shared_subscription_devices_after_owner_renewal(
+                db,
+                owner_customer=customer,
+                plan=customer.plan,
+            )
+            if synced_devices:
+                logger.info(
+                    "[SUBSCRIPTION-SHARE] Synced %d shared device(s) after payment for customer %s",
+                    len(synced_devices),
+                    customer.id,
+                )
+        except Exception as share_err:
+            logger.error(
+                "[SUBSCRIPTION-SHARE] Failed to sync shared devices for customer %s: %s",
+                customer.id,
+                share_err,
+            )
 
     # NOTE: Removed duplicate Payment record creation
     # CustomerPayment is the primary payment record - no need for both

@@ -18,6 +18,7 @@ router = APIRouter(tags=["plans"])
 
 VALID_PLAN_TYPES = [pt.value for pt in PlanType]
 VALID_FUP_ACTIONS = [a.value for a in FupAction]
+MAX_SHARED_USERS_LIMIT = 50
 
 
 def _parse_fup_action(value: Optional[str]) -> Optional[FupAction]:
@@ -39,6 +40,27 @@ def _serialize_plan_fup(plan: Plan) -> dict:
     }
 
 
+def _validate_max_shared_users(value: Optional[int]) -> int:
+    if value is None:
+        return 1
+    if value < 1:
+        raise HTTPException(status_code=400, detail="max_shared_users must be at least 1")
+    if value > MAX_SHARED_USERS_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_shared_users cannot exceed {MAX_SHARED_USERS_LIMIT}",
+        )
+    return value
+
+
+def _serialize_plan_sharing(plan: Plan) -> dict:
+    max_shared_users = int(plan.max_shared_users or 1)
+    return {
+        "max_shared_users": max_shared_users,
+        "sharing_enabled": max_shared_users > 1,
+    }
+
+
 class PlanCreateRequest(BaseModel):
     name: str
     speed: str
@@ -55,6 +77,7 @@ class PlanCreateRequest(BaseModel):
     data_cap_mb: Optional[int] = None
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
+    max_shared_users: Optional[int] = 1
 
 
 class PlanUpdateRequest(BaseModel):
@@ -73,6 +96,7 @@ class PlanUpdateRequest(BaseModel):
     data_cap_mb: Optional[int] = None
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
+    max_shared_users: Optional[int] = None
 
 
 @router.post("/api/plans/create")
@@ -141,6 +165,7 @@ async def create_plan_api(
         fup_action_enum = _parse_fup_action(request.fup_action)
         if request.data_cap_mb is not None and request.data_cap_mb < 0:
             raise HTTPException(status_code=400, detail="data_cap_mb cannot be negative")
+        max_shared_users = _validate_max_shared_users(request.max_shared_users)
 
         plan = Plan(
             name=request.name,
@@ -159,6 +184,7 @@ async def create_plan_api(
             data_cap_mb=request.data_cap_mb,
             fup_action=fup_action_enum,
             fup_throttle_profile=request.fup_throttle_profile,
+            max_shared_users=max_shared_users,
         )
         
         db.add(plan)
@@ -186,6 +212,7 @@ async def create_plan_api(
             "valid_until": plan.valid_until.isoformat() if plan.valid_until else None,
             "created_at": plan.created_at.isoformat(),
             **_serialize_plan_fup(plan),
+            **_serialize_plan_sharing(plan),
         }
     except HTTPException:
         raise
@@ -275,6 +302,8 @@ async def update_plan_api(
             plan.fup_action = _parse_fup_action(request.fup_action)
         if request.fup_throttle_profile is not None:
             plan.fup_throttle_profile = request.fup_throttle_profile if request.fup_throttle_profile != "" else None
+        if request.max_shared_users is not None:
+            plan.max_shared_users = _validate_max_shared_users(request.max_shared_users)
 
         await db.commit()
         await db.refresh(plan)
@@ -297,6 +326,7 @@ async def update_plan_api(
             "original_price": plan.original_price,
             "valid_until": plan.valid_until.isoformat() if plan.valid_until else None,
             **_serialize_plan_fup(plan),
+            **_serialize_plan_sharing(plan),
         }
     except HTTPException:
         raise
