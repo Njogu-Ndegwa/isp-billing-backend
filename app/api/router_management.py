@@ -155,6 +155,8 @@ class InsuranceTunnelBatchRequest(BaseModel):
     apply: bool = False
     router_ids: Optional[List[int]] = None
     limit: Optional[int] = None
+    selection_mode: Optional[str] = "all"
+    tunnel_type: Optional[str] = None
     max_concurrency: int = 2
     force_rotate: bool = False
 
@@ -173,6 +175,14 @@ class InsuranceTunnelBatchRequest(BaseModel):
             return None
         value = int(v)
         return value if value > 0 else None
+
+    @field_validator("selection_mode", "tunnel_type", mode="before")
+    @classmethod
+    def clean_batch_filters(cls, v):
+        if isinstance(v, str):
+            v = v.strip().lower()
+            return v if v else None
+        return v
 
 
 class RouterRemoteAccessRequest(BaseModel):
@@ -277,16 +287,20 @@ async def create_insurance_tunnel_batch(
 
     await db.commit()
 
-    if not request.apply:
-        return await preview_insurance_tunnel_batch(
-            router_ids=request.router_ids,
-            limit=request.limit,
-        )
-
     try:
+        if not request.apply:
+            return await preview_insurance_tunnel_batch(
+                router_ids=request.router_ids,
+                limit=request.limit,
+                selection_mode=request.selection_mode,
+                tunnel_type=request.tunnel_type,
+            )
+
         return await start_insurance_tunnel_batch(
             router_ids=request.router_ids,
             limit=request.limit,
+            selection_mode=request.selection_mode,
+            tunnel_type=request.tunnel_type,
             max_concurrency=request.max_concurrency,
             force_rotate=request.force_rotate,
         )
