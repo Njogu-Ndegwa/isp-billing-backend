@@ -812,6 +812,57 @@ async def run_device_pairing_migrations():
 
 
 # ============================================================================
+# Subscription Sharing Migrations (runs on startup, idempotent)
+# ============================================================================
+async def run_subscription_sharing_migrations():
+    """Add schema needed for plan-level subscription sharing.
+
+    Mirrors migrations/add_subscription_sharing.py so deploys do not depend on a
+    manual production migration step. Every operation is idempotent and safe to
+    re-run on each app start.
+    """
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TYPE provisioningattemptsource
+            ADD VALUE IF NOT EXISTS 'subscription_share'
+        """))
+        await conn.execute(sa_text("""
+            ALTER TYPE provisioningattemptentrypoint
+            ADD VALUE IF NOT EXISTS 'subscription_share'
+        """))
+
+        await conn.execute(sa_text("""
+            ALTER TABLE plans
+            ADD COLUMN IF NOT EXISTS max_shared_users INTEGER NOT NULL DEFAULT 1
+        """))
+        await conn.execute(sa_text("""
+            ALTER TABLE customers
+            ADD COLUMN IF NOT EXISTS subscription_owner_id INTEGER NULL
+            REFERENCES customers(id) ON DELETE SET NULL
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_customers_subscription_owner_id
+            ON customers(subscription_owner_id)
+        """))
+
+        await conn.execute(sa_text("""
+            ALTER TABLE device_pairings
+            ADD COLUMN IF NOT EXISTS subscription_owner_customer_id INTEGER NULL
+            REFERENCES customers(id) ON DELETE SET NULL
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_device_pairings_subscription_owner_customer_id
+            ON device_pairings(subscription_owner_customer_id)
+        """))
+        await conn.execute(sa_text("""
+            ALTER TABLE device_pairings
+            ADD COLUMN IF NOT EXISTS is_subscription_share BOOLEAN NOT NULL DEFAULT false
+        """))
+
+    logger.info("Migration: Subscription sharing columns, indexes, and enum values ready")
+
+
+# ============================================================================
 # B2B Payout Migrations (runs on startup, idempotent)
 # ============================================================================
 async def run_b2b_migrations():
@@ -1715,6 +1766,12 @@ async def startup_event():
         logger.info("Device pairing migrations completed successfully")
     except Exception as e:
         logger.error(f"Device pairing migration failed (non-fatal): {e}")
+
+    try:
+        await run_subscription_sharing_migrations()
+        logger.info("Subscription sharing migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Subscription sharing migration failed (non-fatal): {e}")
 
     try:
         await run_b2b_migrations()
