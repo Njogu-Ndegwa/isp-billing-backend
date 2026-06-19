@@ -1038,6 +1038,28 @@ class DevicePairing(Base):
     plan = relationship("Plan")
 
 
+class SubscriptionShareCode(Base):
+    """One-time code used to add a device to a paid subscription."""
+    __tablename__ = "subscription_share_codes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(16), unique=True, nullable=False, index=True)
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner_customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="active", server_default="active", index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    redeemed_customer_id = Column(Integer, ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True)
+    redeemed_pairing_id = Column(Integer, ForeignKey("device_pairings.id", ondelete="SET NULL"), nullable=True, index=True)
+    redeemed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    router = relationship("Router")
+    owner_customer = relationship("Customer", foreign_keys=[owner_customer_id])
+    redeemed_customer = relationship("Customer", foreign_keys=[redeemed_customer_id])
+    redeemed_pairing = relationship("DevicePairing")
+
+
 class GrowthTarget(Base):
     __tablename__ = "growth_targets"
     id = Column(Integer, primary_key=True, autoincrement=True)

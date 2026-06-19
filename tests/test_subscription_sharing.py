@@ -6,7 +6,11 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.api import device_pairing
-from app.api.device_pairing import ShareSubscriptionRequest
+from app.api.device_pairing import (
+    ShareSubscriptionCodeCreateRequest,
+    ShareSubscriptionCodeRedeemRequest,
+    ShareSubscriptionRequest,
+)
 from app.db.models import (
     Customer,
     CustomerStatus,
@@ -16,6 +20,7 @@ from app.db.models import (
     ProvisioningAttempt,
     ProvisioningAttemptEntrypoint,
     ProvisioningAttemptSource,
+    SubscriptionShareCode,
 )
 from app.services.reseller_payments import record_customer_payment
 from tests.factories import make_customer, make_plan, make_reseller, make_router
@@ -187,6 +192,131 @@ async def test_share_subscription_allows_second_shared_device_without_owner_mac(
         "AA:BB:CC:DD:EE:A2",
         "AA:BB:CC:DD:EE:A3",
     }
+
+
+@pytest.mark.asyncio
+async def test_share_code_redeems_detected_device_and_marks_code_used(db, monkeypatch):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, max_shared_users=2)
+    router = await make_router(db, reseller)
+    owner = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=2),
+        mac_address="AA:BB:CC:DD:EE:D1",
+        phone="254700000401",
+    )
+
+    tasks = []
+
+    async def fake_log(*_args, **_kwargs):
+        return None
+
+    async def fake_provision(*_args, **_kwargs):
+        return {"success": True}
+
+    def fake_create_task(coro):
+        task = asyncio.get_running_loop().create_task(coro)
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(device_pairing, "log_provisioning_event", fake_log)
+    monkeypatch.setattr(device_pairing, "provision_hotspot_customer", fake_provision)
+    monkeypatch.setattr(device_pairing.asyncio, "create_task", fake_create_task)
+
+    code_response = await device_pairing.create_share_subscription_code(
+        ShareSubscriptionCodeCreateRequest(
+            owner_phone="0700000401",
+            router_id=router.id,
+        ),
+        db,
+    )
+
+    assert code_response["success"] is True
+    assert len(code_response["raw_code"]) == 6
+    assert code_response["available_shared_devices"] == 2
+
+    response = await device_pairing.redeem_share_subscription_code(
+        ShareSubscriptionCodeRedeemRequest(
+            code=code_response["code"].lower(),
+            router_id=router.id,
+            device_mac="AA:BB:CC:DD:EE:D2",
+            device_name="Friend phone",
+            device_type="laptop",
+        ),
+        db,
+    )
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    assert response["success"] is True
+    assert response["owner_customer_id"] == owner.id
+    assert response["device_mac"] == "AA:BB:CC:DD:EE:D2"
+    assert response["active_shared_devices"] == 1
+
+    share_code = (
+        await db.execute(
+            select(SubscriptionShareCode).where(SubscriptionShareCode.code == code_response["raw_code"])
+        )
+    ).scalar_one()
+    assert share_code.status == "redeemed"
+    assert share_code.redeemed_customer_id == response["customer_id"]
+    assert share_code.redeemed_pairing_id == response["pairing_id"]
+    assert share_code.redeemed_at is not None
+
+    with pytest.raises(HTTPException) as exc:
+        await device_pairing.redeem_share_subscription_code(
+            ShareSubscriptionCodeRedeemRequest(
+                code=code_response["raw_code"],
+                router_id=router.id,
+                device_mac="AA:BB:CC:DD:EE:D3",
+            ),
+            db,
+        )
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_expired_share_code_cannot_be_redeemed(db):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, max_shared_users=2)
+    router = await make_router(db, reseller)
+    owner = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=2),
+        mac_address="AA:BB:CC:DD:EE:E1",
+        phone="254700000501",
+    )
+    share_code = SubscriptionShareCode(
+        code="ABC123",
+        router_id=router.id,
+        owner_customer_id=owner.id,
+        status="active",
+        expires_at=datetime.utcnow() - timedelta(minutes=1),
+    )
+    db.add(share_code)
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await device_pairing.redeem_share_subscription_code(
+            ShareSubscriptionCodeRedeemRequest(
+                code="ABC-123",
+                router_id=router.id,
+                device_mac="AA:BB:CC:DD:EE:E2",
+            ),
+            db,
+        )
+
+    assert exc.value.status_code == 400
+    await db.refresh(share_code)
+    assert share_code.status == "expired"
 
 
 @pytest.mark.asyncio

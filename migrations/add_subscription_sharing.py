@@ -5,6 +5,7 @@ Adds:
 - plans.max_shared_users: total devices/customers allowed on one paid plan.
 - customers.subscription_owner_id: companion customer rows that share an owner.
 - device_pairings subscription sharing metadata.
+- subscription_share_codes: one-time codes for phone/laptop-friendly sharing.
 - provisioning enum values used for shared-device delivery attempts.
 
 Idempotent: re-running is safe.
@@ -150,6 +151,37 @@ async def migrate():
         else:
             print("  - device_pairings.is_subscription_share already exists")
 
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS subscription_share_codes (
+                    id SERIAL PRIMARY KEY,
+                    code VARCHAR(16) UNIQUE NOT NULL,
+                    router_id INTEGER NOT NULL REFERENCES routers(id) ON DELETE CASCADE,
+                    owner_customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                    status VARCHAR(20) NOT NULL DEFAULT 'active',
+                    expires_at TIMESTAMP NOT NULL,
+                    redeemed_customer_id INTEGER NULL REFERENCES customers(id) ON DELETE SET NULL,
+                    redeemed_pairing_id INTEGER NULL REFERENCES device_pairings(id) ON DELETE SET NULL,
+                    redeemed_at TIMESTAMP NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        )
+        print("  - subscription_share_codes table ready")
+        for index_name, column in [
+            ("ix_subscription_share_codes_code", "code"),
+            ("ix_subscription_share_codes_owner_customer_id", "owner_customer_id"),
+            ("ix_subscription_share_codes_router_id", "router_id"),
+            ("ix_subscription_share_codes_status", "status"),
+            ("ix_subscription_share_codes_expires_at", "expires_at"),
+            ("ix_subscription_share_codes_redeemed_customer_id", "redeemed_customer_id"),
+            ("ix_subscription_share_codes_redeemed_pairing_id", "redeemed_pairing_id"),
+        ]:
+            await _ensure_index(conn, index_name, "subscription_share_codes", column)
+
         print("Migration completed successfully!")
 
 
@@ -158,6 +190,14 @@ async def rollback():
         await conn.execute(
             text("DROP INDEX IF EXISTS ix_device_pairings_subscription_owner_customer_id")
         )
+        await conn.execute(text("DROP INDEX IF EXISTS ix_subscription_share_codes_redeemed_pairing_id"))
+        await conn.execute(text("DROP INDEX IF EXISTS ix_subscription_share_codes_redeemed_customer_id"))
+        await conn.execute(text("DROP INDEX IF EXISTS ix_subscription_share_codes_expires_at"))
+        await conn.execute(text("DROP INDEX IF EXISTS ix_subscription_share_codes_status"))
+        await conn.execute(text("DROP INDEX IF EXISTS ix_subscription_share_codes_router_id"))
+        await conn.execute(text("DROP INDEX IF EXISTS ix_subscription_share_codes_owner_customer_id"))
+        await conn.execute(text("DROP INDEX IF EXISTS ix_subscription_share_codes_code"))
+        await conn.execute(text("DROP TABLE IF EXISTS subscription_share_codes"))
         await conn.execute(text("DROP INDEX IF EXISTS ix_customers_subscription_owner_id"))
         await conn.execute(
             text("ALTER TABLE device_pairings DROP COLUMN IF EXISTS is_subscription_share")

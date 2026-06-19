@@ -860,6 +860,50 @@ async def run_subscription_sharing_migrations():
             ADD COLUMN IF NOT EXISTS is_subscription_share BOOLEAN NOT NULL DEFAULT false
         """))
 
+        await conn.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS subscription_share_codes (
+                id SERIAL PRIMARY KEY,
+                code VARCHAR(16) UNIQUE NOT NULL,
+                router_id INTEGER NOT NULL REFERENCES routers(id) ON DELETE CASCADE,
+                owner_customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                status VARCHAR(20) NOT NULL DEFAULT 'active',
+                expires_at TIMESTAMP NOT NULL,
+                redeemed_customer_id INTEGER NULL REFERENCES customers(id) ON DELETE SET NULL,
+                redeemed_pairing_id INTEGER NULL REFERENCES device_pairings(id) ON DELETE SET NULL,
+                redeemed_at TIMESTAMP NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_subscription_share_codes_code
+            ON subscription_share_codes(code)
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_subscription_share_codes_owner_customer_id
+            ON subscription_share_codes(owner_customer_id)
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_subscription_share_codes_router_id
+            ON subscription_share_codes(router_id)
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_subscription_share_codes_status
+            ON subscription_share_codes(status)
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_subscription_share_codes_expires_at
+            ON subscription_share_codes(expires_at)
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_subscription_share_codes_redeemed_customer_id
+            ON subscription_share_codes(redeemed_customer_id)
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_subscription_share_codes_redeemed_pairing_id
+            ON subscription_share_codes(redeemed_pairing_id)
+        """))
+
     logger.info("Migration: Subscription sharing columns, indexes, and enum values ready")
 
 
