@@ -149,8 +149,6 @@ def _extract_provisioning_error(result: Dict[str, Any]) -> str | None:
     queue_error = queue_result.get("error")
     if queue_error:
         return f"queue_error: {queue_error}"
-    if queue_result.get("pending"):
-        return f"queue_pending: {queue_result.get('message', 'Customer queue not yet created')}"
 
     return None
 
@@ -180,17 +178,32 @@ def derive_delivery_status(
     return None
 
 
+def _is_queue_pending_error(error: str | None) -> bool:
+    return bool(error and str(error).lower().startswith("queue_pending:"))
+
+
 def serialize_delivery_attempt(attempt: ProvisioningAttempt | None) -> Dict[str, Any] | None:
     if not attempt:
         return None
 
+    provisioning_state = _enum_value(attempt.provisioning_state)
+    online_state = _enum_value(attempt.online_state)
+    last_error = attempt.last_error
+
+    if _is_queue_pending_error(last_error):
+        provisioning_state = ProvisioningState.ROUTER_UPDATED.value
+        if online_state == ProvisioningOnlineState.UNKNOWN.value:
+            online_state = ProvisioningOnlineState.OFFLINE.value
+        last_error = None
+    delivery_status = derive_delivery_status(provisioning_state, online_state)
+
     return {
         "attempt_id": attempt.id,
-        "delivery_status": derive_delivery_status(attempt.provisioning_state, attempt.online_state),
-        "provisioning_state": _enum_value(attempt.provisioning_state),
-        "online_state": _enum_value(attempt.online_state),
+        "delivery_status": delivery_status,
+        "provisioning_state": provisioning_state,
+        "online_state": online_state,
         "attempt_count": attempt.attempt_count,
-        "last_error": attempt.last_error,
+        "last_error": last_error,
         "last_attempt_at": attempt.last_attempt_at.isoformat() if attempt.last_attempt_at else None,
         "last_online_at": attempt.last_online_at.isoformat() if attempt.last_online_at else None,
         "external_reference": attempt.external_reference,

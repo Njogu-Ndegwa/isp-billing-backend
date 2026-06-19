@@ -3,7 +3,14 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.api import router_operations
-from app.db.models import CustomerStatus, CustomerUsagePeriod, FupAction
+from app.db.models import (
+    CustomerStatus,
+    CustomerUsagePeriod,
+    FupAction,
+    ProvisioningAttempt,
+    ProvisioningOnlineState,
+    ProvisioningState,
+)
 from app.services import hotspot_provisioning, mikrotik_background
 from app.services.mikrotik_api import MikroTikAPI, is_hotspot_parent_queue_name
 from tests.factories import make_customer, make_plan, make_reseller, make_router
@@ -44,7 +51,7 @@ def test_remove_hotspot_parent_queues_removes_angle_bracket_names():
     assert removed == ["*1"]
 
 
-def test_queue_pending_is_retryable_provisioning_error():
+def test_queue_pending_is_not_a_provisioning_error():
     result = hotspot_provisioning._extract_provisioning_error(
         {
             "profile_result": {"success": True},
@@ -54,7 +61,22 @@ def test_queue_pending_is_retryable_provisioning_error():
         }
     )
 
-    assert result == "queue_pending: Client not connected, queue pending"
+    assert result is None
+
+
+def test_queue_pending_attempt_serializes_as_access_ready():
+    attempt = ProvisioningAttempt(
+        provisioning_state=ProvisioningState.FAILED,
+        online_state=ProvisioningOnlineState.UNKNOWN,
+        last_error="queue_pending: Client not connected, queue pending",
+    )
+
+    result = hotspot_provisioning.serialize_delivery_attempt(attempt)
+
+    assert result["delivery_status"] == "access_ready"
+    assert result["provisioning_state"] == "router_updated"
+    assert result["online_state"] == "offline"
+    assert result["last_error"] is None
 
 
 @pytest.mark.asyncio
