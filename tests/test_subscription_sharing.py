@@ -112,6 +112,135 @@ async def test_share_subscription_creates_shared_customer_and_direct_attempt_wit
 
 
 @pytest.mark.asyncio
+async def test_share_subscription_allows_second_shared_device_without_owner_mac(db, monkeypatch):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, max_shared_users=3)
+    router = await make_router(db, reseller)
+    owner = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=2),
+        mac_address="AA:BB:CC:DD:EE:A1",
+        phone="254700000101",
+    )
+
+    tasks = []
+
+    async def fake_log(*_args, **_kwargs):
+        return None
+
+    async def fake_provision(*_args, **_kwargs):
+        return {"success": True}
+
+    def fake_create_task(coro):
+        task = asyncio.get_running_loop().create_task(coro)
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(device_pairing, "log_provisioning_event", fake_log)
+    monkeypatch.setattr(device_pairing, "provision_hotspot_customer", fake_provision)
+    monkeypatch.setattr(device_pairing.asyncio, "create_task", fake_create_task)
+
+    first = await device_pairing.share_subscription_with_device(
+        ShareSubscriptionRequest(
+            owner_phone="0700000101",
+            router_id=router.id,
+            device_mac="AA:BB:CC:DD:EE:A2",
+            device_name="Tablet",
+            device_type="other",
+        ),
+        db,
+    )
+    second = await device_pairing.share_subscription_with_device(
+        ShareSubscriptionRequest(
+            owner_phone="0700000101",
+            router_id=router.id,
+            device_mac="AA:BB:CC:DD:EE:A3",
+            device_name="Laptop",
+            device_type="laptop",
+        ),
+        db,
+    )
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    assert first["owner_customer_id"] == owner.id
+    assert first["active_shared_devices"] == 1
+    assert second["owner_customer_id"] == owner.id
+    assert second["active_shared_devices"] == 2
+    assert second["delivery"]["delivery_status"] == "activating"
+
+    pairings = (
+        await db.execute(
+            select(DevicePairing).where(
+                DevicePairing.subscription_owner_customer_id == owner.id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+                DevicePairing.is_active == True,  # noqa: E712
+            )
+        )
+    ).scalars().all()
+    assert {p.device_mac for p in pairings} == {
+        "AA:BB:CC:DD:EE:A2",
+        "AA:BB:CC:DD:EE:A3",
+    }
+
+
+@pytest.mark.asyncio
+async def test_share_subscription_without_owner_mac_prefers_shareable_owner(db, monkeypatch):
+    reseller = await make_reseller(db)
+    private_plan = await make_plan(db, reseller, max_shared_users=1)
+    share_plan = await make_plan(db, reseller, max_shared_users=3)
+    router = await make_router(db, reseller)
+    phone = "254700000201"
+    await make_customer(
+        db,
+        reseller,
+        private_plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=5),
+        mac_address="AA:BB:CC:DD:EE:B1",
+        phone=phone,
+    )
+    share_owner = await make_customer(
+        db,
+        reseller,
+        share_plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=1),
+        mac_address="AA:BB:CC:DD:EE:B2",
+        phone=phone,
+    )
+
+    async def fake_log(*_args, **_kwargs):
+        return None
+
+    async def fake_provision(*_args, **_kwargs):
+        return {"success": True}
+
+    monkeypatch.setattr(device_pairing, "log_provisioning_event", fake_log)
+    monkeypatch.setattr(device_pairing, "provision_hotspot_customer", fake_provision)
+    monkeypatch.setattr(device_pairing.asyncio, "create_task", lambda coro: asyncio.get_running_loop().create_task(coro))
+
+    response = await device_pairing.share_subscription_with_device(
+        ShareSubscriptionRequest(
+            owner_phone="0700000201",
+            router_id=router.id,
+            device_mac="AA:BB:CC:DD:EE:B3",
+            device_name="Phone",
+            device_type="other",
+        ),
+        db,
+    )
+
+    assert response["owner_customer_id"] == share_owner.id
+
+
+@pytest.mark.asyncio
 async def test_share_subscription_rejects_plan_with_no_sharing(db):
     reseller = await make_reseller(db)
     plan = await make_plan(db, reseller, max_shared_users=1)

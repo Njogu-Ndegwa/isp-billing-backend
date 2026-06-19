@@ -316,6 +316,7 @@ async def _find_share_owner_customer(
             Customer.expiry.isnot(None),
             Customer.expiry > now,
         )
+        .order_by(Customer.expiry.desc(), Customer.id.desc())
     )
     if owner_mac:
         normalized_owner_mac = _validate_device_mac(owner_mac)
@@ -335,10 +336,13 @@ async def _find_share_owner_customer(
             detail="No active hotspot subscription found for this phone on this router",
         )
     if len(hotspot_owners) > 1 and not owner_mac:
-        raise HTTPException(
-            status_code=409,
-            detail="Multiple active subscriptions found. Provide owner_mac to choose one.",
-        )
+        shareable_owners = [
+            owner for owner in hotspot_owners
+            if sharing_enabled_for_plan(owner.plan)
+        ]
+        if shareable_owners:
+            return shareable_owners[0]
+
     return hotspot_owners[0]
 
 
@@ -531,6 +535,7 @@ async def share_subscription_with_device(
                 "expiry": shared_customer.expiry.isoformat() if shared_customer.expiry else None,
                 "max_shared_users": max_shared_users,
                 "active_shared_devices": active_shared_count + 1,
+                "delivery": None,
                 "message": "Device added to shared subscription via RADIUS.",
             }
 
@@ -585,6 +590,7 @@ async def share_subscription_with_device(
             "expiry": shared_customer.expiry.isoformat() if shared_customer.expiry else None,
             "max_shared_users": max_shared_users,
             "active_shared_devices": active_shared_count + 1,
+            "delivery": serialize_delivery_attempt(attempt),
             "message": "Device added to shared subscription. Provisioning started.",
         }
 
