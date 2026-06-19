@@ -22,8 +22,10 @@ from app.db.models import (
     CustomerStatus,
     BandwidthSnapshot,
     UserBandwidthUsage,
+    CustomerUsagePeriod,
     Plan,
     ConnectionType,
+    FupAction,
     RouterAuthMethod,
     AccessCredential,
     AccessCredStatus,
@@ -39,6 +41,7 @@ from app.services.router_availability import (
     prune_router_availability_history,
 )
 from app.services.usage_tracking import record_usage
+from app.services.fup import hotspot_throttle_rate_for_plan
 from app.core.protected_devices import is_protected_device
 from app.config import settings
 import asyncio
@@ -1859,6 +1862,21 @@ async def sync_active_user_queues():
                 return
             logger.info(f"[SYNC] Found {len(active_customers)} active customers to check")
 
+            customer_ids = [c.id for c in active_customers]
+            fup_periods_by_customer_id = {}
+            if customer_ids:
+                fup_result = await db.execute(
+                    select(CustomerUsagePeriod).where(
+                        CustomerUsagePeriod.customer_id.in_(customer_ids),
+                        CustomerUsagePeriod.closed_at.is_(None),
+                        CustomerUsagePeriod.fup_triggered_at.isnot(None),
+                        CustomerUsagePeriod.fup_reverted_at.is_(None),
+                    )
+                )
+                fup_periods_by_customer_id = {
+                    period.customer_id: period for period in fup_result.scalars().all()
+                }
+
             router_customers_map = {}
             no_router_customers = 0
             skipped_offline_router_keys = set()
@@ -1874,7 +1892,25 @@ async def sync_active_user_queues():
                     skipped_offline_router_keys.add(router_key)
                     continue
 
-                customer_data = {"id": c.id, "mac_address": c.mac_address, "plan_speed": c.plan.speed}
+                plan_speed = c.plan.speed
+                fup_period = fup_periods_by_customer_id.get(c.id)
+                fup_action = (
+                    fup_period.fup_action_taken
+                    or fup_period.fup_action_snapshot
+                    or c.plan.fup_action
+                    if fup_period
+                    else None
+                )
+                if fup_action == FupAction.THROTTLE:
+                    plan_speed = hotspot_throttle_rate_for_plan(c.plan)
+
+                customer_data = {
+                    "id": c.id,
+                    "mac_address": c.mac_address,
+                    "plan_speed": plan_speed,
+                    "fup_active": bool(fup_period),
+                    "fup_action": fup_action.value if fup_action else None,
+                }
                 if router_key not in router_customers_map:
                     router_customers_map[router_key] = {
                         "router": {
@@ -2427,7 +2463,7 @@ async def collect_bandwidth_snapshot():
                                 hotspot_delta_download_bytes += delta_dn
                                 if customer and customer.plan and customer.plan.connection_type == ConnectionType.HOTSPOT:
                                     try:
-                                        await record_usage(
+                                        period = await record_usage(
                                             db,
                                             customer,
                                             delta_up,
@@ -2435,9 +2471,17 @@ async def collect_bandwidth_snapshot():
                                             plan=customer.plan,
                                             now=now,
                                         )
+                                        try:
+                                            from app.services.fup import evaluate_and_enforce
+                                        except ImportError:
+                                            evaluate_and_enforce = None
+                                        if evaluate_and_enforce is not None:
+                                            await evaluate_and_enforce(
+                                                db, customer, period, plan=customer.plan, now=now
+                                            )
                                     except Exception as usage_err:
                                         logger.error(
-                                            "[USAGE] Failed to record hotspot usage for %s: %s",
+                                            "[FUP] Failed to record/enforce hotspot usage for %s: %s",
                                             normalized_mac,
                                             usage_err,
                                         )

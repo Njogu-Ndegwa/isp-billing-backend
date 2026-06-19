@@ -39,6 +39,13 @@ def _serialize_plan_fup(plan: Plan) -> dict:
     }
 
 
+def _request_fields_set(model: BaseModel) -> set[str]:
+    return set(
+        getattr(model, "model_fields_set", None)
+        or getattr(model, "__fields_set__", set())
+    )
+
+
 class PlanCreateRequest(BaseModel):
     name: str
     speed: str
@@ -267,14 +274,19 @@ async def update_plan_api(
                 plan.valid_until = datetime.fromisoformat(request.valid_until.replace('Z', '+00:00')) if request.valid_until != "" else None
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid valid_until format. Use ISO 8601.")
-        if request.data_cap_mb is not None:
-            if request.data_cap_mb < 0:
+        fields_set = _request_fields_set(request)
+        if "data_cap_mb" in fields_set:
+            if request.data_cap_mb is not None and request.data_cap_mb < 0:
                 raise HTTPException(status_code=400, detail="data_cap_mb cannot be negative")
-            plan.data_cap_mb = request.data_cap_mb if request.data_cap_mb > 0 else None
-        if request.fup_action is not None:
+            plan.data_cap_mb = (
+                request.data_cap_mb
+                if request.data_cap_mb is not None and request.data_cap_mb > 0
+                else None
+            )
+        if "fup_action" in fields_set:
             plan.fup_action = _parse_fup_action(request.fup_action)
-        if request.fup_throttle_profile is not None:
-            plan.fup_throttle_profile = request.fup_throttle_profile if request.fup_throttle_profile != "" else None
+        if "fup_throttle_profile" in fields_set:
+            plan.fup_throttle_profile = request.fup_throttle_profile if request.fup_throttle_profile else None
 
         await db.commit()
         await db.refresh(plan)

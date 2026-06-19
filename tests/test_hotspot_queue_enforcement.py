@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.api import router_operations
-from app.db.models import CustomerStatus
+from app.db.models import CustomerStatus, CustomerUsagePeriod, FupAction
 from app.services import hotspot_provisioning, mikrotik_background
 from app.services.mikrotik_api import MikroTikAPI, is_hotspot_parent_queue_name
 from tests.factories import make_customer, make_plan, make_reseller, make_router
@@ -107,6 +107,76 @@ async def test_queue_sync_processes_only_capped_router_batch(db, session_factory
 
     assert len(calls) == 2
     assert all(len(customer_ids) == 1 for _router_name, customer_ids in calls)
+
+
+@pytest.mark.asyncio
+async def test_queue_sync_keeps_active_hotspot_fup_throttle(db, session_factory, monkeypatch):
+    monkeypatch.setattr(mikrotik_background, "async_session", session_factory)
+    monkeypatch.setattr(mikrotik_background, "queue_sync_running", False)
+    monkeypatch.setattr(mikrotik_background, "_queue_sync_router_cursor", 0)
+    monkeypatch.setattr(mikrotik_background, "QUEUE_SYNC_MAX_ROUTERS_PER_RUN", 1)
+    monkeypatch.setattr(mikrotik_background, "_background_db_pool_is_busy", lambda _job_name: False)
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(
+        db,
+        reseller,
+        speed="5M/5M",
+        data_cap_mb=1,
+        fup_action=FupAction.THROTTLE,
+        fup_throttle_profile="512K/512K",
+    )
+    router = await make_router(db, reseller, name="FUPQueueRouter")
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(hours=2),
+        mac_address="AA:BB:CC:DD:EE:FA",
+    )
+    db.add(
+        CustomerUsagePeriod(
+            customer_id=customer.id,
+            period_start=datetime.utcnow() - timedelta(minutes=30),
+            period_end=datetime.utcnow() + timedelta(hours=2),
+            upload_bytes=1_200_000,
+            download_bytes=1_200_000,
+            total_bytes=2_400_000,
+            cap_mb_snapshot=1,
+            fup_action_snapshot=FupAction.THROTTLE,
+            fup_triggered_at=datetime.utcnow() - timedelta(minutes=5),
+            fup_action_taken=FupAction.THROTTLE,
+        )
+    )
+    await db.commit()
+
+    calls = []
+
+    def fake_sync_single_router(router_info, customers_data):
+        calls.append((router_info, customers_data))
+        return {
+            "synced": 0,
+            "errors": 0,
+            "skipped": len(customers_data),
+            "routers_connected": 1,
+        }
+
+    monkeypatch.setattr(
+        mikrotik_background,
+        "_sync_single_router_queues_sync",
+        fake_sync_single_router,
+    )
+
+    await mikrotik_background.sync_active_user_queues()
+
+    assert len(calls) == 1
+    customer_payload = calls[0][1][0]
+    assert customer_payload["id"] == customer.id
+    assert customer_payload["plan_speed"] == "512K/512K"
+    assert customer_payload["fup_active"] is True
+    assert customer_payload["fup_action"] == "throttle"
 
 
 @pytest.mark.asyncio

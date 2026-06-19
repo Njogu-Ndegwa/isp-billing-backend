@@ -173,7 +173,8 @@ async def on_renewal(
 ) -> Optional[CustomerUsagePeriod]:
     """Renewal hook: close current period, open a new one, and lift any FUP.
 
-    Safe to call for any connection type; FUP revert is a no-op for non-PPPoE.
+    Safe to call for any connection type; FUP revert is a no-op unless the
+    previous period was actually throttled/blocked.
     Router-side FUP cleanup may release the supplied DB transaction before
     network I/O. Failures are logged and swallowed so payment processing is
     never blocked by a router glitch.

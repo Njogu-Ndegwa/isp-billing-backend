@@ -1,4 +1,4 @@
-"""Fair Usage Policy (FUP) enforcement for PPPoE customers.
+"""Fair Usage Policy (FUP) enforcement for customer access.
 
 Called once per snapshot cycle from the bandwidth collection job, and from
 renewal hooks (payment / mpesa / momo / zenopay reconciliation) to revert.
@@ -34,9 +34,11 @@ from app.db.models import (
     Plan,
     Router,
 )
-from app.services.mikrotik_api import MikroTikAPI
+from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, parse_speed_to_mikrotik
 
 logger = logging.getLogger("fup")
+
+DEFAULT_HOTSPOT_FUP_THROTTLE_RATE = "1M/1M"
 
 
 # --------------------------- Helpers ---------------------------
@@ -75,6 +77,21 @@ def _router_info(router: Router) -> dict:
         "password": router.password,
         "port": router.port,
     }
+
+
+def hotspot_throttle_rate_for_plan(plan: Optional[Plan]) -> str:
+    """Return the RouterOS rate string used when a hotspot plan is throttled."""
+    return parse_speed_to_mikrotik(
+        (plan.fup_throttle_profile if plan else None)
+        or DEFAULT_HOTSPOT_FUP_THROTTLE_RATE
+    )
+
+
+def _hotspot_identity(customer: Customer) -> tuple[Optional[str], Optional[str]]:
+    if not customer.mac_address:
+        return None, None
+    normalized_mac = normalize_mac_address(customer.mac_address)
+    return normalized_mac, normalized_mac.replace(":", "")
 
 
 # --------------------------- Sync MikroTik helpers ---------------------------
@@ -119,13 +136,290 @@ def _disable_secret_sync(router_info: dict, username: str) -> dict:
         api.disconnect()
 
 
+def _find_hotspot_queue(queues: list[dict], username: str, mac_address: str) -> Optional[dict]:
+    wanted_names = {f"plan_{username}".lower(), f"queue_{username}".lower()}
+    normalized = normalize_mac_address(mac_address)
+    compact = normalized.replace(":", "")
+    for queue in queues or []:
+        name = str(queue.get("name") or "").strip().lower()
+        comment = str(queue.get("comment") or "").upper()
+        if name in wanted_names:
+            return queue
+        if (
+            f"MAC:{normalized}".upper() in comment
+            or f"MAC:{compact}".upper() in comment
+            or normalized.upper() in comment
+            or compact.upper() in comment
+        ):
+            return queue
+    return None
+
+
+def _find_hotspot_binding(bindings: list[dict], mac_address: str) -> Optional[dict]:
+    normalized = normalize_mac_address(mac_address)
+    for binding in bindings or []:
+        binding_mac = binding.get("mac-address")
+        if binding_mac and normalize_mac_address(binding_mac) == normalized:
+            return binding
+    return None
+
+
+def _kick_hotspot_client(api: MikroTikAPI, normalized_mac: str, username: str) -> dict:
+    result = {"sessions_removed": 0, "hosts_removed": 0, "errors": []}
+
+    active = api.send_command("/ip/hotspot/active/print")
+    if active.get("success"):
+        for session in active.get("data", []) or []:
+            session_mac = session.get("mac-address")
+            session_user = str(session.get("user") or "")
+            if (
+                (session_mac and normalize_mac_address(session_mac) == normalized_mac)
+                or session_user.lower() == username.lower()
+            ):
+                sid = session.get(".id")
+                if not sid:
+                    continue
+                remove = api.send_command("/ip/hotspot/active/remove", {"numbers": sid})
+                if remove.get("error"):
+                    result["errors"].append(f"active:{remove['error']}")
+                else:
+                    result["sessions_removed"] += 1
+    elif active.get("error"):
+        result["errors"].append(f"active_print:{active['error']}")
+
+    hosts = api.send_command("/ip/hotspot/host/print")
+    if hosts.get("success"):
+        for host in hosts.get("data", []) or []:
+            host_mac = host.get("mac-address")
+            if host_mac and normalize_mac_address(host_mac) == normalized_mac:
+                hid = host.get(".id")
+                if not hid:
+                    continue
+                remove = api.send_command("/ip/hotspot/host/remove", {"numbers": hid})
+                if remove.get("error"):
+                    result["errors"].append(f"host:{remove['error']}")
+                else:
+                    result["hosts_removed"] += 1
+    elif hosts.get("error"):
+        result["errors"].append(f"host_print:{hosts['error']}")
+
+    return result
+
+
+def _set_hotspot_queue_limit_sync(
+    router_info: dict,
+    mac_address: str,
+    rate_limit: str,
+    *,
+    disabled: str = "no",
+) -> dict:
+    """Set or create the direct-API hotspot simple queue for this customer."""
+    normalized_mac = normalize_mac_address(mac_address)
+    username = normalized_mac.replace(":", "")
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        queues = api.get_simple_queues_minimal()
+        if not queues.get("success"):
+            return {"error": queues.get("error", "queue_print_failed")}
+
+        queue = _find_hotspot_queue(queues.get("data", []), username, normalized_mac)
+        if queue and queue.get(".id"):
+            payload = {
+                "numbers": queue[".id"],
+                "max-limit": rate_limit,
+                "disabled": disabled,
+            }
+            result = api.send_command("/queue/simple/set", payload)
+            if result.get("error"):
+                return {"error": result["error"]}
+            return {"success": True, "queue": queue.get("name"), "max_limit": rate_limit}
+
+        client_ip = api.get_client_ip_by_mac(normalized_mac)
+        if not client_ip:
+            return {"error": "queue_not_found_and_client_ip_unknown"}
+
+        result = api.send_command("/queue/simple/add", {
+            "name": f"plan_{username}",
+            "target": f"{client_ip}/32",
+            "max-limit": rate_limit,
+            "disabled": disabled,
+            "comment": f"MAC:{normalized_mac}|Plan rate limit",
+        })
+        if result.get("error"):
+            return {"error": result["error"]}
+        bypass = api.ensure_queue_fasttrack_bypass([client_ip])
+        return {
+            "success": True,
+            "queue": f"plan_{username}",
+            "max_limit": rate_limit,
+            "created": True,
+            "fasttrack_bypass": bypass,
+        }
+    finally:
+        api.disconnect()
+
+
+def _block_hotspot_sync(router_info: dict, mac_address: str) -> dict:
+    """Block a direct-API hotspot customer via IP binding and kick live state."""
+    normalized_mac = normalize_mac_address(mac_address)
+    username = normalized_mac.replace(":", "")
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        if not bindings.get("success"):
+            return {"error": bindings.get("error", "ip_binding_print_failed")}
+
+        binding = _find_hotspot_binding(bindings.get("data", []), normalized_mac)
+        comment = f"FUP_BLOCKED|USER:{username}|{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+        if binding and binding.get(".id"):
+            binding_result = api.send_command("/ip/hotspot/ip-binding/set", {
+                "numbers": binding[".id"],
+                "type": "blocked",
+                "comment": comment,
+            })
+        else:
+            binding_result = api.send_command("/ip/hotspot/ip-binding/add", {
+                "mac-address": normalized_mac,
+                "type": "blocked",
+                "comment": comment,
+            })
+        if binding_result.get("error"):
+            return {"error": binding_result["error"]}
+
+        queue_result = _set_hotspot_queue_disabled_connected(api, normalized_mac, username)
+        kick_result = _kick_hotspot_client(api, normalized_mac, username)
+        return {
+            "success": True,
+            "binding_result": binding_result,
+            "queue_result": queue_result,
+            "kick_result": kick_result,
+        }
+    finally:
+        api.disconnect()
+
+
+def _set_hotspot_queue_disabled_connected(
+    api: MikroTikAPI, normalized_mac: str, username: str
+) -> dict:
+    queues = api.get_simple_queues_minimal()
+    if not queues.get("success"):
+        return {"error": queues.get("error", "queue_print_failed")}
+    queue = _find_hotspot_queue(queues.get("data", []), username, normalized_mac)
+    if not queue or not queue.get(".id"):
+        return {"skipped": True, "reason": "queue_not_found"}
+    result = api.send_command("/queue/simple/set", {
+        "numbers": queue[".id"],
+        "disabled": "yes",
+    })
+    if result.get("error"):
+        return {"error": result["error"]}
+    return {"success": True, "queue": queue.get("name"), "disabled": "yes"}
+
+
+def _restore_hotspot_sync(router_info: dict, mac_address: str, normal_rate_limit: str) -> dict:
+    """Restore bypass binding and normal simple queue speed for a hotspot customer."""
+    normalized_mac = normalize_mac_address(mac_address)
+    username = normalized_mac.replace(":", "")
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        if not bindings.get("success"):
+            return {"error": bindings.get("error", "ip_binding_print_failed")}
+
+        binding = _find_hotspot_binding(bindings.get("data", []), normalized_mac)
+        comment = f"USER:{username}|EXPIRES:DB_MANAGED|FUP_RESTORED:{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+        if binding and binding.get(".id"):
+            binding_result = api.send_command("/ip/hotspot/ip-binding/set", {
+                "numbers": binding[".id"],
+                "type": "bypassed",
+                "comment": comment,
+            })
+        else:
+            binding_result = api.send_command("/ip/hotspot/ip-binding/add", {
+                "mac-address": normalized_mac,
+                "type": "bypassed",
+                "comment": comment,
+            })
+        if binding_result.get("error"):
+            return {"error": binding_result["error"]}
+
+        queues = api.get_simple_queues_minimal()
+        if not queues.get("success"):
+            return {"error": queues.get("error", "queue_print_failed")}
+
+        queue = _find_hotspot_queue(queues.get("data", []), username, normalized_mac)
+        if queue and queue.get(".id"):
+            queue_result = api.send_command("/queue/simple/set", {
+                "numbers": queue[".id"],
+                "max-limit": normal_rate_limit,
+                "disabled": "no",
+            })
+        else:
+            client_ip = api.get_client_ip_by_mac(normalized_mac)
+            if client_ip:
+                queue_result = api.send_command("/queue/simple/add", {
+                    "name": f"plan_{username}",
+                    "target": f"{client_ip}/32",
+                    "max-limit": normal_rate_limit,
+                    "disabled": "no",
+                    "comment": f"MAC:{normalized_mac}|Plan rate limit",
+                })
+                if not queue_result.get("error"):
+                    api.ensure_queue_fasttrack_bypass([client_ip])
+            else:
+                queue_result = {"skipped": True, "reason": "queue_not_found_and_client_ip_unknown"}
+
+        if queue_result.get("error"):
+            return {"error": queue_result["error"]}
+
+        kick_result = _kick_hotspot_client(api, normalized_mac, username)
+        return {
+            "success": True,
+            "binding_result": binding_result,
+            "queue_result": queue_result,
+            "kick_result": kick_result,
+        }
+    finally:
+        api.disconnect()
+
+
 # --------------------------- Public API ---------------------------
 
 
 async def apply_throttle(
     db: AsyncSession, customer: Customer, plan: Optional[Plan]
 ) -> dict:
-    """Switch the user's PPP secret to the plan's throttle profile."""
+    """Apply the plan's throttled access state."""
+    plan = plan if plan is not None else customer.plan
+    if plan and plan.connection_type == ConnectionType.HOTSPOT:
+        normalized_mac, _username = _hotspot_identity(customer)
+        if not normalized_mac:
+            return {"error": "no_mac_address"}
+        router = await _load_router(db, customer.router_id)
+        if not router:
+            return {"error": "no_router"}
+        info = _router_info(router)
+        rate_limit = hotspot_throttle_rate_for_plan(plan)
+        await db.commit()
+        return await asyncio.to_thread(
+            _set_hotspot_queue_limit_sync, info, normalized_mac, rate_limit
+        )
+
     if not customer.pppoe_username:
         return {"error": "no_pppoe_username"}
     profile = (plan.fup_throttle_profile if plan else None) or "default"
@@ -139,8 +433,22 @@ async def apply_throttle(
     )
 
 
-async def apply_block(db: AsyncSession, customer: Customer) -> dict:
-    """Disable the user's PPP secret and kick any active session."""
+async def apply_block(
+    db: AsyncSession, customer: Customer, plan: Optional[Plan] = None
+) -> dict:
+    """Block customer access at the router."""
+    plan = plan if plan is not None else customer.plan
+    if plan and plan.connection_type == ConnectionType.HOTSPOT:
+        normalized_mac, _username = _hotspot_identity(customer)
+        if not normalized_mac:
+            return {"error": "no_mac_address"}
+        router = await _load_router(db, customer.router_id)
+        if not router:
+            return {"error": "no_router"}
+        info = _router_info(router)
+        await db.commit()
+        return await asyncio.to_thread(_block_hotspot_sync, info, normalized_mac)
+
     if not customer.pppoe_username:
         return {"error": "no_pppoe_username"}
     router = await _load_router(db, customer.router_id)
@@ -156,7 +464,22 @@ async def apply_block(db: AsyncSession, customer: Customer) -> dict:
 async def restore_normal_profile(
     db: AsyncSession, customer: Customer, plan: Optional[Plan]
 ) -> dict:
-    """Restore the user's PPP secret to the plan's normal ``router_profile``."""
+    """Restore the customer's normal router-side access state."""
+    plan = plan if plan is not None else customer.plan
+    if plan and plan.connection_type == ConnectionType.HOTSPOT:
+        normalized_mac, _username = _hotspot_identity(customer)
+        if not normalized_mac:
+            return {"error": "no_mac_address"}
+        router = await _load_router(db, customer.router_id)
+        if not router:
+            return {"error": "no_router"}
+        info = _router_info(router)
+        rate_limit = parse_speed_to_mikrotik(plan.speed if plan else "")
+        await db.commit()
+        return await asyncio.to_thread(
+            _restore_hotspot_sync, info, normalized_mac, rate_limit
+        )
+
     if not customer.pppoe_username:
         return {"error": "no_pppoe_username"}
     profile = (plan.router_profile if plan else None) or "default"
@@ -182,7 +505,7 @@ async def evaluate_and_enforce(
     Returns the action that was applied (if any), or ``None`` if no change.
     """
     plan = plan if plan is not None else customer.plan
-    if not plan or plan.connection_type != ConnectionType.PPPOE:
+    if not plan or plan.connection_type not in (ConnectionType.PPPOE, ConnectionType.HOTSPOT):
         return None
 
     cap_bytes = _cap_bytes(period, plan)
@@ -198,19 +521,20 @@ async def evaluate_and_enforce(
 
     if over_cap and period.fup_triggered_at is None:
         action = _effective_action(period, plan)
+        identifier = customer.pppoe_username or customer.mac_address or f"customer:{customer.id}"
         logger.info(
             f"[FUP] Trigger {action.value} for customer={customer.id} "
-            f"({customer.pppoe_username}) used={period.total_bytes} cap={cap_bytes}"
+            f"({identifier}) used={period.total_bytes} cap={cap_bytes}"
         )
         if action == FupAction.THROTTLE:
             res = await apply_throttle(db, customer, plan)
             if res.get("error"):
-                logger.error(f"[FUP] Throttle failed for {customer.pppoe_username}: {res}")
+                logger.error(f"[FUP] Throttle failed for {identifier}: {res}")
                 return None
         elif action == FupAction.BLOCK:
-            res = await apply_block(db, customer)
+            res = await apply_block(db, customer, plan)
             if res.get("error"):
-                logger.error(f"[FUP] Block failed for {customer.pppoe_username}: {res}")
+                logger.error(f"[FUP] Block failed for {identifier}: {res}")
                 return None
         elif action == FupAction.NOTIFY_ONLY:
             pass
@@ -222,8 +546,9 @@ async def evaluate_and_enforce(
 
     if not over_cap and period.fup_triggered_at and not period.fup_reverted_at:
         # User dropped below the cap (rare mid-period; mostly via renewal).
+        identifier = customer.pppoe_username or customer.mac_address or f"customer:{customer.id}"
         logger.info(
-            f"[FUP] Auto-revert for customer={customer.id} ({customer.pppoe_username}) "
+            f"[FUP] Auto-revert for customer={customer.id} ({identifier}) "
             f"used={period.total_bytes} < cap={cap_bytes}"
         )
         if period.fup_action_taken in (FupAction.THROTTLE, FupAction.BLOCK):
@@ -248,22 +573,31 @@ async def revert(
     history reflects the revert.  Returns True if router action was taken.
     """
     plan = plan if plan is not None else customer.plan
-    if not customer.pppoe_username or not plan or plan.connection_type != ConnectionType.PPPOE:
+    if not plan or plan.connection_type not in (ConnectionType.PPPOE, ConnectionType.HOTSPOT):
+        return False
+    if plan.connection_type == ConnectionType.PPPOE and not customer.pppoe_username:
+        return False
+    if plan.connection_type == ConnectionType.HOTSPOT and not customer.mac_address:
         return False
 
     needs_action = True
     if period is not None and period.fup_triggered_at is None:
         needs_action = False
+    if plan.connection_type == ConnectionType.HOTSPOT and (
+        period is None or period.fup_triggered_at is None
+    ):
+        needs_action = False
 
     if needs_action:
+        identifier = customer.pppoe_username or customer.mac_address or f"customer:{customer.id}"
         try:
             res = await restore_normal_profile(db, customer, plan)
             if res.get("error"):
                 logger.warning(
-                    f"[FUP] Revert profile failed for {customer.pppoe_username}: {res}"
+                    f"[FUP] Revert failed for {identifier}: {res}"
                 )
         except Exception as e:
-            logger.error(f"[FUP] Revert error for {customer.pppoe_username}: {e}")
+            logger.error(f"[FUP] Revert error for {identifier}: {e}")
 
     if period is not None and period.fup_triggered_at and not period.fup_reverted_at:
         period.fup_reverted_at = now or datetime.utcnow()
