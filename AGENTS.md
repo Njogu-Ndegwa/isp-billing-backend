@@ -2,6 +2,10 @@
 
 This file is the handoff map for coding agents working in this repository. Keep it short and link to durable project knowledge instead of turning it into a large manual.
 
+## First Rule
+
+- Any backend schema change must be wired into an idempotent startup migration in `main.py` and verified as part of the server restart path. A standalone script in `migrations/` is useful for manual repair/backfill, but it is never sufficient on its own.
+
 ## Project Context
 
 - Backend: this repository, `isp-billing`.
