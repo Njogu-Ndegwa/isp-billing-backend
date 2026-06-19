@@ -114,7 +114,7 @@ async def test_share_subscription_creates_shared_customer_and_direct_attempt_wit
 @pytest.mark.asyncio
 async def test_share_subscription_allows_second_shared_device_without_owner_mac(db, monkeypatch):
     reseller = await make_reseller(db)
-    plan = await make_plan(db, reseller, max_shared_users=3)
+    plan = await make_plan(db, reseller, max_shared_users=2)
     router = await make_router(db, reseller)
     owner = await make_customer(
         db,
@@ -170,6 +170,7 @@ async def test_share_subscription_allows_second_shared_device_without_owner_mac(
     assert first["owner_customer_id"] == owner.id
     assert first["active_shared_devices"] == 1
     assert second["owner_customer_id"] == owner.id
+    assert second["max_shared_users"] == 2
     assert second["active_shared_devices"] == 2
     assert second["delivery"]["delivery_status"] == "activating"
 
@@ -243,7 +244,7 @@ async def test_share_subscription_without_owner_mac_prefers_shareable_owner(db, 
 @pytest.mark.asyncio
 async def test_share_owner_status_lists_existing_shared_devices_by_phone_variant(db):
     reseller = await make_reseller(db)
-    plan = await make_plan(db, reseller, max_shared_users=3)
+    plan = await make_plan(db, reseller, max_shared_users=2)
     router = await make_router(db, reseller)
     owner = await make_customer(
         db,
@@ -291,9 +292,11 @@ async def test_share_owner_status_lists_existing_shared_devices_by_phone_variant
     assert response["sharing_enabled"] is True
     assert response["owner_customer_id"] == owner.id
     assert response["owner_device_mac"] == owner.mac_address
-    assert response["max_shared_users"] == 3
+    assert response["max_shared_users"] == 2
+    assert response["max_companion_devices"] == 2
     assert response["active_shared_devices"] == 1
     assert response["available_shared_devices"] == 1
+    assert response["message"] == "Subscription can share another device."
     assert response["devices"][0]["device_mac"] == shared.mac_address
     assert response["devices"][0]["customer"]["id"] == shared.id
 
@@ -371,7 +374,18 @@ async def test_share_subscription_enforces_plan_device_limit(db):
         phone=owner.phone,
         subscription_owner_id=owner.id,
     )
-    db.add(
+    second_shared = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=owner.expiry,
+        mac_address="AA:BB:CC:DD:EE:23",
+        phone=owner.phone,
+        subscription_owner_id=owner.id,
+    )
+    db.add_all([
         DevicePairing(
             customer_id=first_shared.id,
             device_mac=first_shared.mac_address,
@@ -383,8 +397,20 @@ async def test_share_subscription_enforces_plan_device_limit(db):
             is_subscription_share=True,
             is_active=True,
             expires_at=owner.expiry,
-        )
-    )
+        ),
+        DevicePairing(
+            customer_id=second_shared.id,
+            device_mac=second_shared.mac_address,
+            device_name="Laptop",
+            device_type=DeviceType.LAPTOP,
+            router_id=router.id,
+            plan_id=plan.id,
+            subscription_owner_customer_id=owner.id,
+            is_subscription_share=True,
+            is_active=True,
+            expires_at=owner.expiry,
+        ),
+    ])
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
@@ -393,12 +419,13 @@ async def test_share_subscription_enforces_plan_device_limit(db):
                 owner_phone=owner.phone,
                 owner_mac=owner.mac_address,
                 router_id=router.id,
-                device_mac="AA:BB:CC:DD:EE:23",
+                device_mac="AA:BB:CC:DD:EE:24",
             ),
             db,
         )
 
     assert exc.value.status_code == 409
+    assert "maximum 2 shared device" in exc.value.detail
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,7 @@ from app.services.subscription_sharing import (
     active_shared_device_count,
     max_shared_users_for_plan,
     schedule_shared_device_delivery,
+    shared_device_limit_for_plan,
     sharing_enabled_for_plan,
 )
 
@@ -414,8 +415,8 @@ async def share_subscription_with_device(
     """
     Add a companion device under an existing paid hotspot subscription.
 
-    The plan's ``max_shared_users`` is the total allowed count including the
-    paying customer. A value of 1 therefore blocks sharing.
+    The plan's ``max_shared_users`` is the shared-device allowance. A value of
+    1 keeps sharing disabled; values above 1 allow that many shared devices.
     """
     try:
         normalized_mac = _validate_device_mac(request.device_mac)
@@ -462,7 +463,7 @@ async def share_subscription_with_device(
             owner.id,
             exclude_pairing_id=existing_pairing_id,
         )
-        max_companion_devices = max_shared_users - 1
+        max_companion_devices = shared_device_limit_for_plan(plan)
         if active_shared_count >= max_companion_devices:
             raise HTTPException(
                 status_code=409,
@@ -656,7 +657,7 @@ async def get_share_subscription_owner_status(
 
         plan = owner.plan
         max_shared_users = max_shared_users_for_plan(plan)
-        max_companion_devices = max(0, max_shared_users - 1)
+        max_companion_devices = shared_device_limit_for_plan(plan)
         pairings = (
             await db.execute(
                 select(DevicePairing, Customer)
