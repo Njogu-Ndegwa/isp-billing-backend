@@ -14,14 +14,19 @@ from app.db.models import (
     CustomerPayment, PaymentMethod, PaymentStatus, DurationUnit,
     Payment, CustomerRating, ProvisioningLog, MpesaTransaction,
     UserBandwidthUsage, Voucher, CustomerUsagePeriod,
-    ProvisioningAttempt, DevicePairing, ReconnectionAttempt,
+    ProvisioningAttempt, ProvisioningAttemptEntrypoint,
+    ProvisioningAttemptSource, DevicePairing, ReconnectionAttempt,
     ZenoPayTransaction, MtnMomoTransaction,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.pppoe_provisioning import (
-    call_pppoe_provision, call_pppoe_remove,
+    call_pppoe_provision, call_pppoe_remove, provision_pppoe_customer,
     build_pppoe_payload, build_pppoe_remove_payload,
+)
+from app.services.hotspot_provisioning import (
+    get_or_create_provisioning_attempt,
+    schedule_provisioning_attempt,
 )
 from app.services.account_numbers import generate_account_number
 
@@ -763,9 +768,29 @@ async def activate_pppoe_customer(
         await db.commit()
         await db.refresh(customer, attribute_names=["plan", "router"])
 
-        pppoe_payload = build_pppoe_payload(customer, customer.router)
+        attempt = await get_or_create_provisioning_attempt(
+            db,
+            customer_id=customer.id,
+            router_id=customer.router.id if customer.router else None,
+            mac_address=None,
+            source_table=ProvisioningAttemptSource.CUSTOMER_PAYMENT,
+            source_pk=payment.id,
+            external_reference=request.payment_reference,
+            entrypoint=ProvisioningAttemptEntrypoint.MANUAL_TRANSACTION_PROVISION,
+        )
+        await schedule_provisioning_attempt(db, attempt)
         await db.commit()
-        provision_result = await call_pppoe_provision(pppoe_payload)
+
+        pppoe_payload = build_pppoe_payload(customer, customer.router)
+        provision_result = await provision_pppoe_customer(
+            customer_id=customer.id,
+            router_id=customer.router.id,
+            pppoe_payload=pppoe_payload,
+            action="pppoe_activation",
+            attempt_id=attempt.id,
+        )
+        provision_succeeded = bool(provision_result and provision_result.get("success"))
+        delivery = provision_result.get("delivery") if provision_result else None
 
         return {
             "success": True,
@@ -774,8 +799,9 @@ async def activate_pppoe_customer(
             "status": customer.status.value,
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
             "plan_name": plan.name,
-            "provision_result": "ok" if provision_result and provision_result.get("success") else "failed",
+            "provision_result": "ok" if provision_succeeded else "retry_pending",
             "provision_error": provision_result.get("error") if provision_result else None,
+            "delivery": delivery,
         }
     except HTTPException:
         raise

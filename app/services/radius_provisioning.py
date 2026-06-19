@@ -60,7 +60,8 @@ class RadiusProvisioning:
         plan_duration_unit: str,
         router_id: int,
         password: Optional[str] = None,
-        existing_expiry: Optional[datetime] = None
+        existing_expiry: Optional[datetime] = None,
+        fixed_expiry: Optional[datetime] = None
     ) -> Dict[str, Any]:
         """
         Provision a hotspot user for RADIUS authentication.
@@ -90,17 +91,25 @@ class RadiusProvisioning:
             if not password:
                 password = self._generate_password()
             
-            # Calculate expiry
-            if existing_expiry and existing_expiry > datetime.utcnow():
+            now = datetime.utcnow()
+
+            # Calculate expiry. Shared-subscription devices use the owner's
+            # already-paid expiry instead of adding a fresh plan duration.
+            if fixed_expiry:
+                expiry = fixed_expiry
+            elif existing_expiry and existing_expiry > now:
                 # Renewal - extend from current expiry
                 base_time = existing_expiry
+                expiry = self._calculate_expiry(base_time, plan_duration_value, plan_duration_unit)
             else:
-                base_time = datetime.utcnow()
-            
-            expiry = self._calculate_expiry(base_time, plan_duration_value, plan_duration_unit)
+                base_time = now
+                expiry = self._calculate_expiry(base_time, plan_duration_value, plan_duration_unit)
             
             # Calculate session timeout
-            session_timeout = calculate_session_timeout(plan_duration_value, plan_duration_unit)
+            if fixed_expiry:
+                session_timeout = max(60, int((expiry - now).total_seconds()))
+            else:
+                session_timeout = calculate_session_timeout(plan_duration_value, plan_duration_unit)
             
             # Parse speed to RADIUS format
             rate_limit = parse_speed_to_radius_format(plan_speed)

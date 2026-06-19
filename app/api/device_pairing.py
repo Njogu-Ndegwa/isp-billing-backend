@@ -14,7 +14,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -48,6 +48,12 @@ from app.services.hotspot_provisioning import (
 )
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.reseller_payments import record_customer_payment
+from app.services.subscription_sharing import (
+    active_shared_device_count,
+    max_shared_users_for_plan,
+    schedule_shared_device_delivery,
+    sharing_enabled_for_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +90,17 @@ class DeviceReconnectRequest(BaseModel):
     owner_phone: str
 
 
+class ShareSubscriptionRequest(BaseModel):
+    owner_phone: str = Field(..., description="Phone number on the active paid subscription")
+    router_id: int
+    device_mac: str = Field(..., description="MAC address of the device to add")
+    owner_mac: Optional[str] = Field(None, description="Optional current MAC of the paying customer")
+    device_name: Optional[str] = None
+    device_type: str = Field("other")
+    device_owner_phone: Optional[str] = None
+    device_owner_name: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -99,6 +116,22 @@ def _validate_device_mac(mac: str) -> str | None:
     if len(clean) != 12 or not re.fullmatch(r'[0-9A-F]{12}', clean):
         return None
     return ':'.join(clean[i:i+2] for i in range(0, 12, 2))
+
+
+def _build_phone_variants(phone: str) -> list[str]:
+    """Build common Kenyan phone variants for matching saved customers."""
+    cleaned = phone.replace("+", "").replace(" ", "").replace("-", "")
+    variants = {cleaned}
+    if cleaned.startswith("254"):
+        variants.add("0" + cleaned[3:])
+        variants.add("+" + cleaned)
+    elif cleaned.startswith("0") and len(cleaned) >= 10:
+        variants.add("254" + cleaned[1:])
+        variants.add("+254" + cleaned[1:])
+    elif cleaned.startswith("+254"):
+        variants.add("0" + cleaned[4:])
+        variants.add(cleaned[1:])
+    return list(variants)
 
 
 def _device_type_value(dt) -> str:
@@ -202,6 +235,8 @@ async def _create_or_update_pairing(
     device_name: Optional[str],
     device_type: DeviceType,
     expires_at: Optional[datetime] = None,
+    subscription_owner_customer_id: Optional[int] = None,
+    is_subscription_share: bool = False,
 ) -> DevicePairing:
     """Upsert a device pairing record."""
     result = await db.execute(
@@ -219,6 +254,8 @@ async def _create_or_update_pairing(
         pairing.device_type = device_type
         pairing.is_active = True
         pairing.expires_at = expires_at
+        pairing.subscription_owner_customer_id = subscription_owner_customer_id
+        pairing.is_subscription_share = is_subscription_share
     else:
         pairing = DevicePairing(
             customer_id=customer_id,
@@ -227,6 +264,8 @@ async def _create_or_update_pairing(
             device_type=device_type,
             router_id=router_id,
             plan_id=plan_id,
+            subscription_owner_customer_id=subscription_owner_customer_id,
+            is_subscription_share=is_subscription_share,
             is_active=True,
             expires_at=expires_at,
         )
@@ -245,6 +284,8 @@ def _serialize_pairing(p: DevicePairing) -> dict:
         "device_type": p.device_type.value if hasattr(p.device_type, "value") else p.device_type,
         "router_id": p.router_id,
         "plan_id": p.plan_id,
+        "subscription_owner_customer_id": p.subscription_owner_customer_id,
+        "is_subscription_share": bool(p.is_subscription_share),
         "is_active": p.is_active,
         "provisioned_at": p.provisioned_at.isoformat() if p.provisioned_at else None,
         "expires_at": p.expires_at.isoformat() if p.expires_at else None,
@@ -252,9 +293,308 @@ def _serialize_pairing(p: DevicePairing) -> dict:
     }
 
 
+async def _find_share_owner_customer(
+    db: AsyncSession,
+    *,
+    router_id: int,
+    owner_phone: str,
+    owner_mac: Optional[str],
+) -> Customer:
+    if not owner_phone or len(owner_phone.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Invalid owner phone number")
+
+    phone_variants = _build_phone_variants(owner_phone.strip())
+    now = datetime.utcnow()
+    stmt = (
+        select(Customer)
+        .options(selectinload(Customer.plan), selectinload(Customer.router))
+        .where(
+            Customer.router_id == router_id,
+            Customer.phone.in_(phone_variants),
+            Customer.subscription_owner_id.is_(None),
+            Customer.status == CustomerStatus.ACTIVE,
+            Customer.expiry.isnot(None),
+            Customer.expiry > now,
+        )
+    )
+    if owner_mac:
+        normalized_owner_mac = _validate_device_mac(owner_mac)
+        if not normalized_owner_mac:
+            raise HTTPException(status_code=400, detail="Invalid owner MAC address format")
+        stmt = stmt.where(Customer.mac_address == normalized_owner_mac)
+
+    owners = list((await db.execute(stmt)).scalars().all())
+    hotspot_owners = [
+        owner for owner in owners
+        if owner.plan and owner.plan.connection_type == ConnectionType.HOTSPOT
+    ]
+
+    if not hotspot_owners:
+        raise HTTPException(
+            status_code=404,
+            detail="No active hotspot subscription found for this phone on this router",
+        )
+    if len(hotspot_owners) > 1 and not owner_mac:
+        raise HTTPException(
+            status_code=409,
+            detail="Multiple active subscriptions found. Provide owner_mac to choose one.",
+        )
+    return hotspot_owners[0]
+
+
+async def _get_or_create_shared_customer(
+    db: AsyncSession,
+    *,
+    normalized_mac: str,
+    owner: Customer,
+    plan: Plan,
+    router_id: int,
+    phone: str,
+    name: Optional[str],
+) -> Customer:
+    result = await db.execute(
+        select(Customer)
+        .options(selectinload(Customer.plan), selectinload(Customer.router))
+        .where(Customer.mac_address == normalized_mac, Customer.user_id == owner.user_id)
+    )
+    customer = result.scalar_one_or_none()
+
+    if customer and customer.id == owner.id:
+        raise HTTPException(status_code=400, detail="This device already owns the subscription")
+
+    if customer and customer.subscription_owner_id is None:
+        if customer.status == CustomerStatus.ACTIVE and customer.expiry and customer.expiry > datetime.utcnow():
+            raise HTTPException(
+                status_code=409,
+                detail="This device already has its own active subscription",
+            )
+
+    customer_name = name or f"Shared Device {normalized_mac[-8:]}"
+    if customer:
+        customer.name = name or customer.name or customer_name
+        customer.phone = phone
+        customer.status = CustomerStatus.ACTIVE
+        customer.expiry = owner.expiry
+        customer.plan_id = plan.id
+        customer.user_id = owner.user_id
+        customer.router_id = router_id
+        customer.subscription_owner_id = owner.id
+        await db.flush()
+        return customer
+
+    customer = Customer(
+        name=customer_name,
+        phone=phone,
+        mac_address=normalized_mac,
+        status=CustomerStatus.ACTIVE,
+        expiry=owner.expiry,
+        plan_id=plan.id,
+        user_id=owner.user_id,
+        router_id=router_id,
+        subscription_owner_id=owner.id,
+    )
+    db.add(customer)
+    await db.flush()
+    return customer
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@router.post("/api/public/device/share-subscription")
+async def share_subscription_with_device(
+    request: ShareSubscriptionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Add a companion device under an existing paid hotspot subscription.
+
+    The plan's ``max_shared_users`` is the total allowed count including the
+    paying customer. A value of 1 therefore blocks sharing.
+    """
+    try:
+        normalized_mac = _validate_device_mac(request.device_mac)
+        if not normalized_mac:
+            raise HTTPException(status_code=400, detail="Invalid MAC address format. Expected format: AA:BB:CC:DD:EE:FF")
+
+        device_type = _parse_device_type(request.device_type)
+        owner = await _find_share_owner_customer(
+            db,
+            router_id=request.router_id,
+            owner_phone=request.owner_phone,
+            owner_mac=request.owner_mac,
+        )
+        plan = owner.plan
+        router_obj = owner.router
+        if not plan or not router_obj:
+            raise HTTPException(status_code=400, detail="Subscription is missing plan or router details")
+
+        if not sharing_enabled_for_plan(plan):
+            raise HTTPException(status_code=403, detail="This plan does not allow subscription sharing")
+
+        existing_pairing = (
+            await db.execute(
+                select(DevicePairing).where(
+                    DevicePairing.device_mac == normalized_mac,
+                    DevicePairing.router_id == request.router_id,
+                )
+            )
+        ).scalar_one_or_none()
+
+        if existing_pairing and existing_pairing.is_active:
+            same_owner = existing_pairing.subscription_owner_customer_id == owner.id
+            if not same_owner:
+                raise HTTPException(status_code=409, detail="This device is already paired on this hotspot")
+
+        max_shared_users = max_shared_users_for_plan(plan)
+        existing_pairing_id = (
+            existing_pairing.id
+            if existing_pairing and existing_pairing.subscription_owner_customer_id == owner.id
+            else None
+        )
+        active_shared_count = await active_shared_device_count(
+            db,
+            owner.id,
+            exclude_pairing_id=existing_pairing_id,
+        )
+        max_companion_devices = max_shared_users - 1
+        if active_shared_count >= max_companion_devices:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This subscription already has the maximum {max_companion_devices} shared device(s)",
+            )
+
+        shared_phone = (request.device_owner_phone or request.owner_phone).strip()
+        shared_customer = await _get_or_create_shared_customer(
+            db,
+            normalized_mac=normalized_mac,
+            owner=owner,
+            plan=plan,
+            router_id=request.router_id,
+            phone=shared_phone,
+            name=request.device_owner_name or request.device_name,
+        )
+
+        pairing = await _create_or_update_pairing(
+            db,
+            shared_customer.id,
+            normalized_mac,
+            request.router_id,
+            plan.id,
+            request.device_name,
+            device_type,
+            expires_at=owner.expiry,
+            subscription_owner_customer_id=owner.id,
+            is_subscription_share=True,
+        )
+
+        auth_method = getattr(router_obj, "auth_method", None)
+        auth_value = auth_method.value if hasattr(auth_method, "value") else auth_method
+        use_radius = auth_value == RouterAuthMethod.RADIUS.value
+
+        if use_radius:
+            from app.services.radius_provisioning import RadiusProvisioning
+
+            provisioning = RadiusProvisioning(db)
+            radius_result = await provisioning.provision_hotspot_user(
+                customer_id=shared_customer.id,
+                mac_address=normalized_mac,
+                phone=shared_phone,
+                plan_speed=plan.speed,
+                plan_duration_value=plan.duration_value,
+                plan_duration_unit=plan.duration_unit.value,
+                router_id=router_obj.id,
+                existing_expiry=shared_customer.expiry,
+                fixed_expiry=owner.expiry,
+            )
+            if not radius_result.get("success"):
+                raise HTTPException(
+                    status_code=502,
+                    detail=radius_result.get("error", "RADIUS provisioning failed"),
+                )
+
+            shared_customer.expiry = datetime.fromisoformat(radius_result["expiry"])
+            pairing.provisioned_at = datetime.utcnow()
+            pairing.expires_at = shared_customer.expiry
+            await db.commit()
+            return {
+                "success": True,
+                "customer_id": shared_customer.id,
+                "owner_customer_id": owner.id,
+                "pairing_id": pairing.id,
+                "device_mac": normalized_mac,
+                "device_type": device_type.value,
+                "auth_method": "RADIUS",
+                "radius_username": radius_result.get("username"),
+                "radius_password": radius_result.get("password"),
+                "expiry": shared_customer.expiry.isoformat() if shared_customer.expiry else None,
+                "max_shared_users": max_shared_users,
+                "active_shared_devices": active_shared_count + 1,
+                "message": "Device added to shared subscription via RADIUS.",
+            }
+
+        hotspot_payload = build_hotspot_payload(
+            shared_customer,
+            plan,
+            router_obj,
+            comment=(
+                f"Shared subscription: owner {owner.id} | "
+                f"Device: {request.device_name or device_type.value} | MAC: {normalized_mac}"
+            ),
+        )
+        attempt = await schedule_shared_device_delivery(
+            db,
+            shared_customer=shared_customer,
+            owner_customer=owner,
+            pairing=pairing,
+            router=router_obj,
+        )
+        pairing.provisioned_at = datetime.utcnow()
+        await db.commit()
+
+        await log_provisioning_event(
+            customer_id=shared_customer.id,
+            router_id=router_obj.id,
+            mac_address=normalized_mac,
+            action="subscription_share",
+            status="scheduled",
+            details=f"Shared subscription device #{pairing.id} under customer {owner.id}",
+            attempt_id=attempt.id,
+        )
+
+        asyncio.create_task(
+            provision_hotspot_customer(
+                shared_customer.id,
+                router_obj.id,
+                hotspot_payload,
+                "subscription_share",
+                attempt.id,
+            )
+        )
+
+        return {
+            "success": True,
+            "customer_id": shared_customer.id,
+            "owner_customer_id": owner.id,
+            "pairing_id": pairing.id,
+            "device_mac": normalized_mac,
+            "device_type": device_type.value,
+            "attempt_id": attempt.id,
+            "auth_method": "DIRECT_API",
+            "expiry": shared_customer.expiry.isoformat() if shared_customer.expiry else None,
+            "max_shared_users": max_shared_users,
+            "active_shared_devices": active_shared_count + 1,
+            "message": "Device added to shared subscription. Provisioning started.",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error sharing subscription with device")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Subscription sharing failed: {str(e)}")
+
 
 @router.post("/api/public/device/pair-and-pay")
 async def pair_device_and_pay(
@@ -694,12 +1034,25 @@ async def list_paired_devices(
         if not router_obj:
             raise HTTPException(status_code=404, detail="Router not found")
 
-        # Get device pairings where the customer's phone matches
+        owner_ids_for_phone = (
+            select(Customer.id)
+            .where(
+                Customer.phone == phone,
+                Customer.router_id == router_id,
+                Customer.subscription_owner_id.is_(None),
+            )
+        )
+
+        # Get pairings where either the device customer or subscription owner
+        # matches the requested phone.
         result = await db.execute(
             select(DevicePairing)
             .join(Customer, DevicePairing.customer_id == Customer.id)
             .where(
-                Customer.phone == phone,
+                or_(
+                    Customer.phone == phone,
+                    DevicePairing.subscription_owner_customer_id.in_(owner_ids_for_phone),
+                ),
                 DevicePairing.router_id == router_id,
                 DevicePairing.is_active == True,
             )

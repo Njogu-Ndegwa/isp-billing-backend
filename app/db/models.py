@@ -48,6 +48,7 @@ class PaymentStatus(str, enum.Enum):
 class ProvisioningAttemptSource(str, enum.Enum):
     MPESA_TRANSACTION = "mpesa_transaction"
     CUSTOMER_PAYMENT = "customer_payment"
+    SUBSCRIPTION_SHARE = "subscription_share"
 
 
 class ProvisioningAttemptEntrypoint(str, enum.Enum):
@@ -55,6 +56,7 @@ class ProvisioningAttemptEntrypoint(str, enum.Enum):
     HOTSPOT_RECONCILIATION = "hotspot_reconciliation"
     VOUCHER_DIRECT_API = "voucher_direct_api"
     MANUAL_TRANSACTION_PROVISION = "manual_transaction_provision"
+    SUBSCRIPTION_SHARE = "subscription_share"
 
 
 class ProvisioningState(str, enum.Enum):
@@ -169,6 +171,19 @@ class Customer(Base):
     # top up. Replaced (not incremented) by the C2B handler. CHECK >= 0 at
     # DB level (see migrations/add_customer_wallet_credit.py).
     wallet_credit_kes = Column(Integer, nullable=False, default=0, server_default="0")
+    # Nullable self-reference used by managed companion devices that share the
+    # paying customer's subscription/expiry instead of buying their own plan.
+    subscription_owner_id = Column(
+        Integer,
+        ForeignKey("customers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    subscription_owner = relationship(
+        "Customer",
+        remote_side=[id],
+        backref="shared_subscription_customers",
+    )
 
 class CustomerRating(Base):
     """Customer ratings/feedback after purchase - identified by phone number"""
@@ -216,6 +231,8 @@ class Plan(Base):
         nullable=True,
     )
     fup_throttle_profile = Column(String(100), nullable=True)
+    # Total customers/devices allowed on one paid subscription. 1 = no sharing.
+    max_shared_users = Column(Integer, nullable=False, default=1, server_default="1")
 
 class Payment(Base):
     __tablename__ = "payments"
@@ -1003,12 +1020,20 @@ class DevicePairing(Base):
     )
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=False)
     plan_id = Column(Integer, ForeignKey("plans.id"), nullable=True)
+    subscription_owner_customer_id = Column(
+        Integer,
+        ForeignKey("customers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    is_subscription_share = Column(Boolean, nullable=False, default=False, server_default="false")
     is_active = Column(Boolean, default=True)
     provisioned_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    customer = relationship("Customer", backref="paired_devices")
+    customer = relationship("Customer", foreign_keys=[customer_id], backref="paired_devices")
+    subscription_owner_customer = relationship("Customer", foreign_keys=[subscription_owner_customer_id])
     router = relationship("Router")
     plan = relationship("Plan")
 

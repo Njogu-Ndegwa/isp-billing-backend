@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from sqlalchemy import select
 
 from app.db.database import async_session, db_pool_snapshot
-from app.db.models import ProvisioningToken, Router
+from app.db.models import ProvisioningToken, Router, User
 from app.services.insurance_l2tp import (
     configure_router_backup_l2tp,
     register_insurance_l2tp_peer,
@@ -19,15 +19,17 @@ from app.services.insurance_l2tp import (
 )
 from app.services.insurance_wireguard import (
     InsuranceWireGuardError,
+    backup_ips_from_manager_peers,
     configure_router_backup_wireguard,
     derive_insurance_ip,
+    list_insurance_peers,
     parse_routeros_major_version,
     read_routeros_version,
     register_insurance_peer,
     validate_insurance_settings,
     verify_insurance_router,
 )
-from app.services.router_availability import router_recently_offline
+from app.services.router_availability import derive_router_status, router_recently_offline
 from app.services.router_helpers import connect_to_router
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,20 @@ logger = logging.getLogger(__name__)
 TERMINAL_JOB_STATUSES = {"completed", "failed"}
 ACTIVE_JOB_STATUSES = {"queued", "running"}
 MAX_JOB_HISTORY = 20
+DEFAULT_START_LIMIT = 10
+MAX_BATCH_LIMIT = 50
+MAX_BATCH_CONCURRENCY = 3
+ACTIVE_OWNER_STATUSES = {"active", "trial"}
+PAID_OWNER_STATUSES = {"active"}
+VERIFICATION_ATTEMPTS = 3
+VERIFICATION_RETRY_DELAY_SECONDS = 15
+SELECTION_MODES = {
+    "all",
+    "online",
+    "online_missing_backup",
+    "paid_reseller_online_missing_backup",
+}
+TUNNEL_TYPE_FILTERS = {"wireguard", "l2tp", "auto"}
 
 
 class Priority(Enum):
@@ -59,6 +75,7 @@ class RouterSnapshot:
     password: str
     port: int
     recently_offline: bool
+    status: str
 
     @classmethod
     def from_router(cls, router: Router, now: datetime) -> "RouterSnapshot":
@@ -70,6 +87,7 @@ class RouterSnapshot:
             password=router.password,
             port=router.port or 8728,
             recently_offline=router_recently_offline(router, now=now),
+            status=derive_router_status(router, now=now),
         )
 
 
@@ -92,6 +110,11 @@ class InsuranceTunnelCandidate:
     token_vpn_type: Optional[str]
     l2tp_username: Optional[str]
     l2tp_password: Optional[str]
+    owner_user_id: Optional[int]
+    owner_role: Optional[str]
+    owner_subscription_status: Optional[str]
+    has_known_backup: bool = False
+    skip_reason: Optional[str] = None
 
 
 _jobs: Dict[str, Dict[str, Any]] = {}
@@ -154,6 +177,107 @@ def _token_vpn_type(token: Optional[ProvisioningToken]) -> Optional[str]:
     return vpn_type if vpn_type in {"wireguard", "l2tp"} else None
 
 
+def _enum_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    raw = value.value if hasattr(value, "value") else value
+    return str(raw).lower()
+
+
+def _owner_skip_reason(owner_role: Optional[str], subscription_status: Optional[str]) -> Optional[str]:
+    if owner_role == "admin":
+        return None
+    if owner_role == "reseller" and subscription_status in ACTIVE_OWNER_STATUSES:
+        return None
+    if owner_role == "reseller":
+        return f"Owner subscription is {subscription_status or 'unknown'}"
+    return "Router owner is missing or unsupported"
+
+
+def _candidate_skip_reason(
+    *,
+    backup_ip_error: Optional[str],
+    recently_offline: bool,
+    owner_role: Optional[str],
+    subscription_status: Optional[str],
+) -> Optional[str]:
+    if backup_ip_error:
+        return backup_ip_error
+    if recently_offline:
+        return "Router was recently offline; skipped for batch safety"
+    return _owner_skip_reason(owner_role, subscription_status)
+
+
+def _normalize_selection_mode(selection_mode: Optional[str]) -> str:
+    value = (selection_mode or "all").strip().lower()
+    if value not in SELECTION_MODES:
+        raise InsuranceWireGuardError(
+            f"Invalid insurance tunnel batch selection_mode '{selection_mode}'. "
+            f"Allowed values: {', '.join(sorted(SELECTION_MODES))}"
+        )
+    return value
+
+
+def _normalize_tunnel_type(tunnel_type: Optional[str]) -> Optional[str]:
+    value = (tunnel_type or "").strip().lower()
+    if not value or value == "all":
+        return None
+    if value not in TUNNEL_TYPE_FILTERS:
+        raise InsuranceWireGuardError(
+            f"Invalid insurance tunnel batch tunnel_type '{tunnel_type}'. "
+            f"Allowed values: all, {', '.join(sorted(TUNNEL_TYPE_FILTERS))}"
+        )
+    return value
+
+
+def _normalize_limit(limit: Optional[int], *, for_start: bool) -> Optional[int]:
+    if limit is None:
+        return DEFAULT_START_LIMIT if for_start else None
+    return min(max(int(limit), 1), MAX_BATCH_LIMIT)
+
+
+def _matches_tunnel_filter(candidate: InsuranceTunnelCandidate, tunnel_type: Optional[str]) -> bool:
+    if tunnel_type is None:
+        return True
+    return (candidate.token_vpn_type or "auto") == tunnel_type
+
+
+def _matches_selection(candidate: InsuranceTunnelCandidate, selection_mode: str) -> bool:
+    if selection_mode == "all":
+        return True
+    if selection_mode == "online":
+        return candidate.router.status == "online"
+    if selection_mode == "online_missing_backup":
+        return candidate.router.status == "online" and not candidate.has_known_backup
+    if selection_mode == "paid_reseller_online_missing_backup":
+        return (
+            candidate.router.status == "online"
+            and candidate.owner_role == "reseller"
+            and candidate.owner_subscription_status in PAID_OWNER_STATUSES
+            and not candidate.has_known_backup
+        )
+    return True
+
+
+def _select_candidates(
+    candidates: List[InsuranceTunnelCandidate],
+    *,
+    selection_mode: str,
+    tunnel_type: Optional[str],
+    limit: Optional[int],
+) -> List[InsuranceTunnelCandidate]:
+    selected = [
+        candidate for candidate in candidates
+        if _matches_selection(candidate, selection_mode)
+        and _matches_tunnel_filter(candidate, tunnel_type)
+    ]
+    return selected[:limit] if limit else selected
+
+
+def _selection_requires_backup_lookup(selection_mode: str) -> bool:
+    return selection_mode in {"online_missing_backup", "paid_reseller_online_missing_backup"}
+
+
 def _blank_counts() -> Dict[str, int]:
     return {
         "queued": 0,
@@ -192,33 +316,45 @@ def _prune_jobs() -> None:
 
 
 def _item_from_candidate(candidate: InsuranceTunnelCandidate) -> Dict[str, Any]:
+    eligible = candidate.skip_reason is None
     return {
         "router_id": candidate.router.id,
         "router_name": candidate.router.name,
         "current_ip": candidate.router.ip_address,
         "backup_ip": candidate.backup_ip,
+        "owner_user_id": candidate.owner_user_id,
+        "owner_role": candidate.owner_role,
+        "owner_subscription_status": candidate.owner_subscription_status,
         "token_vpn_type": candidate.token_vpn_type,
         "planned_tunnel_type": candidate.token_vpn_type or "auto",
+        "router_status": candidate.router.status,
         "recently_offline": candidate.router.recently_offline,
-        "eligible": bool(candidate.backup_ip and not candidate.backup_ip_error and not candidate.router.recently_offline),
+        "has_known_backup": candidate.has_known_backup,
+        "eligible": eligible,
         "status": "queued",
-        "error": candidate.backup_ip_error,
+        "error": candidate.skip_reason,
     }
 
 
 async def load_insurance_tunnel_candidates(
     router_ids: Optional[List[int]] = None,
     limit: Optional[int] = None,
+    selection_mode: str = "all",
+    tunnel_type: Optional[str] = None,
+    for_start: bool = False,
 ) -> List[InsuranceTunnelCandidate]:
+    selection_mode = _normalize_selection_mode(selection_mode)
+    tunnel_type = _normalize_tunnel_type(tunnel_type)
+    effective_limit = _normalize_limit(limit, for_start=for_start)
+
     async with async_session() as db:
         stmt = select(Router).order_by(Router.id)
         if router_ids:
             stmt = stmt.where(Router.id.in_(router_ids))
-        if limit:
-            stmt = stmt.limit(limit)
         routers = list((await db.execute(stmt)).scalars().all())
 
         token_by_router: Dict[int, ProvisioningToken] = {}
+        owner_by_id: Dict[int, User] = {}
         if routers:
             token_stmt = (
                 select(ProvisioningToken)
@@ -228,39 +364,120 @@ async def load_insurance_tunnel_candidates(
             for token in (await db.execute(token_stmt)).scalars().all():
                 token_by_router.setdefault(token.router_id, token)
 
+            owner_ids = sorted({router.user_id for router in routers if router.user_id})
+            if owner_ids:
+                owner_result = await db.execute(select(User).where(User.id.in_(owner_ids)))
+                owner_by_id = {owner.id: owner for owner in owner_result.scalars().all()}
+
         now = datetime.utcnow()
         candidates = []
         for router in routers:
             token = token_by_router.get(router.id)
+            owner = owner_by_id.get(router.user_id)
+            owner_role = _enum_value(getattr(owner, "role", None))
+            owner_subscription_status = _enum_value(getattr(owner, "subscription_status", None))
             try:
                 backup_ip = derive_insurance_ip(router.ip_address)
                 backup_ip_error = None
             except InsuranceWireGuardError as exc:
                 backup_ip = None
                 backup_ip_error = str(exc)
+            router_snapshot = RouterSnapshot.from_router(router, now)
+            skip_reason = _candidate_skip_reason(
+                backup_ip_error=backup_ip_error,
+                recently_offline=router_snapshot.recently_offline,
+                owner_role=owner_role,
+                subscription_status=owner_subscription_status,
+            )
 
             candidates.append(
                 InsuranceTunnelCandidate(
-                    router=RouterSnapshot.from_router(router, now),
+                    router=router_snapshot,
                     backup_ip=backup_ip,
                     backup_ip_error=backup_ip_error,
                     token_vpn_type=_token_vpn_type(token),
                     l2tp_username=getattr(token, "l2tp_username", None),
                     l2tp_password=getattr(token, "l2tp_password", None),
+                    owner_user_id=router.user_id,
+                    owner_role=owner_role,
+                    owner_subscription_status=owner_subscription_status,
+                    skip_reason=skip_reason,
                 )
             )
-        return candidates
+
+    if not candidates:
+        return []
+
+    latest_backup_by_router = await get_latest_insurance_tunnel_items_by_router(
+        [candidate.router.id for candidate in candidates]
+    )
+    manager_backup_ips = set()
+    if _selection_requires_backup_lookup(selection_mode):
+        try:
+            manager_backup_ips = backup_ips_from_manager_peers(await list_insurance_peers())
+        except InsuranceWireGuardError as exc:
+            raise InsuranceWireGuardError(
+                f"Cannot select routers without backup because the insurance manager peer list is unavailable: {exc}"
+            ) from exc
+
+    candidates = [
+        InsuranceTunnelCandidate(
+            router=candidate.router,
+            backup_ip=candidate.backup_ip,
+            backup_ip_error=candidate.backup_ip_error,
+            token_vpn_type=candidate.token_vpn_type,
+            l2tp_username=candidate.l2tp_username,
+            l2tp_password=candidate.l2tp_password,
+            owner_user_id=candidate.owner_user_id,
+            owner_role=candidate.owner_role,
+            owner_subscription_status=candidate.owner_subscription_status,
+            has_known_backup=(
+                (latest_backup_by_router.get(candidate.router.id) or {}).get("status") == "verified"
+                or bool(candidate.backup_ip and candidate.backup_ip in manager_backup_ips)
+            ),
+            skip_reason=candidate.skip_reason,
+        )
+        for candidate in candidates
+    ]
+    return _select_candidates(
+        candidates,
+        selection_mode=selection_mode,
+        tunnel_type=tunnel_type,
+        limit=effective_limit,
+    )
 
 
 async def preview_insurance_tunnel_batch(
     router_ids: Optional[List[int]] = None,
     limit: Optional[int] = None,
+    selection_mode: str = "all",
+    tunnel_type: Optional[str] = None,
 ) -> Dict[str, Any]:
-    candidates = await load_insurance_tunnel_candidates(router_ids=router_ids, limit=limit)
+    selection_mode = _normalize_selection_mode(selection_mode)
+    tunnel_type = _normalize_tunnel_type(tunnel_type)
+    effective_limit = _normalize_limit(limit, for_start=False)
+    candidates = await load_insurance_tunnel_candidates(
+        router_ids=router_ids,
+        limit=effective_limit,
+        selection_mode=selection_mode,
+        tunnel_type=tunnel_type,
+    )
     items = [_item_from_candidate(candidate) for candidate in candidates]
     return {
         "success": True,
         "applied": False,
+        "options": {
+            "router_ids": router_ids,
+            "limit": effective_limit,
+            "selection_mode": selection_mode,
+            "tunnel_type": tunnel_type,
+            "default_start_limit": DEFAULT_START_LIMIT,
+            "max_limit": MAX_BATCH_LIMIT,
+            "max_concurrency": MAX_BATCH_CONCURRENCY,
+            "skips_recently_offline": True,
+            "eligible_owner_subscription_statuses": sorted(ACTIVE_OWNER_STATUSES),
+            "paid_owner_subscription_statuses": sorted(PAID_OWNER_STATUSES),
+        },
         "total": len(items),
         "eligible": sum(1 for item in items if item["eligible"]),
         "skipped": sum(1 for item in items if not item["eligible"]),
@@ -321,13 +538,24 @@ async def start_insurance_tunnel_batch(
     *,
     router_ids: Optional[List[int]] = None,
     limit: Optional[int] = None,
+    selection_mode: str = "all",
+    tunnel_type: Optional[str] = None,
     max_concurrency: int = 2,
     force_rotate: bool = False,
 ) -> Dict[str, Any]:
     global _active_job_id
 
-    candidates = await load_insurance_tunnel_candidates(router_ids=router_ids, limit=limit)
-    max_concurrency = max(1, min(int(max_concurrency or 2), 5))
+    selection_mode = _normalize_selection_mode(selection_mode)
+    tunnel_type = _normalize_tunnel_type(tunnel_type)
+    effective_limit = _normalize_limit(limit, for_start=True)
+    candidates = await load_insurance_tunnel_candidates(
+        router_ids=router_ids,
+        limit=effective_limit,
+        selection_mode=selection_mode,
+        tunnel_type=tunnel_type,
+        for_start=True,
+    )
+    max_concurrency = max(1, min(int(max_concurrency or 2), MAX_BATCH_CONCURRENCY))
     job_id = str(uuid.uuid4())
     job = {
         "job_id": job_id,
@@ -339,10 +567,16 @@ async def start_insurance_tunnel_batch(
         "total": len(candidates),
         "options": {
             "router_ids": router_ids,
-            "limit": limit,
+            "limit": effective_limit,
+            "selection_mode": selection_mode,
+            "tunnel_type": tunnel_type,
             "max_concurrency": max_concurrency,
             "force_rotate": force_rotate,
             "skips_recently_offline": True,
+            "eligible_owner_subscription_statuses": sorted(ACTIVE_OWNER_STATUSES),
+            "paid_owner_subscription_statuses": sorted(PAID_OWNER_STATUSES),
+            "default_start_limit": DEFAULT_START_LIMIT,
+            "max_limit": MAX_BATCH_LIMIT,
         },
         "items": [_item_from_candidate(candidate) for candidate in candidates],
     }
@@ -414,12 +648,41 @@ def _gateway_error(result) -> str:
     return result.error or result.status.value
 
 
+def _short_text(value: Any, max_length: int = 160) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text if len(text) <= max_length else f"{text[:max_length - 3]}..."
+
+
+def _verification_error(verification: Dict[str, Any]) -> str:
+    ping_success = bool(verification.get("ping_success"))
+    tcp_success = bool(verification.get("tcp_success"))
+    parts = [
+        f"ping={'ok' if ping_success else 'failed'}",
+        f"tcp={'ok' if tcp_success else 'failed'}",
+    ]
+    tcp_error = _short_text(verification.get("tcp_error"))
+    if tcp_error:
+        parts.append(f"tcp_error={tcp_error}")
+    if not ping_success:
+        ping_error = _short_text(verification.get("ping_stderr") or verification.get("ping_stdout"))
+        if ping_error:
+            parts.append(f"ping_output={ping_error}")
+    return f"Insurance tunnel applied but verification did not fully pass ({'; '.join(parts)})"
+
+
 async def _process_candidate(
     job_id: str,
     candidate: InsuranceTunnelCandidate,
     force_rotate: bool,
 ) -> None:
     router_id = candidate.router.id
+    if candidate.skip_reason:
+        await _update_item(job_id, router_id, status="skipped", error=candidate.skip_reason, finished_at=_now_iso())
+        return
     if candidate.backup_ip_error:
         await _update_item(job_id, router_id, status="skipped", error=candidate.backup_ip_error, finished_at=_now_iso())
         return
@@ -558,8 +821,49 @@ async def _verify_candidate(
     manager_result: Dict[str, Any],
     router_config: Dict[str, Any],
 ) -> None:
-    verification = await verify_insurance_router(candidate.backup_ip, port=candidate.router.port)
-    verified = bool(verification.get("ping_success") and verification.get("tcp_success"))
+    verification: Dict[str, Any] = {}
+    verification_attempts = []
+    verified = False
+    for attempt in range(1, VERIFICATION_ATTEMPTS + 1):
+        verification = await verify_insurance_router(candidate.backup_ip, port=candidate.router.port)
+        verified = bool(verification.get("ping_success") and verification.get("tcp_success"))
+        verification_attempts.append({
+            "attempt": attempt,
+            "verified": verified,
+            "verification": verification,
+        })
+        if verified:
+            break
+        if attempt < VERIFICATION_ATTEMPTS:
+            await _update_item(
+                job_id,
+                candidate.router.id,
+                status="running",
+                error=_verification_error(verification),
+                verification=verification,
+                verification_attempts=verification_attempts,
+            )
+            await asyncio.sleep(VERIFICATION_RETRY_DELAY_SECONDS)
+
+    error = None if verified else _verification_error(verification)
+    if verified:
+        logger.info(
+            "Insurance tunnel verified for router %s (%s -> %s) after %s attempt(s)",
+            candidate.router.id,
+            candidate.router.ip_address,
+            candidate.backup_ip,
+            len(verification_attempts),
+        )
+    else:
+        logger.warning(
+            "Insurance tunnel partial for router %s (%s -> %s) after %s attempt(s): %s; verification=%s",
+            candidate.router.id,
+            candidate.router.ip_address,
+            candidate.backup_ip,
+            len(verification_attempts),
+            error,
+            verification,
+        )
     await _update_item(
         job_id,
         candidate.router.id,
@@ -567,6 +871,7 @@ async def _verify_candidate(
         manager=manager_result,
         router_actions=router_config.get("actions", []),
         verification=verification,
+        verification_attempts=verification_attempts,
         finished_at=_now_iso(),
-        error=None if verified else "Insurance tunnel applied but verification did not fully pass",
+        error=error,
     )

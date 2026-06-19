@@ -84,6 +84,10 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
 - SSH access to production (key-based, non-interactive for agents), the backend
   deploy runbook, and the one-time procedure to grant the same capability on any
   new server: [`docs/agent-memory/server-access.md`](docs/agent-memory/server-access.md).
+- Claude Code skill **`accessing-production-server`** (`.claude/skills/`) packages this for
+  agents: how to connect and run commands/scripts inside the prod containers safely (read-only
+  first, never restart). Auto-discovered — describe a prod task and it triggers, or run
+  `/accessing-production-server`.
 - Never commit SSH private keys, passwords, or credentials — public keys only.
 
 ## Router Provisioning Gotchas
@@ -98,6 +102,23 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   `docs/agent-memory/incidents/2026-06-10-provision-import-parse-abort-hotspot.md`.
   The admin frontend shows this runbook in the add-router flow
   (`../isp-billing-admin/app/components/HotspotPackageTroubleshoot.tsx`).
+
+- WAN-down means management tunnel is down. If a router has no internet (WAN not
+  up on `ether1`), its WireGuard management tunnel to `10.0.0.x` is also down —
+  the app and `diagnose_mikrotik.py` cannot reach it. Access locally via Winbox
+  Neighbors tab (connect by MAC address from a LAN port, ether2–5, not port 1),
+  or serial console. Common root causes for "ether1 connected but no internet":
+  upstream is fiber ONT in bridge mode (needs PPPoE, not DHCP); WAN/LAN subnet
+  conflict (upstream hands `192.168.88.x`, colliding with hotspot LAN); or
+  provisioning didn't complete (ether1 still in bridge). Clients not logged into
+  hotspot = no internet by design (not a fault).
+
+- Customer router already in the system acting up (clients "connected, no internet", captive
+  portal not appearing, not redirected)? Use the Claude Code skill
+  **`diagnose-customer-router`** (`.claude/skills/`): pass the router id for a read-only
+  diagnosis against a known-good router plus a catalog of proven fixes (7.20+ hotspot-file bug,
+  DHCP subnet mismatch, leftover config) — proposed, never auto-applied. Builds on
+  **`accessing-production-server`** for prod access.
 
 ## AWS Migration / Insurance Tunnel Handoff
 

@@ -735,7 +735,7 @@ async def get_portal_data(
     stmt = (
         select(Router, User)
         .join(User, Router.user_id == User.id)
-        .where(Router.identity == identity)
+        .where(func.lower(Router.identity) == identity.lower())
     )
     result = await db.execute(stmt)
     row = result.one_or_none()
@@ -759,6 +759,14 @@ async def get_portal_data(
 
     has_emergency = any(p.get("plan_type") == "emergency" for p in all_plans_for_flags)
     has_special = any(p.get("plan_type") == "special_offer" for p in all_plans_for_flags)
+    shareable_plans = [
+        p for p in all_plans_for_flags
+        if p.get("connection_type") == "hotspot" and int(p.get("max_shared_users") or 1) > 1
+    ]
+    max_shared_users = max(
+        (int(p.get("max_shared_users") or 1) for p in shareable_plans),
+        default=1,
+    )
     regular_all_hidden = all(
         p.get("is_hidden") for p in all_plans_for_flags if p.get("plan_type") == "regular"
     ) if any(p.get("plan_type") == "regular" for p in all_plans_for_flags) else False
@@ -783,6 +791,8 @@ async def get_portal_data(
             "has_special_offers": has_special,
             "emergency_mode_active": getattr(router_obj, 'emergency_active', False),
             "emergency_message": getattr(router_obj, 'emergency_message', None),
+            "sharing_enabled": bool(shareable_plans),
+            "max_shared_users": max_shared_users,
         },
         "portal_settings": _build_public_response(portal_settings, reseller),
     }

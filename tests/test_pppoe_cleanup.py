@@ -5,7 +5,20 @@ from fastapi import HTTPException
 from sqlalchemy import select, text
 
 from app.api import customer_routes, pppoe_monitor
-from app.db.models import ConnectionType, Customer, CustomerStatus
+from app.db.models import (
+    ConnectionType,
+    Customer,
+    CustomerPayment,
+    CustomerStatus,
+    PaymentMethod,
+    PaymentStatus,
+    ProvisioningAttempt,
+    ProvisioningAttemptEntrypoint,
+    ProvisioningAttemptSource,
+    ProvisioningOnlineState,
+    ProvisioningState,
+)
+from app.services import pppoe_provisioning
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
 
@@ -303,6 +316,102 @@ async def test_edit_active_pppoe_plan_reprovisions_with_new_speed(db, monkeypatc
     assert provision_calls[0]["pppoe_username"] == "plan_change_user"
     assert provision_calls[0]["bandwidth_limit"] == "5M/5M"
     assert remove_calls == []
+
+
+async def test_activate_pppoe_customer_tracks_failed_router_provision_for_retry(db, monkeypatch):
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.INACTIVE)
+
+    async def fake_current_user(_token, _db):
+        return reseller
+
+    async def fake_provision(payload):
+        return {"error": "Profile creation failed: invalid value for argument remote-address:"}
+
+    monkeypatch.setattr(customer_routes, "get_current_user", fake_current_user)
+    monkeypatch.setattr(pppoe_provisioning, "call_pppoe_provision", fake_provision)
+
+    response = await customer_routes.activate_pppoe_customer(
+        customer.id,
+        customer_routes.ActivatePPPoERequest(payment_method="cash"),
+        db,
+        "token",
+    )
+
+    assert response["success"] is True
+    assert response["provision_result"] == "retry_pending"
+    assert "remote-address" in response["provision_error"]
+    assert response["delivery"]["provisioning_state"] == ProvisioningState.RETRY_PENDING.value
+
+    attempt = (
+        await db.execute(select(ProvisioningAttempt).where(ProvisioningAttempt.customer_id == customer.id))
+    ).scalar_one()
+    assert attempt.source_table == ProvisioningAttemptSource.CUSTOMER_PAYMENT
+    assert attempt.entrypoint == ProvisioningAttemptEntrypoint.MANUAL_TRANSACTION_PROVISION
+    assert attempt.router_id == router.id
+    assert attempt.provisioning_state == ProvisioningState.RETRY_PENDING
+    assert attempt.online_state == ProvisioningOnlineState.UNKNOWN
+    assert attempt.attempt_count == 1
+    assert "remote-address" in attempt.last_error
+
+
+async def test_retry_pending_pppoe_provisioning_replays_active_customer_attempt(db, monkeypatch):
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+
+    payment = CustomerPayment(
+        customer_id=customer.id,
+        reseller_id=reseller.id,
+        amount=500,
+        payment_method=PaymentMethod.CASH,
+        days_paid_for=30,
+        status=PaymentStatus.COMPLETED,
+        customer_name=customer.name,
+    )
+    db.add(payment)
+    await db.flush()
+
+    attempt = ProvisioningAttempt(
+        customer_id=customer.id,
+        router_id=router.id,
+        mac_address=None,
+        source_table=ProvisioningAttemptSource.CUSTOMER_PAYMENT,
+        source_pk=payment.id,
+        entrypoint=ProvisioningAttemptEntrypoint.MANUAL_TRANSACTION_PROVISION,
+        provisioning_state=ProvisioningState.RETRY_PENDING,
+        online_state=ProvisioningOnlineState.UNKNOWN,
+        attempt_count=1,
+        last_error="Profile creation failed",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(attempt)
+    await db.commit()
+
+    calls = []
+
+    async def fake_provision(payload):
+        calls.append(payload)
+        return {
+            "success": True,
+            "profile": "pppoe_5M_5M",
+            "rate_limit": "5M/5M",
+        }
+
+    monkeypatch.setattr(pppoe_provisioning, "_retry_db_pool_is_busy", lambda: False)
+    monkeypatch.setattr(pppoe_provisioning, "call_pppoe_provision", fake_provision)
+
+    await pppoe_provisioning.retry_pending_pppoe_provisioning_background()
+
+    assert len(calls) == 1
+    assert calls[0]["pppoe_username"] == "Festo"
+    assert calls[0]["router_ip"] == router.ip_address
+
+    refreshed = await db.get(ProvisioningAttempt, attempt.id)
+    await db.refresh(refreshed)
+    assert refreshed.provisioning_state == ProvisioningState.ROUTER_UPDATED
+    assert refreshed.online_state == ProvisioningOnlineState.UNKNOWN
+    assert refreshed.attempt_count == 2
+    assert refreshed.last_error is None
+    assert refreshed.router_updated_at is not None
 
 
 async def test_pppoe_customer_presence_requires_pppoe_username(db, monkeypatch):

@@ -68,19 +68,27 @@ def _retry_db_pool_is_busy() -> bool:
     return False
 
 
-def build_hotspot_payload(customer: Customer, plan: Plan, router: Router, comment: str) -> Dict[str, Any]:
-    """Build the direct API payload used for hotspot bypass provisioning."""
+def _hotspot_time_limit_for_customer(customer: Customer, plan: Plan) -> str:
+    if customer.subscription_owner_id and customer.expiry:
+        remaining_seconds = int((customer.expiry - datetime.utcnow()).total_seconds())
+        remaining_minutes = max(1, (remaining_seconds + 59) // 60)
+        return f"{remaining_minutes}m"
+
     duration_unit = plan.duration_unit.value.upper()
     duration_value = plan.duration_value
 
     if duration_unit == "MINUTES":
-        time_limit = f"{int(duration_value)}m"
-    elif duration_unit == "HOURS":
-        time_limit = f"{int(duration_value)}h"
-    elif duration_unit == "DAYS":
-        time_limit = f"{int(duration_value)}d"
-    else:
-        time_limit = f"{int(duration_value)}h"
+        return f"{int(duration_value)}m"
+    if duration_unit == "HOURS":
+        return f"{int(duration_value)}h"
+    if duration_unit == "DAYS":
+        return f"{int(duration_value)}d"
+    return f"{int(duration_value)}h"
+
+
+def build_hotspot_payload(customer: Customer, plan: Plan, router: Router, comment: str) -> Dict[str, Any]:
+    """Build the direct API payload used for hotspot bypass provisioning."""
+    time_limit = _hotspot_time_limit_for_customer(customer, plan)
 
     return {
         "mac_address": customer.mac_address,
