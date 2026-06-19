@@ -602,6 +602,128 @@ async def share_subscription_with_device(
         raise HTTPException(status_code=500, detail=f"Subscription sharing failed: {str(e)}")
 
 
+@router.get("/api/public/device/share-subscription/status/{router_id}/{phone}")
+async def get_share_subscription_owner_status(
+    router_id: int,
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Check owner subscription sharing status and attached shared devices."""
+    try:
+        router_obj = (await db.execute(select(Router).where(Router.id == router_id))).scalar_one_or_none()
+        if not router_obj:
+            raise HTTPException(status_code=404, detail="Router not found")
+
+        phone_variants = _build_phone_variants(phone.strip())
+        now = datetime.utcnow()
+        owners = list(
+            (
+                await db.execute(
+                    select(Customer)
+                    .options(selectinload(Customer.plan))
+                    .where(
+                        Customer.router_id == router_id,
+                        Customer.phone.in_(phone_variants),
+                        Customer.subscription_owner_id.is_(None),
+                        Customer.status == CustomerStatus.ACTIVE,
+                        Customer.expiry.isnot(None),
+                        Customer.expiry > now,
+                    )
+                    .order_by(Customer.expiry.desc(), Customer.id.desc())
+                )
+            ).scalars().all()
+        )
+        hotspot_owners = [
+            owner for owner in owners
+            if owner.plan and owner.plan.connection_type == ConnectionType.HOTSPOT
+        ]
+        shareable_owners = [
+            owner for owner in hotspot_owners
+            if sharing_enabled_for_plan(owner.plan)
+        ]
+        owner = shareable_owners[0] if shareable_owners else (hotspot_owners[0] if hotspot_owners else None)
+
+        if not owner:
+            return {
+                "router_id": router_id,
+                "phone": phone,
+                "has_active_subscription": False,
+                "sharing_enabled": False,
+                "devices": [],
+                "count": 0,
+                "message": "No active hotspot subscription found for this phone on this router.",
+            }
+
+        plan = owner.plan
+        max_shared_users = max_shared_users_for_plan(plan)
+        max_companion_devices = max(0, max_shared_users - 1)
+        pairings = (
+            await db.execute(
+                select(DevicePairing, Customer)
+                .join(Customer, DevicePairing.customer_id == Customer.id)
+                .where(
+                    DevicePairing.subscription_owner_customer_id == owner.id,
+                    DevicePairing.router_id == router_id,
+                    DevicePairing.is_subscription_share == True,  # noqa: E712
+                    DevicePairing.is_active == True,  # noqa: E712
+                )
+                .order_by(DevicePairing.created_at.desc())
+            )
+        ).all()
+
+        devices = []
+        for pairing, shared_customer in pairings:
+            attempt = await get_recent_delivery_attempt_for_customer(db, shared_customer.id)
+            devices.append(
+                {
+                    **_serialize_pairing(pairing),
+                    "customer": {
+                        "id": shared_customer.id,
+                        "name": shared_customer.name,
+                        "phone": shared_customer.phone,
+                        "status": shared_customer.status.value,
+                        "expiry": shared_customer.expiry.isoformat() if shared_customer.expiry else None,
+                    },
+                    "delivery": serialize_delivery_attempt(attempt),
+                }
+            )
+
+        active_shared_devices = len(devices)
+        return {
+            "router_id": router_id,
+            "phone": phone,
+            "has_active_subscription": True,
+            "sharing_enabled": sharing_enabled_for_plan(plan),
+            "owner_customer_id": owner.id,
+            "owner_device_mac": owner.mac_address,
+            "owner_expiry": owner.expiry.isoformat() if owner.expiry else None,
+            "plan": {
+                "id": plan.id if plan else None,
+                "name": plan.name if plan else None,
+                "max_shared_users": max_shared_users,
+            },
+            "max_shared_users": max_shared_users,
+            "max_companion_devices": max_companion_devices,
+            "active_shared_devices": active_shared_devices,
+            "available_shared_devices": max(0, max_companion_devices - active_shared_devices),
+            "devices": devices,
+            "count": active_shared_devices,
+            "message": (
+                "Subscription can share another device."
+                if sharing_enabled_for_plan(plan) and active_shared_devices < max_companion_devices
+                else "This subscription has reached its sharing limit."
+                if sharing_enabled_for_plan(plan)
+                else "This subscription plan does not allow sharing."
+            ),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error getting share subscription owner status")
+        raise HTTPException(status_code=500, detail=f"Failed to get sharing status: {str(e)}")
+
+
 @router.post("/api/public/device/pair-and-pay")
 async def pair_device_and_pay(
     request: DevicePairAndPayRequest,

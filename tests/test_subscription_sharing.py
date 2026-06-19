@@ -241,6 +241,81 @@ async def test_share_subscription_without_owner_mac_prefers_shareable_owner(db, 
 
 
 @pytest.mark.asyncio
+async def test_share_owner_status_lists_existing_shared_devices_by_phone_variant(db):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, max_shared_users=3)
+    router = await make_router(db, reseller)
+    owner = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=2),
+        mac_address="AA:BB:CC:DD:EE:C1",
+        phone="254700000301",
+    )
+    shared = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=owner.expiry,
+        mac_address="AA:BB:CC:DD:EE:C2",
+        phone=owner.phone,
+        subscription_owner_id=owner.id,
+    )
+    pairing = DevicePairing(
+        customer_id=shared.id,
+        device_mac=shared.mac_address,
+        device_name="Kitchen TV",
+        device_type=DeviceType.TV,
+        router_id=router.id,
+        plan_id=plan.id,
+        subscription_owner_customer_id=owner.id,
+        is_subscription_share=True,
+        is_active=True,
+        expires_at=shared.expiry,
+    )
+    db.add(pairing)
+    await db.commit()
+
+    response = await device_pairing.get_share_subscription_owner_status(
+        router.id,
+        "0700000301",
+        db,
+    )
+
+    assert response["has_active_subscription"] is True
+    assert response["sharing_enabled"] is True
+    assert response["owner_customer_id"] == owner.id
+    assert response["owner_device_mac"] == owner.mac_address
+    assert response["max_shared_users"] == 3
+    assert response["active_shared_devices"] == 1
+    assert response["available_shared_devices"] == 1
+    assert response["devices"][0]["device_mac"] == shared.mac_address
+    assert response["devices"][0]["customer"]["id"] == shared.id
+
+
+@pytest.mark.asyncio
+async def test_share_owner_status_returns_no_active_subscription(db):
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+
+    response = await device_pairing.get_share_subscription_owner_status(
+        router.id,
+        "0700000401",
+        db,
+    )
+
+    assert response["has_active_subscription"] is False
+    assert response["sharing_enabled"] is False
+    assert response["devices"] == []
+    assert response["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_share_subscription_rejects_plan_with_no_sharing(db):
     reseller = await make_reseller(db)
     plan = await make_plan(db, reseller, max_shared_users=1)
