@@ -2,15 +2,38 @@ import asyncio
 import logging
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import and_, or_, select
 
+from app.db import database as db_module
+from app.db.database import db_pool_snapshot
+from app.db.models import (
+    ConnectionType,
+    Customer,
+    CustomerPayment,
+    CustomerStatus,
+    Plan,
+    ProvisioningAttempt,
+    ProvisioningAttemptEntrypoint,
+    ProvisioningAttemptSource,
+    ProvisioningOnlineState,
+    ProvisioningState,
+    Router,
+    RouterAuthMethod,
+)
 from app.services.mikrotik_api import MikroTikAPI
 from app.config import settings
+from app.services.router_availability import derive_router_status, record_router_availability
 
 logger = logging.getLogger("pppoe_provisioning")
+
+PPPOE_RETRY_STALE_IN_PROGRESS_SECONDS = 90
+PPPOE_RETRY_BATCH_SIZE = 20
+PPPOE_RETRY_MAX_ATTEMPTS = 5
+PPPOE_RETRY_MAX_AGE = timedelta(hours=4)
+PPPOE_RETRY_DB_BUSY_THRESHOLD_PERCENT = 60
 
 _RATE_SUFFIX_MULTIPLIERS = {
     "": 1,
@@ -18,6 +41,38 @@ _RATE_SUFFIX_MULTIPLIERS = {
     "M": 1_000_000,
     "G": 1_000_000_000,
 }
+
+
+def _truncate(value: Any, limit: int = 255) -> str | None:
+    if value is None:
+        return None
+    return str(value)[:limit]
+
+
+def _retry_db_pool_is_busy() -> bool:
+    snapshot = db_pool_snapshot()
+    checked_out_percent = snapshot.get("checked_out_percent")
+    if (
+        isinstance(checked_out_percent, (int, float))
+        and checked_out_percent >= PPPOE_RETRY_DB_BUSY_THRESHOLD_PERCENT
+    ):
+        logger.warning(
+            "[PPPoE-RETRY] Skipping background retry because DB pool is busy: "
+            "checked_out=%s/%s (%.2f%%), status=%s",
+            snapshot.get("checked_out"),
+            snapshot.get("configured_max_app_connections"),
+            checked_out_percent,
+            snapshot.get("status"),
+        )
+        return True
+    return False
+
+
+def _attempt_should_be_terminal(attempt: ProvisioningAttempt, now: datetime) -> bool:
+    return (
+        attempt.attempt_count >= PPPOE_RETRY_MAX_ATTEMPTS
+        or attempt.created_at <= (now - PPPOE_RETRY_MAX_AGE)
+    )
 
 
 def _apply_pppoe_headroom(rate_limit: str, factor: float) -> str:
@@ -231,6 +286,352 @@ async def call_pppoe_remove(payload: dict):
     except Exception as e:
         logger.error(f"[PPPoE] Error in remove task: {e}")
         return {"error": str(e)}
+
+
+async def _persist_pppoe_provisioning_result(
+    *,
+    result: Dict[str, Any],
+    customer_id: int,
+    router_id: int | None,
+    router_ip: str | None,
+    pppoe_username: str | None,
+    action: str,
+    attempt_id: int | None,
+) -> Dict[str, Any]:
+    from app.services.hotspot_provisioning import log_provisioning_event, serialize_delivery_attempt
+
+    provisioning_error = result.get("error")
+    refreshed_attempt = None
+
+    if provisioning_error:
+        final_state = ProvisioningState.RETRY_PENDING
+        if attempt_id is not None:
+            async with db_module.async_session() as db:
+                refreshed_attempt = await db.get(ProvisioningAttempt, attempt_id)
+                if refreshed_attempt:
+                    if _attempt_should_be_terminal(refreshed_attempt, datetime.utcnow()):
+                        final_state = ProvisioningState.FAILED
+                    refreshed_attempt.provisioning_state = final_state
+                    refreshed_attempt.online_state = ProvisioningOnlineState.UNKNOWN
+                    refreshed_attempt.last_error = _truncate(provisioning_error)
+                    refreshed_attempt.updated_at = datetime.utcnow()
+                    await db.commit()
+                    await db.refresh(refreshed_attempt)
+
+        await log_provisioning_event(
+            customer_id=customer_id,
+            router_id=router_id,
+            mac_address=None,
+            action=action,
+            status="failed" if final_state == ProvisioningState.FAILED else "retry_pending",
+            details=f"router={router_ip}; username={pppoe_username}",
+            error=provisioning_error,
+            attempt_id=attempt_id,
+        )
+
+        if router_id:
+            try:
+                async with db_module.async_session() as avail_db:
+                    is_online = "connect" not in provisioning_error.lower()
+                    await record_router_availability(avail_db, router_id, is_online, "pppoe_provisioning")
+                    await avail_db.commit()
+            except Exception:
+                pass
+
+        result["success"] = False
+        result["provisioning_error"] = provisioning_error
+        result["delivery"] = serialize_delivery_attempt(refreshed_attempt)
+        return result
+
+    if attempt_id is not None:
+        async with db_module.async_session() as db:
+            refreshed_attempt = await db.get(ProvisioningAttempt, attempt_id)
+            if refreshed_attempt:
+                refreshed_attempt.provisioning_state = ProvisioningState.ROUTER_UPDATED
+                # For PPPoE, ROUTER_UPDATED means the secret/profile exist.
+                # Online status depends on the customer CPE dialing in later.
+                refreshed_attempt.online_state = ProvisioningOnlineState.UNKNOWN
+                refreshed_attempt.router_updated_at = datetime.utcnow()
+                refreshed_attempt.last_error = None
+                refreshed_attempt.updated_at = datetime.utcnow()
+                await db.commit()
+                await db.refresh(refreshed_attempt)
+
+    await log_provisioning_event(
+        customer_id=customer_id,
+        router_id=router_id,
+        mac_address=None,
+        action=action,
+        status="success",
+        details=(
+            f"router={router_ip}; username={pppoe_username}; "
+            f"profile={result.get('profile', '')}; rate_limit={result.get('rate_limit', '')}"
+        ),
+        attempt_id=attempt_id,
+    )
+
+    if router_id:
+        try:
+            async with db_module.async_session() as avail_db:
+                await record_router_availability(avail_db, router_id, True, "pppoe_provisioning")
+                await avail_db.commit()
+        except Exception:
+            pass
+
+    result["success"] = True
+    result["provisioning_error"] = None
+    result["delivery"] = serialize_delivery_attempt(refreshed_attempt)
+    return result
+
+
+async def provision_pppoe_customer(
+    *,
+    customer_id: int,
+    router_id: int | None,
+    pppoe_payload: Dict[str, Any],
+    action: str = "pppoe_activation",
+    attempt_id: int | None = None,
+) -> Dict[str, Any]:
+    """
+    Provision a PPPoE customer and persist delivery state for retry/reconciliation.
+
+    The DB attempt update, RouterOS write, and result persistence are deliberately
+    separate sections so no DB transaction is held while waiting on MikroTik I/O.
+    """
+    router_ip = pppoe_payload.get("router_ip")
+    pppoe_username = pppoe_payload.get("pppoe_username")
+    now = datetime.utcnow()
+
+    if attempt_id is not None:
+        async with db_module.async_session() as db:
+            attempt = await db.get(ProvisioningAttempt, attempt_id)
+            if attempt:
+                attempt.customer_id = customer_id
+                attempt.router_id = router_id
+                attempt.provisioning_state = ProvisioningState.IN_PROGRESS
+                attempt.last_attempt_at = now
+                attempt.attempt_count += 1
+                attempt.last_error = None
+                attempt.updated_at = now
+                await db.commit()
+
+    if router_id:
+        try:
+            async with db_module.async_session() as db:
+                router_obj = await db.get(Router, router_id)
+                if router_obj and derive_router_status(router_obj) == "offline":
+                    result = {
+                        "success": False,
+                        "error": f"Router {router_ip} is known offline, will retry",
+                    }
+                    return await _persist_pppoe_provisioning_result(
+                        result=result,
+                        customer_id=customer_id,
+                        router_id=router_id,
+                        router_ip=router_ip,
+                        pppoe_username=pppoe_username,
+                        action=action,
+                        attempt_id=attempt_id,
+                    )
+        except Exception:
+            pass
+
+    result = await call_pppoe_provision(pppoe_payload)
+    return await _persist_pppoe_provisioning_result(
+        result=result or {"success": False, "error": "PPPoE provisioning returned no result"},
+        customer_id=customer_id,
+        router_id=router_id,
+        router_ip=router_ip,
+        pppoe_username=pppoe_username,
+        action=action,
+        attempt_id=attempt_id,
+    )
+
+
+async def retry_pending_pppoe_provisioning_background():
+    """
+    Retry active PPPoE customer delivery attempts in small batches.
+
+    This repairs the exact drift where a customer is ACTIVE in the DB but the
+    MikroTik profile/secret creation failed during activation. It is bounded by
+    batch size, retry count, retry age, DB-pool pressure, and per-router grouping.
+    """
+    try:
+        if _retry_db_pool_is_busy():
+            return
+
+        from app.services.hotspot_provisioning import (
+            get_or_create_provisioning_attempt,
+            schedule_provisioning_attempt,
+        )
+
+        now = datetime.utcnow()
+        stale_cutoff = now - timedelta(seconds=PPPOE_RETRY_STALE_IN_PROGRESS_SECONDS)
+        expiry_cutoff = now - PPPOE_RETRY_MAX_AGE
+        work_items: list[tuple[ProvisioningAttempt, Customer, Plan, Router]] = []
+
+        async with db_module.async_session() as db:
+            terminal_candidates = (
+                await db.execute(
+                    select(ProvisioningAttempt)
+                    .join(Customer, ProvisioningAttempt.customer_id == Customer.id)
+                    .join(Plan, Customer.plan_id == Plan.id)
+                    .where(
+                        Customer.pppoe_username.isnot(None),
+                        Plan.connection_type == ConnectionType.PPPOE,
+                        ProvisioningAttempt.provisioning_state.in_(
+                            [
+                                ProvisioningState.SCHEDULED,
+                                ProvisioningState.IN_PROGRESS,
+                                ProvisioningState.RETRY_PENDING,
+                            ]
+                        ),
+                        or_(
+                            ProvisioningAttempt.attempt_count >= PPPOE_RETRY_MAX_ATTEMPTS,
+                            ProvisioningAttempt.created_at <= expiry_cutoff,
+                        ),
+                    )
+                )
+            ).scalars().all()
+
+            for attempt in terminal_candidates:
+                attempt.provisioning_state = ProvisioningState.FAILED
+                attempt.last_error = attempt.last_error or "PPPoE provisioning retry window exhausted"
+                attempt.updated_at = now
+
+            if terminal_candidates:
+                await db.commit()
+
+            attempt_rows = (
+                await db.execute(
+                    select(ProvisioningAttempt, Customer, Plan, Router)
+                    .join(Customer, ProvisioningAttempt.customer_id == Customer.id)
+                    .join(Plan, Customer.plan_id == Plan.id)
+                    .join(Router, Customer.router_id == Router.id)
+                    .where(
+                        Customer.status == CustomerStatus.ACTIVE,
+                        Customer.pppoe_username.isnot(None),
+                        Customer.expiry.isnot(None),
+                        Customer.expiry > now,
+                        Plan.connection_type == ConnectionType.PPPOE,
+                        Router.auth_method == RouterAuthMethod.DIRECT_API,
+                        or_(
+                            ProvisioningAttempt.provisioning_state == ProvisioningState.SCHEDULED,
+                            and_(
+                                ProvisioningAttempt.provisioning_state == ProvisioningState.IN_PROGRESS,
+                                or_(
+                                    ProvisioningAttempt.last_attempt_at.is_(None),
+                                    ProvisioningAttempt.last_attempt_at <= stale_cutoff,
+                                ),
+                            ),
+                            and_(
+                                ProvisioningAttempt.provisioning_state == ProvisioningState.RETRY_PENDING,
+                                ProvisioningAttempt.attempt_count < PPPOE_RETRY_MAX_ATTEMPTS,
+                                ProvisioningAttempt.created_at > expiry_cutoff,
+                            ),
+                        ),
+                    )
+                    .order_by(ProvisioningAttempt.updated_at.asc(), ProvisioningAttempt.id.asc())
+                    .limit(PPPOE_RETRY_BATCH_SIZE)
+                )
+            ).all()
+
+            for attempt, customer, plan, router in attempt_rows:
+                work_items.append((attempt, customer, plan, router))
+
+            remaining_capacity = max(PPPOE_RETRY_BATCH_SIZE - len(work_items), 0)
+            if remaining_capacity:
+                # Safety net: recent paid active PPPoE customers with no attempt
+                # get one. This keeps one missed scheduling bug from becoming
+                # permanent drift, without scanning the full customer table.
+                safety_rows = (
+                    await db.execute(
+                        select(CustomerPayment, Customer, Plan, Router)
+                        .join(Customer, CustomerPayment.customer_id == Customer.id)
+                        .join(Plan, Customer.plan_id == Plan.id)
+                        .join(Router, Customer.router_id == Router.id)
+                        .outerjoin(
+                            ProvisioningAttempt,
+                            and_(
+                                ProvisioningAttempt.source_table == ProvisioningAttemptSource.CUSTOMER_PAYMENT,
+                                ProvisioningAttempt.source_pk == CustomerPayment.id,
+                            ),
+                        )
+                        .where(
+                            CustomerPayment.created_at >= expiry_cutoff,
+                            ProvisioningAttempt.id.is_(None),
+                            Customer.status == CustomerStatus.ACTIVE,
+                            Customer.pppoe_username.isnot(None),
+                            Customer.expiry.isnot(None),
+                            Customer.expiry > now,
+                            Plan.connection_type == ConnectionType.PPPOE,
+                            Router.auth_method == RouterAuthMethod.DIRECT_API,
+                        )
+                        .order_by(CustomerPayment.created_at.asc(), CustomerPayment.id.asc())
+                        .limit(remaining_capacity)
+                    )
+                ).all()
+
+                for payment, customer, _plan, router in safety_rows:
+                    attempt = await get_or_create_provisioning_attempt(
+                        db,
+                        customer_id=customer.id,
+                        router_id=router.id,
+                        mac_address=None,
+                        source_table=ProvisioningAttemptSource.CUSTOMER_PAYMENT,
+                        source_pk=payment.id,
+                        external_reference=payment.payment_reference,
+                        entrypoint=ProvisioningAttemptEntrypoint.MANUAL_TRANSACTION_PROVISION,
+                    )
+                    await schedule_provisioning_attempt(db, attempt)
+                    work_items.append((attempt, customer, _plan, router))
+
+                if safety_rows:
+                    await db.commit()
+
+        if not work_items:
+            logger.debug("[PPPoE-RETRY] No PPPoE delivery attempts need work")
+            return
+
+        if _retry_db_pool_is_busy():
+            return
+
+        logger.warning("[PPPoE-RETRY] Processing %d PPPoE delivery attempt(s)", len(work_items))
+
+        from collections import defaultdict
+
+        router_groups: dict[str, list[tuple[ProvisioningAttempt, Customer, Plan, Router]]] = defaultdict(list)
+        for item in work_items:
+            attempt, customer, _plan, router = item
+            if customer.pppoe_username and customer.pppoe_password:
+                router_key = f"{router.ip_address}:{router.port}"
+                router_groups[router_key].append(item)
+
+        for items in router_groups.values():
+            for attempt, customer, _plan, router in items:
+                payload = {
+                    "pppoe_username": customer.pppoe_username,
+                    "pppoe_password": customer.pppoe_password,
+                    "bandwidth_limit": _plan.speed if _plan else "10Mbps",
+                    "comment": (
+                        f"CID:{customer.id}|{customer.name or customer.phone}|"
+                        f"{datetime.utcnow().strftime('%Y-%m-%d')}"
+                    ),
+                    "router_ip": router.ip_address,
+                    "router_username": router.username,
+                    "router_password": router.password,
+                    "router_port": router.port,
+                }
+                await provision_pppoe_customer(
+                    customer_id=customer.id,
+                    router_id=router.id,
+                    pppoe_payload=payload,
+                    action="pppoe_retry",
+                    attempt_id=attempt.id,
+                )
+
+    except Exception as exc:
+        logger.error("[PPPoE-RETRY] Background retry job failed: %s", exc)
 
 
 def build_pppoe_payload(customer, router) -> dict:

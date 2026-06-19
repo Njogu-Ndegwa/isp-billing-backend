@@ -109,6 +109,7 @@ from app.services.mikrotik_background import (
     _cleanup_single_router_hotspot_sync,
 )
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
+from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
 from app.services.subscription import reconcile_pending_subscription_payments
 from app.services.mpesa_b2b import run_daily_payouts
@@ -1884,6 +1885,14 @@ async def startup_event():
         max_instances=1
     )
     scheduler.add_job(
+        retry_pending_pppoe_provisioning_background,
+        trigger=IntervalTrigger(seconds=113),
+        id='retry_pending_pppoe_provisioning',
+        name='Retry stranded PPPoE provisioning',
+        replace_existing=True,
+        max_instances=1
+    )
+    scheduler.add_job(
         reconcile_pending_mpesa_transactions,
         trigger=IntervalTrigger(seconds=90),
         id='reconcile_pending_mpesa',
@@ -1999,6 +2008,7 @@ async def startup_event():
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "
         "queue repair every 313s, hotspot provisioning retry every 97s, "
+        "PPPoE provisioning retry every 113s, "
         "M-Pesa reconciliation every 90s, "
         "stale token cleanup daily at 00:00 UTC (3:00 AM EAT)"
     )
