@@ -1184,6 +1184,7 @@ async def get_bandwidth_history(
     """
     try:
         user = await get_current_user(token, db)
+        hours = max(1, min(int(hours or 24), 24 * 30))
         since = datetime.utcnow() - timedelta(hours=hours)
         
         router_name = None
