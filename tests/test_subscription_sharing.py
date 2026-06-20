@@ -238,6 +238,14 @@ async def test_share_code_redeems_detected_device_and_marks_code_used(db, monkey
     assert code_response["success"] is True
     assert len(code_response["raw_code"]) == 6
     assert code_response["available_shared_devices"] == 2
+    second_code_response = await device_pairing.create_share_subscription_code(
+        ShareSubscriptionCodeCreateRequest(
+            owner_phone="0700000401",
+            router_id=router.id,
+        ),
+        db,
+    )
+    assert second_code_response["raw_code"] == code_response["raw_code"]
 
     response = await device_pairing.redeem_share_subscription_code(
         ShareSubscriptionCodeRedeemRequest(

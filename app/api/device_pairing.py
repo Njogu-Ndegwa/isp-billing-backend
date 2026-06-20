@@ -755,6 +755,26 @@ async def create_share_subscription_code(
             )
 
         now = datetime.utcnow()
+        existing_code = (
+            await db.execute(
+                select(SubscriptionShareCode)
+                .where(
+                    SubscriptionShareCode.router_id == request.router_id,
+                    SubscriptionShareCode.owner_customer_id == owner.id,
+                    SubscriptionShareCode.status == SHARE_CODE_ACTIVE,
+                    SubscriptionShareCode.expires_at > now,
+                )
+                .order_by(SubscriptionShareCode.expires_at.desc(), SubscriptionShareCode.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing_code:
+            return _serialize_share_code(
+                existing_code,
+                active_shared_devices=active_shared_count,
+                max_companion_devices=max_companion_devices,
+            )
+
         code = await _generate_unique_share_code(db)
         share_code = SubscriptionShareCode(
             code=code,
