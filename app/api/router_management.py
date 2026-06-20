@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, func, case
+from sqlalchemy import delete as sql_delete, inspect, or_, select, update, func, case, text
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
@@ -9,7 +9,24 @@ import httpx
 
 from app.config import settings
 from app.db.database import get_db
-from app.db.models import Router, Customer, CustomerStatus, ProvisioningLog, BandwidthSnapshot, User, UserRole, RouterAvailabilityCheck, ProvisioningToken, Voucher, RouterLogEntry
+from app.db.models import (
+    AccessCredential,
+    BandwidthSnapshot,
+    Customer,
+    CustomerStatus,
+    DevicePairing,
+    ProvisioningAttempt,
+    ProvisioningLog,
+    ProvisioningToken,
+    ReconnectionAttempt,
+    Router,
+    RouterAvailabilityCheck,
+    RouterLogEntry,
+    User,
+    UserRole,
+    Voucher,
+    VoucherStatus,
+)
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.router_availability import build_router_status, record_router_availability
@@ -1948,28 +1965,59 @@ async def delete_router(
             await db.execute(update_customers_stmt)
             logger.info(f"Set {customer_count} customers from router {router_name} to INACTIVE")
         
-        # Clean up related records that reference this router
+        # Clean up related records that reference this router. Customer and
+        # payment history is preserved; router-owned operational state is
+        # explicitly removed before deleting the router.
+        router_attempt_ids = select(ProvisioningAttempt.id).where(
+            ProvisioningAttempt.router_id == router_id
+        )
         await db.execute(
             update(ProvisioningLog)
-            .where(ProvisioningLog.router_id == router_id)
-            .values(router_id=None)
+            .where(
+                or_(
+                    ProvisioningLog.router_id == router_id,
+                    ProvisioningLog.attempt_id.in_(router_attempt_ids),
+                )
+            )
+            .values(router_id=None, attempt_id=None)
         )
         await db.execute(
-            update(BandwidthSnapshot)
+            sql_delete(ProvisioningAttempt)
+            .where(ProvisioningAttempt.router_id == router_id)
+        )
+        await db.execute(
+            sql_delete(BandwidthSnapshot)
             .where(BandwidthSnapshot.router_id == router_id)
-            .values(router_id=None)
         )
         await db.execute(
-            update(ProvisioningToken)
+            sql_delete(ProvisioningToken)
             .where(ProvisioningToken.router_id == router_id)
-            .values(router_id=None)
+        )
+        await db.execute(
+            update(Voucher)
+            .where(
+                Voucher.router_id == router_id,
+                Voucher.status == VoucherStatus.AVAILABLE,
+            )
+            .values(router_id=None, status=VoucherStatus.DISABLED)
         )
         await db.execute(
             update(Voucher)
             .where(Voucher.router_id == router_id)
             .values(router_id=None)
         )
-        from sqlalchemy import delete as sql_delete
+        await db.execute(
+            sql_delete(DevicePairing)
+            .where(DevicePairing.router_id == router_id)
+        )
+        await db.execute(
+            sql_delete(ReconnectionAttempt)
+            .where(ReconnectionAttempt.router_id == router_id)
+        )
+        await db.execute(
+            sql_delete(AccessCredential)
+            .where(AccessCredential.router_id == router_id)
+        )
         await db.execute(
             sql_delete(RouterLogEntry)
             .where(RouterLogEntry.router_id == router_id)
@@ -1979,6 +2027,18 @@ async def delete_router(
             sql_delete(RouterAvailabilityCheck)
             .where(RouterAvailabilityCheck.router_id == router_id)
         )
+        # radius_nas is a raw RADIUS table with ON DELETE CASCADE in its
+        # migration. Delete it explicitly, when present, so router deletion has
+        # no hidden DB cascade side effects.
+        db_connection = await db.connection()
+        has_radius_nas = await db_connection.run_sync(
+            lambda sync_connection: inspect(sync_connection).has_table("radius_nas")
+        )
+        if has_radius_nas:
+            await db.execute(
+                text("DELETE FROM radius_nas WHERE router_id = :router_id"),
+                {"router_id": router_id},
+            )
 
         await db.delete(router_obj)
         await db.commit()
