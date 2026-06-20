@@ -14,6 +14,10 @@ from app.services import mikrotik_background
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
 
+def test_bandwidth_snapshot_retention_covers_largest_dashboard_filter():
+    assert mikrotik_background.BANDWIDTH_HISTORY_RETENTION_DAYS >= 30
+
+
 def _raw_snapshot(router_id: int, *, hotspot_bytes: str, pppoe_bytes: str, rx: int, tx: int) -> dict:
     return {
         "router_id": router_id,

@@ -60,6 +60,7 @@ SAFETY_NET_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
 ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL = timedelta(minutes=5)
 BANDWIDTH_MAX_ROUTERS_PER_RUN = 8
 BANDWIDTH_RUN_TIME_BUDGET_SECONDS = 90
+BANDWIDTH_HISTORY_RETENTION_DAYS = 30
 
 
 class RouterLockManager:
@@ -2596,7 +2597,7 @@ async def collect_bandwidth_snapshot():
 
             _bandwidth_router_cursor = (start_index + processed_count) % len(eligible_routers)
 
-            cutoff = now - timedelta(days=1)
+            cutoff = now - timedelta(days=BANDWIDTH_HISTORY_RETENTION_DAYS)
             await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
             await prune_router_availability_history(db, now=now)
             await db.commit()
