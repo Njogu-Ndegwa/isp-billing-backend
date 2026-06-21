@@ -57,8 +57,25 @@ class TalksasaProvider(MessagingProvider):
         url = f"{self.base_url}/sms/send"
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            response_payload = resp.json()
+            try:
+                response_payload = resp.json()
+            except ValueError:
+                response_payload = {"status": "error", "message": resp.text}
+            if resp.status_code >= 400:
+                message = (
+                    response_payload.get("message")
+                    if isinstance(response_payload, dict)
+                    else None
+                ) or f"HTTP {resp.status_code}"
+                return [
+                    SendResult(
+                        recipient=recipient,
+                        success=False,
+                        status=f"http_{resp.status_code}",
+                        error=str(message)[:255],
+                    )
+                    for recipient in recipients
+                ]
 
         return self._parse_response(response_payload, recipients)
 
@@ -91,12 +108,33 @@ class TalksasaProvider(MessagingProvider):
             return self._align_recipients(results, recipients)
 
         status = str(payload.get("status") or "success")
+        provider_message_id = None
+        provider_status = status
+        if isinstance(data, dict):
+            provider_message_id = (
+                data.get("queue_uid")
+                or data.get("uid")
+                or data.get("message_id")
+                or data.get("id")
+            )
+            provider_status = str(data.get("status") or status)
+        success = status.lower() == "success" and provider_status.lower() not in {
+            "error",
+            "failed",
+            "rejected",
+            "undelivered",
+        }
         return [
             SendResult(
                 recipient=recipient,
-                success=status.lower() == "success",
-                status=status,
-                error=None if status.lower() == "success" else status,
+                success=success,
+                provider_message_id=(
+                    str(provider_message_id)
+                    if provider_message_id not in (None, "", "None")
+                    else None
+                ),
+                status=provider_status,
+                error=None if success else str(payload.get("message") or provider_status)[:255],
             )
             for recipient in recipients
         ]

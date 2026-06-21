@@ -25,15 +25,17 @@ def test_factory_returns_talksasa(monkeypatch):
 
 def test_default_sender_id_is_provider_aware(monkeypatch):
     from app.config import settings
-    from app.services.messaging import default_sender_id
+    from app.services.messaging import default_sender_id, resolve_sender_id
     monkeypatch.setattr(settings, "SMS_SENDER_ID", "")
     monkeypatch.setattr(settings, "SMS_PROVIDER", "talksasa")
     monkeypatch.setattr(settings, "TALKSASA_SENDER_ID", "TALKSASA")
     monkeypatch.setattr(settings, "AT_SENDER_ID", "ATBRAND")
     assert default_sender_id() == "TALKSASA"
+    assert resolve_sender_id("DBBRAND") == "DBBRAND"
 
     monkeypatch.setattr(settings, "SMS_SENDER_ID", "GLOBAL")
     assert default_sender_id() == "GLOBAL"
+    assert resolve_sender_id("DBBRAND") == "GLOBAL"
 
 
 def test_factory_unknown_provider_raises(monkeypatch):
@@ -199,6 +201,60 @@ async def test_talksasa_error_payload_marks_all_recipients_failed(monkeypatch):
     assert len(results) == 1
     assert results[0].success is False
     assert results[0].error == "Insufficient balance"
+
+
+@pytest.mark.asyncio
+async def test_talksasa_accepted_queue_marks_all_recipients_sent(monkeypatch):
+    class _FakeResponse:
+        status_code = 202
+        def json(self):
+            return {
+                "status": "success",
+                "message": "Your SMS is being processed and will be delivered",
+                "data": {
+                    "queue_uid": "queue-1",
+                    "status": "accepted",
+                    "recipients_count": 2,
+                },
+            }
+
+    class _FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    provider = TalksasaProvider(api_token="token", base_url="https://api.example/v3")
+    results = await provider.send_bulk(["254700000001", "254700000002"], "Hi", "BRAND")
+    assert [r.success for r in results] == [True, True]
+    assert {r.provider_message_id for r in results} == {"queue-1"}
+    assert {r.status for r in results} == {"accepted"}
+
+
+@pytest.mark.asyncio
+async def test_talksasa_http_error_body_marks_all_recipients_failed(monkeypatch):
+    class _FakeResponse:
+        status_code = 404
+        text = '{"status":"error","message":"Sender ID information not found"}'
+        def json(self):
+            return {"status": "error", "message": "Sender ID information not found"}
+
+    class _FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    provider = TalksasaProvider(api_token="token", base_url="https://api.example/v3")
+    results = await provider.send_bulk(["254700000001"], "Hi", "BRAND")
+    assert len(results) == 1
+    assert results[0].success is False
+    assert results[0].status == "http_404"
+    assert results[0].error == "Sender ID information not found"
 
 
 @pytest.mark.asyncio

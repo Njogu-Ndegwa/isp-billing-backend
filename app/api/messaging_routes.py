@@ -19,7 +19,7 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import sms_credits, sms_dispatch
-from app.services.messaging import count_segments, default_sender_id
+from app.services.messaging import count_segments, resolve_sender_id
 from app.services.mpesa import initiate_stk_push_direct
 
 logger = logging.getLogger(__name__)
@@ -219,7 +219,7 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
             "shortfall": total - acct.balance,
         })
 
-    sender_id = s.sender_id or default_sender_id()
+    sender_id = resolve_sender_id(s.sender_id)
     camp = SmsCampaign(user_id=user.id, body=req.body, recipient_count=len(recips),
                        segments_per_message=segments, total_credits=total,
                        sender_id=sender_id, status=SmsCampaignStatus.QUEUED)

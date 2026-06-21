@@ -15,7 +15,7 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import sms_credits, sms_dispatch
-from app.services.messaging import count_segments, default_sender_id
+from app.services.messaging import count_segments, resolve_sender_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin-messaging"])
@@ -164,11 +164,12 @@ async def send_inbox(req: InboxSendIn, background: BackgroundTasks,
             db.add(row)
             sms_rows.append(row)
 
-    # Honor the admin-configured sender id (same fallback the reseller send
-    # path uses), not just the env default.
+    # Resolve sender the same way the reseller send path does; SMS_SENDER_ID is
+    # an operational override for provider migrations.
     settings_row = await db.get(MessagingSettings, 1)
-    sender_id = (settings_row.sender_id if settings_row and settings_row.sender_id
-                 else default_sender_id())
+    sender_id = resolve_sender_id(
+        settings_row.sender_id if settings_row and settings_row.sender_id else None
+    )
     await db.flush()
     sms_message_ids = [row.id for row in sms_rows]
     await db.commit()
