@@ -4,6 +4,7 @@ import pytest
 from app.services.messaging import get_provider
 from app.services.messaging.africas_talking import AfricasTalkingProvider
 from app.services.messaging.base import SendResult
+from app.services.messaging.talksasa import TalksasaProvider
 
 
 def test_factory_returns_africas_talking(monkeypatch):
@@ -11,6 +12,28 @@ def test_factory_returns_africas_talking(monkeypatch):
     monkeypatch.setattr(settings, "SMS_PROVIDER", "africastalking")
     provider = get_provider()
     assert isinstance(provider, AfricasTalkingProvider)
+
+
+def test_factory_returns_talksasa(monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "SMS_PROVIDER", "talksasa")
+    monkeypatch.setattr(settings, "TALKSASA_API_TOKEN", "token")
+    monkeypatch.setattr(settings, "TALKSASA_BASE_URL", "https://api.example/v3")
+    provider = get_provider()
+    assert isinstance(provider, TalksasaProvider)
+
+
+def test_default_sender_id_is_provider_aware(monkeypatch):
+    from app.config import settings
+    from app.services.messaging import default_sender_id
+    monkeypatch.setattr(settings, "SMS_SENDER_ID", "")
+    monkeypatch.setattr(settings, "SMS_PROVIDER", "talksasa")
+    monkeypatch.setattr(settings, "TALKSASA_SENDER_ID", "TALKSASA")
+    monkeypatch.setattr(settings, "AT_SENDER_ID", "ATBRAND")
+    assert default_sender_id() == "TALKSASA"
+
+    monkeypatch.setattr(settings, "SMS_SENDER_ID", "GLOBAL")
+    assert default_sender_id() == "GLOBAL"
 
 
 def test_factory_unknown_provider_raises(monkeypatch):
@@ -93,3 +116,98 @@ async def test_missing_recipients_payload_falls_back_to_failed(monkeypatch):
     assert len(results) == 1
     assert results[0].success is False
     assert results[0].status == "no_response"
+
+
+@pytest.mark.asyncio
+async def test_talksasa_posts_json_with_bearer_token(monkeypatch):
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {
+                "status": "success",
+                "data": [
+                    {
+                        "uid": "sms_1",
+                        "recipient": "+254712345678",
+                        "status": "sent",
+                        "cost": 1,
+                    },
+                    {
+                        "uid": "sms_2",
+                        "recipient": "254700000000",
+                        "status": "failed",
+                        "message": "Invalid recipient",
+                    },
+                ],
+            }
+
+    class _FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    provider = TalksasaProvider(api_token="token|with-pipe",
+                                base_url="https://api.example/v3/")
+
+    results = await provider.send_bulk(
+        ["254712345678", "254700000000"], "Hi", "BRAND"
+    )
+
+    assert captured["url"] == "https://api.example/v3/sms/send"
+    assert captured["json"] == {
+        "recipient": "254712345678,254700000000",
+        "sender_id": "BRAND",
+        "type": "plain",
+        "message": "Hi",
+    }
+    assert captured["headers"]["Authorization"] == "Bearer token|with-pipe"
+    assert captured["headers"]["Accept"] == "application/json"
+    by_num = {r.recipient: r for r in results}
+    assert by_num["254712345678"].success is True
+    assert by_num["254712345678"].provider_message_id == "sms_1"
+    assert by_num["254700000000"].success is False
+    assert by_num["254700000000"].error == "Invalid recipient"
+
+
+@pytest.mark.asyncio
+async def test_talksasa_error_payload_marks_all_recipients_failed(monkeypatch):
+    class _FakeResponse:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"status": "error", "message": "Insufficient balance"}
+
+    class _FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    provider = TalksasaProvider(api_token="token", base_url="https://api.example/v3")
+    results = await provider.send_bulk(["254712345678"], "Hi", "BRAND")
+    assert len(results) == 1
+    assert results[0].success is False
+    assert results[0].error == "Insufficient balance"
+
+
+@pytest.mark.asyncio
+async def test_talksasa_missing_credentials_makes_no_request(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("must not open an HTTP client without credentials")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _boom)
+    provider = TalksasaProvider(api_token="", base_url="https://api.example/v3")
+    results = await provider.send_bulk(["254712345678"], "Hi", "BRAND")
+    assert results[0].success is False
+    assert results[0].error == "missing_api_token"

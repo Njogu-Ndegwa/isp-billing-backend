@@ -8,14 +8,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.db.database import get_db
 from app.db.models import (
     User, UserRole, MessagingSettings, SmsCreditOrder, ResellerInboxMessage,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import sms_credits
-from app.services.messaging import get_provider
+from app.services.messaging import default_sender_id, get_provider
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin-messaging"])
@@ -152,7 +151,7 @@ async def send_inbox(req: InboxSendIn, background: BackgroundTasks,
     # path uses), not just the env default.
     settings_row = await db.get(MessagingSettings, 1)
     sender_id = (settings_row.sender_id if settings_row and settings_row.sender_id
-                 else settings.AT_SENDER_ID)
+                 else default_sender_id())
     await db.commit()
 
     if req.also_sms and targets:

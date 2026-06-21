@@ -4,7 +4,23 @@ from app.config import settings
 from app.services.messaging.base import MessagingProvider, SendResult
 from app.services.messaging.segments import count_segments
 
-__all__ = ["get_provider", "count_segments", "MessagingProvider", "SendResult"]
+__all__ = [
+    "default_sender_id",
+    "get_provider",
+    "count_segments",
+    "MessagingProvider",
+    "SendResult",
+]
+
+
+def default_sender_id() -> str:
+    """Return the provider-aware default sender id from environment settings."""
+    if settings.SMS_SENDER_ID:
+        return settings.SMS_SENDER_ID
+    provider = (settings.SMS_PROVIDER or "").lower()
+    if provider == "talksasa":
+        return settings.TALKSASA_SENDER_ID
+    return settings.AT_SENDER_ID
 
 
 def get_provider() -> MessagingProvider:
@@ -15,5 +31,11 @@ def get_provider() -> MessagingProvider:
             username=settings.AT_USERNAME,
             api_key=settings.AT_API_KEY,
             base_url=settings.AT_BASE_URL,
+        )
+    if provider == "talksasa":
+        from app.services.messaging.talksasa import TalksasaProvider
+        return TalksasaProvider(
+            api_token=settings.TALKSASA_API_TOKEN,
+            base_url=settings.TALKSASA_BASE_URL,
         )
     raise ValueError(f"Unsupported SMS provider: {settings.SMS_PROVIDER!r}")

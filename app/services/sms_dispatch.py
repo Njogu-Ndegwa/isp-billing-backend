@@ -21,7 +21,7 @@ from app.db.models import (
     MessagingSettings,
 )
 from app.services import sms_credits
-from app.services.messaging import get_provider
+from app.services.messaging import default_sender_id, get_provider
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ async def dispatch_campaign(campaign_id: int) -> None:
                    SmsMessage.status == SmsMessageStatus.QUEUED)
         )).all()
         body = camp.body
-        sender_id = camp.sender_id or settings.AT_SENDER_ID
+        sender_id = camp.sender_id or default_sender_id()
         user_id = camp.user_id
         await db.commit()
     # --- DB session closed; no connection held from here ---
