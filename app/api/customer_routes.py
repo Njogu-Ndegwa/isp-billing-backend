@@ -13,7 +13,7 @@ from app.db.models import (
     Router, Customer, Plan, CustomerStatus, ConnectionType,
     CustomerPayment, PaymentMethod, PaymentStatus, DurationUnit,
     Payment, CustomerRating, ProvisioningLog, MpesaTransaction,
-    UserBandwidthUsage, Voucher, CustomerUsagePeriod,
+    UserBandwidthUsage, Voucher, CustomerUsagePeriod, UsageCapWatchState,
     ProvisioningAttempt, ProvisioningAttemptEntrypoint,
     ProvisioningAttemptSource, DevicePairing, ReconnectionAttempt,
     ZenoPayTransaction, MtnMomoTransaction,
@@ -416,6 +416,7 @@ async def delete_customer(
         await db.execute(delete(CustomerRating).where(CustomerRating.customer_id == customer_id))
         await db.execute(delete(UserBandwidthUsage).where(UserBandwidthUsage.customer_id == customer_id))
         await db.execute(delete(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id == customer_id))
+        await db.execute(delete(UsageCapWatchState).where(UsageCapWatchState.customer_id == customer_id))
         await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id == customer_id))
         await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.customer_id == customer_id))
         await db.execute(delete(DevicePairing).where(DevicePairing.customer_id == customer_id))

@@ -575,6 +575,42 @@ class CustomerUsagePeriod(Base):
     customer = relationship("Customer", backref="usage_periods")
 
 
+class UsageCapWatchState(Base):
+    """Durable scheduler state for lightweight capped-usage polling.
+
+    Usage totals intentionally stay in ``user_bandwidth_usage`` and
+    ``customer_usage_periods``.  This table only decides when a capped customer
+    should next be sampled and records poll/enforcement failures.
+    """
+    __tablename__ = "usage_cap_watch_state"
+    __table_args__ = (
+        UniqueConstraint("customer_id", name="uq_usage_cap_watch_customer"),
+        Index("ix_usage_cap_watch_due", "next_poll_at", "router_id"),
+        Index("ix_usage_cap_watch_router_due", "router_id", "next_poll_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=False, index=True)
+    queue_key = Column(String(100), nullable=True, index=True)
+    next_poll_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    last_polled_at = Column(DateTime, nullable=True)
+    poll_interval_seconds = Column(Integer, nullable=False, default=300, server_default="300")
+    poll_tier = Column(String(32), nullable=False, default="normal", server_default="normal")
+    consecutive_errors = Column(Integer, nullable=False, default=0, server_default="0")
+    backoff_until = Column(DateTime, nullable=True, index=True)
+    locked_at = Column(DateTime, nullable=True)
+    locked_by = Column(String(64), nullable=True)
+    last_error = Column(String(500), nullable=True)
+    last_enforcement_attempt_at = Column(DateTime, nullable=True)
+    last_enforcement_error = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    customer = relationship("Customer", backref="usage_cap_watch_state")
+    router = relationship("Router")
+
+
 # ========================================
 # ADS MODELS
 # ========================================
