@@ -17,7 +17,7 @@ from app.db.database import async_session
 from app.db.models import (
     Customer, CustomerStatus,
     SmsCampaign, SmsCampaignStatus,
-    SmsMessage, SmsMessageStatus,
+    SmsMessage, SmsMessageStatus, SmsMessageKind,
     MessagingSettings,
 )
 from app.services import sms_credits
@@ -56,6 +56,11 @@ async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
 def _chunks(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
+
+
+def _phone_key(phone: str | None) -> str:
+    """Normalize only for matching provider results back to queued rows."""
+    return (phone or "").strip().replace(" ", "").lstrip("+")
 
 
 async def dispatch_campaign(campaign_id: int) -> None:
@@ -100,24 +105,35 @@ async def dispatch_campaign(campaign_id: int) -> None:
             results = []
         # --- End network call ---
 
-        by_phone = {r.recipient: r for r in results}
+        by_phone = {_phone_key(r.recipient): r for r in results}
 
         failed_credits = 0
+        sent_count = 0
+        failed_count = 0
         # --- Short DB session: persist per-message results ---
         async with async_session() as db:
             for m in chunk:
                 row = await db.get(SmsMessage, m.id)
-                res = by_phone.get(m.recipient_phone)
+                res = by_phone.get(_phone_key(m.recipient_phone))
                 if res is not None and res.success:
                     row.status = SmsMessageStatus.SENT
                     row.provider_message_id = res.provider_message_id
                     row.provider = provider.name
+                    row.error = None
+                    sent_count += 1
                 else:
                     row.status = SmsMessageStatus.FAILED
                     row.error = (res.error if res else "no_response")[:255]
                     failed_credits += row.credits_charged
+                    failed_count += 1
             await db.commit()
         # --- DB session closed ---
+
+        logger.info(
+            "SMS campaign %s provider batch settled: provider=%s requested=%s "
+            "sent=%s failed=%s",
+            campaign_id, provider.name, len(chunk), sent_count, failed_count,
+        )
 
         if failed_credits:
             # --- Short DB session: refund failed credits ---
@@ -152,6 +168,104 @@ async def _finalize(campaign_id: int) -> None:
         else:
             camp.status = SmsCampaignStatus.PARTIAL
         await db.commit()
+        logger.info(
+            "SMS campaign %s finalized: status=%s sent=%s failed=%s",
+            campaign_id,
+            camp.status.value if hasattr(camp.status, "value") else camp.status,
+            sent,
+            failed,
+        )
+
+
+async def dispatch_admin_sms_messages(message_ids: list[int], sender_id: str) -> None:
+    """Send queued admin->reseller SMS rows and persist provider outcomes.
+
+    The rows are created and committed by the request handler first. This worker
+    owns its own short DB sessions and never holds a DB connection while calling
+    the SMS provider.
+    """
+    if not message_ids:
+        return
+    if not settings.SMS_DISPATCH_ENABLED:
+        logger.warning("SMS dispatch disabled; admin message ids left queued: %s", message_ids)
+        return
+
+    # --- Short DB session: read queued rows only ---
+    async with async_session() as db:
+        rows = (await db.execute(
+            select(SmsMessage.id, SmsMessage.recipient_phone, SmsMessage.body)
+            .where(
+                SmsMessage.id.in_(message_ids),
+                SmsMessage.kind == SmsMessageKind.ADMIN_TO_RESELLER,
+                SmsMessage.status == SmsMessageStatus.QUEUED,
+            )
+        )).all()
+        await db.commit()
+    # --- DB session closed; provider I/O starts below ---
+
+    if not rows:
+        return
+
+    provider = get_provider()
+    chunk_size = settings.SMS_DISPATCH_CHUNK_SIZE
+    total_sent = 0
+    total_failed = 0
+
+    # All rows from one admin send normally share a body, but group defensively
+    # so a future caller cannot accidentally send the wrong body to a row.
+    rows_by_body: dict[str, list] = {}
+    for row in rows:
+        rows_by_body.setdefault(row.body, []).append(row)
+
+    for body, body_rows in rows_by_body.items():
+        for chunk in _chunks(body_rows, chunk_size):
+            phones = [m.recipient_phone for m in chunk]
+            provider_error: str | None = None
+
+            try:
+                results = await provider.send_bulk(phones, body, sender_id)
+            except Exception as e:
+                provider_error = str(e)[:255]
+                logger.error("Admin SMS provider send failed: %s", e)
+                results = []
+
+            by_phone = {_phone_key(r.recipient): r for r in results}
+            sent_count = 0
+            failed_count = 0
+
+            # --- Short DB session: persist provider results ---
+            async with async_session() as db:
+                for m in chunk:
+                    row = await db.get(SmsMessage, m.id)
+                    if row is None:
+                        continue
+                    res = by_phone.get(_phone_key(m.recipient_phone))
+                    if res is not None and res.success:
+                        row.status = SmsMessageStatus.SENT
+                        row.provider_message_id = res.provider_message_id
+                        row.provider = provider.name
+                        row.error = None
+                        sent_count += 1
+                    else:
+                        row.status = SmsMessageStatus.FAILED
+                        row.provider = provider.name
+                        row.error = ((res.error if res else provider_error) or "no_response")[:255]
+                        failed_count += 1
+                await db.commit()
+            # --- DB session closed ---
+
+            total_sent += sent_count
+            total_failed += failed_count
+            logger.info(
+                "Admin SMS provider batch settled: provider=%s requested=%s "
+                "sent=%s failed=%s",
+                provider.name, len(chunk), sent_count, failed_count,
+            )
+
+    logger.info(
+        "Admin SMS dispatch complete: messages=%s sent=%s failed=%s",
+        len(rows), total_sent, total_failed,
+    )
 
 
 async def prune_old_messages() -> int:

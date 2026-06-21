@@ -2,12 +2,16 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 import app.api.admin_messaging_routes as amr
 from app.api.admin_messaging_routes import router as admin_messaging_router
 from app.db.database import get_db
 from app.services.auth import verify_token
-from app.db.models import MessagingSettings, ResellerInboxMessage, UserRole
+from app.db.models import (
+    MessagingSettings, ResellerInboxMessage, SmsMessage, SmsMessageKind,
+    SmsMessageStatus, UserRole,
+)
 from app.services import sms_credits
 from tests.factories import make_reseller
 
@@ -83,6 +87,7 @@ async def test_admin_adjust_grants_credits(db, client, monkeypatch):
     ("GET", "/api/admin/messaging/settings", None),
     ("PUT", "/api/admin/messaging/settings", {"price_per_sms_kes": 1.0}),
     ("GET", "/api/admin/messaging/credits/orders", None),
+    ("GET", "/api/admin/messaging/sms", None),
     ("POST", "/api/admin/messaging/resellers/999/credits/adjust", {"delta": 1}),
     ("POST", "/api/admin/messaging/inbox", {"recipient": "all", "body": "hi"}),
 ])
@@ -110,3 +115,73 @@ async def test_inbox_send_to_one_reseller_creates_row(db, client, monkeypatch):
         ResellerInboxMessage.recipient_user_id == reseller.id))).scalars().all()
     assert len(rows) == 1
     assert rows[0].body == "Please update your details"
+
+
+@pytest.mark.asyncio
+async def test_inbox_send_with_sms_creates_status_rows(
+        db, client, monkeypatch):
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    reseller_with_phone = await make_reseller(
+        db, support_phone="254700000001", organization_name="Phone ISP")
+    reseller_without_phone = await make_reseller(db, support_phone=None)
+    db.add(MessagingSettings(id=1, sender_id="BRAND"))
+    await db.commit()
+    _auth_as(monkeypatch, admin)
+
+    dispatched = []
+
+    async def _fake_dispatch(message_ids, sender_id):
+        dispatched.append((message_ids, sender_id))
+
+    monkeypatch.setattr(amr.sms_dispatch, "dispatch_admin_sms_messages",
+                        _fake_dispatch)
+
+    resp = await client.post("/api/admin/messaging/inbox", json={
+        "recipient": "all", "subject": "Notice",
+        "body": "Please update your details", "also_sms": True})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["recipients"] == 2
+    assert payload["sms_queued"] == 1
+    assert payload["sms_skipped_no_phone"] == 1
+
+    rows = (await db.execute(
+        select(SmsMessage).where(SmsMessage.kind == SmsMessageKind.ADMIN_TO_RESELLER)
+    )).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].user_id == reseller_with_phone.id
+    assert rows[0].recipient_phone == "254700000001"
+    assert rows[0].status == SmsMessageStatus.QUEUED
+    assert rows[0].credits_charged == 1
+    assert dispatched == [([rows[0].id], "BRAND")]
+
+
+@pytest.mark.asyncio
+async def test_admin_sms_history_shows_sent_and_failed_counts(
+        db, client, monkeypatch):
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    r1 = await make_reseller(db, organization_name="Alpha ISP")
+    r2 = await make_reseller(db, organization_name="Beta ISP")
+    db.add_all([
+        SmsMessage(user_id=r1.id, recipient_phone="254700000001", body="Hi",
+                   segments=1, credits_charged=1,
+                   kind=SmsMessageKind.ADMIN_TO_RESELLER,
+                   status=SmsMessageStatus.SENT, provider="fake",
+                   provider_message_id="M1"),
+        SmsMessage(user_id=r2.id, recipient_phone="254700000002", body="Hi",
+                   segments=1, credits_charged=1,
+                   kind=SmsMessageKind.ADMIN_TO_RESELLER,
+                   status=SmsMessageStatus.FAILED, provider="fake",
+                   error="Rejected"),
+    ])
+    await db.commit()
+    _auth_as(monkeypatch, admin)
+
+    resp = await client.get("/api/admin/messaging/sms")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["summary"]["sent"] == 1
+    assert payload["summary"]["failed"] == 1
+    assert payload["summary"]["queued"] == 0
+    names = {m["reseller_name"] for m in payload["messages"]}
+    assert names == {"Alpha ISP", "Beta ISP"}
