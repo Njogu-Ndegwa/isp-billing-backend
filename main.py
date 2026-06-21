@@ -1797,8 +1797,15 @@ async def run_messaging_migrations():
             "ON sms_messages(created_at) WHERE status = 'failed'"
         ))
         await conn.execute(text(
-            "INSERT INTO messaging_settings (id) VALUES (1) "
-            "ON CONFLICT (id) DO NOTHING"
+            "ALTER TABLE messaging_settings "
+            "ALTER COLUMN price_per_sms_kes SET DEFAULT 0.50"
+        ))
+        await conn.execute(text(
+            "INSERT INTO messaging_settings (id, price_per_sms_kes) VALUES (1, 0.50) "
+            "ON CONFLICT (id) DO UPDATE SET "
+            "price_per_sms_kes = EXCLUDED.price_per_sms_kes, "
+            "updated_at = NOW() "
+            "WHERE messaging_settings.price_per_sms_kes = 1.00"
         ))
     logger.info("Migration: Messaging/SMS tables, enums, indexes ready")
 

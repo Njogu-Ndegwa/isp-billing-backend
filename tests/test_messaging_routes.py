@@ -53,7 +53,7 @@ async def test_purchase_creates_order_and_calls_stk(db, client, monkeypatch):
         merchant_request_id = "mr_1"
 
     async def _fake_stk(**kwargs):
-        assert kwargs["amount"] == 50      # 50 credits * default price 1.0
+        assert kwargs["amount"] == 25      # 50 credits * default price 0.5
         return _Stk()
     monkeypatch.setattr(mr, "initiate_stk_push_direct", _fake_stk)
 
@@ -61,6 +61,15 @@ async def test_purchase_creates_order_and_calls_stk(db, client, monkeypatch):
                              json={"quantity": 50, "phone_number": "0712345678"})
     assert resp.status_code == 200
     assert resp.json()["checkout_request_id"] == "ws_CO_1"
+
+
+@pytest.mark.asyncio
+async def test_credits_endpoint_exposes_default_half_shilling_price(db, client, monkeypatch):
+    r = await make_reseller(db)
+    _auth_as(monkeypatch, r)
+    resp = await client.get("/api/messaging/credits")
+    assert resp.status_code == 200
+    assert resp.json()["price_per_sms_kes"] == 0.5
 
 
 @pytest.mark.asyncio

@@ -44,6 +44,15 @@ def _auth_as(monkeypatch, user):
 
 
 @pytest.mark.asyncio
+async def test_admin_settings_default_price_is_half_shilling(db, client, monkeypatch):
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    _auth_as(monkeypatch, admin)
+    resp = await client.get("/api/admin/messaging/settings")
+    assert resp.status_code == 200
+    assert resp.json()["price_per_sms_kes"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_admin_updates_price(db, client, monkeypatch):
     admin = await make_reseller(db, role=UserRole.ADMIN)
     db.add(MessagingSettings(id=1))

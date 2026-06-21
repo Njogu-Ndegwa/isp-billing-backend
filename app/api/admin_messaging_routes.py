@@ -40,7 +40,11 @@ class SettingsIn(BaseModel):
 async def get_settings(db: AsyncSession = Depends(get_db),
                        token: str = Depends(verify_token)):
     await _require_admin(token, db)
-    s = await db.get(MessagingSettings, 1) or MessagingSettings(id=1)
+    s = await db.get(MessagingSettings, 1)
+    if s is None:
+        s = MessagingSettings(id=1)
+        db.add(s)
+        await db.flush()
     return {
         "price_per_sms_kes": float(s.price_per_sms_kes),
         "min_purchase_credits": s.min_purchase_credits,

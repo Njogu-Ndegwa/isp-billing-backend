@@ -32,7 +32,7 @@ TABLES = [
     """
     CREATE TABLE IF NOT EXISTS messaging_settings (
         id SERIAL PRIMARY KEY,
-        price_per_sms_kes NUMERIC(6,2) NOT NULL DEFAULT 1,
+        price_per_sms_kes NUMERIC(6,2) NOT NULL DEFAULT 0.50,
         min_purchase_credits INTEGER NOT NULL DEFAULT 10,
         sender_id VARCHAR(20),
         provider VARCHAR(50) NOT NULL DEFAULT 'africastalking',
@@ -170,7 +170,15 @@ async def migrate():
         for ddl in INDEXES:
             await conn.execute(text(ddl))
         await conn.execute(text(
-            "INSERT INTO messaging_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
+            "ALTER TABLE messaging_settings "
+            "ALTER COLUMN price_per_sms_kes SET DEFAULT 0.50"
+        ))
+        await conn.execute(text(
+            "INSERT INTO messaging_settings (id, price_per_sms_kes) VALUES (1, 0.50) "
+            "ON CONFLICT (id) DO UPDATE SET "
+            "price_per_sms_kes = EXCLUDED.price_per_sms_kes, "
+            "updated_at = NOW() "
+            "WHERE messaging_settings.price_per_sms_kes = 1.00"
         ))
     print("Messaging migration completed successfully!")
 

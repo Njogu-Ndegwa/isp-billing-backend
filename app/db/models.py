@@ -1608,7 +1608,7 @@ class SmsMessageKind(str, enum.Enum):
 class MessagingSettings(Base):
     __tablename__ = "messaging_settings"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    price_per_sms_kes = Column(DECIMAL(6, 2), nullable=False, default=1, server_default="1")
+    price_per_sms_kes = Column(DECIMAL(6, 2), nullable=False, default=0.5, server_default="0.50")
     min_purchase_credits = Column(Integer, nullable=False, default=10, server_default="10")
     sender_id = Column(String(20), nullable=True)
     provider = Column(String(50), nullable=False, default="africastalking", server_default="africastalking")
