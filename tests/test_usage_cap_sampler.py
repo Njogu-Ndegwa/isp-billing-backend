@@ -197,3 +197,60 @@ async def test_cap_sampler_backs_off_router_errors(
     assert state.backoff_until is not None
     assert state.last_error == "connect_failed"
     assert period is None
+
+
+@pytest.mark.asyncio
+async def test_cap_sampler_seeds_from_existing_period_cap_when_plan_is_uncapped(
+    db,
+    session_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(usage_cap_sampler, "async_session", session_factory)
+    monkeypatch.setattr(usage_cap_sampler, "cap_sampler_running", False)
+    monkeypatch.setattr(usage_cap_sampler, "_db_pool_is_busy", lambda: False)
+
+    reseller = await make_reseller(db)
+    router = await make_router(
+        db,
+        reseller,
+        auth_method=RouterAuthMethod.DIRECT_API,
+    )
+    plan = await make_plan(db, reseller, data_cap_mb=None)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(minutes=20),
+        mac_address="AA:BB:CC:DD:EE:33",
+    )
+    db.add(
+        CustomerUsagePeriod(
+            customer_id=customer.id,
+            period_start=datetime.utcnow() - timedelta(minutes=1),
+            period_end=customer.expiry,
+            cap_mb_snapshot=20,
+        )
+    )
+    await db.commit()
+
+    monkeypatch.setattr(
+        usage_cap_sampler,
+        "_fetch_queue_usage_for_router_sync",
+        lambda _router_info: {"success": True, "data": [_queue_for(customer.mac_address, "0/0")]},
+    )
+
+    await usage_cap_sampler.sample_capped_usage_background()
+
+    async with session_factory() as s:
+        state = (
+            await s.execute(
+                select(UsageCapWatchState).where(
+                    UsageCapWatchState.customer_id == customer.id
+                )
+            )
+        ).scalar_one()
+
+    assert state.queue_key == "AA:BB:CC:DD:EE:33"
+    assert state.poll_tier == "small_cap"

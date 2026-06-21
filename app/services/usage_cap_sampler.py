@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.db.database import async_session, db_pool_snapshot
@@ -118,18 +118,31 @@ def _router_info(router: Router) -> dict[str, Any]:
 async def _seed_missing_watch_states(db, now: datetime) -> int:
     """Create watch rows for active capped direct-API customers in small batches."""
     state_missing = UsageCapWatchState.id.is_(None)
+    capped_plan_or_period = or_(
+        and_(Plan.data_cap_mb.isnot(None), Plan.data_cap_mb > 0),
+        and_(
+            CustomerUsagePeriod.cap_mb_snapshot.isnot(None),
+            CustomerUsagePeriod.cap_mb_snapshot > 0,
+        ),
+    )
     stmt = (
         select(Customer, Plan)
         .join(Plan, Customer.plan_id == Plan.id)
         .join(Router, Customer.router_id == Router.id)
         .outerjoin(UsageCapWatchState, UsageCapWatchState.customer_id == Customer.id)
+        .outerjoin(
+            CustomerUsagePeriod,
+            and_(
+                CustomerUsagePeriod.customer_id == Customer.id,
+                CustomerUsagePeriod.closed_at.is_(None),
+            ),
+        )
         .where(
             state_missing,
             Customer.status == CustomerStatus.ACTIVE,
             Customer.router_id.isnot(None),
             Plan.connection_type.in_([ConnectionType.HOTSPOT, ConnectionType.PPPOE]),
-            Plan.data_cap_mb.isnot(None),
-            Plan.data_cap_mb > 0,
+            capped_plan_or_period,
             Router.auth_method == RouterAuthMethod.DIRECT_API,
         )
         .order_by(Customer.id)
@@ -169,8 +182,13 @@ def _due_filters(now: datetime):
         Customer.status == CustomerStatus.ACTIVE,
         Customer.router_id.isnot(None),
         Plan.connection_type.in_([ConnectionType.HOTSPOT, ConnectionType.PPPOE]),
-        Plan.data_cap_mb.isnot(None),
-        Plan.data_cap_mb > 0,
+        or_(
+            and_(Plan.data_cap_mb.isnot(None), Plan.data_cap_mb > 0),
+            and_(
+                CustomerUsagePeriod.cap_mb_snapshot.isnot(None),
+                CustomerUsagePeriod.cap_mb_snapshot > 0,
+            ),
+        ),
         Router.auth_method == RouterAuthMethod.DIRECT_API,
     )
 
@@ -191,6 +209,13 @@ async def _claim_due_watch_items(now: datetime, run_id: str) -> list[WatchItem]:
             .join(Customer, UsageCapWatchState.customer_id == Customer.id)
             .join(Plan, Customer.plan_id == Plan.id)
             .join(Router, UsageCapWatchState.router_id == Router.id)
+            .outerjoin(
+                CustomerUsagePeriod,
+                and_(
+                    CustomerUsagePeriod.customer_id == Customer.id,
+                    CustomerUsagePeriod.closed_at.is_(None),
+                ),
+            )
             .where(*_due_filters(now))
             .group_by(UsageCapWatchState.router_id)
             .order_by(oldest_due)
@@ -206,6 +231,13 @@ async def _claim_due_watch_items(now: datetime, run_id: str) -> list[WatchItem]:
             .join(Customer, UsageCapWatchState.customer_id == Customer.id)
             .join(Plan, Customer.plan_id == Plan.id)
             .join(Router, UsageCapWatchState.router_id == Router.id)
+            .outerjoin(
+                CustomerUsagePeriod,
+                and_(
+                    CustomerUsagePeriod.customer_id == Customer.id,
+                    CustomerUsagePeriod.closed_at.is_(None),
+                ),
+            )
             .where(UsageCapWatchState.router_id.in_(router_ids), *_due_filters(now))
             .order_by(UsageCapWatchState.router_id, UsageCapWatchState.next_poll_at)
         )
