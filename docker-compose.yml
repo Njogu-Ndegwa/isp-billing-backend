@@ -87,6 +87,17 @@ services:
       - INSURANCE_WG_SUBNET=${INSURANCE_WG_SUBNET:-10.250.0.0/16}
       - INSURANCE_L2TP_INTERFACE=${INSURANCE_L2TP_INTERFACE:-l2tp-aws2}
       - INSURANCE_L2TP_IPSEC_PSK=${INSURANCE_L2TP_IPSEC_PSK:-}
+      - SMS_PROVIDER=${SMS_PROVIDER:-africastalking}
+      - SMS_SENDER_ID=${SMS_SENDER_ID:-}
+      - AT_USERNAME=${AT_USERNAME:-}
+      - AT_API_KEY=${AT_API_KEY:-}
+      - AT_SENDER_ID=${AT_SENDER_ID:-}
+      - AT_BASE_URL=${AT_BASE_URL:-https://api.africastalking.com}
+      - TALKSASA_API_TOKEN=${TALKSASA_API_TOKEN:-}
+      - TALKSASA_SENDER_ID=${TALKSASA_SENDER_ID:-}
+      - TALKSASA_BASE_URL=${TALKSASA_BASE_URL:-https://bulksms.talksasa.com/api/v3}
+      - SMS_DISPATCH_CHUNK_SIZE=${SMS_DISPATCH_CHUNK_SIZE:-100}
+      - SMS_DISPATCH_ENABLED=${SMS_DISPATCH_ENABLED:-true}
     volumes:
       - wg_sock:/var/run/wg-manager
     depends_on:
