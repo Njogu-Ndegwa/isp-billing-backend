@@ -178,12 +178,21 @@ async def credits_callback(request: Request, db: AsyncSession = Depends(get_db))
 @router.get("/api/messaging/recipients")
 async def list_recipients(filter: str = Query("all"),
                           plan_id: Optional[int] = None,
+                          search: Optional[str] = None,
+                          exclude_customer_ids: Optional[str] = Query(None),
+                          limit: int = Query(50, ge=1, le=500),
+                          offset: int = Query(0, ge=0),
                           db: AsyncSession = Depends(get_db),
                           token: str = Depends(verify_token)):
     user = await _require_reseller(token, db)
-    recips = await sms_dispatch.resolve_recipients(db, user.id, filter=filter,
-                                                   plan_id=plan_id)
-    return {"count": len(recips), "recipients": recips}
+    exclude = [int(x) for x in exclude_customer_ids.split(",") if x.strip().isdigit()] \
+        if exclude_customer_ids else None
+    recips = await sms_dispatch.resolve_recipients(
+        db, user.id, filter=filter, plan_id=plan_id, search=search,
+        exclude_customer_ids=exclude)
+    page = recips[offset:offset + limit]
+    return {"count": len(recips), "recipients": page,
+            "has_more": offset + limit < len(recips)}
 
 
 class SendRequest(BaseModel):

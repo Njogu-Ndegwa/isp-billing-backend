@@ -170,3 +170,31 @@ async def test_admin_is_rejected_from_reseller_endpoint(db, client, monkeypatch)
     _auth_as(monkeypatch, admin)
     resp = await client.get("/api/messaging/credits")
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_recipients_returns_names_and_paginates(db, client, monkeypatch):
+    from tests.factories import make_customer, make_plan
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    p = await make_plan(db, r)
+    for i in range(3):
+        await make_customer(db, r, p, name=f"C{i}", phone=f"25470000010{i}")
+    resp = await client.get("/api/messaging/recipients?limit=2&offset=0")
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["count"] == 3
+    assert len(body["recipients"]) == 2
+    assert body["has_more"] is True
+    assert set(body["recipients"][0].keys()) == {"customer_id", "name", "phone"}
+
+
+@pytest.mark.asyncio
+async def test_recipients_search_filters(db, client, monkeypatch):
+    from tests.factories import make_customer, make_plan
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    p = await make_plan(db, r)
+    await make_customer(db, r, p, name="Zara", phone="254799999999")
+    await make_customer(db, r, p, name="Tom", phone="254788888888")
+    resp = await client.get("/api/messaging/recipients?search=zar")
+    assert [c["name"] for c in resp.json()["recipients"]] == ["Zara"]
+    assert resp.json()["count"] == 1
