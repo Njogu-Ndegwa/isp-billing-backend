@@ -201,6 +201,30 @@ async def test_recipients_search_filters(db, client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_campaign_detail_has_names_and_counts(db, client, monkeypatch):
+    from tests.factories import make_customer, make_plan
+    from app.db.models import (SmsCampaign, SmsCampaignStatus, SmsMessage,
+                               SmsMessageStatus, SmsMessageKind)
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    p = await make_plan(db, r)
+    c = await make_customer(db, r, p, name="Named Cust", phone="254700000301")
+    camp = SmsCampaign(user_id=r.id, body="hi", recipient_count=1,
+                       segments_per_message=1, total_credits=1,
+                       status=SmsCampaignStatus.COMPLETED)
+    db.add(camp); await db.flush()
+    db.add(SmsMessage(campaign_id=camp.id, user_id=r.id, customer_id=c.id,
+                      recipient_phone="254700000301", body="hi", segments=1,
+                      credits_charged=1, kind=SmsMessageKind.RESELLER_TO_CUSTOMER,
+                      status=SmsMessageStatus.SENT))
+    await db.commit()
+    resp = await client.get(f"/api/messaging/campaigns/{camp.id}")
+    body = resp.json()
+    assert body["messages"][0]["name"] == "Named Cust"
+    assert body["counts"] == {"total": 1, "sent": 1, "failed": 0,
+                              "queued": 0, "delivered": 0}
+
+
+@pytest.mark.asyncio
 async def test_ledger_lists_reseller_transactions_newest_first(db, client, monkeypatch):
     from tests.factories import make_sms_account
     from app.services import sms_credits

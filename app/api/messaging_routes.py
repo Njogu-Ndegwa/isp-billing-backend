@@ -346,6 +346,7 @@ async def list_campaigns(db: AsyncSession = Depends(get_db),
 @router.get("/api/messaging/campaigns/{campaign_id}")
 async def campaign_detail(campaign_id: int, db: AsyncSession = Depends(get_db),
                           token: str = Depends(verify_token)):
+    from app.db.models import Customer  # local import ok, or add to top block
     user = await _require_reseller(token, db)
     camp = (await db.execute(
         select(SmsCampaign).where(SmsCampaign.id == campaign_id,
@@ -353,18 +354,23 @@ async def campaign_detail(campaign_id: int, db: AsyncSession = Depends(get_db),
     )).scalar_one_or_none()
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    msgs = (await db.execute(
-        select(SmsMessage).where(SmsMessage.campaign_id == campaign_id).limit(2000)
-    )).scalars().all()
-    return {
-        "id": camp.id,
-        "status": camp.status.value if hasattr(camp.status, "value") else camp.status,
-        "messages": [{
-            "phone": m.recipient_phone,
-            "status": m.status.value if hasattr(m.status, "value") else m.status,
-            "error": m.error,
-        } for m in msgs],
-    }
+    rows = (await db.execute(
+        select(SmsMessage, Customer.name)
+        .outerjoin(Customer, SmsMessage.customer_id == Customer.id)
+        .where(SmsMessage.campaign_id == campaign_id).limit(2000)
+    )).all()
+    counts = {"total": 0, "sent": 0, "failed": 0, "queued": 0, "delivered": 0}
+    messages = []
+    for m, name in rows:
+        st = m.status.value if hasattr(m.status, "value") else m.status
+        counts["total"] += 1
+        if st in counts:
+            counts[st] += 1
+        messages.append({"phone": m.recipient_phone, "name": name,
+                         "status": st, "error": m.error})
+    return {"id": camp.id,
+            "status": camp.status.value if hasattr(camp.status, "value") else camp.status,
+            "counts": counts, "messages": messages}
 
 
 # ---- Inbox (admin -> reseller) --------------------------------------------
