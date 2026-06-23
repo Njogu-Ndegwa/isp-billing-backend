@@ -444,6 +444,17 @@ def _existing_pairing_blocks_share(pairing: DevicePairing | None, owner: Custome
     return True
 
 
+async def _open_shared_device_usage_period(
+    db: AsyncSession,
+    *,
+    shared_customer: Customer,
+    plan: Plan,
+) -> None:
+    from app.services.usage_tracking import open_new_period
+
+    await open_new_period(db, shared_customer, plan=plan, now=datetime.utcnow())
+
+
 def _remove_shared_device_from_direct_router_sync(router_info: dict, mac_address: str) -> dict:
     api = MikroTikAPI(
         router_info["ip"],
@@ -636,6 +647,11 @@ async def _share_subscription_for_owner(
         if existing_pairing and existing_pairing.subscription_owner_customer_id == owner.id
         else None
     )
+    same_owner_active_pairing = bool(
+        existing_pairing
+        and existing_pairing.is_active
+        and existing_pairing.subscription_owner_customer_id == owner.id
+    )
     active_shared_count = await active_shared_device_count(
         db,
         owner.id,
@@ -699,6 +715,8 @@ async def _share_subscription_for_owner(
         shared_customer.expiry = datetime.fromisoformat(radius_result["expiry"])
         pairing.provisioned_at = datetime.utcnow()
         pairing.expires_at = shared_customer.expiry
+        if not same_owner_active_pairing:
+            await _open_shared_device_usage_period(db, shared_customer=shared_customer, plan=plan)
         _mark_share_code_redeemed(share_code, shared_customer=shared_customer, pairing=pairing)
         await db.commit()
         return {
@@ -735,6 +753,8 @@ async def _share_subscription_for_owner(
         router=router_obj,
     )
     pairing.provisioned_at = datetime.utcnow()
+    if not same_owner_active_pairing:
+        await _open_shared_device_usage_period(db, shared_customer=shared_customer, plan=plan)
     _mark_share_code_redeemed(share_code, shared_customer=shared_customer, pairing=pairing)
     await db.commit()
 

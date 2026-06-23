@@ -290,15 +290,16 @@ async def test_share_code_redeems_detected_device_and_marks_code_used(db, monkey
 @pytest.mark.asyncio
 async def test_share_code_reuses_stale_pairing_from_expired_previous_owner_with_same_phone(db, monkeypatch):
     reseller = await make_reseller(db)
-    plan = await make_plan(db, reseller, max_shared_users=2)
+    plan = await make_plan(db, reseller, max_shared_users=2, data_cap_mb=100)
     router = await make_router(db, reseller)
+    old_expiry = datetime.utcnow() - timedelta(days=1)
     old_owner = await make_customer(
         db,
         reseller,
         plan,
         router,
         status=CustomerStatus.INACTIVE,
-        expiry=datetime.utcnow() - timedelta(days=1),
+        expiry=old_expiry,
         mac_address="AA:BB:CC:DD:EF:31",
         phone="254700000431",
     )
@@ -323,6 +324,15 @@ async def test_share_code_reuses_stale_pairing_from_expired_previous_owner_with_
         phone=old_owner.phone,
         subscription_owner_id=old_owner.id,
     )
+    old_period = CustomerUsagePeriod(
+        customer_id=old_shared.id,
+        period_start=old_expiry - timedelta(minutes=20),
+        period_end=old_expiry,
+        upload_bytes=0,
+        download_bytes=0,
+        total_bytes=0,
+        cap_mb_snapshot=20,
+    )
     stale_pairing = DevicePairing(
         customer_id=old_shared.id,
         device_mac=old_shared.mac_address,
@@ -335,7 +345,7 @@ async def test_share_code_reuses_stale_pairing_from_expired_previous_owner_with_
         is_active=True,
         expires_at=old_owner.expiry,
     )
-    db.add(stale_pairing)
+    db.add_all([old_period, stale_pairing])
     await db.commit()
     await db.refresh(stale_pairing)
 
@@ -384,11 +394,23 @@ async def test_share_code_reuses_stale_pairing_from_expired_previous_owner_with_
 
     await db.refresh(old_shared)
     await db.refresh(stale_pairing)
+    await db.refresh(old_period)
     assert old_shared.status == CustomerStatus.ACTIVE
     assert old_shared.expiry == fresh_owner.expiry
     assert old_shared.subscription_owner_id == fresh_owner.id
     assert stale_pairing.subscription_owner_customer_id == fresh_owner.id
     assert stale_pairing.expires_at == fresh_owner.expiry
+    assert old_period.closed_at is not None
+    current_period = (
+        await db.execute(
+            select(CustomerUsagePeriod).where(
+                CustomerUsagePeriod.customer_id == old_shared.id,
+                CustomerUsagePeriod.closed_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    assert current_period.cap_mb_snapshot == 100
+    assert current_period.period_end == fresh_owner.expiry
 
 
 @pytest.mark.asyncio

@@ -146,6 +146,7 @@ async def close_open_period(
     if not open_period:
         return None
     open_period.closed_at = now or datetime.utcnow()
+    await db.flush()
     return open_period
 
 
