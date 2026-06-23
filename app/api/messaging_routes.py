@@ -200,6 +200,7 @@ class SendRequest(BaseModel):
     filter: str = "all"
     plan_id: Optional[int] = None
     customer_ids: Optional[list[int]] = None
+    exclude_customer_ids: Optional[list[int]] = None
     template_id: Optional[int] = None
 
 
@@ -214,7 +215,8 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
 
     recips = await sms_dispatch.resolve_recipients(
         db, user.id, filter=req.filter, plan_id=req.plan_id,
-        customer_ids=req.customer_ids)
+        customer_ids=req.customer_ids,
+        exclude_customer_ids=req.exclude_customer_ids)
     if not recips:
         raise HTTPException(status_code=400, detail="No recipients matched")
 

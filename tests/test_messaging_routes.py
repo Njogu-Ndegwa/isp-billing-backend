@@ -198,3 +198,21 @@ async def test_recipients_search_filters(db, client, monkeypatch):
     resp = await client.get("/api/messaging/recipients?search=zar")
     assert [c["name"] for c in resp.json()["recipients"]] == ["Zara"]
     assert resp.json()["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_send_excludes_then_charges_remaining(db, client, monkeypatch):
+    from tests.factories import make_customer, make_plan, make_sms_account
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    await make_sms_account(db, r, balance=100)
+    p = await make_plan(db, r)
+    keep = await make_customer(db, r, p, name="Keep", phone="254700000201")
+    drop = await make_customer(db, r, p, name="Drop", phone="254700000202")
+    captured = {}
+    async def _fake_dispatch(cid): captured["cid"] = cid
+    monkeypatch.setattr(mr.sms_dispatch, "dispatch_campaign", _fake_dispatch)
+    resp = await client.post("/api/messaging/send", json={
+        "body": "hello", "filter": "all", "exclude_customer_ids": [drop.id]})
+    assert resp.status_code == 200
+    assert resp.json()["recipient_count"] == 1
+    assert resp.json()["credits_reserved"] == 1  # 1 segment * 1 recipient
