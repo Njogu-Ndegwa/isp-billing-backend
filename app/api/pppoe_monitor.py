@@ -5,6 +5,7 @@ from sqlalchemy.orm import selectinload
 from typing import Optional
 from datetime import datetime
 
+from app.config import settings
 from app.db.database import db_pool_snapshot, get_db
 from app.db.models import Customer, Plan, Router, UserBandwidthUsage
 from app.services.auth import verify_token, get_current_user
@@ -721,6 +722,14 @@ def _rate_limits_match(actual: str, expected: str) -> bool:
     return bool(actual_pair and expected_pair and actual_pair == expected_pair)
 
 
+def _apply_pppoe_headroom_for_expected(rate_limit: str, factor: float) -> str:
+    pair = _rate_limit_pair_bps(rate_limit)
+    if not pair or factor <= 0 or abs(factor - 1.0) < 0.0001:
+        return rate_limit
+    upload, download = pair
+    return f"{int(round(upload * factor))}/{int(round(download * factor))}"
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -843,7 +852,9 @@ async def pppoe_customer_presence(
         and bool(secret.get("profile"))
         and presence.get("profile_detail") is None
     )
-    expected_rate_limit = parse_speed_to_mikrotik(db_customer["plan_speed"] or "")
+    plan_rate_limit = parse_speed_to_mikrotik(db_customer["plan_speed"] or "")
+    headroom_factor = float(getattr(settings, "PPPOE_RATE_LIMIT_HEADROOM", 1.0) or 1.0)
+    expected_rate_limit = _apply_pppoe_headroom_for_expected(plan_rate_limit, headroom_factor)
     profile_rate_limit = (presence.get("profile_detail") or {}).get("rate_limit", "")
     active_queue_limit = (presence.get("active_session") or {}).get("max_limit", "")
     profile_rate_matches = (
@@ -858,6 +869,8 @@ async def pppoe_customer_presence(
     )
     speed_enforcement = {
         "plan_speed": db_customer["plan_speed"],
+        "plan_rate_limit": plan_rate_limit,
+        "headroom_factor": headroom_factor,
         "expected_rate_limit": expected_rate_limit,
         "profile_rate_limit": profile_rate_limit,
         "profile_rate_matches_plan": profile_rate_matches,
