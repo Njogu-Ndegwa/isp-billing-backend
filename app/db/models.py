@@ -1611,7 +1611,7 @@ class MessagingSettings(Base):
     price_per_sms_kes = Column(DECIMAL(6, 2), nullable=False, default=0.5, server_default="0.50")
     min_purchase_credits = Column(Integer, nullable=False, default=10, server_default="10")
     sender_id = Column(String(20), nullable=True)
-    provider = Column(String(50), nullable=False, default="africastalking", server_default="africastalking")
+    provider = Column(String(50), nullable=False, default="talksasa", server_default="talksasa")
     enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     message_retention_days = Column(Integer, nullable=False, default=60, server_default="60")
     bundles = Column(JSON, nullable=True)

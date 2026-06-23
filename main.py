@@ -1801,11 +1801,20 @@ async def run_messaging_migrations():
             "ALTER COLUMN price_per_sms_kes SET DEFAULT 0.50"
         ))
         await conn.execute(text(
-            "INSERT INTO messaging_settings (id, price_per_sms_kes) VALUES (1, 0.50) "
+            "ALTER TABLE messaging_settings "
+            "ALTER COLUMN provider SET DEFAULT 'talksasa'"
+        ))
+        await conn.execute(text(
+            "INSERT INTO messaging_settings (id, price_per_sms_kes, provider) "
+            "VALUES (1, 0.50, 'talksasa') "
             "ON CONFLICT (id) DO UPDATE SET "
             "price_per_sms_kes = EXCLUDED.price_per_sms_kes, "
+            "provider = CASE "
+            "WHEN messaging_settings.provider = 'africastalking' "
+            "THEN EXCLUDED.provider ELSE messaging_settings.provider END, "
             "updated_at = NOW() "
-            "WHERE messaging_settings.price_per_sms_kes = 1.00"
+            "WHERE messaging_settings.price_per_sms_kes = 1.00 "
+            "OR messaging_settings.provider = 'africastalking'"
         ))
     logger.info("Migration: Messaging/SMS tables, enums, indexes ready")
 

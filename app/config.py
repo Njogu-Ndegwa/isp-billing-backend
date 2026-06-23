@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     INSURANCE_MANAGER_TIMEOUT: int = 10
 
     # --- Messaging / SMS -------------------------------------------------
-    SMS_PROVIDER: str = "africastalking"
+    SMS_PROVIDER: str = "talksasa"
     SMS_SENDER_ID: str = "TALKSASA"
     AT_USERNAME: str = ""
     AT_API_KEY: str = ""
