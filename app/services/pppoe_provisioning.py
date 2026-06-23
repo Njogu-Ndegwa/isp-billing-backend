@@ -34,6 +34,9 @@ PPPOE_RETRY_BATCH_SIZE = 20
 PPPOE_RETRY_MAX_ATTEMPTS = 5
 PPPOE_RETRY_MAX_AGE = timedelta(hours=4)
 PPPOE_RETRY_DB_BUSY_THRESHOLD_PERCENT = 60
+PPPOE_DEFAULT_LOCAL_ADDRESS = "192.168.89.1"
+PPPOE_DEFAULT_POOL_NAME = "pppoe-pool"
+PPPOE_DEFAULT_POOL_RANGE = "192.168.89.2-192.168.89.254"
 
 _RATE_SUFFIX_MULTIPLIERS = {
     "": 1,
@@ -141,8 +144,14 @@ def _provision_pppoe_sync(payload: dict) -> dict:
         # the server is not yet visible. Without these fallbacks the created profile
         # would have no remote-address, so RouterOS accepts the PPPoE auth but then
         # fails to assign an IP -- the session silently drops at IPCP.
-        local_address = base_profile_data.get("local_address") or "192.168.89.1"
-        pool_name = base_profile_data.get("remote_address") or "pppoe-pool"
+        local_address = base_profile_data.get("local_address") or PPPOE_DEFAULT_LOCAL_ADDRESS
+        pool_name = base_profile_data.get("remote_address") or PPPOE_DEFAULT_POOL_NAME
+
+        if pool_name == PPPOE_DEFAULT_POOL_NAME:
+            pool_result = api.ensure_ip_pool(PPPOE_DEFAULT_POOL_NAME, PPPOE_DEFAULT_POOL_RANGE)
+            if pool_result.get("error"):
+                logger.error(f"[PPPoE] IP pool ensure failed: {pool_result['error']}")
+                return {"error": f"IP pool ensure failed: {pool_result['error']}"}
 
         profile_result = api.ensure_pppoe_profile(
             profile_name,

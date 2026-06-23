@@ -19,7 +19,7 @@ from app.db.models import (
     ResellerPaymentMethod, ResellerPaymentMethodType,
     B2BTransaction, B2BTransactionStatus,
     ZenoPayTransaction, DevicePairing, ReconnectionAttempt,
-    ProvisioningAttempt, CustomerUsagePeriod,
+    ProvisioningAttempt, CustomerUsagePeriod, UsageCapWatchState,
     Lead, LeadActivity, LeadFollowUp, LeadSource,
     MtnMomoTransaction, AccessCredential,
 )
@@ -1693,6 +1693,7 @@ async def delete_reseller(
     # 5b. Customer usage periods (NOT NULL customer_id FK — must be deleted
     #     explicitly; SQLAlchemy's default would try to NULL the FK and fail).
     await db.execute(delete(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id.in_(customer_ids)))
+    await db.execute(delete(UsageCapWatchState).where(UsageCapWatchState.customer_id.in_(customer_ids)))
 
     # 6. Provisioning logs (customer-side + router-side)
     await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id.in_(customer_ids)))

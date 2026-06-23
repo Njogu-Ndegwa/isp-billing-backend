@@ -108,6 +108,7 @@ from app.services.mikrotik_background import (
     _cleanup_customer_from_mikrotik_sync,
     _cleanup_single_router_hotspot_sync,
 )
+from app.services.usage_cap_sampler import sample_capped_usage_background
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
@@ -1270,9 +1271,86 @@ async def run_fup_usage_migrations():
             "CREATE INDEX IF NOT EXISTS ix_customer_usage_periods_customer_open "
             "ON customer_usage_periods (customer_id, closed_at)"
         ))
+        await conn.execute(sa_text(
+            """
+            CREATE TABLE IF NOT EXISTS usage_cap_watch_state (
+                id SERIAL PRIMARY KEY,
+                customer_id INTEGER NOT NULL REFERENCES customers(id),
+                router_id INTEGER NOT NULL REFERENCES routers(id),
+                queue_key VARCHAR(100) NULL,
+                next_poll_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                last_polled_at TIMESTAMP NULL,
+                poll_interval_seconds INTEGER NOT NULL DEFAULT 300,
+                poll_tier VARCHAR(32) NOT NULL DEFAULT 'normal',
+                consecutive_errors INTEGER NOT NULL DEFAULT 0,
+                backoff_until TIMESTAMP NULL,
+                locked_at TIMESTAMP NULL,
+                locked_by VARCHAR(64) NULL,
+                last_error VARCHAR(500) NULL,
+                last_enforcement_attempt_at TIMESTAMP NULL,
+                last_enforcement_error VARCHAR(500) NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_usage_cap_watch_customer UNIQUE (customer_id)
+            )
+            """
+        ))
+        for col_name, col_def in (
+            ("queue_key", "VARCHAR(100) NULL"),
+            ("next_poll_at", "TIMESTAMP NOT NULL DEFAULT NOW()"),
+            ("last_polled_at", "TIMESTAMP NULL"),
+            ("poll_interval_seconds", "INTEGER NOT NULL DEFAULT 300"),
+            ("poll_tier", "VARCHAR(32) NOT NULL DEFAULT 'normal'"),
+            ("consecutive_errors", "INTEGER NOT NULL DEFAULT 0"),
+            ("backoff_until", "TIMESTAMP NULL"),
+            ("locked_at", "TIMESTAMP NULL"),
+            ("locked_by", "VARCHAR(64) NULL"),
+            ("last_error", "VARCHAR(500) NULL"),
+            ("last_enforcement_attempt_at", "TIMESTAMP NULL"),
+            ("last_enforcement_error", "VARCHAR(500) NULL"),
+            ("created_at", "TIMESTAMP NOT NULL DEFAULT NOW()"),
+            ("updated_at", "TIMESTAMP NOT NULL DEFAULT NOW()"),
+        ):
+            await conn.execute(sa_text(
+                f"ALTER TABLE usage_cap_watch_state "
+                f"ADD COLUMN IF NOT EXISTS {col_name} {col_def}"
+            ))
+        await conn.execute(sa_text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_cap_watch_customer "
+            "ON usage_cap_watch_state (customer_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_usage_cap_watch_state_customer_id "
+            "ON usage_cap_watch_state (customer_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_usage_cap_watch_state_router_id "
+            "ON usage_cap_watch_state (router_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_usage_cap_watch_state_queue_key "
+            "ON usage_cap_watch_state (queue_key)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_usage_cap_watch_state_next_poll_at "
+            "ON usage_cap_watch_state (next_poll_at)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_usage_cap_watch_state_backoff_until "
+            "ON usage_cap_watch_state (backoff_until)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_usage_cap_watch_due "
+            "ON usage_cap_watch_state (next_poll_at, router_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_usage_cap_watch_router_due "
+            "ON usage_cap_watch_state (router_id, next_poll_at)"
+        ))
         logger.info(
             "Migration: Ensured FUP enum, plans/user_bandwidth_usage columns, "
-            "bandwidth snapshot service counters, and customer_usage_periods table"
+            "bandwidth snapshot service counters, customer_usage_periods table, "
+            "and usage_cap_watch_state table"
         )
 
 
@@ -1719,8 +1797,24 @@ async def run_messaging_migrations():
             "ON sms_messages(created_at) WHERE status = 'failed'"
         ))
         await conn.execute(text(
-            "INSERT INTO messaging_settings (id) VALUES (1) "
-            "ON CONFLICT (id) DO NOTHING"
+            "ALTER TABLE messaging_settings "
+            "ALTER COLUMN price_per_sms_kes SET DEFAULT 0.50"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE messaging_settings "
+            "ALTER COLUMN provider SET DEFAULT 'talksasa'"
+        ))
+        await conn.execute(text(
+            "INSERT INTO messaging_settings (id, price_per_sms_kes, provider) "
+            "VALUES (1, 0.50, 'talksasa') "
+            "ON CONFLICT (id) DO UPDATE SET "
+            "price_per_sms_kes = EXCLUDED.price_per_sms_kes, "
+            "provider = CASE "
+            "WHEN messaging_settings.provider = 'africastalking' "
+            "THEN EXCLUDED.provider ELSE messaging_settings.provider END, "
+            "updated_at = NOW() "
+            "WHERE messaging_settings.price_per_sms_kes = 1.00 "
+            "OR messaging_settings.provider = 'africastalking'"
         ))
     logger.info("Migration: Messaging/SMS tables, enums, indexes ready")
 
@@ -1913,6 +2007,14 @@ async def startup_event():
         max_instances=1
     )
     scheduler.add_job(
+        sample_capped_usage_background,
+        trigger=IntervalTrigger(seconds=19),
+        id='usage_cap_sampler',
+        name='Lightweight capped customer usage sampler',
+        replace_existing=True,
+        max_instances=1
+    )
+    scheduler.add_job(
         sync_active_user_queues,
         trigger=IntervalTrigger(seconds=313),
         id='sync_active_user_queues',
@@ -2051,7 +2153,7 @@ async def startup_event():
     scheduler.start()
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "
-        "queue repair every 313s, hotspot provisioning retry every 97s, "
+        "cap sampler every 19s, queue repair every 313s, hotspot provisioning retry every 97s, "
         "PPPoE provisioning retry every 113s, "
         "M-Pesa reconciliation every 90s, "
         "stale token cleanup daily at 00:00 UTC (3:00 AM EAT)"

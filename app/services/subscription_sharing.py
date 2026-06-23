@@ -164,6 +164,7 @@ async def sync_shared_subscription_devices_after_owner_renewal(
     ).all()
 
     synced: list[dict] = []
+    now = datetime.utcnow()
     for pairing, shared_customer, router in rows:
         if not shared_customer.mac_address:
             continue
@@ -176,6 +177,17 @@ async def sync_shared_subscription_devices_after_owner_renewal(
         shared_customer.subscription_owner_id = owner_customer.id
         pairing.plan_id = owner_customer.plan_id
         pairing.expires_at = owner_customer.expiry
+
+        try:
+            from app.services.usage_tracking import on_renewal
+
+            await on_renewal(db, shared_customer, plan=plan, now=now)
+        except Exception as exc:
+            logger.error(
+                "[SUBSCRIPTION-SHARE] Failed to renew usage period for shared customer %s: %s",
+                shared_customer.id,
+                exc,
+            )
 
         auth_method = getattr(router, "auth_method", None)
         auth_value = auth_method.value if hasattr(auth_method, "value") else auth_method

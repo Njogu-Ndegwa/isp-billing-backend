@@ -52,7 +52,7 @@ async def test_dispatch_marks_sent_and_refunds_failures(db, session_factory, mon
         name = "fake"
         async def send_bulk(self, recipients, body, sender_id):
             return [
-                SendResult(recipient="254700000001", success=True,
+                SendResult(recipient="+254700000001", success=True,
                            provider_message_id="X1", status="Success"),
                 SendResult(recipient="254700000002", success=False,
                            status="Failed", error="Failed"),
@@ -108,3 +108,50 @@ async def test_dispatch_all_success_marks_completed(db, session_factory, monkeyp
         assert camp.sent_count == 1
         assert camp.failed_count == 0
         assert camp.refunded_credits == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_admin_sms_messages_updates_per_recipient_status(
+        db, session_factory, monkeypatch):
+    r1 = await make_reseller(db, support_phone="254700000001")
+    r2 = await make_reseller(db, support_phone="254700000002")
+    m1 = SmsMessage(user_id=r1.id, recipient_phone=r1.support_phone, body="Notice",
+                    segments=1, credits_charged=1,
+                    kind=SmsMessageKind.ADMIN_TO_RESELLER,
+                    status=SmsMessageStatus.QUEUED)
+    m2 = SmsMessage(user_id=r2.id, recipient_phone=r2.support_phone, body="Notice",
+                    segments=1, credits_charged=1,
+                    kind=SmsMessageKind.ADMIN_TO_RESELLER,
+                    status=SmsMessageStatus.QUEUED)
+    db.add_all([m1, m2])
+    await db.commit()
+    ids = [m1.id, m2.id]
+
+    class _FakeProvider:
+        name = "fake"
+        async def send_bulk(self, recipients, body, sender_id):
+            assert recipients == ["254700000001", "254700000002"]
+            assert body == "Notice"
+            assert sender_id == "BRAND"
+            return [
+                SendResult(recipient="+254700000001", success=True,
+                           provider_message_id="ADM1", status="Success"),
+                SendResult(recipient="254700000002", success=False,
+                           status="Rejected", error="Rejected"),
+            ]
+
+    monkeypatch.setattr(sms_dispatch, "get_provider", lambda: _FakeProvider())
+    monkeypatch.setattr(sms_dispatch, "async_session", session_factory)
+
+    await sms_dispatch.dispatch_admin_sms_messages(ids, "BRAND")
+
+    async with session_factory() as s:
+        row1 = await s.get(SmsMessage, ids[0])
+        row2 = await s.get(SmsMessage, ids[1])
+        assert row1.status == SmsMessageStatus.SENT
+        assert row1.provider == "fake"
+        assert row1.provider_message_id == "ADM1"
+        assert row1.error is None
+        assert row2.status == SmsMessageStatus.FAILED
+        assert row2.provider == "fake"
+        assert row2.error == "Rejected"

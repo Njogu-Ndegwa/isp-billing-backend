@@ -15,6 +15,7 @@ from app.api.device_pairing import (
 from app.db.models import (
     Customer,
     CustomerStatus,
+    CustomerUsagePeriod,
     DevicePairing,
     DeviceType,
     PaymentMethod,
@@ -659,7 +660,7 @@ async def test_share_subscription_enforces_plan_device_limit(db):
 @pytest.mark.asyncio
 async def test_owner_renewal_extends_shared_devices_and_schedules_delivery(db):
     reseller = await make_reseller(db)
-    plan = await make_plan(db, reseller, max_shared_users=3)
+    plan = await make_plan(db, reseller, max_shared_users=3, data_cap_mb=20)
     router = await make_router(db, reseller)
     owner = await make_customer(
         db,
@@ -717,6 +718,16 @@ async def test_owner_renewal_extends_shared_devices_and_schedules_delivery(db):
     assert shared.status == CustomerStatus.ACTIVE
     assert shared.expiry == owner.expiry
     assert pairing.expires_at == owner.expiry
+    shared_period = (
+        await db.execute(
+            select(CustomerUsagePeriod).where(
+                CustomerUsagePeriod.customer_id == shared.id,
+                CustomerUsagePeriod.closed_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    assert shared_period.period_end == shared.expiry
+    assert shared_period.cap_mb_snapshot == 20
 
     attempt = (
         await db.execute(

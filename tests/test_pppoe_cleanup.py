@@ -185,7 +185,7 @@ async def test_pppoe_customer_presence_uses_db_values_and_reports_offline(db, mo
                 "last_caller_id": "",
             },
             "active_session": None,
-            "profile_detail": {"name": "pppoe_5M_5M", "rate_limit": "5000000/5000000"},
+            "profile_detail": {"name": "pppoe_5M_5M", "rate_limit": "5400000/5400000"},
             "profile_lookup_success": True,
             "profile_lookup_error": None,
             "session_lookup_success": True,
@@ -247,7 +247,9 @@ async def test_pppoe_customer_presence_flags_plan_rate_mismatch(db, monkeypatch)
 
     assert response["speed_enforcement"] == {
         "plan_speed": "5M/5M",
-        "expected_rate_limit": "5M/5M",
+        "plan_rate_limit": "5M/5M",
+        "headroom_factor": 1.08,
+        "expected_rate_limit": "5400000/5400000",
         "profile_rate_limit": "10M/10M",
         "profile_rate_matches_plan": False,
         "active_queue_limit": "",
@@ -316,6 +318,29 @@ async def test_edit_active_pppoe_plan_reprovisions_with_new_speed(db, monkeypatc
     assert provision_calls[0]["pppoe_username"] == "plan_change_user"
     assert provision_calls[0]["bandwidth_limit"] == "5M/5M"
     assert remove_calls == []
+
+
+async def test_edit_active_pppoe_rejects_blank_username(db, monkeypatch):
+    reseller, _, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+
+    async def fake_current_user(_token, _db):
+        return reseller
+
+    monkeypatch.setattr(customer_routes, "get_current_user", fake_current_user)
+
+    with pytest.raises(HTTPException) as exc:
+        await customer_routes.edit_customer(
+            customer.id,
+            customer_routes.CustomerEditRequest(pppoe_username=" "),
+            db,
+            "token",
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "PPPoE username cannot be blank"
+
+    await db.refresh(customer)
+    assert customer.pppoe_username == "Festo"
 
 
 async def test_activate_pppoe_customer_tracks_failed_router_provision_for_retry(db, monkeypatch):

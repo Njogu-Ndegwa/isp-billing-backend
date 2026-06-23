@@ -1,4 +1,5 @@
 from app.api.router_operations import _heal_dual_mode_sync
+from app.services import pppoe_provisioning
 from app.services.mikrotik_api import MikroTikAPI, parse_speed_to_mikrotik
 
 
@@ -65,6 +66,75 @@ def test_ensure_pppoe_profile_sets_only_one_on_create():
             "only-one": "yes",
         },
     )
+
+
+def test_pppoe_provisioning_creates_missing_default_pool_before_profile(monkeypatch):
+    class FakeMikroTikAPI:
+        instances = []
+
+        def __init__(self, *_args, **_kwargs):
+            self.calls = []
+            FakeMikroTikAPI.instances.append(self)
+
+        def connect(self):
+            return True
+
+        def disconnect(self):
+            self.calls.append(("disconnect", None))
+
+        def _parse_speed_to_mikrotik(self, speed):
+            assert speed == "7Mbps"
+            return "7M/7M"
+
+        def get_active_pppoe_profile(self):
+            self.calls.append(("get_active_pppoe_profile", None))
+            return {"success": True, "found": False, "data": None}
+
+        def ensure_ip_pool(self, pool_name, pool_range):
+            self.calls.append(("ensure_ip_pool", pool_name, pool_range))
+            return {"success": True, "action": "created"}
+
+        def ensure_pppoe_profile(self, profile_name, rate_limit, **kwargs):
+            self.calls.append(("ensure_pppoe_profile", profile_name, rate_limit, kwargs))
+            return {"success": True}
+
+        def add_pppoe_secret(self, username, password, profile, comment=""):
+            self.calls.append(("add_pppoe_secret", username, password, profile, comment))
+            return {"success": True}
+
+        def ensure_pppoe_fasttrack_bypass(self, pool_name=""):
+            self.calls.append(("ensure_pppoe_fasttrack_bypass", pool_name))
+            return {"success": True}
+
+        def disconnect_pppoe_session(self, username):
+            self.calls.append(("disconnect_pppoe_session", username))
+            return {"success": True, "disconnected": 0}
+
+    monkeypatch.setattr(pppoe_provisioning, "MikroTikAPI", FakeMikroTikAPI)
+
+    result = pppoe_provisioning._provision_pppoe_sync({
+        "pppoe_username": "benny254",
+        "pppoe_password": "secret",
+        "bandwidth_limit": "7Mbps",
+        "comment": "CID:8112|Benny|2026-06-23",
+        "router_ip": "10.0.0.23",
+        "router_username": "admin",
+        "router_password": "router-secret",
+        "router_port": 8728,
+    })
+
+    assert result["success"] is True
+    api = FakeMikroTikAPI.instances[0]
+    pool_call = (
+        "ensure_ip_pool",
+        pppoe_provisioning.PPPOE_DEFAULT_POOL_NAME,
+        pppoe_provisioning.PPPOE_DEFAULT_POOL_RANGE,
+    )
+    profile_call = next(call for call in api.calls if call[0] == "ensure_pppoe_profile")
+    assert pool_call in api.calls
+    assert api.calls.index(pool_call) < api.calls.index(profile_call)
+    assert profile_call[3]["local_address"] == pppoe_provisioning.PPPOE_DEFAULT_LOCAL_ADDRESS
+    assert profile_call[3]["pool_name"] == pppoe_provisioning.PPPOE_DEFAULT_POOL_NAME
 
 
 def test_ensure_pppoe_server_sets_reconnect_defaults_on_create():

@@ -3,19 +3,19 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.db.database import get_db
 from app.db.models import (
     User, UserRole, MessagingSettings, SmsCreditOrder, ResellerInboxMessage,
+    SmsMessage, SmsMessageKind, SmsMessageStatus,
 )
 from app.services.auth import verify_token, get_current_user
-from app.services import sms_credits
-from app.services.messaging import get_provider
+from app.services import sms_credits, sms_dispatch
+from app.services.messaging import count_segments, resolve_sender_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin-messaging"])
@@ -41,7 +41,11 @@ class SettingsIn(BaseModel):
 async def get_settings(db: AsyncSession = Depends(get_db),
                        token: str = Depends(verify_token)):
     await _require_admin(token, db)
-    s = await db.get(MessagingSettings, 1) or MessagingSettings(id=1)
+    s = await db.get(MessagingSettings, 1)
+    if s is None:
+        s = MessagingSettings(id=1)
+        db.add(s)
+        await db.flush()
     return {
         "price_per_sms_kes": float(s.price_per_sms_kes),
         "min_purchase_credits": s.min_purchase_credits,
@@ -140,32 +144,89 @@ async def send_inbox(req: InboxSendIn, background: BackgroundTasks,
             raise HTTPException(status_code=404, detail="Reseller not found")
 
     broadcast_id = str(uuid.uuid4()) if req.recipient == "all" else None
-    targets = []
+    sms_rows: list[SmsMessage] = []
+    segments = count_segments(req.body) if req.also_sms else 0
     for r in resellers:
         db.add(ResellerInboxMessage(
             recipient_user_id=r.id, sender_user_id=admin.id, subject=req.subject,
             body=req.body, sent_sms=req.also_sms, broadcast_id=broadcast_id))
-        if req.also_sms and r.support_phone:
-            targets.append(r.support_phone)
+        phone = (r.support_phone or "").strip()
+        if req.also_sms and phone:
+            row = SmsMessage(
+                user_id=r.id,
+                recipient_phone=phone,
+                body=req.body,
+                segments=segments,
+                credits_charged=segments,
+                kind=SmsMessageKind.ADMIN_TO_RESELLER,
+                status=SmsMessageStatus.QUEUED,
+            )
+            db.add(row)
+            sms_rows.append(row)
 
-    # Honor the admin-configured sender id (same fallback the reseller send
-    # path uses), not just the env default.
+    # Resolve sender the same way the reseller send path does; SMS_SENDER_ID is
+    # an operational override for provider migrations.
     settings_row = await db.get(MessagingSettings, 1)
-    sender_id = (settings_row.sender_id if settings_row and settings_row.sender_id
-                 else settings.AT_SENDER_ID)
+    sender_id = resolve_sender_id(
+        settings_row.sender_id if settings_row and settings_row.sender_id else None
+    )
+    await db.flush()
+    sms_message_ids = [row.id for row in sms_rows]
     await db.commit()
 
-    if req.also_sms and targets:
-        background.add_task(_send_admin_sms, targets, req.body, sender_id)
+    if sms_message_ids:
+        background.add_task(sms_dispatch.dispatch_admin_sms_messages,
+                            sms_message_ids, sender_id)
 
-    return {"message": "Inbox message sent", "recipients": len(resellers)}
+    return {
+        "message": "Inbox message sent",
+        "recipients": len(resellers),
+        "sms_queued": len(sms_message_ids),
+        "sms_skipped_no_phone": (len(resellers) - len(sms_message_ids)
+                                 if req.also_sms else 0),
+    }
 
 
-async def _send_admin_sms(phones: list[str], body: str, sender_id: str):
-    """Admin->reseller SMS. Platform cost, no reseller credit deduction.
-    No DB session is held across the provider call."""
-    try:
-        provider = get_provider()
-        await provider.send_bulk(phones, body, sender_id)
-    except Exception as e:
-        logger.error("Admin SMS send failed: %s", e)
+@router.get("/api/admin/messaging/sms")
+async def list_admin_sms(limit: int = Query(100, ge=1, le=500),
+                         db: AsyncSession = Depends(get_db),
+                         token: str = Depends(verify_token)):
+    await _require_admin(token, db)
+    kind = SmsMessageKind.ADMIN_TO_RESELLER
+
+    count_rows = (await db.execute(
+        select(SmsMessage.status, func.count(SmsMessage.id))
+        .where(SmsMessage.kind == kind)
+        .group_by(SmsMessage.status)
+    )).all()
+    summary = {status.value: 0 for status in SmsMessageStatus}
+    for status, count in count_rows:
+        key = status.value if hasattr(status, "value") else status
+        summary[key] = count
+
+    rows = (await db.execute(
+        select(SmsMessage, User)
+        .join(User, SmsMessage.user_id == User.id)
+        .where(SmsMessage.kind == kind)
+        .order_by(SmsMessage.created_at.desc())
+        .limit(limit)
+    )).all()
+
+    return {
+        "summary": summary,
+        "messages": [{
+            "id": m.id,
+            "reseller_id": r.id,
+            "reseller_name": r.organization_name or r.email,
+            "phone": m.recipient_phone,
+            "body": m.body,
+            "segments": m.segments,
+            "credits_charged": m.credits_charged,
+            "provider": m.provider,
+            "provider_message_id": m.provider_message_id,
+            "status": m.status.value if hasattr(m.status, "value") else m.status,
+            "error": m.error,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+        } for m, r in rows],
+    }
