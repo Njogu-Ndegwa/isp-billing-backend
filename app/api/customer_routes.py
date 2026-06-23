@@ -90,7 +90,7 @@ async def register_customer_api(
             if existing_result.scalar_one_or_none():
                 raise HTTPException(status_code=409, detail="Customer with this MAC address already exists")
         
-        pppoe_username = request.pppoe_username
+        pppoe_username = request.pppoe_username.strip() if request.pppoe_username else None
         pppoe_password = request.pppoe_password
 
         if plan.connection_type == ConnectionType.PPPOE:
@@ -191,10 +191,12 @@ async def edit_customer(
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
 
+        target_plan = customer.plan
         if request.plan_id is not None:
             plan_stmt = select(Plan).where(Plan.id == request.plan_id, Plan.user_id == user.id)
             plan_result = await db.execute(plan_stmt)
-            if not plan_result.scalar_one_or_none():
+            target_plan = plan_result.scalar_one_or_none()
+            if not target_plan:
                 raise HTTPException(status_code=404, detail="Plan not found")
 
         if request.router_id is not None:
@@ -213,16 +215,39 @@ async def edit_customer(
             if mac_result.scalar_one_or_none():
                 raise HTTPException(status_code=409, detail="Another customer with this MAC address already exists")
 
-        if request.pppoe_username is not None and request.pppoe_username != customer.pppoe_username:
+        normalized_pppoe_username = (
+            request.pppoe_username.strip()
+            if request.pppoe_username is not None
+            else None
+        )
+        normalized_pppoe_password = (
+            request.pppoe_password.strip()
+            if request.pppoe_password is not None
+            else None
+        )
+        target_is_pppoe = bool(
+            target_plan and target_plan.connection_type == ConnectionType.PPPOE
+        )
+
+        if target_is_pppoe and request.pppoe_username is not None and not normalized_pppoe_username:
+            raise HTTPException(status_code=400, detail="PPPoE username cannot be blank")
+        if target_is_pppoe and request.pppoe_password is not None and not normalized_pppoe_password:
+            raise HTTPException(status_code=400, detail="PPPoE password cannot be blank")
+
+        if (
+            request.pppoe_username is not None
+            and normalized_pppoe_username
+            and normalized_pppoe_username != customer.pppoe_username
+        ):
             pppoe_stmt = select(Customer).where(
-                Customer.pppoe_username == request.pppoe_username,
+                Customer.pppoe_username == normalized_pppoe_username,
                 Customer.id != customer_id,
             )
             pppoe_result = await db.execute(pppoe_stmt)
             if pppoe_result.scalar_one_or_none():
                 raise HTTPException(
                     status_code=409,
-                    detail=f"PPPoE username '{request.pppoe_username}' already exists",
+                    detail=f"PPPoE username '{normalized_pppoe_username}' already exists",
                 )
 
         old_pppoe_username = customer.pppoe_username
@@ -233,6 +258,10 @@ async def edit_customer(
         pppoe_location_changed = False
 
         update_fields = request.model_dump(exclude_none=True)
+        if request.pppoe_username is not None:
+            update_fields["pppoe_username"] = normalized_pppoe_username or None
+        if request.pppoe_password is not None:
+            update_fields["pppoe_password"] = normalized_pppoe_password or None
         if "expiry" in update_fields and update_fields["expiry"] is not None:
             update_fields["expiry"] = update_fields["expiry"].replace(tzinfo=None)
         for field, value in update_fields.items():

@@ -318,6 +318,29 @@ async def test_edit_active_pppoe_plan_reprovisions_with_new_speed(db, monkeypatc
     assert remove_calls == []
 
 
+async def test_edit_active_pppoe_rejects_blank_username(db, monkeypatch):
+    reseller, _, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+
+    async def fake_current_user(_token, _db):
+        return reseller
+
+    monkeypatch.setattr(customer_routes, "get_current_user", fake_current_user)
+
+    with pytest.raises(HTTPException) as exc:
+        await customer_routes.edit_customer(
+            customer.id,
+            customer_routes.CustomerEditRequest(pppoe_username=" "),
+            db,
+            "token",
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "PPPoE username cannot be blank"
+
+    await db.refresh(customer)
+    assert customer.pppoe_username == "Festo"
+
+
 async def test_activate_pppoe_customer_tracks_failed_router_provision_for_retry(db, monkeypatch):
     reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.INACTIVE)
 

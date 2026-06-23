@@ -2530,6 +2530,36 @@ class MikroTikAPI:
     # PPPoE MANAGEMENT
     # =========================================================================
 
+    def ensure_ip_pool(self, pool_name: str, pool_range: str) -> Dict[str, Any]:
+        """Ensure a RouterOS IP pool exists before profiles reference it."""
+        if not self.connected:
+            return {"error": "Not connected"}
+        if not pool_name:
+            return {"error": "Pool name is required"}
+        if not pool_range:
+            return {"error": "Pool range is required"}
+        try:
+            pools = self.send_command("/ip/pool/print")
+            if pools.get("success"):
+                for pool in pools.get("data", []) or []:
+                    if pool.get("name") == pool_name:
+                        return {"success": True, "action": "exists", "pool_name": pool_name}
+
+            result = self.send_command(
+                "/ip/pool/add",
+                {"name": pool_name, "ranges": pool_range},
+            )
+            if result.get("error"):
+                if _router_error_is_duplicate(result.get("error", "")):
+                    return {"success": True, "action": "exists", "pool_name": pool_name}
+                return result
+
+            logger.info("Created IP pool '%s' with ranges %s", pool_name, pool_range)
+            return {"success": True, "action": "created", "pool_name": pool_name}
+        except Exception as e:
+            logger.error(f"Error ensuring IP pool '{pool_name}': {e}")
+            return {"error": str(e)}
+
     def ensure_pppoe_profile(
         self,
         profile_name: str,
