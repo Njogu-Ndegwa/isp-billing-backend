@@ -181,6 +181,83 @@ async def test_talksasa_posts_json_with_bearer_token(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_talksasa_normalizes_common_kenyan_phone_formats(monkeypatch):
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+        def json(self):
+            return {
+                "status": "success",
+                "data": {"queue_uid": "queue-1", "status": "accepted"},
+            }
+
+    class _FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            captured["json"] = json
+            return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    provider = TalksasaProvider(api_token="token", base_url="https://api.example/v3")
+    results = await provider.send_bulk(["0712345678", "+254700000000"], "Hi", "BRAND")
+
+    assert captured["json"]["recipient"] == "254712345678,254700000000"
+    assert [r.recipient for r in results] == ["0712345678", "+254700000000"]
+    assert all(r.success for r in results)
+
+
+@pytest.mark.asyncio
+async def test_talksasa_bulk_4xx_falls_back_to_single_recipient_sends(monkeypatch):
+    calls = []
+
+    class _FakeResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+        def json(self):
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            calls.append(json)
+            if len(calls) == 1:
+                return _FakeResponse(404, {
+                    "status": "error",
+                    "message": "000 is a invalid phone number",
+                })
+            if json["recipient"] == "999":
+                return _FakeResponse(404, {
+                    "status": "error",
+                    "message": "999 is a invalid phone number",
+                })
+            return _FakeResponse(200, {
+                "status": "success",
+                "data": {"queue_uid": "queue-1", "status": "accepted"},
+            })
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    provider = TalksasaProvider(api_token="token", base_url="https://api.example/v3")
+    results = await provider.send_bulk(["999", "0712345678"], "Hi", "BRAND")
+
+    assert [call["recipient"] for call in calls] == [
+        "999,254712345678",
+        "999",
+        "254712345678",
+    ]
+    by_recipient = {r.recipient: r for r in results}
+    assert by_recipient["999"].success is False
+    assert by_recipient["999"].error == "999 is a invalid phone number"
+    assert by_recipient["0712345678"].success is True
+
+
+@pytest.mark.asyncio
 async def test_talksasa_error_payload_marks_all_recipients_failed(monkeypatch):
     class _FakeResponse:
         status_code = 200

@@ -43,8 +43,27 @@ class TalksasaProvider(MessagingProvider):
                 for recipient in recipients
             ]
 
+        prepared: list[tuple[str, str]] = []
+        results: list[SendResult] = []
+        for recipient in recipients:
+            formatted = self._format_recipient(recipient)
+            if not formatted:
+                results.append(
+                    SendResult(
+                        recipient=recipient,
+                        success=False,
+                        status="invalid_recipient",
+                        error="invalid_recipient",
+                    )
+                )
+                continue
+            prepared.append((recipient, formatted))
+
+        if not prepared:
+            return results
+
         payload = {
-            "recipient": ",".join(recipients),
+            "recipient": ",".join(formatted for _, formatted in prepared),
             "sender_id": sender_id,
             "type": "plain",
             "message": body,
@@ -62,6 +81,13 @@ class TalksasaProvider(MessagingProvider):
             except ValueError:
                 response_payload = {"status": "error", "message": resp.text}
             if resp.status_code >= 400:
+                if len(prepared) > 1:
+                    results.extend(
+                        await self._send_individual(
+                            client, url, headers, prepared, body, sender_id
+                        )
+                    )
+                    return results
                 message = (
                     response_payload.get("message")
                     if isinstance(response_payload, dict)
@@ -69,15 +95,70 @@ class TalksasaProvider(MessagingProvider):
                 ) or f"HTTP {resp.status_code}"
                 return [
                     SendResult(
-                        recipient=recipient,
+                        recipient=prepared[0][0],
                         success=False,
                         status=f"http_{resp.status_code}",
                         error=str(message)[:255],
                     )
-                    for recipient in recipients
                 ]
 
-        return self._parse_response(response_payload, recipients)
+        parsed = self._parse_response(
+            response_payload, [original for original, _ in prepared]
+        )
+        return results + parsed
+
+    async def _send_individual(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+        prepared: list[tuple[str, str]],
+        body: str,
+        sender_id: str,
+    ) -> list[SendResult]:
+        results: list[SendResult] = []
+        for original, formatted in prepared:
+            payload = {
+                "recipient": formatted,
+                "sender_id": sender_id,
+                "type": "plain",
+                "message": body,
+            }
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+                try:
+                    response_payload = resp.json()
+                except ValueError:
+                    response_payload = {"status": "error", "message": resp.text}
+            except Exception as exc:
+                results.append(
+                    SendResult(
+                        recipient=original,
+                        success=False,
+                        status="network_error",
+                        error=str(exc)[:255],
+                    )
+                )
+                continue
+
+            if resp.status_code >= 400:
+                message = (
+                    response_payload.get("message")
+                    if isinstance(response_payload, dict)
+                    else None
+                ) or f"HTTP {resp.status_code}"
+                results.append(
+                    SendResult(
+                        recipient=original,
+                        success=False,
+                        status=f"http_{resp.status_code}",
+                        error=str(message)[:255],
+                    )
+                )
+                continue
+
+            results.extend(self._parse_response(response_payload, [original]))
+        return results
 
     def _parse_response(
         self, payload: dict[str, Any], recipients: list[str]
@@ -192,3 +273,15 @@ class TalksasaProvider(MessagingProvider):
 
     def _phone_key(self, phone: str) -> str:
         return "".join(ch for ch in phone if ch.isdigit())
+
+    def _format_recipient(self, phone: str | None) -> str:
+        digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+        if not digits:
+            return ""
+        if digits.startswith("00") and len(digits) > 2:
+            digits = digits[2:]
+        if digits.startswith("0") and len(digits) == 10:
+            return "254" + digits[1:]
+        if len(digits) == 9 and digits[0] in {"1", "7"}:
+            return "254" + digits
+        return digits
