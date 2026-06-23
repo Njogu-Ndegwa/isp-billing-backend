@@ -128,12 +128,16 @@ def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list, db_dual_ports:
                 "link_up": link_up,
             })
         if dual_port_checks:
+            all_dual_ports_attached = all(
+                p["pppoe_attachment_mode"] == "dual"
+                for p in dual_port_checks
+            )
+            any_dual_port_up = any(p["link_up"] for p in dual_port_checks)
             checks.append({
                 "check": "dual_ports",
                 "description": "Dual-mode ports (PPPoE + Hotspot) on the dual bridge",
-                "passed": has_dual and all(
-                    p["pppoe_attachment_mode"] == "dual" and p["link_up"] for p in dual_port_checks
-                ),
+                "passed": has_dual and all_dual_ports_attached,
+                "any_port_up": any_dual_port_up,
                 "detail": dual_port_checks,
             })
 
