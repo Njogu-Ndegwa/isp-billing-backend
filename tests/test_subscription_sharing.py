@@ -288,6 +288,110 @@ async def test_share_code_redeems_detected_device_and_marks_code_used(db, monkey
 
 
 @pytest.mark.asyncio
+async def test_share_code_reuses_stale_pairing_from_expired_previous_owner_with_same_phone(db, monkeypatch):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, max_shared_users=2)
+    router = await make_router(db, reseller)
+    old_owner = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.INACTIVE,
+        expiry=datetime.utcnow() - timedelta(days=1),
+        mac_address="AA:BB:CC:DD:EF:31",
+        phone="254700000431",
+    )
+    fresh_owner = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(hours=2),
+        mac_address="AA:BB:CC:DD:EF:32",
+        phone="254700000431",
+    )
+    old_shared = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.INACTIVE,
+        expiry=old_owner.expiry,
+        mac_address="AA:BB:CC:DD:EF:33",
+        phone=old_owner.phone,
+        subscription_owner_id=old_owner.id,
+    )
+    stale_pairing = DevicePairing(
+        customer_id=old_shared.id,
+        device_mac=old_shared.mac_address,
+        device_name="Friend phone",
+        device_type=DeviceType.LAPTOP,
+        router_id=router.id,
+        plan_id=plan.id,
+        subscription_owner_customer_id=old_owner.id,
+        is_subscription_share=True,
+        is_active=True,
+        expires_at=old_owner.expiry,
+    )
+    db.add(stale_pairing)
+    await db.commit()
+    await db.refresh(stale_pairing)
+
+    tasks = []
+
+    async def fake_log(*_args, **_kwargs):
+        return None
+
+    async def fake_provision(*_args, **_kwargs):
+        return {"success": True}
+
+    def fake_create_task(coro):
+        task = asyncio.get_running_loop().create_task(coro)
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(device_pairing, "log_provisioning_event", fake_log)
+    monkeypatch.setattr(device_pairing, "provision_hotspot_customer", fake_provision)
+    monkeypatch.setattr(device_pairing.asyncio, "create_task", fake_create_task)
+
+    code_response = await device_pairing.create_share_subscription_code(
+        ShareSubscriptionCodeCreateRequest(
+            owner_phone="0700000431",
+            router_id=router.id,
+        ),
+        db,
+    )
+
+    response = await device_pairing.redeem_share_subscription_code(
+        ShareSubscriptionCodeRedeemRequest(
+            code=code_response["raw_code"],
+            router_id=router.id,
+            device_mac=old_shared.mac_address,
+            device_name="Friend phone",
+            device_type="laptop",
+        ),
+        db,
+    )
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    assert response["success"] is True
+    assert response["owner_customer_id"] == fresh_owner.id
+    assert response["pairing_id"] == stale_pairing.id
+    assert response["active_shared_devices"] == 1
+
+    await db.refresh(old_shared)
+    await db.refresh(stale_pairing)
+    assert old_shared.status == CustomerStatus.ACTIVE
+    assert old_shared.expiry == fresh_owner.expiry
+    assert old_shared.subscription_owner_id == fresh_owner.id
+    assert stale_pairing.subscription_owner_customer_id == fresh_owner.id
+    assert stale_pairing.expires_at == fresh_owner.expiry
+
+
+@pytest.mark.asyncio
 async def test_expired_share_code_cannot_be_redeemed(db):
     reseller = await make_reseller(db)
     plan = await make_plan(db, reseller, max_shared_users=2)

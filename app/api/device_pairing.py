@@ -409,6 +409,41 @@ def _mark_share_code_redeemed(
     share_code.updated_at = now
 
 
+def _existing_pairing_blocks_share(pairing: DevicePairing | None, owner: Customer) -> bool:
+    if not pairing or not pairing.is_active:
+        return False
+    if pairing.subscription_owner_customer_id == owner.id:
+        return False
+
+    now = datetime.utcnow()
+    paired_customer = getattr(pairing, "customer", None)
+    if (
+        paired_customer
+        and (
+            paired_customer.status != CustomerStatus.ACTIVE
+            or not paired_customer.expiry
+            or paired_customer.expiry <= now
+        )
+    ):
+        return False
+
+    if pairing.is_subscription_share:
+        share_owner = getattr(pairing, "subscription_owner_customer", None)
+        if pairing.subscription_owner_customer_id is None:
+            return False
+        if (
+            share_owner
+            and (
+                share_owner.status != CustomerStatus.ACTIVE
+                or not share_owner.expiry
+                or share_owner.expiry <= now
+            )
+        ):
+            return False
+
+    return True
+
+
 def _remove_shared_device_from_direct_router_sync(router_info: dict, mac_address: str) -> dict:
     api = MikroTikAPI(
         router_info["ip"],
@@ -581,17 +616,20 @@ async def _share_subscription_for_owner(
 
     existing_pairing = (
         await db.execute(
-            select(DevicePairing).where(
+            select(DevicePairing)
+            .options(
+                selectinload(DevicePairing.customer),
+                selectinload(DevicePairing.subscription_owner_customer),
+            )
+            .where(
                 DevicePairing.device_mac == normalized_mac,
                 DevicePairing.router_id == router_id,
             )
         )
     ).scalar_one_or_none()
 
-    if existing_pairing and existing_pairing.is_active:
-        same_owner = existing_pairing.subscription_owner_customer_id == owner.id
-        if not same_owner:
-            raise HTTPException(status_code=409, detail="This device is already paired on this hotspot")
+    if _existing_pairing_blocks_share(existing_pairing, owner):
+        raise HTTPException(status_code=409, detail="This device is already paired on this hotspot")
 
     existing_pairing_id = (
         existing_pairing.id
