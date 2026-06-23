@@ -16,6 +16,10 @@ from app.services import sms_credits
 from tests.factories import make_reseller
 
 
+async def make_admin(db):
+    return await make_reseller(db, role=UserRole.ADMIN)
+
+
 @pytest_asyncio.fixture
 async def app(session_factory):
     application = FastAPI()
@@ -89,7 +93,7 @@ async def test_admin_adjust_grants_credits(db, client, monkeypatch):
     ("GET", "/api/admin/messaging/credits/orders", None),
     ("GET", "/api/admin/messaging/sms", None),
     ("POST", "/api/admin/messaging/resellers/999/credits/adjust", {"delta": 1}),
-    ("POST", "/api/admin/messaging/inbox", {"recipient": "all", "body": "hi"}),
+    ("POST", "/api/admin/messaging/inbox", {"all_resellers": True, "body": "hi"}),
 ])
 async def test_reseller_is_rejected_from_all_admin_endpoints(
         db, client, monkeypatch, method, path, payload):
@@ -106,7 +110,7 @@ async def test_inbox_send_to_one_reseller_creates_row(db, client, monkeypatch):
     reseller = await make_reseller(db)
     _auth_as(monkeypatch, admin)
     resp = await client.post("/api/admin/messaging/inbox", json={
-        "recipient": str(reseller.id), "subject": "Notice",
+        "reseller_ids": [reseller.id], "all_resellers": False, "subject": "Notice",
         "body": "Please update your details", "also_sms": False})
     assert resp.status_code == 200
     assert resp.json()["recipients"] == 1
@@ -137,7 +141,7 @@ async def test_inbox_send_with_sms_creates_status_rows(
                         _fake_dispatch)
 
     resp = await client.post("/api/admin/messaging/inbox", json={
-        "recipient": "all", "subject": "Notice",
+        "all_resellers": True, "subject": "Notice",
         "body": "Please update your details", "also_sms": True})
     assert resp.status_code == 200
     payload = resp.json()
@@ -185,3 +189,15 @@ async def test_admin_sms_history_shows_sent_and_failed_counts(
     assert payload["summary"]["queued"] == 0
     names = {m["reseller_name"] for m in payload["messages"]}
     assert names == {"Alpha ISP", "Beta ISP"}
+
+
+@pytest.mark.asyncio
+async def test_broadcast_to_selected_resellers(db, client, monkeypatch):
+    from tests.factories import make_reseller
+    admin = await make_admin(db); _auth_as(monkeypatch, admin)
+    r1 = await make_reseller(db); r2 = await make_reseller(db); await make_reseller(db)
+    resp = await client.post("/api/admin/messaging/inbox", json={
+        "reseller_ids": [r1.id, r2.id], "all_resellers": False,
+        "subject": "Hi", "body": "msg", "also_sms": False})
+    assert resp.status_code == 200
+    assert resp.json()["recipients"] == 2

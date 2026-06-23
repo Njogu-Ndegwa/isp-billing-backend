@@ -117,7 +117,8 @@ async def adjust_credits(reseller_id: int, body: AdjustIn,
 
 
 class InboxSendIn(BaseModel):
-    recipient: str = Field(..., description='reseller id (as string) or "all"')
+    reseller_ids: Optional[list[int]] = None
+    all_resellers: bool = False
     subject: Optional[str] = Field(None, max_length=200)
     body: str = Field(..., min_length=1, max_length=2000)
     also_sms: bool = False
@@ -128,22 +129,19 @@ async def send_inbox(req: InboxSendIn, background: BackgroundTasks,
                      db: AsyncSession = Depends(get_db),
                      token: str = Depends(verify_token)):
     admin = await _require_admin(token, db)
-    if req.recipient == "all":
+    if req.all_resellers:
         resellers = (await db.execute(
-            select(User).where(User.role == UserRole.RESELLER)
-        )).scalars().all()
-    else:
-        try:
-            rid = int(req.recipient)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="recipient must be id or 'all'")
+            select(User).where(User.role == UserRole.RESELLER))).scalars().all()
+    elif req.reseller_ids:
         resellers = (await db.execute(
-            select(User).where(User.id == rid, User.role == UserRole.RESELLER)
-        )).scalars().all()
+            select(User).where(User.id.in_(req.reseller_ids),
+                               User.role == UserRole.RESELLER))).scalars().all()
         if not resellers:
-            raise HTTPException(status_code=404, detail="Reseller not found")
-
-    broadcast_id = str(uuid.uuid4()) if req.recipient == "all" else None
+            raise HTTPException(status_code=404, detail="No matching resellers")
+    else:
+        raise HTTPException(status_code=400,
+                            detail="Select resellers or choose all")
+    broadcast_id = str(uuid.uuid4()) if req.all_resellers else None
     sms_rows: list[SmsMessage] = []
     segments = count_segments(req.body) if req.also_sms else 0
     for r in resellers:
