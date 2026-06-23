@@ -153,7 +153,7 @@ async def test_inbox_send_with_sms_creates_status_rows(
     assert rows[0].recipient_phone == "254700000001"
     assert rows[0].status == SmsMessageStatus.QUEUED
     assert rows[0].credits_charged == 1
-    assert dispatched == [([rows[0].id], "BRAND")]
+    assert dispatched == [([rows[0].id], "TALKSASA")]
 
 
 @pytest.mark.asyncio
