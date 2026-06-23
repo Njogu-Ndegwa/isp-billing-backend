@@ -10,8 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.db.models import (
-    User, UserRole, MessagingSettings, SmsCreditOrder, ResellerInboxMessage,
-    SmsMessage, SmsMessageKind, SmsMessageStatus,
+    User, UserRole, MessagingSettings, SmsCreditOrder, SmsCreditTransaction,
+    ResellerInboxMessage, SmsMessage, SmsMessageKind, SmsMessageStatus,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import sms_credits, sms_dispatch
@@ -114,6 +114,28 @@ async def adjust_credits(reseller_id: int, body: AdjustIn,
     new_balance = await sms_credits.adjust(db, reseller_id, body.delta, note=body.note)
     await db.commit()
     return {"reseller_id": reseller_id, "balance": new_balance}
+
+
+@router.get("/api/admin/messaging/resellers/{reseller_id}/ledger")
+async def reseller_ledger(reseller_id: int,
+                          limit: int = Query(50, ge=1, le=200),
+                          offset: int = Query(0, ge=0),
+                          db: AsyncSession = Depends(get_db),
+                          token: str = Depends(verify_token)):
+    await _require_admin(token, db)
+    rows = (await db.execute(
+        select(SmsCreditTransaction)
+        .where(SmsCreditTransaction.user_id == reseller_id)
+        .order_by(SmsCreditTransaction.created_at.desc(),
+                  SmsCreditTransaction.id.desc())
+        .limit(limit).offset(offset))).scalars().all()
+    return {"transactions": [{
+        "id": t.id,
+        "kind": t.kind.value if hasattr(t.kind, "value") else t.kind,
+        "change": t.change, "balance_after": t.balance_after,
+        "reference": t.reference, "note": t.note,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    } for t in rows]}
 
 
 class InboxSendIn(BaseModel):

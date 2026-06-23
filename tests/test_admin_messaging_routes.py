@@ -201,3 +201,16 @@ async def test_broadcast_to_selected_resellers(db, client, monkeypatch):
         "subject": "Hi", "body": "msg", "also_sms": False})
     assert resp.status_code == 200
     assert resp.json()["recipients"] == 2
+
+
+@pytest.mark.asyncio
+async def test_admin_reseller_ledger(db, client, monkeypatch):
+    from tests.factories import make_reseller, make_sms_account
+    from app.services import sms_credits
+    from app.db.models import SmsCreditTxnKind
+    admin = await make_admin(db); _auth_as(monkeypatch, admin)
+    r = await make_reseller(db); await make_sms_account(db, r, balance=0)
+    await sms_credits.grant(db, r.id, 40, SmsCreditTxnKind.PURCHASE); await db.commit()
+    resp = await client.get(f"/api/admin/messaging/resellers/{r.id}/ledger")
+    assert resp.status_code == 200
+    assert resp.json()["transactions"][0]["change"] == 40
