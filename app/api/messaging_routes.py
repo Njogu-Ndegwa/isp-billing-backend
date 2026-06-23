@@ -15,7 +15,7 @@ from app.db.models import (
     MessagingSettings, MessageTemplate,
     SmsCreditOrder, SmsCreditOrderStatus, SmsCreditTxnKind, SmsCreditTransaction,
     SmsCampaign, SmsCampaignStatus, SmsMessage, SmsMessageStatus, SmsMessageKind,
-    ResellerInboxMessage,
+    ResellerInboxMessage, Customer,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import sms_credits, sms_dispatch
@@ -346,7 +346,6 @@ async def list_campaigns(db: AsyncSession = Depends(get_db),
 @router.get("/api/messaging/campaigns/{campaign_id}")
 async def campaign_detail(campaign_id: int, db: AsyncSession = Depends(get_db),
                           token: str = Depends(verify_token)):
-    from app.db.models import Customer  # local import ok, or add to top block
     user = await _require_reseller(token, db)
     camp = (await db.execute(
         select(SmsCampaign).where(SmsCampaign.id == campaign_id,
@@ -356,7 +355,7 @@ async def campaign_detail(campaign_id: int, db: AsyncSession = Depends(get_db),
         raise HTTPException(status_code=404, detail="Campaign not found")
     rows = (await db.execute(
         select(SmsMessage, Customer.name)
-        .outerjoin(Customer, SmsMessage.customer_id == Customer.id)
+        .outerjoin(Customer, (SmsMessage.customer_id == Customer.id) & (Customer.user_id == user.id))
         .where(SmsMessage.campaign_id == campaign_id).limit(2000)
     )).all()
     counts = {"total": 0, "sent": 0, "failed": 0, "queued": 0, "delivered": 0}

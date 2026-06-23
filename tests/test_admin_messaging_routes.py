@@ -94,6 +94,7 @@ async def test_admin_adjust_grants_credits(db, client, monkeypatch):
     ("GET", "/api/admin/messaging/sms", None),
     ("POST", "/api/admin/messaging/resellers/999/credits/adjust", {"delta": 1}),
     ("POST", "/api/admin/messaging/inbox", {"all_resellers": True, "body": "hi"}),
+    ("GET", "/api/admin/messaging/resellers/999/ledger", None),
 ])
 async def test_reseller_is_rejected_from_all_admin_endpoints(
         db, client, monkeypatch, method, path, payload):

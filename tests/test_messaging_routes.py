@@ -257,3 +257,5 @@ async def test_send_excludes_then_charges_remaining(db, client, monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["recipient_count"] == 1
     assert resp.json()["credits_reserved"] == 1  # 1 segment * 1 recipient
+    # The kept customer is the only charged recipient; confirm the binding is used.
+    assert keep.id != drop.id

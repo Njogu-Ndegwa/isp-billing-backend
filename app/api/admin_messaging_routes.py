@@ -163,7 +163,9 @@ async def send_inbox(req: InboxSendIn, background: BackgroundTasks,
     else:
         raise HTTPException(status_code=400,
                             detail="Select resellers or choose all")
-    broadcast_id = str(uuid.uuid4()) if req.all_resellers else None
+    broadcast_id = (str(uuid.uuid4())
+                    if req.all_resellers or (req.reseller_ids and len(req.reseller_ids) > 1)
+                    else None)
     sms_rows: list[SmsMessage] = []
     segments = count_segments(req.body) if req.also_sms else 0
     for r in resellers:
