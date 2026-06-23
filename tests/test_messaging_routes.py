@@ -201,6 +201,23 @@ async def test_recipients_search_filters(db, client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ledger_lists_reseller_transactions_newest_first(db, client, monkeypatch):
+    from tests.factories import make_sms_account
+    from app.services import sms_credits
+    from app.db.models import SmsCreditTxnKind
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    await make_sms_account(db, r, balance=0)
+    await sms_credits.grant(db, r.id, 100, SmsCreditTxnKind.PURCHASE, reference="SMS-1")
+    await sms_credits.try_deduct(db, r.id, 30, reference="campaign:5")
+    await db.commit()
+    resp = await client.get("/api/messaging/credits/ledger")
+    txns = resp.json()["transactions"]
+    assert resp.status_code == 200
+    assert [t["kind"] for t in txns] == ["send_debit", "purchase"]
+    assert txns[0]["change"] == -30 and txns[0]["balance_after"] == 70
+
+
+@pytest.mark.asyncio
 async def test_send_excludes_then_charges_remaining(db, client, monkeypatch):
     from tests.factories import make_customer, make_plan, make_sms_account
     r = await make_reseller(db); _auth_as(monkeypatch, r)

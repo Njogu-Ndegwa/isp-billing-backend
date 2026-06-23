@@ -13,7 +13,7 @@ from app.db.database import get_db
 from app.db.models import (
     User, UserRole,
     MessagingSettings, MessageTemplate,
-    SmsCreditOrder, SmsCreditOrderStatus, SmsCreditTxnKind,
+    SmsCreditOrder, SmsCreditOrderStatus, SmsCreditTxnKind, SmsCreditTransaction,
     SmsCampaign, SmsCampaignStatus, SmsMessage, SmsMessageStatus, SmsMessageKind,
     ResellerInboxMessage,
 )
@@ -171,6 +171,28 @@ async def credits_callback(request: Request, db: AsyncSession = Depends(get_db))
     except Exception:
         logger.exception("SMS credits callback error")
     return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+
+@router.get("/api/messaging/credits/ledger")
+async def credit_ledger(limit: int = Query(50, ge=1, le=200),
+                        offset: int = Query(0, ge=0),
+                        db: AsyncSession = Depends(get_db),
+                        token: str = Depends(verify_token)):
+    user = await _require_reseller(token, db)
+    rows = (await db.execute(
+        select(SmsCreditTransaction)
+        .where(SmsCreditTransaction.user_id == user.id)
+        .order_by(SmsCreditTransaction.created_at.desc(),
+                  SmsCreditTransaction.id.desc())
+        .limit(limit).offset(offset)
+    )).scalars().all()
+    return {"transactions": [{
+        "id": t.id,
+        "kind": t.kind.value if hasattr(t.kind, "value") else t.kind,
+        "change": t.change, "balance_after": t.balance_after,
+        "reference": t.reference, "note": t.note,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    } for t in rows]}
 
 
 # ---- Recipients + send ----------------------------------------------------
