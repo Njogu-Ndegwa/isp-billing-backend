@@ -12,6 +12,38 @@ from tests.factories import make_reseller, make_plan, make_customer, make_sms_ac
 
 
 @pytest.mark.asyncio
+async def test_resolve_includes_name(db):
+    r = await make_reseller(db)
+    p = await make_plan(db, r)
+    await make_customer(db, r, p, name="Jane Doe", phone="254700000001")
+    out = await sms_dispatch.resolve_recipients(db, r.id, filter="all")
+    assert out == [{"customer_id": out[0]["customer_id"], "name": "Jane Doe", "phone": "254700000001"}]
+
+
+@pytest.mark.asyncio
+async def test_resolve_search_matches_name_or_phone(db):
+    r = await make_reseller(db)
+    p = await make_plan(db, r)
+    await make_customer(db, r, p, name="Alice", phone="254700000010")
+    await make_customer(db, r, p, name="Bob", phone="254711222333")
+    by_name = await sms_dispatch.resolve_recipients(db, r.id, search="ali")
+    assert [c["name"] for c in by_name] == ["Alice"]
+    by_phone = await sms_dispatch.resolve_recipients(db, r.id, search="711222")
+    assert [c["name"] for c in by_phone] == ["Bob"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_exclude_customer_ids(db):
+    r = await make_reseller(db)
+    p = await make_plan(db, r)
+    keep = await make_customer(db, r, p, name="Keep", phone="254700000020")
+    drop = await make_customer(db, r, p, name="Drop", phone="254700000021")
+    out = await sms_dispatch.resolve_recipients(db, r.id, filter="all",
+                                                exclude_customer_ids=[drop.id])
+    assert [c["customer_id"] for c in out] == [keep.id]
+
+
+@pytest.mark.asyncio
 async def test_resolve_recipients_all_scoped_to_reseller(db):
     r1 = await make_reseller(db)
     r2 = await make_reseller(db)
