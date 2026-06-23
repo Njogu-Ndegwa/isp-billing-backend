@@ -222,7 +222,9 @@ async def initiate_b2b_payment(
         "Amount": str(net_amount),
         "PartyA": party_a,
         "PartyB": party_b,
-        "AccountReference": account_reference[:13],
+        # AccountReference can be a bank account number. Never truncate an
+        # identifier here; a shortened value can point to a different account.
+        "AccountReference": account_reference,
         "Remarks": remarks[:100],
         "QueueTimeOutURL": timeout_url,
         "ResultURL": result_url,
