@@ -22,3 +22,93 @@ async def test_new_columns_exist_and_default(db):
     await db.commit()
     got = (await db.execute(select(SmsMessage))).scalars().one()
     assert got.category == "reseller_welcome"
+
+
+from app.db.models import ResellerInboxMessage, UserRole
+from app.services.reseller_welcome import (
+    queue_reseller_welcome, render_welcome_body, effective_welcome_settings,
+    WELCOME_CATEGORY, DEFAULT_WELCOME_BODY,
+)
+from tests.factories import make_reseller
+
+
+@pytest.mark.asyncio
+async def test_queue_creates_inbox_and_sms_when_enabled_with_phone(db):
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    reseller = await make_reseller(db, support_phone="254700111222",
+                                   organization_name="Acme Net")
+    db.add(MessagingSettings(id=1, welcome_support_phone="254799000000"))
+    await db.commit()
+
+    sms_ids = await queue_reseller_welcome(db, reseller)
+    await db.commit()
+
+    inbox = (await db.execute(select(ResellerInboxMessage).where(
+        ResellerInboxMessage.recipient_user_id == reseller.id))).scalars().all()
+    assert len(inbox) == 1
+    assert inbox[0].sender_user_id == admin.id
+    assert inbox[0].sent_sms is True
+
+    sms = (await db.execute(select(SmsMessage).where(
+        SmsMessage.user_id == reseller.id))).scalars().all()
+    assert len(sms) == 1
+    assert sms[0].kind == SmsMessageKind.ADMIN_TO_RESELLER
+    assert sms[0].category == WELCOME_CATEGORY
+    assert sms[0].status == SmsMessageStatus.QUEUED
+    assert sms[0].recipient_phone == "254700111222"
+    assert "254799000000" in sms[0].body
+    assert "Acme Net" in sms[0].body
+    assert sms_ids == [sms[0].id]
+
+
+@pytest.mark.asyncio
+async def test_queue_no_phone_creates_inbox_only(db):
+    await make_reseller(db, role=UserRole.ADMIN)
+    reseller = await make_reseller(db, support_phone=None)
+    db.add(MessagingSettings(id=1))
+    await db.commit()
+
+    sms_ids = await queue_reseller_welcome(db, reseller)
+    await db.commit()
+
+    assert sms_ids == []
+    inbox = (await db.execute(select(ResellerInboxMessage).where(
+        ResellerInboxMessage.recipient_user_id == reseller.id))).scalars().all()
+    assert len(inbox) == 1
+    assert inbox[0].sent_sms is False
+    assert (await db.execute(select(SmsMessage))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_queue_disabled_creates_nothing(db):
+    await make_reseller(db, role=UserRole.ADMIN)
+    reseller = await make_reseller(db, support_phone="254700111222")
+    db.add(MessagingSettings(id=1, welcome_enabled=False))
+    await db.commit()
+
+    sms_ids = await queue_reseller_welcome(db, reseller)
+    await db.commit()
+
+    assert sms_ids == []
+    assert (await db.execute(select(ResellerInboxMessage))).scalars().all() == []
+    assert (await db.execute(select(SmsMessage))).scalars().all() == []
+
+
+def test_render_welcome_body_substitutes_placeholders():
+    out = render_welcome_body("Hi {org}, call {support_phone}.",
+                              org="Acme", support_phone="0712")
+    assert out == "Hi Acme, call 0712."
+
+
+def test_render_welcome_body_handles_missing_phone():
+    out = render_welcome_body("Call {support_phone} now.", org="Acme",
+                              support_phone=None)
+    assert "{support_phone}" not in out
+    assert "our support line" in out
+
+
+def test_effective_welcome_settings_defaults_when_null():
+    cfg = effective_welcome_settings(None)
+    assert cfg["enabled"] is True
+    assert cfg["body"] == DEFAULT_WELCOME_BODY
+    assert cfg["support_phone"] is None
