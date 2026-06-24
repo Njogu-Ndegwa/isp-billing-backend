@@ -28,6 +28,7 @@ from app.services.pppoe_customer_import import (
     normalize_workbook_rows,
     import_pppoe_customers,
 )
+from app.services.pppoe_router_transfer import transfer_pppoe_customers_between_routers
 from app.config import settings
 
 import logging
@@ -4090,6 +4091,77 @@ def _pppoe_import_report_payload(report, *, success: Optional[bool] = None) -> d
     payload["success"] = (not report.errors) if success is None else success
     payload["has_errors"] = bool(report.errors)
     return payload
+
+
+def _pppoe_transfer_report_payload(report, *, success: Optional[bool] = None) -> dict:
+    payload = asdict(report)
+    payload["success"] = report.ok if success is None else success
+    payload["has_errors"] = bool(report.errors)
+    return payload
+
+
+class TransferPPPoECustomersRequest(BaseModel):
+    target_router_id: int
+    apply: bool = False
+    active_only: bool = False
+    skip_target_provision: bool = False
+    sample_limit: int = 10
+
+
+@router.post("/api/routers/{source_router_id}/pppoe-customers/transfer")
+async def transfer_router_pppoe_customers(
+    source_router_id: int,
+    request: TransferPPPoECustomersRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Preview or move PPPoE customers from one router to another.
+
+    Apply mode provisions active PPPoE customers on the target router before
+    moving DB ownership. Inactive/pending customers move in DB only, preserving
+    their inactive state until renewal.
+    """
+    user = await get_current_user(token, db)
+    role = getattr(user, "role", None)
+
+    source_router = await get_router_by_id(db, source_router_id, user.id, role)
+    if not source_router:
+        raise HTTPException(status_code=404, detail="Source router not found")
+
+    target_router = await get_router_by_id(db, request.target_router_id, user.id, role)
+    if not target_router:
+        raise HTTPException(status_code=404, detail="Target router not found")
+
+    if source_router.id == target_router.id:
+        raise HTTPException(status_code=400, detail="Source and target routers must be different")
+
+    if source_router.user_id != target_router.user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Source and target routers must belong to the same owner",
+        )
+
+    sample_limit = max(0, min(int(request.sample_limit or 0), 100))
+    report = await transfer_pppoe_customers_between_routers(
+        db,
+        source_router_id=source_router_id,
+        target_router_id=request.target_router_id,
+        dry_run=not request.apply,
+        active_only=request.active_only,
+        provision_target=not request.skip_target_provision,
+        sample_limit=sample_limit,
+    )
+
+    return {
+        "success": report.ok,
+        "stage": "transfer",
+        "source_router_id": source_router_id,
+        "source_router_name": source_router.name,
+        "target_router_id": request.target_router_id,
+        "target_router_name": target_router.name,
+        "dry_run": report.dry_run,
+        "report": _pppoe_transfer_report_payload(report),
+    }
 
 
 def _parse_package_plan_mapping(package_plan_json: Optional[str]) -> Optional[dict]:
