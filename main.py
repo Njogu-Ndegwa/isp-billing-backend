@@ -1805,6 +1805,17 @@ async def run_messaging_migrations():
             "ALTER COLUMN provider SET DEFAULT 'talksasa'"
         ))
         await conn.execute(text(
+            "ALTER TABLE messaging_settings "
+            "ADD COLUMN IF NOT EXISTS welcome_enabled BOOLEAN NOT NULL DEFAULT true, "
+            "ADD COLUMN IF NOT EXISTS welcome_subject VARCHAR(200) NULL, "
+            "ADD COLUMN IF NOT EXISTS welcome_message_body VARCHAR(2000) NULL, "
+            "ADD COLUMN IF NOT EXISTS welcome_support_phone VARCHAR(20) NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE sms_messages "
+            "ADD COLUMN IF NOT EXISTS category VARCHAR(40) NULL"
+        ))
+        await conn.execute(text(
             "INSERT INTO messaging_settings (id, price_per_sms_kes, provider) "
             "VALUES (1, 0.50, 'talksasa') "
             "ON CONFLICT (id) DO UPDATE SET "

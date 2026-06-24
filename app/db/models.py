@@ -1615,6 +1615,10 @@ class MessagingSettings(Base):
     enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     message_retention_days = Column(Integer, nullable=False, default=60, server_default="60")
     bundles = Column(JSON, nullable=True)
+    welcome_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    welcome_subject = Column(String(200), nullable=True)
+    welcome_message_body = Column(String(2000), nullable=True)
+    welcome_support_phone = Column(String(20), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1710,6 +1714,7 @@ class SmsMessage(Base):
                          values_callable=lambda e: [x.value for x in e]),
                     nullable=False, default=SmsMessageStatus.QUEUED)
     error = Column(String(255), nullable=True)
+    category = Column(String(40), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
