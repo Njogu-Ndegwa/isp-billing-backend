@@ -185,3 +185,56 @@ async def test_admin_sms_history_shows_sent_and_failed_counts(
     assert payload["summary"]["queued"] == 0
     names = {m["reseller_name"] for m in payload["messages"]}
     assert names == {"Alpha ISP", "Beta ISP"}
+
+
+@pytest.mark.asyncio
+async def test_settings_returns_welcome_defaults(db, client, monkeypatch):
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    _auth_as(monkeypatch, admin)
+    resp = await client.get("/api/admin/messaging/settings")
+    body = resp.json()
+    assert body["welcome_enabled"] is True
+    assert body["welcome_subject"]
+    assert body["welcome_message_body"]
+    assert "welcome_support_phone" in body
+
+
+@pytest.mark.asyncio
+async def test_settings_update_welcome_fields(db, client, monkeypatch):
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    db.add(MessagingSettings(id=1))
+    await db.commit()
+    _auth_as(monkeypatch, admin)
+    resp = await client.put("/api/admin/messaging/settings", json={
+        "welcome_enabled": False,
+        "welcome_message_body": "Custom welcome for {org}",
+        "welcome_support_phone": "254700999888"})
+    assert resp.status_code == 200
+    s = await db.get(MessagingSettings, 1)
+    assert s.welcome_enabled is False
+    assert s.welcome_message_body == "Custom welcome for {org}"
+    assert s.welcome_support_phone == "254700999888"
+
+
+@pytest.mark.asyncio
+async def test_admin_sms_history_filters_by_category(db, client, monkeypatch):
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    r1 = await make_reseller(db, organization_name="Welcome ISP")
+    r2 = await make_reseller(db, organization_name="Promo ISP")
+    db.add_all([
+        SmsMessage(user_id=r1.id, recipient_phone="254700000001", body="Welcome",
+                   segments=1, credits_charged=1,
+                   kind=SmsMessageKind.ADMIN_TO_RESELLER,
+                   status=SmsMessageStatus.SENT, category="reseller_welcome"),
+        SmsMessage(user_id=r2.id, recipient_phone="254700000002", body="Promo",
+                   segments=1, credits_charged=1,
+                   kind=SmsMessageKind.ADMIN_TO_RESELLER,
+                   status=SmsMessageStatus.SENT, category=None),
+    ])
+    await db.commit()
+    _auth_as(monkeypatch, admin)
+    resp = await client.get("/api/admin/messaging/sms?category=reseller_welcome")
+    msgs = resp.json()["messages"]
+    assert len(msgs) == 1
+    assert msgs[0]["category"] == "reseller_welcome"
+    assert msgs[0]["reseller_name"] == "Welcome ISP"

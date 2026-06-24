@@ -35,6 +35,10 @@ class SettingsIn(BaseModel):
     enabled: Optional[bool] = None
     message_retention_days: Optional[int] = None
     bundles: Optional[list] = None
+    welcome_enabled: Optional[bool] = None
+    welcome_subject: Optional[str] = None
+    welcome_message_body: Optional[str] = None
+    welcome_support_phone: Optional[str] = None
 
 
 @router.get("/api/admin/messaging/settings")
@@ -46,6 +50,8 @@ async def get_settings(db: AsyncSession = Depends(get_db),
         s = MessagingSettings(id=1)
         db.add(s)
         await db.flush()
+    from app.services.reseller_welcome import effective_welcome_settings
+    cfg = effective_welcome_settings(s)
     return {
         "price_per_sms_kes": float(s.price_per_sms_kes),
         "min_purchase_credits": s.min_purchase_credits,
@@ -53,6 +59,10 @@ async def get_settings(db: AsyncSession = Depends(get_db),
         "enabled": s.enabled,
         "message_retention_days": s.message_retention_days,
         "bundles": s.bundles or [],
+        "welcome_enabled": cfg["enabled"],
+        "welcome_subject": cfg["subject"],
+        "welcome_message_body": cfg["body"],
+        "welcome_support_phone": cfg["support_phone"],
     }
 
 
@@ -76,6 +86,14 @@ async def update_settings(body: SettingsIn, db: AsyncSession = Depends(get_db),
         s.message_retention_days = body.message_retention_days
     if body.bundles is not None:
         s.bundles = body.bundles
+    if body.welcome_enabled is not None:
+        s.welcome_enabled = body.welcome_enabled
+    if body.welcome_subject is not None:
+        s.welcome_subject = body.welcome_subject or None
+    if body.welcome_message_body is not None:
+        s.welcome_message_body = body.welcome_message_body or None
+    if body.welcome_support_phone is not None:
+        s.welcome_support_phone = body.welcome_support_phone or None
     await db.commit()
     return {"message": "Settings updated"}
 
@@ -189,6 +207,7 @@ async def send_inbox(req: InboxSendIn, background: BackgroundTasks,
 
 @router.get("/api/admin/messaging/sms")
 async def list_admin_sms(limit: int = Query(100, ge=1, le=500),
+                         category: Optional[str] = Query(None),
                          db: AsyncSession = Depends(get_db),
                          token: str = Depends(verify_token)):
     await _require_admin(token, db)
@@ -204,12 +223,15 @@ async def list_admin_sms(limit: int = Query(100, ge=1, le=500),
         key = status.value if hasattr(status, "value") else status
         summary[key] = count
 
-    rows = (await db.execute(
+    msg_stmt = (
         select(SmsMessage, User)
         .join(User, SmsMessage.user_id == User.id)
         .where(SmsMessage.kind == kind)
-        .order_by(SmsMessage.created_at.desc())
-        .limit(limit)
+    )
+    if category:
+        msg_stmt = msg_stmt.where(SmsMessage.category == category)
+    rows = (await db.execute(
+        msg_stmt.order_by(SmsMessage.created_at.desc()).limit(limit)
     )).all()
 
     return {
@@ -226,6 +248,7 @@ async def list_admin_sms(limit: int = Query(100, ge=1, le=500),
             "provider_message_id": m.provider_message_id,
             "status": m.status.value if hasattr(m.status, "value") else m.status,
             "error": m.error,
+            "category": m.category,
             "created_at": m.created_at.isoformat() if m.created_at else None,
             "updated_at": m.updated_at.isoformat() if m.updated_at else None,
         } for m, r in rows],
