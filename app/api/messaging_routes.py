@@ -13,9 +13,9 @@ from app.db.database import get_db
 from app.db.models import (
     User, UserRole,
     MessagingSettings, MessageTemplate,
-    SmsCreditOrder, SmsCreditOrderStatus, SmsCreditTxnKind,
+    SmsCreditOrder, SmsCreditOrderStatus, SmsCreditTxnKind, SmsCreditTransaction,
     SmsCampaign, SmsCampaignStatus, SmsMessage, SmsMessageStatus, SmsMessageKind,
-    ResellerInboxMessage,
+    ResellerInboxMessage, Customer,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import sms_credits, sms_dispatch
@@ -173,17 +173,48 @@ async def credits_callback(request: Request, db: AsyncSession = Depends(get_db))
     return {"ResultCode": 0, "ResultDesc": "Accepted"}
 
 
+@router.get("/api/messaging/credits/ledger")
+async def credit_ledger(limit: int = Query(50, ge=1, le=200),
+                        offset: int = Query(0, ge=0),
+                        db: AsyncSession = Depends(get_db),
+                        token: str = Depends(verify_token)):
+    user = await _require_reseller(token, db)
+    rows = (await db.execute(
+        select(SmsCreditTransaction)
+        .where(SmsCreditTransaction.user_id == user.id)
+        .order_by(SmsCreditTransaction.created_at.desc(),
+                  SmsCreditTransaction.id.desc())
+        .limit(limit).offset(offset)
+    )).scalars().all()
+    return {"transactions": [{
+        "id": t.id,
+        "kind": t.kind.value if hasattr(t.kind, "value") else t.kind,
+        "change": t.change, "balance_after": t.balance_after,
+        "reference": t.reference, "note": t.note,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    } for t in rows]}
+
+
 # ---- Recipients + send ----------------------------------------------------
 
 @router.get("/api/messaging/recipients")
 async def list_recipients(filter: str = Query("all"),
                           plan_id: Optional[int] = None,
+                          search: Optional[str] = None,
+                          exclude_customer_ids: Optional[str] = Query(None),
+                          limit: int = Query(50, ge=1, le=500),
+                          offset: int = Query(0, ge=0),
                           db: AsyncSession = Depends(get_db),
                           token: str = Depends(verify_token)):
     user = await _require_reseller(token, db)
-    recips = await sms_dispatch.resolve_recipients(db, user.id, filter=filter,
-                                                   plan_id=plan_id)
-    return {"count": len(recips), "recipients": recips}
+    exclude = [int(x) for x in exclude_customer_ids.split(",") if x.strip().isdigit()] \
+        if exclude_customer_ids else None
+    recips = await sms_dispatch.resolve_recipients(
+        db, user.id, filter=filter, plan_id=plan_id, search=search,
+        exclude_customer_ids=exclude)
+    page = recips[offset:offset + limit]
+    return {"count": len(recips), "recipients": page,
+            "has_more": offset + limit < len(recips)}
 
 
 class SendRequest(BaseModel):
@@ -191,6 +222,7 @@ class SendRequest(BaseModel):
     filter: str = "all"
     plan_id: Optional[int] = None
     customer_ids: Optional[list[int]] = None
+    exclude_customer_ids: Optional[list[int]] = None
     template_id: Optional[int] = None
 
 
@@ -205,7 +237,8 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
 
     recips = await sms_dispatch.resolve_recipients(
         db, user.id, filter=req.filter, plan_id=req.plan_id,
-        customer_ids=req.customer_ids)
+        customer_ids=req.customer_ids,
+        exclude_customer_ids=req.exclude_customer_ids)
     if not recips:
         raise HTTPException(status_code=400, detail="No recipients matched")
 
@@ -320,18 +353,23 @@ async def campaign_detail(campaign_id: int, db: AsyncSession = Depends(get_db),
     )).scalar_one_or_none()
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    msgs = (await db.execute(
-        select(SmsMessage).where(SmsMessage.campaign_id == campaign_id).limit(2000)
-    )).scalars().all()
-    return {
-        "id": camp.id,
-        "status": camp.status.value if hasattr(camp.status, "value") else camp.status,
-        "messages": [{
-            "phone": m.recipient_phone,
-            "status": m.status.value if hasattr(m.status, "value") else m.status,
-            "error": m.error,
-        } for m in msgs],
-    }
+    rows = (await db.execute(
+        select(SmsMessage, Customer.name)
+        .outerjoin(Customer, (SmsMessage.customer_id == Customer.id) & (Customer.user_id == user.id))
+        .where(SmsMessage.campaign_id == campaign_id).limit(2000)
+    )).all()
+    counts = {"total": 0, "sent": 0, "failed": 0, "queued": 0, "delivered": 0}
+    messages = []
+    for m, name in rows:
+        st = m.status.value if hasattr(m.status, "value") else m.status
+        counts["total"] += 1
+        if st in counts:
+            counts[st] += 1
+        messages.append({"phone": m.recipient_phone, "name": name,
+                         "status": st, "error": m.error})
+    return {"id": camp.id,
+            "status": camp.status.value if hasattr(camp.status, "value") else camp.status,
+            "counts": counts, "messages": messages}
 
 
 # ---- Inbox (admin -> reseller) --------------------------------------------

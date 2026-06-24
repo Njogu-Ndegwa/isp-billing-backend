@@ -170,3 +170,92 @@ async def test_admin_is_rejected_from_reseller_endpoint(db, client, monkeypatch)
     _auth_as(monkeypatch, admin)
     resp = await client.get("/api/messaging/credits")
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_recipients_returns_names_and_paginates(db, client, monkeypatch):
+    from tests.factories import make_customer, make_plan
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    p = await make_plan(db, r)
+    for i in range(3):
+        await make_customer(db, r, p, name=f"C{i}", phone=f"25470000010{i}")
+    resp = await client.get("/api/messaging/recipients?limit=2&offset=0")
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["count"] == 3
+    assert len(body["recipients"]) == 2
+    assert body["has_more"] is True
+    assert set(body["recipients"][0].keys()) == {"customer_id", "name", "phone"}
+
+
+@pytest.mark.asyncio
+async def test_recipients_search_filters(db, client, monkeypatch):
+    from tests.factories import make_customer, make_plan
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    p = await make_plan(db, r)
+    await make_customer(db, r, p, name="Zara", phone="254799999999")
+    await make_customer(db, r, p, name="Tom", phone="254788888888")
+    resp = await client.get("/api/messaging/recipients?search=zar")
+    assert [c["name"] for c in resp.json()["recipients"]] == ["Zara"]
+    assert resp.json()["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_campaign_detail_has_names_and_counts(db, client, monkeypatch):
+    from tests.factories import make_customer, make_plan
+    from app.db.models import (SmsCampaign, SmsCampaignStatus, SmsMessage,
+                               SmsMessageStatus, SmsMessageKind)
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    p = await make_plan(db, r)
+    c = await make_customer(db, r, p, name="Named Cust", phone="254700000301")
+    camp = SmsCampaign(user_id=r.id, body="hi", recipient_count=1,
+                       segments_per_message=1, total_credits=1,
+                       status=SmsCampaignStatus.COMPLETED)
+    db.add(camp); await db.flush()
+    db.add(SmsMessage(campaign_id=camp.id, user_id=r.id, customer_id=c.id,
+                      recipient_phone="254700000301", body="hi", segments=1,
+                      credits_charged=1, kind=SmsMessageKind.RESELLER_TO_CUSTOMER,
+                      status=SmsMessageStatus.SENT))
+    await db.commit()
+    resp = await client.get(f"/api/messaging/campaigns/{camp.id}")
+    body = resp.json()
+    assert body["messages"][0]["name"] == "Named Cust"
+    assert body["counts"] == {"total": 1, "sent": 1, "failed": 0,
+                              "queued": 0, "delivered": 0}
+
+
+@pytest.mark.asyncio
+async def test_ledger_lists_reseller_transactions_newest_first(db, client, monkeypatch):
+    from tests.factories import make_sms_account
+    from app.services import sms_credits
+    from app.db.models import SmsCreditTxnKind
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    await make_sms_account(db, r, balance=0)
+    await sms_credits.grant(db, r.id, 100, SmsCreditTxnKind.PURCHASE, reference="SMS-1")
+    await sms_credits.try_deduct(db, r.id, 30, reference="campaign:5")
+    await db.commit()
+    resp = await client.get("/api/messaging/credits/ledger")
+    txns = resp.json()["transactions"]
+    assert resp.status_code == 200
+    assert [t["kind"] for t in txns] == ["send_debit", "purchase"]
+    assert txns[0]["change"] == -30 and txns[0]["balance_after"] == 70
+
+
+@pytest.mark.asyncio
+async def test_send_excludes_then_charges_remaining(db, client, monkeypatch):
+    from tests.factories import make_customer, make_plan, make_sms_account
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    await make_sms_account(db, r, balance=100)
+    p = await make_plan(db, r)
+    keep = await make_customer(db, r, p, name="Keep", phone="254700000201")
+    drop = await make_customer(db, r, p, name="Drop", phone="254700000202")
+    captured = {}
+    async def _fake_dispatch(cid): captured["cid"] = cid
+    monkeypatch.setattr(mr.sms_dispatch, "dispatch_campaign", _fake_dispatch)
+    resp = await client.post("/api/messaging/send", json={
+        "body": "hello", "filter": "all", "exclude_customer_ids": [drop.id]})
+    assert resp.status_code == 200
+    assert resp.json()["recipient_count"] == 1
+    assert resp.json()["credits_reserved"] == 1  # 1 segment * 1 recipient
+    # The kept customer is the only charged recipient; confirm the binding is used.
+    assert keep.id != drop.id

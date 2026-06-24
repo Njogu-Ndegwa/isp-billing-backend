@@ -10,8 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.db.models import (
-    User, UserRole, MessagingSettings, SmsCreditOrder, ResellerInboxMessage,
-    SmsMessage, SmsMessageKind, SmsMessageStatus,
+    User, UserRole, MessagingSettings, SmsCreditOrder, SmsCreditTransaction,
+    ResellerInboxMessage, SmsMessage, SmsMessageKind, SmsMessageStatus,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import sms_credits, sms_dispatch
@@ -116,8 +116,31 @@ async def adjust_credits(reseller_id: int, body: AdjustIn,
     return {"reseller_id": reseller_id, "balance": new_balance}
 
 
+@router.get("/api/admin/messaging/resellers/{reseller_id}/ledger")
+async def reseller_ledger(reseller_id: int,
+                          limit: int = Query(50, ge=1, le=200),
+                          offset: int = Query(0, ge=0),
+                          db: AsyncSession = Depends(get_db),
+                          token: str = Depends(verify_token)):
+    await _require_admin(token, db)
+    rows = (await db.execute(
+        select(SmsCreditTransaction)
+        .where(SmsCreditTransaction.user_id == reseller_id)
+        .order_by(SmsCreditTransaction.created_at.desc(),
+                  SmsCreditTransaction.id.desc())
+        .limit(limit).offset(offset))).scalars().all()
+    return {"transactions": [{
+        "id": t.id,
+        "kind": t.kind.value if hasattr(t.kind, "value") else t.kind,
+        "change": t.change, "balance_after": t.balance_after,
+        "reference": t.reference, "note": t.note,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    } for t in rows]}
+
+
 class InboxSendIn(BaseModel):
-    recipient: str = Field(..., description='reseller id (as string) or "all"')
+    reseller_ids: Optional[list[int]] = None
+    all_resellers: bool = False
     subject: Optional[str] = Field(None, max_length=200)
     body: str = Field(..., min_length=1, max_length=2000)
     also_sms: bool = False
@@ -128,22 +151,21 @@ async def send_inbox(req: InboxSendIn, background: BackgroundTasks,
                      db: AsyncSession = Depends(get_db),
                      token: str = Depends(verify_token)):
     admin = await _require_admin(token, db)
-    if req.recipient == "all":
+    if req.all_resellers:
         resellers = (await db.execute(
-            select(User).where(User.role == UserRole.RESELLER)
-        )).scalars().all()
-    else:
-        try:
-            rid = int(req.recipient)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="recipient must be id or 'all'")
+            select(User).where(User.role == UserRole.RESELLER))).scalars().all()
+    elif req.reseller_ids:
         resellers = (await db.execute(
-            select(User).where(User.id == rid, User.role == UserRole.RESELLER)
-        )).scalars().all()
+            select(User).where(User.id.in_(req.reseller_ids),
+                               User.role == UserRole.RESELLER))).scalars().all()
         if not resellers:
-            raise HTTPException(status_code=404, detail="Reseller not found")
-
-    broadcast_id = str(uuid.uuid4()) if req.recipient == "all" else None
+            raise HTTPException(status_code=404, detail="No matching resellers")
+    else:
+        raise HTTPException(status_code=400,
+                            detail="Select resellers or choose all")
+    broadcast_id = (str(uuid.uuid4())
+                    if req.all_resellers or (req.reseller_ids and len(req.reseller_ids) > 1)
+                    else None)
     sms_rows: list[SmsMessage] = []
     segments = count_segments(req.body) if req.also_sms else 0
     for r in resellers:
