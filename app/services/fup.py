@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -38,7 +39,8 @@ from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, parse_
 
 logger = logging.getLogger("fup")
 
-DEFAULT_HOTSPOT_FUP_THROTTLE_RATE = "1M/1M"
+DEFAULT_FUP_THROTTLE_RATE = "1M/1M"
+DEFAULT_HOTSPOT_FUP_THROTTLE_RATE = DEFAULT_FUP_THROTTLE_RATE
 
 
 # --------------------------- Helpers ---------------------------
@@ -87,6 +89,28 @@ def hotspot_throttle_rate_for_plan(plan: Optional[Plan]) -> str:
     )
 
 
+def pppoe_throttle_rate_for_plan(plan: Optional[Plan]) -> str:
+    """Return the RouterOS rate string used when a PPPoE plan is throttled.
+
+    ``fup_throttle_profile`` carries a *speed* (e.g. ``"5M/2M"``), matching the
+    hotspot field, rather than a hand-named PPP profile.
+    """
+    return parse_speed_to_mikrotik(
+        (plan.fup_throttle_profile if plan else None)
+        or DEFAULT_FUP_THROTTLE_RATE
+    )
+
+
+def _fup_profile_name_for_rate(rate_limit: str) -> str:
+    """Deterministic ``/ppp/profile`` name carrying a throttle rate.
+
+    ``"3M/1M"`` -> ``"fup-3M-1M"`` so plans that share a throttle speed reuse a
+    single profile instead of proliferating per-customer profiles on the router.
+    """
+    safe = re.sub(r"[^0-9A-Za-z]+", "-", rate_limit).strip("-") or "default"
+    return f"fup-{safe}"
+
+
 def _hotspot_identity(customer: Customer) -> tuple[Optional[str], Optional[str]]:
     if not customer.mac_address:
         return None, None
@@ -109,6 +133,36 @@ def _set_secret_profile_sync(router_info: dict, username: str, profile: str) -> 
         result = api.send_command("/ppp/secret/set", {
             "numbers": username,
             "profile": profile,
+            "disabled": "no",
+        })
+        api.disconnect_pppoe_session(username)
+        return result
+    finally:
+        api.disconnect()
+
+
+def _set_secret_throttle_profile_sync(
+    router_info: dict, username: str, profile_name: str, rate_limit: str
+) -> dict:
+    """Throttle a PPPoE user to ``rate_limit``.
+
+    Ensures a ``/ppp/profile`` named ``profile_name`` carries ``rate_limit``,
+    points the PPP secret at it, and drops the live session so the new rate
+    takes effect immediately.
+    """
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        ensured = api.ensure_pppoe_profile(profile_name, rate_limit)
+        if ensured.get("error"):
+            return {"error": ensured["error"]}
+        result = api.send_command("/ppp/secret/set", {
+            "numbers": username,
+            "profile": profile_name,
             "disabled": "no",
         })
         api.disconnect_pppoe_session(username)
@@ -422,14 +476,19 @@ async def apply_throttle(
 
     if not customer.pppoe_username:
         return {"error": "no_pppoe_username"}
-    profile = (plan.fup_throttle_profile if plan else None) or "default"
+    rate_limit = pppoe_throttle_rate_for_plan(plan)
+    profile_name = _fup_profile_name_for_rate(rate_limit)
     router = await _load_router(db, customer.router_id)
     if not router:
         return {"error": "no_router"}
     info = _router_info(router)
     await db.commit()
     return await asyncio.to_thread(
-        _set_secret_profile_sync, info, customer.pppoe_username, profile
+        _set_secret_throttle_profile_sync,
+        info,
+        customer.pppoe_username,
+        profile_name,
+        rate_limit,
     )
 
 
