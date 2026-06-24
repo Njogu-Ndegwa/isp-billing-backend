@@ -1,7 +1,15 @@
 import pytest
 from sqlalchemy import select
 
-from app.db.models import MessagingSettings, SmsMessage, SmsMessageKind, SmsMessageStatus
+from app.db.models import (
+    MessagingSettings, ResellerInboxMessage, SmsMessage, SmsMessageKind,
+    SmsMessageStatus, UserRole,
+)
+from app.services.reseller_welcome import (
+    queue_reseller_welcome, render_welcome_body, effective_welcome_settings,
+    WELCOME_CATEGORY, DEFAULT_WELCOME_BODY,
+)
+from tests.factories import make_reseller
 
 
 @pytest.mark.asyncio
@@ -22,14 +30,6 @@ async def test_new_columns_exist_and_default(db):
     await db.commit()
     got = (await db.execute(select(SmsMessage))).scalars().one()
     assert got.category == "reseller_welcome"
-
-
-from app.db.models import ResellerInboxMessage, UserRole
-from app.services.reseller_welcome import (
-    queue_reseller_welcome, render_welcome_body, effective_welcome_settings,
-    WELCOME_CATEGORY, DEFAULT_WELCOME_BODY,
-)
-from tests.factories import make_reseller
 
 
 @pytest.mark.asyncio
@@ -91,6 +91,24 @@ async def test_queue_disabled_creates_nothing(db):
 
     assert sms_ids == []
     assert (await db.execute(select(ResellerInboxMessage))).scalars().all() == []
+    assert (await db.execute(select(SmsMessage))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_queue_messaging_globally_disabled_skips_sms(db):
+    await make_reseller(db, role=UserRole.ADMIN)
+    reseller = await make_reseller(db, support_phone="254700111222")
+    db.add(MessagingSettings(id=1, enabled=False))
+    await db.commit()
+
+    sms_ids = await queue_reseller_welcome(db, reseller)
+    await db.commit()
+
+    assert sms_ids == []
+    inbox = (await db.execute(select(ResellerInboxMessage).where(
+        ResellerInboxMessage.recipient_user_id == reseller.id))).scalars().all()
+    assert len(inbox) == 1
+    assert inbox[0].sent_sms is False
     assert (await db.execute(select(SmsMessage))).scalars().all() == []
 
 
