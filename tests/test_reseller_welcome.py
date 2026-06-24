@@ -130,3 +130,86 @@ def test_effective_welcome_settings_defaults_when_null():
     assert cfg["enabled"] is True
     assert cfg["body"] == DEFAULT_WELCOME_BODY
     assert cfg["support_phone"] is None
+
+
+@pytest.mark.asyncio
+async def test_registration_triggers_welcome(db, session_factory, monkeypatch):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from app.api.auth_routes import router as auth_router
+    from app.db.database import get_db
+
+    await make_reseller(db, role=UserRole.ADMIN)
+    db.add(MessagingSettings(id=1, welcome_support_phone="254799000000"))
+    await db.commit()
+
+    application = FastAPI()
+    application.include_router(auth_router)
+
+    async def _override_get_db():
+        async with session_factory() as s:
+            try:
+                yield s
+                await s.commit()
+            except Exception:
+                await s.rollback()
+                raise
+    application.dependency_overrides[get_db] = _override_get_db
+
+    dispatched = []
+
+    async def _fake_dispatch(message_ids, sender_id):
+        dispatched.append((message_ids, sender_id))
+    monkeypatch.setattr(
+        "app.services.sms_dispatch.dispatch_admin_sms_messages", _fake_dispatch)
+
+    async with AsyncClient(transport=ASGITransport(app=application),
+                           base_url="http://test") as client:
+        resp = await client.post("/api/users/register", json={
+            "email": "newreseller@example.com", "password": "secret123",
+            "role": "reseller", "organization_name": "Newbie ISP",
+            "support_phone": "254700111222"})
+    assert resp.status_code == 200
+
+    sms = (await db.execute(select(SmsMessage).where(
+        SmsMessage.category == WELCOME_CATEGORY))).scalars().all()
+    assert len(sms) == 1
+    assert dispatched and dispatched[0][0] == [sms[0].id]
+
+
+@pytest.mark.asyncio
+async def test_registration_survives_welcome_failure(db, session_factory, monkeypatch):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from app.api.auth_routes import router as auth_router
+    from app.db.database import get_db
+    from app.db.models import User
+
+    application = FastAPI()
+    application.include_router(auth_router)
+
+    async def _override_get_db():
+        async with session_factory() as s:
+            try:
+                yield s
+                await s.commit()
+            except Exception:
+                await s.rollback()
+                raise
+    application.dependency_overrides[get_db] = _override_get_db
+
+    async def _boom(db, reseller):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(
+        "app.services.reseller_welcome.queue_reseller_welcome", _boom)
+
+    async with AsyncClient(transport=ASGITransport(app=application),
+                           base_url="http://test") as client:
+        resp = await client.post("/api/users/register", json={
+            "email": "survivor@example.com", "password": "secret123",
+            "role": "reseller", "organization_name": "Survivor ISP",
+            "support_phone": "254700111222"})
+    assert resp.status_code == 200
+    user = (await db.execute(select(User).where(
+        User.email == "survivor@example.com"))).scalar_one_or_none()
+    assert user is not None

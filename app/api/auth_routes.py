@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
@@ -30,6 +30,7 @@ class UserRegisterRequest(BaseModel):
 @router.post("/api/users/register")
 async def register_user_api(
     request: UserRegisterRequest,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """Register a new user (admin or reseller)"""
@@ -73,6 +74,31 @@ async def register_user_api(
                 await db.commit()
             except Exception as link_err:
                 logger.warning(f"Lead auto-link failed (non-fatal): {link_err}")
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
+            try:
+                from app.services.reseller_welcome import queue_reseller_welcome
+                from app.services import sms_dispatch
+                from app.services.messaging import resolve_sender_id
+                from app.db.models import MessagingSettings
+
+                sms_ids = await queue_reseller_welcome(db, user)
+                settings_row = await db.get(MessagingSettings, 1)
+                sender_id = resolve_sender_id(
+                    settings_row.sender_id
+                    if settings_row and settings_row.sender_id else None
+                )
+                await db.commit()
+                if sms_ids:
+                    background.add_task(
+                        sms_dispatch.dispatch_admin_sms_messages,
+                        sms_ids, sender_id)
+            except Exception as welcome_err:
+                logger.warning(
+                    f"Reseller welcome message failed (non-fatal): {welcome_err}")
                 try:
                     await db.rollback()
                 except Exception:
