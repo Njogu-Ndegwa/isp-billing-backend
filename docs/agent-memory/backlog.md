@@ -83,3 +83,19 @@ Project-level items that should survive across agent sessions.
 - Problem: `initiate_b2b_payment` holds its DB session open across the Safaricom B2B HTTP call (httpx POST), violating the Database Session Discipline pattern; the 2026-06-10 payout fix limited the blast radius to one reseller per session but did not remove the cross-I/O hold.
 - Why it matters: a slow Safaricom response pins one pool connection per in-flight payout; under provider outages (e.g. their nightly 23:00-01:00 UTC window) this still wastes pool capacity.
 - Proposed next step: restructure to read inputs and commit before the HTTP call, then persist the result in a fresh session (same pattern as `kick_pending_payment_check`). Also consider moving the daily payout schedule out of 23:59 UTC, which sits inside Safaricom's recurring maintenance window.
+
+## Messaging / Onboarding
+
+### SMS Body Column Shorter Than Editable Body
+
+- Status: planned
+- Problem: `SmsMessage.body` is `VARCHAR(1000)` but both the admin inbox body and the new `messaging_settings.welcome_message_body` are `VARCHAR(2000)`. An admin who sets a welcome body (or sends a manual `send_inbox` SMS) over 1000 chars would have the SMS row insert exceed the column on Postgres.
+- Why it matters: for the reseller welcome path the SMS row is created inside the registration hook's non-fatal try/except, so an oversized body would silently suppress the entire welcome (inbox + SMS) for that signup rather than erroring loudly. Pre-existing for the manual `send_inbox` path too.
+- Proposed next step: either validate/clamp the SMS body to 1000 chars where SMS rows are created (`reseller_welcome.queue_reseller_welcome` and `admin_messaging_routes.send_inbox`), or widen `sms_messages.body` to 2000 via an idempotent startup migration. Prefer clamping the SMS copy, since a multi-segment welcome SMS is undesirable anyway.
+
+### Welcome Message Not Sent On Lead Conversion
+
+- Status: planned
+- Problem: the reseller welcome message fires only from self-service `register_user_api`. `convert_lead` (`app/api/lead_routes.py`) also creates a `RESELLER` account but has no welcome hook.
+- Why it matters: admin-initiated lead conversions never receive the onboarding welcome/router-setup offer. This was a deliberate scope boundary ("signup" = self-service), but may be desired.
+- Proposed next step: if welcome-on-conversion is wanted, call `reseller_welcome.queue_reseller_welcome` + schedule `sms_dispatch.dispatch_admin_sms_messages` in `convert_lead`, reusing the same non-fatal, commit-before-dispatch pattern as `register_user_api`.
