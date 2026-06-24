@@ -96,6 +96,26 @@ async def get_or_open_current_period(
     plan = plan if plan is not None else customer.plan
     period_start, period_end = _period_window(customer, plan, now)
 
+    existing = (
+        await db.execute(
+            select(CustomerUsagePeriod)
+            .where(
+                CustomerUsagePeriod.customer_id == customer.id,
+                CustomerUsagePeriod.period_start == period_start,
+            )
+            .order_by(CustomerUsagePeriod.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing:
+        existing.period_end = period_end
+        existing.closed_at = None
+        existing.cap_mb_snapshot = plan.data_cap_mb if plan else None
+        existing.fup_action_snapshot = plan.fup_action if plan else None
+        existing.updated_at = now
+        await db.flush()
+        return existing
+
     period = CustomerUsagePeriod(
         customer_id=customer.id,
         period_start=period_start,

@@ -11,6 +11,7 @@ from app.db.models import (
     UserBandwidthUsage,
 )
 from app.services import mikrotik_background
+from app.services.usage_tracking import open_new_period
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
 
@@ -213,3 +214,46 @@ async def test_reseller_top_usage_includes_hotspot_and_pppoe(
     assert by_type["hotspot"].identifier == "AA:BB:CC:DD:EE:11"
     assert by_type["hotspot"].total_mb == 5.0
     assert by_type["pppoe"].pppoe_username == "pppoe-top"
+
+
+@pytest.mark.asyncio
+async def test_open_new_period_reopens_same_billing_window_without_duplicate(db):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, data_cap_mb=20)
+    router = await make_router(db, reseller)
+    expiry = datetime.utcnow() + timedelta(days=30)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        mac_address="AA:BB:CC:DD:EE:88",
+        phone="254700000088",
+        expiry=expiry,
+    )
+
+    first = await open_new_period(db, customer, plan=plan, now=datetime.utcnow())
+    first.upload_bytes = 1024
+    first.download_bytes = 2048
+    first.total_bytes = 3072
+    await db.commit()
+
+    reopened = await open_new_period(
+        db,
+        customer,
+        plan=plan,
+        now=datetime.utcnow() + timedelta(seconds=1),
+    )
+    await db.commit()
+
+    periods = (
+        await db.execute(
+            select(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id == customer.id)
+        )
+    ).scalars().all()
+
+    assert reopened.id == first.id
+    assert reopened.closed_at is None
+    assert reopened.period_end == expiry
+    assert reopened.total_bytes == 3072
+    assert len(periods) == 1
