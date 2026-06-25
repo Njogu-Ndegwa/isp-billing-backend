@@ -76,7 +76,7 @@ import logging
 import asyncio
 import time
 import re
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -895,12 +895,22 @@ _WEBFIG_DROP_RESPONSE_HEADERS = _WEBFIG_HOP_BY_HOP_HEADERS | {
 
 
 def _forward_webfig_query(request: Request) -> str:
-    items = [
-        (key, value)
-        for key, value in request.query_params.multi_items()
-        if key != "remote_access_token"
-    ]
-    return urlencode(items, doseq=True)
+    # WebFig's live "listen" channel is GET /jsproxy/?<binary-token>: the token is raw
+    # binary percent-encoded straight into the query string with no key=value pair.
+    # Re-parsing it through request.query_params and rebuilding with urlencode corrupts
+    # it -- it appends "=" to the value-less token (and would drop/replace any non-UTF-8
+    # bytes) -- so the router 403s the channel and WebFig logs the operator out. Forward
+    # the query verbatim; only strip our own remote_access_token (present on the first
+    # navigation). Splitting on raw "&"/"=" is safe because any such byte inside the
+    # token is itself percent-encoded.
+    raw = request.url.query
+    if not raw or "remote_access_token=" not in raw:
+        return raw
+    return "&".join(
+        pair
+        for pair in raw.split("&")
+        if pair.split("=", 1)[0] != "remote_access_token"
+    )
 
 
 def _forward_webfig_headers(request: Request, host_header: str) -> dict[str, str]:

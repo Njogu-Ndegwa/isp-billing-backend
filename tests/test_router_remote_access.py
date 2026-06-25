@@ -374,6 +374,32 @@ async def test_open_router_webfig_returns_short_lived_proxy_path_after_commit(db
     router_remote_access.revoke_webfig_proxy_sessions(router.id)
 
 
+def test_forward_webfig_query_preserves_raw_listen_token():
+    """WebFig's live channel is GET /jsproxy/?<binary-token>.
+
+    The token is raw binary percent-encoded straight into the query string with no
+    key=value pair. Re-parsing it through request.query_params and rebuilding with
+    urlencode corrupts it (it appends "=" to the value-less token), so the router 403s
+    the channel and WebFig logs the operator out. It must pass through byte-for-byte.
+    """
+    raw = "%00%00%00%04%00%00%02J%C3%AD%1Dq~nX"
+    req = _request("/jsproxy/", query=raw)
+    assert router_management._forward_webfig_query(req) == raw
+
+
+def test_forward_webfig_query_strips_remote_access_token_but_keeps_rest():
+    req = _request(
+        "/api/admin/routers/77/webfig/",
+        query="remote_access_token=GjHaiomz004Z&tab=interfaces",
+    )
+    assert router_management._forward_webfig_query(req) == "tab=interfaces"
+
+
+def test_forward_webfig_query_strips_sole_remote_access_token():
+    req = _request("/api/admin/routers/77/webfig/", query="remote_access_token=GjHaiomz004Z")
+    assert router_management._forward_webfig_query(req) == ""
+
+
 @pytest.mark.asyncio
 async def test_webfig_proxy_uses_session_cookie_and_rewrites_router_paths(monkeypatch):
     session = router_remote_access.create_webfig_proxy_session(
