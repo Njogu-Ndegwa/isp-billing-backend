@@ -29,10 +29,12 @@ logger = logging.getLogger(__name__)
 async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
                              plan_id: Optional[int] = None,
                              customer_ids: Optional[list[int]] = None,
+                             exclude_customer_ids: Optional[list[int]] = None,
+                             search: Optional[str] = None,
                              expiring_days: int = 7) -> list[dict]:
-    """Return [{customer_id, phone}] for a reseller, de-duplicated by phone."""
-    stmt = select(Customer.id, Customer.phone).where(Customer.user_id == reseller_id)
-    stmt = stmt.where(Customer.phone.isnot(None))
+    """Return [{customer_id, name, phone}] for a reseller, de-duplicated by phone."""
+    stmt = select(Customer.id, Customer.name, Customer.phone).where(
+        Customer.user_id == reseller_id, Customer.phone.isnot(None))
     if customer_ids:
         stmt = stmt.where(Customer.id.in_(customer_ids))
     elif filter == "by_plan" and plan_id:
@@ -42,14 +44,20 @@ async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
     elif filter == "expiring":
         cutoff = datetime.utcnow() + timedelta(days=expiring_days)
         stmt = stmt.where(Customer.expiry.isnot(None), Customer.expiry <= cutoff)
+    if exclude_customer_ids and not customer_ids:
+        stmt = stmt.where(Customer.id.notin_(exclude_customer_ids))
+    if search:
+        like = f"%{search.strip()}%"
+        stmt = stmt.where((Customer.name.ilike(like)) | (Customer.phone.ilike(like)))
+    stmt = stmt.order_by(Customer.id)
     rows = (await db.execute(stmt)).all()
     seen, out = set(), []
-    for cid, phone in rows:
+    for cid, name, phone in rows:
         phone = (phone or "").strip()
         if not phone or phone in seen:
             continue
         seen.add(phone)
-        out.append({"customer_id": cid, "phone": phone})
+        out.append({"customer_id": cid, "name": name, "phone": phone})
     return out
 
 

@@ -61,3 +61,75 @@ or if you explicitly want to set all rows to one known password:
 Matching is by `pppoe_username`.
 
 If a username already belongs to another reseller/router, the import stops unless `--reassign-existing` is passed. Use that flag only when intentionally moving the customer row.
+
+## Move Existing Customers Between Routers
+
+Use this after a replacement router has already been provisioned into the app.
+By default, apply mode first creates/updates active PPPoE secrets/profiles on
+the target MikroTik, then changes `customers.router_id` for PPPoE customers and
+moves related retry/FUP watcher state. It does not change customer status,
+expiry, payments, plans, passwords, or account numbers.
+
+Inactive and pending customers are moved in the DB but are not provisioned on
+the target router. That preserves their inactive state; their future renewal
+will provision them on the new router.
+
+Preview:
+
+```powershell
+myEnv\Scripts\python.exe scripts\move_pppoe_customers.py `
+  --source-router-id 12 `
+  --target-router-id 34
+```
+
+Apply:
+
+```powershell
+myEnv\Scripts\python.exe scripts\move_pppoe_customers.py `
+  --source-router-id 12 `
+  --target-router-id 34 `
+  --apply
+```
+
+Default behavior moves active, inactive, and pending PPPoE customers so future
+renewals use the new router. Use `--active-only` only when intentionally leaving
+expired/inactive customers on the old router.
+
+Use DB-only mode only when the target router has already been prepared manually:
+
+```powershell
+myEnv\Scripts\python.exe scripts\move_pppoe_customers.py `
+  --source-router-id 12 `
+  --target-router-id 34 `
+  --skip-target-provision `
+  --apply
+```
+
+If any active customer fails to provision on the target router, the script does
+not apply the DB move. Fix the target-router error and rerun.
+
+The same flow is exposed to the admin frontend:
+
+```http
+POST /api/routers/{source_router_id}/pppoe-customers/transfer
+```
+
+Preview body:
+
+```json
+{
+  "target_router_id": 34
+}
+```
+
+Apply body:
+
+```json
+{
+  "target_router_id": 34,
+  "apply": true
+}
+```
+
+Optional flags match the CLI: `active_only`, `skip_target_provision`, and
+`sample_limit`.

@@ -15,7 +15,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -48,7 +48,7 @@ from app.services.hotspot_provisioning import (
     schedule_provisioning_attempt,
     serialize_delivery_attempt,
 )
-from app.services.mikrotik_api import MikroTikAPI
+from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.reseller_payments import record_customer_payment
 from app.services.subscription_sharing import (
     active_shared_device_count,
@@ -125,6 +125,12 @@ class ShareSubscriptionCodeRedeemRequest(BaseModel):
     device_type: str = Field("other")
     device_owner_phone: Optional[str] = None
     device_owner_name: Optional[str] = None
+
+
+class ShareSubscriptionDisconnectRequest(BaseModel):
+    owner_phone: str = Field(..., description="Phone number on the active paid subscription")
+    router_id: int
+    pairing_id: int = Field(..., description="Shared device pairing to disconnect")
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +409,97 @@ def _mark_share_code_redeemed(
     share_code.updated_at = now
 
 
+def _existing_pairing_blocks_share(pairing: DevicePairing | None, owner: Customer) -> bool:
+    if not pairing or not pairing.is_active:
+        return False
+    if pairing.subscription_owner_customer_id == owner.id:
+        return False
+
+    now = datetime.utcnow()
+    paired_customer = getattr(pairing, "customer", None)
+    if (
+        paired_customer
+        and (
+            paired_customer.status != CustomerStatus.ACTIVE
+            or not paired_customer.expiry
+            or paired_customer.expiry <= now
+        )
+    ):
+        return False
+
+    if pairing.is_subscription_share:
+        share_owner = getattr(pairing, "subscription_owner_customer", None)
+        if pairing.subscription_owner_customer_id is None:
+            return False
+        if (
+            share_owner
+            and (
+                share_owner.status != CustomerStatus.ACTIVE
+                or not share_owner.expiry
+                or share_owner.expiry <= now
+            )
+        ):
+            return False
+
+    return True
+
+
+async def _open_shared_device_usage_period(
+    db: AsyncSession,
+    *,
+    shared_customer: Customer,
+    plan: Plan,
+) -> None:
+    from app.services.usage_tracking import open_new_period
+
+    await open_new_period(db, shared_customer, plan=plan, now=datetime.utcnow())
+
+
+def _remove_shared_device_from_direct_router_sync(router_info: dict, mac_address: str) -> dict:
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=15,
+        connect_timeout=5,
+    )
+    if not api.connect():
+        return {
+            "success": False,
+            "error": api.last_connect_error or "Failed to connect to router",
+        }
+
+    try:
+        result = api.remove_bypassed_user(mac_address)
+        if result.get("error"):
+            return {"success": False, "error": result["error"], "details": result}
+        return {"success": True, "details": result.get("details", result)}
+    finally:
+        api.disconnect()
+
+
+async def _delete_radius_shared_device_entries(db: AsyncSession, mac_address: str) -> dict:
+    username = normalize_mac_address(mac_address).replace(":", "").upper()
+    check_result = await db.execute(
+        text("DELETE FROM radius_check WHERE username = :username"),
+        {"username": username},
+    )
+    await db.execute(
+        text("DELETE FROM radius_reply WHERE username = :username"),
+        {"username": username},
+    )
+    await db.execute(
+        text("DELETE FROM radius_usergroup WHERE username = :username"),
+        {"username": username},
+    )
+    return {
+        "success": True,
+        "username": username,
+        "deleted_from_radius": check_result.rowcount > 0,
+    }
+
+
 async def _find_share_owner_customer(
     db: AsyncSession,
     *,
@@ -530,22 +627,30 @@ async def _share_subscription_for_owner(
 
     existing_pairing = (
         await db.execute(
-            select(DevicePairing).where(
+            select(DevicePairing)
+            .options(
+                selectinload(DevicePairing.customer),
+                selectinload(DevicePairing.subscription_owner_customer),
+            )
+            .where(
                 DevicePairing.device_mac == normalized_mac,
                 DevicePairing.router_id == router_id,
             )
         )
     ).scalar_one_or_none()
 
-    if existing_pairing and existing_pairing.is_active:
-        same_owner = existing_pairing.subscription_owner_customer_id == owner.id
-        if not same_owner:
-            raise HTTPException(status_code=409, detail="This device is already paired on this hotspot")
+    if _existing_pairing_blocks_share(existing_pairing, owner):
+        raise HTTPException(status_code=409, detail="This device is already paired on this hotspot")
 
     existing_pairing_id = (
         existing_pairing.id
         if existing_pairing and existing_pairing.subscription_owner_customer_id == owner.id
         else None
+    )
+    same_owner_active_pairing = bool(
+        existing_pairing
+        and existing_pairing.is_active
+        and existing_pairing.subscription_owner_customer_id == owner.id
     )
     active_shared_count = await active_shared_device_count(
         db,
@@ -555,7 +660,7 @@ async def _share_subscription_for_owner(
     if active_shared_count >= max_companion_devices:
         raise HTTPException(
             status_code=409,
-            detail=f"This subscription already has the maximum {max_companion_devices} shared device(s)",
+            detail=f"This subscription already has the maximum {max_shared_users} total device(s)",
         )
 
     shared_phone = (device_owner_phone or owner.phone or "").strip()
@@ -610,6 +715,8 @@ async def _share_subscription_for_owner(
         shared_customer.expiry = datetime.fromisoformat(radius_result["expiry"])
         pairing.provisioned_at = datetime.utcnow()
         pairing.expires_at = shared_customer.expiry
+        if not same_owner_active_pairing:
+            await _open_shared_device_usage_period(db, shared_customer=shared_customer, plan=plan)
         _mark_share_code_redeemed(share_code, shared_customer=shared_customer, pairing=pairing)
         await db.commit()
         return {
@@ -646,6 +753,8 @@ async def _share_subscription_for_owner(
         router=router_obj,
     )
     pairing.provisioned_at = datetime.utcnow()
+    if not same_owner_active_pairing:
+        await _open_shared_device_usage_period(db, shared_customer=shared_customer, plan=plan)
     _mark_share_code_redeemed(share_code, shared_customer=shared_customer, pairing=pairing)
     await db.commit()
 
@@ -698,8 +807,9 @@ async def share_subscription_with_device(
     """
     Add a companion device under an existing paid hotspot subscription.
 
-    The plan's ``max_shared_users`` is the shared-device allowance. A value of
-    1 keeps sharing disabled; values above 1 allow that many shared devices.
+    The plan's ``max_shared_users`` is the total-device allowance, including
+    the owner's paid device. A value of 1 keeps sharing disabled; values above
+    1 allow ``max_shared_users - 1`` shared devices.
     """
     try:
         normalized_mac = _validate_device_mac(request.device_mac)
@@ -745,13 +855,13 @@ async def create_share_subscription_code(
             owner_phone=request.owner_phone,
             owner_mac=request.owner_mac,
         )
-        _plan, _router_obj, _max_shared_users, max_companion_devices, active_shared_count = (
+        _plan, _router_obj, max_shared_users, max_companion_devices, active_shared_count = (
             await _load_active_share_owner_stats(db, owner=owner, router_id=request.router_id)
         )
         if active_shared_count >= max_companion_devices:
             raise HTTPException(
                 status_code=409,
-                detail=f"This subscription already has the maximum {max_companion_devices} shared device(s)",
+                detail=f"This subscription already has the maximum {max_shared_users} total device(s)",
             )
 
         now = datetime.utcnow()
@@ -994,6 +1104,115 @@ async def get_share_subscription_owner_status(
     except Exception as e:
         logger.exception("Error getting share subscription owner status")
         raise HTTPException(status_code=500, detail=f"Failed to get sharing status: {str(e)}")
+
+
+@router.post("/api/public/device/share-subscription/disconnect")
+async def disconnect_shared_subscription_device(
+    request: ShareSubscriptionDisconnectRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Disconnect an active shared device and free one subscription slot."""
+    cleanup_result: dict = {"success": True, "skipped": True}
+    owner_id: int | None = None
+    shared_customer_id: int | None = None
+    normalized_mac: str | None = None
+    auth_value: str | None = None
+    router_info: dict | None = None
+
+    try:
+        owner = await _find_share_owner_customer(
+            db,
+            router_id=request.router_id,
+            owner_phone=request.owner_phone,
+            owner_mac=None,
+        )
+        owner_id = owner.id
+
+        pairing = (
+            await db.execute(
+                select(DevicePairing)
+                .options(selectinload(DevicePairing.customer), selectinload(DevicePairing.router))
+                .where(
+                    DevicePairing.id == request.pairing_id,
+                    DevicePairing.router_id == request.router_id,
+                    DevicePairing.subscription_owner_customer_id == owner.id,
+                    DevicePairing.is_subscription_share == True,  # noqa: E712
+                    DevicePairing.is_active == True,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if not pairing:
+            raise HTTPException(status_code=404, detail="Shared device not found for this subscription")
+        if not pairing.customer or not pairing.router:
+            raise HTTPException(status_code=400, detail="Shared device is missing customer or router details")
+
+        normalized_mac = _validate_device_mac(pairing.device_mac)
+        if not normalized_mac:
+            raise HTTPException(status_code=400, detail="Shared device has an invalid MAC address")
+
+        now = datetime.utcnow()
+        shared_customer = pairing.customer
+        router_obj = pairing.router
+        shared_customer_id = shared_customer.id
+        pairing.is_active = False
+        pairing.expires_at = now
+        shared_customer.expiry = now
+        shared_customer.subscription_owner_id = None
+
+        auth_method = getattr(router_obj, "auth_method", None)
+        auth_value = auth_method.value if hasattr(auth_method, "value") else auth_method
+        if auth_value != RouterAuthMethod.RADIUS.value:
+            router_info = {
+                "ip": router_obj.ip_address,
+                "username": router_obj.username,
+                "password": router_obj.password,
+                "port": router_obj.port,
+                "name": router_obj.name,
+            }
+
+        await db.commit()
+
+        if auth_value == RouterAuthMethod.RADIUS.value:
+            cleanup_result = await _delete_radius_shared_device_entries(db, normalized_mac)
+        elif router_info:
+            cleanup_result = await asyncio.to_thread(
+                _remove_shared_device_from_direct_router_sync,
+                router_info,
+                normalized_mac,
+            )
+
+        cleanup_success = bool(cleanup_result.get("success"))
+        shared_customer = await db.get(Customer, shared_customer_id)
+        if shared_customer and cleanup_success:
+            shared_customer.status = CustomerStatus.INACTIVE
+            shared_customer.expiry = datetime.utcnow()
+
+        remaining_shared_devices = await active_shared_device_count(db, owner_id)
+        await db.commit()
+
+        return {
+            "success": True,
+            "pairing_id": request.pairing_id,
+            "customer_id": shared_customer_id,
+            "device_mac": normalized_mac,
+            "router_id": request.router_id,
+            "owner_customer_id": owner_id,
+            "active_shared_devices": remaining_shared_devices,
+            "cleanup_status": "removed" if cleanup_success else "pending",
+            "cleanup": cleanup_result,
+            "message": (
+                "Shared device disconnected."
+                if cleanup_success
+                else "Shared device slot freed. Router cleanup is still pending."
+            ),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error disconnecting shared subscription device")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to disconnect shared device: {str(e)}")
 
 
 @router.post("/api/public/device/pair-and-pay")

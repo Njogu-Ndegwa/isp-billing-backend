@@ -2871,7 +2871,7 @@ class MikroTikAPI:
             password_known = password is not None and str(password) != ""
             if not password_known:
                 secrets = self.send_command("/ppp/secret/print")
-                if not secrets.get("success") or not secrets.get("data"):
+                if not secrets.get("success"):
                     return {
                         "error": (
                             f"PPPoE password is missing and existing secret '{username}' "
@@ -2880,7 +2880,7 @@ class MikroTikAPI:
                     }
 
                 existing_secret = None
-                for secret in secrets["data"]:
+                for secret in secrets.get("data") or []:
                     if secret.get("name") == username:
                         existing_secret = secret
                         break

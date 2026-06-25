@@ -9,6 +9,7 @@ from app.api import device_pairing
 from app.api.device_pairing import (
     ShareSubscriptionCodeCreateRequest,
     ShareSubscriptionCodeRedeemRequest,
+    ShareSubscriptionDisconnectRequest,
     ShareSubscriptionRequest,
 )
 from app.db.models import (
@@ -118,7 +119,7 @@ async def test_share_subscription_creates_shared_customer_and_direct_attempt_wit
 
 
 @pytest.mark.asyncio
-async def test_share_subscription_allows_second_shared_device_without_owner_mac(db, monkeypatch):
+async def test_share_subscription_allows_one_shared_device_without_owner_mac_for_two_device_plan(db, monkeypatch):
     reseller = await make_reseller(db)
     plan = await make_plan(db, reseller, max_shared_users=2)
     router = await make_router(db, reseller)
@@ -160,25 +161,26 @@ async def test_share_subscription_allows_second_shared_device_without_owner_mac(
         ),
         db,
     )
-    second = await device_pairing.share_subscription_with_device(
-        ShareSubscriptionRequest(
-            owner_phone="0700000101",
-            router_id=router.id,
-            device_mac="AA:BB:CC:DD:EE:A3",
-            device_name="Laptop",
-            device_type="laptop",
-        ),
-        db,
-    )
     if tasks:
         await asyncio.gather(*tasks)
 
     assert first["owner_customer_id"] == owner.id
+    assert first["max_shared_users"] == 2
     assert first["active_shared_devices"] == 1
-    assert second["owner_customer_id"] == owner.id
-    assert second["max_shared_users"] == 2
-    assert second["active_shared_devices"] == 2
-    assert second["delivery"]["delivery_status"] == "activating"
+
+    with pytest.raises(HTTPException) as exc:
+        await device_pairing.share_subscription_with_device(
+            ShareSubscriptionRequest(
+                owner_phone="0700000101",
+                router_id=router.id,
+                device_mac="AA:BB:CC:DD:EE:A3",
+                device_name="Laptop",
+                device_type="laptop",
+            ),
+            db,
+        )
+    assert exc.value.status_code == 409
+    assert "maximum 2 total device" in exc.value.detail
 
     pairings = (
         await db.execute(
@@ -189,10 +191,7 @@ async def test_share_subscription_allows_second_shared_device_without_owner_mac(
             )
         )
     ).scalars().all()
-    assert {p.device_mac for p in pairings} == {
-        "AA:BB:CC:DD:EE:A2",
-        "AA:BB:CC:DD:EE:A3",
-    }
+    assert {p.device_mac for p in pairings} == {"AA:BB:CC:DD:EE:A2"}
 
 
 @pytest.mark.asyncio
@@ -238,7 +237,7 @@ async def test_share_code_redeems_detected_device_and_marks_code_used(db, monkey
 
     assert code_response["success"] is True
     assert len(code_response["raw_code"]) == 6
-    assert code_response["available_shared_devices"] == 2
+    assert code_response["available_shared_devices"] == 1
     second_code_response = await device_pairing.create_share_subscription_code(
         ShareSubscriptionCodeCreateRequest(
             owner_phone="0700000401",
@@ -286,6 +285,132 @@ async def test_share_code_redeems_detected_device_and_marks_code_used(db, monkey
             db,
         )
     assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_share_code_reuses_stale_pairing_from_expired_previous_owner_with_same_phone(db, monkeypatch):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, max_shared_users=2, data_cap_mb=100)
+    router = await make_router(db, reseller)
+    old_expiry = datetime.utcnow() - timedelta(days=1)
+    old_owner = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.INACTIVE,
+        expiry=old_expiry,
+        mac_address="AA:BB:CC:DD:EF:31",
+        phone="254700000431",
+    )
+    fresh_owner = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(hours=2),
+        mac_address="AA:BB:CC:DD:EF:32",
+        phone="254700000431",
+    )
+    old_shared = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.INACTIVE,
+        expiry=old_owner.expiry,
+        mac_address="AA:BB:CC:DD:EF:33",
+        phone=old_owner.phone,
+        subscription_owner_id=old_owner.id,
+    )
+    old_period = CustomerUsagePeriod(
+        customer_id=old_shared.id,
+        period_start=old_expiry - timedelta(minutes=20),
+        period_end=old_expiry,
+        upload_bytes=0,
+        download_bytes=0,
+        total_bytes=0,
+        cap_mb_snapshot=20,
+    )
+    stale_pairing = DevicePairing(
+        customer_id=old_shared.id,
+        device_mac=old_shared.mac_address,
+        device_name="Friend phone",
+        device_type=DeviceType.LAPTOP,
+        router_id=router.id,
+        plan_id=plan.id,
+        subscription_owner_customer_id=old_owner.id,
+        is_subscription_share=True,
+        is_active=True,
+        expires_at=old_owner.expiry,
+    )
+    db.add_all([old_period, stale_pairing])
+    await db.commit()
+    await db.refresh(stale_pairing)
+
+    tasks = []
+
+    async def fake_log(*_args, **_kwargs):
+        return None
+
+    async def fake_provision(*_args, **_kwargs):
+        return {"success": True}
+
+    def fake_create_task(coro):
+        task = asyncio.get_running_loop().create_task(coro)
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(device_pairing, "log_provisioning_event", fake_log)
+    monkeypatch.setattr(device_pairing, "provision_hotspot_customer", fake_provision)
+    monkeypatch.setattr(device_pairing.asyncio, "create_task", fake_create_task)
+
+    code_response = await device_pairing.create_share_subscription_code(
+        ShareSubscriptionCodeCreateRequest(
+            owner_phone="0700000431",
+            router_id=router.id,
+        ),
+        db,
+    )
+
+    response = await device_pairing.redeem_share_subscription_code(
+        ShareSubscriptionCodeRedeemRequest(
+            code=code_response["raw_code"],
+            router_id=router.id,
+            device_mac=old_shared.mac_address,
+            device_name="Friend phone",
+            device_type="laptop",
+        ),
+        db,
+    )
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    assert response["success"] is True
+    assert response["owner_customer_id"] == fresh_owner.id
+    assert response["pairing_id"] == stale_pairing.id
+    assert response["active_shared_devices"] == 1
+
+    await db.refresh(old_shared)
+    await db.refresh(stale_pairing)
+    await db.refresh(old_period)
+    assert old_shared.status == CustomerStatus.ACTIVE
+    assert old_shared.expiry == fresh_owner.expiry
+    assert old_shared.subscription_owner_id == fresh_owner.id
+    assert stale_pairing.subscription_owner_customer_id == fresh_owner.id
+    assert stale_pairing.expires_at == fresh_owner.expiry
+    assert old_period.closed_at is not None
+    current_period = (
+        await db.execute(
+            select(CustomerUsagePeriod).where(
+                CustomerUsagePeriod.customer_id == old_shared.id,
+                CustomerUsagePeriod.closed_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    assert current_period.cap_mb_snapshot == 100
+    assert current_period.period_end == fresh_owner.expiry
 
 
 @pytest.mark.asyncio
@@ -432,12 +557,103 @@ async def test_share_owner_status_lists_existing_shared_devices_by_phone_variant
     assert response["owner_customer_id"] == owner.id
     assert response["owner_device_mac"] == owner.mac_address
     assert response["max_shared_users"] == 2
-    assert response["max_companion_devices"] == 2
+    assert response["max_companion_devices"] == 1
     assert response["active_shared_devices"] == 1
-    assert response["available_shared_devices"] == 1
-    assert response["message"] == "Subscription can share another device."
+    assert response["available_shared_devices"] == 0
+    assert response["message"] == "This subscription has reached its sharing limit."
     assert response["devices"][0]["device_mac"] == shared.mac_address
     assert response["devices"][0]["customer"]["id"] == shared.id
+
+
+@pytest.mark.asyncio
+async def test_disconnect_shared_subscription_device_frees_slot_and_deactivates_customer(db, monkeypatch):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, max_shared_users=2)
+    router = await make_router(db, reseller)
+    owner = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=2),
+        mac_address="AA:BB:CC:DD:EF:01",
+        phone="254700000501",
+    )
+    shared = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=owner.expiry,
+        mac_address="AA:BB:CC:DD:EF:02",
+        phone=owner.phone,
+        subscription_owner_id=owner.id,
+    )
+    pairing = DevicePairing(
+        customer_id=shared.id,
+        device_mac=shared.mac_address,
+        device_name="Guest Phone",
+        device_type=DeviceType.OTHER,
+        router_id=router.id,
+        plan_id=plan.id,
+        subscription_owner_customer_id=owner.id,
+        is_subscription_share=True,
+        is_active=True,
+        expires_at=shared.expiry,
+    )
+    db.add(pairing)
+    await db.commit()
+    await db.refresh(pairing)
+
+    cleanup_calls = []
+
+    def fake_cleanup(router_info, mac_address):
+        cleanup_calls.append((router_info, mac_address))
+        return {"success": True, "details": {"removed": True}}
+
+    monkeypatch.setattr(device_pairing, "_remove_shared_device_from_direct_router_sync", fake_cleanup)
+
+    response = await device_pairing.disconnect_shared_subscription_device(
+        ShareSubscriptionDisconnectRequest(
+            owner_phone="0700000501",
+            router_id=router.id,
+            pairing_id=pairing.id,
+        ),
+        db,
+    )
+
+    assert response["success"] is True
+    assert response["cleanup_status"] == "removed"
+    assert response["active_shared_devices"] == 0
+    assert cleanup_calls == [
+        (
+            {
+                "ip": router.ip_address,
+                "username": router.username,
+                "password": router.password,
+                "port": router.port,
+                "name": router.name,
+            },
+            shared.mac_address,
+        )
+    ]
+
+    await db.refresh(pairing)
+    await db.refresh(shared)
+    assert pairing.is_active is False
+    assert shared.status == CustomerStatus.INACTIVE
+    assert shared.subscription_owner_id is None
+    assert shared.expiry <= datetime.utcnow()
+
+    status = await device_pairing.get_share_subscription_owner_status(
+        router.id,
+        "0700000501",
+        db,
+    )
+    assert status["active_shared_devices"] == 0
+    assert status["available_shared_devices"] == 1
 
 
 @pytest.mark.asyncio
@@ -564,7 +780,7 @@ async def test_share_subscription_enforces_plan_device_limit(db):
         )
 
     assert exc.value.status_code == 409
-    assert "maximum 2 shared device" in exc.value.detail
+    assert "maximum 2 total device" in exc.value.detail
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,7 @@ Three new fields on `Plan` (PPPoE plans only):
 |---|---|---|
 | `data_cap_mb` | integer (MB), nullable | Monthly cap. `null` or `0` = unlimited. |
 | `fup_action` | `"throttle"` | `"block"` | `"notify_only"` | What to do when cap is exceeded. Default: `null` -> falls back to `THROTTLE`. |
-| `fup_throttle_profile` | string, nullable | MikroTik PPP profile to switch the user to when throttled. Required if `fup_action` = `"throttle"`. |
+| `fup_throttle_profile` | string, nullable | Throttled speed applied when the cap is hit, in `Down/Up` form (e.g. `"3M/1M"`). Hotspot applies it as a simple-queue rate; PPPoE auto-creates/assigns a shared `fup-<rate>` PPP profile carrying that rate-limit. Blank → `1M/1M`. |
 
 ### Create / update plan
 
@@ -37,7 +37,7 @@ Authorization: Bearer <jwt>
   "router_profile": "home-10m",
   "data_cap_mb": 100000,
   "fup_action": "throttle",
-  "fup_throttle_profile": "home-10m-fup"
+  "fup_throttle_profile": "3M/1M"
 }
 ```
 
@@ -203,9 +203,9 @@ Expect a `period` object whose `total_mb` increases over subsequent calls.
 
 ### Step 4. Pick one pilot plan and set a small cap
 
-Pick a low-risk PPPoE plan with at most a handful of customers, and a
-known throttle profile that already exists in MikroTik (create one via
-WinBox / RouterOS first if needed, e.g. a 1M/1M `home-fup` profile).
+Pick a low-risk PPPoE plan with at most a handful of customers and a throttle
+speed (e.g. `1M/1M`). No router prep is needed: the enforcer auto-creates a
+shared `fup-1M-1M` PPP profile carrying that rate-limit on first trigger.
 
 ```bash
 curl -X PUT \
@@ -214,7 +214,7 @@ curl -X PUT \
   -d '{
         "data_cap_mb": 1000,
         "fup_action": "throttle",
-        "fup_throttle_profile": "home-fup"
+        "fup_throttle_profile": "1M/1M"
       }' \
   https://<host>/api/plans/<pilot_plan_id>
 ```
@@ -227,9 +227,10 @@ curl -X PUT \
 ### Step 5. Watch the logs
 
 Look for `[FUP] Trigger throttle` / `[FUP] Auto-revert` lines. Verify the
-customer's PPP secret profile flips to `home-fup` on MikroTik (`/ppp/secret
-print where name=<username>`) and that `fup_active` becomes `true` in the
-usage endpoint.
+customer's PPP secret profile flips to `fup-1M-1M` on MikroTik (`/ppp/secret
+print where name=<username>`), that the `fup-1M-1M` profile exists with the
+expected `rate-limit` (`/ppp/profile print`), and that `fup_active` becomes
+`true` in the usage endpoint.
 
 ### Step 6. Verify renewal reset
 

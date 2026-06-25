@@ -1,8 +1,8 @@
 """Shared-customer subscription helpers.
 
-Plan ``max_shared_users`` is the shared-device allowance on one paid
-subscription. A value of 1 keeps sharing disabled; values above 1 are the
-number of extra devices/customers that may share the subscription.
+Plan ``max_shared_users`` is the total-device allowance on one paid
+subscription, including the paying owner's device. A value of 1 keeps sharing
+disabled; values above 1 allow ``max_shared_users - 1`` extra devices/customers.
 """
 
 import logging
@@ -45,7 +45,7 @@ def sharing_enabled_for_plan(plan: Plan | None) -> bool:
 
 def shared_device_limit_for_plan(plan: Plan | None) -> int:
     max_shared_users = max_shared_users_for_plan(plan)
-    return max_shared_users if max_shared_users > 1 else 0
+    return max(0, max_shared_users - 1)
 
 
 async def active_shared_device_count(
