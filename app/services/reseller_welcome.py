@@ -23,13 +23,15 @@ logger = logging.getLogger(__name__)
 
 WELCOME_CATEGORY = "reseller_welcome"
 
-DEFAULT_WELCOME_SUBJECT = "Welcome aboard"
+DEFAULT_WELCOME_SUBJECT = "Welcome to Bitwave Technologies"
 DEFAULT_WELCOME_BODY = (
-    "Hi {org}, welcome aboard! Your reseller account is ready. Need help adding "
-    "your first router? We'll set it up for you for FREE - just call "
-    "{support_phone}. Log in any time to get started."
+    "Welcome to Bitwave Technologies, {org}! Your reseller account is ready. "
+    "Need help adding your first router? We'll set it up for you for FREE - "
+    "just call us on {support_phone}. Log in any time to get started."
 )
-DEFAULT_SUPPORT_PHONE_FALLBACK = "our support line"
+# Default contact number rendered into {support_phone} when the admin has not
+# configured one in messaging settings. Editable via welcome_support_phone.
+DEFAULT_WELCOME_SUPPORT_PHONE = "+254795635364"
 
 
 def effective_welcome_settings(settings_row: Optional[MessagingSettings]) -> dict:
@@ -37,7 +39,7 @@ def effective_welcome_settings(settings_row: Optional[MessagingSettings]) -> dic
     enabled = True
     subject = DEFAULT_WELCOME_SUBJECT
     body = DEFAULT_WELCOME_BODY
-    support_phone = None
+    support_phone = DEFAULT_WELCOME_SUPPORT_PHONE
     if settings_row is not None:
         if settings_row.welcome_enabled is not None:
             enabled = settings_row.welcome_enabled
@@ -45,7 +47,7 @@ def effective_welcome_settings(settings_row: Optional[MessagingSettings]) -> dic
             subject = settings_row.welcome_subject
         if settings_row.welcome_message_body:
             body = settings_row.welcome_message_body
-        support_phone = settings_row.welcome_support_phone or None
+        support_phone = settings_row.welcome_support_phone or DEFAULT_WELCOME_SUPPORT_PHONE
     return {"enabled": enabled, "subject": subject, "body": body,
             "support_phone": support_phone}
 
@@ -53,7 +55,7 @@ def effective_welcome_settings(settings_row: Optional[MessagingSettings]) -> dic
 def render_welcome_body(body_template: str, *, org: str,
                         support_phone: Optional[str]) -> str:
     """Substitute {org} and {support_phone}; never leak a literal placeholder."""
-    phone = support_phone or DEFAULT_SUPPORT_PHONE_FALLBACK
+    phone = support_phone or DEFAULT_WELCOME_SUPPORT_PHONE
     out = body_template.replace("{org}", org or "there")
     out = out.replace("{support_phone}", phone)
     return out

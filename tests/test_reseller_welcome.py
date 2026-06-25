@@ -7,7 +7,7 @@ from app.db.models import (
 )
 from app.services.reseller_welcome import (
     queue_reseller_welcome, render_welcome_body, effective_welcome_settings,
-    WELCOME_CATEGORY, DEFAULT_WELCOME_BODY,
+    WELCOME_CATEGORY, DEFAULT_WELCOME_BODY, DEFAULT_WELCOME_SUPPORT_PHONE,
 )
 from tests.factories import make_reseller
 
@@ -122,14 +122,15 @@ def test_render_welcome_body_handles_missing_phone():
     out = render_welcome_body("Call {support_phone} now.", org="Acme",
                               support_phone=None)
     assert "{support_phone}" not in out
-    assert "our support line" in out
+    assert DEFAULT_WELCOME_SUPPORT_PHONE in out
 
 
 def test_effective_welcome_settings_defaults_when_null():
     cfg = effective_welcome_settings(None)
     assert cfg["enabled"] is True
     assert cfg["body"] == DEFAULT_WELCOME_BODY
-    assert cfg["support_phone"] is None
+    assert cfg["support_phone"] == DEFAULT_WELCOME_SUPPORT_PHONE
+    assert "Bitwave Technologies" in cfg["body"]
 
 
 @pytest.mark.asyncio
