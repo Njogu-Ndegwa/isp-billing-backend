@@ -784,6 +784,28 @@ async def proxy_router_webfig_api_root_escape(request: Request):
     return {"message": "ISP Billing SaaS API", "version": "1.0.0", "updated": "2025-11-02-v2"}
 
 
+_webfig_upstream_client: httpx.AsyncClient | None = None
+
+
+def _webfig_upstream_client_singleton() -> httpx.AsyncClient:
+    # RouterOS binds WebFig's live channel (GET /jsproxy/?<token>) to the TCP connection
+    # that registered the listener on a prior POST /jsproxy. Opening a fresh AsyncClient
+    # per request closed that connection immediately, so the router dropped the listener
+    # (-> 404 Not Found on the poll) and WebFig logged the operator out. Reuse one
+    # keep-alive client so upstream connections to the router persist across requests and
+    # the listener survives between polls. verify=False because management-VPN routers use
+    # self-signed certs; read=300s covers the jsproxy long-poll.
+    global _webfig_upstream_client
+    if _webfig_upstream_client is None:
+        _webfig_upstream_client = httpx.AsyncClient(
+            follow_redirects=False,
+            verify=False,
+            timeout=httpx.Timeout(connect=5.0, read=300.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_keepalive_connections=16, keepalive_expiry=180.0),
+        )
+    return _webfig_upstream_client
+
+
 async def _proxy_webfig_request(
     router_id: int,
     request: Request,
@@ -801,40 +823,31 @@ async def _proxy_webfig_request(
     request_body = await request.body()
     is_jsproxy = _is_webfig_jsproxy_path(proxy_path)
 
+    client = _webfig_upstream_client_singleton()
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=False,
-            timeout=httpx.Timeout(
-                connect=5.0,
-                read=_webfig_proxy_read_timeout(proxy_path),
-                write=10.0,
-                pool=5.0,
-            ),
-            verify=False if session.webfig_scheme == "https" else True,
-        ) as client:
-            last_exc = None
-            attempts = 2 if is_jsproxy else 1
-            for attempt in range(attempts):
-                try:
-                    upstream = await client.request(
-                        request.method,
+        last_exc = None
+        attempts = 2 if is_jsproxy else 1
+        for attempt in range(attempts):
+            try:
+                upstream = await client.request(
+                    request.method,
+                    target_url,
+                    headers=_forward_webfig_headers(request, host_header),
+                    content=request_body,
+                )
+                break
+            except httpx.RequestError as exc:
+                last_exc = exc
+                if attempt + 1 < attempts:
+                    logger.warning(
+                        "WebFig proxy retrying router_id=%s name=%s target=%s after error=%s",
+                        router_id,
+                        session.router_name,
                         target_url,
-                        headers=_forward_webfig_headers(request, host_header),
-                        content=request_body,
+                        repr(exc),
                     )
-                    break
-                except httpx.RequestError as exc:
-                    last_exc = exc
-                    if attempt + 1 < attempts:
-                        logger.warning(
-                            "WebFig proxy retrying router_id=%s name=%s target=%s after error=%s",
-                            router_id,
-                            session.router_name,
-                            target_url,
-                            repr(exc),
-                        )
-                        continue
-                    raise last_exc
+                    continue
+                raise last_exc
     except httpx.RequestError as exc:
         logger.warning(
             "WebFig proxy could not reach router_id=%s name=%s target=%s error=%r",
@@ -959,13 +972,6 @@ def _build_webfig_upstream_url(session, proxy_path: str) -> str:
     default_port = 443 if scheme == "https" else 80
     port_part = "" if port == default_port else f":{port}"
     return f"{scheme}://{session.router_ip}{port_part}/{proxy_path.lstrip('/')}"
-
-
-def _webfig_proxy_read_timeout(proxy_path: str) -> float:
-    configured = float(settings.ROUTER_WEBFIG_PROXY_TIMEOUT_SECONDS)
-    if _is_webfig_jsproxy_path(proxy_path):
-        return max(configured, 300.0)
-    return configured
 
 
 def _is_webfig_jsproxy_path(proxy_path: str) -> bool:
