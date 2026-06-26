@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text, delete, update, case
+from sqlalchemy import select, func, text, delete, update, case, or_
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta, date
@@ -22,6 +22,10 @@ from app.db.models import (
     ProvisioningAttempt, CustomerUsagePeriod, UsageCapWatchState,
     Lead, LeadActivity, LeadFollowUp, LeadSource,
     MtnMomoTransaction, AccessCredential,
+    PortalSettings, ShopProduct, ShopOrder, ShopOrderItem, ShopOrderTracking,
+    SubscriptionShareCode, C2BTransaction, UnmatchedC2BPayment,
+    SmsCreditAccount, SmsCreditTransaction, SmsCreditOrder, MessageTemplate,
+    SmsCampaign, SmsMessage, ResellerInboxMessage,
 )
 from app.services.auth import verify_token, get_current_user, pwd_context
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
@@ -1510,7 +1514,10 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         select(func.count(Voucher.id)).where(Voucher.user_id == reseller_id)
     )).scalar() or 0
     customer_payments = (await db.execute(
-        select(func.count(CustomerPayment.id)).where(CustomerPayment.reseller_id == reseller_id)
+        select(func.count(CustomerPayment.id)).where(or_(
+            CustomerPayment.reseller_id == reseller_id,
+            CustomerPayment.customer_id.in_(customer_ids_stmt),
+        ))
     )).scalar() or 0
     provisioning_tokens = (await db.execute(
         select(func.count(ProvisioningToken.id)).where(ProvisioningToken.user_id == reseller_id)
@@ -1519,7 +1526,10 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         select(func.count(ResellerPayout.id)).where(ResellerPayout.reseller_id == reseller_id)
     )).scalar() or 0
     transaction_charges = (await db.execute(
-        select(func.count(ResellerTransactionCharge.id)).where(ResellerTransactionCharge.reseller_id == reseller_id)
+        select(func.count(ResellerTransactionCharge.id)).where(or_(
+            ResellerTransactionCharge.reseller_id == reseller_id,
+            ResellerTransactionCharge.created_by == reseller_id,
+        ))
     )).scalar() or 0
     b2b_transactions = (await db.execute(
         select(func.count(B2BTransaction.id)).where(B2BTransaction.reseller_id == reseller_id)
@@ -1536,18 +1546,39 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
     availability_checks = await _count(RouterAvailabilityCheck, RouterAvailabilityCheck.router_id, router_ids_stmt)
 
     zenopay_transactions = (await db.execute(
-        select(func.count(ZenoPayTransaction.id)).where(ZenoPayTransaction.reseller_id == reseller_id)
+        select(func.count(ZenoPayTransaction.id)).where(or_(
+            ZenoPayTransaction.reseller_id == reseller_id,
+            ZenoPayTransaction.customer_id.in_(customer_ids_stmt),
+        ))
     )).scalar() or 0
-    device_pairings = await _count(DevicePairing, DevicePairing.customer_id, customer_ids_stmt)
-    reconnection_attempts = await _count(ReconnectionAttempt, ReconnectionAttempt.customer_id, customer_ids_stmt)
-    provisioning_attempts = await _count(ProvisioningAttempt, ProvisioningAttempt.customer_id, customer_ids_stmt)
+    device_pairings = (await db.execute(
+        select(func.count(DevicePairing.id)).where(or_(
+            DevicePairing.customer_id.in_(customer_ids_stmt),
+            DevicePairing.router_id.in_(router_ids_stmt),
+        ))
+    )).scalar() or 0
+    reconnection_attempts = (await db.execute(
+        select(func.count(ReconnectionAttempt.id)).where(or_(
+            ReconnectionAttempt.customer_id.in_(customer_ids_stmt),
+            ReconnectionAttempt.router_id.in_(router_ids_stmt),
+        ))
+    )).scalar() or 0
+    provisioning_attempts = (await db.execute(
+        select(func.count(ProvisioningAttempt.id)).where(or_(
+            ProvisioningAttempt.customer_id.in_(customer_ids_stmt),
+            ProvisioningAttempt.router_id.in_(router_ids_stmt),
+        ))
+    )).scalar() or 0
     customer_usage_periods = await _count(CustomerUsagePeriod, CustomerUsagePeriod.customer_id, customer_ids_stmt)
     payment_methods = (await db.execute(
         select(func.count(ResellerPaymentMethod.id)).where(ResellerPaymentMethod.user_id == reseller_id)
     )).scalar() or 0
 
     mtn_momo_transactions = (await db.execute(
-        select(func.count(MtnMomoTransaction.id)).where(MtnMomoTransaction.reseller_id == reseller_id)
+        select(func.count(MtnMomoTransaction.id)).where(or_(
+            MtnMomoTransaction.reseller_id == reseller_id,
+            MtnMomoTransaction.customer_id.in_(customer_ids_stmt),
+        ))
     )).scalar() or 0
 
     # CRM / lead pipeline owned by this reseller
@@ -1573,7 +1604,84 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
     )).scalar() or 0
 
     access_credentials = (await db.execute(
-        select(func.count(AccessCredential.id)).where(AccessCredential.user_id == reseller_id)
+        select(func.count(AccessCredential.id)).where(or_(
+            AccessCredential.user_id == reseller_id,
+            AccessCredential.router_id.in_(router_ids_stmt),
+        ))
+    )).scalar() or 0
+
+    sms_credit_accounts = (await db.execute(
+        select(func.count(SmsCreditAccount.id)).where(SmsCreditAccount.user_id == reseller_id)
+    )).scalar() or 0
+    sms_credit_transactions = (await db.execute(
+        select(func.count(SmsCreditTransaction.id)).where(SmsCreditTransaction.user_id == reseller_id)
+    )).scalar() or 0
+    sms_credit_orders = (await db.execute(
+        select(func.count(SmsCreditOrder.id)).where(SmsCreditOrder.user_id == reseller_id)
+    )).scalar() or 0
+    message_templates = (await db.execute(
+        select(func.count(MessageTemplate.id)).where(MessageTemplate.user_id == reseller_id)
+    )).scalar() or 0
+    sms_campaigns = (await db.execute(
+        select(func.count(SmsCampaign.id)).where(SmsCampaign.user_id == reseller_id)
+    )).scalar() or 0
+    campaign_ids_stmt = select(SmsCampaign.id).where(SmsCampaign.user_id == reseller_id)
+    sms_messages = (await db.execute(
+        select(func.count(SmsMessage.id)).where(or_(
+            SmsMessage.user_id == reseller_id,
+            SmsMessage.customer_id.in_(customer_ids_stmt),
+            SmsMessage.campaign_id.in_(campaign_ids_stmt),
+        ))
+    )).scalar() or 0
+    reseller_inbox_messages = (await db.execute(
+        select(func.count(ResellerInboxMessage.id)).where(or_(
+            ResellerInboxMessage.recipient_user_id == reseller_id,
+            ResellerInboxMessage.sender_user_id == reseller_id,
+        ))
+    )).scalar() or 0
+
+    portal_settings = (await db.execute(
+        select(func.count(PortalSettings.id)).where(PortalSettings.user_id == reseller_id)
+    )).scalar() or 0
+    shop_order_ids_stmt = select(ShopOrder.id).where(ShopOrder.user_id == reseller_id)
+    shop_product_ids_stmt = select(ShopProduct.id).where(ShopProduct.user_id == reseller_id)
+    shop_products = (await db.execute(
+        select(func.count(ShopProduct.id)).where(ShopProduct.user_id == reseller_id)
+    )).scalar() or 0
+    shop_orders = (await db.execute(
+        select(func.count(ShopOrder.id)).where(ShopOrder.user_id == reseller_id)
+    )).scalar() or 0
+    shop_order_items = (await db.execute(
+        select(func.count(ShopOrderItem.id)).where(or_(
+            ShopOrderItem.order_id.in_(shop_order_ids_stmt),
+            ShopOrderItem.product_id.in_(shop_product_ids_stmt),
+        ))
+    )).scalar() or 0
+    shop_order_tracking = (await db.execute(
+        select(func.count(ShopOrderTracking.id)).where(or_(
+            ShopOrderTracking.order_id.in_(shop_order_ids_stmt),
+            ShopOrderTracking.updated_by_user_id == reseller_id,
+        ))
+    )).scalar() or 0
+    subscription_share_codes = (await db.execute(
+        select(func.count(SubscriptionShareCode.id)).where(or_(
+            SubscriptionShareCode.owner_customer_id.in_(customer_ids_stmt),
+            SubscriptionShareCode.redeemed_customer_id.in_(customer_ids_stmt),
+            SubscriptionShareCode.router_id.in_(router_ids_stmt),
+        ))
+    )).scalar() or 0
+    c2b_transactions_nulled = (await db.execute(
+        select(func.count(C2BTransaction.id)).where(or_(
+            C2BTransaction.matched_reseller_id == reseller_id,
+            C2BTransaction.matched_customer_id.in_(customer_ids_stmt),
+        ))
+    )).scalar() or 0
+    unmatched_c2b_payments_nulled = (await db.execute(
+        select(func.count(UnmatchedC2BPayment.id)).where(or_(
+            UnmatchedC2BPayment.assigned_reseller_id == reseller_id,
+            UnmatchedC2BPayment.resolved_by_user_id == reseller_id,
+            UnmatchedC2BPayment.resolution_customer_id.in_(customer_ids_stmt),
+        ))
     )).scalar() or 0
 
     # WG peers to remove
@@ -1615,6 +1723,21 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         "cross_lead_activities": cross_lead_activities,
         "cross_lead_followups": cross_lead_followups,
         "access_credentials": access_credentials,
+        "sms_credit_accounts": sms_credit_accounts,
+        "sms_credit_transactions": sms_credit_transactions,
+        "sms_credit_orders": sms_credit_orders,
+        "message_templates": message_templates,
+        "sms_campaigns": sms_campaigns,
+        "sms_messages": sms_messages,
+        "reseller_inbox_messages": reseller_inbox_messages,
+        "portal_settings": portal_settings,
+        "shop_products": shop_products,
+        "shop_orders": shop_orders,
+        "shop_order_items": shop_order_items,
+        "shop_order_tracking": shop_order_tracking,
+        "subscription_share_codes": subscription_share_codes,
+        "c2b_transactions_nulled": c2b_transactions_nulled,
+        "unmatched_c2b_payments_nulled": unmatched_c2b_payments_nulled,
         "wireguard_peers": wg_tokens,
     }
 
@@ -1636,40 +1759,58 @@ async def delete_reseller(
     reseller = await _get_reseller_or_404(db, reseller_id)
 
     summary = await _reseller_deletion_summary(db, reseller_id)
+    reseller_info = {
+        "id": reseller.id,
+        "email": reseller.email,
+        "organization_name": reseller.organization_name,
+    }
 
     if not confirm:
         return {
             "dry_run": True,
-            "reseller": {
-                "id": reseller.id,
-                "email": reseller.email,
-                "organization_name": reseller.organization_name,
-            },
+            "reseller": reseller_info,
             "will_delete": summary,
             "message": "Add ?confirm=true to actually delete this reseller and all associated data.",
         }
 
     # ── Phase 1: WireGuard cleanup (best-effort) ──
-    wg_failures = []
     tokens_result = await db.execute(
-        select(ProvisioningToken).where(
+        select(
+            ProvisioningToken.id,
+            ProvisioningToken.vpn_type,
+            ProvisioningToken.l2tp_username,
+            ProvisioningToken.wg_public_key,
+        ).where(
             ProvisioningToken.user_id == reseller_id,
             ProvisioningToken.wg_public_key.isnot(None),
         )
     )
-    for tk in tokens_result.scalars().all():
+    vpn_peers = [dict(row) for row in tokens_result.mappings().all()]
+
+    # Release the read transaction before calling the VPN manager.
+    await db.commit()
+
+    wg_failures = []
+    for tk in vpn_peers:
         try:
-            if tk.vpn_type == "l2tp" and tk.l2tp_username:
-                await remove_l2tp_peer(tk.l2tp_username)
-            elif tk.wg_public_key:
-                await remove_wireguard_peer(tk.wg_public_key)
+            if tk["vpn_type"] == "l2tp" and tk["l2tp_username"]:
+                await remove_l2tp_peer(tk["l2tp_username"])
+            elif tk["wg_public_key"]:
+                await remove_wireguard_peer(tk["wg_public_key"])
         except Exception as e:
-            wg_failures.append({"token_id": tk.id, "error": str(e)})
-            logger.warning(f"[DELETE-RESELLER] VPN peer removal failed for token {tk.id}: {e}")
+            wg_failures.append({"token_id": tk["id"], "error": str(e)})
+            logger.warning(f"[DELETE-RESELLER] VPN peer removal failed for token {tk['id']}: {e}")
 
     # ── Phase 2: DB cascade deletion (bottom-up) ──
     customer_ids = select(Customer.id).where(Customer.user_id == reseller_id)
     router_ids = select(Router.id).where(Router.user_id == reseller_id)
+    plan_ids = select(Plan.id).where(Plan.user_id == reseller_id)
+    campaign_ids = select(SmsCampaign.id).where(SmsCampaign.user_id == reseller_id)
+    shop_order_ids = select(ShopOrder.id).where(ShopOrder.user_id == reseller_id)
+    shop_product_ids = select(ShopProduct.id).where(ShopProduct.user_id == reseller_id)
+    payment_method_ids = select(ResellerPaymentMethod.id).where(
+        ResellerPaymentMethod.user_id == reseller_id
+    )
 
     # 1. Null out vouchers.redeemed_by pointing to this reseller's customers
     await db.execute(
@@ -1684,6 +1825,88 @@ async def delete_reseller(
         "DELETE FROM radius_reply WHERE customer_id IN (SELECT id FROM customers WHERE user_id = :uid)"
     ).bindparams(uid=reseller_id))
 
+    # Messaging/SMS tables added after this deleter was first written.
+    await db.execute(delete(SmsMessage).where(or_(
+        SmsMessage.user_id == reseller_id,
+        SmsMessage.customer_id.in_(customer_ids),
+        SmsMessage.campaign_id.in_(campaign_ids),
+    )))
+    await db.execute(delete(SmsCampaign).where(SmsCampaign.user_id == reseller_id))
+    await db.execute(delete(MessageTemplate).where(MessageTemplate.user_id == reseller_id))
+    await db.execute(delete(SmsCreditOrder).where(SmsCreditOrder.user_id == reseller_id))
+    await db.execute(delete(SmsCreditTransaction).where(SmsCreditTransaction.user_id == reseller_id))
+    await db.execute(delete(SmsCreditAccount).where(SmsCreditAccount.user_id == reseller_id))
+    await db.execute(delete(ResellerInboxMessage).where(or_(
+        ResellerInboxMessage.recipient_user_id == reseller_id,
+        ResellerInboxMessage.sender_user_id == reseller_id,
+    )))
+
+    # Preserve C2B audit rows but remove links to the deleted reseller/customers.
+    await db.execute(
+        update(C2BTransaction)
+        .where(C2BTransaction.matched_customer_id.in_(customer_ids))
+        .values(matched_customer_id=None)
+    )
+    await db.execute(
+        update(C2BTransaction)
+        .where(C2BTransaction.matched_reseller_id == reseller_id)
+        .values(matched_reseller_id=None)
+    )
+    await db.execute(
+        update(UnmatchedC2BPayment)
+        .where(UnmatchedC2BPayment.assigned_reseller_id == reseller_id)
+        .values(assigned_reseller_id=None)
+    )
+    await db.execute(
+        update(UnmatchedC2BPayment)
+        .where(UnmatchedC2BPayment.resolved_by_user_id == reseller_id)
+        .values(resolved_by_user_id=None)
+    )
+    await db.execute(
+        update(UnmatchedC2BPayment)
+        .where(UnmatchedC2BPayment.resolution_customer_id.in_(customer_ids))
+        .values(resolution_customer_id=None)
+    )
+
+    # Captive portal/shop data and cross-row shop references.
+    await db.execute(delete(PortalSettings).where(PortalSettings.user_id == reseller_id))
+    await db.execute(
+        update(ShopOrderTracking)
+        .where(ShopOrderTracking.updated_by_user_id == reseller_id)
+        .values(updated_by_user_id=None)
+    )
+    await db.execute(delete(ShopOrderTracking).where(ShopOrderTracking.order_id.in_(shop_order_ids)))
+    await db.execute(delete(ShopOrderItem).where(ShopOrderItem.order_id.in_(shop_order_ids)))
+    await db.execute(
+        update(ShopOrderItem)
+        .where(ShopOrderItem.product_id.in_(shop_product_ids))
+        .values(product_id=None)
+    )
+    await db.execute(delete(ShopOrder).where(ShopOrder.user_id == reseller_id))
+    await db.execute(delete(ShopProduct).where(ShopProduct.user_id == reseller_id))
+
+    await db.execute(delete(SubscriptionShareCode).where(or_(
+        SubscriptionShareCode.owner_customer_id.in_(customer_ids),
+        SubscriptionShareCode.redeemed_customer_id.in_(customer_ids),
+        SubscriptionShareCode.router_id.in_(router_ids),
+    )))
+    await db.execute(
+        update(Customer)
+        .where(Customer.subscription_owner_id.in_(customer_ids))
+        .values(subscription_owner_id=None)
+    )
+    await db.execute(
+        update(DevicePairing)
+        .where(DevicePairing.subscription_owner_customer_id.in_(customer_ids))
+        .values(subscription_owner_customer_id=None)
+    )
+    await db.execute(delete(AccessCredential).where(or_(
+        AccessCredential.user_id == reseller_id,
+        AccessCredential.router_id.in_(router_ids),
+    )))
+    await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.reseller_id == reseller_id))
+    await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id.in_(customer_ids)))
+
     # 4. Customer ratings
     await db.execute(delete(CustomerRating).where(CustomerRating.customer_id.in_(customer_ids)))
 
@@ -1693,7 +1916,10 @@ async def delete_reseller(
     # 5b. Customer usage periods (NOT NULL customer_id FK — must be deleted
     #     explicitly; SQLAlchemy's default would try to NULL the FK and fail).
     await db.execute(delete(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id.in_(customer_ids)))
-    await db.execute(delete(UsageCapWatchState).where(UsageCapWatchState.customer_id.in_(customer_ids)))
+    await db.execute(delete(UsageCapWatchState).where(or_(
+        UsageCapWatchState.customer_id.in_(customer_ids),
+        UsageCapWatchState.router_id.in_(router_ids),
+    )))
 
     # 6. Provisioning logs (customer-side + router-side)
     await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id.in_(customer_ids)))
@@ -1759,15 +1985,15 @@ async def delete_reseller(
     await db.execute(
         update(Customer).where(Customer.router_id.in_(router_ids)).values(router_id=None)
     )
-    plan_ids = select(Plan.id).where(Plan.user_id == reseller_id)
     await db.execute(
         update(Customer).where(Customer.plan_id.in_(plan_ids)).values(plan_id=None)
     )
     await db.execute(
         update(Voucher).where(Voucher.router_id.in_(router_ids)).values(router_id=None)
     )
+    await db.execute(delete(Voucher).where(Voucher.plan_id.in_(plan_ids)))
     await db.execute(
-        update(Voucher).where(Voucher.plan_id.in_(plan_ids)).values(plan_id=None)
+        update(Router).where(Router.payment_method_id.in_(payment_method_ids)).values(payment_method_id=None)
     )
 
     # 17. Routers
@@ -1786,7 +2012,18 @@ async def delete_reseller(
     await db.execute(delete(ResellerPayout).where(ResellerPayout.reseller_id == reseller_id))
 
     # 21b. Reseller transaction charges
-    await db.execute(delete(ResellerTransactionCharge).where(ResellerTransactionCharge.reseller_id == reseller_id))
+    created_charge_ids = select(ResellerTransactionCharge.id).where(
+        ResellerTransactionCharge.created_by == reseller_id
+    )
+    await db.execute(
+        update(B2BTransaction)
+        .where(B2BTransaction.charge_id.in_(created_charge_ids))
+        .values(charge_id=None)
+    )
+    await db.execute(delete(ResellerTransactionCharge).where(or_(
+        ResellerTransactionCharge.reseller_id == reseller_id,
+        ResellerTransactionCharge.created_by == reseller_id,
+    )))
 
     # 21c. Subscription payments (must precede invoices due to FK)
     await db.execute(delete(SubscriptionPayment).where(SubscriptionPayment.user_id == reseller_id))
@@ -1800,15 +2037,6 @@ async def delete_reseller(
     # 22. Reseller payment methods
     await db.execute(delete(ResellerPaymentMethod).where(ResellerPaymentMethod.user_id == reseller_id))
 
-    # 22b. MTN MoMo transactions (references reseller_id and customer_id)
-    await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.reseller_id == reseller_id))
-    await db.execute(
-        delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id.in_(customer_ids))
-    )
-
-    # 22c. Access credentials owned by this reseller (router FK already cleaned up above)
-    await db.execute(delete(AccessCredential).where(AccessCredential.user_id == reseller_id))
-
     # 22d. CRM / Lead pipeline cleanup
     #   - Drop activities/follow-ups this reseller created on OTHER resellers'
     #     leads (created_by is NOT NULL so we can't null them out).
@@ -1817,12 +2045,14 @@ async def delete_reseller(
     #   - Null out leads.converted_user_id pointing to this user so we don't
     #     trip the leads_converted_user_id_fkey constraint.
     #   - Delete this reseller's lead sources.
+    lead_source_ids = select(LeadSource.id).where(LeadSource.user_id == reseller_id)
     await db.execute(delete(LeadActivity).where(LeadActivity.created_by == reseller_id))
     await db.execute(delete(LeadFollowUp).where(LeadFollowUp.created_by == reseller_id))
     await db.execute(delete(Lead).where(Lead.user_id == reseller_id))
     await db.execute(
         update(Lead).where(Lead.converted_user_id == reseller_id).values(converted_user_id=None)
     )
+    await db.execute(update(Lead).where(Lead.source_id.in_(lead_source_ids)).values(source_id=None))
     await db.execute(delete(LeadSource).where(LeadSource.user_id == reseller_id))
 
     # 23. Null out created_by references from other users
@@ -1833,15 +2063,11 @@ async def delete_reseller(
 
     await db.commit()
 
-    logger.info(f"[DELETE-RESELLER] Deleted reseller {reseller_id} ({reseller.email}): {summary}")
+    logger.info(f"[DELETE-RESELLER] Deleted reseller {reseller_id} ({reseller_info['email']}): {summary}")
 
     return {
         "dry_run": False,
-        "reseller": {
-            "id": reseller.id,
-            "email": reseller.email,
-            "organization_name": reseller.organization_name,
-        },
+        "reseller": reseller_info,
         "deleted": summary,
         "wireguard_failures": wg_failures,
         "message": "Reseller and all associated data deleted successfully.",
