@@ -1532,9 +1532,10 @@ async def get_mpesa_transactions_summary(
 
         if want_mpesa:
             mpesa_stmt = (
-                select(MpesaTransaction, Customer, Router)
+                select(MpesaTransaction, Customer, Router, Plan)
                 .join(Customer, MpesaTransaction.customer_id == Customer.id, isouter=True)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
+                .join(Plan, Customer.plan_id == Plan.id, isouter=True)
                 .where(
                     (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
                 )
@@ -1546,7 +1547,7 @@ async def get_mpesa_transactions_summary(
             if date_end:
                 mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at <= date_end)
 
-            for tx, customer, rtr in (await db.execute(mpesa_stmt)).all():
+            for tx, customer, rtr, plan in (await db.execute(mpesa_stmt)).all():
                 rows.append({
                     "amount": float(tx.amount),
                     "status": tx.status.value,
@@ -1554,13 +1555,15 @@ async def get_mpesa_transactions_summary(
                     "router_name": rtr.name if rtr else None,
                     "router_id": rtr.id if rtr else None,
                     "counts_as_revenue": True,
+                    "connection_type": plan.connection_type.value if plan and plan.connection_type else None,
                 })
 
         if want_other:
             cp_stmt = (
-                select(CustomerPayment, Customer, Router)
+                select(CustomerPayment, Customer, Router, Plan)
                 .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
+                .outerjoin(Plan, Customer.plan_id == Plan.id)
                 .where(
                     CustomerPayment.reseller_id == user.id,
                     CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
@@ -1579,7 +1582,7 @@ async def get_mpesa_transactions_summary(
             if date_end:
                 cp_stmt = cp_stmt.where(CustomerPayment.created_at <= date_end)
 
-            for pay, customer, rtr in (await db.execute(cp_stmt)).all():
+            for pay, customer, rtr, plan in (await db.execute(cp_stmt)).all():
                 rows.append({
                     "amount": float(pay.amount),
                     "status": pay.status.value if pay.status else "completed",
@@ -1587,6 +1590,7 @@ async def get_mpesa_transactions_summary(
                     "router_name": rtr.name if rtr else None,
                     "router_id": rtr.id if rtr else None,
                     "counts_as_revenue": bool(pay.counts_as_revenue),
+                    "connection_type": plan.connection_type.value if plan and plan.connection_type else None,
                 })
 
         total_transactions = len(rows)
@@ -1622,6 +1626,23 @@ async def get_mpesa_transactions_summary(
                 if r["counts_as_revenue"]:
                     router_breakdown[rname]["amount"] += r["amount"]
 
+        # Hotspot vs PPPoE split — completed, revenue-counting rows only.
+        # static_ip / null plans stay out of the split but remain in the totals.
+        connection_type_breakdown: dict = {
+            "hotspot": {"count": 0, "amount": 0},
+            "pppoe": {"count": 0, "amount": 0},
+        }
+        for r in rows:
+            ct = r.get("connection_type")
+            if ct not in ("hotspot", "pppoe"):
+                continue
+            if r["status"] != "completed" or not r["counts_as_revenue"]:
+                continue
+            connection_type_breakdown[ct]["count"] += 1
+            connection_type_breakdown[ct]["amount"] += r["amount"]
+        for ct in connection_type_breakdown:
+            connection_type_breakdown[ct]["amount"] = round(connection_type_breakdown[ct]["amount"], 2)
+
         return {
             "total_transactions": total_transactions,
             "total_amount": total_amount,
@@ -1629,6 +1650,7 @@ async def get_mpesa_transactions_summary(
             "status_breakdown": status_breakdown,
             "method_breakdown": method_breakdown,
             "router_breakdown": router_breakdown,
+            "connection_type_breakdown": connection_type_breakdown,
             "period": {
                 "date": date,
                 "start_date": start_date,
