@@ -134,6 +134,15 @@ def reset_fake_mikrotik_api():
     FakeMikroTikAPI.initial_services = None
 
 
+@pytest.fixture(autouse=True)
+def reset_webfig_upstream_client():
+    # The proxy now reuses one persistent httpx client (module global); reset it between
+    # tests so each test's monkeypatched FakeAsyncClient is the one that gets created.
+    router_management._webfig_upstream_client = None
+    yield
+    router_management._webfig_upstream_client = None
+
+
 def test_remote_access_rejects_unrestricted_sources():
     with pytest.raises(router_remote_access.RouterRemoteAccessError):
         router_remote_access.normalize_source_cidrs(["0.0.0.0/0"])
@@ -372,6 +381,73 @@ async def test_open_router_webfig_returns_short_lived_proxy_path_after_commit(db
     )
     assert calls[1] == "availability_recorded"
     router_remote_access.revoke_webfig_proxy_sessions(router.id)
+
+
+def test_forward_webfig_query_preserves_raw_listen_token():
+    """WebFig's live channel is GET /jsproxy/?<binary-token>.
+
+    The token is raw binary percent-encoded straight into the query string with no
+    key=value pair. Re-parsing it through request.query_params and rebuilding with
+    urlencode corrupts it (it appends "=" to the value-less token), so the router 403s
+    the channel and WebFig logs the operator out. It must pass through byte-for-byte.
+    """
+    raw = "%00%00%00%04%00%00%02J%C3%AD%1Dq~nX"
+    req = _request("/jsproxy/", query=raw)
+    assert router_management._forward_webfig_query(req) == raw
+
+
+def test_forward_webfig_query_strips_remote_access_token_but_keeps_rest():
+    req = _request(
+        "/api/admin/routers/77/webfig/",
+        query="remote_access_token=GjHaiomz004Z&tab=interfaces",
+    )
+    assert router_management._forward_webfig_query(req) == "tab=interfaces"
+
+
+def test_forward_webfig_query_strips_sole_remote_access_token():
+    req = _request("/api/admin/routers/77/webfig/", query="remote_access_token=GjHaiomz004Z")
+    assert router_management._forward_webfig_query(req) == ""
+
+
+@pytest.mark.asyncio
+async def test_webfig_proxy_reuses_one_upstream_client_across_requests(monkeypatch):
+    """RouterOS binds WebFig's live /jsproxy listen channel to the TCP connection.
+
+    A fresh httpx client per request closed that connection, so the router dropped the
+    listener (-> 404 on the poll) and logged the operator out. The proxy must reuse one
+    keep-alive client across requests so the connection -- and the listener -- survive.
+    """
+    session = router_remote_access.create_webfig_proxy_session(
+        router_id=90,
+        router_name="Router-90",
+        router_ip="10.0.90.1",
+        created_by_user_id=1,
+    )
+    created = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+
+        async def request(self, method, url, headers=None, content=None):
+            return httpx.Response(200, headers={"content-type": "text/html"}, content=b"ok")
+
+    monkeypatch.setattr(router_management.httpx, "AsyncClient", FakeAsyncClient)
+
+    for _ in range(3):
+        resp = await router_management.proxy_router_webfig(
+            90,
+            _request(
+                "/api/admin/routers/90/webfig/",
+                f"remote_access_token={session.token}",
+                headers=[(b"host", b"testserver")],
+            ),
+            "",
+        )
+        assert resp.status_code == 200
+
+    assert len(created) == 1
+    router_remote_access.revoke_webfig_proxy_sessions(90)
 
 
 @pytest.mark.asyncio
