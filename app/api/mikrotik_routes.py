@@ -24,6 +24,7 @@ _health_cache = {}  # router_id -> {"data": ..., "timestamp": ...}
 _health_cache_ttl = 60  # Fresh live health TTL. Stale dashboard calls revalidate in background.
 _health_cache_stale_ttl = 1800  # Keep last live system details for 30 min instead of showing blanks.
 _health_refresh_retry_floor = 20  # Minimum seconds between background live refresh starts per router.
+_health_refresh_inflight_max_age_seconds = 45  # Background refresh should finish in ~10s; recover if marker sticks.
 _health_refresh_inflight = set()  # cache keys currently being refreshed after a fast snapshot response
 _health_refresh_last_started = {}  # cache_key -> datetime of last live refresh attempt
 
@@ -475,6 +476,24 @@ def _queue_health_cache_refresh(
     cache_key,
 ) -> dict:
     if cache_key in _health_refresh_inflight:
+        last_started = _health_refresh_last_started.get(cache_key)
+        if not last_started:
+            logger.warning(
+                "Clearing MikroTik health refresh marker without timestamp for %s",
+                router_name,
+            )
+            _health_refresh_inflight.discard(cache_key)
+        else:
+            elapsed = (datetime.utcnow() - last_started).total_seconds()
+            if elapsed > _health_refresh_inflight_max_age_seconds:
+                logger.warning(
+                    "Clearing stale MikroTik health refresh marker for %s after %.1fs",
+                    router_name,
+                    elapsed,
+                )
+                _health_refresh_inflight.discard(cache_key)
+
+    if cache_key in _health_refresh_inflight:
         return {"refresh_in_progress": True, "retry_after_seconds": 5}
 
     last_started = _health_refresh_last_started.get(cache_key)
@@ -710,6 +729,7 @@ async def get_mikrotik_health(
             "data": result,
             "timestamp": datetime.utcnow()
         }
+        _health_refresh_inflight.discard(cache_key)
         
         return _shape_health_response(
             result,
