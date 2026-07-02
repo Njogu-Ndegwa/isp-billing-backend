@@ -264,6 +264,9 @@ class CustomerPayment(Base):
     payment_reference = Column(String(100), nullable=True)
     payment_date = Column(DateTime, default=datetime.utcnow)
     days_paid_for = Column(Integer, nullable=False)
+    # Snapshot of the plan purchased in THIS payment. Customer.plan_id is
+    # overwritten on every purchase, so it cannot be used for history.
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
     status = Column(Enum(PaymentStatus), default=PaymentStatus.COMPLETED)
     notes = Column(String(500), nullable=True)
     # Snapshot of customer name at payment time — preserved after customer deletion
@@ -513,6 +516,9 @@ class MpesaTransaction(Base):
     lipay_tx_no = Column(String(255), nullable=True)  # <-- Add this line
     status = Column(Enum(MpesaTransactionStatus), default=MpesaTransactionStatus.pending)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    # Snapshot of the plan purchased in THIS transaction. Customer.plan_id is
+    # overwritten on every purchase, so it cannot be used for history.
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
     merchant_request_id = Column(String(255), nullable=True)
     mpesa_receipt_number = Column(String(255), nullable=True)
     result_code = Column(String(50), nullable=True)

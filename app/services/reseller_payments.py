@@ -50,6 +50,9 @@ async def record_customer_payment(
         days_paid_for=days_paid_for,
         notes=notes,
         customer_name=customer.name,
+        # Snapshot the plan being paid for — customer.plan_id is already set
+        # to the purchased plan by the time any payment is recorded.
+        plan_id=customer.plan_id,
         collection_mode=collection_mode,
         counts_as_revenue=counts_as_revenue,
     )
