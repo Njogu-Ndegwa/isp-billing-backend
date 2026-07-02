@@ -686,6 +686,30 @@ async def run_payment_method_migrations():
             """))
             logger.info("Migration: Added collection_mode column to customer_payments")
 
+        # Add plan_id snapshot to mpesa_transactions and customer_payments if
+        # missing. Records the plan purchased in each transaction so history
+        # doesn't follow the customer's current plan (see
+        # migrations/add_transaction_plan_id.py).
+        for tx_table in ("mpesa_transactions", "customer_payments"):
+            result = await conn.execute(sa_text(f"""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = '{tx_table}' AND column_name = 'plan_id'
+            """))
+            if not result.fetchone():
+                await conn.execute(sa_text(f"""
+                    ALTER TABLE {tx_table}
+                    ADD COLUMN plan_id INTEGER NULL
+                """))
+                await conn.execute(sa_text(f"""
+                    ALTER TABLE {tx_table}
+                    ADD CONSTRAINT fk_{tx_table}_plan_id
+                    FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE SET NULL
+                """))
+                logger.info(f"Migration: Added plan_id column to {tx_table}")
+            else:
+                logger.info(f"Migration: {tx_table}.plan_id already exists, skipping")
+
         # Create reseller_transaction_charges table if it doesn't exist
         from app.db.models import ResellerTransactionCharge
         await conn.run_sync(
