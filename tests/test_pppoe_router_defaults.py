@@ -68,6 +68,161 @@ def test_ensure_pppoe_profile_sets_only_one_on_create():
     )
 
 
+def test_ensure_pppoe_fasttrack_bypass_rebuilds_rules_after_fasttrack():
+    api = _connected_api()
+    commands = []
+
+    api.get_ip_pool_status = lambda pool_name: {
+        "success": True,
+        "pools": [{"name": pool_name, "ranges": "192.168.89.254-192.168.89.254"}],
+    }
+
+    def send_command_optimized(command, proplist=None, query=""):
+        assert command == "/ip/firewall/filter/print"
+        return {
+            "success": True,
+            "data": [
+                {".id": "*1", "chain": "forward", "action": "fasttrack-connection", "disabled": "false"},
+                {
+                    ".id": "*2",
+                    "chain": "forward",
+                    "action": "accept",
+                    "src-address": "192.168.89.254",
+                    "comment": "PPPoE bypass FastTrack (src) 192.168.89.254/32",
+                    "disabled": "false",
+                },
+                {
+                    ".id": "*3",
+                    "chain": "forward",
+                    "action": "accept",
+                    "dst-address": "192.168.89.254",
+                    "comment": "PPPoE bypass FastTrack (dst) 192.168.89.254/32",
+                    "disabled": "false",
+                },
+            ],
+        }
+
+    def send_command(command, args=None):
+        commands.append((command, args or {}))
+        return {"success": True}
+
+    api.send_command_optimized = send_command_optimized
+    api.send_command = send_command
+
+    result = api.ensure_pppoe_fasttrack_bypass(pool_name="pppoe-pool")
+
+    assert result["success"] is True
+    assert result["rules_removed"] == 2
+    assert result["rules_added"] == 2
+    assert (
+        "/ip/firewall/filter/remove",
+        {"numbers": "*2"},
+    ) in commands
+    assert (
+        "/ip/firewall/filter/remove",
+        {"numbers": "*3"},
+    ) in commands
+    assert (
+        "/ip/firewall/filter/add",
+        {
+            "chain": "forward",
+            "src-address": "192.168.89.254/32",
+            "action": "accept",
+            "comment": "PPPoE bypass FastTrack (src) 192.168.89.254/32",
+            "place-before": "*1",
+        },
+    ) in commands
+    assert (
+        "/ip/firewall/filter/add",
+        {
+            "chain": "forward",
+            "dst-address": "192.168.89.254/32",
+            "action": "accept",
+            "comment": "PPPoE bypass FastTrack (dst) 192.168.89.254/32",
+            "place-before": "*1",
+        },
+    ) in commands
+
+
+def test_ensure_pppoe_fasttrack_bypass_reuses_rules_before_fasttrack():
+    api = _connected_api()
+    commands = []
+
+    api.get_ip_pool_status = lambda pool_name: {
+        "success": True,
+        "pools": [{"name": pool_name, "ranges": "192.168.89.254-192.168.89.254"}],
+    }
+
+    def send_command_optimized(command, proplist=None, query=""):
+        return {
+            "success": True,
+            "data": [
+                {
+                    ".id": "*2",
+                    "chain": "forward",
+                    "action": "accept",
+                    "src-address": "192.168.89.254/32",
+                    "comment": "PPPoE bypass FastTrack (src) 192.168.89.254/32",
+                    "disabled": "false",
+                },
+                {
+                    ".id": "*3",
+                    "chain": "forward",
+                    "action": "accept",
+                    "dst-address": "192.168.89.254/32",
+                    "comment": "PPPoE bypass FastTrack (dst) 192.168.89.254/32",
+                    "disabled": "false",
+                },
+                {".id": "*1", "chain": "forward", "action": "fasttrack-connection", "disabled": "false"},
+            ],
+        }
+
+    api.send_command_optimized = send_command_optimized
+    api.send_command = lambda command, args=None: commands.append((command, args or {})) or {"success": True}
+
+    result = api.ensure_pppoe_fasttrack_bypass(pool_name="pppoe-pool")
+
+    assert result["success"] is True
+    assert result["rules_reused"] == 2
+    assert result["rules_added"] == 0
+    assert result["rules_removed"] == 0
+    assert commands == []
+
+
+def test_add_pppoe_secret_updates_when_router_reports_same_name_exists():
+    api = _connected_api()
+    commands = []
+
+    def send_command(command, args=None):
+        commands.append((command, args or {}))
+        if command == "/ppp/secret/add":
+            return {"error": "failure: secret with the same name already exists"}
+        if command == "/ppp/secret/print":
+            return {"success": True, "data": [{".id": "*7", "name": "Festo"}]}
+        return {"success": True}
+
+    api.send_command = send_command
+
+    result = api.add_pppoe_secret(
+        username="Festo",
+        password="secret",
+        profile="pppoe_3M_2M",
+        comment="CID:8257|repair",
+    )
+
+    assert result == {"success": True}
+    assert commands[-1] == (
+        "/ppp/secret/set",
+        {
+            "numbers": "*7",
+            "password": "secret",
+            "profile": "pppoe_3M_2M",
+            "service": "pppoe",
+            "comment": "CID:8257|repair",
+        },
+    )
+
+
 def test_pppoe_provisioning_creates_missing_default_pool_before_profile(monkeypatch):
     class FakeMikroTikAPI:
         instances = []

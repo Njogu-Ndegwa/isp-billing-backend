@@ -54,6 +54,14 @@ Project-level items that should survive across agent sessions.
 - Why it matters: operators need an early signal when parent queues are repeatedly regenerated or queue repair falls behind, before customers report unlimited speeds.
 - Proposed next step: record queue repair duration, routers processed, parent queues removed, queues created, queues updated, skipped recently-offline routers, and errors in job metrics or a small health endpoint.
 
+### PPPoE FastTrack Bypass Order And Profile Drift
+
+- Status: started
+- Problem: PPPoE speed enforcement can drift when a customer remains on an old symmetric profile after an asymmetric plan change.
+- Why it matters: RouterOS dynamic PPP queues only enforce reliably when the secret profile matches the DB plan and the PPPoE pool accept rules are before FastTrack; otherwise customers can see incorrect or skipped limits.
+- Done so far: `ensure_pppoe_fasttrack_bypass` now rebuilds/removes stale managed bypass rules that are after the earliest active FastTrack rule, with focused tests.
+- Proposed next step: add an admin repair/check that compares DB plan speed with router secret profile and active dynamic queue limits, then safely reprovisions mismatched active PPPoE customers.
+
 ### RADIUS Expansion
 
 - Status: planned

@@ -2785,13 +2785,15 @@ class MikroTikAPI:
             filter_rules = filters_result.get("data", []) if filters_result.get("success") else []
 
             fasttrack_rule = None
-            for rule in filter_rules:
+            fasttrack_index = None
+            for idx, rule in enumerate(filter_rules):
                 if (
                     rule.get("chain") == "forward"
                     and rule.get("action") == "fasttrack-connection"
                     and str(rule.get("disabled", "false")).lower() != "true"
                 ):
                     fasttrack_rule = rule
+                    fasttrack_index = idx
                     break
 
             if not fasttrack_rule:
@@ -2804,47 +2806,92 @@ class MikroTikAPI:
                 }
 
             ft_id = fasttrack_rule.get(".id")
+            if not ft_id:
+                return {"error": "Active FastTrack rule has no identifier; cannot place PPPoE bypass rules"}
             rules_added = 0
+            rules_removed = 0
+            rules_reused = 0
+            warnings: List[str] = []
+
+            def _active_rule(rule: Dict[str, Any]) -> bool:
+                return str(rule.get("disabled", "false")).lower() != "true"
+
+            def _matching_managed_rules(comment: str) -> List[tuple[int, Dict[str, Any]]]:
+                return [
+                    (idx, rule)
+                    for idx, rule in enumerate(filter_rules)
+                    if rule.get("comment") == comment
+                ]
+
+            def _rule_before_fasttrack(idx: int) -> bool:
+                return fasttrack_index is None or idx < fasttrack_index
+
+            def _rule_address_matches(rule_address: str, cidr: str) -> bool:
+                rule_value = str(rule_address or "").strip()
+                if rule_value == cidr:
+                    return True
+                try:
+                    network = ipaddress.ip_network(cidr, strict=False)
+                    if network.prefixlen == network.max_prefixlen:
+                        return rule_value == str(network.network_address)
+                except ValueError:
+                    pass
+                return False
+
+            def _ensure_bypass_rule(comment: str, address_field: str, cidr: str) -> Optional[str]:
+                nonlocal rules_added, rules_removed, rules_reused
+
+                matches = _matching_managed_rules(comment)
+                valid_rule = None
+                for idx, rule in matches:
+                    if (
+                        _rule_address_matches(rule.get(address_field, ""), cidr)
+                        and _active_rule(rule)
+                        and _rule_before_fasttrack(idx)
+                    ):
+                        valid_rule = rule
+                        break
+
+                for idx, rule in matches:
+                    if valid_rule is not None and rule is valid_rule:
+                        continue
+                    rule_id = rule.get(".id")
+                    if not rule_id:
+                        continue
+                    remove = self.send_command("/ip/firewall/filter/remove", {"numbers": rule_id})
+                    if remove.get("error"):
+                        warnings.append(f"Could not remove stale FastTrack bypass rule {comment}: {remove['error']}")
+                    else:
+                        rules_removed += 1
+
+                if valid_rule is not None:
+                    rules_reused += 1
+                    return None
+
+                args = {
+                    "chain": "forward",
+                    address_field: cidr,
+                    "action": "accept",
+                    "comment": comment,
+                    "place-before": ft_id,
+                }
+                result = self.send_command("/ip/firewall/filter/add", args)
+                if result.get("error"):
+                    return result["error"]
+                rules_added += 1
+                return None
+
             for cidr in cidrs:
                 src_comment = f"PPPoE bypass FastTrack (src) {cidr}"
                 dst_comment = f"PPPoE bypass FastTrack (dst) {cidr}"
 
-                src_exists = any(
-                    r.get("comment") == src_comment
-                    and r.get("src-address") == cidr
-                    and str(r.get("disabled", "false")).lower() != "true"
-                    for r in filter_rules
-                )
-                dst_exists = any(
-                    r.get("comment") == dst_comment
-                    and r.get("dst-address") == cidr
-                    and str(r.get("disabled", "false")).lower() != "true"
-                    for r in filter_rules
-                )
+                src_error = _ensure_bypass_rule(src_comment, "src-address", cidr)
+                if src_error:
+                    return {"error": f"FastTrack bypass (src {cidr}): {src_error}"}
 
-                if not src_exists and ft_id:
-                    result = self.send_command("/ip/firewall/filter/add", {
-                        "chain": "forward",
-                        "src-address": cidr,
-                        "action": "accept",
-                        "comment": src_comment,
-                        "place-before": ft_id,
-                    })
-                    if result.get("error"):
-                        return {"error": f"FastTrack bypass (src {cidr}): {result['error']}"}
-                    rules_added += 1
-
-                if not dst_exists and ft_id:
-                    result = self.send_command("/ip/firewall/filter/add", {
-                        "chain": "forward",
-                        "dst-address": cidr,
-                        "action": "accept",
-                        "comment": dst_comment,
-                        "place-before": ft_id,
-                    })
-                    if result.get("error"):
-                        return {"error": f"FastTrack bypass (dst {cidr}): {result['error']}"}
-                    rules_added += 1
+                dst_error = _ensure_bypass_rule(dst_comment, "dst-address", cidr)
+                if dst_error:
+                    return {"error": f"FastTrack bypass (dst {cidr}): {dst_error}"}
 
             return {
                 "success": True,
@@ -2852,6 +2899,9 @@ class MikroTikAPI:
                 "pool_name": effective_pool,
                 "cidrs": cidrs,
                 "rules_added": rules_added,
+                "rules_removed": rules_removed,
+                "rules_reused": rules_reused,
+                "warnings": warnings,
             }
         except Exception as e:
             logger.error(f"Error ensuring PPPoE FastTrack bypass: {e}")
@@ -2917,11 +2967,19 @@ class MikroTikAPI:
 
             result = self.send_command("/ppp/secret/add", args)
             if "error" in result:
-                if "already have" in result.get("error", ""):
+                if _router_error_is_duplicate(result.get("error", "")):
+                    secret_id = username
+                    secrets = self.send_command("/ppp/secret/print")
+                    if secrets.get("success") and secrets.get("data"):
+                        for secret in secrets["data"]:
+                            if secret.get("name") == username:
+                                secret_id = secret.get(".id") or username
+                                break
                     update_args = {
-                        "numbers": username,
+                        "numbers": secret_id,
                         "password": password,
                         "profile": profile,
+                        "service": service,
                     }
                     if comment:
                         update_args["comment"] = comment
