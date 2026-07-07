@@ -108,6 +108,15 @@ probe, re-run-safe wireguard step, per-platform remedy text).
 
 ## Follow-Up Work
 
+- 2026-07-07 recurrence: v7 provisioning hit the same parse-sensitive command
+  after the script grew to line 137:
+  `:do { /ip hotspot profile set [find where name=hsprof1] html-directory=$bwHtmlDir } on-error={`.
+  This happened when the profile `add` path failed and the fallback update was
+  parsed. The generator now avoids the fragile hotspot-profile
+  `[find where name=hsprof1]` form for both the fallback `set` and later
+  `get`, using named-profile access instead; regression coverage lives in
+  `tests/test_provisioning_script.py`.
+
 - STEP 4–6 still reference `/ip hotspot` directly; they are only reached when
   the probe passed, so they're safe today — but any future reordering that
   puts hotspot references before the preflight reintroduces the crash

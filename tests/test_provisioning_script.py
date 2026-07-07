@@ -84,6 +84,14 @@ def test_wireguard_step_is_rerun_safe():
             assert line.startswith("    "), f"unwrapped: {line}"
 
 
+def test_hotspot_profile_fallback_avoids_parse_fragile_find_where():
+    script = generate_rsc_script(_token("wireguard"))
+    assert "/ip hotspot profile set [find where name=hsprof1]" not in script
+    assert "/ip hotspot profile get [find where name=hsprof1]" not in script
+    assert "/ip hotspot profile set hsprof1 html-directory=$bwHtmlDir" in script
+    assert "/ip hotspot profile get hsprof1 html-directory" in script
+
+
 def test_no_line_continuation_backslashes():
     for vpn_type in ("wireguard", "l2tp"):
         script = generate_rsc_script(_token(vpn_type))

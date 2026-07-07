@@ -662,7 +662,7 @@ def _rsc_hotspot(token: ProvisioningToken) -> str:
     /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=$bwHtmlDir
     :log info ("Provisioning: hotspot profile hsprof1 created with html-directory=" . $bwHtmlDir)
 } on-error={
-    :do { /ip hotspot profile set [find where name=hsprof1] html-directory=$bwHtmlDir } on-error={
+    :do { /ip hotspot profile set hsprof1 html-directory=$bwHtmlDir } on-error={
         :log warning "Provisioning: could not update hsprof1 html-directory, continuing"
     }
     :log info ("Provisioning: hotspot profile hsprof1 already existed, html-directory=" . $bwHtmlDir)
@@ -721,7 +721,7 @@ def _rsc_login_page(token: ProvisioningToken) -> str:
 # available.
 :local htmlDir ""
 :do {{
-    :set htmlDir [/ip hotspot profile get [find where name=hsprof1] html-directory]
+    :set htmlDir [/ip hotspot profile get hsprof1 html-directory]
 }} on-error={{}}
 :if ([:len $htmlDir] = 0) do={{
     :global bwHtmlDir
