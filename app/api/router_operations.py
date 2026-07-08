@@ -3,12 +3,12 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func
 from sqlalchemy.orm import selectinload
-from typing import Optional, List
+from typing import Any, Dict, List, Optional, Set
 from datetime import datetime, timedelta
 from dataclasses import asdict
 from pathlib import Path
 
-from app.db.database import get_db
+from app.db.database import db_pool_snapshot, get_db
 from app.db.models import Router, Customer, Plan, CustomerStatus, ConnectionType, ProvisioningToken
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import (
@@ -2508,6 +2508,618 @@ async def remove_single_illegal_user(
 
 _port_status_cache: dict = {}  # router_id -> {"data": ..., "timestamp": datetime}
 _PORT_CACHE_TTL = 30  # 30 seconds -- port status changes infrequently
+_port_analytics_cache: dict = {}  # router_id -> {"data": ..., "timestamp": datetime}
+_port_analytics_locks: dict = {}
+_PORT_ANALYTICS_CACHE_TTL = 60  # heavier live reads; serve cached data by default
+_PORT_ANALYTICS_REFRESH_FLOOR = 20  # force refresh cannot hammer one router repeatedly
+_PORT_ANALYTICS_BUSY_WAIT_SECONDS = 0.5
+_PORT_ANALYTICS_ROUTER_TIMEOUT_SECONDS = 35
+_PORT_ANALYTICS_SAMPLE_LIMIT = 25
+
+
+def _routeros_rows(resp: dict) -> List[dict]:
+    if isinstance(resp, dict) and resp.get("success"):
+        return resp.get("data") or []
+    return []
+
+
+def _cached_port_analytics(router_id: int) -> Optional[dict]:
+    cached = _port_analytics_cache.get(router_id)
+    if not cached:
+        return None
+    age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
+    result = cached["data"].copy()
+    result["cached"] = True
+    result["cache_age_seconds"] = round(age, 1)
+    return result
+
+
+def _db_pool_busy_for_optional_live_diagnostics() -> bool:
+    try:
+        pressure = (db_pool_snapshot().get("pressure") or {}).get("level")
+    except Exception as exc:
+        logger.warning("Could not read DB pool pressure for port analytics: %s", exc)
+        return False
+    return pressure in {"warning", "critical"}
+
+
+def _routeros_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() == "true"
+
+
+def _safe_routeros_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_mac_safe(mac_address: Any) -> str:
+    if not mac_address:
+        return ""
+    try:
+        return normalize_mac_address(str(mac_address))
+    except Exception:
+        return str(mac_address).upper()
+
+
+def _first_nonempty(*values: Any) -> str:
+    for value in values:
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _looks_like_infrastructure_device(
+    mac_address: str,
+    metadata: Dict[str, Any],
+    known_customer_macs: Set[str],
+) -> bool:
+    if not mac_address or mac_address in known_customer_macs:
+        return False
+    if metadata.get("neighbor"):
+        return True
+
+    text = " ".join(
+        str(metadata.get(key) or "").lower()
+        for key in ("identity", "hostname", "board", "platform", "comment")
+    )
+    token_text = text
+    for separator in ("-", "_", "/", "|", ":", "."):
+        token_text = token_text.replace(separator, " ")
+    tokens = set(token_text.split())
+    exact_markers = {"ap", "cpe"}
+    substring_markers = (
+        "access point",
+        "access",
+        "router",
+        "switch",
+        "mikrotik",
+        "ruijie",
+        "reyee",
+        "tplink",
+        "tp-link",
+        "ubnt",
+        "ubiquiti",
+        "nanostation",
+        "litebeam",
+        "nanobeam",
+    )
+    return bool(tokens & exact_markers) or any(marker in text for marker in substring_markers)
+
+
+def _monitor_ethernet(api: MikroTikAPI, port_name: str) -> Dict[str, Any]:
+    result = api.send_command(
+        "/interface/ethernet/monitor",
+        {"numbers": port_name, "once": ""},
+    )
+    rows = _routeros_rows(result)
+    return rows[0] if rows else {}
+
+
+def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
+    """Read-only downstream device and customer-load analytics for one router."""
+    api = MikroTikAPI(
+        router_info["ip"],
+        router_info["username"],
+        router_info["password"],
+        router_info["port"],
+        timeout=25,
+        connect_timeout=7,
+    )
+    if not api.connect():
+        return {"error": "connect_failed", "reason": api.last_connect_error}
+
+    try:
+        identity_rows = _routeros_rows(api.send_command("/system/identity/print"))
+        resource_rows = _routeros_rows(api.send_command("/system/resource/print"))
+        interface_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/interface/print",
+                proplist=[
+                    "name",
+                    "type",
+                    "running",
+                    "disabled",
+                    "rx-byte",
+                    "tx-byte",
+                    "rx-packet",
+                    "tx-packet",
+                    "rx-error",
+                    "tx-error",
+                    "rx-drop",
+                    "tx-drop",
+                    "link-downs",
+                    "last-link-up-time",
+                    "actual-mtu",
+                ],
+            )
+        )
+        ethernet_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/interface/ethernet/print",
+                proplist=[
+                    "name",
+                    "default-name",
+                    "running",
+                    "disabled",
+                    "mac-address",
+                    "auto-negotiation",
+                    "speed",
+                    "full-duplex",
+                    "poe-out",
+                    "poe-out-status",
+                ],
+            )
+        )
+        bridge_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/interface/bridge/print",
+                proplist=["name", "running", "disabled", "mac-address"],
+            )
+        )
+        bridge_port_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/interface/bridge/port/print",
+                proplist=[
+                    "interface",
+                    "bridge",
+                    "status",
+                    "disabled",
+                    "pvid",
+                    "hw",
+                    "hw-offload",
+                    "comment",
+                ],
+            )
+        )
+        bridge_host_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/interface/bridge/host/print",
+                proplist=[
+                    "mac-address",
+                    "interface",
+                    "on-interface",
+                    "bridge",
+                    "local",
+                    "external",
+                ],
+            )
+        )
+        neighbor_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/ip/neighbor/print",
+                proplist=[
+                    "interface",
+                    "address",
+                    "mac-address",
+                    "identity",
+                    "platform",
+                    "board",
+                    "version",
+                    "uptime",
+                ],
+            )
+        )
+        dhcp_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/ip/dhcp-server/lease/print",
+                proplist=[
+                    "address",
+                    "active-address",
+                    "mac-address",
+                    "active-mac-address",
+                    "host-name",
+                    "status",
+                    "server",
+                    "dynamic",
+                    "disabled",
+                    "last-seen",
+                    "expires-after",
+                    "comment",
+                ],
+            )
+        )
+        arp_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/ip/arp/print",
+                proplist=[
+                    "address",
+                    "mac-address",
+                    "interface",
+                    "dynamic",
+                    "complete",
+                    "disabled",
+                ],
+            )
+        )
+        hotspot_host_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/ip/hotspot/host/print",
+                proplist=[
+                    "mac-address",
+                    "address",
+                    "to-address",
+                    "server",
+                    "authorized",
+                    "bypassed",
+                    "bytes-in",
+                    "bytes-out",
+                    "uptime",
+                    "idle-time",
+                ],
+            )
+        )
+        hotspot_active_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/ip/hotspot/active/print",
+                proplist=[
+                    "user",
+                    "mac-address",
+                    "address",
+                    "server",
+                    "uptime",
+                    "idle-time",
+                    "bytes-in",
+                    "bytes-out",
+                    "login-by",
+                ],
+            )
+        )
+        ppp_active_rows = _routeros_rows(
+            api.send_command_optimized(
+                "/ppp/active/print",
+                proplist=["name", "address", "caller-id", "service", "uptime"],
+            )
+        )
+
+        iface_by_name = {row.get("name"): row for row in interface_rows if row.get("name")}
+        ethernet_by_name = {row.get("name"): row for row in ethernet_rows if row.get("name")}
+        bridge_port_by_interface = {
+            row.get("interface"): row for row in bridge_port_rows if row.get("interface")
+        }
+
+        learned_macs_by_port: Dict[str, Set[str]] = {}
+        for row in bridge_host_rows:
+            mac = _normalize_mac_safe(row.get("mac-address"))
+            if not mac or _routeros_bool(row.get("local")):
+                continue
+            port_name = _first_nonempty(row.get("on-interface"), row.get("interface"))
+            if not port_name:
+                continue
+            learned_macs_by_port.setdefault(port_name, set()).add(mac)
+
+        device_meta: Dict[str, Dict[str, Any]] = {}
+
+        def meta_for(mac: str) -> Dict[str, Any]:
+            return device_meta.setdefault(mac, {})
+
+        for row in neighbor_rows:
+            mac = _normalize_mac_safe(row.get("mac-address"))
+            if not mac:
+                continue
+            meta_for(mac).update(
+                {
+                    "neighbor": True,
+                    "identity": row.get("identity", ""),
+                    "ip": row.get("address", ""),
+                    "board": row.get("board", ""),
+                    "platform": row.get("platform", ""),
+                    "version": row.get("version", ""),
+                    "neighbor_interface": row.get("interface", ""),
+                    "neighbor_uptime": row.get("uptime", ""),
+                }
+            )
+
+        for row in dhcp_rows:
+            mac = _normalize_mac_safe(
+                _first_nonempty(row.get("active-mac-address"), row.get("mac-address"))
+            )
+            if not mac:
+                continue
+            meta_for(mac).update(
+                {
+                    "hostname": row.get("host-name", ""),
+                    "dhcp_ip": _first_nonempty(row.get("active-address"), row.get("address")),
+                    "dhcp_status": row.get("status", ""),
+                    "dhcp_server": row.get("server", ""),
+                    "last_seen": row.get("last-seen", ""),
+                    "expires_after": row.get("expires-after", ""),
+                    "comment": row.get("comment", ""),
+                }
+            )
+
+        for row in arp_rows:
+            mac = _normalize_mac_safe(row.get("mac-address"))
+            if not mac:
+                continue
+            meta_for(mac).update(
+                {
+                    "arp_ip": row.get("address", ""),
+                    "arp_interface": row.get("interface", ""),
+                }
+            )
+
+        hotspot_seen: Set[str] = set()
+        hotspot_authorized: Set[str] = set()
+        hotspot_bypassed: Set[str] = set()
+        for row in hotspot_host_rows:
+            mac = _normalize_mac_safe(row.get("mac-address"))
+            if not mac:
+                continue
+            hotspot_seen.add(mac)
+            if _routeros_bool(row.get("authorized")):
+                hotspot_authorized.add(mac)
+            if _routeros_bool(row.get("bypassed")):
+                hotspot_bypassed.add(mac)
+            meta_for(mac).update(
+                {
+                    "hotspot_ip": _first_nonempty(row.get("address"), row.get("to-address")),
+                    "hotspot_authorized": _routeros_bool(row.get("authorized")),
+                    "hotspot_bypassed": _routeros_bool(row.get("bypassed")),
+                    "hotspot_bytes": _safe_routeros_int(row.get("bytes-in"))
+                    + _safe_routeros_int(row.get("bytes-out")),
+                    "hotspot_uptime": row.get("uptime", ""),
+                    "hotspot_idle_time": row.get("idle-time", ""),
+                }
+            )
+
+        active_hotspot_macs: Set[str] = set()
+        for row in hotspot_active_rows:
+            mac = _normalize_mac_safe(row.get("mac-address"))
+            if not mac:
+                continue
+            active_hotspot_macs.add(mac)
+            meta_for(mac).update(
+                {
+                    "hotspot_active": True,
+                    "hotspot_user": row.get("user", ""),
+                    "hotspot_active_ip": row.get("address", ""),
+                    "hotspot_active_uptime": row.get("uptime", ""),
+                }
+            )
+
+        active_ppp_macs: Set[str] = set()
+        for row in ppp_active_rows:
+            mac = _normalize_mac_safe(row.get("caller-id"))
+            if not mac:
+                continue
+            active_ppp_macs.add(mac)
+            meta_for(mac).update(
+                {
+                    "ppp_active": True,
+                    "ppp_user": row.get("name", ""),
+                    "ppp_ip": row.get("address", ""),
+                    "ppp_uptime": row.get("uptime", ""),
+                }
+            )
+
+        known_customer_macs = set(customer_by_mac.keys())
+        ethernet_port_names = [
+            row.get("name")
+            for row in interface_rows
+            if row.get("type") == "ether" and row.get("name")
+        ]
+        port_names = sorted(
+            set(ethernet_port_names) | set(bridge_port_by_interface.keys()),
+            key=lambda name: (
+                0 if str(name).startswith("ether") else 1,
+                _safe_routeros_int("".join(ch for ch in str(name) if ch.isdigit())),
+                str(name),
+            ),
+        )
+
+        infrastructure_candidates = []
+        port_summaries = []
+        warnings = []
+
+        for port_name in port_names:
+            iface = iface_by_name.get(port_name, {})
+            ethernet = ethernet_by_name.get(port_name, {})
+            bridge_port = bridge_port_by_interface.get(port_name, {})
+            monitor = _monitor_ethernet(api, port_name) if ethernet else {}
+            learned_macs = learned_macs_by_port.get(port_name, set())
+            known_macs = sorted(mac for mac in learned_macs if mac in known_customer_macs)
+            unknown_macs = sorted(mac for mac in learned_macs if mac not in known_customer_macs)
+            connected_macs = sorted(
+                mac
+                for mac in known_macs
+                if (
+                    mac in hotspot_authorized
+                    or mac in hotspot_bypassed
+                    or mac in active_hotspot_macs
+                    or mac in active_ppp_macs
+                )
+            )
+
+            infrastructure_here = []
+            downstream_samples = []
+            for mac in sorted(learned_macs):
+                metadata = device_meta.get(mac, {})
+                customer = customer_by_mac.get(mac)
+                sample = {
+                    "mac": mac,
+                    "kind": "known_customer" if customer else "unknown_device",
+                    "name": (
+                        customer.get("name")
+                        if customer
+                        else _first_nonempty(metadata.get("identity"), metadata.get("hostname"))
+                    ),
+                    "ip": _first_nonempty(
+                        metadata.get("hotspot_active_ip"),
+                        metadata.get("hotspot_ip"),
+                        metadata.get("dhcp_ip"),
+                        metadata.get("arp_ip"),
+                        metadata.get("ip"),
+                    ),
+                    "last_seen": metadata.get("last_seen", ""),
+                    "hotspot_authorized": mac in hotspot_authorized,
+                    "hotspot_bypassed": mac in hotspot_bypassed,
+                    "hotspot_active": mac in active_hotspot_macs,
+                    "ppp_active": mac in active_ppp_macs,
+                }
+                if customer:
+                    sample["customer_id"] = customer.get("id")
+                    sample["customer_status"] = customer.get("status")
+                if _looks_like_infrastructure_device(mac, metadata, known_customer_macs):
+                    infra = {
+                        "mac": mac,
+                        "name": _first_nonempty(metadata.get("identity"), metadata.get("hostname")),
+                        "ip": _first_nonempty(
+                            metadata.get("ip"),
+                            metadata.get("dhcp_ip"),
+                            metadata.get("arp_ip"),
+                        ),
+                        "board": metadata.get("board", ""),
+                        "platform": metadata.get("platform", ""),
+                        "version": metadata.get("version", ""),
+                        "source": "neighbor" if metadata.get("neighbor") else "dhcp/arp",
+                        "last_seen": metadata.get("last_seen", ""),
+                    }
+                    infrastructure_here.append(infra)
+                    infrastructure_candidates.append({"port": port_name, **infra})
+                    sample["kind"] = "infrastructure"
+                downstream_samples.append(sample)
+
+            link_up = _routeros_bool(iface.get("running"))
+            rx_packets = _safe_routeros_int(iface.get("rx-packet"))
+            rx_errors = _safe_routeros_int(iface.get("rx-error"))
+            tx_errors = _safe_routeros_int(iface.get("tx-error"))
+            port_warnings = []
+            health = "down"
+            if link_up and learned_macs:
+                health = "active"
+            elif link_up:
+                health = "silent_link"
+                if rx_packets == 0:
+                    port_warnings.append(
+                        "Link is up but the router has received 0 packets and learned no downstream MACs"
+                    )
+                else:
+                    port_warnings.append(
+                        "Link is up but no downstream MACs are currently learned"
+                    )
+            if rx_errors or tx_errors:
+                port_warnings.append("Interface errors are present")
+            if port_warnings:
+                warnings.append({"port": port_name, "warnings": port_warnings})
+
+            port_summaries.append(
+                {
+                    "port": port_name,
+                    "bridge": bridge_port.get("bridge", ""),
+                    "bridge_status": bridge_port.get("status", ""),
+                    "link": {
+                        "up": link_up,
+                        "status": monitor.get("status", ""),
+                        "rate": monitor.get("rate") or ethernet.get("speed", ""),
+                        "full_duplex": _routeros_bool(
+                            _first_nonempty(monitor.get("full-duplex"), ethernet.get("full-duplex"))
+                        ),
+                        "last_link_up_time": iface.get("last-link-up-time", ""),
+                        "link_downs": _safe_routeros_int(iface.get("link-downs")),
+                    },
+                    "traffic": {
+                        "rx_byte": _safe_routeros_int(iface.get("rx-byte")),
+                        "tx_byte": _safe_routeros_int(iface.get("tx-byte")),
+                        "rx_packet": rx_packets,
+                        "tx_packet": _safe_routeros_int(iface.get("tx-packet")),
+                        "rx_error": rx_errors,
+                        "tx_error": tx_errors,
+                        "rx_drop": _safe_routeros_int(iface.get("rx-drop")),
+                        "tx_drop": _safe_routeros_int(iface.get("tx-drop")),
+                    },
+                    "counts": {
+                        "learned_macs": len(learned_macs),
+                        "known_customers_seen": len(known_macs),
+                        "known_customers_connected": len(connected_macs),
+                        "hotspot_hosts_seen": len([mac for mac in learned_macs if mac in hotspot_seen]),
+                        "hotspot_authorized": len([mac for mac in learned_macs if mac in hotspot_authorized]),
+                        "hotspot_bypassed": len([mac for mac in learned_macs if mac in hotspot_bypassed]),
+                        "active_hotspot_sessions": len([mac for mac in learned_macs if mac in active_hotspot_macs]),
+                        "active_ppp_sessions": len([mac for mac in learned_macs if mac in active_ppp_macs]),
+                        "unknown_devices": len(unknown_macs),
+                        "infrastructure_devices": len(infrastructure_here),
+                    },
+                    "health": {
+                        "status": health,
+                        "warnings": port_warnings,
+                    },
+                    "infrastructure": infrastructure_here[:_PORT_ANALYTICS_SAMPLE_LIMIT],
+                    "downstream_devices_sample": downstream_samples[:_PORT_ANALYTICS_SAMPLE_LIMIT],
+                }
+            )
+
+        identity = identity_rows[0] if identity_rows else {}
+        resource = resource_rows[0] if resource_rows else {}
+        return {
+            "success": True,
+            "router": {
+                "id": router_info["id"],
+                "name": router_info["name"],
+                "identity_db": router_info.get("identity"),
+                "identity_live": identity.get("name", ""),
+                "ip": router_info["ip"],
+            },
+            "generated_at": datetime.utcnow().isoformat(),
+            "cached": False,
+            "system": {
+                "version": resource.get("version", ""),
+                "board_name": resource.get("board-name", ""),
+                "architecture": resource.get("architecture-name", ""),
+                "uptime": resource.get("uptime", ""),
+                "cpu_load": _safe_routeros_int(resource.get("cpu-load")),
+                "free_memory": _safe_routeros_int(resource.get("free-memory")),
+                "total_memory": _safe_routeros_int(resource.get("total-memory")),
+                "free_hdd_space": _safe_routeros_int(resource.get("free-hdd-space")),
+                "total_hdd_space": _safe_routeros_int(resource.get("total-hdd-space")),
+            },
+            "totals": {
+                "interfaces": len(interface_rows),
+                "bridges": len(bridge_rows),
+                "bridge_ports": len(bridge_port_rows),
+                "bridge_hosts": len(bridge_host_rows),
+                "neighbors": len(neighbor_rows),
+                "dhcp_leases": len(dhcp_rows),
+                "arp_entries": len(arp_rows),
+                "hotspot_hosts": len(hotspot_host_rows),
+                "hotspot_authorized": len(hotspot_authorized),
+                "hotspot_bypassed": len(hotspot_bypassed),
+                "hotspot_active": len(hotspot_active_rows),
+                "ppp_active": len(ppp_active_rows),
+                "db_customers_with_mac": len(customer_by_mac),
+            },
+            "warnings": warnings,
+            "infrastructure_candidates": infrastructure_candidates[:_PORT_ANALYTICS_SAMPLE_LIMIT],
+            "ports": port_summaries,
+        }
+    except Exception as e:
+        logger.exception("Error getting port analytics: %s", e)
+        return {"error": str(e)}
+    finally:
+        api.disconnect()
 
 
 def _get_port_status_sync(router_info: dict) -> dict:
@@ -2713,6 +3325,163 @@ async def get_router_port_status(
     }
 
     return response
+
+
+@router.get("/api/routers/{router_id}/port-analytics")
+async def get_router_port_analytics(
+    router_id: int,
+    refresh: bool = False,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Read-only downstream-device analytics for one router.
+
+    This is intentionally separate from /ports because it performs heavier live
+    RouterOS reads and joins learned MACs against customer MACs. It never holds
+    a DB transaction across RouterOS I/O and does not write snapshots/history.
+    """
+    user = await get_current_user(token, db)
+    role = getattr(getattr(user, "role", None), "value", getattr(user, "role", None))
+    router_obj = await get_router_by_id(db, router_id, user.id, role)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+
+    router_info = {
+        "id": router_obj.id,
+        "name": router_obj.name,
+        "identity": router_obj.identity,
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+    }
+    await db.commit()
+
+    cached_result = _cached_port_analytics(router_id)
+    if cached_result:
+        cache_age = cached_result.get("cache_age_seconds") or 0
+        if not refresh and cache_age < _PORT_ANALYTICS_CACHE_TTL:
+            return cached_result
+        if refresh and cache_age < _PORT_ANALYTICS_REFRESH_FLOOR:
+            cached_result["refresh_skipped"] = True
+            cached_result["refresh_skip_reason"] = "recent_cache"
+            return cached_result
+        if _db_pool_busy_for_optional_live_diagnostics():
+            cached_result["stale"] = True
+            cached_result["refresh_skipped"] = True
+            cached_result["refresh_skip_reason"] = "db_pool_pressure"
+            return cached_result
+
+    if _db_pool_busy_for_optional_live_diagnostics():
+        raise HTTPException(
+            status_code=503,
+            detail="Port analytics temporarily skipped because DB pool pressure is elevated",
+        )
+
+    lock = _port_analytics_locks.setdefault(router_id, asyncio.Lock())
+    if lock.locked():
+        if cached_result:
+            cached_result["stale"] = True
+            cached_result["refresh_pending"] = True
+            cached_result["refresh_skip_reason"] = "refresh_already_running"
+            return cached_result
+        raise HTTPException(
+            status_code=429,
+            detail="Port analytics refresh already running for this router; retry shortly",
+        )
+
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=_PORT_ANALYTICS_BUSY_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        cached_result = _cached_port_analytics(router_id)
+        if cached_result:
+            cached_result["stale"] = True
+            cached_result["refresh_pending"] = True
+            cached_result["refresh_skip_reason"] = "refresh_already_running"
+            return cached_result
+        raise HTTPException(
+            status_code=429,
+            detail="Port analytics refresh already running for this router; retry shortly",
+        )
+
+    try:
+        cached_result = _cached_port_analytics(router_id)
+        if cached_result:
+            cache_age = cached_result.get("cache_age_seconds") or 0
+            if not refresh and cache_age < _PORT_ANALYTICS_CACHE_TTL:
+                return cached_result
+            if refresh and cache_age < _PORT_ANALYTICS_REFRESH_FLOOR:
+                cached_result["refresh_skipped"] = True
+                cached_result["refresh_skip_reason"] = "recent_cache"
+                return cached_result
+
+        stmt = select(
+            Customer.id,
+            Customer.name,
+            Customer.mac_address,
+            Customer.status,
+        ).where(
+            Customer.router_id == router_id,
+            Customer.mac_address.isnot(None),
+        )
+        customer_result = await db.execute(stmt)
+        customer_by_mac = {}
+        for customer_id, name, mac_address, status in customer_result.all():
+            normalized_mac = _normalize_mac_safe(mac_address)
+            if not normalized_mac:
+                continue
+            customer_by_mac[normalized_mac] = {
+                "id": customer_id,
+                "name": name,
+                "status": status.value if status else None,
+            }
+
+        await db.commit()
+
+        result = await run_with_guard(
+            router_id,
+            _get_port_analytics_sync,
+            router_info,
+            customer_by_mac,
+            acquire_timeout_seconds=_PORT_ANALYTICS_BUSY_WAIT_SECONDS,
+            timeout_seconds=_PORT_ANALYTICS_ROUTER_TIMEOUT_SECONDS,
+        )
+
+        if result.get("error") in {"busy", "timeout"}:
+            cached_result = _cached_port_analytics(router_id)
+            if cached_result:
+                cached_result["stale"] = True
+                cached_result["refresh_skipped"] = True
+                cached_result["refresh_skip_reason"] = result.get("error")
+                cached_result["error_detail"] = result.get("detail")
+                return cached_result
+            status_code = 429 if result.get("error") == "busy" else 504
+            raise HTTPException(
+                status_code=status_code,
+                detail=result.get("detail") or "Port analytics unavailable",
+            )
+
+        if result.get("error") == "connect_failed":
+            cached_result = _cached_port_analytics(router_id)
+            if cached_result:
+                cached_result["stale"] = True
+                cached_result["error"] = result.get("reason") or "connect_failed"
+                return cached_result
+            raise HTTPException(
+                status_code=503,
+                detail=f"Failed to connect to router: {router_info['name']}",
+            )
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        _port_analytics_cache[router_id] = {
+            "data": result,
+            "timestamp": datetime.utcnow(),
+        }
+        return result
+    finally:
+        lock.release()
 
 
 # =========================================================================
