@@ -746,26 +746,63 @@ async def provision_hotspot_customer(
                     attempt.updated_at = now
                 await db.commit()
 
+    # Pull-channel prep (opt-in routers only): render a fetchable provisioning script
+    # so a paid user can be delivered over the router's outbound check-in when we can't
+    # push over the tunnel. Rendering is CPU-only (safe in-session); the network handoff
+    # happens AFTER the session is released (Database Session Discipline).
+    pull_identity = None
+    pull_rsc = None
+    pull_key = None
     if router_id and not verify_only:
+        offline = False
         try:
             async with async_session() as db:
                 router_obj = await db.get(Router, router_id)
-                if router_obj and derive_router_status(router_obj) == "offline":
-                    logger.warning(
-                        "[PROVISION] Skipping customer %s — router %s is known offline",
-                        customer_id, router_ip,
-                    )
-                    result = {
-                        "success": False,
-                        "error": f"Router {router_ip} is known offline, will retry",
-                    }
-                    return await _persist_provisioning_result(
-                        result=result, verify_only=False,
-                        customer_id=customer_id, router_id=router_id,
-                        router_ip=router_ip, mac_address=mac_address,
-                        action=action, attempt_id=attempt_id,
-                        hotspot_payload=hotspot_payload,
-                    )
+                offline = bool(router_obj and derive_router_status(router_obj) == "offline")
+                if (router_obj and getattr(router_obj, "pull_channel_enabled", False)
+                        and router_obj.identity):
+                    try:
+                        from app.services.mikrotik_api import parse_speed_to_mikrotik
+                        from app.services.pull_provisioning import render_hotspot_provision_rsc
+                        pull_rsc = render_hotspot_provision_rsc(
+                            username=hotspot_payload.get("username"),
+                            password=hotspot_payload.get("password"),
+                            mac_address=hotspot_payload.get("mac_address"),
+                            rate_limit=parse_speed_to_mikrotik(hotspot_payload.get("bandwidth_limit")),
+                            time_limit=hotspot_payload.get("time_limit"),
+                            comment=hotspot_payload.get("comment", ""),
+                        )
+                        pull_identity = router_obj.identity
+                        pull_key = hotspot_payload.get("username") or f"cust{customer_id}"
+                    except Exception as render_exc:
+                        logger.warning(
+                            "[PROVISION] pull-channel render skipped for customer %s: %s",
+                            customer_id, render_exc,
+                        )
+            # ---- network handoff OUTSIDE the DB session ----
+            if offline and pull_identity and pull_rsc:
+                from app.services.pull_provisioning import handoff_to_pull_service
+                handoff = await handoff_to_pull_service(pull_identity, pull_key, pull_rsc)
+                logger.info(
+                    "[PROVISION] pull-channel queued for offline router %s customer %s: %s",
+                    pull_identity, customer_id, handoff,
+                )
+            if offline:
+                logger.warning(
+                    "[PROVISION] Skipping push for customer %s — router %s is known offline",
+                    customer_id, router_ip,
+                )
+                result = {
+                    "success": False,
+                    "error": f"Router {router_ip} is known offline, will retry",
+                }
+                return await _persist_provisioning_result(
+                    result=result, verify_only=False,
+                    customer_id=customer_id, router_id=router_id,
+                    router_ip=router_ip, mac_address=mac_address,
+                    action=action, attempt_id=attempt_id,
+                    hotspot_payload=hotspot_payload,
+                )
         except Exception:
             pass
 
@@ -778,6 +815,19 @@ async def provision_hotspot_customer(
         }
     except Exception as exc:
         result = {"success": False, "error": str(exc)}
+
+    # Pull-channel fallback: the status looked online but the push failed (a flapping
+    # router). Queue the render for the router to fetch on its next outbound check-in.
+    if pull_identity and pull_rsc and not result.get("success"):
+        try:
+            from app.services.pull_provisioning import handoff_to_pull_service
+            handoff = await handoff_to_pull_service(pull_identity, pull_key, pull_rsc)
+            logger.info(
+                "[PROVISION] pull-channel queued after push failure for router %s customer %s: %s",
+                pull_identity, customer_id, handoff,
+            )
+        except Exception:
+            pass
 
     try:
         return await _persist_provisioning_result(

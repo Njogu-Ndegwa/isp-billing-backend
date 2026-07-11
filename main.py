@@ -1879,6 +1879,27 @@ async def run_compensation_voucher_migrations():
     logger.info("Compensation voucher migrations complete")
 
 
+async def run_pull_channel_migrations():
+    """Add routers.pull_channel_enabled (bool, default false) for the outbound
+    pull-provisioning channel. Opt-in per router; the command queue itself lives on
+    the secondary server, so this flag is the only schema the app needs. Idempotent:
+    checks information_schema before altering, so it is safe to run on every startup."""
+    async with async_engine.begin() as conn:
+        result = await conn.execute(sa_text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'routers' AND column_name = 'pull_channel_enabled'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE routers
+                ADD COLUMN pull_channel_enabled BOOLEAN NOT NULL DEFAULT false
+            """))
+            logger.info("Pull-channel migration: added routers.pull_channel_enabled")
+        else:
+            logger.info("Pull-channel migration: pull_channel_enabled already exists, skipping")
+    logger.info("Pull-channel migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -2000,6 +2021,12 @@ async def startup_event():
         logger.info("Compensation voucher migrations completed successfully")
     except Exception as e:
         logger.error(f"Compensation voucher migration failed (non-fatal): {e}")
+
+    try:
+        await run_pull_channel_migrations()
+        logger.info("Pull-channel migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Pull-channel migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

@@ -391,6 +391,14 @@ class Router(Base):
     emergency_active = Column(Boolean, nullable=False, default=False, server_default="false")
     emergency_message = Column(String(500), nullable=True)
     hotspot_sharing_blocked = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Opt-in per router: when true, paid-user provisioning that can't be pushed over
+    # the WireGuard tunnel is queued for the router to PULL over an outbound HTTPS
+    # check-in instead. Intended only for flaky/Starlink-fed routers. Default false
+    # keeps every other router on the existing push-only path, untouched.
+    # Opt-in per router: paid provisioning that can't be pushed over the tunnel is
+    # instead handed to the secondary-server pull service for the router to fetch.
+    # The queue itself lives on the secondary server; the old box keeps only this flag.
+    pull_channel_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 
