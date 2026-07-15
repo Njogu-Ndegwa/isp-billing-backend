@@ -762,18 +762,33 @@ async def provision_hotspot_customer(
                 if (router_obj and getattr(router_obj, "pull_channel_enabled", False)
                         and router_obj.identity):
                     try:
+                        import calendar
                         from app.services.mikrotik_api import parse_speed_to_mikrotik
                         from app.services.pull_provisioning import render_hotspot_provision_rsc
-                        pull_rsc = render_hotspot_provision_rsc(
-                            username=hotspot_payload.get("username"),
-                            password=hotspot_payload.get("password"),
-                            mac_address=hotspot_payload.get("mac_address"),
-                            rate_limit=parse_speed_to_mikrotik(hotspot_payload.get("bandwidth_limit")),
-                            time_limit=hotspot_payload.get("time_limit"),
-                            comment=hotspot_payload.get("comment", ""),
-                        )
-                        pull_identity = router_obj.identity
-                        pull_key = hotspot_payload.get("username") or f"cust{customer_id}"
+                        # Bound the pull command to the customer's paid window so it can
+                        # never keep re-granting access after expiry (the free-internet
+                        # bug). Skip the handoff entirely for an already-expired customer.
+                        cust = await db.get(Customer, customer_id)
+                        cust_expiry = getattr(cust, "expiry", None)
+                        expires_ts = (calendar.timegm(cust_expiry.utctimetuple())
+                                      if cust_expiry else None)
+                        if cust_expiry is not None and cust_expiry <= now:
+                            logger.info(
+                                "[PROVISION] pull-channel skipped — customer %s already expired",
+                                customer_id,
+                            )
+                        else:
+                            pull_rsc = render_hotspot_provision_rsc(
+                                username=hotspot_payload.get("username"),
+                                password=hotspot_payload.get("password"),
+                                mac_address=hotspot_payload.get("mac_address"),
+                                rate_limit=parse_speed_to_mikrotik(hotspot_payload.get("bandwidth_limit")),
+                                time_limit=hotspot_payload.get("time_limit"),
+                                comment=hotspot_payload.get("comment", ""),
+                                expires_at=expires_ts,
+                            )
+                            pull_identity = router_obj.identity
+                            pull_key = hotspot_payload.get("username") or f"cust{customer_id}"
                     except Exception as render_exc:
                         logger.warning(
                             "[PROVISION] pull-channel render skipped for customer %s: %s",
@@ -826,6 +841,17 @@ async def provision_hotspot_customer(
                 "[PROVISION] pull-channel queued after push failure for router %s customer %s: %s",
                 pull_identity, customer_id, handoff,
             )
+        except Exception:
+            pass
+
+    # Delivered over the tunnel: clear any pending pull command so a later outbound
+    # fetch can't re-apply it. Belt-and-suspenders with the expiry bound — together
+    # they guarantee a command never re-grants access after the customer is served or
+    # their plan ends.
+    if pull_identity and pull_key and result.get("success"):
+        try:
+            from app.services.pull_provisioning import clear_pull_service
+            await clear_pull_service(pull_identity, pull_key)
         except Exception:
             pass
 

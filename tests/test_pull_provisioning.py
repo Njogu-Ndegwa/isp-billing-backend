@@ -99,3 +99,32 @@ def test_ros_quote_strips_control_and_escapes():
     assert '"' not in out.replace('\\"', "")   # every quote is escaped
     assert "\r" not in out and "\n" not in out  # control chars stripped
     assert "\\$" in out                          # dollar escaped
+
+
+# --- expiry header (the free-internet fix) ---
+
+def test_expires_header_is_first_line_and_parseable():
+    rsc = render_hotspot_provision_rsc(
+        username="u", password="p", mac_address="AA:BB:CC:DD:EE:FF",
+        rate_limit="1M/1M", time_limit="20m", expires_at=1752566400,
+    )
+    first = rsc.splitlines()[0]
+    assert first == "# PULL-EXPIRES 1752566400"   # first line, exact format
+    assert first.startswith("#")                   # RouterOS ignores it on import
+
+
+def test_no_expires_header_when_omitted():
+    rsc = render_hotspot_provision_rsc(
+        username="u", password="p", mac_address="AA:BB:CC:DD:EE:FF",
+        rate_limit="1M/1M", time_limit="20m",
+    )
+    assert "PULL-EXPIRES" not in rsc               # backward compatible
+
+
+@pytest.mark.parametrize("bad_exp", [0, -5])
+def test_nonpositive_expiry_is_dropped(bad_exp):
+    rsc = render_hotspot_provision_rsc(
+        username="u", password="p", mac_address="AA:BB:CC:DD:EE:FF",
+        rate_limit="1M/1M", time_limit="20m", expires_at=bad_exp,
+    )
+    assert "PULL-EXPIRES" not in rsc

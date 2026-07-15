@@ -60,11 +60,17 @@ def _ros_quote(s) -> str:
 def render_hotspot_provision_rsc(
     *, username: str, password: str, mac_address: str,
     rate_limit: str, time_limit: str, comment: str = "",
+    expires_at: int | None = None,
 ) -> str:
     """Render an idempotent RouterOS script that provisions one hotspot user exactly
     like ``MikroTikAPI.add_customer_bypass_mode`` (profile -> user -> bypassed
     ip-binding). Re-applying is a no-op, so the router may safely fetch it repeatedly.
-    Raises ValueError on any value that fails validation."""
+    Raises ValueError on any value that fails validation.
+
+    ``expires_at`` (unix seconds) is emitted as a leading ``# PULL-EXPIRES`` comment.
+    RouterOS ignores ``#`` lines on import, but the pull service reads it and STOPS
+    serving the command once the customer's plan has expired — so a delivered command
+    can never keep re-granting access past the paid window (the free-internet bug)."""
     user = _require(username, _USERNAME_RE, "username")
     mac = _normalize_mac(mac_address)
     rate = _require(rate_limit, _RATE_RE, "rate_limit")
@@ -73,7 +79,13 @@ def render_hotspot_provision_rsc(
     pw = _ros_quote(password)
     cm = _ros_quote(comment)
 
-    return "\n".join([
+    header = []
+    if expires_at is not None:
+        exp = int(expires_at)
+        if exp > 0:
+            header.append(f"# PULL-EXPIRES {exp}")
+
+    return "\n".join(header + [
         f"# pull-provisioning hotspot user {user}",
         "/ip hotspot user profile",
         (f':if ([:len [find name="{profile}"]] = 0) do={{ add name="{profile}" '
