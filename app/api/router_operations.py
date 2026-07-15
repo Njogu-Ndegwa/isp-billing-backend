@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, func
+from sqlalchemy import select, or_, func, case
 from sqlalchemy.orm import selectinload
 from typing import Any, Dict, List, Optional, Set
 from datetime import datetime, timedelta
@@ -9,7 +9,15 @@ from dataclasses import asdict
 from pathlib import Path
 
 from app.db.database import db_pool_snapshot, get_db
-from app.db.models import Router, Customer, Plan, CustomerStatus, ConnectionType, ProvisioningToken
+from app.db.models import (
+    Router,
+    Customer,
+    CustomerPayment,
+    Plan,
+    CustomerStatus,
+    ConnectionType,
+    ProvisioningToken,
+)
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import (
     MikroTikAPI,
@@ -2934,6 +2942,9 @@ def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
         infrastructure_candidates = []
         port_summaries = []
         warnings = []
+        revenue_windows = ("total", "today", "this_week", "this_month")
+        attributed_revenue = {key: 0.0 for key in revenue_windows}
+        revenue_counted_macs: Set[str] = set()
 
         for port_name in port_names:
             iface = iface_by_name.get(port_name, {})
@@ -2953,6 +2964,21 @@ def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
                     or mac in active_ppp_macs
                 )
             )
+
+            # Revenue is attributed to the port where each paying customer's
+            # device is currently seen (same source as known_customers_seen).
+            port_revenue = {key: 0.0 for key in revenue_windows}
+            paying_customers_seen = 0
+            for mac in known_macs:
+                customer_revenue = (customer_by_mac.get(mac) or {}).get("revenue") or {}
+                if float(customer_revenue.get("total") or 0) > 0:
+                    paying_customers_seen += 1
+                for key in revenue_windows:
+                    port_revenue[key] += float(customer_revenue.get(key) or 0)
+                if mac not in revenue_counted_macs:
+                    revenue_counted_macs.add(mac)
+                    for key in revenue_windows:
+                        attributed_revenue[key] += float(customer_revenue.get(key) or 0)
 
             infrastructure_here = []
             downstream_samples = []
@@ -2983,6 +3009,9 @@ def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
                 if customer:
                     sample["customer_id"] = customer.get("id")
                     sample["customer_status"] = customer.get("status")
+                    sample["revenue_total"] = round(
+                        float((customer.get("revenue") or {}).get("total") or 0), 2
+                    )
                 if _looks_like_infrastructure_device(mac, metadata, known_customer_macs):
                     infra = {
                         "mac": mac,
@@ -3051,6 +3080,10 @@ def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
                         "rx_drop": _safe_routeros_int(iface.get("rx-drop")),
                         "tx_drop": _safe_routeros_int(iface.get("tx-drop")),
                     },
+                    "revenue": {
+                        **{key: round(port_revenue[key], 2) for key in revenue_windows},
+                        "paying_customers_seen": paying_customers_seen,
+                    },
                     "counts": {
                         "learned_macs": len(learned_macs),
                         "known_customers_seen": len(known_macs),
@@ -3113,6 +3146,10 @@ def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
             },
             "warnings": warnings,
             "infrastructure_candidates": infrastructure_candidates[:_PORT_ANALYTICS_SAMPLE_LIMIT],
+            "revenue": {
+                f"attributed_{key}": round(attributed_revenue[key], 2)
+                for key in revenue_windows
+            },
             "ports": port_summaries,
         }
     except Exception as e:
@@ -3335,7 +3372,9 @@ async def get_router_port_analytics(
     token: str = Depends(verify_token),
 ):
     """
-    Read-only downstream-device analytics for one router.
+    Read-only downstream-device analytics for one router, including per-port
+    customer counts and per-port revenue (revenue is attributed to the port
+    where each paying customer's device is currently seen).
 
     This is intentionally separate from /ports because it performs heavier live
     RouterOS reads and joins learned MACs against customer MACs. It never holds
@@ -3437,6 +3476,71 @@ async def get_router_port_analytics(
                 "status": status.value if status else None,
             }
 
+        # Per-customer revenue for this router (same convention as the
+        # dashboard: CustomerPayment rows with counts_as_revenue=true).
+        # Computed here so the RouterOS section below can attribute revenue
+        # to ports without touching the DB again.
+        now = datetime.utcnow()
+        today_start = datetime(now.year, now.month, now.day)
+        week_start = today_start - timedelta(days=now.weekday())
+        month_start = datetime(now.year, now.month, 1)
+        revenue_stmt = (
+            select(
+                CustomerPayment.customer_id,
+                func.coalesce(func.sum(CustomerPayment.amount), 0).label("total"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (CustomerPayment.created_at >= today_start, CustomerPayment.amount),
+                            else_=0.0,
+                        )
+                    ),
+                    0,
+                ).label("today"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (CustomerPayment.created_at >= week_start, CustomerPayment.amount),
+                            else_=0.0,
+                        )
+                    ),
+                    0,
+                ).label("this_week"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (CustomerPayment.created_at >= month_start, CustomerPayment.amount),
+                            else_=0.0,
+                        )
+                    ),
+                    0,
+                ).label("this_month"),
+            )
+            .join(Customer, CustomerPayment.customer_id == Customer.id)
+            .where(
+                Customer.router_id == router_id,
+                CustomerPayment.counts_as_revenue == True,
+            )
+            .group_by(CustomerPayment.customer_id)
+        )
+        revenue_result = await db.execute(revenue_stmt)
+        revenue_by_customer_id = {}
+        router_revenue = {"total": 0.0, "today": 0.0, "this_week": 0.0, "this_month": 0.0}
+        for customer_id, total, today, this_week, this_month in revenue_result.all():
+            revenue = {
+                "total": float(total or 0),
+                "today": float(today or 0),
+                "this_week": float(this_week or 0),
+                "this_month": float(this_month or 0),
+            }
+            revenue_by_customer_id[customer_id] = revenue
+            for key in router_revenue:
+                router_revenue[key] += revenue[key]
+        for entry in customer_by_mac.values():
+            revenue = revenue_by_customer_id.get(entry["id"])
+            if revenue:
+                entry["revenue"] = revenue
+
         await db.commit()
 
         result = await run_with_guard(
@@ -3474,6 +3578,19 @@ async def get_router_port_analytics(
             )
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])
+
+        # Router-wide revenue context so the UI can show how much of the
+        # router's revenue is attributable to a currently-seen port. Customers
+        # who are offline right now (or have no MAC on file) show up as
+        # unattributed rather than under a port.
+        revenue_section = result.setdefault("revenue", {})
+        revenue_section.update(
+            {f"router_{key}": round(value, 2) for key, value in router_revenue.items()}
+        )
+        attributed_total = float(revenue_section.get("attributed_total") or 0)
+        revenue_section["unattributed_total"] = round(
+            max(0.0, router_revenue["total"] - attributed_total), 2
+        )
 
         _port_analytics_cache[router_id] = {
             "data": result,
