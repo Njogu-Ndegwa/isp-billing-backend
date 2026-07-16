@@ -7,7 +7,7 @@ paybill numbers or bank accounts via the Safaricom B2B API.
 
 import base64
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +38,14 @@ SAFARICOM_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=5.0)
 SUBSCRIPTION_OWNER_TRIGGER = "subscription_owner"
 
 CERTS_DIR = Path(__file__).resolve().parent.parent / "certs"
+
+
+def _provider_id_or_none(value: object) -> Optional[str]:
+    """Normalize absent Safaricom identifiers so unique indexes can allow repeats."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 # ---------------------------------------------------------------------------
 # Business Bouquet Tariff – fee paid by sender (business), receiver pays 0
@@ -251,8 +259,8 @@ async def initiate_b2b_payment(
 
     logger.info("B2B API response for reseller %s: %s", reseller_id, response_data)
 
-    conversation_id = response_data.get("ConversationID")
-    originator_id = response_data.get("OriginatorConversationID")
+    conversation_id = _provider_id_or_none(response_data.get("ConversationID"))
+    originator_id = _provider_id_or_none(response_data.get("OriginatorConversationID"))
 
     response_code = response_data.get("ResponseCode", "")
     if str(response_code) != "0":
@@ -305,17 +313,19 @@ async def process_b2b_result(db: AsyncSession, result_body: dict) -> Optional[B2
     On success, auto-creates ResellerPayout + ResellerTransactionCharge.
     """
     result = result_body.get("Result", result_body)
-    conversation_id = result.get("ConversationID")
-    originator_id = result.get("OriginatorConversationID")
+    conversation_id = _provider_id_or_none(result.get("ConversationID"))
+    originator_id = _provider_id_or_none(result.get("OriginatorConversationID"))
     result_code = result.get("ResultCode")
     result_desc = result.get("ResultDesc", "")
-    transaction_id = result.get("TransactionID")
+    transaction_id = _provider_id_or_none(result.get("TransactionID"))
 
-    stmt = select(B2BTransaction).where(
-        B2BTransaction.conversation_id == conversation_id
-    )
-    row = await db.execute(stmt)
-    txn = row.scalar_one_or_none()
+    txn = None
+    if conversation_id:
+        stmt = select(B2BTransaction).where(
+            B2BTransaction.conversation_id == conversation_id
+        )
+        row = await db.execute(stmt)
+        txn = row.scalar_one_or_none()
 
     if not txn:
         if originator_id:
@@ -326,7 +336,10 @@ async def process_b2b_result(db: AsyncSession, result_body: dict) -> Optional[B2
             txn = row2.scalar_one_or_none()
 
     if not txn:
-        logger.warning("B2B callback for unknown conversation_id=%s", conversation_id)
+        logger.warning(
+            "B2B callback for unknown conversation_id=%s originator_id=%s",
+            conversation_id, originator_id,
+        )
         return None
 
     if txn.status != B2BTransactionStatus.PENDING:
@@ -395,8 +408,8 @@ async def process_b2b_result(db: AsyncSession, result_body: dict) -> Optional[B2
 async def process_b2b_timeout(db: AsyncSession, body: dict) -> Optional[B2BTransaction]:
     """Mark a B2B transaction as timed out for retry on next daily run."""
     result = body.get("Result", body)
-    conversation_id = result.get("ConversationID")
-    originator_id = result.get("OriginatorConversationID")
+    conversation_id = _provider_id_or_none(result.get("ConversationID"))
+    originator_id = _provider_id_or_none(result.get("OriginatorConversationID"))
 
     stmt = select(B2BTransaction)
     if conversation_id:
@@ -608,6 +621,16 @@ async def run_daily_payouts():
     skip_count = 0
     fail_count = 0
 
+    # Dedupe window: anchor it ONCE at run start, as a rolling 20-hour window.
+    # The run fires at 23:59 UTC and crosses midnight mid-loop. The old
+    # calendar-day window ("created_at >= today 00:00"), recomputed per
+    # reseller, made the pre-midnight minute count the PREVIOUS night's
+    # post-midnight payouts as "already paid today" and mass-skip resellers
+    # who were legitimately owed (2026-07-15 incident: 3 initiated, everyone
+    # else silently skipped). 20 hours still blocks a double fire within the
+    # same night while leaving last night's run (~24h old) out of the window.
+    dedupe_window_start = datetime.utcnow() - timedelta(hours=20)
+
     # Snapshot plain ids first: one reseller's failure must never poison the
     # ORM state (or session) used for the resellers that follow. A rollback
     # expires every object in the session, and touching an expired attribute
@@ -623,15 +646,16 @@ async def run_daily_payouts():
             # transaction) for one reseller cannot leak into the next.
             async with AsyncSessionLocal() as db:
                 balance = await get_unpaid_balance(db, reseller_id)
-                if balance < 1:
+                # KES 1 can never net positive after the KES 1 Kadogo fee —
+                # skip quietly instead of raising a spurious "failed".
+                if balance < 2:
                     skip_count += 1
                     continue
 
-                today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-                existing_today = await db.execute(
+                existing_recent = await db.execute(
                     select(func.count(B2BTransaction.id)).where(
                         B2BTransaction.reseller_id == reseller_id,
-                        B2BTransaction.created_at >= today_start,
+                        B2BTransaction.created_at >= dedupe_window_start,
                         B2BTransaction.triggered_by == "scheduled",
                         B2BTransaction.status.in_([
                             B2BTransactionStatus.PENDING,
@@ -639,8 +663,11 @@ async def run_daily_payouts():
                         ]),
                     )
                 )
-                if existing_today.scalar() > 0:
-                    logger.info("Reseller %s already has a scheduled B2B tx today, skipping", reseller_id)
+                if existing_recent.scalar() > 0:
+                    logger.info(
+                        "Reseller %s already has a scheduled B2B tx in the last 20h, skipping",
+                        reseller_id,
+                    )
                     skip_count += 1
                     continue
 
