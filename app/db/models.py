@@ -265,6 +265,11 @@ class CustomerPayment(Base):
         nullable=True,
     )
     counts_as_revenue = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Router port the paying customer's device was seen on around payment time.
+    # Stamped asynchronously by the port-attribution background job; NULL means
+    # unattributed (customer offline at stamping time, no MAC on file, or the
+    # payment predates port tracking).
+    port_name = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     customer = relationship("Customer", backref="customer_payments")
     reseller = relationship("User", backref="received_payments", foreign_keys=[reseller_id])

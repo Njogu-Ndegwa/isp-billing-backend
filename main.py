@@ -109,6 +109,7 @@ from app.services.mikrotik_background import (
     _cleanup_single_router_hotspot_sync,
 )
 from app.services.usage_cap_sampler import sample_capped_usage_background
+from app.services.payment_port_attribution import attribute_recent_payment_ports_background
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
@@ -1879,6 +1880,30 @@ async def run_compensation_voucher_migrations():
     logger.info("Compensation voucher migrations complete")
 
 
+async def run_payment_port_attribution_migrations():
+    """Add customer_payments.port_name (varchar, nullable) so revenue can be
+    attributed to the router port the paying customer's device was on around
+    payment time. Stamped by the port-attribution background job; NULL means
+    unattributed. Idempotent: checks information_schema before altering."""
+    async with async_engine.begin() as conn:
+        result = await conn.execute(sa_text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'customer_payments' AND column_name = 'port_name'
+        """))
+        if not result.fetchone():
+            await conn.execute(sa_text("""
+                ALTER TABLE customer_payments
+                ADD COLUMN port_name VARCHAR(64) NULL
+            """))
+            logger.info("Payment port attribution migration: added customer_payments.port_name")
+        else:
+            logger.info("Payment port attribution migration: port_name already exists, skipping")
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_cp_port_name ON customer_payments(port_name)"
+        ))
+    logger.info("Payment port attribution migrations complete")
+
+
 async def run_pull_channel_migrations():
     """Add routers.pull_channel_enabled (bool, default false) for the outbound
     pull-provisioning channel. Opt-in per router; the command queue itself lives on
@@ -2028,6 +2053,12 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Pull-channel migration failed (non-fatal): {e}")
 
+    try:
+        await run_payment_port_attribution_migrations()
+        logger.info("Payment port attribution migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Payment port attribution migration failed (non-fatal): {e}")
+
     scheduler.add_job(
         cleanup_expired_users_background,
         trigger=IntervalTrigger(seconds=67),
@@ -2049,6 +2080,14 @@ async def startup_event():
         trigger=IntervalTrigger(seconds=19),
         id='usage_cap_sampler',
         name='Lightweight capped customer usage sampler',
+        replace_existing=True,
+        max_instances=1
+    )
+    scheduler.add_job(
+        attribute_recent_payment_ports_background,
+        trigger=IntervalTrigger(seconds=131),
+        id='payment_port_attribution',
+        name='Stamp recent payments with the customer\'s current router port',
         replace_existing=True,
         max_instances=1
     )

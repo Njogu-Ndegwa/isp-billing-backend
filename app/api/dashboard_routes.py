@@ -888,6 +888,7 @@ async def get_daily_transaction_counts(
     router_id: Optional[int] = None,
     payment_method: Optional[str] = None,
     status: Optional[str] = "completed",
+    by_port: bool = False,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
@@ -897,6 +898,10 @@ async def get_daily_transaction_counts(
     Uses customer_payments as the authoritative completed-payment ledger.
     period: 7d | 30d | 90d | 6m | 1y (ignored when start_date+end_date provided)
     status: completed | pending | failed | refunded | all
+    by_port: requires router_id; additionally splits each day's revenue by the
+    recorded router port (customer_payments.port_name; NULL -> "unattributed").
+    Response gains port_keys (ordered, "unattributed" last) and each data point
+    gains by_port: {port: revenue}.
     """
     try:
         user = await get_current_user(token, db)
@@ -947,23 +952,32 @@ async def get_daily_transaction_counts(
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid payment_method")
 
+        if by_port and not router_id:
+            raise HTTPException(status_code=400, detail="by_port requires router_id")
+
         day_bucket = func.date(CustomerPayment.created_at).label("day")
+        select_columns = [
+            day_bucket,
+            func.count(CustomerPayment.id).label("transactions"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("revenue"),
+        ]
+        group_columns = [day_bucket]
+        if by_port:
+            select_columns.append(CustomerPayment.port_name.label("port_name"))
+            group_columns.append(CustomerPayment.port_name)
+
         stmt = (
-            select(
-                day_bucket,
-                func.count(CustomerPayment.id).label("transactions"),
-                func.coalesce(
-                    func.sum(
-                        case(
-                            (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
-                            else_=0,
-                        )
-                    ),
-                    0,
-                ).label("revenue"),
-            )
+            select(*select_columns)
             .where(*filters)
-            .group_by(day_bucket)
+            .group_by(*group_columns)
             .order_by(day_bucket)
         )
 
@@ -974,6 +988,7 @@ async def get_daily_transaction_counts(
         await db.commit()
 
         buckets = {}
+        port_keys_seen = set()
         for row in rows:
             raw_day = row.day
             if isinstance(raw_day, datetime):
@@ -982,10 +997,21 @@ async def get_daily_transaction_counts(
                 day_key = raw_day.isoformat()
             else:
                 day_key = str(raw_day)
-            buckets[day_key] = {
-                "transactions": int(row.transactions or 0),
-                "revenue": round(float(row.revenue or 0), 2),
-            }
+            bucket = buckets.setdefault(day_key, {"transactions": 0, "revenue": 0.0, "by_port": {}})
+            bucket["transactions"] += int(row.transactions or 0)
+            revenue = round(float(row.revenue or 0), 2)
+            bucket["revenue"] = round(bucket["revenue"] + revenue, 2)
+            if by_port:
+                port_key = getattr(row, "port_name", None) or "unattributed"
+                port_keys_seen.add(port_key)
+                bucket["by_port"][port_key] = round(bucket["by_port"].get(port_key, 0.0) + revenue, 2)
+
+        # Stable stacking order: real ports first (natural sort), unattributed last
+        def _port_sort_key(name: str):
+            digits = "".join(ch for ch in name if ch.isdigit())
+            return (name == "unattributed", name.rstrip("0123456789"), int(digits) if digits else 0)
+
+        port_keys = sorted(port_keys_seen, key=_port_sort_key) if by_port else []
 
         data = []
         total_transactions = 0
@@ -994,15 +1020,18 @@ async def get_daily_transaction_counts(
         final_day = (range_end - timedelta(days=1)).date()
         while cursor <= final_day:
             key = cursor.isoformat()
-            bucket = buckets.get(key, {"transactions": 0, "revenue": 0.0})
+            bucket = buckets.get(key, {"transactions": 0, "revenue": 0.0, "by_port": {}})
             total_transactions += bucket["transactions"]
             total_revenue += bucket["revenue"]
-            data.append({
+            point = {
                 "date": key,
                 "label": cursor.strftime("%b %d"),
                 "transactions": bucket["transactions"],
                 "revenue": bucket["revenue"],
-            })
+            }
+            if by_port:
+                point["by_port"] = {port: bucket["by_port"].get(port, 0.0) for port in port_keys}
+            data.append(point)
             cursor += timedelta(days=1)
 
         active_days = len([point for point in data if point["transactions"] > 0])
@@ -1015,6 +1044,8 @@ async def get_daily_transaction_counts(
             "router_id": router_id,
             "payment_method": payment_method,
             "status": status_filter,
+            "by_port": by_port,
+            "port_keys": port_keys,
             "data": data,
             "totals": {
                 "transactions": total_transactions,

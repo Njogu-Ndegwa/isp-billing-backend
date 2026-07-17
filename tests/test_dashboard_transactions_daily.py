@@ -104,6 +104,65 @@ async def test_transactions_daily_reseller_sees_only_own_payments(db, monkeypatc
     assert result["data"][0]["revenue"] == 100.0
 
 
+async def test_transactions_daily_by_port_splits_revenue_by_recorded_port(db, monkeypatch):
+    reseller = await make_reseller(db, email="reseller-port@example.com")
+    plan = await make_plan(db, reseller, price=100)
+    router = await make_router(db, reseller, ip_address="10.0.0.12")
+    customer = await make_customer(
+        db, reseller, plan, router,
+        phone="254700000003",
+        mac_address="AA:00:00:00:00:03",
+    )
+
+    day = datetime(2026, 6, 2, 8, 0, 0)
+    stamped = await _add_payment(db, customer, reseller, amount=100.0, created_at=day)
+    stamped.port_name = "ether2"
+    await _add_payment(db, customer, reseller, amount=50.0, created_at=day)
+    await db.commit()
+
+    async def fake_current_user(token, db):
+        return reseller
+
+    monkeypatch.setattr(dashboard_routes, "get_current_user", fake_current_user)
+
+    result = await dashboard_routes.get_daily_transaction_counts(
+        start_date="2026-06-02",
+        end_date="2026-06-02",
+        router_id=router.id,
+        by_port=True,
+        status="completed",
+        db=db,
+        token="test-token",
+    )
+
+    assert result["by_port"] is True
+    assert result["port_keys"] == ["ether2", "unattributed"]
+    assert result["data"][0]["revenue"] == 150.0
+    assert result["data"][0]["by_port"] == {"ether2": 100.0, "unattributed": 50.0}
+    assert result["totals"]["revenue"] == 150.0
+
+
+async def test_transactions_daily_by_port_requires_router(db, monkeypatch):
+    reseller = await make_reseller(db, email="reseller-port2@example.com")
+
+    async def fake_current_user(token, db):
+        return reseller
+
+    monkeypatch.setattr(dashboard_routes, "get_current_user", fake_current_user)
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        await dashboard_routes.get_daily_transaction_counts(
+            start_date="2026-06-02",
+            end_date="2026-06-02",
+            by_port=True,
+            status="completed",
+            db=db,
+            token="test-token",
+        )
+    assert exc.value.status_code == 400
+
+
 async def test_revenue_over_time_admin_sees_all_reseller_payments(db, monkeypatch):
     await _seed_two_reseller_payments(db)
     admin = SimpleNamespace(id=1, role=UserRole.ADMIN)
