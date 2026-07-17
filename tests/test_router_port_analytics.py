@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.api import router_operations
-from app.db.models import CustomerStatus
+from app.db.models import CustomerPayment, CustomerStatus
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
 
@@ -216,8 +216,18 @@ def test_port_analytics_groups_downstream_devices_by_port(monkeypatch):
             "port": 8728,
         },
         {
-            "AA:BB:CC:DD:EE:01": {"id": 1, "name": "Customer One", "status": "active"},
-            "AA:BB:CC:DD:EE:02": {"id": 2, "name": "Customer Two", "status": "active"},
+            "AA:BB:CC:DD:EE:01": {
+                "id": 1,
+                "name": "Customer One",
+                "status": "active",
+                "revenue": {"total": 1500.0, "today": 100.0, "this_week": 300.0, "this_month": 700.0},
+            },
+            "AA:BB:CC:DD:EE:02": {
+                "id": 2,
+                "name": "Customer Two",
+                "status": "active",
+                "revenue": {"total": 500.0, "today": 0.0, "this_week": 0.0, "this_month": 200.0},
+            },
         },
     )
 
@@ -230,10 +240,32 @@ def test_port_analytics_groups_downstream_devices_by_port(monkeypatch):
     assert ether6["counts"]["hotspot_authorized"] == 1
     assert ether6["counts"]["hotspot_bypassed"] == 1
     assert ether6["infrastructure"][0]["name"] == "Ruijie"
+    assert ether6["revenue"] == {
+        "total": 2000.0,
+        "today": 100.0,
+        "this_week": 300.0,
+        "this_month": 900.0,
+        "paying_customers_seen": 2,
+    }
+    customer_sample = next(
+        sample
+        for sample in ether6["downstream_devices_sample"]
+        if sample.get("customer_id") == 1
+    )
+    assert customer_sample["revenue_total"] == 1500.0
 
     ether7 = next(port for port in result["ports"] if port["port"] == "ether7")
     assert ether7["health"]["status"] == "silent_link"
     assert "received 0 packets" in ether7["health"]["warnings"][0]
+    assert ether7["revenue"]["total"] == 0.0
+    assert ether7["revenue"]["paying_customers_seen"] == 0
+
+    assert result["revenue"] == {
+        "attributed_total": 2000.0,
+        "attributed_today": 100.0,
+        "attributed_this_week": 300.0,
+        "attributed_this_month": 900.0,
+    }
 
 
 @pytest.mark.asyncio
@@ -289,6 +321,79 @@ async def test_port_analytics_endpoint_matches_customers_and_uses_cache(db, monk
     assert first["cached"] is False
     assert second["cached"] is True
     assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_port_analytics_endpoint_attaches_customer_and_router_revenue(db, monkeypatch):
+    router_operations._port_analytics_cache.clear()
+    router_operations._port_analytics_locks.clear()
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller, name="Router A")
+    plan = await make_plan(db, reseller)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        mac_address="aa-bb-cc-dd-ee-01",
+        name="Customer One",
+    )
+    db.add(
+        CustomerPayment(
+            customer_id=customer.id,
+            reseller_id=reseller.id,
+            amount=800.0,
+            days_paid_for=30,
+        )
+    )
+    # Compensation-style rows must not count toward port revenue
+    db.add(
+        CustomerPayment(
+            customer_id=customer.id,
+            reseller_id=reseller.id,
+            amount=200.0,
+            days_paid_for=7,
+            counts_as_revenue=False,
+        )
+    )
+    await db.commit()
+
+    async def fake_current_user(_token, _db):
+        return SimpleNamespace(id=reseller.id, role=reseller.role)
+
+    def fake_sync(router_info, customer_by_mac):
+        entry = customer_by_mac["AA:BB:CC:DD:EE:01"]
+        assert entry["revenue"]["total"] == 800.0
+        assert entry["revenue"]["today"] == 800.0
+        return {
+            "success": True,
+            "router": {"id": router.id, "name": router.name},
+            "generated_at": "2026-07-08T00:00:00",
+            "cached": False,
+            "revenue": {
+                "attributed_total": 300.0,
+                "attributed_today": 300.0,
+                "attributed_this_week": 300.0,
+                "attributed_this_month": 300.0,
+            },
+            "ports": [],
+        }
+
+    monkeypatch.setattr(router_operations, "get_current_user", fake_current_user)
+    monkeypatch.setattr(router_operations, "_get_port_analytics_sync", fake_sync)
+
+    response = await router_operations.get_router_port_analytics(
+        router.id,
+        refresh=True,
+        db=db,
+        token="token",
+    )
+
+    assert response["revenue"]["router_total"] == 800.0
+    assert response["revenue"]["router_today"] == 800.0
+    assert response["revenue"]["attributed_total"] == 300.0
+    assert response["revenue"]["unattributed_total"] == 500.0
 
 
 @pytest.mark.asyncio
