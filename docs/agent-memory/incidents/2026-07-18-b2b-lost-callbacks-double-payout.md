@@ -56,10 +56,18 @@ stuck pending) — the callback loss is a Safaricom-side hazard, not a regressio
   manual-triggered; settle completed/failed/ambiguous/idempotent/uncorrelated;
   job selects only stale unresolved) + existing B2B suites — all pass.
 
-## Follow-up
+## Live-verified Safaricom Transaction Status API quirks (2026-07-18, txn 1029)
 
-- TODO in `process_b2b_status_result`: learn Safaricom's exact "transaction
-  does not exist" result code from production logs, then auto-fail those.
+- Request field for the original transaction's id is **`OriginalConversationID`**
+  — NOT `OriginatorConversationID` as the B2B payment ack names it. Wrong name
+  → `400.002.02`.
+- Sending `TransactionID: ""` alongside it → all-empty ack (no errorCode).
+- Result code **2033** = "receipt cannot be found by the specified
+  OriginatorConversationID" = the payment was never processed. Auto-failed
+  when the transaction is <48h old; older ones stay blocked for manual
+  statement review (stale 2033 could mean aged out of their index).
+
+## Follow-up
 - Fix invalid destination paybills (SFC_IC0003 nightly: resellers 330/333/256/
   277/307; never-sent: 320→9285575, 241→5506814, 272→3463601).
 - Reconcile June stuck pendings (txns 707/710/711/1029) against an older
