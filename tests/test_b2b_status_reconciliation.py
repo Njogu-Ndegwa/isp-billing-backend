@@ -240,6 +240,51 @@ async def test_status_result_failed_marks_failed_no_payout(engine, db, monkeypat
     assert not await b2b.has_unresolved_b2b(db, r1.id)
 
 
+async def test_status_result_2033_fresh_marks_failed(engine, db, monkeypatch):
+    """Code 2033 (no record at Safaricom) on a FRESH transaction is a
+    definitive 'never processed' — mark failed so the reseller stays owed."""
+    from app.services import mpesa_b2b as b2b
+
+    r1 = await make_reseller(db)
+    txn = await _make_txn(db, r1.id, status=B2BTransactionStatus.PENDING,
+                          age=timedelta(hours=1), conversation_id="AG_orig_2033")
+
+    b2b._status_query_map.clear()
+    b2b._status_query_map["QCONV-2033"] = txn.id
+    settled = await b2b.process_b2b_status_result(
+        db, _status_result_body("QCONV-2033", result_code="2033", status_text="")
+    )
+    await db.commit()
+
+    assert settled.status == B2BTransactionStatus.FAILED
+    payouts = (await db.execute(
+        select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
+    )).scalars().all()
+    assert payouts == []
+    assert not await b2b.has_unresolved_b2b(db, r1.id)
+
+
+async def test_status_result_2033_stale_stays_blocked(engine, db, monkeypatch):
+    """2033 on an OLD transaction may just mean it aged out of Safaricom's
+    status index — manual statement review required, keep blocking."""
+    from app.services import mpesa_b2b as b2b
+
+    r1 = await make_reseller(db)
+    txn = await _make_txn(db, r1.id, status=B2BTransactionStatus.PENDING,
+                          age=timedelta(days=20), conversation_id="AG_orig_2033_old")
+
+    b2b._status_query_map.clear()
+    b2b._status_query_map["QCONV-2033-OLD"] = txn.id
+    await b2b.process_b2b_status_result(
+        db, _status_result_body("QCONV-2033-OLD", result_code="2033", status_text="")
+    )
+    await db.commit()
+
+    await db.refresh(txn)
+    assert txn.status == B2BTransactionStatus.PENDING
+    assert await b2b.has_unresolved_b2b(db, r1.id)
+
+
 async def test_status_result_ambiguous_leaves_txn_blocked(engine, db, monkeypatch):
     """Query-level errors or unknown status strings must change nothing —
     uncertainty never releases money."""

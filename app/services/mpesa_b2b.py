@@ -630,12 +630,33 @@ async def process_b2b_status_result(db: AsyncSession, body: dict) -> Optional[B2
     result_code = str(result.get("ResultCode", ""))
     result_desc = result.get("ResultDesc", "")
     if result_code != "0":
-        # The QUERY itself failed (bad credentials, unknown transaction, API
-        # trouble). Do NOT guess an outcome — log loudly and leave the txn
+        # Code 2033 = "receipt cannot be found by the specified
+        # OriginatorConversationID" (verified live on txn 1029, 2026-07-18):
+        # Safaricom has no record of the transaction, i.e. the payment was
+        # never processed and its failure callback was lost. Definitive for a
+        # FRESH transaction — mark failed so the reseller stays owed and the
+        # next run pays them. For old transactions 2033 could also mean the
+        # id aged out of their status index, so those stay blocked for manual
+        # statement review; wrongly failing a real payment re-creates the
+        # exact double-pay this module exists to prevent.
+        fresh = txn.created_at and txn.created_at >= datetime.utcnow() - timedelta(hours=48)
+        if result_code == "2033" and fresh:
+            txn.status = B2BTransactionStatus.FAILED
+            txn.result_code = result_code
+            txn.result_desc = (
+                f"Status query: no record at Safaricom — payment never "
+                f"processed ({result_desc})"
+            )[:500]
+            await db.flush()
+            logger.warning(
+                "B2B txn %s marked failed via status query (2033 not found): reseller=%s",
+                txn.id, txn.reseller_id,
+            )
+            return txn
+
+        # Any other query failure (bad credentials, API trouble, stale 2033).
+        # Do NOT guess an outcome — log loudly and leave the txn
         # unresolved/blocked for the next tick or manual review.
-        # TODO: once production shows us Safaricom's exact "transaction does
-        # not exist" code, auto-mark those FAILED so never-processed requests
-        # unblock without manual review.
         logger.error(
             "B2B status query for txn %s returned code=%s desc=%s — leaving unresolved",
             txn.id, result_code, result_desc,
