@@ -539,12 +539,14 @@ async def query_b2b_transaction_status(
     # Query by M-Pesa receipt when we have one; otherwise by the original
     # transaction's OriginatorConversationID (the lost-callback case).
     # Send exactly one of the two: including TransactionID as an empty string
-    # alongside OriginatorConversationID makes Safaricom return an all-empty
-    # ack (observed live on txn 1029, 2026-07-18).
+    # alongside the conversation id makes Safaricom return an all-empty ack
+    # (observed live on txn 1029, 2026-07-18). And the status API names the
+    # field "OriginalConversationID" — NOT "OriginatorConversationID" as the
+    # payment ack does (their 400.002.02 error spells out the expected name).
     if transaction_id:
         payload["TransactionID"] = transaction_id
     else:
-        payload["OriginatorConversationID"] = originator_conversation_id
+        payload["OriginalConversationID"] = originator_conversation_id
 
     async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
         response = await client.post(
