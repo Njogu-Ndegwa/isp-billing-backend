@@ -538,10 +538,12 @@ async def query_b2b_transaction_status(
     }
     # Query by M-Pesa receipt when we have one; otherwise by the original
     # transaction's OriginatorConversationID (the lost-callback case).
+    # Send exactly one of the two: including TransactionID as an empty string
+    # alongside OriginatorConversationID makes Safaricom return an all-empty
+    # ack (observed live on txn 1029, 2026-07-18).
     if transaction_id:
         payload["TransactionID"] = transaction_id
     else:
-        payload["TransactionID"] = ""
         payload["OriginatorConversationID"] = originator_conversation_id
 
     async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
