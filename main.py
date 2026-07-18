@@ -922,6 +922,14 @@ async def run_b2b_migrations():
             "EXCEPTION WHEN duplicate_object THEN NULL; "
             "END $$"
         ))
+        # The production type predates 'timeout' (created by an older model's
+        # create_all, so the CREATE TYPE above no-ops via duplicate_object and
+        # never upgrades it). Without this, any bind of TIMEOUT — the timeout
+        # callback, the in-flight guard, the status reconciliation query —
+        # fails with InvalidTextRepresentationError (found live 2026-07-18).
+        await conn.execute(sa_text(
+            "ALTER TYPE b2btransactionstatus ADD VALUE IF NOT EXISTS 'timeout'"
+        ))
         from app.db.models import B2BTransaction
         await conn.run_sync(
             lambda c: B2BTransaction.__table__.create(c, checkfirst=True)
