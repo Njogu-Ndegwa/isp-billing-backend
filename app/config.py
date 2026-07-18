@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     MPESA_B2B_SECURITY_CREDENTIAL: str = ""
     MPESA_B2B_RESULT_URL: str = ""
     MPESA_B2B_TIMEOUT_URL: str = ""
+    MPESA_B2B_STATUS_RESULT_URL: str = ""
+    MPESA_B2B_STATUS_TIMEOUT_URL: str = ""
     MPESA_B2B_DAILY_PAYOUT_ENABLED: bool = False
 
     # Router Auto-Provisioning

@@ -25,8 +25,10 @@ from app.services.mpesa_b2b import (
     get_b2b_fee,
     get_kadogo_surcharge,
     get_unpaid_balance,
+    has_unresolved_b2b,
     payout_reseller,
     process_b2b_result,
+    process_b2b_status_result,
     process_b2b_timeout,
     resolve_b2b_payment_method,
 )
@@ -67,6 +69,25 @@ async def b2b_timeout_callback(request: Request, db: AsyncSession = Depends(get_
     return {"ResultCode": "0", "ResultDesc": "Accepted"}
 
 
+@router.post("/api/mpesa/b2b/status-result")
+async def b2b_status_result_callback(request: Request, db: AsyncSession = Depends(get_db)):
+    """Safaricom ResultURL handler for transaction-status queries — settles
+    pending/timeout B2B transactions whose original callback was lost."""
+    body = await request.json()
+    logger.info("B2B status-query result received: %s", body)
+    await process_b2b_status_result(db, body)
+    await db.commit()
+    return {"ResultCode": "0", "ResultDesc": "Accepted"}
+
+
+@router.post("/api/mpesa/b2b/status-timeout")
+async def b2b_status_timeout_callback(request: Request):
+    """Status-query timeout: ignore — the reconciliation job re-queries."""
+    body = await request.json()
+    logger.warning("B2B status-query timeout received: %s", body)
+    return {"ResultCode": "0", "ResultDesc": "Accepted"}
+
+
 # ---------------------------------------------------------------------------
 # Admin: Manual payout trigger
 # ---------------------------------------------------------------------------
@@ -93,6 +114,20 @@ async def trigger_b2b_payout(
     reseller = await db.get(User, reseller_id)
     if not reseller or reseller.role != UserRole.RESELLER:
         raise HTTPException(status_code=404, detail="Reseller not found")
+
+    # A pending/timeout transaction means money may already be in flight with
+    # no verdict from Safaricom. Manually re-sending on top of one is exactly
+    # how the 2026-07-18 double-payouts happened (KES 12,713 duplicated).
+    if await has_unresolved_b2b(db, reseller_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This reseller has a payout whose outcome Safaricom has not yet "
+                "confirmed. It is being verified automatically (usually within "
+                "~10 minutes) — sending again now risks paying twice. Check the "
+                "B2B transaction history for the pending/timeout entry."
+            ),
+        )
 
     balance = await get_unpaid_balance(db, reseller_id)
     if balance <= 0:

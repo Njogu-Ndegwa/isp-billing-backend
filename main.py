@@ -2188,6 +2188,19 @@ async def startup_event():
     else:
         logger.info("B2B daily payouts disabled (MPESA_B2B_DAILY_PAYOUT_ENABLED=False)")
 
+    if app_settings.MPESA_B2B_INITIATOR_NAME:
+        from app.services.mpesa_b2b import run_b2b_status_reconciliation
+        scheduler.add_job(
+            run_b2b_status_reconciliation,
+            trigger=IntervalTrigger(minutes=10),
+            id='b2b_status_reconciliation',
+            name='Reconcile unresolved B2B payouts via Safaricom status query',
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+        logger.info("B2B status reconciliation scheduled every 10 minutes")
+
     scheduler.start()
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "

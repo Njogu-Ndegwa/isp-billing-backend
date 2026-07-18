@@ -307,6 +307,63 @@ async def initiate_b2b_payment(
 # Callback processing
 # ---------------------------------------------------------------------------
 
+async def _settle_completed_transaction(
+    db: AsyncSession, txn: B2BTransaction, transaction_id: Optional[str]
+) -> None:
+    """Mark a transaction completed and create its payout + fee charge rows.
+
+    Shared by the Safaricom result callback and the transaction-status
+    reconciliation path — the ledger must end up identical whichever way we
+    learn that the money moved.
+    """
+    txn.status = B2BTransactionStatus.COMPLETED
+    txn.completed_at = datetime.utcnow()
+    if transaction_id:
+        txn.transaction_id = transaction_id
+
+    if txn.triggered_by == SUBSCRIPTION_OWNER_TRIGGER:
+        logger.info(
+            "Subscription owner B2B transfer completed: owner=%s net=%s fee=%s ref=%s",
+            txn.reseller_id, txn.net_amount, txn.fee, transaction_id,
+        )
+        await db.flush()
+        return
+
+    reference = transaction_id or txn.conversation_id or f"B2B-{txn.id}"
+    payout = ResellerPayout(
+        reseller_id=txn.reseller_id,
+        amount=txn.net_amount,
+        payment_method="mpesa_b2b",
+        reference=reference,
+        notes=f"Auto B2B payout via {txn.party_b} (acc: {txn.account_reference})",
+    )
+    db.add(payout)
+    await db.flush()
+    txn.payout_id = payout.id
+
+    if txn.fee > 0:
+        admin_result = await db.execute(
+            select(User.id).where(User.role == UserRole.ADMIN).limit(1)
+        )
+        admin_id = admin_result.scalar_one_or_none() or txn.reseller_id
+
+        charge = ResellerTransactionCharge(
+            reseller_id=txn.reseller_id,
+            amount=txn.fee,
+            description=f"M-Pesa B2B transfer fee (KES {int(txn.net_amount)} to {txn.party_b})",
+            reference=reference,
+            created_by=admin_id,
+        )
+        db.add(charge)
+        await db.flush()
+        txn.charge_id = charge.id
+
+    logger.info(
+        "B2B payout completed: reseller=%s net=%s fee=%s ref=%s",
+        txn.reseller_id, txn.net_amount, txn.fee, transaction_id,
+    )
+
+
 async def process_b2b_result(db: AsyncSession, result_body: dict) -> Optional[B2BTransaction]:
     """
     Process a B2B result callback from Safaricom.
@@ -351,49 +408,7 @@ async def process_b2b_result(db: AsyncSession, result_body: dict) -> Optional[B2
     txn.transaction_id = transaction_id
 
     if str(result_code) == "0":
-        txn.status = B2BTransactionStatus.COMPLETED
-        txn.completed_at = datetime.utcnow()
-
-        if txn.triggered_by == SUBSCRIPTION_OWNER_TRIGGER:
-            logger.info(
-                "Subscription owner B2B transfer completed: owner=%s net=%s fee=%s ref=%s",
-                txn.reseller_id, txn.net_amount, txn.fee, transaction_id,
-            )
-            await db.flush()
-            return txn
-
-        payout = ResellerPayout(
-            reseller_id=txn.reseller_id,
-            amount=txn.net_amount,
-            payment_method="mpesa_b2b",
-            reference=transaction_id or conversation_id,
-            notes=f"Auto B2B payout via {txn.party_b} (acc: {txn.account_reference})",
-        )
-        db.add(payout)
-        await db.flush()
-        txn.payout_id = payout.id
-
-        if txn.fee > 0:
-            admin_result = await db.execute(
-                select(User.id).where(User.role == UserRole.ADMIN).limit(1)
-            )
-            admin_id = admin_result.scalar_one_or_none() or txn.reseller_id
-
-            charge = ResellerTransactionCharge(
-                reseller_id=txn.reseller_id,
-                amount=txn.fee,
-                description=f"M-Pesa B2B transfer fee (KES {int(txn.net_amount)} to {txn.party_b})",
-                reference=transaction_id or conversation_id,
-                created_by=admin_id,
-            )
-            db.add(charge)
-            await db.flush()
-            txn.charge_id = charge.id
-
-        logger.info(
-            "B2B payout completed: reseller=%s net=%s fee=%s ref=%s",
-            txn.reseller_id, txn.net_amount, txn.fee, transaction_id,
-        )
+        await _settle_completed_transaction(db, txn, transaction_id)
     else:
         txn.status = B2BTransactionStatus.FAILED
         logger.warning(
@@ -406,7 +421,10 @@ async def process_b2b_result(db: AsyncSession, result_body: dict) -> Optional[B2
 
 
 async def process_b2b_timeout(db: AsyncSession, body: dict) -> Optional[B2BTransaction]:
-    """Mark a B2B transaction as timed out for retry on next daily run."""
+    """Mark a B2B transaction as timed out. A timeout is NOT a verdict — the
+    money may still have moved — so the transaction stays unresolved (blocking
+    further payouts to that reseller) until the status reconciliation job gets
+    a definitive answer from Safaricom."""
     result = body.get("Result", body)
     conversation_id = _provider_id_or_none(result.get("ConversationID"))
     originator_id = _provider_id_or_none(result.get("OriginatorConversationID"))
@@ -429,6 +447,277 @@ async def process_b2b_timeout(db: AsyncSession, body: dict) -> Optional[B2BTrans
     await db.flush()
     logger.warning("B2B transaction %s timed out for reseller %s", txn.id, txn.reseller_id)
     return txn
+
+
+# ---------------------------------------------------------------------------
+# In-flight guard
+# ---------------------------------------------------------------------------
+
+# Statuses where money may have moved but we don't have Safaricom's verdict
+# yet. A transaction in one of these states — of ANY age and ANY trigger —
+# must block further payouts to that reseller: the 2026-07-18 incident was
+# Safaricom losing result callbacks, leaving sent money invisible to the
+# balance and every later payout a duplicate.
+UNRESOLVED_STATUSES = [B2BTransactionStatus.PENDING, B2BTransactionStatus.TIMEOUT]
+
+
+async def has_unresolved_b2b(db: AsyncSession, reseller_id: int) -> bool:
+    """True if the reseller has a B2B transaction whose outcome is unknown."""
+    stmt = select(func.count(B2BTransaction.id)).where(
+        B2BTransaction.reseller_id == reseller_id,
+        B2BTransaction.status.in_(UNRESOLVED_STATUSES),
+    )
+    return int((await db.execute(stmt)).scalar()) > 0
+
+
+# ---------------------------------------------------------------------------
+# Transaction-status reconciliation (never trust callback silence)
+# ---------------------------------------------------------------------------
+
+STATUS_QUERY_MIN_AGE = timedelta(minutes=5)
+STATUS_QUERY_MAX_AGE = timedelta(days=30)
+STATUS_QUERY_BATCH_LIMIT = 20
+
+# Correlates a status query's ConversationID (from Safaricom's ack) to our
+# B2B transaction id, because the async status result carries the QUERY's
+# ids, not the original transaction's. In-memory on purpose: if the app
+# restarts before the result arrives, the next reconciliation tick simply
+# re-queries — the loop converges even when status results themselves get lost.
+_status_query_map: dict[str, int] = {}
+_STATUS_QUERY_MAP_MAX = 500
+
+
+def _remember_status_query(conversation_id: Optional[str], txn_id: int) -> None:
+    if not conversation_id:
+        return
+    if len(_status_query_map) >= _STATUS_QUERY_MAP_MAX:
+        _status_query_map.pop(next(iter(_status_query_map)))
+    _status_query_map[conversation_id] = txn_id
+
+
+async def query_b2b_transaction_status(
+    txn_id: int,
+    originator_conversation_id: Optional[str],
+    transaction_id: Optional[str],
+) -> bool:
+    """Ask Safaricom what happened to a B2B transaction (async result via
+    callback). Returns True if the query was accepted. No DB access here —
+    callers must not hold a session across this network call."""
+    if not (transaction_id or originator_conversation_id):
+        logger.warning(
+            "B2B status query for txn %s impossible: no receipt or originator id", txn_id
+        )
+        return False
+
+    access_token = await _get_access_token()
+    security_credential = generate_security_credential()
+
+    base_url = (
+        "https://api.safaricom.co.ke"
+        if settings.MPESA_ENVIRONMENT == "production"
+        else "https://sandbox.safaricom.co.ke"
+    )
+    callback_base = settings.MPESA_CALLBACK_URL.rsplit("/api/", 1)[0]
+    result_url = settings.MPESA_B2B_STATUS_RESULT_URL or (
+        f"{callback_base}/api/mpesa/b2b/status-result"
+    )
+    timeout_url = settings.MPESA_B2B_STATUS_TIMEOUT_URL or (
+        f"{callback_base}/api/mpesa/b2b/status-timeout"
+    )
+
+    payload = {
+        "Initiator": settings.MPESA_B2B_INITIATOR_NAME,
+        "SecurityCredential": security_credential,
+        "CommandID": "TransactionStatusQuery",
+        "PartyA": settings.MPESA_SHORTCODE,
+        "IdentifierType": "4",
+        "Remarks": f"Status check b2b txn {txn_id}",
+        "Occasion": str(txn_id),
+        "ResultURL": result_url,
+        "QueueTimeOutURL": timeout_url,
+    }
+    # Query by M-Pesa receipt when we have one; otherwise by the original
+    # transaction's OriginatorConversationID (the lost-callback case).
+    if transaction_id:
+        payload["TransactionID"] = transaction_id
+    else:
+        payload["TransactionID"] = ""
+        payload["OriginatorConversationID"] = originator_conversation_id
+
+    async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
+        response = await client.post(
+            f"{base_url}/mpesa/transactionstatus/v1/query",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+        logger.error(
+            "B2B status query for txn %s: non-JSON response HTTP %s: %s",
+            txn_id, response.status_code, response.text[:300],
+        )
+        return False
+
+    if str(data.get("ResponseCode", "")) != "0":
+        logger.warning("B2B status query for txn %s rejected: %s", txn_id, data)
+        return False
+
+    _remember_status_query(_provider_id_or_none(data.get("ConversationID")), txn_id)
+    _remember_status_query(
+        _provider_id_or_none(data.get("OriginatorConversationID")), txn_id
+    )
+    logger.info("B2B status query accepted for txn %s", txn_id)
+    return True
+
+
+def _result_parameters(result: dict) -> dict:
+    """Flatten Safaricom's ResultParameters list into a {Key: Value} dict."""
+    params = {}
+    container = result.get("ResultParameters") or {}
+    items = container.get("ResultParameter") or []
+    if isinstance(items, dict):
+        items = [items]
+    for item in items:
+        key = item.get("Key")
+        if key is not None:
+            params[str(key)] = item.get("Value")
+    return params
+
+
+async def process_b2b_status_result(db: AsyncSession, body: dict) -> Optional[B2BTransaction]:
+    """Settle a pending/timeout B2B transaction from a status-query result.
+
+    Safety posture: only a definitive Safaricom verdict changes state.
+    "Completed" → settle exactly like the normal result callback;
+    an explicit failed/cancelled status → mark failed (reseller stays owed);
+    anything ambiguous → leave the transaction unresolved, which keeps the
+    reseller blocked from further payouts. Uncertainty never releases money.
+    """
+    result = body.get("Result", body)
+    query_conv_id = _provider_id_or_none(result.get("ConversationID"))
+    query_orig_id = _provider_id_or_none(result.get("OriginatorConversationID"))
+
+    txn_id = _status_query_map.get(query_conv_id or "") or _status_query_map.get(
+        query_orig_id or ""
+    )
+    if txn_id is None:
+        # Map lost (restart) or unknown query — the reconciliation tick will
+        # re-query; nothing settles without correlation.
+        logger.warning(
+            "B2B status result with no matching query (conv=%s orig=%s), ignoring",
+            query_conv_id, query_orig_id,
+        )
+        return None
+
+    txn = await db.get(B2BTransaction, txn_id)
+    if not txn:
+        return None
+    if txn.status not in UNRESOLVED_STATUSES:
+        logger.info(
+            "B2B status result for txn %s already in state %s, ignoring", txn.id, txn.status
+        )
+        return txn
+
+    result_code = str(result.get("ResultCode", ""))
+    result_desc = result.get("ResultDesc", "")
+    if result_code != "0":
+        # The QUERY itself failed (bad credentials, unknown transaction, API
+        # trouble). Do NOT guess an outcome — log loudly and leave the txn
+        # unresolved/blocked for the next tick or manual review.
+        # TODO: once production shows us Safaricom's exact "transaction does
+        # not exist" code, auto-mark those FAILED so never-processed requests
+        # unblock without manual review.
+        logger.error(
+            "B2B status query for txn %s returned code=%s desc=%s — leaving unresolved",
+            txn.id, result_code, result_desc,
+        )
+        return txn
+
+    params = _result_parameters(result)
+    status_text = str(
+        params.get("TransactionStatus") or params.get("Transaction Status") or ""
+    ).strip().lower()
+    receipt = _provider_id_or_none(
+        params.get("ReceiptNo") or params.get("Receipt No") or result.get("TransactionID")
+    )
+
+    if status_text == "completed":
+        txn.result_code = "0"
+        txn.result_desc = f"Reconciled via transaction status query: {result_desc}"[:500]
+        await _settle_completed_transaction(db, txn, receipt)
+        logger.warning(
+            "B2B txn %s settled via status query (callback was lost): reseller=%s net=%s ref=%s",
+            txn.id, txn.reseller_id, txn.net_amount, receipt,
+        )
+    elif status_text in ("failed", "cancelled", "declined", "expired"):
+        txn.status = B2BTransactionStatus.FAILED
+        txn.result_code = result_code
+        txn.result_desc = (
+            f"Reconciled via transaction status query: {status_text} — "
+            f"{params.get('TransactionReason') or result_desc}"
+        )[:500]
+        logger.warning(
+            "B2B txn %s marked failed via status query: reseller=%s reason=%s",
+            txn.id, txn.reseller_id, txn.result_desc,
+        )
+    else:
+        logger.error(
+            "B2B status query for txn %s returned unrecognized TransactionStatus=%r "
+            "— leaving unresolved", txn.id, status_text,
+        )
+        return txn
+
+    await db.flush()
+    return txn
+
+
+async def run_b2b_status_reconciliation():
+    """Scheduled job: query Safaricom for every B2B transaction stuck without
+    a verdict, so a lost callback can never leave sent money unrecorded
+    (2026-07-18 incident: 15 lost callbacks → KES 12,713 double-paid)."""
+    if not settings.MPESA_B2B_INITIATOR_NAME:
+        return
+
+    from app.db.database import db_pool_snapshot
+
+    level = (db_pool_snapshot().get("pressure") or {}).get("level")
+    if level in ("warning", "critical"):
+        logger.info("B2B status reconciliation skipped: DB pool pressure %s", level)
+        return
+
+    now = datetime.utcnow()
+    # Short session: read the stale list, release, THEN talk to Safaricom.
+    async with AsyncSessionLocal() as db:
+        stmt = (
+            select(
+                B2BTransaction.id,
+                B2BTransaction.originator_conversation_id,
+                B2BTransaction.transaction_id,
+            )
+            .where(
+                B2BTransaction.status.in_(UNRESOLVED_STATUSES),
+                B2BTransaction.created_at <= now - STATUS_QUERY_MIN_AGE,
+                B2BTransaction.created_at >= now - STATUS_QUERY_MAX_AGE,
+            )
+            .order_by(B2BTransaction.created_at)
+            .limit(STATUS_QUERY_BATCH_LIMIT)
+        )
+        stale = list((await db.execute(stmt)).all())
+
+    if not stale:
+        return
+
+    logger.warning("B2B status reconciliation: %d unresolved transaction(s)", len(stale))
+    for txn_id, originator_id, receipt in stale:
+        try:
+            await query_b2b_transaction_status(txn_id, originator_id, receipt)
+        except Exception as e:
+            logger.error("B2B status query failed for txn %s: %s", txn_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +938,19 @@ async def run_daily_payouts():
                 # KES 1 can never net positive after the KES 1 Kadogo fee —
                 # skip quietly instead of raising a spurious "failed".
                 if balance < 2:
+                    skip_count += 1
+                    continue
+
+                # Unresolved payment of ANY age (any trigger) = money may be
+                # in flight with no verdict. Sending again is how the
+                # 2026-07-18 double-pays happened — block until the status
+                # reconciliation job settles it.
+                if await has_unresolved_b2b(db, reseller_id):
+                    logger.warning(
+                        "Reseller %s has an unresolved (pending/timeout) B2B tx, "
+                        "skipping until reconciled",
+                        reseller_id,
+                    )
                     skip_count += 1
                     continue
 
