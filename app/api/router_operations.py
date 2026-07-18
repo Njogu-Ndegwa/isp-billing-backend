@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, func
+from sqlalchemy import select, or_, func, case
 from sqlalchemy.orm import selectinload
 from typing import Any, Dict, List, Optional, Set
 from datetime import datetime, timedelta
@@ -9,7 +9,15 @@ from dataclasses import asdict
 from pathlib import Path
 
 from app.db.database import db_pool_snapshot, get_db
-from app.db.models import Router, Customer, Plan, CustomerStatus, ConnectionType, ProvisioningToken
+from app.db.models import (
+    Router,
+    Customer,
+    CustomerPayment,
+    Plan,
+    CustomerStatus,
+    ConnectionType,
+    ProvisioningToken,
+)
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import (
     MikroTikAPI,
@@ -2619,8 +2627,17 @@ def _monitor_ethernet(api: MikroTikAPI, port_name: str) -> Dict[str, Any]:
     return rows[0] if rows else {}
 
 
-def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
-    """Read-only downstream device and customer-load analytics for one router."""
+def _get_port_analytics_sync(
+    router_info: dict,
+    customer_by_mac: dict,
+    revenue_by_port: Optional[dict] = None,
+) -> dict:
+    """Read-only downstream device and customer-load analytics for one router.
+
+    revenue_by_port carries pre-computed sums of payments stamped with each
+    port (recorded attribution at payment time) — no revenue is inferred from
+    live device presence.
+    """
     api = MikroTikAPI(
         router_info["ip"],
         router_info["username"],
@@ -2934,6 +2951,7 @@ def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
         infrastructure_candidates = []
         port_summaries = []
         warnings = []
+        revenue_by_port = revenue_by_port or {}
 
         for port_name in port_names:
             iface = iface_by_name.get(port_name, {})
@@ -2983,6 +3001,7 @@ def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
                 if customer:
                     sample["customer_id"] = customer.get("id")
                     sample["customer_status"] = customer.get("status")
+                    sample["revenue_total"] = round(float(customer.get("revenue_total") or 0), 2)
                 if _looks_like_infrastructure_device(mac, metadata, known_customer_macs):
                     infra = {
                         "mac": mac,
@@ -3050,6 +3069,13 @@ def _get_port_analytics_sync(router_info: dict, customer_by_mac: dict) -> dict:
                         "tx_error": tx_errors,
                         "rx_drop": _safe_routeros_int(iface.get("rx-drop")),
                         "tx_drop": _safe_routeros_int(iface.get("tx-drop")),
+                    },
+                    "revenue": revenue_by_port.get(port_name) or {
+                        "total": 0.0,
+                        "today": 0.0,
+                        "this_week": 0.0,
+                        "this_month": 0.0,
+                        "paying_customers": 0,
                     },
                     "counts": {
                         "learned_macs": len(learned_macs),
@@ -3335,7 +3361,10 @@ async def get_router_port_analytics(
     token: str = Depends(verify_token),
 ):
     """
-    Read-only downstream-device analytics for one router.
+    Read-only downstream-device analytics for one router, including per-port
+    customer counts and per-port revenue. Revenue attribution is RECORDED at
+    payment time (customer_payments.port_name, stamped by the background
+    port-attribution job), so it is stable — not inferred from live presence.
 
     This is intentionally separate from /ports because it performs heavier live
     RouterOS reads and joins learned MACs against customer MACs. It never holds
@@ -3437,6 +3466,85 @@ async def get_router_port_analytics(
                 "status": status.value if status else None,
             }
 
+        # Revenue per port from RECORDED attribution: each payment is stamped
+        # with the port the customer's device was on around payment time (see
+        # payment_port_attribution service). NULL port_name = unattributed
+        # (customer offline at stamping, no MAC, or pre-tracking history).
+        # Same revenue convention as the dashboard: counts_as_revenue=true.
+        now = datetime.utcnow()
+        today_start = datetime(now.year, now.month, now.day)
+        week_start = today_start - timedelta(days=now.weekday())
+        month_start = datetime(now.year, now.month, 1)
+
+        def _window_sum(window_start):
+            return func.coalesce(
+                func.sum(
+                    case(
+                        (CustomerPayment.created_at >= window_start, CustomerPayment.amount),
+                        else_=0.0,
+                    )
+                ),
+                0,
+            )
+
+        revenue_stmt = (
+            select(
+                CustomerPayment.port_name,
+                func.coalesce(func.sum(CustomerPayment.amount), 0).label("total"),
+                _window_sum(today_start).label("today"),
+                _window_sum(week_start).label("this_week"),
+                _window_sum(month_start).label("this_month"),
+                func.count(func.distinct(CustomerPayment.customer_id)).label("paying_customers"),
+            )
+            .join(Customer, CustomerPayment.customer_id == Customer.id)
+            .where(
+                Customer.router_id == router_id,
+                CustomerPayment.counts_as_revenue == True,
+            )
+            .group_by(CustomerPayment.port_name)
+        )
+        revenue_by_port = {}
+        unattributed_revenue = {"total": 0.0, "today": 0.0, "this_week": 0.0, "this_month": 0.0}
+        attributed_revenue = {"total": 0.0, "today": 0.0, "this_week": 0.0, "this_month": 0.0}
+        for port_name, total, today, this_week, this_month, paying_customers in (
+            await db.execute(revenue_stmt)
+        ).all():
+            sums = {
+                "total": round(float(total or 0), 2),
+                "today": round(float(today or 0), 2),
+                "this_week": round(float(this_week or 0), 2),
+                "this_month": round(float(this_month or 0), 2),
+            }
+            if port_name:
+                revenue_by_port[port_name] = {**sums, "paying_customers": int(paying_customers or 0)}
+                for key in attributed_revenue:
+                    attributed_revenue[key] += sums[key]
+            else:
+                for key in unattributed_revenue:
+                    unattributed_revenue[key] += sums[key]
+
+        # Per-customer all-time totals for the downstream-device list.
+        customer_revenue_stmt = (
+            select(
+                CustomerPayment.customer_id,
+                func.coalesce(func.sum(CustomerPayment.amount), 0),
+            )
+            .join(Customer, CustomerPayment.customer_id == Customer.id)
+            .where(
+                Customer.router_id == router_id,
+                CustomerPayment.counts_as_revenue == True,
+            )
+            .group_by(CustomerPayment.customer_id)
+        )
+        revenue_total_by_customer_id = {
+            customer_id: float(total or 0)
+            for customer_id, total in (await db.execute(customer_revenue_stmt)).all()
+        }
+        for entry in customer_by_mac.values():
+            total = revenue_total_by_customer_id.get(entry["id"])
+            if total:
+                entry["revenue_total"] = total
+
         await db.commit()
 
         result = await run_with_guard(
@@ -3444,6 +3552,7 @@ async def get_router_port_analytics(
             _get_port_analytics_sync,
             router_info,
             customer_by_mac,
+            revenue_by_port,
             acquire_timeout_seconds=_PORT_ANALYTICS_BUSY_WAIT_SECONDS,
             timeout_seconds=_PORT_ANALYTICS_ROUTER_TIMEOUT_SECONDS,
         )
@@ -3474,6 +3583,21 @@ async def get_router_port_analytics(
             )
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])
+
+        # Router-wide revenue context. Attribution is RECORDED at payment time
+        # by the port-attribution job; unattributed covers customers who were
+        # offline when stamping ran, have no MAC on file, or paid before port
+        # tracking existed.
+        result["revenue"] = {
+            "attribution": "recorded",
+            **{f"attributed_{key}": round(value, 2) for key, value in attributed_revenue.items()},
+            **{
+                f"router_{key}": round(attributed_revenue[key] + unattributed_revenue[key], 2)
+                for key in attributed_revenue
+            },
+            "unattributed_total": round(unattributed_revenue["total"], 2),
+            "unattributed_this_month": round(unattributed_revenue["this_month"], 2),
+        }
 
         _port_analytics_cache[router_id] = {
             "data": result,

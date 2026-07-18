@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.api import router_operations
-from app.db.models import CustomerStatus
+from app.db.models import CustomerPayment, CustomerStatus
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
 
@@ -216,8 +216,27 @@ def test_port_analytics_groups_downstream_devices_by_port(monkeypatch):
             "port": 8728,
         },
         {
-            "AA:BB:CC:DD:EE:01": {"id": 1, "name": "Customer One", "status": "active"},
-            "AA:BB:CC:DD:EE:02": {"id": 2, "name": "Customer Two", "status": "active"},
+            "AA:BB:CC:DD:EE:01": {
+                "id": 1,
+                "name": "Customer One",
+                "status": "active",
+                "revenue_total": 1500.0,
+            },
+            "AA:BB:CC:DD:EE:02": {
+                "id": 2,
+                "name": "Customer Two",
+                "status": "active",
+                "revenue_total": 500.0,
+            },
+        },
+        {
+            "ether6": {
+                "total": 2000.0,
+                "today": 100.0,
+                "this_week": 300.0,
+                "this_month": 900.0,
+                "paying_customers": 2,
+            },
         },
     )
 
@@ -230,10 +249,25 @@ def test_port_analytics_groups_downstream_devices_by_port(monkeypatch):
     assert ether6["counts"]["hotspot_authorized"] == 1
     assert ether6["counts"]["hotspot_bypassed"] == 1
     assert ether6["infrastructure"][0]["name"] == "Ruijie"
+    assert ether6["revenue"] == {
+        "total": 2000.0,
+        "today": 100.0,
+        "this_week": 300.0,
+        "this_month": 900.0,
+        "paying_customers": 2,
+    }
+    customer_sample = next(
+        sample
+        for sample in ether6["downstream_devices_sample"]
+        if sample.get("customer_id") == 1
+    )
+    assert customer_sample["revenue_total"] == 1500.0
 
     ether7 = next(port for port in result["ports"] if port["port"] == "ether7")
     assert ether7["health"]["status"] == "silent_link"
     assert "received 0 packets" in ether7["health"]["warnings"][0]
+    assert ether7["revenue"]["total"] == 0.0
+    assert ether7["revenue"]["paying_customers"] == 0
 
 
 @pytest.mark.asyncio
@@ -258,7 +292,7 @@ async def test_port_analytics_endpoint_matches_customers_and_uses_cache(db, monk
 
     calls = {"count": 0}
 
-    def fake_sync(router_info, customer_by_mac):
+    def fake_sync(router_info, customer_by_mac, revenue_by_port=None):
         calls["count"] += 1
         assert router_info["id"] == router.id
         assert "AA:BB:CC:DD:EE:01" in customer_by_mac
@@ -292,6 +326,90 @@ async def test_port_analytics_endpoint_matches_customers_and_uses_cache(db, monk
 
 
 @pytest.mark.asyncio
+async def test_port_analytics_endpoint_uses_recorded_port_attribution(db, monkeypatch):
+    router_operations._port_analytics_cache.clear()
+    router_operations._port_analytics_locks.clear()
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller, name="Router A")
+    plan = await make_plan(db, reseller)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        mac_address="aa-bb-cc-dd-ee-01",
+        name="Customer One",
+    )
+    # Stamped payment -> attributed to ether2
+    db.add(
+        CustomerPayment(
+            customer_id=customer.id,
+            reseller_id=reseller.id,
+            amount=800.0,
+            days_paid_for=30,
+            port_name="ether2",
+        )
+    )
+    # Never stamped -> unattributed
+    db.add(
+        CustomerPayment(
+            customer_id=customer.id,
+            reseller_id=reseller.id,
+            amount=300.0,
+            days_paid_for=7,
+        )
+    )
+    # Compensation-style rows must not count toward revenue at all
+    db.add(
+        CustomerPayment(
+            customer_id=customer.id,
+            reseller_id=reseller.id,
+            amount=200.0,
+            days_paid_for=7,
+            counts_as_revenue=False,
+            port_name="ether2",
+        )
+    )
+    await db.commit()
+
+    async def fake_current_user(_token, _db):
+        return SimpleNamespace(id=reseller.id, role=reseller.role)
+
+    seen = {}
+
+    def fake_sync(router_info, customer_by_mac, revenue_by_port=None):
+        seen["revenue_by_port"] = revenue_by_port
+        entry = customer_by_mac["AA:BB:CC:DD:EE:01"]
+        assert entry["revenue_total"] == 1100.0
+        return {
+            "success": True,
+            "router": {"id": router.id, "name": router.name},
+            "generated_at": "2026-07-08T00:00:00",
+            "cached": False,
+            "ports": [],
+        }
+
+    monkeypatch.setattr(router_operations, "get_current_user", fake_current_user)
+    monkeypatch.setattr(router_operations, "_get_port_analytics_sync", fake_sync)
+
+    response = await router_operations.get_router_port_analytics(
+        router.id,
+        refresh=True,
+        db=db,
+        token="token",
+    )
+
+    assert seen["revenue_by_port"]["ether2"]["total"] == 800.0
+    assert seen["revenue_by_port"]["ether2"]["paying_customers"] == 1
+    assert response["revenue"]["attribution"] == "recorded"
+    assert response["revenue"]["attributed_total"] == 800.0
+    assert response["revenue"]["unattributed_total"] == 300.0
+    assert response["revenue"]["router_total"] == 1100.0
+    assert response["revenue"]["router_today"] == 1100.0
+
+
+@pytest.mark.asyncio
 async def test_port_analytics_refresh_true_is_rate_limited_by_recent_cache(db, monkeypatch):
     router_operations._port_analytics_cache.clear()
     router_operations._port_analytics_locks.clear()
@@ -303,7 +421,7 @@ async def test_port_analytics_refresh_true_is_rate_limited_by_recent_cache(db, m
 
     calls = {"count": 0}
 
-    def fake_sync(_router_info, _customer_by_mac):
+    def fake_sync(_router_info, _customer_by_mac, _revenue_by_port=None):
         calls["count"] += 1
         return {
             "success": True,
