@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 
 SAFARICOM_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=5.0)
 SUBSCRIPTION_OWNER_TRIGGER = "subscription_owner"
+# triggered_by value for self-service withdrawals from the Account Statement
+# page (vs "manual" = admin-triggered, "scheduled" = nightly job).
+RESELLER_TRIGGER = "reseller"
 
 CERTS_DIR = Path(__file__).resolve().parent.parent / "certs"
 
@@ -99,6 +102,32 @@ def get_kadogo_surcharge(amount: float) -> int:
         if low <= amt <= high:
             return surcharge
     return 0
+
+
+def compute_fee_breakdown(balance: float) -> tuple[int, int, int]:
+    """Return (total_fee, kadogo_surcharge, net) for paying out `balance`.
+
+    Safaricom charges based on the net amount sent; we need
+    ``net + safaricom_fee(net) == balance``. At most tier boundaries a single
+    correction finds the right fee; at narrow "gap zones" (e.g. 101-105,
+    506-510) no exact solution exists and we fall back to the fee for the
+    gross balance.
+    """
+    fee = get_b2b_fee(balance)
+    net = int(balance - fee)
+    actual_fee = get_b2b_fee(net)
+    if actual_fee != fee:
+        fee = actual_fee
+        net = int(balance - fee)
+        if get_b2b_fee(net) != fee:
+            fee = get_b2b_fee(balance)
+
+    kadogo = 0
+    if balance <= 100:
+        kadogo = get_kadogo_surcharge(balance - fee)
+        fee += kadogo
+
+    return fee, kadogo, int(balance - fee)
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +819,53 @@ async def get_unpaid_balance(db: AsyncSession, reseller_id: int) -> float:
     return round(mpesa_rev + correction - paid - charges, 2)
 
 
+# ---------------------------------------------------------------------------
+# Payout schedule (per-reseller frequency)
+# ---------------------------------------------------------------------------
+
+PAYOUT_FREQUENCY_MANUAL = "manual"
+DEFAULT_PAYOUT_FREQUENCY = "daily"
+
+# Minimum gap (hours) between automatic payouts, per frequency. Each window
+# sits ~4h short of the nominal period for the same reason the daily window
+# is 20h, not 24h: the job fires at 23:59 UTC and the previous cycle's
+# transaction lands slightly AFTER the period boundary — a full-length window
+# would count it and skip a legitimately-due reseller (2026-07-15 incident).
+PAYOUT_FREQUENCY_WINDOWS_HOURS = {
+    "daily": 20,
+    "weekly": 7 * 24 - 4,
+    "monthly": 30 * 24 - 4,
+}
+
+VALID_PAYOUT_FREQUENCIES = tuple(PAYOUT_FREQUENCY_WINDOWS_HOURS) + (PAYOUT_FREQUENCY_MANUAL,)
+
+# Balance payouts count toward the weekly/monthly gate no matter who fired
+# them; subscription_owner B2B traffic is a different money flow entirely.
+BALANCE_PAYOUT_TRIGGERS = ["scheduled", "manual", RESELLER_TRIGGER]
+
+
+async def get_payout_frequency(db: AsyncSession, reseller_id: int) -> str:
+    """Return the reseller's configured payout frequency ('daily' if unset)."""
+    stmt = select(ResellerFinancials.payout_frequency).where(
+        ResellerFinancials.user_id == reseller_id
+    )
+    val = (await db.execute(stmt)).scalar_one_or_none()
+    return val if val in VALID_PAYOUT_FREQUENCIES else DEFAULT_PAYOUT_FREQUENCY
+
+
+async def set_payout_frequency(db: AsyncSession, reseller_id: int, frequency: str) -> None:
+    """Upsert the reseller's payout frequency onto their financials row."""
+    if frequency not in VALID_PAYOUT_FREQUENCIES:
+        raise ValueError(f"Invalid payout frequency: {frequency}")
+    stmt = select(ResellerFinancials).where(ResellerFinancials.user_id == reseller_id)
+    fin = (await db.execute(stmt)).scalar_one_or_none()
+    if fin:
+        fin.payout_frequency = frequency
+    else:
+        db.add(ResellerFinancials(user_id=reseller_id, payout_frequency=frequency))
+    await db.flush()
+
+
 async def _monthly_b2b_count(db: AsyncSession, reseller_id: int) -> int:
     """Count B2B transactions this calendar month for Kadogo surcharge tracking."""
     now = datetime.utcnow()
@@ -884,22 +960,7 @@ async def payout_reseller(
     if not party_b:
         raise ValueError("Payment method has no destination paybill number configured")
 
-    # Safaricom charges based on the net amount sent; we need:
-    #   net + safaricom_fee(net) == balance
-    # At most tier boundaries a single correction finds the right fee.
-    # At narrow "gap zones" (e.g. 101-105, 506-510) no exact solution
-    # exists — we skip the payout and let the balance accumulate.
-    fee = get_b2b_fee(balance)
-    net = int(balance - fee)
-    actual_fee = get_b2b_fee(net)
-    if actual_fee != fee:
-        fee = actual_fee
-        net = int(balance - fee)
-        if get_b2b_fee(net) != fee:
-            fee = get_b2b_fee(balance)
-
-    if balance <= 100:
-        fee += get_kadogo_surcharge(balance - fee)
+    fee, _, _ = compute_fee_breakdown(balance)
 
     txn = await initiate_b2b_payment(
         db=db,
@@ -935,15 +996,20 @@ async def run_daily_payouts():
     skip_count = 0
     fail_count = 0
 
-    # Dedupe window: anchor it ONCE at run start, as a rolling 20-hour window.
-    # The run fires at 23:59 UTC and crosses midnight mid-loop. The old
-    # calendar-day window ("created_at >= today 00:00"), recomputed per
-    # reseller, made the pre-midnight minute count the PREVIOUS night's
-    # post-midnight payouts as "already paid today" and mass-skip resellers
-    # who were legitimately owed (2026-07-15 incident: 3 initiated, everyone
-    # else silently skipped). 20 hours still blocks a double fire within the
-    # same night while leaving last night's run (~24h old) out of the window.
-    dedupe_window_start = datetime.utcnow() - timedelta(hours=20)
+    # Dedupe windows: anchor them ONCE at run start, as rolling windows (one
+    # per payout frequency). The run fires at 23:59 UTC and crosses midnight
+    # mid-loop. The old calendar-day window ("created_at >= today 00:00"),
+    # recomputed per reseller, made the pre-midnight minute count the PREVIOUS
+    # night's post-midnight payouts as "already paid today" and mass-skip
+    # resellers who were legitimately owed (2026-07-15 incident: 3 initiated,
+    # everyone else silently skipped). Each window sits a few hours short of
+    # its nominal period so the previous cycle's slightly-late transaction
+    # stays outside it.
+    run_anchor = datetime.utcnow()
+    dedupe_windows = {
+        freq: run_anchor - timedelta(hours=hours)
+        for freq, hours in PAYOUT_FREQUENCY_WINDOWS_HOURS.items()
+    }
 
     # Snapshot plain ids first: one reseller's failure must never poison the
     # ORM state (or session) used for the resellers that follow. A rollback
@@ -959,6 +1025,13 @@ async def run_daily_payouts():
             # Fresh short session per reseller: a failure (or aborted
             # transaction) for one reseller cannot leak into the next.
             async with AsyncSessionLocal() as db:
+                frequency = await get_payout_frequency(db, reseller_id)
+                if frequency == PAYOUT_FREQUENCY_MANUAL:
+                    # Reseller opted out of automatic payouts; they withdraw
+                    # themselves from the Account Statement page.
+                    skip_count += 1
+                    continue
+
                 balance = await get_unpaid_balance(db, reseller_id)
                 # KES 1 can never net positive after the KES 1 Kadogo fee —
                 # skip quietly instead of raising a spurious "failed".
@@ -979,21 +1052,34 @@ async def run_daily_payouts():
                     skip_count += 1
                     continue
 
-                existing_recent = await db.execute(
-                    select(func.count(B2BTransaction.id)).where(
-                        B2BTransaction.reseller_id == reseller_id,
-                        B2BTransaction.created_at >= dedupe_window_start,
-                        B2BTransaction.triggered_by == "scheduled",
-                        B2BTransaction.status.in_([
-                            B2BTransactionStatus.PENDING,
-                            B2BTransactionStatus.COMPLETED,
-                        ]),
+                dedupe_filters = [
+                    B2BTransaction.reseller_id == reseller_id,
+                    B2BTransaction.created_at >= dedupe_windows[frequency],
+                    B2BTransaction.status.in_([
+                        B2BTransactionStatus.PENDING,
+                        B2BTransactionStatus.COMPLETED,
+                    ]),
+                ]
+                if frequency == DEFAULT_PAYOUT_FREQUENCY:
+                    # Daily keeps its historical semantics: only a scheduled
+                    # payout blocks tonight's run — an admin/self payout made
+                    # earlier today does not stop the remaining balance.
+                    dedupe_filters.append(B2BTransaction.triggered_by == "scheduled")
+                else:
+                    # Weekly/monthly express "how often I want cash": ANY
+                    # balance payout inside the window restarts the clock,
+                    # including admin-manual and reseller self-withdrawals.
+                    dedupe_filters.append(
+                        B2BTransaction.triggered_by.in_(BALANCE_PAYOUT_TRIGGERS)
                     )
+
+                existing_recent = await db.execute(
+                    select(func.count(B2BTransaction.id)).where(*dedupe_filters)
                 )
                 if existing_recent.scalar() > 0:
                     logger.info(
-                        "Reseller %s already has a scheduled B2B tx in the last 20h, skipping",
-                        reseller_id,
+                        "Reseller %s already has a B2B tx inside their %s payout window, skipping",
+                        reseller_id, frequency,
                     )
                     skip_count += 1
                     continue

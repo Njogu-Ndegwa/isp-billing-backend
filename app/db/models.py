@@ -288,6 +288,11 @@ class ResellerFinancials(Base):
     # cascading deletes. Always >= 0. Repaired via /api/admin/repair-balance.
     balance_correction = Column(Float, default=0.0, nullable=False)
     balance_corrected_at = Column(DateTime, nullable=True)
+    # How often the scheduled B2B job pays this reseller out:
+    # 'daily' (default), 'weekly', 'monthly', or 'manual' (self-service only).
+    # Plain string, not a Postgres enum — see the 2026-07-18 b2btransactionstatus
+    # enum incident for why new values must never require an ALTER TYPE.
+    payout_frequency = Column(String(10), nullable=False, default="daily", server_default="daily")
     user = relationship("User", backref="financials")
 
 class Subscription(Base):

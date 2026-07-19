@@ -980,6 +980,16 @@ async def run_b2b_migrations():
             "ADD COLUMN IF NOT EXISTS triggered_by VARCHAR(20) NULL"
         ))
 
+    # Per-reseller payout schedule: 'daily' (default), 'weekly', 'monthly', or
+    # 'manual' (never auto-paid; reseller withdraws from the Account Statement
+    # page). Read by run_daily_payouts and the reseller payout-settings API.
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "ALTER TABLE reseller_financials "
+            "ADD COLUMN IF NOT EXISTS payout_frequency VARCHAR(10) NOT NULL DEFAULT 'daily'"
+        ))
+        logger.info("Migration: Ensured reseller_financials.payout_frequency exists")
+
 
 # ============================================================================
 # Subscription System Migrations (runs on startup, idempotent)

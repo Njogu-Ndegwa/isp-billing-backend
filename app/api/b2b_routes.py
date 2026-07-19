@@ -1,7 +1,9 @@
 """
-B2B payout routes: Safaricom callbacks, admin manual trigger, transaction history.
+B2B payout routes: Safaricom callbacks, admin manual trigger, reseller
+self-service withdrawals + payout schedule, transaction history.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -22,8 +24,11 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.mpesa_b2b import (
-    get_b2b_fee,
-    get_kadogo_surcharge,
+    RESELLER_TRIGGER,
+    UNRESOLVED_STATUSES,
+    VALID_PAYOUT_FREQUENCIES,
+    compute_fee_breakdown,
+    get_payout_frequency,
     get_unpaid_balance,
     has_unresolved_b2b,
     payout_reseller,
@@ -31,17 +36,44 @@ from app.services.mpesa_b2b import (
     process_b2b_status_result,
     process_b2b_timeout,
     resolve_b2b_payment_method,
+    set_payout_frequency,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["b2b-payouts"])
 
+# Minimum self-service withdrawal: matches the nightly job's floor — KES 1 can
+# never net positive after the KES 1 Kadogo fee.
+MIN_WITHDRAWAL_KES = 2
+
+# Per-reseller payout guard. The unresolved-B2B check reads committed rows, so
+# two near-simultaneous requests (double-click, retry) could both pass it and
+# both send money — the 2026-07-18 double-pay failure mode. The app runs as a
+# single worker, so an in-process lock closes that race. Never awaited while
+# held elsewhere: a second caller is rejected immediately instead of queueing
+# behind a Safaricom call.
+_payout_locks: dict[int, asyncio.Lock] = {}
+
+
+def _payout_lock(reseller_id: int) -> asyncio.Lock:
+    lock = _payout_locks.get(reseller_id)
+    if lock is None:
+        lock = _payout_locks[reseller_id] = asyncio.Lock()
+    return lock
+
 
 async def _require_admin(token: str, db: AsyncSession) -> User:
     user = await get_current_user(token, db)
     if user.role != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+async def _require_reseller(token: str, db: AsyncSession) -> User:
+    user = await get_current_user(token, db)
+    if user.role != UserRole.RESELLER:
+        raise HTTPException(status_code=403, detail="Reseller access required")
     return user
 
 
@@ -115,46 +147,53 @@ async def trigger_b2b_payout(
     if not reseller or reseller.role != UserRole.RESELLER:
         raise HTTPException(status_code=404, detail="Reseller not found")
 
-    # A pending/timeout transaction means money may already be in flight with
-    # no verdict from Safaricom. Manually re-sending on top of one is exactly
-    # how the 2026-07-18 double-payouts happened (KES 12,713 duplicated).
-    if await has_unresolved_b2b(db, reseller_id):
+    lock = _payout_lock(reseller_id)
+    if lock.locked():
         raise HTTPException(
             status_code=409,
-            detail=(
-                "This reseller has a payout whose outcome Safaricom has not yet "
-                "confirmed. It is being verified automatically (usually within "
-                "~10 minutes) — sending again now risks paying twice. Check the "
-                "B2B transaction history for the pending/timeout entry."
-            ),
+            detail="A payout for this reseller is already being processed",
         )
+    async with lock:
+        # A pending/timeout transaction means money may already be in flight with
+        # no verdict from Safaricom. Manually re-sending on top of one is exactly
+        # how the 2026-07-18 double-payouts happened (KES 12,713 duplicated).
+        if await has_unresolved_b2b(db, reseller_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This reseller has a payout whose outcome Safaricom has not yet "
+                    "confirmed. It is being verified automatically (usually within "
+                    "~10 minutes) — sending again now risks paying twice. Check the "
+                    "B2B transaction history for the pending/timeout entry."
+                ),
+            )
 
-    balance = await get_unpaid_balance(db, reseller_id)
-    if balance <= 0:
-        raise HTTPException(status_code=400, detail="No unpaid balance to pay out")
+        balance = await get_unpaid_balance(db, reseller_id)
+        if balance <= 0:
+            raise HTTPException(status_code=400, detail="No unpaid balance to pay out")
 
-    if request.payment_method_id:
-        pm = await db.get(ResellerPaymentMethod, request.payment_method_id)
-        if not pm or pm.user_id != reseller_id:
-            raise HTTPException(status_code=404, detail="Payment method not found for this reseller")
-    else:
-        pm = await resolve_b2b_payment_method(db, reseller_id)
+        if request.payment_method_id:
+            pm = await db.get(ResellerPaymentMethod, request.payment_method_id)
+            if not pm or pm.user_id != reseller_id:
+                raise HTTPException(status_code=404, detail="Payment method not found for this reseller")
+        else:
+            pm = await resolve_b2b_payment_method(db, reseller_id)
 
-    if not pm:
-        raise HTTPException(
-            status_code=400,
-            detail="No eligible payment method (bank_account or mpesa_paybill) found for this reseller",
-        )
+        if not pm:
+            raise HTTPException(
+                status_code=400,
+                detail="No eligible payment method (bank_account or mpesa_paybill) found for this reseller",
+            )
 
-    try:
-        txn = await payout_reseller(db, reseller_id, pm, balance)
-        await db.commit()
-        await db.refresh(txn)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error("B2B payout failed for reseller %s: %s", reseller_id, e)
-        raise HTTPException(status_code=500, detail=f"B2B payout initiation failed: {e}")
+        try:
+            txn = await payout_reseller(db, reseller_id, pm, balance)
+            await db.commit()
+            await db.refresh(txn)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error("B2B payout failed for reseller %s: %s", reseller_id, e)
+            raise HTTPException(status_code=500, detail=f"B2B payout initiation failed: {e}")
 
     return {
         "transaction": _serialize_b2b_txn(txn),
@@ -182,26 +221,10 @@ async def b2b_fee_preview(
         raise HTTPException(status_code=404, detail="Reseller not found")
 
     balance = await get_unpaid_balance(db, reseller_id)
-    kadogo = 0
-
     if balance > 0:
-        fee = get_b2b_fee(balance)
-        net = int(balance - fee)
-        actual_fee = get_b2b_fee(net)
-        if actual_fee != fee:
-            fee = actual_fee
-            net = int(balance - fee)
-            if get_b2b_fee(net) != fee:
-                fee = get_b2b_fee(balance)
-
-        if balance <= 100:
-            kadogo = get_kadogo_surcharge(balance - fee)
-            fee += kadogo
-
-        net = int(balance - fee)
+        fee, kadogo, net = compute_fee_breakdown(balance)
     else:
-        fee = 0
-        net = 0
+        fee, kadogo, net = 0, 0, 0
 
     return {
         "reseller_id": reseller_id,
@@ -210,6 +233,203 @@ async def b2b_fee_preview(
         "kadogo_surcharge": kadogo,
         "total_fee": fee,
         "net_payout": net,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reseller self-service: payout settings + manual withdrawal
+# (rendered on the Account Statement page)
+# ---------------------------------------------------------------------------
+
+class PayoutSettingsUpdate(BaseModel):
+    payout_frequency: str
+
+
+def _serialize_withdrawal_txn(txn: B2BTransaction) -> dict:
+    """Reseller-facing subset of a B2B transaction."""
+    return {
+        "id": txn.id,
+        "amount": txn.amount,
+        "fee": txn.fee,
+        "net_amount": txn.net_amount,
+        "status": txn.status.value if hasattr(txn.status, "value") else txn.status,
+        "transaction_id": txn.transaction_id,
+        "created_at": txn.created_at.isoformat() if txn.created_at else None,
+        "completed_at": txn.completed_at.isoformat() if txn.completed_at else None,
+    }
+
+
+@router.get("/api/reseller/payout-settings")
+async def get_reseller_payout_settings(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Everything the Account Statement page needs to render the withdrawal card:
+    balance, fee preview, destination, payout schedule, and — when a
+    withdrawal is currently blocked — why.
+    """
+    user = await _require_reseller(token, db)
+
+    frequency = await get_payout_frequency(db, user.id)
+    balance = await get_unpaid_balance(db, user.id)
+    pm = await resolve_b2b_payment_method(db, user.id)
+
+    unresolved = (await db.execute(
+        select(B2BTransaction)
+        .where(
+            B2BTransaction.reseller_id == user.id,
+            B2BTransaction.status.in_(UNRESOLVED_STATUSES),
+        )
+        .order_by(B2BTransaction.created_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    if balance > 0:
+        fee, kadogo, net = compute_fee_breakdown(balance)
+    else:
+        fee, kadogo, net = 0, 0, 0
+
+    blocked_reason = None
+    if unresolved is not None:
+        blocked_reason = "pending_withdrawal"
+    elif pm is None:
+        blocked_reason = "no_payment_method"
+    elif balance < MIN_WITHDRAWAL_KES:
+        blocked_reason = "balance_too_low"
+
+    return {
+        "payout_frequency": frequency,
+        "available_frequencies": list(VALID_PAYOUT_FREQUENCIES),
+        "unpaid_balance": balance,
+        "minimum_withdrawal": MIN_WITHDRAWAL_KES,
+        "fee_preview": {
+            "safaricom_fee": fee - kadogo,
+            "kadogo_surcharge": kadogo,
+            "total_fee": fee,
+            "net_payout": net,
+        },
+        "payment_method": (
+            {
+                "id": pm.id,
+                "label": pm.label,
+                "method_type": pm.method_type.value if hasattr(pm.method_type, "value") else pm.method_type,
+                "destination": pm.bank_paybill_number or pm.mpesa_paybill_number,
+            }
+            if pm
+            else None
+        ),
+        "can_withdraw": blocked_reason is None,
+        "blocked_reason": blocked_reason,
+        "pending_withdrawal": _serialize_withdrawal_txn(unresolved) if unresolved else None,
+    }
+
+
+@router.put("/api/reseller/payout-settings")
+async def update_reseller_payout_settings(
+    request: PayoutSettingsUpdate,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Set how often the scheduled job pays this reseller out. 'manual' disables
+    automatic payouts entirely — money only moves when the reseller withdraws.
+    """
+    user = await _require_reseller(token, db)
+
+    frequency = request.payout_frequency.strip().lower()
+    if frequency not in VALID_PAYOUT_FREQUENCIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"payout_frequency must be one of: {', '.join(VALID_PAYOUT_FREQUENCIES)}",
+        )
+
+    await set_payout_frequency(db, user.id, frequency)
+    await db.commit()
+    logger.info("Reseller %s set payout frequency to %s", user.id, frequency)
+    return {"payout_frequency": frequency}
+
+
+@router.post("/api/reseller/withdraw")
+async def reseller_withdraw(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Reseller-triggered B2B payout of their full unpaid balance to their
+    configured bank account / M-Pesa paybill.
+    """
+    user = await _require_reseller(token, db)
+
+    lock = _payout_lock(user.id)
+    if lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail="A withdrawal is already being processed",
+        )
+    async with lock:
+        # Same in-flight guard as the admin endpoint: an unresolved transaction
+        # means money may already be moving with no verdict from Safaricom.
+        if await has_unresolved_b2b(db, user.id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Your previous withdrawal is still being confirmed with "
+                    "Safaricom (usually within ~10 minutes). Withdrawing again "
+                    "now could pay you twice — please try again shortly."
+                ),
+            )
+
+        balance = await get_unpaid_balance(db, user.id)
+        if balance < MIN_WITHDRAWAL_KES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Balance is below the KES {MIN_WITHDRAWAL_KES} minimum withdrawal",
+            )
+
+        pm = await resolve_b2b_payment_method(db, user.id)
+        if not pm:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No eligible payout destination. Add a bank account or "
+                    "M-Pesa paybill under payment methods first."
+                ),
+            )
+
+        try:
+            txn = await payout_reseller(
+                db, user.id, pm, balance, triggered_by=RESELLER_TRIGGER
+            )
+            await db.commit()
+            await db.refresh(txn)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error("Self-service withdrawal failed for reseller %s: %s", user.id, e)
+            raise HTTPException(
+                status_code=500,
+                detail="Withdrawal could not be initiated. Please try again later.",
+            )
+
+    if txn.status == B2BTransactionStatus.FAILED:
+        # Safaricom rejected it synchronously (e.g. invalid paybill). The failed
+        # transaction is already committed for audit; surface a clear error.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Safaricom rejected the withdrawal: {txn.result_desc or 'unknown error'}",
+        )
+
+    logger.info(
+        "Self-service withdrawal initiated: reseller=%s amount=%s net=%s fee=%s -> %s",
+        user.id, txn.amount, txn.net_amount, txn.fee, txn.party_b,
+    )
+    return {
+        "transaction": _serialize_withdrawal_txn(txn),
+        "balance_before": balance,
+        "fee": txn.fee,
+        "net_payout": txn.net_amount,
+        "destination_label": pm.label,
     }
 
 
