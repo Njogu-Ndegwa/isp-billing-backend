@@ -627,6 +627,39 @@ STATUS_QUERY_BATCH_LIMIT = 20
 # (found live on rid 10, txns 710/711, 2026-07-19).
 MANUAL_REVIEW_MARKER = "Needs manual statement review"
 
+# Corroborating-evidence rule for stale zombies (Dennis, 2026-07-19): a stale
+# 2033 alone is ambiguous, but if this many balance payouts to the SAME
+# reseller have completed and reconciled SINCE the zombie was created, the
+# ledger has been re-validated repeatedly with the zombie counted as unpaid —
+# combined with the missing result callback and missing status record, treat
+# it as never processed and auto-fail (reseller stays owed, payouts unblock).
+# The residual risk is a bounded, weeks-old, one-time overpayment if the
+# statement would have shown it after all — accepted over deadlocking active
+# resellers on ancient uncertainty. Zombies WITHOUT that history still go to
+# manual review: a reseller whose payouts stopped right at the zombie is
+# exactly the case where it may have landed.
+STALE_ZOMBIE_CORROBORATION_MIN = 2
+
+
+async def _completed_payouts_since(db: AsyncSession, reseller_id: int, after: datetime) -> int:
+    """Count completed balance payouts to this reseller created after `after`."""
+    stmt = select(func.count(B2BTransaction.id)).where(
+        B2BTransaction.reseller_id == reseller_id,
+        B2BTransaction.status == B2BTransactionStatus.COMPLETED,
+        B2BTransaction.triggered_by.in_(BALANCE_PAYOUT_TRIGGERS),
+        B2BTransaction.created_at > after,
+    )
+    return int((await db.execute(stmt)).scalar())
+
+
+def _stale_zombie_autofail_desc(later_count: int) -> str:
+    return (
+        f"Auto-failed stale unresolved payout: Safaricom has no record "
+        f"(2033), the result callback never arrived, and {later_count} later "
+        f"payouts to this reseller completed and reconciled since. Treated "
+        f"as never processed; reseller stays owed."
+    )[:500]
+
 # Correlates a status query's ConversationID (from Safaricom's ack) to our
 # B2B transaction id, because the async status result carries the QUERY's
 # ids, not the original transaction's. In-memory on purpose: if the app
@@ -805,19 +838,34 @@ async def process_b2b_status_result(db: AsyncSession, body: dict) -> Optional[B2
 
         if result_code == "2033":
             # Old transaction that Safaricom's status index no longer knows:
-            # could be never-processed OR a real payment that aged out. Mark it
-            # for manual statement review (and stop re-querying it) — resolve
-            # from the admin B2B transactions view. Still blocks payouts.
+            # could be never-processed OR a real payment that aged out. Decide
+            # by corroborating evidence (see STALE_ZOMBIE_CORROBORATION_MIN)
+            # instead of blocking an actively-transacting reseller forever.
+            later = await _completed_payouts_since(db, txn.reseller_id, txn.created_at)
+            if later >= STALE_ZOMBIE_CORROBORATION_MIN:
+                txn.status = B2BTransactionStatus.FAILED
+                txn.result_code = result_code
+                txn.result_desc = _stale_zombie_autofail_desc(later)
+                await db.flush()
+                logger.warning(
+                    "B2B txn %s auto-failed (stale 2033 + %d later reconciled "
+                    "payouts): reseller=%s unblocked",
+                    txn.id, later, txn.reseller_id,
+                )
+                return txn
+
             txn.result_desc = (
                 f"{MANUAL_REVIEW_MARKER}: Safaricom has no record (2033) but "
-                f"the transaction is too old to auto-fail. Verify it on the "
-                f"M-Pesa org/bank statement, then resolve it as completed "
-                f"(with its receipt) or failed."
+                f"the transaction is too old to auto-fail and this reseller "
+                f"has no later reconciled payouts to corroborate it. Verify "
+                f"it on the M-Pesa org/bank statement, then resolve it as "
+                f"completed (with its receipt) or failed."
             )[:500]
             await db.flush()
             logger.error(
                 "B2B txn %s (reseller %s) flagged for manual statement review "
-                "(stale 2033) — payouts stay blocked until resolved",
+                "(stale 2033, no corroborating payouts) — payouts stay blocked "
+                "until resolved",
                 txn.id, txn.reseller_id,
             )
             return txn
@@ -884,6 +932,32 @@ async def run_b2b_status_reconciliation():
         return
 
     now = datetime.utcnow()
+
+    # First, retro-apply the corroborating-evidence rule to rows already
+    # flagged for manual review: their 2033 verdict is recorded, so no new
+    # Safaricom call is needed — a reseller who has kept getting reconciled
+    # payouts since the zombie was created gets unblocked here. DB-only work
+    # in one short session.
+    async with AsyncSessionLocal() as db:
+        flagged = (await db.execute(
+            select(B2BTransaction).where(
+                B2BTransaction.status.in_(UNRESOLVED_STATUSES),
+                B2BTransaction.result_desc.startswith(MANUAL_REVIEW_MARKER),
+            )
+        )).scalars().all()
+        for txn in flagged:
+            later = await _completed_payouts_since(db, txn.reseller_id, txn.created_at)
+            if later >= STALE_ZOMBIE_CORROBORATION_MIN:
+                txn.status = B2BTransactionStatus.FAILED
+                txn.result_code = "2033"
+                txn.result_desc = _stale_zombie_autofail_desc(later)
+                logger.warning(
+                    "B2B txn %s auto-failed from manual-review backlog "
+                    "(stale 2033 + %d later reconciled payouts): reseller=%s unblocked",
+                    txn.id, later, txn.reseller_id,
+                )
+        await db.commit()
+
     # Short session: read the stale list, release, THEN talk to Safaricom.
     async with AsyncSessionLocal() as db:
         stmt = (

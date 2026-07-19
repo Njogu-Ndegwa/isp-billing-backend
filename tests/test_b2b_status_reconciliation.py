@@ -288,6 +288,77 @@ async def test_status_result_2033_stale_stays_blocked(engine, db, monkeypatch):
     assert (txn.result_desc or "").startswith(b2b.MANUAL_REVIEW_MARKER)
 
 
+async def test_status_result_2033_stale_with_history_auto_fails(engine, db, monkeypatch):
+    """Corroborating-evidence rule: a stale 2033 zombie whose reseller has had
+    later payouts complete and reconcile is treated as never-processed —
+    auto-failed, reseller stays owed and unblocked. (An actively-transacting
+    reseller must not be deadlocked by ancient uncertainty.)"""
+    from app.services import mpesa_b2b as b2b
+
+    r1 = await make_reseller(db)
+    txn = await _make_txn(db, r1.id, status=B2BTransactionStatus.PENDING,
+                          age=timedelta(days=39), conversation_id="AG_zombie_hist")
+    # Two later reconciled balance payouts = the corroboration threshold.
+    await _make_txn(db, r1.id, status=B2BTransactionStatus.COMPLETED,
+                    age=timedelta(days=20), conversation_id="AG_later_1")
+    await _make_txn(db, r1.id, status=B2BTransactionStatus.COMPLETED,
+                    age=timedelta(days=5), conversation_id="AG_later_2")
+
+    b2b._status_query_map.clear()
+    b2b._status_query_map["QCONV-2033-HIST"] = txn.id
+    await b2b.process_b2b_status_result(
+        db, _status_result_body("QCONV-2033-HIST", result_code="2033", status_text="")
+    )
+    await db.commit()
+
+    await db.refresh(txn)
+    assert txn.status == B2BTransactionStatus.FAILED
+    assert "Auto-failed stale unresolved payout" in (txn.result_desc or "")
+    payouts = (await db.execute(
+        select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
+    )).scalars().all()
+    assert payouts == []  # failed = no ledger rows; the reseller stays owed
+    assert not await b2b.has_unresolved_b2b(db, r1.id)
+
+
+async def test_reconciliation_sweep_unsticks_flagged_zombies_with_history(
+    engine, db, session_factory, monkeypatch
+):
+    """Rows already flagged for manual review get retro-resolved by the same
+    evidence rule on the next tick — no new Safaricom call needed."""
+    from app.services import mpesa_b2b as b2b
+
+    r1 = await make_reseller(db)
+    flagged = await _make_txn(db, r1.id, status=B2BTransactionStatus.PENDING,
+                              age=timedelta(days=39), conversation_id="AG_flagged_hist")
+    flagged.result_desc = f"{b2b.MANUAL_REVIEW_MARKER}: stale 2033"
+    # Corroboration: two later reconciled payouts.
+    await _make_txn(db, r1.id, status=B2BTransactionStatus.COMPLETED,
+                    age=timedelta(days=10), conversation_id="AG_fl_later_1")
+    await _make_txn(db, r1.id, status=B2BTransactionStatus.COMPLETED,
+                    age=timedelta(days=2), conversation_id="AG_fl_later_2")
+
+    # Control: a flagged zombie whose reseller has NO later payouts stays put.
+    r2 = await make_reseller(db)
+    stuck = await _make_txn(db, r2.id, status=B2BTransactionStatus.PENDING,
+                            age=timedelta(days=39), conversation_id="AG_flagged_alone")
+    stuck.result_desc = f"{b2b.MANUAL_REVIEW_MARKER}: stale 2033"
+    await db.commit()
+
+    monkeypatch.setattr(b2b, "AsyncSessionLocal", session_factory)
+    monkeypatch.setattr(b2b.settings, "MPESA_B2B_INITIATOR_NAME", "tester", raising=False)
+    monkeypatch.setattr(b2b, "query_b2b_transaction_status", AsyncMock(return_value=True))
+
+    await b2b.run_b2b_status_reconciliation()
+
+    await db.refresh(flagged)
+    await db.refresh(stuck)
+    assert flagged.status == B2BTransactionStatus.FAILED
+    assert not await b2b.has_unresolved_b2b(db, r1.id)
+    assert stuck.status == B2BTransactionStatus.PENDING
+    assert await b2b.has_unresolved_b2b(db, r2.id)
+
+
 async def test_status_result_ambiguous_leaves_txn_blocked(engine, db, monkeypatch):
     """Query-level errors or unknown status strings must change nothing —
     uncertainty never releases money."""
