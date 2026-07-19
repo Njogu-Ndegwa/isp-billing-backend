@@ -411,6 +411,13 @@ class Router(Base):
     # instead handed to the secondary-server pull service for the router to fetch.
     # The queue itself lives on the secondary server; the old box keeps only this flag.
     pull_channel_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Opt-in per router: when true, the owner gets an in-app inbox message when the
+    # router stays offline past a debounce threshold and again when it comes back
+    # online. The *_notified_at stamps throttle repeats (and the offline stamp marks
+    # the current outage as announced) so a flapping router cannot flood the inbox.
+    status_alerts_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    online_notified_at = Column(DateTime, nullable=True)
+    offline_notified_at = Column(DateTime, nullable=True)
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 

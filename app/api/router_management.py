@@ -128,6 +128,7 @@ class RouterUpdateRequest(BaseModel):
     payment_methods: Optional[List[str]] = None
     emergency_active: Optional[bool] = None
     emergency_message: Optional[str] = None
+    status_alerts_enabled: Optional[bool] = None
 
     @field_validator("name", "ip_address", "username", "password", mode="before")
     @classmethod
@@ -152,6 +153,10 @@ class RouterUpdateRequest(BaseModel):
 
 class RouterIdentityUpdate(BaseModel):
     identity: str
+
+
+class RouterStatusAlertsRequest(BaseModel):
+    enabled: bool
 
 
 class InsuranceWireGuardRequest(BaseModel):
@@ -1299,6 +1304,7 @@ async def get_routers(
             "emergency_active": getattr(router_obj, "emergency_active", False),
             "emergency_message": getattr(router_obj, "emergency_message", None),
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
+            "status_alerts_enabled": getattr(router_obj, "status_alerts_enabled", False),
         }
         if is_admin:
             token_obj = token_by_router.get(router_obj.id)
@@ -1849,6 +1855,8 @@ async def update_router(
                 router_obj.emergency_message = None
         if request.emergency_message is not None:
             router_obj.emergency_message = request.emergency_message
+        if request.status_alerts_enabled is not None:
+            router_obj.status_alerts_enabled = request.status_alerts_enabled
 
         await db.commit()
         await db.refresh(router_obj)
@@ -1868,6 +1876,7 @@ async def update_router(
             "emergency_active": router_obj.emergency_active,
             "emergency_message": router_obj.emergency_message,
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
+            "status_alerts_enabled": getattr(router_obj, "status_alerts_enabled", False),
             "updated_at": datetime.utcnow().isoformat()
         }
         
@@ -1877,6 +1886,29 @@ async def update_router(
         logger.error(f"Error updating router: {str(e)}")
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to update router: {str(e)}")
+
+
+@router.put("/api/routers/{router_id}/status-alerts")
+async def set_router_status_alerts(
+    router_id: int,
+    request: RouterStatusAlertsRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """Toggle the opt-in offline/back-online inbox alerts for one router."""
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    router_obj = await _get_owned_router(db, router_id, user.id)
+    router_obj.status_alerts_enabled = request.enabled
+    await db.commit()
+    return {
+        "router_id": router_obj.id,
+        "status_alerts_enabled": router_obj.status_alerts_enabled,
+        "message": (
+            "Status alerts enabled" if request.enabled
+            else "Status alerts disabled"
+        ),
+    }
 
 
 @router.delete("/api/routers/{router_id}")

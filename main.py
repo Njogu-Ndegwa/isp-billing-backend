@@ -110,6 +110,7 @@ from app.services.mikrotik_background import (
 )
 from app.services.usage_cap_sampler import sample_capped_usage_background
 from app.services.payment_port_attribution import attribute_recent_payment_ports_background
+from app.services.router_status_alerts import scan_and_notify_offline_routers
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
@@ -1948,6 +1949,20 @@ async def run_pull_channel_migrations():
     logger.info("Pull-channel migrations complete")
 
 
+async def run_router_status_alert_migrations():
+    """Add routers.status_alerts_enabled (opt-in offline/back-online inbox alerts)
+    plus the online_notified_at / offline_notified_at cooldown+outage stamps.
+    Idempotent: ADD COLUMN IF NOT EXISTS, safe to run on every startup."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS status_alerts_enabled BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS online_notified_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS offline_notified_at TIMESTAMP NULL
+        """))
+    logger.info("Router status-alert migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -2077,6 +2092,12 @@ async def startup_event():
         logger.error(f"Pull-channel migration failed (non-fatal): {e}")
 
     try:
+        await run_router_status_alert_migrations()
+        logger.info("Router status-alert migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Router status-alert migration failed (non-fatal): {e}")
+
+    try:
         await run_payment_port_attribution_migrations()
         logger.info("Payment port attribution migrations completed successfully")
     except Exception as e:
@@ -2103,6 +2124,14 @@ async def startup_event():
         trigger=IntervalTrigger(seconds=19),
         id='usage_cap_sampler',
         name='Lightweight capped customer usage sampler',
+        replace_existing=True,
+        max_instances=1
+    )
+    scheduler.add_job(
+        scan_and_notify_offline_routers,
+        trigger=IntervalTrigger(seconds=293),
+        id='router_offline_alerts',
+        name='Send opt-in router offline alerts (DB-only, debounced)',
         replace_existing=True,
         max_instances=1
     )

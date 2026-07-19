@@ -6,6 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import database
 from app.db.models import Router, RouterAvailabilityCheck
+from app.services.router_status_alerts import (
+    send_router_recovery_notification,
+    should_consider_recovery_notification,
+)
 
 
 ROUTER_OFFLINE_SKIP_PERIOD = timedelta(minutes=30)
@@ -92,10 +96,19 @@ async def record_router_availability(
     unused.
     """
     checked_at = checked_at or datetime.utcnow()
+    notify_transition = False
+    offline_since: Optional[datetime] = None
     async with database.async_session() as adb:
         router = await adb.get(Router, router_id)
         if not router:
             return
+
+        if is_online:
+            # Capture the offline->online transition BEFORE overwriting the
+            # summary columns; the message itself is sent after this commit.
+            notify_transition = should_consider_recovery_notification(router, checked_at)
+            if notify_transition:
+                offline_since = router.last_online_at
 
         router.last_status = is_online
         router.last_checked_at = checked_at
@@ -114,6 +127,12 @@ async def record_router_availability(
             )
         )
         await adb.commit()
+
+    if notify_transition:
+        # DB-only, own short session, never raises (see router_status_alerts).
+        await send_router_recovery_notification(
+            router_id, offline_since=offline_since, now=checked_at
+        )
 
 
 async def prune_router_availability_history(
