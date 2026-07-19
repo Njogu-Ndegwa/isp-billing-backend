@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -617,8 +617,15 @@ async def has_unresolved_b2b(db: AsyncSession, reseller_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 STATUS_QUERY_MIN_AGE = timedelta(minutes=5)
-STATUS_QUERY_MAX_AGE = timedelta(days=30)
 STATUS_QUERY_BATCH_LIMIT = 20
+
+# Prefix written onto a stuck transaction once Safaricom's status index no
+# longer knows it (stale 2033). Rows carrying it are excluded from further
+# automatic queries — they can only be closed from the admin B2B view after
+# checking the org/bank statement. Without this marker + exclusion, any-age
+# blocking plus a bounded query window used to deadlock resellers forever
+# (found live on rid 10, txns 710/711, 2026-07-19).
+MANUAL_REVIEW_MARKER = "Needs manual statement review"
 
 # Correlates a status query's ConversationID (from Safaricom's ack) to our
 # B2B transaction id, because the async status result carries the QUERY's
@@ -796,9 +803,28 @@ async def process_b2b_status_result(db: AsyncSession, body: dict) -> Optional[B2
             )
             return txn
 
-        # Any other query failure (bad credentials, API trouble, stale 2033).
-        # Do NOT guess an outcome — log loudly and leave the txn
-        # unresolved/blocked for the next tick or manual review.
+        if result_code == "2033":
+            # Old transaction that Safaricom's status index no longer knows:
+            # could be never-processed OR a real payment that aged out. Mark it
+            # for manual statement review (and stop re-querying it) — resolve
+            # from the admin B2B transactions view. Still blocks payouts.
+            txn.result_desc = (
+                f"{MANUAL_REVIEW_MARKER}: Safaricom has no record (2033) but "
+                f"the transaction is too old to auto-fail. Verify it on the "
+                f"M-Pesa org/bank statement, then resolve it as completed "
+                f"(with its receipt) or failed."
+            )[:500]
+            await db.flush()
+            logger.error(
+                "B2B txn %s (reseller %s) flagged for manual statement review "
+                "(stale 2033) — payouts stay blocked until resolved",
+                txn.id, txn.reseller_id,
+            )
+            return txn
+
+        # Any other query failure (bad credentials, API trouble). Do NOT guess
+        # an outcome — log loudly and leave the txn unresolved/blocked for the
+        # next tick or manual review.
         logger.error(
             "B2B status query for txn %s returned code=%s desc=%s — leaving unresolved",
             txn.id, result_code, result_desc,
@@ -869,7 +895,15 @@ async def run_b2b_status_reconciliation():
             .where(
                 B2BTransaction.status.in_(UNRESOLVED_STATUSES),
                 B2BTransaction.created_at <= now - STATUS_QUERY_MIN_AGE,
-                B2BTransaction.created_at >= now - STATUS_QUERY_MAX_AGE,
+                # ANY age: the in-flight guard blocks on any-age unresolved
+                # txns, so the query window must reach just as far — a bounded
+                # window deadlocked resellers with old zombies (rid 10,
+                # 2026-07-19). Rows already flagged for manual statement
+                # review are the one exception; re-querying them is pointless.
+                or_(
+                    B2BTransaction.result_desc.is_(None),
+                    ~B2BTransaction.result_desc.startswith(MANUAL_REVIEW_MARKER),
+                ),
             )
             .order_by(B2BTransaction.created_at)
             .limit(STATUS_QUERY_BATCH_LIMIT)
@@ -937,6 +971,7 @@ async def get_unpaid_balance(db: AsyncSession, reseller_id: int) -> float:
 # ---------------------------------------------------------------------------
 
 PAYOUT_FREQUENCY_MANUAL = "manual"
+PAYOUT_FREQUENCY_CUSTOM = "custom"
 DEFAULT_PAYOUT_FREQUENCY = "daily"
 
 # Minimum gap (hours) between automatic payouts, per frequency. Each window
@@ -950,32 +985,85 @@ PAYOUT_FREQUENCY_WINDOWS_HOURS = {
     "monthly": 30 * 24 - 4,
 }
 
-VALID_PAYOUT_FREQUENCIES = tuple(PAYOUT_FREQUENCY_WINDOWS_HOURS) + (PAYOUT_FREQUENCY_MANUAL,)
+VALID_PAYOUT_FREQUENCIES = tuple(PAYOUT_FREQUENCY_WINDOWS_HOURS) + (
+    PAYOUT_FREQUENCY_CUSTOM,
+    PAYOUT_FREQUENCY_MANUAL,
+)
 
-# Balance payouts count toward the weekly/monthly gate no matter who fired
-# them; subscription_owner B2B traffic is a different money flow entirely.
+MIN_CUSTOM_INTERVAL_DAYS = 1
+MAX_CUSTOM_INTERVAL_DAYS = 90
+
+
+def custom_window_hours(interval_days: int) -> int:
+    """Dedupe window for a custom every-N-days schedule (never below daily's 20h)."""
+    return max(20, interval_days * 24 - 4)
+
+
+# Balance payouts count toward the weekly/monthly/custom gate no matter who
+# fired them; subscription_owner B2B traffic is a different money flow entirely.
 BALANCE_PAYOUT_TRIGGERS = ["scheduled", "manual", RESELLER_TRIGGER]
+
+
+async def get_payout_schedule(db: AsyncSession, reseller_id: int) -> tuple[str, Optional[int]]:
+    """Return (frequency, custom_interval_days). Falls back to ('daily', None)
+    when unset or when a 'custom' row has no usable interval."""
+    row = (await db.execute(
+        select(
+            ResellerFinancials.payout_frequency,
+            ResellerFinancials.payout_interval_days,
+        ).where(ResellerFinancials.user_id == reseller_id)
+    )).first()
+    freq = row.payout_frequency if row else None
+    if freq not in VALID_PAYOUT_FREQUENCIES:
+        return DEFAULT_PAYOUT_FREQUENCY, None
+    if freq == PAYOUT_FREQUENCY_CUSTOM:
+        interval = row.payout_interval_days
+        if not interval or not (
+            MIN_CUSTOM_INTERVAL_DAYS <= interval <= MAX_CUSTOM_INTERVAL_DAYS
+        ):
+            return DEFAULT_PAYOUT_FREQUENCY, None
+        return freq, int(interval)
+    return freq, None
 
 
 async def get_payout_frequency(db: AsyncSession, reseller_id: int) -> str:
     """Return the reseller's configured payout frequency ('daily' if unset)."""
-    stmt = select(ResellerFinancials.payout_frequency).where(
-        ResellerFinancials.user_id == reseller_id
-    )
-    val = (await db.execute(stmt)).scalar_one_or_none()
-    return val if val in VALID_PAYOUT_FREQUENCIES else DEFAULT_PAYOUT_FREQUENCY
+    frequency, _ = await get_payout_schedule(db, reseller_id)
+    return frequency
 
 
-async def set_payout_frequency(db: AsyncSession, reseller_id: int, frequency: str) -> None:
-    """Upsert the reseller's payout frequency onto their financials row."""
+async def set_payout_frequency(
+    db: AsyncSession,
+    reseller_id: int,
+    frequency: str,
+    interval_days: Optional[int] = None,
+) -> None:
+    """Upsert the reseller's payout schedule onto their financials row."""
     if frequency not in VALID_PAYOUT_FREQUENCIES:
         raise ValueError(f"Invalid payout frequency: {frequency}")
+    if frequency == PAYOUT_FREQUENCY_CUSTOM:
+        if not interval_days or not (
+            MIN_CUSTOM_INTERVAL_DAYS <= int(interval_days) <= MAX_CUSTOM_INTERVAL_DAYS
+        ):
+            raise ValueError(
+                f"Custom schedule needs an interval between "
+                f"{MIN_CUSTOM_INTERVAL_DAYS} and {MAX_CUSTOM_INTERVAL_DAYS} days"
+            )
+        interval_days = int(interval_days)
+    else:
+        interval_days = None
     stmt = select(ResellerFinancials).where(ResellerFinancials.user_id == reseller_id)
     fin = (await db.execute(stmt)).scalar_one_or_none()
     if fin:
         fin.payout_frequency = frequency
+        if interval_days is not None:
+            fin.payout_interval_days = interval_days
     else:
-        db.add(ResellerFinancials(user_id=reseller_id, payout_frequency=frequency))
+        db.add(ResellerFinancials(
+            user_id=reseller_id,
+            payout_frequency=frequency,
+            payout_interval_days=interval_days,
+        ))
     await db.flush()
 
 
@@ -1146,7 +1234,7 @@ async def run_daily_payouts():
             # transaction) for one reseller cannot leak into the next.
             async with lock:
                 async with AsyncSessionLocal() as db:
-                    frequency = await get_payout_frequency(db, reseller_id)
+                    frequency, interval_days = await get_payout_schedule(db, reseller_id)
                     if frequency == PAYOUT_FREQUENCY_MANUAL:
                         # Reseller opted out of automatic payouts; they withdraw
                         # themselves from the Account Statement page.
@@ -1175,9 +1263,16 @@ async def run_daily_payouts():
                         skip_count += 1
                         continue
 
+                    if frequency == PAYOUT_FREQUENCY_CUSTOM:
+                        window_start = run_anchor - timedelta(
+                            hours=custom_window_hours(interval_days)
+                        )
+                    else:
+                        window_start = dedupe_windows[frequency]
+
                     dedupe_filters = [
                         B2BTransaction.reseller_id == reseller_id,
-                        B2BTransaction.created_at >= dedupe_windows[frequency],
+                        B2BTransaction.created_at >= window_start,
                         B2BTransaction.status.in_([
                             B2BTransactionStatus.PENDING,
                             B2BTransactionStatus.COMPLETED,
@@ -1189,8 +1284,8 @@ async def run_daily_payouts():
                         # earlier today does not stop the remaining balance.
                         dedupe_filters.append(B2BTransaction.triggered_by == "scheduled")
                     else:
-                        # Weekly/monthly express "how often I want cash": ANY
-                        # balance payout inside the window restarts the clock,
+                        # Weekly/monthly/custom express "how often I want cash":
+                        # ANY balance payout inside the window restarts the clock,
                         # including admin-manual and reseller self-withdrawals.
                         dedupe_filters.append(
                             B2BTransaction.triggered_by.in_(BALANCE_PAYOUT_TRIGGERS)

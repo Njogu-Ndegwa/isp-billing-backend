@@ -283,6 +283,9 @@ async def test_status_result_2033_stale_stays_blocked(engine, db, monkeypatch):
     await db.refresh(txn)
     assert txn.status == B2BTransactionStatus.PENDING
     assert await b2b.has_unresolved_b2b(db, r1.id)
+    # ...and it is flagged for manual statement review so the reconciliation
+    # job stops re-querying it (an admin resolves it from the B2B view).
+    assert (txn.result_desc or "").startswith(b2b.MANUAL_REVIEW_MARKER)
 
 
 async def test_status_result_ambiguous_leaves_txn_blocked(engine, db, monkeypatch):
@@ -337,8 +340,16 @@ async def test_reconciliation_queries_only_stale_unresolved(
                     age=timedelta(minutes=1), originator_id="orig-fresh")
     await _make_txn(db, r1.id, status=B2BTransactionStatus.COMPLETED,
                     age=timedelta(hours=5), originator_id="orig-done")
-    await _make_txn(db, r1.id, status=B2BTransactionStatus.PENDING,
-                    age=timedelta(days=60), originator_id="orig-ancient")
+    # Any-age zombies MUST be queried: the in-flight guard blocks on any age,
+    # so a bounded query window would deadlock the reseller (rid 10, txns
+    # 710/711, 2026-07-19 — 39-day-old pendings nothing would ever resolve).
+    ancient = await _make_txn(db, r1.id, status=B2BTransactionStatus.PENDING,
+                              age=timedelta(days=60), originator_id="orig-ancient")
+    # ...except rows already flagged for manual statement review.
+    flagged = await _make_txn(db, r1.id, status=B2BTransactionStatus.PENDING,
+                              age=timedelta(days=45), originator_id="orig-flagged")
+    flagged.result_desc = f"{b2b.MANUAL_REVIEW_MARKER}: stale 2033"
+    await db.commit()
 
     monkeypatch.setattr(b2b, "AsyncSessionLocal", session_factory)
     monkeypatch.setattr(b2b.settings, "MPESA_B2B_INITIATOR_NAME", "tester", raising=False)
@@ -353,4 +364,4 @@ async def test_reconciliation_queries_only_stale_unresolved(
 
     await b2b.run_b2b_status_reconciliation()
 
-    assert sorted(queried) == sorted([stale_pending.id, stale_timeout.id])
+    assert sorted(queried) == sorted([stale_pending.id, stale_timeout.id, ancient.id])

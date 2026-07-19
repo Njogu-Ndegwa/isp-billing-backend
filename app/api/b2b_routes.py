@@ -23,12 +23,15 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.mpesa_b2b import (
+    MAX_CUSTOM_INTERVAL_DAYS,
+    MIN_CUSTOM_INTERVAL_DAYS,
     RESELLER_TRIGGER,
     UNRESOLVED_STATUSES,
     VALID_PAYOUT_FREQUENCIES,
     PayoutInFlightError,
+    _settle_completed_transaction,
     compute_fee_breakdown,
-    get_payout_frequency,
+    get_payout_schedule,
     get_unpaid_balance,
     has_unresolved_b2b,
     payout_lock,
@@ -259,6 +262,7 @@ async def b2b_fee_preview(
 
 class PayoutSettingsUpdate(BaseModel):
     payout_frequency: str
+    payout_interval_days: Optional[int] = None
 
 
 def _serialize_withdrawal_txn(txn: B2BTransaction) -> dict:
@@ -287,7 +291,7 @@ async def get_reseller_payout_settings(
     """
     user = await _require_reseller(token, db)
 
-    frequency = await get_payout_frequency(db, user.id)
+    frequency, interval_days = await get_payout_schedule(db, user.id)
     balance = await get_unpaid_balance(db, user.id)
     pm = await resolve_b2b_payment_method(db, user.id)
 
@@ -320,6 +324,9 @@ async def get_reseller_payout_settings(
 
     return {
         "payout_frequency": frequency,
+        "payout_interval_days": interval_days,
+        "custom_interval_min_days": MIN_CUSTOM_INTERVAL_DAYS,
+        "custom_interval_max_days": MAX_CUSTOM_INTERVAL_DAYS,
         "available_frequencies": list(VALID_PAYOUT_FREQUENCIES),
         "unpaid_balance": balance,
         "minimum_withdrawal": MIN_WITHDRAWAL_KES,
@@ -365,10 +372,19 @@ async def update_reseller_payout_settings(
             detail=f"payout_frequency must be one of: {', '.join(VALID_PAYOUT_FREQUENCIES)}",
         )
 
-    await set_payout_frequency(db, user.id, frequency)
+    try:
+        await set_payout_frequency(db, user.id, frequency, request.payout_interval_days)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     await db.commit()
-    logger.info("Reseller %s set payout frequency to %s", user.id, frequency)
-    return {"payout_frequency": frequency}
+    logger.info(
+        "Reseller %s set payout schedule to %s (interval_days=%s)",
+        user.id, frequency, request.payout_interval_days,
+    )
+    return {
+        "payout_frequency": frequency,
+        "payout_interval_days": request.payout_interval_days if frequency == "custom" else None,
+    }
 
 
 @router.post("/api/reseller/withdraw")
@@ -582,6 +598,74 @@ async def list_b2b_transactions(
         },
         "transactions": transactions,
     }
+
+
+class ResolveB2BRequest(BaseModel):
+    outcome: str  # 'completed' | 'failed'
+    receipt: Optional[str] = None
+    note: str
+
+
+@router.post("/api/admin/b2b-transactions/{txn_id}/resolve")
+async def resolve_b2b_transaction(
+    txn_id: int,
+    request: ResolveB2BRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Manually close a stuck (pending/timeout) B2B transaction after verifying
+    it on the M-Pesa org/bank statement — the escape hatch for transactions
+    Safaricom's status API can no longer answer for (stale 2033).
+
+    outcome='completed' requires the real M-Pesa receipt from the statement
+    and creates the same payout + fee ledger rows as a normal callback;
+    outcome='failed' releases the balance (the reseller stays owed).
+    """
+    admin = await _require_admin(token, db)
+
+    if not request.note or not request.note.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="A note is required — say what you verified on the statement",
+        )
+
+    outcome = request.outcome.strip().lower()
+    if outcome not in ("completed", "failed"):
+        raise HTTPException(status_code=400, detail="outcome must be 'completed' or 'failed'")
+
+    txn = await db.get(B2BTransaction, txn_id)
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if txn.status not in UNRESOLVED_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Transaction is already {txn.status.value if hasattr(txn.status, 'value') else txn.status} — only pending/timeout transactions can be resolved",
+        )
+
+    note = request.note.strip()
+    if outcome == "completed":
+        receipt = (request.receipt or "").strip()
+        if not receipt:
+            raise HTTPException(
+                status_code=400,
+                detail="The M-Pesa receipt from the statement is required to mark a payment completed",
+            )
+        txn.result_code = "0"
+        txn.result_desc = f"Manually resolved as completed by admin {admin.id}: {note}"[:500]
+        await _settle_completed_transaction(db, txn, receipt)
+    else:
+        txn.status = B2BTransactionStatus.FAILED
+        txn.result_code = txn.result_code or "MANUAL"
+        txn.result_desc = f"Manually resolved as failed by admin {admin.id}: {note}"[:500]
+
+    await db.commit()
+    await db.refresh(txn)
+    logger.warning(
+        "B2B txn %s manually resolved as %s by admin %s (reseller %s)",
+        txn.id, outcome, admin.id, txn.reseller_id,
+    )
+    return {"transaction": _serialize_b2b_txn(txn)}
 
 
 @router.get("/api/admin/resellers/{reseller_id}/b2b-transactions")

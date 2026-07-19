@@ -15,11 +15,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import select
 
 from app.db.models import (
     B2BTransaction,
     B2BTransactionStatus,
     ResellerFinancials,
+    ResellerPayout,
     UserRole,
 )
 from tests.factories import make_reseller
@@ -185,6 +187,52 @@ async def test_daily_semantics_unchanged_manual_txn_does_not_block(
     await b2b.run_daily_payouts()
 
     assert attempted == [r1.id]
+
+
+async def test_custom_interval_gating(engine, db, session_factory, monkeypatch):
+    """Custom every-N-days: paid once the last payout falls outside the
+    N*24h-4h window, skipped inside it."""
+    from app.services import mpesa_b2b as b2b
+
+    inside = await make_reseller(db)
+    db.add(ResellerFinancials(user_id=inside.id, payout_frequency="custom",
+                              payout_interval_days=3))
+    due = await make_reseller(db)
+    db.add(ResellerFinancials(user_id=due.id, payout_frequency="custom",
+                              payout_interval_days=3))
+    await db.commit()
+
+    await _make_txn(db, inside.id, age=timedelta(days=2), conversation_id="AG_cust_recent")
+    await _make_txn(db, due.id, age=timedelta(days=3), conversation_id="AG_cust_old")
+
+    attempted = _patch_payout_env(b2b, monkeypatch, session_factory)
+    await b2b.run_daily_payouts()
+
+    assert attempted == [due.id]
+
+
+async def test_custom_schedule_validation(engine, db):
+    from app.services import mpesa_b2b as b2b
+
+    r1 = await make_reseller(db)
+    with pytest.raises(ValueError):
+        await b2b.set_payout_frequency(db, r1.id, "custom")  # no interval
+    with pytest.raises(ValueError):
+        await b2b.set_payout_frequency(db, r1.id, "custom", interval_days=0)
+    with pytest.raises(ValueError):
+        await b2b.set_payout_frequency(db, r1.id, "custom", interval_days=91)
+
+    await b2b.set_payout_frequency(db, r1.id, "custom", interval_days=5)
+    await db.commit()
+    assert await b2b.get_payout_schedule(db, r1.id) == ("custom", 5)
+
+    # A custom row whose interval was somehow lost degrades to daily.
+    fin = (await db.execute(
+        select(ResellerFinancials).where(ResellerFinancials.user_id == r1.id)
+    )).scalar_one()
+    fin.payout_interval_days = None
+    await db.commit()
+    assert await b2b.get_payout_schedule(db, r1.id) == ("daily", None)
 
 
 async def test_frequency_helpers_roundtrip(engine, db):
@@ -432,7 +480,7 @@ async def test_payout_settings_get_and_put(engine, db, monkeypatch):
     assert settings_before["can_withdraw"] is False
     assert settings_before["blocked_reason"] == "no_payment_method"
     assert set(settings_before["available_frequencies"]) == {
-        "daily", "weekly", "monthly", "manual",
+        "daily", "weekly", "monthly", "custom", "manual",
     }
 
     resp = await routes.update_reseller_payout_settings(
@@ -448,3 +496,107 @@ async def test_payout_settings_get_and_put(engine, db, monkeypatch):
             routes.PayoutSettingsUpdate(payout_frequency="hourly"), db=db, token="t"
         )
     assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Admin: manual resolution of stuck transactions
+# ---------------------------------------------------------------------------
+
+async def test_admin_resolve_completed_creates_ledger_and_unblocks(
+    engine, db, monkeypatch
+):
+    """Statement-verified payment: resolving as completed writes the same
+    payout + fee rows as a normal callback and unblocks the reseller."""
+    from app.api import b2b_routes as routes
+    from app.services import mpesa_b2b as b2b
+
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    r1 = await make_reseller(db)
+    stuck = await _make_txn(
+        db, r1.id, age=timedelta(days=40), conversation_id="AG_zombie_1",
+        status=B2BTransactionStatus.PENDING,
+    )
+    _login_as(monkeypatch, routes, admin)
+
+    result = await routes.resolve_b2b_transaction(
+        stuck.id,
+        routes.ResolveB2BRequest(
+            outcome="completed", receipt="UGXRECEIPT1", note="Found on June statement",
+        ),
+        db=db, token="t",
+    )
+
+    assert result["transaction"]["status"] == "completed"
+    assert result["transaction"]["transaction_id"] == "UGXRECEIPT1"
+    payouts = (await db.execute(
+        select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
+    )).scalars().all()
+    assert len(payouts) == 1
+    assert payouts[0].amount == stuck.net_amount
+    assert not await b2b.has_unresolved_b2b(db, r1.id)
+
+
+async def test_admin_resolve_failed_unblocks_without_payout(engine, db, monkeypatch):
+    from app.api import b2b_routes as routes
+    from app.services import mpesa_b2b as b2b
+
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    r1 = await make_reseller(db)
+    stuck = await _make_txn(
+        db, r1.id, age=timedelta(days=40), conversation_id="AG_zombie_2",
+        status=B2BTransactionStatus.PENDING,
+    )
+    _login_as(monkeypatch, routes, admin)
+
+    result = await routes.resolve_b2b_transaction(
+        stuck.id,
+        routes.ResolveB2BRequest(outcome="failed", note="Not on the statement"),
+        db=db, token="t",
+    )
+
+    assert result["transaction"]["status"] == "failed"
+    payouts = (await db.execute(
+        select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
+    )).scalars().all()
+    assert payouts == []
+    assert not await b2b.has_unresolved_b2b(db, r1.id)
+
+
+async def test_admin_resolve_guards(engine, db, monkeypatch):
+    from app.api import b2b_routes as routes
+
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    r1 = await make_reseller(db)
+    stuck = await _make_txn(
+        db, r1.id, age=timedelta(days=40), conversation_id="AG_zombie_3",
+        status=B2BTransactionStatus.PENDING,
+    )
+    done = await _make_txn(
+        db, r1.id, age=timedelta(days=1), conversation_id="AG_done_1",
+        status=B2BTransactionStatus.COMPLETED,
+    )
+
+    # Non-admin cannot resolve
+    _login_as(monkeypatch, routes, r1)
+    with pytest.raises(HTTPException) as exc:
+        await routes.resolve_b2b_transaction(
+            stuck.id, routes.ResolveB2BRequest(outcome="failed", note="x"), db=db, token="t",
+        )
+    assert exc.value.status_code == 403
+
+    _login_as(monkeypatch, routes, admin)
+
+    # Completed requires the statement receipt
+    with pytest.raises(HTTPException) as exc:
+        await routes.resolve_b2b_transaction(
+            stuck.id, routes.ResolveB2BRequest(outcome="completed", note="verified"),
+            db=db, token="t",
+        )
+    assert exc.value.status_code == 400
+
+    # Already-resolved transactions cannot be re-resolved
+    with pytest.raises(HTTPException) as exc:
+        await routes.resolve_b2b_transaction(
+            done.id, routes.ResolveB2BRequest(outcome="failed", note="x"), db=db, token="t",
+        )
+    assert exc.value.status_code == 409
