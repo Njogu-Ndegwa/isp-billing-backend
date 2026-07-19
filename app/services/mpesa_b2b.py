@@ -5,6 +5,7 @@ Handles automated and manual payouts from the system paybill to resellers'
 paybill numbers or bank accounts via the Safaricom B2B API.
 """
 
+import asyncio
 import base64
 import logging
 from datetime import datetime, timedelta
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -39,6 +40,49 @@ SUBSCRIPTION_OWNER_TRIGGER = "subscription_owner"
 # triggered_by value for self-service withdrawals from the Account Statement
 # page (vs "manual" = admin-triggered, "scheduled" = nightly job).
 RESELLER_TRIGGER = "reseller"
+
+
+class PayoutInFlightError(Exception):
+    """Another payout for this reseller is initiating or awaiting a verdict.
+
+    Raised by initiate_b2b_payment's atomic guard. Callers must treat it as
+    "do not send" — the other payout covers (or may cover) the balance."""
+
+
+# In-process per-reseller payout guard. Lets initiators fail fast instead of
+# queueing behind a Safaricom call. This is a UX layer only — the authoritative
+# double-spend guard is the committed write-ahead intent row plus the advisory
+# lock inside initiate_b2b_payment, which also holds across multiple workers.
+_payout_locks: dict[int, asyncio.Lock] = {}
+
+
+def payout_lock(reseller_id: int) -> asyncio.Lock:
+    lock = _payout_locks.get(reseller_id)
+    if lock is None:
+        lock = _payout_locks[reseller_id] = asyncio.Lock()
+    return lock
+
+
+# Arbitrary but stable namespace for pg advisory locks guarding B2B initiation.
+_PAYOUT_ADVISORY_CLASS = 0xB2B
+
+
+async def _try_payout_advisory_lock(db: AsyncSession, reseller_id: int) -> bool:
+    """Cross-process serialization of payout initiation.
+
+    Takes a Postgres transaction-scoped advisory lock — held until the
+    caller's current transaction commits or rolls back, so it exactly spans
+    the unresolved-check + intent-insert and never a network call. On
+    non-Postgres engines (tests) it is a no-op; the in-process lock still
+    guards there."""
+    bind = getattr(db, "bind", None)
+    if bind is None or bind.dialect.name != "postgresql":
+        return True
+    result = await db.execute(
+        text("SELECT pg_try_advisory_xact_lock(:cls, :rid)"),
+        {"cls": _PAYOUT_ADVISORY_CLASS, "rid": reseller_id},
+    )
+    return bool(result.scalar())
 
 CERTS_DIR = Path(__file__).resolve().parent.parent / "certs"
 
@@ -221,28 +265,82 @@ async def initiate_b2b_payment(
     triggered_by: str = "manual",
 ) -> B2BTransaction:
     """
-    Initiate a B2B payment via Safaricom API and persist a pending transaction.
+    Initiate a B2B payment via Safaricom API and persist the transaction.
+
+    Double-spend safety — write-ahead intent:
+
+    1. A PENDING intent row is committed BEFORE any network I/O, in the same
+       short transaction as a per-reseller advisory lock and an
+       unresolved-transaction re-check. From that commit on, every other
+       payout path (nightly job, admin trigger, self-withdrawal — any worker,
+       even after a restart) is blocked by has_unresolved_b2b().
+    2. The Safaricom call then happens with no DB transaction open.
+    3. The synchronous ack settles the intent: ResponseCode 0 records the
+       conversation ids (row stays PENDING for the result callback); a
+       rejection or a definitely-not-sent error marks it FAILED, releasing
+       the balance. An AMBIGUOUS failure (request may have reached Safaricom
+       but no ack parsed) leaves the intent PENDING with no conversation id:
+       money may be moving, so the reseller stays blocked until the row is
+       manually reconciled against the M-Pesa org statement. Uncertainty
+       never releases money (2026-07-18 incident).
 
     Args:
         amount: The total balance being paid out (fee is calculated on this).
         party_b: Destination paybill/shortcode.
         account_reference: Account number at the destination.
         fee: The Safaricom fee that will be deducted (for record-keeping).
+
+    Raises PayoutInFlightError if another payout for this reseller is
+    initiating or unresolved. Commits the caller's session.
     """
     net_amount = int(amount - fee)
     if net_amount <= 0:
         raise ValueError(f"Net payout amount must be positive (amount={amount}, fee={fee})")
 
-    access_token = await _get_access_token()
-    security_credential = generate_security_credential()
+    party_a = settings.MPESA_SHORTCODE
+
+    # ── Phase 1: committed write-ahead intent, atomically guarded ──────────
+    if not await _try_payout_advisory_lock(db, reseller_id):
+        raise PayoutInFlightError(
+            f"Another payout for reseller {reseller_id} is being initiated right now"
+        )
+    if await has_unresolved_b2b(db, reseller_id):
+        raise PayoutInFlightError(
+            f"Reseller {reseller_id} has an unresolved B2B transaction"
+        )
+
+    txn = B2BTransaction(
+        reseller_id=reseller_id,
+        conversation_id=None,
+        originator_conversation_id=None,
+        amount=amount,
+        fee=fee,
+        net_amount=net_amount,
+        party_a=party_a,
+        party_b=party_b,
+        account_reference=account_reference,
+        remarks=remarks,
+        status=B2BTransactionStatus.PENDING,
+        triggered_by=triggered_by,
+    )
+    db.add(txn)
+    # Intent becomes visible to every other payout path; advisory lock released.
+    await db.commit()
+
+    # ── Phase 2: network I/O with no DB transaction open ───────────────────
+    try:
+        access_token = await _get_access_token()
+        security_credential = generate_security_credential()
+    except Exception as e:
+        # Nothing was sent — safe to release the balance.
+        await _settle_intent_failed(db, txn, f"failed before send: {e}")
+        raise
 
     base_url = (
         "https://api.safaricom.co.ke"
         if settings.MPESA_ENVIRONMENT == "production"
         else "https://sandbox.safaricom.co.ke"
     )
-
-    party_a = settings.MPESA_SHORTCODE
     result_url = settings.MPESA_B2B_RESULT_URL or (
         f"{settings.MPESA_CALLBACK_URL.rsplit('/api/', 1)[0]}/api/mpesa/b2b/result"
     )
@@ -267,69 +365,84 @@ async def initiate_b2b_payment(
         "ResultURL": result_url,
     }
 
-    async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
-        response = await client.post(
-            f"{base_url}/mpesa/b2b/v1/paymentrequest",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
+    try:
+        async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
+            response = await client.post(
+                f"{base_url}/mpesa/b2b/v1/paymentrequest",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        # The request never reached Safaricom — safe to release the balance.
+        await _settle_intent_failed(db, txn, f"connect error, not sent: {e}")
+        raise RuntimeError(f"Safaricom B2B unreachable: {e}")
+    except Exception as e:
+        # Sent (or possibly sent) but no ack — money MAY be moving. Keep the
+        # intent PENDING: with no Safaricom ids the reconciliation job cannot
+        # query it, so it blocks this reseller's payouts until manually
+        # reconciled against the org portal statement. That is deliberate.
+        await _annotate_intent(db, txn, f"no ack from Safaricom: {e}")
+        logger.error(
+            "B2B send for txn %s (reseller %s) got no ack — left PENDING for "
+            "manual reconciliation: %s", txn.id, reseller_id, e,
         )
+        raise RuntimeError(f"Safaricom B2B call failed after send: {e}")
 
     try:
         response_data = response.json()
     except Exception:
+        # An HTTP response arrived but not the API's JSON (e.g. a gateway
+        # error page). Whether the payment was queued is unknowable here —
+        # same conservative treatment as a lost ack.
+        await _annotate_intent(db, txn, f"non-JSON ack, HTTP {response.status_code}")
         logger.error(
-            "B2B API returned non-JSON response (HTTP %s) for reseller %s: %s",
-            response.status_code, reseller_id, response.text[:500],
+            "B2B API returned non-JSON response (HTTP %s) for txn %s reseller %s — "
+            "left PENDING for manual reconciliation: %s",
+            response.status_code, txn.id, reseller_id, response.text[:500],
         )
         raise RuntimeError(f"Safaricom B2B API error: HTTP {response.status_code}")
 
     logger.info("B2B API response for reseller %s: %s", reseller_id, response_data)
 
-    conversation_id = _provider_id_or_none(response_data.get("ConversationID"))
-    originator_id = _provider_id_or_none(response_data.get("OriginatorConversationID"))
+    # ── Phase 3: settle the intent from the synchronous ack ────────────────
+    txn.conversation_id = _provider_id_or_none(response_data.get("ConversationID"))
+    txn.originator_conversation_id = _provider_id_or_none(
+        response_data.get("OriginatorConversationID")
+    )
 
     response_code = response_data.get("ResponseCode", "")
     if str(response_code) != "0":
-        txn = B2BTransaction(
-            reseller_id=reseller_id,
-            conversation_id=conversation_id,
-            originator_conversation_id=originator_id,
-            amount=amount,
-            fee=fee,
-            net_amount=net_amount,
-            party_a=party_a,
-            party_b=party_b,
-            account_reference=account_reference,
-            remarks=remarks,
-            status=B2BTransactionStatus.FAILED,
-            result_code=str(response_code),
-            result_desc=response_data.get("ResponseDescription", ""),
-            triggered_by=triggered_by,
-        )
-        db.add(txn)
-        await db.flush()
-        return txn
+        txn.status = B2BTransactionStatus.FAILED
+        txn.result_code = str(response_code)
+        txn.result_desc = response_data.get("ResponseDescription", "")
 
-    txn = B2BTransaction(
-        reseller_id=reseller_id,
-        conversation_id=conversation_id,
-        originator_conversation_id=originator_id,
-        amount=amount,
-        fee=fee,
-        net_amount=net_amount,
-        party_a=party_a,
-        party_b=party_b,
-        account_reference=account_reference,
-        remarks=remarks,
-        status=B2BTransactionStatus.PENDING,
-        triggered_by=triggered_by,
-    )
-    db.add(txn)
-    await db.flush()
+    await db.commit()
     return txn
+
+
+async def _settle_intent_failed(db: AsyncSession, txn: B2BTransaction, desc: str) -> None:
+    """Mark a write-ahead intent FAILED (money definitely never left).
+
+    A failure here leaves the row PENDING — over-blocking, which is the safe
+    direction — so it must never mask the original send error."""
+    try:
+        txn.status = B2BTransactionStatus.FAILED
+        txn.result_desc = desc[:500]
+        await db.commit()
+    except Exception as e:
+        logger.error("Could not settle failed B2B intent %s: %s", txn.id, e)
+
+
+async def _annotate_intent(db: AsyncSession, txn: B2BTransaction, desc: str) -> None:
+    """Record why an intent is stuck PENDING; the status itself stays PENDING."""
+    try:
+        txn.result_desc = desc[:500]
+        await db.commit()
+    except Exception as e:
+        logger.error("Could not annotate B2B intent %s: %s", txn.id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1022,84 +1135,102 @@ async def run_daily_payouts():
 
     for reseller_id in reseller_ids:
         try:
+            # Share the per-reseller payout guard with the manual/self-service
+            # endpoints so the job never races a withdrawal happening right now.
+            lock = payout_lock(reseller_id)
+            if lock.locked():
+                skip_count += 1
+                continue
+
             # Fresh short session per reseller: a failure (or aborted
             # transaction) for one reseller cannot leak into the next.
-            async with AsyncSessionLocal() as db:
-                frequency = await get_payout_frequency(db, reseller_id)
-                if frequency == PAYOUT_FREQUENCY_MANUAL:
-                    # Reseller opted out of automatic payouts; they withdraw
-                    # themselves from the Account Statement page.
-                    skip_count += 1
-                    continue
+            async with lock:
+                async with AsyncSessionLocal() as db:
+                    frequency = await get_payout_frequency(db, reseller_id)
+                    if frequency == PAYOUT_FREQUENCY_MANUAL:
+                        # Reseller opted out of automatic payouts; they withdraw
+                        # themselves from the Account Statement page.
+                        skip_count += 1
+                        continue
 
-                balance = await get_unpaid_balance(db, reseller_id)
-                # KES 1 can never net positive after the KES 1 Kadogo fee —
-                # skip quietly instead of raising a spurious "failed".
-                if balance < 2:
-                    skip_count += 1
-                    continue
+                    # Unresolved payment of ANY age (any trigger) = money may
+                    # be in flight with no verdict. Sending again is how the
+                    # 2026-07-18 double-pays happened — block until the status
+                    # reconciliation job settles it. Checked BEFORE the balance
+                    # read: a pending payout completing in between would leave
+                    # a stale, overstated balance.
+                    if await has_unresolved_b2b(db, reseller_id):
+                        logger.warning(
+                            "Reseller %s has an unresolved (pending/timeout) B2B tx, "
+                            "skipping until reconciled",
+                            reseller_id,
+                        )
+                        skip_count += 1
+                        continue
 
-                # Unresolved payment of ANY age (any trigger) = money may be
-                # in flight with no verdict. Sending again is how the
-                # 2026-07-18 double-pays happened — block until the status
-                # reconciliation job settles it.
-                if await has_unresolved_b2b(db, reseller_id):
-                    logger.warning(
-                        "Reseller %s has an unresolved (pending/timeout) B2B tx, "
-                        "skipping until reconciled",
-                        reseller_id,
+                    balance = await get_unpaid_balance(db, reseller_id)
+                    # KES 1 can never net positive after the KES 1 Kadogo fee —
+                    # skip quietly instead of raising a spurious "failed".
+                    if balance < 2:
+                        skip_count += 1
+                        continue
+
+                    dedupe_filters = [
+                        B2BTransaction.reseller_id == reseller_id,
+                        B2BTransaction.created_at >= dedupe_windows[frequency],
+                        B2BTransaction.status.in_([
+                            B2BTransactionStatus.PENDING,
+                            B2BTransactionStatus.COMPLETED,
+                        ]),
+                    ]
+                    if frequency == DEFAULT_PAYOUT_FREQUENCY:
+                        # Daily keeps its historical semantics: only a scheduled
+                        # payout blocks tonight's run — an admin/self payout made
+                        # earlier today does not stop the remaining balance.
+                        dedupe_filters.append(B2BTransaction.triggered_by == "scheduled")
+                    else:
+                        # Weekly/monthly express "how often I want cash": ANY
+                        # balance payout inside the window restarts the clock,
+                        # including admin-manual and reseller self-withdrawals.
+                        dedupe_filters.append(
+                            B2BTransaction.triggered_by.in_(BALANCE_PAYOUT_TRIGGERS)
+                        )
+
+                    existing_recent = await db.execute(
+                        select(func.count(B2BTransaction.id)).where(*dedupe_filters)
                     )
-                    skip_count += 1
-                    continue
+                    if existing_recent.scalar() > 0:
+                        logger.info(
+                            "Reseller %s already has a B2B tx inside their %s payout window, skipping",
+                            reseller_id, frequency,
+                        )
+                        skip_count += 1
+                        continue
 
-                dedupe_filters = [
-                    B2BTransaction.reseller_id == reseller_id,
-                    B2BTransaction.created_at >= dedupe_windows[frequency],
-                    B2BTransaction.status.in_([
-                        B2BTransactionStatus.PENDING,
-                        B2BTransactionStatus.COMPLETED,
-                    ]),
-                ]
-                if frequency == DEFAULT_PAYOUT_FREQUENCY:
-                    # Daily keeps its historical semantics: only a scheduled
-                    # payout blocks tonight's run — an admin/self payout made
-                    # earlier today does not stop the remaining balance.
-                    dedupe_filters.append(B2BTransaction.triggered_by == "scheduled")
-                else:
-                    # Weekly/monthly express "how often I want cash": ANY
-                    # balance payout inside the window restarts the clock,
-                    # including admin-manual and reseller self-withdrawals.
-                    dedupe_filters.append(
-                        B2BTransaction.triggered_by.in_(BALANCE_PAYOUT_TRIGGERS)
-                    )
+                    pm = await resolve_b2b_payment_method(db, reseller_id)
+                    if not pm:
+                        skip_count += 1
+                        continue
 
-                existing_recent = await db.execute(
-                    select(func.count(B2BTransaction.id)).where(*dedupe_filters)
-                )
-                if existing_recent.scalar() > 0:
-                    logger.info(
-                        "Reseller %s already has a B2B tx inside their %s payout window, skipping",
-                        reseller_id, frequency,
-                    )
-                    skip_count += 1
-                    continue
+                    try:
+                        txn = await payout_reseller(
+                            db, reseller_id, pm, balance, triggered_by="scheduled"
+                        )
+                    except PayoutInFlightError:
+                        # Another initiator won the race between our check and
+                        # the send — that payout covers the balance.
+                        skip_count += 1
+                        continue
+                    await db.commit()
 
-                pm = await resolve_b2b_payment_method(db, reseller_id)
-                if not pm:
-                    skip_count += 1
-                    continue
-
-                txn = await payout_reseller(db, reseller_id, pm, balance, triggered_by="scheduled")
-                await db.commit()
-
-                if txn.status == B2BTransactionStatus.PENDING:
-                    paid_count += 1
-                    logger.info(
-                        "B2B payout initiated: reseller=%s amount=%s net=%s fee=%s -> %s",
-                        reseller_id, txn.amount, txn.net_amount, txn.fee, txn.party_b,
-                    )
-                else:
-                    fail_count += 1
+                    if txn.status == B2BTransactionStatus.PENDING:
+                        paid_count += 1
+                        logger.info(
+                            "B2B payout initiated: reseller=%s amount=%s net=%s fee=%s -> %s",
+                            reseller_id, txn.amount, txn.net_amount, txn.fee, txn.party_b,
+                        )
+                    else:
+                        fail_count += 1
 
         except Exception as e:
             fail_count += 1

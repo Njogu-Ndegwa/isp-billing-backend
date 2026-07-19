@@ -8,6 +8,7 @@ Covers:
 - GET/PUT /api/reseller/payout-settings.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -269,7 +270,7 @@ async def test_withdraw_rejected_while_lock_held(engine, db, monkeypatch):
     r1 = await make_reseller(db)
     _login_as(monkeypatch, routes, r1)
 
-    lock = routes._payout_lock(r1.id)
+    lock = routes.payout_lock(r1.id)
     await lock.acquire()
     try:
         with pytest.raises(HTTPException) as exc:
@@ -350,6 +351,74 @@ async def test_withdraw_synchronous_safaricom_rejection_is_surfaced(
         await routes.reseller_withdraw(db=db, token="t")
     assert exc.value.status_code == 502
     assert "Receiver party is invalid" in exc.value.detail
+
+
+async def test_withdraw_cooldown_blocks_rapid_retries(engine, db, monkeypatch):
+    """Anti-abuse: a second self-withdrawal inside the cooldown window is
+    throttled even when the previous one is fully resolved."""
+    from app.api import b2b_routes as routes
+
+    r1 = await make_reseller(db)
+    _login_as(monkeypatch, routes, r1)
+    monkeypatch.setattr(routes, "get_unpaid_balance", AsyncMock(return_value=500.0))
+    monkeypatch.setattr(
+        routes, "resolve_b2b_payment_method",
+        AsyncMock(return_value=SimpleNamespace(id=1, label="My Paybill")),
+    )
+    await _make_txn(
+        db, r1.id, age=timedelta(minutes=2), conversation_id="AG_recent_wd",
+        triggered_by="reseller", status=B2BTransactionStatus.COMPLETED,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await routes.reseller_withdraw(db=db, token="t")
+    assert exc.value.status_code == 429
+
+
+async def test_concurrent_withdrawals_only_one_proceeds(engine, db, monkeypatch):
+    """Two overlapping requests (double-click / scripted spam): exactly one may
+    initiate a payout; the other is rejected before touching the balance."""
+    from app.api import b2b_routes as routes
+
+    r1 = await make_reseller(db)
+    _login_as(monkeypatch, routes, r1)
+    monkeypatch.setattr(routes, "get_unpaid_balance", AsyncMock(return_value=500.0))
+    monkeypatch.setattr(
+        routes, "resolve_b2b_payment_method",
+        AsyncMock(return_value=SimpleNamespace(id=1, label="My Paybill")),
+    )
+
+    sends = []
+
+    async def fake_payout(db_, reseller_id, pm, balance=None, triggered_by="manual"):
+        await asyncio.sleep(0.05)  # hold the lock across event-loop yields
+        sends.append(reseller_id)
+        txn = B2BTransaction(
+            reseller_id=reseller_id,
+            conversation_id="AG_race",
+            amount=balance, fee=13.0, net_amount=487.0,
+            party_a="4159825", party_b="247247",
+            status=B2BTransactionStatus.PENDING,
+            triggered_by=triggered_by,
+        )
+        db_.add(txn)
+        await db_.flush()
+        return txn
+
+    monkeypatch.setattr(routes, "payout_reseller", fake_payout)
+
+    results = await asyncio.gather(
+        routes.reseller_withdraw(db=db, token="t"),
+        routes.reseller_withdraw(db=db, token="t"),
+        return_exceptions=True,
+    )
+
+    succeeded = [r for r in results if isinstance(r, dict)]
+    rejected = [r for r in results if isinstance(r, HTTPException)]
+    assert len(sends) == 1
+    assert len(succeeded) == 1
+    assert len(rejected) == 1
+    assert rejected[0].status_code == 409
 
 
 async def test_payout_settings_get_and_put(engine, db, monkeypatch):

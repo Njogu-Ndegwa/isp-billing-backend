@@ -3,7 +3,6 @@ B2B payout routes: Safaricom callbacks, admin manual trigger, reseller
 self-service withdrawals + payout schedule, transaction history.
 """
 
-import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -27,10 +26,12 @@ from app.services.mpesa_b2b import (
     RESELLER_TRIGGER,
     UNRESOLVED_STATUSES,
     VALID_PAYOUT_FREQUENCIES,
+    PayoutInFlightError,
     compute_fee_breakdown,
     get_payout_frequency,
     get_unpaid_balance,
     has_unresolved_b2b,
+    payout_lock,
     payout_reseller,
     process_b2b_result,
     process_b2b_status_result,
@@ -47,20 +48,27 @@ router = APIRouter(tags=["b2b-payouts"])
 # never net positive after the KES 1 Kadogo fee.
 MIN_WITHDRAWAL_KES = 2
 
-# Per-reseller payout guard. The unresolved-B2B check reads committed rows, so
-# two near-simultaneous requests (double-click, retry) could both pass it and
-# both send money — the 2026-07-18 double-pay failure mode. The app runs as a
-# single worker, so an in-process lock closes that race. Never awaited while
-# held elsewhere: a second caller is rejected immediately instead of queueing
-# behind a Safaricom call.
-_payout_locks: dict[int, asyncio.Lock] = {}
+# Anti-abuse throttle on self-service withdrawals: at most one initiation
+# attempt per reseller per window, whatever its outcome. Their own balance is
+# all they can move, but unthrottled retries would hammer Safaricom's API
+# with our credentials. Admin/scheduled payouts are not throttled.
+WITHDRAWAL_COOLDOWN = timedelta(minutes=10)
 
 
-def _payout_lock(reseller_id: int) -> asyncio.Lock:
-    lock = _payout_locks.get(reseller_id)
-    if lock is None:
-        lock = _payout_locks[reseller_id] = asyncio.Lock()
-    return lock
+async def _withdrawal_cooldown_remaining(db: AsyncSession, reseller_id: int) -> int:
+    """Seconds until this reseller may attempt another self-withdrawal (0 = now)."""
+    last_at = (await db.execute(
+        select(func.max(B2BTransaction.created_at)).where(
+            B2BTransaction.reseller_id == reseller_id,
+            B2BTransaction.triggered_by == RESELLER_TRIGGER,
+        )
+    )).scalar()
+    if not last_at:
+        return 0
+    elapsed = datetime.utcnow() - last_at
+    if elapsed >= WITHDRAWAL_COOLDOWN:
+        return 0
+    return max(1, int((WITHDRAWAL_COOLDOWN - elapsed).total_seconds()))
 
 
 async def _require_admin(token: str, db: AsyncSession) -> User:
@@ -147,7 +155,7 @@ async def trigger_b2b_payout(
     if not reseller or reseller.role != UserRole.RESELLER:
         raise HTTPException(status_code=404, detail="Reseller not found")
 
-    lock = _payout_lock(reseller_id)
+    lock = payout_lock(reseller_id)
     if lock.locked():
         raise HTTPException(
             status_code=409,
@@ -189,6 +197,14 @@ async def trigger_b2b_payout(
             txn = await payout_reseller(db, reseller_id, pm, balance)
             await db.commit()
             await db.refresh(txn)
+        except PayoutInFlightError:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Another payout for this reseller is already in flight. "
+                    "Check the B2B transaction history for the pending entry."
+                ),
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
@@ -290,6 +306,8 @@ async def get_reseller_payout_settings(
     else:
         fee, kadogo, net = 0, 0, 0
 
+    cooldown_remaining = await _withdrawal_cooldown_remaining(db, user.id)
+
     blocked_reason = None
     if unresolved is not None:
         blocked_reason = "pending_withdrawal"
@@ -297,12 +315,15 @@ async def get_reseller_payout_settings(
         blocked_reason = "no_payment_method"
     elif balance < MIN_WITHDRAWAL_KES:
         blocked_reason = "balance_too_low"
+    elif cooldown_remaining > 0:
+        blocked_reason = "cooldown"
 
     return {
         "payout_frequency": frequency,
         "available_frequencies": list(VALID_PAYOUT_FREQUENCIES),
         "unpaid_balance": balance,
         "minimum_withdrawal": MIN_WITHDRAWAL_KES,
+        "cooldown_seconds_remaining": cooldown_remaining,
         "fee_preview": {
             "safaricom_fee": fee - kadogo,
             "kadogo_surcharge": kadogo,
@@ -361,7 +382,7 @@ async def reseller_withdraw(
     """
     user = await _require_reseller(token, db)
 
-    lock = _payout_lock(user.id)
+    lock = payout_lock(user.id)
     if lock.locked():
         raise HTTPException(
             status_code=409,
@@ -377,6 +398,16 @@ async def reseller_withdraw(
                     "Your previous withdrawal is still being confirmed with "
                     "Safaricom (usually within ~10 minutes). Withdrawing again "
                     "now could pay you twice — please try again shortly."
+                ),
+            )
+
+        cooldown_remaining = await _withdrawal_cooldown_remaining(db, user.id)
+        if cooldown_remaining > 0:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Please wait a few minutes between withdrawals "
+                    f"(about {max(1, cooldown_remaining // 60)} min remaining)."
                 ),
             )
 
@@ -403,6 +434,14 @@ async def reseller_withdraw(
             )
             await db.commit()
             await db.refresh(txn)
+        except PayoutInFlightError:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Another payout to you is already in flight — "
+                    "please try again once it completes."
+                ),
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
