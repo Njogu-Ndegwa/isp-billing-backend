@@ -40,7 +40,8 @@ class PaymentMethodCreate(BaseModel):
     method_type: str = Field(
         ...,
         description=(
-            "bank_account | mpesa_paybill | mpesa_paybill_with_keys | zenopay | mtn_momo"
+            "bank_account | mpesa_paybill | mpesa_till | mpesa_paybill_with_keys "
+            "| zenopay | mtn_momo"
         ),
     )
     label: str = Field(..., max_length=100, description="Display name for this method")
@@ -51,6 +52,9 @@ class PaymentMethodCreate(BaseModel):
 
     # M-Pesa Paybill (no keys)
     mpesa_paybill_number: Optional[str] = None
+
+    # M-Pesa Buy Goods till (payout destination)
+    mpesa_till_number: Optional[str] = None
 
     # M-Pesa Paybill/Till (with keys)
     mpesa_shortcode: Optional[str] = None
@@ -77,6 +81,7 @@ class PaymentMethodUpdate(BaseModel):
     bank_paybill_number: Optional[str] = None
     bank_account_number: Optional[str] = None
     mpesa_paybill_number: Optional[str] = None
+    mpesa_till_number: Optional[str] = None
     mpesa_shortcode: Optional[str] = None
     mpesa_passkey: Optional[str] = None
     mpesa_consumer_key: Optional[str] = None
@@ -115,6 +120,26 @@ def _validate_fields(method_type: ResellerPaymentMethodType, data: PaymentMethod
                 status_code=400,
                 detail="mpesa_paybill_number is required for M-Pesa Paybill (no keys)",
             )
+
+    elif method_type == ResellerPaymentMethodType.MPESA_TILL:
+        till = (data.mpesa_till_number or "").strip().replace(" ", "")
+        if not till:
+            raise HTTPException(
+                status_code=400,
+                detail="mpesa_till_number is required for M-Pesa Till (Buy Goods)",
+            )
+        # Resellers keep entering their M-Pesa phone number here (seen in
+        # production: 07XXXXXXXX as a payout destination, which B2B can never
+        # pay). Tills are 4-9 digits and don't start with 0.
+        if not till.isdigit() or not (4 <= len(till) <= 9) or till.startswith("0"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "mpesa_till_number must be a Buy Goods till number (4-9 digits, "
+                    "not starting with 0) — a phone number cannot receive B2B payouts"
+                ),
+            )
+        data.mpesa_till_number = till
 
     elif method_type == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS:
         missing = []
@@ -181,6 +206,9 @@ def _serialize_payment_method(pm: ResellerPaymentMethod) -> dict:
 
     elif method_type_value == ResellerPaymentMethodType.MPESA_PAYBILL.value:
         result["mpesa_paybill_number"] = pm.mpesa_paybill_number
+
+    elif method_type_value == ResellerPaymentMethodType.MPESA_TILL.value:
+        result["mpesa_till_number"] = pm.mpesa_till_number
 
     elif method_type_value == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS.value:
         result["mpesa_shortcode"] = pm.mpesa_shortcode
@@ -253,6 +281,7 @@ async def create_payment_method(
         bank_paybill_number=request.bank_paybill_number,
         bank_account_number=request.bank_account_number,
         mpesa_paybill_number=request.mpesa_paybill_number,
+        mpesa_till_number=request.mpesa_till_number,
         mpesa_shortcode=request.mpesa_shortcode,
         mpesa_passkey_encrypted=(
             encrypt_credential(request.mpesa_passkey) if request.mpesa_passkey else None
@@ -361,6 +390,8 @@ async def update_payment_method(
         pm.bank_account_number = request.bank_account_number
     if request.mpesa_paybill_number is not None:
         pm.mpesa_paybill_number = request.mpesa_paybill_number
+    if request.mpesa_till_number is not None:
+        pm.mpesa_till_number = request.mpesa_till_number.strip().replace(" ", "")
     if request.mpesa_shortcode is not None:
         pm.mpesa_shortcode = request.mpesa_shortcode
 
@@ -503,6 +534,7 @@ async def test_payment_method(
 
     elif method_type in (
         ResellerPaymentMethodType.MPESA_PAYBILL,
+        ResellerPaymentMethodType.MPESA_TILL,
         ResellerPaymentMethodType.BANK_ACCOUNT,
     ):
         return {

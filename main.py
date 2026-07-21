@@ -59,6 +59,8 @@ from app.api.shop_routes import router as shop_router
 from app.api.portal_routes import router as portal_router
 from app.api.messaging_routes import router as messaging_router
 from app.api.admin_messaging_routes import router as admin_messaging_router
+from app.api.feedback_routes import router as feedback_router
+from app.api.admin_feedback_routes import router as admin_feedback_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -96,6 +98,8 @@ app.include_router(shop_router)
 app.include_router(portal_router)
 app.include_router(messaging_router)
 app.include_router(admin_messaging_router)
+app.include_router(feedback_router)
+app.include_router(admin_feedback_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -642,6 +646,18 @@ async def run_payment_method_migrations():
         await conn.run_sync(
             lambda c: ResellerPayout.__table__.create(c, checkfirst=True)
         )
+
+        # Buy Goods till payouts (2026-07-21): the pre-existing enum type
+        # no-ops the CREATE TYPE above via duplicate_object, so new values
+        # must be added explicitly (lesson from the missing 'timeout' label
+        # on b2btransactionstatus, 2026-07-18).
+        await conn.execute(sa_text(
+            "ALTER TYPE resellerpaymentmethodtype ADD VALUE IF NOT EXISTS 'mpesa_till'"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE reseller_payment_methods "
+            "ADD COLUMN IF NOT EXISTS mpesa_till_number VARCHAR(20)"
+        ))
 
         # Add payment_method_id FK to routers if missing
         result = await conn.execute(sa_text("""
@@ -1963,6 +1979,43 @@ async def run_router_status_alert_migrations():
     logger.info("Router status-alert migrations complete")
 
 
+async def run_feedback_migrations():
+    """Create feedback board (Ideas + Bugs) enums, tables, indexes. Idempotent."""
+    from sqlalchemy import text, inspect
+
+    enums = {
+        "feedbackkind": ["bug", "idea"],
+        "feedbackstatus": ["new", "under_review", "planned", "in_progress",
+                           "fixed", "declined", "duplicate", "spam"],
+    }
+    async with async_engine.begin() as conn:
+        for name, values in enums.items():
+            vals = ", ".join(f"'{v}'" for v in values)
+            await conn.execute(text(
+                f"DO $$ BEGIN CREATE TYPE {name} AS ENUM ({vals}); "
+                f"EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+            ))
+
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+
+        from app.db.models import FeedbackPost, FeedbackVote, FeedbackComment
+        targets = [FeedbackPost, FeedbackVote, FeedbackComment]
+        to_create = [m.__table__ for m in targets if m.__tablename__ not in tables]
+        if to_create:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
+
+        # Partial index for the admin queue's default "open statuses" scan.
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_feedback_posts_open_queue "
+            "ON feedback_posts(created_at) "
+            "WHERE status NOT IN ('fixed','declined','duplicate','spam')"
+        ))
+    logger.info("Migration: feedback board tables, enums, indexes ready")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -2102,6 +2155,12 @@ async def startup_event():
         logger.info("Payment port attribution migrations completed successfully")
     except Exception as e:
         logger.error(f"Payment port attribution migration failed (non-fatal): {e}")
+
+    try:
+        await run_feedback_migrations()
+        logger.info("Feedback board migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Feedback board migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

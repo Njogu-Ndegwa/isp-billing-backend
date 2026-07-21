@@ -842,6 +842,9 @@ class RouterAvailabilityCheck(Base):
 class ResellerPaymentMethodType(str, enum.Enum):
     BANK_ACCOUNT = "bank_account"
     MPESA_PAYBILL = "mpesa_paybill"
+    # Buy Goods merchant till — B2B receiver identifier type 2, paid via
+    # CommandID BusinessBuyGoods (a paybill is type 4 / BusinessPayBill).
+    MPESA_TILL = "mpesa_till"
     MPESA_PAYBILL_WITH_KEYS = "mpesa_paybill_with_keys"
     ZENOPAY = "zenopay"
     MTN_MOMO = "mtn_momo"
@@ -879,6 +882,9 @@ class ResellerPaymentMethod(Base):
 
     # M-Pesa Paybill without API keys
     mpesa_paybill_number = Column(String(20), nullable=True)
+
+    # M-Pesa Buy Goods till (payout destination, no account number)
+    mpesa_till_number = Column(String(20), nullable=True)
 
     # M-Pesa Paybill/Till with API keys (encrypted at rest)
     mpesa_shortcode = Column(String(20), nullable=True)
@@ -1758,3 +1764,84 @@ class ResellerInboxMessage(Base):
     sent_sms = Column(Boolean, nullable=False, default=False, server_default="false")
     broadcast_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FeedbackKind(str, enum.Enum):
+    BUG = "bug"
+    IDEA = "idea"
+
+
+class FeedbackStatus(str, enum.Enum):
+    NEW = "new"
+    UNDER_REVIEW = "under_review"
+    PLANNED = "planned"
+    IN_PROGRESS = "in_progress"
+    FIXED = "fixed"
+    DECLINED = "declined"
+    DUPLICATE = "duplicate"
+    SPAM = "spam"
+
+
+class FeedbackPost(Base):
+    """A bug report or feature idea on the shared reseller feedback board."""
+    __tablename__ = "feedback_posts"
+    __table_args__ = (
+        Index("ix_feedback_posts_user_created", "user_id", "created_at"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    kind = Column(Enum(FeedbackKind, name="feedbackkind",
+                       values_callable=lambda e: [x.value for x in e]), nullable=False)
+    title = Column(String(200), nullable=False)
+    body = Column(String(5000), nullable=False)
+    status = Column(Enum(FeedbackStatus, name="feedbackstatus",
+                         values_callable=lambda e: [x.value for x in e]),
+                    nullable=False, default=FeedbackStatus.NEW,
+                    server_default="new", index=True)
+    upvotes = Column(Integer, nullable=False, default=0, server_default="0")
+    downvotes = Column(Integer, nullable=False, default=0, server_default="0")
+    comment_count = Column(Integer, nullable=False, default=0, server_default="0")
+    # Admin-confirmed duplicate target (self-FK); ai_duplicate_of_id is the
+    # AI's unconfirmed suggestion.
+    duplicate_of_id = Column(Integer, ForeignKey("feedback_posts.id", ondelete="SET NULL"),
+                             nullable=True)
+    ai_triaged_at = Column(DateTime, nullable=True)
+    ai_spam = Column(Boolean, nullable=True)
+    ai_kind = Column(String(16), nullable=True)
+    ai_severity = Column(Integer, nullable=True)
+    ai_summary = Column(String(300), nullable=True)
+    ai_affected_area = Column(String(60), nullable=True)
+    ai_duplicate_of_id = Column(Integer, ForeignKey("feedback_posts.id", ondelete="SET NULL"),
+                                nullable=True)
+    ai_raw = Column(JSON, nullable=True)
+    ai_error = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class FeedbackVote(Base):
+    __tablename__ = "feedback_votes"
+    __table_args__ = (
+        UniqueConstraint("post_id", "user_id", name="uq_feedback_votes_post_user"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    post_id = Column(Integer, ForeignKey("feedback_posts.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    value = Column(Integer, nullable=False)  # +1 or -1
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FeedbackComment(Base):
+    __tablename__ = "feedback_comments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    post_id = Column(Integer, ForeignKey("feedback_posts.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    body = Column(String(2000), nullable=False)
+    is_admin = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", foreign_keys=[user_id])

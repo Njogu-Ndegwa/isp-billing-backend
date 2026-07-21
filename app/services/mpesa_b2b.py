@@ -263,6 +263,7 @@ async def initiate_b2b_payment(
     remarks: str = "Reseller payout",
     fee: float = 0,
     triggered_by: str = "manual",
+    command_id: str = "BusinessPayBill",
 ) -> B2BTransaction:
     """
     Initiate a B2B payment via Safaricom API and persist the transaction.
@@ -286,9 +287,12 @@ async def initiate_b2b_payment(
 
     Args:
         amount: The total balance being paid out (fee is calculated on this).
-        party_b: Destination paybill/shortcode.
-        account_reference: Account number at the destination.
+        party_b: Destination paybill/shortcode or till number.
+        account_reference: Account number at the destination (paybill only).
         fee: The Safaricom fee that will be deducted (for record-keeping).
+        command_id: "BusinessPayBill" (paybill/bank, receiver type 4) or
+            "BusinessBuyGoods" (merchant till, receiver type 2 — tills have
+            no accounts, so AccountReference is omitted from the payload).
 
     Raises PayoutInFlightError if another payout for this reseller is
     initiating or unresolved. Commits the caller's session.
@@ -319,6 +323,7 @@ async def initiate_b2b_payment(
         party_a=party_a,
         party_b=party_b,
         account_reference=account_reference,
+        command_id=command_id,
         remarks=remarks,
         status=B2BTransactionStatus.PENDING,
         triggered_by=triggered_by,
@@ -351,19 +356,26 @@ async def initiate_b2b_payment(
     payload = {
         "Initiator": settings.MPESA_B2B_INITIATOR_NAME,
         "SecurityCredential": security_credential,
-        "CommandID": "BusinessPayBill",
+        "CommandID": command_id,
         "SenderIdentifierType": "4",
-        "RecieverIdentifierType": "4",
+        # Receiver identifier type 2 = merchant till, 4 = org shortcode.
+        # Sending type 4 to a till is exactly the SFC_IC0003 "Receiver party
+        # is invalid" failure that till-number resellers hit nightly.
+        "RecieverIdentifierType": "2" if command_id == "BusinessBuyGoods" else "4",
         "Amount": str(net_amount),
         "PartyA": party_a,
         "PartyB": party_b,
-        # AccountReference can be a bank account number. Never truncate an
-        # identifier here; a shortened value can point to a different account.
-        "AccountReference": account_reference,
         "Remarks": remarks[:100],
         "QueueTimeOutURL": timeout_url,
         "ResultURL": result_url,
     }
+    if command_id != "BusinessBuyGoods":
+        # AccountReference can be a bank account number. Never truncate an
+        # identifier here; a shortened value can point to a different account.
+        # Tills have no accounts — Safaricom chokes on unexpected/empty
+        # fields (cf. the empty-TransactionID all-empty-ack quirk), so the
+        # key is omitted entirely for BusinessBuyGoods.
+        payload["AccountReference"] = account_reference
 
     try:
         async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
@@ -1159,6 +1171,7 @@ async def _monthly_b2b_count(db: AsyncSession, reseller_id: int) -> int:
 B2B_ELIGIBLE_TYPES = [
     ResellerPaymentMethodType.BANK_ACCOUNT,
     ResellerPaymentMethodType.MPESA_PAYBILL,
+    ResellerPaymentMethodType.MPESA_TILL,
 ]
 
 
@@ -1167,7 +1180,7 @@ async def resolve_b2b_payment_method(
 ) -> Optional[ResellerPaymentMethod]:
     """
     Find the best B2B-eligible payment method for a reseller.
-    1. First active bank_account or mpesa_paybill method
+    1. First active bank_account, mpesa_paybill, or mpesa_till method
     2. Fallback: if exactly one B2B-eligible method exists (even inactive), use it
     """
     active_stmt = (
@@ -1222,6 +1235,7 @@ async def payout_reseller(
     if isinstance(method_type, str):
         method_type = ResellerPaymentMethodType(method_type)
 
+    command_id = "BusinessPayBill"
     if method_type == ResellerPaymentMethodType.BANK_ACCOUNT:
         party_b = payment_method.bank_paybill_number
         account_ref = payment_method.bank_account_number or ""
@@ -1229,11 +1243,16 @@ async def payout_reseller(
         party_b = payment_method.mpesa_paybill_number
         reseller = await db.get(User, reseller_id)
         account_ref = (reseller.organization_name or reseller.email)[:13] if reseller else ""
+    elif method_type == ResellerPaymentMethodType.MPESA_TILL:
+        # Buy Goods merchant till: different receiver type, no account.
+        party_b = payment_method.mpesa_till_number
+        account_ref = ""
+        command_id = "BusinessBuyGoods"
     else:
         raise ValueError(f"Payment method type {method_type} not eligible for B2B payout")
 
     if not party_b:
-        raise ValueError("Payment method has no destination paybill number configured")
+        raise ValueError("Payment method has no destination paybill/till number configured")
 
     fee, _, _ = compute_fee_breakdown(balance)
 
@@ -1246,6 +1265,7 @@ async def payout_reseller(
         remarks=f"Payout to {payment_method.label}",
         fee=fee,
         triggered_by=triggered_by,
+        command_id=command_id,
     )
     return txn
 
