@@ -6,6 +6,20 @@ This file is the handoff map for coding agents working in this repository. Keep 
 
 - Any backend schema change must be wired into an idempotent startup migration in `main.py` and verified as part of the server restart path. A standalone script in `migrations/` is useful for manual repair/backfill, but it is never sufficient on its own.
 
+## Worktree Rule
+
+- ALL agents do implementation work from a dedicated git worktree, ALWAYS — even for
+  small changes and even when the task doesn't ask for it (`EnterWorktree`, or
+  `git worktree add <path> origin/main`). The main checkout is for reading, queries,
+  and prod-access scripts only: it permanently carries other agents' uncommitted WIP,
+  and working in it has already caused collisions and a production outage
+  (2026-07-21: `main.py` feedback-board wiring was pushed while the four modules it
+  imports sat untracked in the main checkout; the next deploy crash-looped the app
+  on ModuleNotFoundError until they were committed).
+- Corollary: never commit/push wiring or imports for files that are not themselves
+  committed. Before pushing anything that touches `main.py`, run `git status app/`
+  and confirm no untracked module you depend on is left behind.
+
 ## Project Context
 
 - Backend: this repository, `isp-billing`.
@@ -123,6 +137,64 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   diagnosis against a known-good router plus a catalog of proven fixes (7.20+ hotspot-file bug,
   DHCP subnet mismatch, leftover config) — proposed, never auto-applied. Builds on
   **`accessing-production-server`** for prod access.
+
+- **Ex-provider (second-hand) routers** — provisioning is additive, so old-ISP config survives.
+  Five confirmed instances as of 2026-07-10; all on RB951/hEX from WispMan/Simbafastnet. Check:
+  (1) **foreign management tunnels** (ovpn/l2tp/pptp out-interface) + schedulers that re-arm them —
+  delete scheduler FIRST, then disable tunnel; (2) **`html-directory-override`** on the hotspot
+  profile — silently overrides `html-directory`; clear with `set html-directory-override=""`; 
+  (3) **ether2–5 in wrong bridge** — bridgeLocal vs. bridge (additive script fails silently if port
+  already in a bridge); (4) **conflicting subnet on bridge** — if the old ISP used `10.0.0.x/y`,
+  the router may own `10.0.0.1`, causing `ping 10.0.0.1` to return 0ms (self-ping, not our server);
+  real server RTT ~200ms. Detailed incident notes + cleanup script:
+  see `project-secondhand-router-onboarding` memory and
+  `.claude/skills/diagnose-customer-router/cleanup_wispman_leftovers.py`.
+
+- **L2TP NAT collision — two routers, one public IP** — when two ROS6 routers at the same premises
+  dial L2TP/IPsec to the server from behind one NAT (identical public IP), each new IKE phase-1
+  handshake evicts the other's SA → both tunnels cycle every ~90–120 s indefinitely, breaking
+  provisioning and payment delivery. Diagnostic: availability cliff on router A matches router B's
+  `created_at` exactly; both share the same `/ip cloud` public-address; L2TP logs show
+  `session closed` → redial every ~90 s. Fix: separate uplinks, or migrate one to ROS7 WireGuard
+  (WireGuard multiplexes any number of peers behind one NAT). Confirm with `wan_state_probe.py`
+  in `.claude/skills/diagnose-customer-router/`. Backlog: warn at registration when a new L2TP
+  router's WAN IP matches an existing active router's WAN IP. hAP lite gotcha: no RTC → log
+  timestamps unreliable until SNTP syncs after reboot. Server-side gotcha: stale `ppp<N>` iface
+  may show `10.0.100.x` via `ip -br addr` even when router is unreachable — confirm with live ping.
+
+- **Insurance tunnel rescue** — when a router's primary L2TP/WG path is dead, reach it via the
+  new AWS server: `ssh -o BatchMode=yes dennis@35.170.199.141` (passwordless sudo granted
+  2026-07-19; `dennis ALL=(ALL) NOPASSWD:ALL` in `/etc/sudoers.d/99-dennis-nopasswd`), then
+  connect to `10.250.0.x` or `10.250.100.x`. NOTE: no `librouteros`/`routeros_api` on that box —
+  use a raw stdlib RouterOS API client piped over ssh. Proved in anger on Router-0715 (2026-07-10).
+
+- **Router logs are EAT (UTC+3); server/DB is UTC.** When correlating MikroTik `/log print`
+  timestamps against app logs, DB records, or customer expiry fields, subtract 3 hours from the
+  router timestamp (or add 3h to UTC to compare). Getting this backwards produces a ~3h ghost offset
+  in incident timelines.
+
+- **SIMSEAS #4 (router 110) has a live egress tunnel as of 2026-07-19.** A `wg-egress` WireGuard
+  interface (`10.60.0.2/24` → AWS `35.170.199.141:51822`) is routing ALL customer traffic through
+  AWS Virginia to test Starlink congestion bypass. Off-peak this adds ~270ms latency (10× worse).
+  Failover to direct Starlink in ~3s. Production plan: move egress to Hetzner `91.98.238.12`
+  (see `project-simseas-starlink-egress` memory). Don't remove this tunnel without checking with Dennis.
+
+## Feedback Board (Ideas + Bugs)
+
+- Shared reseller feedback board (levelsio-style): bug reports / feature ideas
+  with upvote/downvote, comments, statuses, and Claude AI triage on submission
+  (spam filter, severity, affected area, duplicate suggestion, critical-bug
+  inbox alert to the admin). Backend: `app/api/feedback_routes.py`,
+  `app/api/admin_feedback_routes.py`, `app/services/feedback_queue.py`
+  (priority formula + work packets), `app/services/feedback_ai.py` (Anthropic
+  calls — follows Database Session Discipline; degrades to manual triage when
+  `ANTHROPIC_API_KEY` is unset). Frontend: `/feedback` board +
+  `/admin/feedback` triage in `../isp-billing-admin`.
+- To work the queue from Claude Code, use the **`handle-feedback`** skill
+  (`.claude/skills/handle-feedback/`). Status changes notify the reporter's
+  inbox — never mark a post `fixed` before the fix is deployed.
+- Tests: `tests/test_feedback_routes.py`, `tests/test_admin_feedback_routes.py`,
+  `tests/test_feedback_ai.py`.
 
 ## AWS Migration / Insurance Tunnel Handoff
 
