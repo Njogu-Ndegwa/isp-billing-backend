@@ -141,9 +141,12 @@ async def initiate_customer_payment(
             account_reference=account_reference,
         )
 
+    # MPESA_TILL is a payout destination (nightly B2B BusinessBuyGoods), not a
+    # collection channel — customers still pay the platform shortcode via STK.
     if method_type in (
         ResellerPaymentMethodType.MPESA_PAYBILL,
         ResellerPaymentMethodType.BANK_ACCOUNT,
+        ResellerPaymentMethodType.MPESA_TILL,
     ):
         return await _initiate_mpesa_system_collected(
             db, payment_method, customer, phone, amount, reference,
