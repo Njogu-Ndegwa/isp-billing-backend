@@ -5,19 +5,30 @@ Covers both directions:
 - outage ("went offline") via the debounced scheduler scan
 
 plus the noise-control gates: opt-in flag, minimum outage duration, staleness
-window, per-outage stamp, and cooldown claims.
+window, per-outage stamp, and cooldown claims — and the SMS leg: credit-charged
+queueing, inbox-only degradation, and refund-on-failed-send settlement.
 """
 
 from datetime import datetime, timedelta
 
 from sqlalchemy import select
 
-from app.db.models import ResellerInboxMessage, Router, User, UserRole
+from app.db.models import (
+    ResellerInboxMessage,
+    Router,
+    SmsCreditTransaction, SmsCreditTxnKind,
+    SmsMessage, SmsMessageKind, SmsMessageStatus,
+    User, UserRole,
+)
+from app.services import router_status_alerts, sms_credits
 from app.services.router_availability import record_router_availability
 from app.services.router_status_alerts import (
+    ALERT_SMS_CATEGORY,
     MIN_OUTAGE_FOR_ALERTS,
     NOTIFY_COOLDOWN,
     OFFLINE_STATUS_FRESH_WINDOW,
+    _OPT_OUT_HINT,
+    deliver_alert_sms,
     scan_and_notify_offline_routers,
     should_consider_recovery_notification,
 )
@@ -261,3 +272,182 @@ async def test_full_outage_and_recovery_pair(db):
 
     assert await scan_and_notify_offline_routers() == 1
     assert len(await _inbox_messages(db, reseller.id)) == 3
+
+
+# ─── SMS leg (credits-charged, same opt-in toggle) ──────────────────────────
+
+async def _setup_sms_reseller(db, *, credits=10, phone="254700000001"):
+    admin = await _make_admin(db)
+    reseller = await make_reseller(db, support_phone=phone)
+    if credits:
+        await sms_credits.grant(db, reseller.id, credits, reference="test-grant")
+        await db.commit()
+    router = await make_router(
+        db,
+        reseller,
+        status_alerts_enabled=True,
+        last_status=False,
+        last_checked_at=datetime.utcnow() - timedelta(minutes=3),
+        last_online_at=datetime.utcnow() - timedelta(hours=2),
+    )
+    return admin, reseller, router
+
+
+def _capture_sms_spawn(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        router_status_alerts, "_spawn_alert_sms_dispatch",
+        lambda sms_id, sender: calls.append((sms_id, sender)))
+    return calls
+
+
+async def _sms_rows(db, user_id):
+    result = await db.execute(
+        select(SmsMessage).where(SmsMessage.user_id == user_id))
+    return result.scalars().all()
+
+
+async def test_recovery_alert_queues_charged_sms(db, monkeypatch):
+    calls = _capture_sms_spawn(monkeypatch)
+    _, reseller, router = await _setup_sms_reseller(db)
+
+    await record_router_availability(db, router.id, True, "test")
+
+    messages = await _inbox_messages(db, reseller.id)
+    assert len(messages) == 1
+    assert messages[0].sent_sms is True
+
+    rows = await _sms_rows(db, reseller.id)
+    assert len(rows) == 1
+    sms = rows[0]
+    assert sms.recipient_phone == "254700000001"
+    assert sms.kind == SmsMessageKind.ADMIN_TO_RESELLER
+    assert sms.category == ALERT_SMS_CATEGORY
+    assert sms.status == SmsMessageStatus.QUEUED
+    assert "back online" in sms.body
+    assert _OPT_OUT_HINT not in sms.body
+    assert sms.segments == 1
+    assert sms.credits_charged == 1
+    assert calls == [(sms.id, "TALKSASA")]
+
+    acct = await sms_credits.get_or_create_account(db, reseller.id)
+    await db.refresh(acct)
+    assert acct.balance == 9
+
+
+async def test_offline_scan_alert_queues_charged_sms(db, monkeypatch):
+    calls = _capture_sms_spawn(monkeypatch)
+    _, reseller, _ = await _setup_sms_reseller(db)
+
+    assert await scan_and_notify_offline_routers() == 1
+
+    rows = await _sms_rows(db, reseller.id)
+    assert len(rows) == 1
+    assert "appears to be offline" in rows[0].body
+    assert _OPT_OUT_HINT not in rows[0].body
+    assert len(calls) == 1
+
+
+async def test_alert_degrades_to_inbox_only_without_credits(db, monkeypatch):
+    calls = _capture_sms_spawn(monkeypatch)
+    _, reseller, router = await _setup_sms_reseller(db, credits=0)
+
+    await record_router_availability(db, router.id, True, "test")
+
+    messages = await _inbox_messages(db, reseller.id)
+    assert len(messages) == 1
+    assert messages[0].sent_sms is False
+    assert await _sms_rows(db, reseller.id) == []
+    assert calls == []
+
+
+async def test_alert_skips_sms_without_phone(db, monkeypatch):
+    calls = _capture_sms_spawn(monkeypatch)
+    _, reseller, router = await _setup_sms_reseller(db, phone=None)
+
+    await record_router_availability(db, router.id, True, "test")
+
+    messages = await _inbox_messages(db, reseller.id)
+    assert len(messages) == 1
+    assert messages[0].sent_sms is False
+    assert await _sms_rows(db, reseller.id) == []
+    assert calls == []
+
+
+async def _make_queued_alert_sms(db, reseller, *, credits_charged=1):
+    row = SmsMessage(
+        user_id=reseller.id,
+        recipient_phone="254700000001",
+        body="Your router 'r' appears to be offline.",
+        segments=1,
+        credits_charged=credits_charged,
+        kind=SmsMessageKind.ADMIN_TO_RESELLER,
+        category=ALERT_SMS_CATEGORY,
+        status=SmsMessageStatus.QUEUED,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def _refund_txns(db, user_id):
+    result = await db.execute(
+        select(SmsCreditTransaction).where(
+            SmsCreditTransaction.user_id == user_id,
+            SmsCreditTransaction.kind == SmsCreditTxnKind.REFUND,
+        )
+    )
+    return result.scalars().all()
+
+
+async def test_deliver_refunds_credits_when_provider_send_fails(db, monkeypatch):
+    reseller = await make_reseller(db, support_phone="254700000001")
+    await sms_credits.grant(db, reseller.id, 5, reference="test-grant")
+    await db.commit()
+    assert await sms_credits.try_deduct(db, reseller.id, 1, reference="router_alert:1")
+    await db.commit()
+    row = await _make_queued_alert_sms(db, reseller)
+
+    async def _fake_dispatch(ids, sender):
+        failed = await db.get(SmsMessage, ids[0])
+        failed.status = SmsMessageStatus.FAILED
+        failed.error = "provider_error"
+        await db.commit()
+
+    monkeypatch.setattr(
+        "app.services.sms_dispatch.dispatch_admin_sms_messages", _fake_dispatch)
+
+    await deliver_alert_sms(row.id, "TALKSASA")
+
+    await db.refresh(row)
+    assert row.status == SmsMessageStatus.FAILED
+    assert row.credits_charged == 0
+    acct = await sms_credits.get_or_create_account(db, reseller.id)
+    await db.refresh(acct)
+    assert acct.balance == 5
+    assert len(await _refund_txns(db, reseller.id)) == 1
+
+
+async def test_deliver_settles_row_stuck_queued_after_dispatch_crash(db, monkeypatch):
+    reseller = await make_reseller(db, support_phone="254700000001")
+    await sms_credits.grant(db, reseller.id, 5, reference="test-grant")
+    assert await sms_credits.try_deduct(db, reseller.id, 1, reference="router_alert:1")
+    await db.commit()
+    row = await _make_queued_alert_sms(db, reseller)
+
+    async def _crash_dispatch(ids, sender):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "app.services.sms_dispatch.dispatch_admin_sms_messages", _crash_dispatch)
+
+    await deliver_alert_sms(row.id, "TALKSASA")
+
+    await db.refresh(row)
+    assert row.status == SmsMessageStatus.FAILED
+    assert row.error == "dispatch_error"
+    assert row.credits_charged == 0
+    acct = await sms_credits.get_or_create_account(db, reseller.id)
+    await db.refresh(acct)
+    assert acct.balance == 5

@@ -10,14 +10,20 @@ One flag (``routers.status_alerts_enabled``) covers both directions:
 - Online: ``record_router_availability`` calls into here on an offline -> online
   transition and sends the matching "back online" recovery notice.
 
-Delivery is an in-app inbox message (``ResellerInboxMessage``) only — no SMS row
-is created and no credits are touched.
+Delivery is an in-app inbox message (``ResellerInboxMessage``) plus, when the
+owner has a phone on file, messaging is enabled, and their SMS credit balance
+covers it, an SMS charged to the owner's credits (same single opt-in toggle).
+Insufficient credits silently degrade to inbox-only; a failed provider send is
+refunded.
 
-Session discipline: everything here is DB-only and runs in its OWN short session
-(the online path fires AFTER the availability write has committed), so the hot
-``routers`` row lock stays bounded to milliseconds (see Database Session
-Discipline in AGENTS.md). The offline scan sheds load when the DB pool is under
-pressure, per the background-work guardrails.
+Session discipline: message/credit rows are DB-only and run in their OWN short
+session (the online path fires AFTER the availability write has committed), so
+the hot ``routers`` row lock stays bounded to milliseconds (see Database Session
+Discipline in AGENTS.md). The provider SMS send happens in a fire-and-forget
+task AFTER that commit — availability is recorded from ~40 code paths, some
+customer-facing, so the network call must neither hold a session nor add
+latency there. The offline scan sheds load when the DB pool is under pressure,
+per the background-work guardrails.
 
 Noise control:
 - ``MIN_OUTAGE_FOR_ALERTS``: outages shorter than this produce no message in
@@ -29,18 +35,30 @@ Noise control:
   announced).
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import select, update
 
+from app.config import settings
 from app.db import database
 from app.db.database import db_pool_snapshot
-from app.db.models import ResellerInboxMessage, Router, User
+from app.db.models import (
+    MessagingSettings,
+    ResellerInboxMessage,
+    Router,
+    SmsMessage, SmsMessageKind, SmsMessageStatus,
+    User,
+)
+from app.services import sms_credits, sms_dispatch
+from app.services.messaging import count_segments, resolve_sender_id
 from app.services.reseller_welcome import _resolve_sender_admin_id
 
 logger = logging.getLogger(__name__)
+
+ALERT_SMS_CATEGORY = "router_status_alert"
 
 MIN_OUTAGE_FOR_ALERTS = timedelta(minutes=15)
 NOTIFY_COOLDOWN = timedelta(minutes=30)
@@ -126,22 +144,117 @@ def render_offline_notification(name: str, offline_since: datetime,
     return subject, body + _OPT_OUT_HINT
 
 
-async def _create_inbox_message(db, router: Router, subject: str, body: str) -> bool:
-    """Add the inbox row for the router's owner. Caller commits."""
+async def _queue_alert_sms(db, owner: User, router: Router,
+                           sms_body: str) -> tuple[Optional[int], Optional[str]]:
+    """Charge the owner's credits and add the QUEUED SMS row. Caller commits.
+
+    Returns (sms_message_id, provider_sender_id), or (None, None) when SMS is
+    skipped: dispatch disabled, messaging disabled, no phone on file, or
+    insufficient credits (inbox-only in every skip case).
+    """
+    if not settings.SMS_DISPATCH_ENABLED:
+        return None, None
+    phone = (owner.support_phone or "").strip()
+    if not phone:
+        return None, None
+    settings_row = await db.get(MessagingSettings, 1)
+    if settings_row is not None and not settings_row.enabled:
+        return None, None
+    segments = count_segments(sms_body)
+    if not await sms_credits.try_deduct(
+            db, owner.id, segments,
+            reference=f"router_alert:{router.id}",
+            note=f"Status alert SMS for router '{router.name}'"):
+        logger.info(
+            "Router %s alert SMS skipped: user %s has insufficient credits",
+            router.id, owner.id,
+        )
+        return None, None
+    row = SmsMessage(
+        user_id=owner.id,
+        recipient_phone=phone,
+        body=sms_body,
+        segments=segments,
+        credits_charged=segments,
+        kind=SmsMessageKind.ADMIN_TO_RESELLER,
+        category=ALERT_SMS_CATEGORY,
+        status=SmsMessageStatus.QUEUED,
+    )
+    db.add(row)
+    await db.flush()
+    return row.id, resolve_sender_id(settings_row.sender_id if settings_row else None)
+
+
+async def _create_alert_messages(
+    db, router: Router, subject: str, body: str,
+) -> tuple[bool, Optional[int], Optional[str]]:
+    """Add the inbox row (+ optional charged SMS row) for the router's owner.
+
+    Caller commits. Returns (created, sms_message_id, provider_sender_id);
+    the SMS fields are None when no SMS was queued.
+    """
     owner = await db.get(User, router.user_id)
     if not owner:
-        return False
-    sender_id = await _resolve_sender_admin_id(db, owner)
-    if sender_id is None:
-        return False
+        return False, None, None
+    admin_id = await _resolve_sender_admin_id(db, owner)
+    if admin_id is None:
+        return False, None, None
+    # The SMS is the inbox body minus the opt-out hint (keeps it one segment).
+    sms_id, provider_sender = await _queue_alert_sms(
+        db, owner, router, body.removesuffix(_OPT_OUT_HINT))
     db.add(ResellerInboxMessage(
         recipient_user_id=owner.id,
-        sender_user_id=sender_id,
+        sender_user_id=admin_id,
         subject=subject,
         body=body,
-        sent_sms=False,
+        sent_sms=sms_id is not None,
     ))
-    return True
+    return True, sms_id, provider_sender
+
+
+async def deliver_alert_sms(sms_id: int, provider_sender_id: Optional[str]) -> None:
+    """Send one queued alert SMS, refunding the credits if it did not go out.
+
+    The dispatcher manages its own short sessions, so no DB connection is held
+    across the provider call. Never raises.
+    """
+    try:
+        await sms_dispatch.dispatch_admin_sms_messages([sms_id], provider_sender_id)
+    except Exception:
+        logger.exception("Alert SMS dispatch crashed for sms %s", sms_id)
+    try:
+        async with database.async_session() as db:
+            row = await db.get(SmsMessage, sms_id)
+            if row is None:
+                return
+            if row.status == SmsMessageStatus.QUEUED:
+                # Dispatch crashed before persisting a result for this row.
+                row.status = SmsMessageStatus.FAILED
+                row.error = row.error or "dispatch_error"
+            if row.status == SmsMessageStatus.FAILED and row.credits_charged:
+                await sms_credits.refund(
+                    db, row.user_id, row.credits_charged,
+                    reference=f"router_alert_sms:{sms_id}",
+                    note="Router alert SMS not delivered")
+                row.credits_charged = 0
+            await db.commit()
+    except Exception:
+        logger.exception("Alert SMS settlement failed for sms %s", sms_id)
+
+
+_alert_sms_tasks: set = set()
+
+
+def _spawn_alert_sms_dispatch(sms_id: int,
+                              provider_sender_id: Optional[str]) -> None:
+    """Fire-and-forget the provider send so callers never wait on the network."""
+    try:
+        task = asyncio.create_task(deliver_alert_sms(sms_id, provider_sender_id))
+    except RuntimeError:
+        logger.warning("No running event loop; alert SMS %s left queued", sms_id)
+        return
+    _alert_sms_tasks.add(task)
+    task.add_done_callback(_alert_sms_tasks.discard)
 
 
 async def send_router_recovery_notification(
@@ -178,15 +291,19 @@ async def send_router_recovery_notification(
                 await db.rollback()
                 return False
             subject, body = render_recovery_notification(router.name, offline_since, now)
-            if not await _create_inbox_message(db, router, subject, body):
+            created, sms_id, provider_sender = await _create_alert_messages(
+                db, router, subject, body)
+            if not created:
                 await db.rollback()
                 return False
             await db.commit()
             logger.info(
-                "Router recovery notification sent: router %s -> user %s",
-                router_id, router.user_id,
+                "Router recovery notification sent: router %s -> user %s (sms=%s)",
+                router_id, router.user_id, sms_id is not None,
             )
-            return True
+        if sms_id is not None:
+            _spawn_alert_sms_dispatch(sms_id, provider_sender)
+        return True
     except Exception:
         logger.exception("Router recovery notification failed for router %s", router_id)
         return False
@@ -237,15 +354,19 @@ async def send_router_offline_notification(
             subject, body = render_offline_notification(
                 router.name, router.last_online_at, now
             )
-            if not await _create_inbox_message(db, router, subject, body):
+            created, sms_id, provider_sender = await _create_alert_messages(
+                db, router, subject, body)
+            if not created:
                 await db.rollback()
                 return False
             await db.commit()
             logger.info(
-                "Router offline notification sent: router %s -> user %s",
-                router_id, router.user_id,
+                "Router offline notification sent: router %s -> user %s (sms=%s)",
+                router_id, router.user_id, sms_id is not None,
             )
-            return True
+        if sms_id is not None:
+            _spawn_alert_sms_dispatch(sms_id, provider_sender)
+        return True
     except Exception:
         logger.exception("Router offline notification failed for router %s", router_id)
         return False
