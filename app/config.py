@@ -97,6 +97,17 @@ class Settings(BaseSettings):
     SMS_DISPATCH_CHUNK_SIZE: int = 100
     SMS_DISPATCH_ENABLED: bool = True
 
+    # --- Transactional email (password reset) ----------------------------
+    # RESEND_API_KEY lives in the server .env only — never committed.
+    # Empty key = reset emails are skipped and logged; the forgot-password
+    # endpoint still returns its generic response (no user enumeration).
+    RESEND_API_KEY: str = ""
+    RESEND_BASE_URL: str = "https://api.resend.com"
+    EMAIL_FROM: str = "Bitwave Technologies <noreply@bitwavetechnologies.com>"
+    # Base URL of the admin frontend, used to build password reset links.
+    FRONTEND_BASE_URL: str = "https://bitwavetechnologies.com"
+    PASSWORD_RESET_TOKEN_TTL_MINUTES: int = 60
+
     # Just-in-time RouterOS operator access. This is the source allowed to
     # reach WinBox/SSH/WebFig when an admin opens remote access for a router.
     ROUTER_REMOTE_ACCESS_SOURCE_CIDRS: str = "10.0.0.1/32"
