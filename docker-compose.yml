@@ -98,6 +98,15 @@ services:
       - TALKSASA_BASE_URL=${TALKSASA_BASE_URL:-https://bulksms.talksasa.com/api/v3}
       - SMS_DISPATCH_CHUNK_SIZE=${SMS_DISPATCH_CHUNK_SIZE:-100}
       - SMS_DISPATCH_ENABLED=${SMS_DISPATCH_ENABLED:-true}
+      # Transactional email (password reset) - key lives in server .env only
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - EMAIL_FROM=${EMAIL_FROM:-Bitwave Technologies <noreply@bitwavetechnologies.com>}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-https://bitwavetechnologies.com}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USERNAME=${SMTP_USERNAME:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_USE_SSL=${SMTP_USE_SSL:-false}
     volumes:
       - wg_sock:/var/run/wg-manager
     depends_on:
