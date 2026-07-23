@@ -24,6 +24,7 @@ from app.services import router_status_alerts, sms_credits
 from app.services.router_availability import record_router_availability
 from app.services.router_status_alerts import (
     ALERT_SMS_CATEGORY,
+    MAX_OUTAGE_AGE_FOR_ALERTS,
     MIN_OUTAGE_FOR_ALERTS,
     NOTIFY_COOLDOWN,
     OFFLINE_STATUS_FRESH_WINDOW,
@@ -235,6 +236,30 @@ async def test_offline_scan_skips_never_online_router(db):
 
     assert await scan_and_notify_offline_routers() == 0
     assert await _inbox_messages(db, reseller.id) == []
+
+
+async def test_offline_scan_skips_ancient_outage(db):
+    # A router that went down weeks ago is not news — zombie rows from
+    # re-registrations must never alert (2026-07-23 backfill burst lesson).
+    _, reseller, _ = await _setup_offline_router(
+        db,
+        offline_for=MAX_OUTAGE_AGE_FOR_ALERTS + timedelta(hours=1),
+        checked_ago=timedelta(minutes=3),
+    )
+
+    assert await scan_and_notify_offline_routers() == 0
+    assert await _inbox_messages(db, reseller.id) == []
+
+
+async def test_offline_scan_alerts_just_inside_max_age(db):
+    _, reseller, _ = await _setup_offline_router(
+        db, offline_for=MAX_OUTAGE_AGE_FOR_ALERTS - timedelta(hours=1)
+    )
+
+    assert await scan_and_notify_offline_routers() == 1
+    messages = await _inbox_messages(db, reseller.id)
+    assert len(messages) == 1
+    assert "appears to be offline" in messages[0].body
 
 
 async def test_offline_scan_skips_stale_status(db):

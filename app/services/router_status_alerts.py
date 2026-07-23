@@ -29,6 +29,9 @@ per the background-work guardrails.
 Noise control:
 - ``MIN_OUTAGE_FOR_ALERTS``: outages shorter than this produce no message in
   either direction.
+- ``MAX_OUTAGE_AGE_FOR_ALERTS``: "went offline" is only announced while the
+  outage is recent; ancient outages (zombie rows from re-registrations,
+  decommissioned routers) stay silent.
 - ``NOTIFY_COOLDOWN`` via the per-router ``online_notified_at`` /
   ``offline_notified_at`` stamps, claimed with an atomic UPDATE so concurrent
   writers cannot double-send. The offline stamp doubles as the once-per-outage
@@ -63,6 +66,12 @@ ALERT_SMS_CATEGORY = "router_status_alert"
 
 MIN_OUTAGE_FOR_ALERTS = timedelta(minutes=15)
 NOTIFY_COOLDOWN = timedelta(minutes=30)
+# Only announce outages that BEGAN recently. An outage older than this is not
+# news — the owner already knows, or the row is a zombie left behind by a
+# re-registration (2026-07-23: the default-on backfill sent 99 alerts for
+# week-plus outages on exactly such rows). Recovery notices are NOT capped:
+# a transition back online is always fresh news.
+MAX_OUTAGE_AGE_FOR_ALERTS = timedelta(hours=48)
 # An offline verdict older than this is stale ("unknown", not confirmed offline):
 # offline routers are still re-probed at least every ~30 min by background jobs,
 # so a fresh outage always has a recent failed check.
@@ -319,6 +328,7 @@ def _offline_candidate_filters(now: datetime):
         Router.last_checked_at >= now - OFFLINE_STATUS_FRESH_WINDOW,
         Router.last_online_at.isnot(None),
         Router.last_online_at <= now - MIN_OUTAGE_FOR_ALERTS,
+        Router.last_online_at >= now - MAX_OUTAGE_AGE_FOR_ALERTS,
         (Router.offline_notified_at.is_(None))
         | (
             (Router.offline_notified_at < Router.last_online_at)
