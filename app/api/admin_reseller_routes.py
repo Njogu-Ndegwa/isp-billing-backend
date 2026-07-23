@@ -638,7 +638,7 @@ async def get_reseller_detail(
     recent_stmt = (
         select(CustomerPayment, Customer, Plan)
         .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
-        .outerjoin(Plan, Customer.plan_id == Plan.id)
+        .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
         .where(CustomerPayment.reseller_id == reseller_id)
         .order_by(CustomerPayment.created_at.desc())
         .limit(10)
@@ -853,7 +853,7 @@ async def get_reseller_payments(
     payments_stmt = (
         select(CustomerPayment, Customer, Plan)
         .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
-        .outerjoin(Plan, Customer.plan_id == Plan.id)
+        .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
         .where(*base_filter)
         .order_by(CustomerPayment.created_at.desc())
         .offset(offset)

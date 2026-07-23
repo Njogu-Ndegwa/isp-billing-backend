@@ -855,6 +855,7 @@ async def activate_pppoe_customer(
         payment = CustomerPayment(
             customer_id=customer.id,
             reseller_id=user.id,
+            plan_id=plan.id,
             amount=float(plan.price),
             payment_method=pm_enum,
             payment_reference=request.payment_reference,

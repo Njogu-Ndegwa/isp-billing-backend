@@ -271,6 +271,7 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                         amount=float(cb_amount),
                         reference=f"RECOVERED-{checkout_request_id}",
                         customer_id=orphan_customer.id,
+                        plan_id=orphan_customer.plan_id,
                         status=MpesaTransactionStatus.pending,
                         created_at=datetime.utcnow(),
                         updated_at=datetime.utcnow(),
@@ -1376,7 +1377,7 @@ async def manual_provision_transaction(
                 select(MpesaTransaction, Customer, Router, Plan)
                 .join(Customer, MpesaTransaction.customer_id == Customer.id)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
-                .join(Plan, Customer.plan_id == Plan.id, isouter=True)
+                .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
                 .where(
                     MpesaTransaction.id == transaction_id,
                     Customer.user_id == user.id,
@@ -1405,7 +1406,7 @@ async def manual_provision_transaction(
                 select(CustomerPayment, Customer, Router, Plan)
                 .join(Customer, CustomerPayment.customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
-                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(
                     CustomerPayment.id == transaction_id,
                     CustomerPayment.reseller_id == user.id,
@@ -1548,7 +1549,7 @@ async def get_mpesa_transactions_summary(
                 select(MpesaTransaction, Customer, Router, Plan)
                 .join(Customer, MpesaTransaction.customer_id == Customer.id, isouter=True)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
-                .join(Plan, Customer.plan_id == Plan.id, isouter=True)
+                .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
                 .where(
                     (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
                 )
@@ -1576,7 +1577,7 @@ async def get_mpesa_transactions_summary(
                 select(CustomerPayment, Customer, Router, Plan)
                 .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
-                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(
                     CustomerPayment.reseller_id == user.id,
                     CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
