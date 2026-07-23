@@ -714,6 +714,16 @@ async def run_user_migrations():
             logger.info("Migration: users.last_login_at already exists, skipping")
 
 
+async def run_password_reset_migrations():
+    """Create password_reset_tokens table for self-service password reset (idempotent)."""
+    async with async_engine.begin() as conn:
+        from app.db.models import PasswordResetToken
+        await conn.run_sync(
+            lambda c: PasswordResetToken.__table__.create(c, checkfirst=True)
+        )
+    logger.info("Migration: password_reset_tokens table ready")
+
+
 # ============================================================================
 # Startup / Shutdown
 # ============================================================================
@@ -2060,6 +2070,12 @@ async def startup_event():
         logger.info("User migrations completed successfully")
     except Exception as e:
         logger.error(f"User migration failed (non-fatal): {e}")
+
+    try:
+        await run_password_reset_migrations()
+        logger.info("Password reset migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Password reset migration failed (non-fatal): {e}")
 
     try:
         await run_reconnection_migrations()

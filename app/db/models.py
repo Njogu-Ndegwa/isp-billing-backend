@@ -138,6 +138,16 @@ class User(Base):
     )
     subscription_expires_at = Column(DateTime, nullable=True)
 
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # sha256 hex of the raw token; the raw token only ever lives in the email link
+    token_hash = Column(String(64), unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+
 class Customer(Base):
     __tablename__ = "customers"
     __table_args__ = (
