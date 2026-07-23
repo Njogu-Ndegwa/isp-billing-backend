@@ -1,15 +1,24 @@
-"""Transactional email via the Resend HTTP API.
+"""Transactional email for password reset links.
 
-Used for password reset links. Deliberately minimal: one provider, one
-httpx call, no DB access — callers must follow Database Session Discipline
-and invoke this only after their session is committed/closed (it is slow
+Two config-driven transports, checked in order:
+  1. SMTP (stdlib smtplib in a thread) when SMTP_HOST is set — e.g.
+     smtp.gmail.com with an app password. No extra dependency; fine for
+     this app's tiny volume.
+  2. Resend HTTP API when RESEND_API_KEY is set.
+
+No DB access here — callers must follow Database Session Discipline and
+invoke this only after their session is committed/closed (it is slow
 external I/O).
 
-With RESEND_API_KEY unset the send is skipped and logged so local/dev and
-a not-yet-configured production degrade gracefully.
+With neither transport configured the send is skipped and logged so
+local/dev and a not-yet-configured production degrade gracefully.
 """
 
+import asyncio
 import logging
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import httpx
 
@@ -21,36 +30,68 @@ SEND_TIMEOUT_SECONDS = 15
 
 
 def email_enabled() -> bool:
-    return bool(settings.RESEND_API_KEY)
+    return bool(settings.SMTP_HOST or settings.RESEND_API_KEY)
+
+
+def _send_via_smtp_sync(to: str, subject: str, html: str) -> None:
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = settings.EMAIL_FROM
+    msg["To"] = to
+    msg.attach(MIMEText(html, "html"))
+
+    if settings.SMTP_USE_SSL:
+        server = smtplib.SMTP_SSL(
+            settings.SMTP_HOST, settings.SMTP_PORT, timeout=SEND_TIMEOUT_SECONDS
+        )
+    else:
+        server = smtplib.SMTP(
+            settings.SMTP_HOST, settings.SMTP_PORT, timeout=SEND_TIMEOUT_SECONDS
+        )
+    try:
+        if not settings.SMTP_USE_SSL:
+            server.starttls()
+        if settings.SMTP_USERNAME:
+            server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+        server.send_message(msg)
+    finally:
+        server.quit()
+
+
+async def _send_via_resend(to: str, subject: str, html: str) -> bool:
+    async with httpx.AsyncClient(timeout=SEND_TIMEOUT_SECONDS) as client:
+        resp = await client.post(
+            f"{settings.RESEND_BASE_URL}/emails",
+            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+            json={
+                "from": settings.EMAIL_FROM,
+                "to": [to],
+                "subject": subject,
+                "html": html,
+            },
+        )
+    if resp.status_code in (200, 201):
+        return True
+    logger.error(
+        "Email send failed (%s) to %s: %s",
+        resp.status_code, to, resp.text[:300],
+    )
+    return False
 
 
 async def send_email(to: str, subject: str, html: str) -> bool:
-    """Send one email. Returns True on acceptance by the provider."""
+    """Send one email. Returns True on acceptance by the transport."""
     if not email_enabled():
         logger.warning(
-            "Email sending disabled (RESEND_API_KEY unset); dropped '%s' to %s",
-            subject, to,
+            "Email sending disabled (no SMTP_HOST or RESEND_API_KEY); "
+            "dropped '%s' to %s", subject, to,
         )
         return False
     try:
-        async with httpx.AsyncClient(timeout=SEND_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                f"{settings.RESEND_BASE_URL}/emails",
-                headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
-                json={
-                    "from": settings.EMAIL_FROM,
-                    "to": [to],
-                    "subject": subject,
-                    "html": html,
-                },
-            )
-        if resp.status_code in (200, 201):
+        if settings.SMTP_HOST:
+            await asyncio.to_thread(_send_via_smtp_sync, to, subject, html)
             return True
-        logger.error(
-            "Email send failed (%s) to %s: %s",
-            resp.status_code, to, resp.text[:300],
-        )
-        return False
+        return await _send_via_resend(to, subject, html)
     except Exception as exc:
         logger.error("Email send error to %s: %s", to, exc)
         return False

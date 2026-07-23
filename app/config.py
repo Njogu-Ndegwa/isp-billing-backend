@@ -98,9 +98,16 @@ class Settings(BaseSettings):
     SMS_DISPATCH_ENABLED: bool = True
 
     # --- Transactional email (password reset) ----------------------------
-    # RESEND_API_KEY lives in the server .env only — never committed.
-    # Empty key = reset emails are skipped and logged; the forgot-password
-    # endpoint still returns its generic response (no user enumeration).
+    # Credentials live in the server .env only — never committed.
+    # SMTP is preferred when SMTP_HOST is set (e.g. smtp.gmail.com + app
+    # password); otherwise Resend is used if RESEND_API_KEY is set. With
+    # neither configured, reset emails are skipped and logged; the
+    # forgot-password endpoint still returns its generic response.
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_USE_SSL: bool = False  # False = STARTTLS on 587; True = implicit TLS on 465
     RESEND_API_KEY: str = ""
     RESEND_BASE_URL: str = "https://api.resend.com"
     EMAIL_FROM: str = "Bitwave Technologies <noreply@bitwavetechnologies.com>"
