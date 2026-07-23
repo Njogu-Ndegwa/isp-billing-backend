@@ -1976,16 +1976,35 @@ async def run_pull_channel_migrations():
 
 
 async def run_router_status_alert_migrations():
-    """Add routers.status_alerts_enabled (opt-in offline/back-online inbox alerts)
-    plus the online_notified_at / offline_notified_at cooldown+outage stamps.
-    Idempotent: ADD COLUMN IF NOT EXISTS, safe to run on every startup."""
+    """Add routers.status_alerts_enabled (default-on offline/back-online alerts,
+    per-router opt-out) plus the online_notified_at / offline_notified_at
+    cooldown+outage stamps. Also flips the pre-2026-07 opt-in deployment to
+    default-on ONCE: the one-time backfill is guarded by the column's current
+    DEFAULT, so a reseller who opts out afterwards is never re-enabled by a
+    restart. Idempotent, safe to run on every startup."""
     async with async_engine.begin() as conn:
         await conn.execute(sa_text("""
             ALTER TABLE routers
-            ADD COLUMN IF NOT EXISTS status_alerts_enabled BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS status_alerts_enabled BOOLEAN NOT NULL DEFAULT true,
             ADD COLUMN IF NOT EXISTS online_notified_at TIMESTAMP NULL,
             ADD COLUMN IF NOT EXISTS offline_notified_at TIMESTAMP NULL
         """))
+        result = await conn.execute(sa_text("""
+            SELECT column_default FROM information_schema.columns
+            WHERE table_name = 'routers' AND column_name = 'status_alerts_enabled'
+        """))
+        row = result.fetchone()
+        if row and row[0] is not None and "false" in str(row[0]).lower():
+            backfilled = await conn.execute(sa_text(
+                "UPDATE routers SET status_alerts_enabled = true"
+            ))
+            await conn.execute(sa_text(
+                "ALTER TABLE routers ALTER COLUMN status_alerts_enabled SET DEFAULT true"
+            ))
+            logger.info(
+                "Router status-alert migration: flipped to default-on, "
+                "backfilled %s router(s)", backfilled.rowcount,
+            )
     logger.info("Router status-alert migrations complete")
 
 
