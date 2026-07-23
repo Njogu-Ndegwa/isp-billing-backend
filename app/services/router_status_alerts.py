@@ -1,4 +1,5 @@
-"""Opt-in per-router status alerts: "went offline" and "back online" inbox messages.
+"""Per-router status alerts (on by default, opt-out): "went offline" and
+"back online" messages.
 
 One flag (``routers.status_alerts_enabled``) covers both directions:
 
