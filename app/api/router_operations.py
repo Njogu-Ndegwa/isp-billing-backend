@@ -26,6 +26,7 @@ from app.services.mikrotik_api import (
     validate_mac_address,
 )
 from app.services.router_helpers import get_router_by_id, get_router_by_identity, connect_to_router
+from app.services.device_classifier import classify_device, infer_hotspot_subnets
 from app.core.protected_devices import is_protected_device
 from app.services.router_availability import record_router_availability
 from app.services.router_concurrency import run_with_guard
@@ -2933,6 +2934,17 @@ def _get_port_analytics_sync(
                 }
             )
 
+        # Hotspot subnet inference for the gateway-claim signal (computed from
+        # hotspot host addresses ALREADY fetched above — no extra RouterOS
+        # calls). A device claiming x.y.z.1 outside these subnets is the field
+        # signature of a misconfigured router-mode AP in the hotspot bridge.
+        hotspot_subnets = infer_hotspot_subnets(
+            address
+            for row in hotspot_host_rows
+            for address in (row.get("address"), row.get("to-address"))
+            if address
+        )
+
         known_customer_macs = set(customer_by_mac.keys())
         ethernet_port_names = [
             row.get("name")
@@ -3002,6 +3014,23 @@ def _get_port_analytics_sync(
                     sample["customer_id"] = customer.get("id")
                     sample["customer_status"] = customer.get("status")
                     sample["revenue_total"] = round(float(customer.get("revenue_total") or 0), 2)
+                # Additive computed classification (no schema, no extra
+                # RouterOS calls): vendor OUI + lease hostname/identity +
+                # gateway-claim check against the inferred hotspot subnets.
+                classification = classify_device(
+                    mac_address=mac,
+                    hostnames=(metadata.get("hostname"), metadata.get("identity")),
+                    source_ip=metadata.get("hotspot_ip"),
+                    hotspot_subnets=hotspot_subnets,
+                )
+                sample["vendor"] = classification["vendor"]
+                sample["router_mode_suspect"] = classification["router_mode_suspect"]
+                # Known billing customers stay "customer" even on vendor-OUI
+                # hits (a paying PPPoE/hotspot account is often registered by
+                # its CPE's MAC) — same precedence the legacy heuristic uses.
+                sample["device_class"] = (
+                    "customer" if customer else classification["device_class"]
+                )
                 if _looks_like_infrastructure_device(mac, metadata, known_customer_macs):
                     infra = {
                         "mac": mac,
@@ -3016,10 +3045,13 @@ def _get_port_analytics_sync(
                         "version": metadata.get("version", ""),
                         "source": "neighbor" if metadata.get("neighbor") else "dhcp/arp",
                         "last_seen": metadata.get("last_seen", ""),
+                        "vendor": classification["vendor"],
+                        "router_mode_suspect": classification["router_mode_suspect"],
                     }
                     infrastructure_here.append(infra)
                     infrastructure_candidates.append({"port": port_name, **infra})
                     sample["kind"] = "infrastructure"
+                    sample["device_class"] = "infrastructure"
                 downstream_samples.append(sample)
 
             link_up = _routeros_bool(iface.get("running"))
@@ -3138,6 +3170,7 @@ def _get_port_analytics_sync(
                 "db_customers_with_mac": len(customer_by_mac),
             },
             "warnings": warnings,
+            "hotspot_subnets_inferred": sorted(hotspot_subnets),
             "infrastructure_candidates": infrastructure_candidates[:_PORT_ANALYTICS_SAMPLE_LIMIT],
             "ports": port_summaries,
         }
