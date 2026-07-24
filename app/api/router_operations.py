@@ -3036,6 +3036,14 @@ def _get_port_analytics_sync(
                     sample["device_class"] = "customer"
                 else:
                     sample["device_class"] = classification["device_class"]
+                # Equipment rows carry a hardware name, never the billing
+                # account that pays through the box (zone APs) — the paying
+                # identity stays in customer_id/revenue_total.
+                if sample["device_class"] == "infrastructure" and customer:
+                    hardware_name = _first_nonempty(
+                        metadata.get("identity"), metadata.get("hostname")
+                    )
+                    sample["name"] = hardware_name or None
                 if _looks_like_infrastructure_device(mac, metadata, known_customer_macs):
                     infra = {
                         "mac": mac,
