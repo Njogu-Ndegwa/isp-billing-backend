@@ -364,9 +364,51 @@ def test_port_analytics_classifies_vendor_aps_and_router_mode_suspects(monkeypat
     assert suspect["vendor"] is None
     assert suspect["router_mode_suspect"] is True
 
-    # Registered billing customers stay "customer".
+    # Registered billing customers on non-hardware MACs stay "customer".
     assert samples["AA:BB:CC:DD:EE:01"]["device_class"] == "customer"
     assert samples["AA:BB:CC:DD:EE:01"]["router_mode_suspect"] is False
+
+
+def test_port_analytics_hardware_precedence_over_hotspot_accounts(monkeypatch):
+    """Product ruling 2026-07-25: AP/CPE hardware renders as equipment even
+    when a hotspot account pays through its MAC (reseller zone boxes);
+    PPPoE accounts are the exception — their CPE genuinely IS the customer."""
+    monkeypatch.setattr(router_operations, "MikroTikAPI", FakePortAnalyticsAPIWithApSuspects)
+    router_info = {
+        "id": 10,
+        "name": "Router A",
+        "identity": "Router-A",
+        "ip": "10.0.0.5",
+        "username": "admin",
+        "password": "pw",
+        "port": 8728,
+    }
+
+    # Tenda-OUI device with a HOTSPOT account on its MAC -> equipment wins.
+    result = router_operations._get_port_analytics_sync(
+        router_info,
+        {"B4:0F:3B:12:34:56": {"id": 7, "name": "Zone Box", "status": "active",
+                               "pppoe": False}},
+        {},
+    )
+    ether6 = next(port for port in result["ports"] if port["port"] == "ether6")
+    samples = {s["mac"]: s for s in ether6["downstream_devices_sample"]}
+    zone_box = samples["B4:0F:3B:12:34:56"]
+    assert zone_box["device_class"] == "infrastructure"
+    assert zone_box["vendor"] == "Tenda"
+    # the paying identity stays available for annotation/attribution
+    assert zone_box["customer_id"] == 7
+
+    # Same hardware MAC but a PPPoE account -> the exception applies.
+    result = router_operations._get_port_analytics_sync(
+        router_info,
+        {"B4:0F:3B:12:34:56": {"id": 7, "name": "PPPoE Sub", "status": "active",
+                               "pppoe": True}},
+        {},
+    )
+    ether6 = next(port for port in result["ports"] if port["port"] == "ether6")
+    samples = {s["mac"]: s for s in ether6["downstream_devices_sample"]}
+    assert samples["B4:0F:3B:12:34:56"]["device_class"] == "customer"
 
 
 @pytest.mark.asyncio

@@ -3025,12 +3025,17 @@ def _get_port_analytics_sync(
                 )
                 sample["vendor"] = classification["vendor"]
                 sample["router_mode_suspect"] = classification["router_mode_suspect"]
-                # Known billing customers stay "customer" even on vendor-OUI
-                # hits (a paying PPPoE/hotspot account is often registered by
-                # its CPE's MAC) — same precedence the legacy heuristic uses.
-                sample["device_class"] = (
-                    "customer" if customer else classification["device_class"]
-                )
+                # Precedence (product ruling 2026-07-25): identifiable AP/CPE
+                # hardware renders as equipment even when a hotspot account
+                # pays through its MAC (reseller zone boxes). The exception is
+                # PPPoE: that subscriber's CPE genuinely IS the customer.
+                if customer and (
+                    customer.get("pppoe")
+                    or classification["device_class"] != "infrastructure"
+                ):
+                    sample["device_class"] = "customer"
+                else:
+                    sample["device_class"] = classification["device_class"]
                 if _looks_like_infrastructure_device(mac, metadata, known_customer_macs):
                     infra = {
                         "mac": mac,
@@ -3483,13 +3488,14 @@ async def get_router_port_analytics(
             Customer.name,
             Customer.mac_address,
             Customer.status,
+            Customer.pppoe_username,
         ).where(
             Customer.router_id == router_id,
             Customer.mac_address.isnot(None),
         )
         customer_result = await db.execute(stmt)
         customer_by_mac = {}
-        for customer_id, name, mac_address, status in customer_result.all():
+        for customer_id, name, mac_address, status, pppoe_username in customer_result.all():
             normalized_mac = _normalize_mac_safe(mac_address)
             if not normalized_mac:
                 continue
@@ -3497,6 +3503,7 @@ async def get_router_port_analytics(
                 "id": customer_id,
                 "name": name,
                 "status": status.value if status else None,
+                "pppoe": bool(pppoe_username),
             }
 
         # Revenue per port from RECORDED attribution: each payment is stamped

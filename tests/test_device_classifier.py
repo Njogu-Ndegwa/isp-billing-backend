@@ -178,3 +178,12 @@ def test_classify_ordinary_hotspot_client_stays_customer():
         "vendor": None,
         "router_mode_suspect": False,
     }
+
+
+def test_fcaab6_is_tenda():
+    # Field case: Major1's well-behaved AP (lease hostname "Tenda") whose OUI
+    # was missing from the map — port 5 showed customers with no equipment.
+    from app.services.device_classifier import vendor_from_mac
+
+    assert vendor_from_mac("FC:AA:B6:74:1A:33") == "Tenda"
+    assert vendor_from_mac("fcaab674:1a:33") == "Tenda"

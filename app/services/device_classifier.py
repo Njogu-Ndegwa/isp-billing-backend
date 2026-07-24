@@ -33,6 +33,7 @@ INFRASTRUCTURE_OUI_VENDORS: Dict[str, str] = {
     "D83214": "Tenda",
     "0495E6": "Tenda",
     "502B73": "Tenda",
+    "FCAAB6": "Tenda",
     # TP-Link
     "8C44BB": "TP-Link",
     "50C7BF": "TP-Link",
