@@ -263,11 +263,110 @@ def test_port_analytics_groups_downstream_devices_by_port(monkeypatch):
     )
     assert customer_sample["revenue_total"] == 1500.0
 
+    # Additive computed classification fields (no schema changes).
+    assert result["hotspot_subnets_inferred"] == ["192.168.88"]
+    assert customer_sample["device_class"] == "customer"
+    assert customer_sample["vendor"] is None
+    assert customer_sample["router_mode_suspect"] is False
+    ruijie_sample = next(
+        sample
+        for sample in ether6["downstream_devices_sample"]
+        if sample["mac"] == "10:5F:02:A5:1A:CD"
+    )
+    assert ruijie_sample["kind"] == "infrastructure"
+    assert ruijie_sample["device_class"] == "infrastructure"
+    assert ruijie_sample["vendor"] == "Ruijie"
+    assert ruijie_sample["router_mode_suspect"] is False
+    assert ether6["infrastructure"][0]["vendor"] == "Ruijie"
+    assert ether6["infrastructure"][0]["router_mode_suspect"] is False
+
     ether7 = next(port for port in result["ports"] if port["port"] == "ether7")
     assert ether7["health"]["status"] == "silent_link"
     assert "received 0 packets" in ether7["health"]["warnings"][0]
     assert ether7["revenue"]["total"] == 0.0
     assert ether7["revenue"]["paying_customers"] == 0
+
+
+class FakePortAnalyticsAPIWithApSuspects(FakePortAnalyticsAPI):
+    """Same fake router plus a Tenda-OUI AP and a router-mode CPE suspect.
+
+    The suspect claims gateway identity 192.168.0.1 while the hotspot subnet
+    is 192.168.88.0/24 — the field signature of a misconfigured router-mode
+    AP plugged into the hotspot bridge (Beyond #1, 2026-07-24).
+    """
+
+    def send_command_optimized(self, command, proplist=None, query=None):
+        result = super().send_command_optimized(command, proplist, query)
+        if command == "/interface/bridge/host/print":
+            result["data"] = result["data"] + [
+                {
+                    "mac-address": "B4:0F:3B:12:34:56",
+                    "interface": "ether6",
+                    "on-interface": "ether6",
+                    "local": "false",
+                },
+                {
+                    "mac-address": "AA:BB:CC:DD:EE:99",
+                    "interface": "ether6",
+                    "on-interface": "ether6",
+                    "local": "false",
+                },
+            ]
+        if command == "/ip/hotspot/host/print":
+            result["data"] = result["data"] + [
+                {
+                    "mac-address": "AA:BB:CC:DD:EE:99",
+                    "address": "192.168.0.1",
+                    "authorized": "false",
+                    "bypassed": "false",
+                },
+            ]
+        return result
+
+
+def test_port_analytics_classifies_vendor_aps_and_router_mode_suspects(monkeypatch):
+    monkeypatch.setattr(router_operations, "MikroTikAPI", FakePortAnalyticsAPIWithApSuspects)
+
+    result = router_operations._get_port_analytics_sync(
+        {
+            "id": 10,
+            "name": "Router A",
+            "identity": "Router-A",
+            "ip": "10.0.0.5",
+            "username": "admin",
+            "password": "pw",
+            "port": 8728,
+        },
+        {
+            "AA:BB:CC:DD:EE:01": {"id": 1, "name": "Customer One", "status": "active"},
+            "AA:BB:CC:DD:EE:02": {"id": 2, "name": "Customer Two", "status": "active"},
+        },
+        {},
+    )
+
+    assert result["success"] is True
+    assert result["hotspot_subnets_inferred"] == ["192.168.88"]
+    ether6 = next(port for port in result["ports"] if port["port"] == "ether6")
+    samples = {sample["mac"]: sample for sample in ether6["downstream_devices_sample"]}
+
+    # Tenda OUI, no DHCP lease / neighbor entry: legacy "kind" is unchanged
+    # but the computed classification recognizes the AP vendor.
+    tenda = samples["B4:0F:3B:12:34:56"]
+    assert tenda["kind"] == "unknown_device"
+    assert tenda["device_class"] == "infrastructure"
+    assert tenda["vendor"] == "Tenda"
+    assert tenda["router_mode_suspect"] is False
+
+    # Unknown OUI claiming a foreign gateway identity (192.168.0.1 while the
+    # hotspot subnet is 192.168.88.0/24) => router-mode AP suspect.
+    suspect = samples["AA:BB:CC:DD:EE:99"]
+    assert suspect["device_class"] == "infrastructure"
+    assert suspect["vendor"] is None
+    assert suspect["router_mode_suspect"] is True
+
+    # Registered billing customers stay "customer".
+    assert samples["AA:BB:CC:DD:EE:01"]["device_class"] == "customer"
+    assert samples["AA:BB:CC:DD:EE:01"]["router_mode_suspect"] is False
 
 
 @pytest.mark.asyncio
