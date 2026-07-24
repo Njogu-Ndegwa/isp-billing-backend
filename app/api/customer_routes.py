@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, update, text
+from sqlalchemy import select, delete, update, text, and_, or_
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
@@ -38,6 +38,50 @@ logger = logging.getLogger(__name__)
 def _generate_pppoe_password(length: int = 12) -> str:
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+# ---------------------------------------------------------------------------
+# Customer vs. visitor tiering (data hygiene, presentation-only)
+#
+# Many `customers` rows are devices/people who never paid (portal signups,
+# abandoned STK pushes, location captures). To reduce reseller confusion the
+# list endpoints expose a computed `has_paid` flag and a `tier` label
+# ("customer" if they ever paid or currently hold paid time, else "visitor").
+# This is purely additive: no schema change, no row mutation, and no effect
+# on revenue/financial calculations.
+# ---------------------------------------------------------------------------
+
+VALID_CUSTOMER_TIERS = {"all", "customer", "visitor"}
+
+
+def _has_paid_condition(now: datetime):
+    """SQL boolean expression: this customer has at least one COMPLETED
+    customer_payments row OR currently-active paid time (expiry in the
+    future). Evaluated in the same SELECT as the customer list — one query,
+    no per-row lookups (small DB pool; see Database Session Discipline)."""
+    completed_payment_exists = (
+        select(CustomerPayment.id)
+        .where(
+            CustomerPayment.customer_id == Customer.id,
+            CustomerPayment.status == PaymentStatus.COMPLETED,
+        )
+        .exists()
+    )
+    return or_(
+        completed_payment_exists,
+        and_(Customer.expiry.isnot(None), Customer.expiry > now),
+    )
+
+
+def _validate_tier(tier: Optional[str]) -> str:
+    normalized = (tier or "all").lower()
+    if normalized not in VALID_CUSTOMER_TIERS:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid tier filter; expected one of: all, customer, visitor",
+        )
+    return normalized
+
 
 router = APIRouter(tags=["customers"])
 
@@ -500,22 +544,41 @@ async def delete_customer(
 @router.get("/api/customers")
 async def get_customers_api(
     router_id: Optional[int] = None,
+    tier: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Get all customers for the authenticated user, optionally filtered by router."""
+    """Get all customers for the authenticated user, optionally filtered by router.
+
+    `tier` (optional, default "all") filters by payment history:
+    "customer" = has at least one completed payment or currently-active paid
+    time; "visitor" = never paid. Each item also carries computed `has_paid`
+    and `tier` fields.
+    """
+    tier_filter = _validate_tier(tier)
     try:
         user = await get_current_user(token, db)
-        
-        stmt = select(Customer).where(Customer.user_id == user.id).options(
-            selectinload(Customer.plan),
-            selectinload(Customer.router)
+
+        now = datetime.utcnow()
+        has_paid = _has_paid_condition(now)
+
+        stmt = (
+            select(Customer, has_paid.label("has_paid"))
+            .where(Customer.user_id == user.id)
+            .options(
+                selectinload(Customer.plan),
+                selectinload(Customer.router)
+            )
         )
         if router_id is not None:
             stmt = stmt.where(Customer.router_id == router_id)
+        if tier_filter == "customer":
+            stmt = stmt.where(has_paid)
+        elif tier_filter == "visitor":
+            stmt = stmt.where(~has_paid)
         result = await db.execute(stmt)
-        customers = result.scalars().all()
-        
+        rows = result.all()
+
         return [
             {
                 "id": c.id,
@@ -532,6 +595,8 @@ async def get_customers_api(
                 "router_id": c.router_id,
                 "account_number": c.account_number,
                 "wallet_credit_kes": c.wallet_credit_kes,
+                "has_paid": bool(c_has_paid),
+                "tier": "customer" if c_has_paid else "visitor",
                 "plan": {
                     "id": c.plan.id,
                     "name": c.plan.name,
@@ -543,7 +608,7 @@ async def get_customers_api(
                     "name": c.router.name
                 } if c.router else None
             }
-            for c in customers
+            for c, c_has_paid in rows
         ]
     except Exception as e:
         logger.error(f"Error fetching customers: {str(e)}")
@@ -553,13 +618,23 @@ async def get_customers_api(
 @router.get("/api/customers/active")
 async def get_active_customers(
     router_id: Optional[int] = None,
+    tier: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Get all currently active guests, optionally filtered by router."""
+    """Get all currently active guests, optionally filtered by router.
+
+    `tier` (optional, default "all") filters by payment history exactly like
+    `/api/customers`; each item carries computed `has_paid` and `tier`.
+    """
+    tier_filter = _validate_tier(tier)
     try:
         user = await get_current_user(token, db)
-        stmt = select(Customer).where(
+
+        now = datetime.utcnow()
+        has_paid = _has_paid_condition(now)
+
+        stmt = select(Customer, has_paid.label("has_paid")).where(
             Customer.user_id == user.id,
             Customer.status == CustomerStatus.ACTIVE
         ).options(
@@ -568,12 +643,14 @@ async def get_active_customers(
         ).order_by(Customer.expiry)
         if router_id is not None:
             stmt = stmt.where(Customer.router_id == router_id)
-        
-        result = await db.execute(stmt)
-        customers = result.scalars().all()
+        if tier_filter == "customer":
+            stmt = stmt.where(has_paid)
+        elif tier_filter == "visitor":
+            stmt = stmt.where(~has_paid)
 
-        now = datetime.utcnow()
-        
+        result = await db.execute(stmt)
+        rows = result.all()
+
         return [
             {
                 "id": c.id,
@@ -591,6 +668,8 @@ async def get_active_customers(
                 "router_id": c.router_id,
                 "account_number": c.account_number,
                 "wallet_credit_kes": c.wallet_credit_kes,
+                "has_paid": bool(c_has_paid),
+                "tier": "customer" if c_has_paid else "visitor",
                 "plan": {
                     "id": c.plan.id,
                     "name": c.plan.name,
@@ -602,7 +681,7 @@ async def get_active_customers(
                     "name": c.router.name
                 } if c.router else None
             }
-            for c in customers
+            for c, c_has_paid in rows
         ]
     except Exception as e:
         logger.error(f"Error fetching active customers: {str(e)}")
