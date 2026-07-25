@@ -552,3 +552,105 @@ async def test_full_payment_marks_paid_and_activates(db):
     ).scalars().all()
     assert all(p.status == SubscriptionPaymentStatus.COMPLETED for p in payments)
     assert sum(p.amount for p in payments) == invoice.final_charge
+
+
+# ---------------------------------------------------------------------------
+# Reseller account statement — math consistency with the payout engine
+# ---------------------------------------------------------------------------
+
+async def _get_statement(db, monkeypatch, reseller, **kwargs):
+    from app.api import dashboard_routes
+
+    async def fake_current_user(token, _db):
+        return reseller
+
+    monkeypatch.setattr(dashboard_routes, "get_current_user", fake_current_user)
+    return await dashboard_routes.get_reseller_account_statement(
+        db=db, token="test-token", **kwargs
+    )
+
+
+async def test_statement_balance_matches_payout_engine(db, monkeypatch):
+    """The statement's unpaid_balance must equal what the B2B payout job /
+    self-service withdrawal will actually pay (mpesa_b2b.get_unpaid_balance).
+    Historically the statement summed EVERY mobile-money row — including
+    DIRECT-collected (reseller's own paybill), failed, and zero-revenue comp
+    rows — telling resellers the platform owed money it never held."""
+    from app.db.models import ResellerFinancials, ResellerPayout, ResellerTransactionCharge
+    from app.services.mpesa_b2b import get_unpaid_balance
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    cust = await make_customer(db, reseller, plan)
+
+    await _add_payment(db, reseller, cust, 1000.0)  # counts (system-collected)
+    await _add_payment(db, reseller, cust, 250.0, collection_mode=None)  # counts (legacy/STK)
+    await _add_payment(db, reseller, cust, 300.0, collection_mode=CollectionMode.DIRECT)
+    await _add_payment(db, reseller, cust, 400.0, status=PaymentStatus.FAILED)
+    await _add_payment(db, reseller, cust, 150.0, counts_as_revenue=False)
+
+    db.add(ResellerPayout(reseller_id=reseller.id, amount=500.0, payment_method="mpesa_b2b"))
+    db.add(
+        ResellerTransactionCharge(
+            reseller_id=reseller.id, amount=50.0,
+            description="B2B fee", created_by=reseller.id,
+        )
+    )
+    db.add(ResellerFinancials(user_id=reseller.id, balance_correction=100.0))
+    await db.commit()
+
+    stmt = await _get_statement(db, monkeypatch, reseller)
+
+    balance = stmt["balance"]
+    assert balance["total_system_collected"] == 1250.0  # DIRECT/failed/comp excluded
+    assert balance["total_paid_to_you"] == 500.0
+    assert balance["total_transaction_charges"] == 50.0
+    assert balance["balance_correction"] == 100.0
+    assert balance["unpaid_balance"] == 1250.0 + 100.0 - 500.0 - 50.0
+    assert balance["unpaid_balance"] == await get_unpaid_balance(db, reseller.id)
+    # the response reconciles internally
+    assert balance["unpaid_balance"] == round(
+        balance["total_system_collected"]
+        + balance["balance_correction"]
+        - balance["total_paid_to_you"]
+        - balance["total_transaction_charges"],
+        2,
+    )
+
+
+async def test_statement_entries_merge_and_period_summary(db, monkeypatch):
+    from app.db.models import ResellerPayout, ResellerTransactionCharge
+
+    reseller = await make_reseller(db)
+    db.add(
+        ResellerPayout(
+            reseller_id=reseller.id, amount=700.0, payment_method="mpesa_b2b",
+            reference="B2B-REF-1", created_at=datetime(2026, 7, 1, 10, 0),
+        )
+    )
+    db.add(
+        ResellerTransactionCharge(
+            reseller_id=reseller.id, amount=13.0, description="M-Pesa B2B transfer fee",
+            created_by=reseller.id, created_at=datetime(2026, 7, 1, 10, 0, 1),
+        )
+    )
+    db.add(
+        ResellerPayout(
+            reseller_id=reseller.id, amount=200.0, payment_method="cash",
+            created_at=datetime(2026, 5, 1, 9, 0),  # outside the filter window
+        )
+    )
+    await db.commit()
+
+    stmt = await _get_statement(
+        db, monkeypatch, reseller, start_date="2026-06-01", end_date="2026-07-31"
+    )
+
+    assert stmt["total_entries"] == 2
+    types = [e["type"] for e in stmt["entries"]]
+    assert types == ["charge", "payout"]  # newest first
+    assert stmt["period_summary"]["total_payouts"] == 700.0
+    assert stmt["period_summary"]["total_charges"] == 13.0
+    assert stmt["period_summary"]["net"] == 687.0
+    # balance block stays all-time regardless of the date filter
+    assert stmt["balance"]["total_paid_to_you"] == 900.0
