@@ -820,6 +820,24 @@ def _cleanup_single_router_pppoe_sync(router_info: dict, customers_data: list) -
                 if remove_result.get("error"):
                     results["failed"].append({"id": cust["id"], "error": remove_result["error"]})
                     logger.error(f"[CRON-PPPoE] Failed to remove secret for {pppoe_user}: {remove_result['error']}")
+                elif disconnect_result.get("error"):
+                    # Secret removal succeeded (no re-auth possible) but the
+                    # live session could not be confirmed dead. Report failure
+                    # so the DB row stays ACTIVE and the next run retries the
+                    # disconnect — marking it removed here leaves the client
+                    # surfing on the established session while the DB says
+                    # INACTIVE ("system disconnect doesn't cut client
+                    # internet"), invisible to every retry path. Retry is
+                    # cheap: remove_pppoe_secret returns not_found next run.
+                    results["failed"].append({
+                        "id": cust["id"],
+                        "error": f"session disconnect failed: {disconnect_result['error']}",
+                    })
+                    logger.error(
+                        f"[CRON-PPPoE] Secret removed but session disconnect failed for "
+                        f"{pppoe_user}: {disconnect_result['error']}; keeping customer "
+                        f"{cust['id']} ACTIVE for retry"
+                    )
                 else:
                     results["removed"].append({
                         "id": cust["id"],
