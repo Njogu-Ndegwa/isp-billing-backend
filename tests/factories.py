@@ -46,6 +46,22 @@ async def make_reseller(db: AsyncSession, **overrides) -> User:
     return user
 
 
+async def make_admin(db: AsyncSession, **overrides) -> User:
+    defaults = dict(
+        user_code=_next("user_code"),
+        email=f"admin{_SEQ['user_code']}@example.com",
+        password_hash="not-a-real-hash",
+        role=UserRole.ADMIN,
+        organization_name="Bitwave Admin",
+    )
+    defaults.update(overrides)
+    user = User(**defaults)
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
 async def make_plan(
     db: AsyncSession,
     reseller: User,
