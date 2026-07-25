@@ -30,6 +30,10 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user, pwd_context
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
 from app.services.admin_metrics import compute_dashboard_v2_extras
+from app.services.mpesa_b2b import (
+    PAYOUT_REVENUE_FILTERS,
+    get_unpaid_balance as _canonical_unpaid_balance,
+)
 from app.config import settings
 from app.services.app_settings import get_setting, set_setting
 from app.services.voucher_service import COMPENSATION_DAILY_LIMIT_KEY
@@ -120,28 +124,29 @@ async def _total_transaction_charges(db: AsyncSession, reseller_id: int) -> floa
 
 
 async def _mpesa_revenue(db: AsyncSession, reseller_id: int) -> float:
-    """Revenue that landed in admin's M-Pesa (excludes cash/voucher)."""
+    """Revenue the PLATFORM actually collected on the reseller's behalf.
+
+    Uses the canonical PAYOUT_REVENUE_FILTERS from mpesa_b2b (mobile money AND
+    completed AND revenue-bearing AND not DIRECT-collected into the reseller's
+    own paybill/till) so admin displays agree with the number the B2B payout
+    job pays. Bare MOBILE_MONEY here previously counted DIRECT/pending/comp
+    rows and diverged from every payout surface.
+    """
     stmt = select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
-        CustomerPayment.reseller_id == reseller_id, MPESA_FILTER
+        CustomerPayment.reseller_id == reseller_id, *PAYOUT_REVENUE_FILTERS
     )
     return float((await db.execute(stmt)).scalar())
 
 
 async def _unpaid_balance(db: AsyncSession, reseller_id: int) -> float:
     """
-    Canonical unpaid-balance formula that includes the one-time balance_correction
-    applied when historical payment rows were lost to cascading deletes.
-    Always use this instead of computing mpesa_rev - paid - charges inline.
+    Canonical unpaid-balance formula (delegates to mpesa_b2b.get_unpaid_balance,
+    which includes the one-time balance_correction applied when historical
+    payment rows were lost to cascading deletes).
+    Always use this instead of computing mpesa_rev - paid - charges inline —
+    what the admin sees must be exactly what the payout job pays.
     """
-    mpesa_rev = await _mpesa_revenue(db, reseller_id)
-    paid = await _total_payouts(db, reseller_id)
-    charges = await _total_transaction_charges(db, reseller_id)
-    correction_row = (await db.execute(
-        select(func.coalesce(ResellerFinancials.balance_correction, 0.0))
-        .where(ResellerFinancials.user_id == reseller_id)
-    )).scalar_one_or_none()
-    correction = float(correction_row or 0)
-    return round(mpesa_rev + correction - paid - charges, 2)
+    return await _canonical_unpaid_balance(db, reseller_id)
 
 
 def _serialize_payment_method_for_admin(pm: ResellerPaymentMethod) -> dict:
@@ -2207,14 +2212,20 @@ async def get_transaction_charges(
 # unpaid balance negative. These endpoints correct that for affected resellers
 # without touching anyone whose balance is already accurate.
 #
-# Algorithm:
+# Algorithm (all revenue sums use the canonical PAYOUT_REVENUE_FILTERS from
+# mpesa_b2b — the correction this flow WRITES is a term inside
+# get_unpaid_balance, so it must be computed on the same formula or it
+# corrupts the number the B2B job actually pays):
 #   last_payout_date = most recent ResellerPayout.created_at
-#   true_unpaid      = SUM(mobile-money CustomerPayments since last_payout_date)
+#   true_unpaid      = SUM(canonical-revenue CustomerPayments since last_payout_date)
 #                    - SUM(charges since last_payout_date)
-#   raw_balance      = mpesa_rev - total_paid - total_charges  (may be negative)
+#   raw_balance      = canonical_rev - total_paid - total_charges  (may be negative;
+#                      excludes any existing balance_correction)
 #   correction       = max(0, true_unpaid - raw_balance)
 #
 # Non-affected resellers produce correction = 0 and are left untouched.
+# Re-running is safe: _apply_repair OVERWRITES balance_correction (the sole
+# writer of that column), so corrections never accumulate.
 # ---------------------------------------------------------------------------
 
 async def _compute_repair(db: AsyncSession, reseller_id: int) -> dict:
@@ -2222,16 +2233,14 @@ async def _compute_repair(db: AsyncSession, reseller_id: int) -> dict:
     Compute the balance correction for one reseller without writing anything.
     Returns a dict with diagnostic fields and the proposed correction amount.
     """
-    MPESA = CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY
-
     # Last payout date (None if no payouts ever)
     last_payout_stmt = select(func.max(ResellerPayout.created_at)).where(
         ResellerPayout.reseller_id == reseller_id
     )
     last_payout_date: datetime | None = (await db.execute(last_payout_stmt)).scalar_one_or_none()
 
-    # Payments since last payout (all time if no payout ever)
-    pm_filters = [CustomerPayment.reseller_id == reseller_id, MPESA]
+    # Canonical-revenue payments since last payout (all time if no payout ever)
+    pm_filters = [CustomerPayment.reseller_id == reseller_id, *PAYOUT_REVENUE_FILTERS]
     if last_payout_date:
         pm_filters.append(CustomerPayment.created_at > last_payout_date)
     payments_since = float(
@@ -2252,11 +2261,12 @@ async def _compute_repair(db: AsyncSession, reseller_id: int) -> dict:
 
     true_unpaid = max(0.0, round(payments_since - charges_since, 2))
 
-    # Raw balance: mpesa_rev minus total payouts minus total charges (no correction)
+    # Raw balance: canonical revenue minus total payouts minus total charges
+    # (no correction term — this is what the correction gets computed against)
     mpesa_rev = float(
         (await db.execute(
             select(func.coalesce(func.sum(CustomerPayment.amount), 0))
-            .where(CustomerPayment.reseller_id == reseller_id, MPESA)
+            .where(CustomerPayment.reseller_id == reseller_id, *PAYOUT_REVENUE_FILTERS)
         )).scalar()
     )
     total_paid = float(
