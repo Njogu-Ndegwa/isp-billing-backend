@@ -1,0 +1,20 @@
+# Allowlist for scripts/check_session_discipline.py
+#
+# Format: one entry per line ->  file::function::call
+#   * file      repo-relative path with forward slashes (e.g. app/services/foo.py)
+#   * function  dotted qualname inside the module (e.g. MyClass.method or outer.inner)
+#   * call      the awaited dotted call name exactly as the checker reports it
+# '#' starts a comment; every entry MUST carry a justification comment.
+#
+# Use this file ONLY for verified false positives (the checker cannot prove the
+# session was released) or for accepted debt marked TODO(violation). A true
+# violation in a money/hot path gets a TODO(violation) entry here plus a
+# backlog item — never a silent pass.
+#
+# As of 2026-07-25 the full scan of app/ + main.py reports ZERO hits: every
+# function that mixes async_session()/AsyncSessionLocal() blocks with RouterOS,
+# httpx, payment-provider, sleep, or to_thread work was manually audited
+# (mpesa_transactions, subscription, sms_dispatch, hotspot_provisioning,
+# mikrotik_background, mpesa_b2b, insurance_tunnel_batch, payment_routes) and
+# each one commits/closes the session before the I/O. This file exists so the
+# first future hit has a documented place to be triaged.
