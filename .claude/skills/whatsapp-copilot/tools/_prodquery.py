@@ -58,15 +58,19 @@ class ProdQueryError(RuntimeError):
 
 def assert_select_only(sql: str) -> None:
     """Reject anything that is not a single read-only SELECT/WITH statement."""
-    if ";" in sql:
-        raise ProdQueryError("semicolons are not allowed in tool SQL (single statement only)")
     if "\x00" in sql:
         raise ProdQueryError("NUL byte in SQL")
-    # Strip leading whitespace and -- comments to find the first keyword.
-    head = re.sub(r"(?:\s|--[^\n]*\n?)+", " ", sql, count=0).strip().lower()
+    # `--` line comments are inert to psql statement-splitting but full of
+    # prose (semicolons, words like "deletion") — validate the CODE only.
+    # Caught live 2026-07-26: payout_status's own filter comment contained
+    # "paybill/till; the" and tripped the raw-string check.
+    code = re.sub(r"--[^\n]*", "", sql)
+    if ";" in code:
+        raise ProdQueryError("semicolons are not allowed in tool SQL (single statement only)")
+    head = code.strip().lower()
     if not (head.startswith("select") or head.startswith("with")):
         raise ProdQueryError("only SELECT/WITH statements are allowed")
-    m = _FORBIDDEN.search(sql)
+    m = _FORBIDDEN.search(code)
     if m:
         raise ProdQueryError(f"forbidden keyword in SQL: {m.group(0)!r}")
 
@@ -97,7 +101,11 @@ def run_batch(queries, timeout: int = 60):
     t0 = time.monotonic()
     try:
         proc = subprocess.run(
-            SSH_CMD, input=payload, capture_output=True, text=True, timeout=timeout
+            SSH_CMD, input=payload, capture_output=True, text=True, timeout=timeout,
+            # Windows defaults text= pipes to the locale codepage (cp1252);
+            # an em-dash in a SQL comment then reaches Postgres as 0x97 and
+            # fails UTF-8 validation. Caught live 2026-07-26. Always UTF-8.
+            encoding="utf-8", errors="replace",
         )
     except FileNotFoundError:
         raise ProdQueryError("ssh executable not found on PATH")
