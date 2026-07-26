@@ -1298,7 +1298,15 @@ async def admin_dashboard(
     return {
         "resellers": {
             "total": total_resellers,
+            # Login recency — a usage signal, not a subscription state. Keep it
+            # labelled as such: roughly half of these are resellers signing in to
+            # a suspended account.
             "active_last_30_days": active_resellers,
+            # Resellers whose subscription is actually live right now. This is the
+            # number the "Active Resellers" card shows, and growth_deltas
+            # .resellers_change_percent tracks this same population.
+            "active_subscriptions": v2_extras["active_subscribers_now"],
+            "active_subscriptions_prev_month": v2_extras["active_subscribers_prev_month"],
             "subscription_active": sub_active,
             "subscription_trial": sub_trial,
             "subscription_suspended": sub_suspended,

@@ -18,6 +18,7 @@ from app.db.models import (
     Router,
     Subscription, SubscriptionStatus,
     SubscriptionPayment, SubscriptionPaymentStatus,
+    ResellerTransactionCharge,
     GrowthTarget,
 )
 
@@ -78,6 +79,68 @@ def _pct_change(current: float, previous: float) -> float:
 
 def _safe_div(num: float, denom: float) -> float:
     return round(num / denom, 2) if denom else 0.0
+
+
+_RESELLER = User.role == UserRole.RESELLER
+_LAPSED_STATUSES = [SubscriptionStatus.INACTIVE, SubscriptionStatus.SUSPENDED]
+
+
+def _aligned_previous_window(
+    cur_start: datetime,
+    cur_end: datetime,
+    prev_start: datetime,
+    prev_end: datetime,
+) -> tuple[datetime, datetime]:
+    """Clip the previous window to the elapsed span of the current one.
+
+    The current window is period-to-date while the previous one is a full period.
+    Comparing them directly makes every delta swing with the day of the month —
+    catastrophic on the 2nd, flat on the 31st — so measure the same number of
+    elapsed days on both sides.
+    """
+    elapsed = cur_end - cur_start
+    return prev_start, min(prev_start + elapsed, prev_end)
+
+
+def _paid_before(moment: datetime):
+    """EXISTS clause: this reseller completed a subscription payment before `moment`."""
+    return (
+        select(SubscriptionPayment.id)
+        .where(
+            SubscriptionPayment.user_id == User.id,
+            SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+            SubscriptionPayment.created_at < moment,
+        )
+        .correlate(User)
+        .exists()
+    )
+
+
+async def _subscribers_at(
+    db: AsyncSession, moment: datetime, *, paying_only: bool,
+) -> int:
+    """Count resellers whose subscription covered `moment`.
+
+    There is no subscription-status history table, so coverage is reconstructed
+    from `subscription_expires_at`: a reseller who registered before `moment` and
+    whose access ran to at least `moment` was subscribed then. `paying_only` also
+    requires a completed subscription payment before `moment`, which excludes free
+    trials. Known limitation: only the latest expiry is stored, so a reseller who
+    lapsed and later re-subscribed reads as covered across the gap.
+
+    Using one definition for every point in time is the whole point — the previous
+    behaviour applied a different formula to the current and prior periods, which
+    made month-over-month deltas meaningless.
+    """
+    conds = [
+        _RESELLER,
+        User.created_at < moment,
+        User.subscription_expires_at.isnot(None),
+        User.subscription_expires_at >= moment,
+    ]
+    if paying_only:
+        conds.append(_paid_before(moment))
+    return (await db.execute(select(func.count(User.id)).where(*conds))).scalar() or 0
 
 
 def _date_label(d: date) -> str:
@@ -265,102 +328,122 @@ async def compute_mrr(db: AsyncSession) -> dict[str, Any]:
 # 2. Churn
 # ---------------------------------------------------------------------------
 
+async def _lapsed_in_window(
+    db: AsyncSession, start: datetime, end: datetime,
+) -> tuple[list, list]:
+    """Split resellers who lost access in [start, end) into (churned, trial_expiries).
+
+    A reseller only counts as churned if they had actually paid before the window
+    opened. Expired trials land in the same SUSPENDED status but never paid, so
+    counting them as churn conflates failed trial conversion with losing a paying
+    customer — the two need completely different responses.
+    """
+    rows = (await db.execute(
+        select(
+            User.id,
+            User.organization_name,
+            User.subscription_expires_at,
+            User.created_at,
+            _paid_before(start).label("was_paying"),
+        )
+        .where(
+            _RESELLER,
+            User.subscription_status.in_(_LAPSED_STATUSES),
+            User.subscription_expires_at >= start,
+            User.subscription_expires_at < end,
+        )
+    )).all()
+    return (
+        [r for r in rows if r.was_paying],
+        [r for r in rows if not r.was_paying],
+    )
+
+
 async def compute_churn(db: AsyncSession, period: str = "month") -> dict[str, Any]:
     now = datetime.utcnow()
     cur_start, cur_end, prev_start, prev_end = _period_range(period)
-
-    active_at_start = (await db.execute(
-        select(func.count(User.id)).where(
-            User.role == UserRole.RESELLER,
-            or_(
-                User.subscription_status.in_([
-                    SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL,
-                ]),
-                and_(
-                    User.subscription_status.in_([
-                        SubscriptionStatus.INACTIVE, SubscriptionStatus.SUSPENDED,
-                    ]),
-                    User.subscription_expires_at >= cur_start,
-                ),
-            ),
-        )
-    )).scalar() or 0
-
-    churned_q = (
-        select(User.id, User.organization_name, User.subscription_expires_at)
-        .where(
-            User.role == UserRole.RESELLER,
-            User.subscription_status.in_([
-                SubscriptionStatus.INACTIVE, SubscriptionStatus.SUSPENDED,
-            ]),
-            User.subscription_expires_at >= cur_start,
-            User.subscription_expires_at < cur_end,
-        )
+    prev_start, prev_end = _aligned_previous_window(
+        cur_start, cur_end, prev_start, prev_end
     )
-    churned_rows = (await db.execute(churned_q)).all()
+
+    # Denominator is the cohort that existed and was paying when the period
+    # OPENED. The previous implementation counted everyone active *right now*,
+    # so resellers who signed up mid-period landed in their own "period start"
+    # base and diluted the rate.
+    cohort_at_start = await _subscribers_at(db, cur_start, paying_only=True)
+    subscribers_at_start = await _subscribers_at(db, cur_start, paying_only=False)
+
+    churned_rows, trial_rows = await _lapsed_in_window(db, cur_start, cur_end)
     churned_count = len(churned_rows)
+    trial_expiry_count = len(trial_rows)
 
-    churn_rate = _safe_div(churned_count * 100, active_at_start)
+    churn_rate = _safe_div(churned_count * 100, cohort_at_start)
 
-    prev_active_at_start = (await db.execute(
-        select(func.count(User.id)).where(
-            User.role == UserRole.RESELLER,
-            or_(
-                User.subscription_status.in_([
-                    SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL,
-                ]),
-                and_(
-                    User.subscription_status.in_([
-                        SubscriptionStatus.INACTIVE, SubscriptionStatus.SUSPENDED,
-                    ]),
-                    User.subscription_expires_at >= prev_start,
-                ),
-            ),
-        )
-    )).scalar() or 0
-
-    prev_churned = (await db.execute(
-        select(func.count(User.id)).where(
-            User.role == UserRole.RESELLER,
-            User.subscription_status.in_([
-                SubscriptionStatus.INACTIVE, SubscriptionStatus.SUSPENDED,
-            ]),
-            User.subscription_expires_at >= prev_start,
-            User.subscription_expires_at < prev_end,
-        )
-    )).scalar() or 0
-
-    prev_churn_rate = _safe_div(prev_churned * 100, prev_active_at_start)
+    prev_cohort = await _subscribers_at(db, prev_start, paying_only=True)
+    prev_churned_rows, prev_trial_rows = await _lapsed_in_window(
+        db, prev_start, prev_end
+    )
+    prev_churn_rate = _safe_div(len(prev_churned_rows) * 100, prev_cohort)
 
     new_resellers = (await db.execute(
         select(func.count(User.id)).where(
-            User.role == UserRole.RESELLER,
+            _RESELLER,
             User.created_at >= cur_start,
             User.created_at < cur_end,
         )
     )).scalar() or 0
 
-    net_growth = new_resellers - churned_count
+    # Trials that lapsed, over every trial that could have lapsed in the window.
+    # Most trials here are short enough to start AND expire inside the same
+    # period, so measuring against only the trials open at the start produces a
+    # rate above 100%.
+    trials_at_start = max(subscribers_at_start - cohort_at_start, 0)
+    trials_at_risk = trials_at_start + new_resellers
+    trial_expiry_rate = _safe_div(trial_expiry_count * 100, trials_at_risk)
 
-    churned_resellers = [
-        {
-            "id": row.id,
-            "organization_name": row.organization_name,
-            "churned_at": row.subscription_expires_at.isoformat() if row.subscription_expires_at else None,
-            "reason": "subscription_expired",
-        }
-        for row in churned_rows
-    ]
+    # Net movement in the paying base, not signups-minus-lapses across two
+    # different populations.
+    cohort_now = await _subscribers_at(db, cur_end, paying_only=True)
+    net_growth = cohort_now - cohort_at_start
+
+    def _serialise(rows, reason: str) -> list[dict]:
+        return [
+            {
+                "id": row.id,
+                "organization_name": row.organization_name,
+                "churned_at": (
+                    row.subscription_expires_at.isoformat()
+                    if row.subscription_expires_at else None
+                ),
+                "signed_up_at": row.created_at.isoformat() if row.created_at else None,
+                "reason": reason,
+            }
+            for row in rows
+        ]
 
     return {
         "churn_rate": churn_rate,
         "churned_count": churned_count,
-        "total_at_period_start": active_at_start,
+        "total_at_period_start": cohort_at_start,
         "previous_period_churn_rate": prev_churn_rate,
         "change_percent": round(churn_rate - prev_churn_rate, 2),
+        "change_unit": "percentage_points",
         "net_reseller_growth": net_growth,
-        "churned_resellers": churned_resellers,
+        "new_resellers": new_resellers,
+        "paying_subscribers_now": cohort_now,
+        # Failed trial conversions, reported separately so they stop being
+        # mistaken for churn.
+        "trial_expiry_count": trial_expiry_count,
+        "trial_expiry_rate": trial_expiry_rate,
+        "trials_at_period_start": trials_at_start,
+        "trials_at_risk": trials_at_risk,
+        "subscribers_at_period_start": subscribers_at_start,
+        "previous_period_trial_expiries": len(prev_trial_rows),
+        "insufficient_data": cohort_at_start == 0,
+        "churned_resellers": _serialise(churned_rows, "paid_subscription_lapsed"),
+        "trial_expiries": _serialise(trial_rows, "trial_expired_never_paid"),
         "period": period,
+        "comparison_basis": "same elapsed days in the previous period",
         "calculated_at": now.isoformat(),
     }
 
@@ -431,6 +514,12 @@ async def compute_dashboard_v2_extras(db: AsyncSession) -> dict[str, Any]:
         prev_month_start = datetime(now.year, now.month - 1, 1)
     prev_month_end = month_start
 
+    # Month-to-date compared against the same elapsed days last month, not
+    # against last month in full.
+    rev_prev_start, rev_prev_end = _aligned_previous_window(
+        month_start, now, prev_month_start, prev_month_end
+    )
+
     cur_revenue = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0))
         .where(
@@ -441,23 +530,24 @@ async def compute_dashboard_v2_extras(db: AsyncSession) -> dict[str, Any]:
     prev_revenue = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0))
         .where(
-            CustomerPayment.created_at >= prev_month_start,
-            CustomerPayment.created_at < prev_month_end,
+            CustomerPayment.created_at >= rev_prev_start,
+            CustomerPayment.created_at < rev_prev_end,
             CustomerPayment.counts_as_revenue == True,
         )
     )).scalar())
 
-    cur_resellers = (await db.execute(
-        select(func.count(User.id)).where(
-            User.role == UserRole.RESELLER,
-            User.created_at < now,
-        )
+    # The "Active Resellers" card shows a live-subscription count, so its trend
+    # has to move with that same population. It previously compared cumulative
+    # registrations — a counter that only ever goes up, so the card could report
+    # growth while the active base was collapsing.
+    cur_resellers = await _subscribers_at(db, now, paying_only=False)
+    prev_resellers = await _subscribers_at(db, prev_month_end, paying_only=False)
+
+    registered_now = (await db.execute(
+        select(func.count(User.id)).where(_RESELLER, User.created_at < now)
     )).scalar() or 0
-    prev_resellers = (await db.execute(
-        select(func.count(User.id)).where(
-            User.role == UserRole.RESELLER,
-            User.created_at < prev_month_end,
-        )
+    registered_prev = (await db.execute(
+        select(func.count(User.id)).where(_RESELLER, User.created_at < prev_month_end)
     )).scalar() or 0
 
     cur_customers = (await db.execute(
@@ -491,8 +581,13 @@ async def compute_dashboard_v2_extras(db: AsyncSession) -> dict[str, Any]:
             "revenue_change_percent": _pct_change(cur_revenue, prev_revenue),
             "resellers_change_percent": _pct_change(cur_resellers, prev_resellers),
             "customers_change_percent": _pct_change(cur_customers, prev_customers),
-            "comparison_period": "vs last month",
+            "registered_resellers_change_percent": _pct_change(
+                registered_now, registered_prev
+            ),
+            "comparison_period": "vs same point last month",
         },
+        "active_subscribers_now": cur_resellers,
+        "active_subscribers_prev_month": prev_resellers,
         "signups_today": signups_today,
         "signups_this_week": signups_week,
         "signups_this_month": signups_month,
@@ -603,65 +698,71 @@ async def compute_arpu(db: AsyncSession) -> dict[str, Any]:
     now = datetime.utcnow()
     month_start = datetime(now.year, now.month, 1)
     if now.month == 1:
-        prev_start = datetime(now.year - 1, 12, 1)
+        prev_month_start = datetime(now.year - 1, 12, 1)
     else:
-        prev_start = datetime(now.year, now.month - 1, 1)
-    prev_end = month_start
+        prev_month_start = datetime(now.year, now.month - 1, 1)
+    prev_start, prev_end = _aligned_previous_window(
+        month_start, now, prev_month_start, month_start
+    )
 
-    cur_rev = float((await db.execute(
-        select(func.coalesce(func.sum(SubscriptionPayment.amount), 0))
-        .where(
-            SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
-            SubscriptionPayment.created_at >= month_start,
-        )
-    )).scalar())
+    async def _subscription_revenue(start: datetime, end: datetime) -> float:
+        return float((await db.execute(
+            select(func.coalesce(func.sum(SubscriptionPayment.amount), 0))
+            .where(
+                SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+                SubscriptionPayment.created_at >= start,
+                SubscriptionPayment.created_at < end,
+            )
+        )).scalar())
 
-    prev_rev = float((await db.execute(
-        select(func.coalesce(func.sum(SubscriptionPayment.amount), 0))
-        .where(
-            SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
-            SubscriptionPayment.created_at >= prev_start,
-            SubscriptionPayment.created_at < prev_end,
-        )
-    )).scalar())
+    async def _charge_revenue(start: datetime, end: datetime) -> float:
+        return float((await db.execute(
+            select(func.coalesce(func.sum(ResellerTransactionCharge.amount), 0))
+            .where(
+                ResellerTransactionCharge.created_at >= start,
+                ResellerTransactionCharge.created_at < end,
+            )
+        )).scalar())
 
-    active_resellers = (await db.execute(
-        select(func.count(User.id)).where(
-            User.role == UserRole.RESELLER,
-            User.subscription_status.in_([
-                SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL,
-            ]),
-        )
-    )).scalar() or 0
+    cur_rev = await _subscription_revenue(month_start, now)
+    prev_rev = await _subscription_revenue(prev_start, prev_end)
+    cur_charges = await _charge_revenue(month_start, now)
 
-    prev_active = (await db.execute(
-        select(func.count(User.id)).where(
-            User.role == UserRole.RESELLER,
-            or_(
-                User.subscription_status.in_([
-                    SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL,
-                ]),
-                and_(
-                    User.subscription_status.in_([
-                        SubscriptionStatus.INACTIVE, SubscriptionStatus.SUSPENDED,
-                    ]),
-                    User.subscription_expires_at >= prev_start,
-                ),
-            ),
-        )
-    )).scalar() or 0
+    # Both periods use the SAME denominator definition. Previously the current
+    # period counted ACTIVE/TRIAL resellers while the prior period also swept in
+    # everyone who had lapsed since — a denominator roughly 3x larger, which
+    # crushed the prior ARPU and reported the difference as explosive growth.
+    paying_now = await _subscribers_at(db, now, paying_only=True)
+    paying_prev = await _subscribers_at(db, prev_end, paying_only=True)
 
-    cur_arpu = _safe_div(cur_rev, active_resellers)
-    prev_arpu = _safe_div(prev_rev, prev_active)
+    # Trials pay nothing by definition, so they dilute ARPU. Reported alongside
+    # rather than folded into the headline.
+    subscribers_now = await _subscribers_at(db, now, paying_only=False)
+
+    cur_arpu = _safe_div(cur_rev, paying_now)
+    prev_arpu = _safe_div(prev_rev, paying_prev)
 
     return {
         "current_arpu": cur_arpu,
         "previous_period_arpu": prev_arpu,
         "change_percent": _pct_change(cur_arpu, prev_arpu),
         "currency": "KES",
-        "active_resellers": active_resellers,
+        # Kept for API compatibility; now means "resellers with a paid, live
+        # subscription" rather than a status snapshot that included trials.
+        "active_resellers": paying_now,
+        "paying_subscribers": paying_now,
+        "previous_paying_subscribers": paying_prev,
+        "subscribers_including_trials": subscribers_now,
+        "arpu_including_trials": _safe_div(cur_rev, subscribers_now),
         "total_revenue": round(cur_rev, 2),
+        # The platform also earns transaction charges. Surfaced so the headline
+        # can be widened to total platform revenue per reseller if wanted, without
+        # silently redefining the existing figure.
+        "transaction_charges": round(cur_charges, 2),
+        "arpu_incl_transaction_charges": _safe_div(cur_rev + cur_charges, paying_now),
+        "insufficient_data": paying_now == 0,
         "period": "month",
+        "comparison_basis": "same elapsed days in the previous month",
         "calculated_at": now.isoformat(),
     }
 
@@ -1244,24 +1345,9 @@ async def _compute_target_current(db: AsyncSession, target_id: str) -> float:
         return float(val or 0)
 
     if target_id == "churn_target":
-        total_active = (await db.execute(
-            select(func.count(User.id)).where(
-                User.role == UserRole.RESELLER,
-                User.subscription_status.in_([
-                    SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL,
-                ]),
-            )
-        )).scalar() or 0
-        churned = (await db.execute(
-            select(func.count(User.id)).where(
-                User.role == UserRole.RESELLER,
-                User.subscription_status.in_([
-                    SubscriptionStatus.INACTIVE, SubscriptionStatus.SUSPENDED,
-                ]),
-                User.subscription_expires_at >= month_start,
-                User.subscription_expires_at < now,
-            )
-        )).scalar() or 0
-        return _safe_div(churned * 100, total_active + churned) if (total_active + churned) else 0.0
+        # One churn definition for the whole dashboard. This used to be a
+        # separately-written formula that happened to agree with the churn card
+        # only while no suspended reseller had a future expiry date.
+        return float((await compute_churn(db, period="month"))["churn_rate"])
 
     return 0.0
