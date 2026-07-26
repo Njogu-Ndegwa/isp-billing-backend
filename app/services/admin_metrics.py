@@ -132,11 +132,20 @@ async def _subscribers_at(
     behaviour applied a different formula to the current and prior periods, which
     made month-over-month deltas meaningless.
     """
+    now = datetime.utcnow()
     conds = [
         _RESELLER,
         User.created_at < moment,
         User.subscription_expires_at.isnot(None),
         User.subscription_expires_at >= moment,
+        # An admin suspension revokes access before the paid-for period runs out,
+        # so a still-future expiry stops being evidence of coverage. The moment
+        # of suspension is not recorded, so this applies at every `moment` rather
+        # than from the suspension date onwards.
+        or_(
+            User.subscription_status.notin_(_LAPSED_STATUSES),
+            User.subscription_expires_at < now,
+        ),
     ]
     if paying_only:
         conds.append(_paid_before(moment))

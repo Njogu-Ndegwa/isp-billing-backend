@@ -198,6 +198,32 @@ async def test_arpu_uses_one_denominator_definition_for_both_periods(db):
 
 
 @pytest.mark.asyncio
+async def test_admin_suspension_drops_a_reseller_despite_a_future_expiry(db):
+    """Suspending mid-period revokes access; the paid-through date is now moot.
+
+    deactivate_subscription leaves subscription_expires_at untouched, so a
+    reseller suspended before their period ends still carries a future expiry.
+    """
+    cur_start, now, prev_start, mid, _ = _windows()
+    future = now + timedelta(days=30)
+
+    await _paying_subscriber(
+        db, created=prev_start, paid_at=prev_start, expires=future,
+        status=SubscriptionStatus.ACTIVE,
+    )
+    await _paying_subscriber(
+        db, created=prev_start, paid_at=prev_start, expires=future,
+        status=SubscriptionStatus.SUSPENDED,
+    )
+
+    result = await compute_arpu(db)
+    extras = await compute_dashboard_v2_extras(db)
+
+    assert result["paying_subscribers"] == 1
+    assert extras["active_subscribers_now"] == 1
+
+
+@pytest.mark.asyncio
 async def test_arpu_excludes_trials_from_headline_denominator(db):
     """Trials pay nothing by definition, so they must not dilute the headline."""
     cur_start, now, prev_start, mid, _ = _windows()
