@@ -545,12 +545,17 @@ async def compute_dashboard_v2_extras(db: AsyncSession) -> dict[str, Any]:
         )
     )).scalar())
 
-    # The "Active Resellers" card shows a live-subscription count, so its trend
-    # has to move with that same population. It previously compared cumulative
-    # registrations — a counter that only ever goes up, so the card could report
-    # growth while the active base was collapsing.
-    cur_resellers = await _subscribers_at(db, now, paying_only=False)
-    prev_resellers = await _subscribers_at(db, prev_month_end, paying_only=False)
+    # The headline reseller card shows the PAYING base, so its trend tracks that
+    # same population. Counting trials in the headline hid the number that
+    # matters: a trial converting to paid moves one reseller from the trial
+    # column to the paying column and leaves an all-subscriptions total flat.
+    cur_resellers = await _subscribers_at(db, now, paying_only=True)
+    prev_resellers = await _subscribers_at(db, prev_month_end, paying_only=True)
+
+    # All live subscriptions, trials included — kept for the "N on trial"
+    # context line and for capacity planning.
+    cur_subs = await _subscribers_at(db, now, paying_only=False)
+    prev_subs = await _subscribers_at(db, prev_month_end, paying_only=False)
 
     registered_now = (await db.execute(
         select(func.count(User.id)).where(_RESELLER, User.created_at < now)
@@ -593,10 +598,13 @@ async def compute_dashboard_v2_extras(db: AsyncSession) -> dict[str, Any]:
             "registered_resellers_change_percent": _pct_change(
                 registered_now, registered_prev
             ),
+            "active_subscribers_change_percent": _pct_change(cur_subs, prev_subs),
             "comparison_period": "vs same point last month",
         },
-        "active_subscribers_now": cur_resellers,
-        "active_subscribers_prev_month": prev_resellers,
+        "paying_subscribers_now": cur_resellers,
+        "paying_subscribers_prev_month": prev_resellers,
+        "active_subscribers_now": cur_subs,
+        "active_subscribers_prev_month": prev_subs,
         "signups_today": signups_today,
         "signups_this_week": signups_week,
         "signups_this_month": signups_month,

@@ -268,11 +268,47 @@ async def test_active_reseller_trend_tracks_subscriptions_not_registrations(db):
     extras = await compute_dashboard_v2_extras(db)
     deltas = extras["growth_deltas"]
 
-    assert extras["active_subscribers_now"] == 1
-    assert extras["active_subscribers_prev_month"] == 1
+    assert extras["paying_subscribers_now"] == 1
+    assert extras["paying_subscribers_prev_month"] == 1
     assert deltas["resellers_change_percent"] == 0.0
     # The old cumulative-registration signal stays available, clearly named.
     assert deltas["registered_resellers_change_percent"] > 0
+
+
+@pytest.mark.asyncio
+async def test_headline_reseller_card_moves_when_a_trial_converts(db):
+    """A conversion must show up. Counting trials in the headline hides it.
+
+    Converting moves one reseller from the trial column to the paying column, so
+    an all-subscriptions total stays flat while the paying base grows.
+    """
+    cur_start, now, prev_start, mid, _ = _windows()
+    before = prev_start - timedelta(days=10)
+    future = now + timedelta(days=30)
+
+    # Paying since before last month.
+    await _paying_subscriber(
+        db, created=before, paid_at=before, expires=future,
+        status=SubscriptionStatus.ACTIVE,
+    )
+    # On trial at the start of last month, paid for the first time this month.
+    await _paying_subscriber(
+        db, created=before, paid_at=mid, expires=future,
+        status=SubscriptionStatus.ACTIVE,
+    )
+
+    extras = await compute_dashboard_v2_extras(db)
+    deltas = extras["growth_deltas"]
+
+    assert extras["paying_subscribers_prev_month"] == 1
+    assert extras["paying_subscribers_now"] == 2
+    assert deltas["resellers_change_percent"] == 100.0
+
+    # Total live subscriptions did not move — which is exactly why the headline
+    # must not be measured that way.
+    assert extras["active_subscribers_prev_month"] == 2
+    assert extras["active_subscribers_now"] == 2
+    assert deltas["active_subscribers_change_percent"] == 0.0
 
 
 # ---------------------------------------------------------------------------

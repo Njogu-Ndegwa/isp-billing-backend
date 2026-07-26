@@ -1302,9 +1302,12 @@ async def admin_dashboard(
             # labelled as such: roughly half of these are resellers signing in to
             # a suspended account.
             "active_last_30_days": active_resellers,
-            # Resellers whose subscription is actually live right now. This is the
-            # number the "Active Resellers" card shows, and growth_deltas
-            # .resellers_change_percent tracks this same population.
+            # Resellers on a paid, live subscription. This is the headline card
+            # value, and growth_deltas.resellers_change_percent tracks this same
+            # population so the number and its trend cannot diverge.
+            "paying_subscriptions": v2_extras["paying_subscribers_now"],
+            "paying_subscriptions_prev_month": v2_extras["paying_subscribers_prev_month"],
+            # All live subscriptions including trials.
             "active_subscriptions": v2_extras["active_subscribers_now"],
             "active_subscriptions_prev_month": v2_extras["active_subscribers_prev_month"],
             "subscription_active": sub_active,
