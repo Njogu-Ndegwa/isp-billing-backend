@@ -2508,24 +2508,62 @@ async def collect_bandwidth_snapshot():
 
                             # --- PPPoE dynamic queues (<pppoe-USERNAME>) ---
                             if qname.startswith("<pppoe-") and qname.endswith(">"):
-                                pppoe_user = qname[7:-1]
+                                pppoe_user = qname[7:-1].strip()
                                 upload_bytes, download_bytes = _parse_queue_bytes(q.get("bytes", "0/0"))
-                                pppoe_key = f"pppoe:{pppoe_user}"
 
+                                # Attribution must tolerate real-fleet drift or the
+                                # customer's open period silently stays at 0 MB while
+                                # the queue counters keep moving (observed in prod:
+                                # 39/172 pppoe:* usage rows orphaned on 2026-07-26).
+                                # Match case-insensitively on the sampled router first
+                                # (resellers hand-recreate secrets in Winbox with
+                                # different case) ...
                                 cust_result = await db.execute(
                                     select(Customer)
                                     .options(selectinload(Customer.plan))
                                     .where(
-                                        Customer.pppoe_username == pppoe_user,
+                                        func.lower(Customer.pppoe_username) == pppoe_user.lower(),
                                         Customer.router_id == router_id,
                                     )
                                 )
                                 customer = cust_result.scalars().first()
+                                if customer is None:
+                                    # ... then fall back to the globally unique
+                                    # username (create/update/import all enforce
+                                    # uniqueness): a replaced or re-registered router
+                                    # leaves Customer.router_id pointing at a stale
+                                    # router row. Refuse to guess when the
+                                    # case-insensitive match is ambiguous.
+                                    fallback_result = await db.execute(
+                                        select(Customer)
+                                        .options(selectinload(Customer.plan))
+                                        .where(func.lower(Customer.pppoe_username) == pppoe_user.lower())
+                                        .limit(2)
+                                    )
+                                    fallback_matches = fallback_result.scalars().all()
+                                    if len(fallback_matches) == 1:
+                                        customer = fallback_matches[0]
+
+                                # Canonical usage-row key comes from the DB username
+                                # when the customer is known so the cap sampler and
+                                # the snapshot job share one row even when the
+                                # router-side secret drifted in case.
+                                if customer and customer.pppoe_username:
+                                    pppoe_key = f"pppoe:{customer.pppoe_username}"
+                                else:
+                                    pppoe_key = f"pppoe:{pppoe_user}"
+                                lookup_keys = list({pppoe_key, f"pppoe:{pppoe_user}"})
 
                                 existing = await db.execute(
-                                    select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address == pppoe_key)
+                                    select(UserBandwidthUsage).where(
+                                        UserBandwidthUsage.mac_address.in_(lookup_keys)
+                                    )
                                 )
-                                usage = existing.scalar_one_or_none()
+                                usage_rows = existing.scalars().all()
+                                usage = next(
+                                    (u for u in usage_rows if u.mac_address == pppoe_key),
+                                    usage_rows[0] if usage_rows else None,
+                                )
 
                                 # --- Reset-safe delta computation ---
                                 if usage:
@@ -2538,6 +2576,11 @@ async def collect_bandwidth_snapshot():
                                             f"(prev={usage.last_upload_bytes or 0}/{usage.last_download_bytes or 0}, "
                                             f"now={upload_bytes}/{download_bytes})"
                                         )
+                                    if usage.mac_address != pppoe_key and len(usage_rows) == 1:
+                                        # Normalize a case-drifted key in place once the
+                                        # customer is known (skip when a canonical row
+                                        # already exists to avoid growing duplicates).
+                                        usage.mac_address = pppoe_key
                                     usage.upload_bytes = upload_bytes
                                     usage.download_bytes = download_bytes
                                     usage.last_upload_bytes = upload_bytes
