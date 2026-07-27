@@ -638,7 +638,7 @@ async def get_reseller_detail(
     recent_stmt = (
         select(CustomerPayment, Customer, Plan)
         .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
-        .outerjoin(Plan, Customer.plan_id == Plan.id)
+        .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
         .where(CustomerPayment.reseller_id == reseller_id)
         .order_by(CustomerPayment.created_at.desc())
         .limit(10)
@@ -853,7 +853,7 @@ async def get_reseller_payments(
     payments_stmt = (
         select(CustomerPayment, Customer, Plan)
         .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
-        .outerjoin(Plan, Customer.plan_id == Plan.id)
+        .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
         .where(*base_filter)
         .order_by(CustomerPayment.created_at.desc())
         .offset(offset)
@@ -1298,7 +1298,18 @@ async def admin_dashboard(
     return {
         "resellers": {
             "total": total_resellers,
+            # Login recency — a usage signal, not a subscription state. Keep it
+            # labelled as such: roughly half of these are resellers signing in to
+            # a suspended account.
             "active_last_30_days": active_resellers,
+            # Resellers on a paid, live subscription. This is the headline card
+            # value, and growth_deltas.resellers_change_percent tracks this same
+            # population so the number and its trend cannot diverge.
+            "paying_subscriptions": v2_extras["paying_subscribers_now"],
+            "paying_subscriptions_prev_month": v2_extras["paying_subscribers_prev_month"],
+            # All live subscriptions including trials.
+            "active_subscriptions": v2_extras["active_subscribers_now"],
+            "active_subscriptions_prev_month": v2_extras["active_subscribers_prev_month"],
             "subscription_active": sub_active,
             "subscription_trial": sub_trial,
             "subscription_suspended": sub_suspended,

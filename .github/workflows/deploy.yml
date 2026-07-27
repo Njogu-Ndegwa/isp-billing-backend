@@ -27,11 +27,15 @@ jobs:
           docker push ${{ env.IMAGE_NAME }}:latest
 
       - name: Deploy to AWS EC2
+        # Key-only auth: the server dropped password SSH in the 2026-07-21
+        # hardening. SERVER_SSH_KEY is a dedicated deploy key whose public half
+        # lives in the server user's authorized_keys.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y sshpass
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
 
-          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
           set -e
           
           echo "=========================================="

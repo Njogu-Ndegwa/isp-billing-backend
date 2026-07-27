@@ -21,7 +21,8 @@ async def save_mpesa_transaction(
     phone_number: str, 
     amount: float, 
     reference: str,
-    merchant_request_id: str = None
+    merchant_request_id: str = None,
+    plan_id: int = None
 ) -> MpesaTransaction:
     """
     Save a new M-Pesa transaction to the database.
@@ -33,6 +34,7 @@ async def save_mpesa_transaction(
             amount=amount,
             reference=reference,
             merchant_request_id=merchant_request_id,
+            plan_id=plan_id,
             status=MpesaTransactionStatus.pending,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()

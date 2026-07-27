@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, func
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
@@ -271,6 +271,7 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                         amount=float(cb_amount),
                         reference=f"RECOVERED-{checkout_request_id}",
                         customer_id=orphan_customer.id,
+                        plan_id=orphan_customer.plan_id,
                         status=MpesaTransactionStatus.pending,
                         created_at=datetime.utcnow(),
                         updated_at=datetime.utcnow(),
@@ -538,7 +539,12 @@ async def initiate_mpesa_payment_api(
         customer = result.scalar_one_or_none()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
-        
+
+        # Snapshot the plan being paid for now — customer.plan_id gets
+        # overwritten by later purchases, and the session may roll back
+        # before the failure record below is written.
+        purchased_plan_id = customer.plan_id
+
         reference = f"PAYMENT-{request.customer_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
         # Look up the reseller's display name for the STK push prompt
@@ -619,6 +625,7 @@ async def initiate_mpesa_payment_api(
                         amount=request.amount,
                         reference=reference,
                         customer_id=request.customer_id,
+                        plan_id=purchased_plan_id,
                         status=MpesaTransactionStatus.failed,
                         failure_source=FailureSource.MPESA_API,
                         result_code="STK_PUSH_FAILED",
@@ -642,7 +649,8 @@ async def initiate_mpesa_payment_api(
             phone_number=request.phone,
             amount=request.amount,
             reference=reference,
-            merchant_request_id=stk_response.get("merchantRequestId") or stk_response.get("merchant_request_id")
+            merchant_request_id=stk_response.get("merchantRequestId") or stk_response.get("merchant_request_id"),
+            plan_id=purchased_plan_id,
         )
         
         await link_transaction_to_customer(
@@ -882,6 +890,7 @@ async def register_hotspot_and_pay_api(
                         amount=float(plan.price),
                         reference=reference,
                         customer_id=customer.id,
+                        plan_id=plan.id,
                         status=MpesaTransactionStatus.pending
                     )
                     db.add(mpesa_txn)
@@ -906,6 +915,7 @@ async def register_hotspot_and_pay_api(
                                 amount=float(plan.price),
                                 reference=reference,
                                 customer_id=customer_id,
+                                plan_id=plan.id,
                                 status=MpesaTransactionStatus.failed,
                                 failure_source=FailureSource.MPESA_API,
                                 result_code="STK_PUSH_FAILED",
@@ -1058,7 +1068,9 @@ async def get_mpesa_transactions(
                 select(MpesaTransaction, Customer, Router, Plan)
                 .join(Customer, MpesaTransaction.customer_id == Customer.id, isouter=True)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
-                .join(Plan, Customer.plan_id == Plan.id, isouter=True)
+                # Prefer the plan snapshotted on the transaction itself; legacy
+                # rows (plan_id NULL) fall back to the customer's current plan.
+                .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
                 .where(
                     (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
                 )
@@ -1139,7 +1151,9 @@ async def get_mpesa_transactions(
                 select(CustomerPayment, Customer, Router, Plan)
                 .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
-                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                # Prefer the plan snapshotted on the payment itself; legacy
+                # rows (plan_id NULL) fall back to the customer's current plan.
+                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(
                     CustomerPayment.reseller_id == user.id,
                     CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
@@ -1363,7 +1377,7 @@ async def manual_provision_transaction(
                 select(MpesaTransaction, Customer, Router, Plan)
                 .join(Customer, MpesaTransaction.customer_id == Customer.id)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
-                .join(Plan, Customer.plan_id == Plan.id, isouter=True)
+                .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
                 .where(
                     MpesaTransaction.id == transaction_id,
                     Customer.user_id == user.id,
@@ -1392,7 +1406,7 @@ async def manual_provision_transaction(
                 select(CustomerPayment, Customer, Router, Plan)
                 .join(Customer, CustomerPayment.customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
-                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(
                     CustomerPayment.id == transaction_id,
                     CustomerPayment.reseller_id == user.id,
@@ -1535,7 +1549,7 @@ async def get_mpesa_transactions_summary(
                 select(MpesaTransaction, Customer, Router, Plan)
                 .join(Customer, MpesaTransaction.customer_id == Customer.id, isouter=True)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
-                .join(Plan, Customer.plan_id == Plan.id, isouter=True)
+                .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
                 .where(
                     (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
                 )
@@ -1563,7 +1577,7 @@ async def get_mpesa_transactions_summary(
                 select(CustomerPayment, Customer, Router, Plan)
                 .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
-                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(
                     CustomerPayment.reseller_id == user.id,
                     CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
@@ -1696,7 +1710,7 @@ async def get_failed_mpesa_transactions(
         ).join(
             Router, Customer.router_id == Router.id, isouter=True
         ).join(
-            Plan, Customer.plan_id == Plan.id, isouter=True
+            Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True
         ).where(
             (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
         ).where(

@@ -138,6 +138,16 @@ class User(Base):
     )
     subscription_expires_at = Column(DateTime, nullable=True)
 
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # sha256 hex of the raw token; the raw token only ever lives in the email link
+    token_hash = Column(String(64), unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+
 class Customer(Base):
     __tablename__ = "customers"
     __table_args__ = (
@@ -254,6 +264,9 @@ class CustomerPayment(Base):
     payment_reference = Column(String(100), nullable=True)
     payment_date = Column(DateTime, default=datetime.utcnow)
     days_paid_for = Column(Integer, nullable=False)
+    # Snapshot of the plan purchased in THIS payment. Customer.plan_id is
+    # overwritten on every purchase, so it cannot be used for history.
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
     status = Column(Enum(PaymentStatus), default=PaymentStatus.COMPLETED)
     notes = Column(String(500), nullable=True)
     # Snapshot of customer name at payment time — preserved after customer deletion
@@ -411,11 +424,12 @@ class Router(Base):
     # instead handed to the secondary-server pull service for the router to fetch.
     # The queue itself lives on the secondary server; the old box keeps only this flag.
     pull_channel_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
-    # Opt-in per router: when true, the owner gets an in-app inbox message when the
+    # On by default, per-router opt-out: when true, the owner gets an inbox message
+    # (and an SMS charged to their credits, when phone+balance allow) when the
     # router stays offline past a debounce threshold and again when it comes back
     # online. The *_notified_at stamps throttle repeats (and the offline stamp marks
     # the current outage as announced) so a flapping router cannot flood the inbox.
-    status_alerts_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    status_alerts_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     online_notified_at = Column(DateTime, nullable=True)
     offline_notified_at = Column(DateTime, nullable=True)
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
@@ -502,6 +516,9 @@ class MpesaTransaction(Base):
     lipay_tx_no = Column(String(255), nullable=True)  # <-- Add this line
     status = Column(Enum(MpesaTransactionStatus), default=MpesaTransactionStatus.pending)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    # Snapshot of the plan purchased in THIS transaction. Customer.plan_id is
+    # overwritten on every purchase, so it cannot be used for history.
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
     merchant_request_id = Column(String(255), nullable=True)
     mpesa_receipt_number = Column(String(255), nullable=True)
     result_code = Column(String(50), nullable=True)

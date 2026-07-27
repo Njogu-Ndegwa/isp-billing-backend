@@ -107,3 +107,19 @@ Project-level items that should survive across agent sessions.
 - Problem: the reseller welcome message fires only from self-service `register_user_api`. `convert_lead` (`app/api/lead_routes.py`) also creates a `RESELLER` account but has no welcome hook.
 - Why it matters: admin-initiated lead conversions never receive the onboarding welcome/router-setup offer. This was a deliberate scope boundary ("signup" = self-service), but may be desired.
 - Proposed next step: if welcome-on-conversion is wanted, call `reseller_welcome.queue_reseller_welcome` + schedule `sms_dispatch.dispatch_admin_sms_messages` in `convert_lead`, reusing the same non-fatal, commit-before-dispatch pattern as `register_user_api`.
+
+## Admin Dashboard Metrics
+
+### No Subscription Status History (ARPU / Churn / Active Resellers Denominators)
+
+- Status: planned
+- Problem: nothing records when a reseller's subscription state changed. `users.subscription_expires_at` is overwritten on every renewal and `subscription_status` is a bare snapshot, so any "how many were subscribed last month" figure has to be reconstructed. `admin_metrics._subscribers_at()` currently derives it as `created_at < T AND subscription_expires_at >= T`, applied uniformly to every point in time.
+- Why it matters: that reconstruction is right for the common case but wrong for a reseller who lapsed and later re-subscribed — only the latest expiry survives, so they read as covered across the gap they were actually churned in. It silently understates churn and overstates historical active counts. Fixing the mismatched-denominator bug (2026-07-26) removed the large error; this is the residual one.
+- Proposed next step: either derive coverage from `subscription_invoices` (`period_start`/`period_end`/`paid_at` already exist, but check backfill coverage before trusting it), or add a `subscription_status_events` append-only table written by `activate_subscription` / `deactivate_subscription` and wired into an idempotent startup migration in `main.py`.
+
+### SUSPENDED Conflates Three Different Outcomes
+
+- Status: planned
+- Problem: `deactivate_subscription` defaults to `SUSPENDED` for expired trials, expired paid subscriptions, and admin/billing suspensions alike. `INACTIVE` is effectively unused (0 rows as of 2026-07-26, against 269 SUSPENDED).
+- Why it matters: churn reporting has to infer intent from payment history to tell a failed trial conversion from a lost paying customer. Any future retention, dunning or win-back work needs the same distinction and will re-derive it.
+- Proposed next step: record an explicit reason on deactivation (trial_expired / payment_lapsed / admin_suspended) rather than overloading one status, and have `compute_churn` read it instead of probing `SubscriptionPayment` history.

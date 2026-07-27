@@ -1297,6 +1297,7 @@ async def pair_device_and_pay(
                     amount=float(plan.price),
                     reference=reference,
                     customer_id=customer.id,
+                    plan_id=plan.id,
                     status=MpesaTransactionStatus.pending,
                 )
                 db.add(mpesa_txn)

@@ -140,6 +140,7 @@ async def make_payment(
         days_paid_for=days_paid_for,
         status=PaymentStatus.COMPLETED,
         customer_name=customer.name,
+        plan_id=customer.plan_id,
     )
     db.add(payment)
 
