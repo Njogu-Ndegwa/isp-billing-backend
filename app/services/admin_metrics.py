@@ -1555,6 +1555,10 @@ async def compute_earnings(
 
     cached = await cache.get(cache_key)
     if cached is not None:
+        # Auth already opened a transaction. Close it rather than sit "idle in
+        # transaction" for the whole response — the pool is 15+15 with a 10s
+        # checkout timeout, and this path does no further reads.
+        await db.commit()
         return cached
 
     prev_start, cur_start, cur_end = _earnings_windows(span)
@@ -1565,6 +1569,10 @@ async def compute_earnings(
     current_series, current_totals = _earnings_series(daily, cur_start, cur_end, granularity)
     _, previous_totals = _earnings_series(daily, prev_start, cur_start, granularity)
     all_time = await _earnings_all_time(db, own_ids)
+    accounts = await own_reseller_accounts(db, own_ids)
+    # Last read is done. Release the snapshot before assembling and serialising
+    # the payload, which for a 1095-day window is not a small object.
+    await db.commit()
 
     current_groups = _group_totals(current_totals)
     previous_groups = _group_totals(previous_totals)
@@ -1594,7 +1602,7 @@ async def compute_earnings(
         "all_time": all_time,
         "average_per_bucket": _safe_div(current_groups["combined"], len(current_series)),
         "series": current_series,
-        "own_reseller_accounts": await own_reseller_accounts(db, own_ids),
+        "own_reseller_accounts": accounts,
     }
     await cache.set(cache_key, payload, EARNINGS_CACHE_TTL)
     return payload
