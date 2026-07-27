@@ -336,3 +336,41 @@ async def admin_update_growth_targets(
                 detail=f"target_value is required for target '{item['id']}'",
             )
     return await svc.upsert_growth_targets(db, payload)
+
+
+# ---------------------------------------------------------------------------
+# 14. Combined earnings (GET) + own reseller accounts (PUT)
+# ---------------------------------------------------------------------------
+
+class OwnResellerAccountsPut(BaseModel):
+    reseller_ids: list[int]
+
+
+@router.get("/api/admin/metrics/earnings")
+async def admin_earnings(
+    period: str = Query("30d", regex="^(7d|30d|90d|1y)$"),
+    days: Optional[int] = Query(
+        None, ge=1, le=1095,
+        description="Custom window in days. Overrides `period` when supplied.",
+    ),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Everything we earn, split by stream: SaaS charges + our own reseller collections."""
+    await _require_admin(token, db)
+    return await svc.compute_earnings(db, period=period, days=days)
+
+
+@router.put("/api/admin/metrics/earnings/accounts")
+async def admin_set_own_reseller_accounts(
+    body: OwnResellerAccountsPut,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Choose which reseller accounts count as ours in the earnings view."""
+    await _require_admin(token, db)
+    saved = await svc.set_own_reseller_ids(db, body.reseller_ids)
+    return {
+        "reseller_ids": saved,
+        "accounts": await svc.own_reseller_accounts(db, saved),
+    }

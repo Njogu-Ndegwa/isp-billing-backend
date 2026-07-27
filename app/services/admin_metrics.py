@@ -6,6 +6,7 @@ ready to be serialised as JSON by FastAPI.
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import datetime, timedelta, date
 from typing import Any
@@ -17,9 +18,11 @@ from app.db.models import (
     User, UserRole, Customer, CustomerPayment,
     Router,
     Subscription, SubscriptionStatus,
+    SubscriptionInvoice,
     SubscriptionPayment, SubscriptionPaymentStatus,
     GrowthTarget,
 )
+from app.services.app_settings import get_setting, set_setting
 
 import logging
 
@@ -1265,3 +1268,289 @@ async def _compute_target_current(db: AsyncSession, target_id: str) -> float:
         return _safe_div(churned * 100, total_active + churned) if (total_active + churned) else 0.0
 
     return 0.0
+
+
+# ---------------------------------------------------------------------------
+# 14. Combined earnings — system sales + own reseller collections
+# ---------------------------------------------------------------------------
+
+# Which reseller accounts the admin personally operates. Their customer
+# collections are "our" money, not a third party's, so they form a stream of
+# their own alongside the SaaS revenue other resellers pay us.
+OWN_RESELLER_IDS_SETTING = "admin_own_reseller_ids"
+
+# Ordered as they stack in the chart, ground up.
+EARNING_STREAMS: list[dict[str, str]] = [
+    {"key": "saas_hotspot", "label": "Hotspot commission", "group": "system"},
+    {"key": "saas_pppoe", "label": "PPPoE user fees", "group": "system"},
+    {"key": "saas_other", "label": "Other system charges", "group": "system"},
+    {"key": "reseller", "label": "My reseller collections", "group": "reseller"},
+]
+_SYSTEM_KEYS = ("saas_hotspot", "saas_pppoe", "saas_other")
+
+
+async def get_own_reseller_ids(db: AsyncSession) -> list[int]:
+    """Reseller user IDs the admin has flagged as their own accounts."""
+    raw = await get_setting(db, OWN_RESELLER_IDS_SETTING)
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("Malformed %s setting: %r", OWN_RESELLER_IDS_SETTING, raw)
+        return []
+    if not isinstance(parsed, list):
+        return []
+    ids: set[int] = set()
+    for value in parsed:
+        try:
+            ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return sorted(ids)
+
+
+async def set_own_reseller_ids(db: AsyncSession, ids: list[int]) -> list[int]:
+    """Persist the admin's own reseller accounts, dropping non-reseller IDs."""
+    requested: set[int] = set()
+    for value in ids:
+        try:
+            requested.add(int(value))
+        except (TypeError, ValueError):
+            continue
+
+    valid: list[int] = []
+    if requested:
+        valid = list((await db.execute(
+            select(User.id).where(
+                User.id.in_(requested), User.role == UserRole.RESELLER,
+            )
+        )).scalars().all())
+
+    cleaned = sorted(set(valid))
+    await set_setting(db, OWN_RESELLER_IDS_SETTING, json.dumps(cleaned))
+    return cleaned
+
+
+async def own_reseller_accounts(db: AsyncSession, ids: list[int]) -> list[dict[str, Any]]:
+    if not ids:
+        return []
+    rows = (await db.execute(
+        select(User.id, User.organization_name, User.email).where(User.id.in_(ids))
+    )).all()
+    return [
+        {"id": r.id, "organization_name": r.organization_name, "email": r.email}
+        for r in rows
+    ]
+
+
+def _earnings_span_days(period: str, days: int | None) -> int:
+    """Resolve the requested window to a plain day count."""
+    if days:
+        return max(1, min(int(days), 1095))
+    return {"7d": 7, "30d": 30, "90d": 90, "1y": 365}.get(period, 30)
+
+
+def _granularity_for_span(days: int) -> str:
+    if days <= 62:
+        return "day"
+    if days <= 186:
+        return "week"
+    return "month"
+
+
+def _split_saas_payment(
+    amount: float, hotspot_charge: Any, pppoe_charge: Any,
+) -> tuple[float, float, float]:
+    """Attribute one subscription payment across its invoice's charge lines.
+
+    Payments are pro-rated by the invoice's hotspot/PPPoE split so a partial
+    payment lands proportionally. Payments with no linked invoice (or an
+    invoice with no charges) can't be attributed and fall to "other".
+    """
+    hotspot = float(hotspot_charge or 0)
+    pppoe = float(pppoe_charge or 0)
+    total_charge = hotspot + pppoe
+    if total_charge <= 0:
+        return 0.0, 0.0, amount
+    return amount * hotspot / total_charge, amount * pppoe / total_charge, 0.0
+
+
+async def _earnings_series(
+    db: AsyncSession,
+    own_ids: list[int],
+    start: datetime,
+    end: datetime,
+    granularity: str,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """Bucketed per-stream earnings plus per-stream totals for one window."""
+    saas_stmt = (
+        select(
+            SubscriptionPayment.created_at,
+            SubscriptionPayment.amount,
+            SubscriptionInvoice.hotspot_charge,
+            SubscriptionInvoice.pppoe_charge,
+        )
+        .outerjoin(
+            SubscriptionInvoice,
+            SubscriptionPayment.invoice_id == SubscriptionInvoice.id,
+        )
+        .where(
+            SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+            SubscriptionPayment.created_at >= start,
+            SubscriptionPayment.created_at < end,
+        )
+    )
+    # Money we pay ourselves for our own reseller account isn't income.
+    if own_ids:
+        saas_stmt = saas_stmt.where(SubscriptionPayment.user_id.notin_(own_ids))
+
+    buckets: dict[date, dict[str, float]] = {}
+
+    def _bucket_for(value: Any) -> dict[str, float]:
+        key = _bucket_start(_coerce_date(value), granularity)
+        return buckets.setdefault(
+            key, {"saas_hotspot": 0.0, "saas_pppoe": 0.0, "saas_other": 0.0, "reseller": 0.0}
+        )
+
+    for row in (await db.execute(saas_stmt)).all():
+        hotspot, pppoe, other = _split_saas_payment(
+            float(row.amount or 0), row.hotspot_charge, row.pppoe_charge,
+        )
+        bucket = _bucket_for(row.created_at)
+        bucket["saas_hotspot"] += hotspot
+        bucket["saas_pppoe"] += pppoe
+        bucket["saas_other"] += other
+
+    if own_ids:
+        reseller_rows = (await db.execute(
+            select(
+                func.date(CustomerPayment.created_at).label("d"),
+                func.coalesce(func.sum(CustomerPayment.amount), 0).label("rev"),
+            )
+            .where(
+                CustomerPayment.reseller_id.in_(own_ids),
+                CustomerPayment.counts_as_revenue == True,  # noqa: E712
+                CustomerPayment.created_at >= start,
+                CustomerPayment.created_at < end,
+            )
+            .group_by(func.date(CustomerPayment.created_at))
+        )).all()
+        for row in reseller_rows:
+            _bucket_for(row.d)["reseller"] += float(row.rev or 0)
+
+    first = _bucket_start(start.date(), granularity)
+    last = _bucket_start((end - timedelta(microseconds=1)).date(), granularity)
+
+    series: list[dict[str, Any]] = []
+    totals = {"saas_hotspot": 0.0, "saas_pppoe": 0.0, "saas_other": 0.0, "reseller": 0.0}
+    cumulative = 0.0
+    cursor = first
+    while cursor <= last:
+        values = buckets.get(cursor)
+        point: dict[str, Any] = {
+            "date": cursor.isoformat(),
+            "label": _bucket_label(cursor, granularity),
+        }
+        bucket_total = 0.0
+        for stream in EARNING_STREAMS:
+            key = stream["key"]
+            amount = round(values[key], 2) if values else 0.0
+            point[key] = amount
+            totals[key] += amount
+            bucket_total += amount
+        cumulative = round(cumulative + bucket_total, 2)
+        point["total"] = round(bucket_total, 2)
+        point["cumulative_total"] = cumulative
+        series.append(point)
+        cursor = _next_bucket_start(cursor, granularity)
+
+    return series, {k: round(v, 2) for k, v in totals.items()}
+
+
+async def _earnings_all_time(db: AsyncSession, own_ids: list[int]) -> dict[str, float]:
+    system_stmt = select(
+        func.coalesce(func.sum(SubscriptionPayment.amount), 0)
+    ).where(SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED)
+    if own_ids:
+        system_stmt = system_stmt.where(SubscriptionPayment.user_id.notin_(own_ids))
+    system = float((await db.execute(system_stmt)).scalar() or 0)
+
+    reseller = 0.0
+    if own_ids:
+        reseller = float((await db.execute(
+            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+                CustomerPayment.reseller_id.in_(own_ids),
+                CustomerPayment.counts_as_revenue == True,  # noqa: E712
+            )
+        )).scalar() or 0)
+
+    return {
+        "system": round(system, 2),
+        "reseller": round(reseller, 2),
+        "combined": round(system + reseller, 2),
+    }
+
+
+def _group_totals(totals: dict[str, float]) -> dict[str, float]:
+    system = round(sum(totals[k] for k in _SYSTEM_KEYS), 2)
+    reseller = round(totals["reseller"], 2)
+    return {"system": system, "reseller": reseller, "combined": round(system + reseller, 2)}
+
+
+async def compute_earnings(
+    db: AsyncSession, period: str = "30d", days: int | None = None,
+) -> dict[str, Any]:
+    """Combined view of every way the platform makes money.
+
+    Streams: the SaaS charges other resellers pay us (split into the hotspot
+    commission and the per-PPPoE-user fee), and the gross collections of the
+    reseller accounts we run ourselves.
+    """
+    span = _earnings_span_days(period, days)
+    granularity = _granularity_for_span(span)
+
+    now = datetime.utcnow()
+    cur_start = now - timedelta(days=span)
+    prev_start = cur_start - timedelta(days=span)
+
+    own_ids = await get_own_reseller_ids(db)
+
+    current_series, current_totals = await _earnings_series(
+        db, own_ids, cur_start, now, granularity,
+    )
+    _, previous_totals = await _earnings_series(
+        db, own_ids, prev_start, cur_start, granularity,
+    )
+    all_time = await _earnings_all_time(db, own_ids)
+
+    current_groups = _group_totals(current_totals)
+    previous_groups = _group_totals(previous_totals)
+
+    # "Other" only exists when a payment couldn't be traced to an invoice —
+    # hide the band entirely rather than show a permanently empty legend chip.
+    streams = [
+        {**stream, "total": current_totals[stream["key"]]}
+        for stream in EARNING_STREAMS
+        if stream["key"] != "saas_other" or current_totals["saas_other"] > 0
+    ]
+
+    return {
+        "period": period,
+        "days": span,
+        "granularity": granularity,
+        "start_date": cur_start.date().isoformat(),
+        "end_date": now.date().isoformat(),
+        "streams": streams,
+        "totals": {**current_totals, **current_groups},
+        "previous_totals": {**previous_totals, **previous_groups},
+        "change_percent": {
+            "combined": _pct_change(current_groups["combined"], previous_groups["combined"]),
+            "system": _pct_change(current_groups["system"], previous_groups["system"]),
+            "reseller": _pct_change(current_groups["reseller"], previous_groups["reseller"]),
+        },
+        "all_time": all_time,
+        "average_per_bucket": _safe_div(current_groups["combined"], len(current_series)),
+        "series": current_series,
+        "own_reseller_accounts": await own_reseller_accounts(db, own_ids),
+    }
