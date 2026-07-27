@@ -1389,10 +1389,8 @@ EARNINGS_CACHE_PREFIX = "admin_earnings:"
 EARNINGS_CACHE_TTL = 90
 
 
-def _earnings_cache_key(
-    period: str, days: int | None, own_ids: list[int],
-) -> str | None:
-    """Cache key for a window, or None when the result shouldn't be cached.
+def _earnings_cache_key(period: str, own_ids: list[int]) -> str:
+    """Cache key for a window.
 
     The account list is part of the key rather than something we invalidate
     around it. `cache` is per-process, so a `clear_pattern` on the PUT only
@@ -1401,14 +1399,10 @@ def _earnings_cache_key(
     which is the "reseller band reads zero" confusion all over again and far
     harder to spot. Keying by accounts makes a change miss everywhere at once.
 
-    Ad-hoc `days` windows aren't cached at all: `days` spans 1..1095, nothing
-    evicts an entry that is never read again, and one key per day value is an
-    unbounded hold on memory for windows nobody revisits. The four named
-    periods are what the UI actually uses, so the key space stays at four per
-    account set.
+    Four calendar periods per account set keeps the key space bounded, which
+    matters because InMemoryCache only frees an expired entry when that same
+    key is read again — an unbounded key space would leak.
     """
-    if days:
-        return None
     accounts = ",".join(str(i) for i in own_ids) or "none"
     return f"{EARNINGS_CACHE_PREFIX}{period}:{accounts}"
 
@@ -1490,35 +1484,63 @@ async def own_reseller_accounts(db: AsyncSession, ids: list[int]) -> list[dict[s
     ]
 
 
-def _earnings_span_days(period: str, days: int | None) -> int:
-    """Resolve the requested window to a plain day count."""
-    if days:
-        return max(1, min(int(days), 1095))
-    return {"7d": 7, "30d": 30, "90d": 90, "1y": 365}.get(period, 30)
+EARNINGS_PERIODS = ("week", "month", "quarter", "year")
 
 
-def _granularity_for_span(days: int) -> str:
-    if days <= 62:
-        return "day"
-    if days <= 186:
+def _earnings_windows(period: str) -> tuple[date, date, date, date]:
+    """(prev_start, prev_end, cur_start, cur_end) as whole days, end-exclusive.
+
+    Calendar periods-to-date, matching the chips the UI shows and the rest of
+    the admin dashboard: "Month" means this month so far, not the trailing 30
+    days. The previous window is clipped to the same number of elapsed days —
+    comparing a half-finished month against a whole one makes every delta swing
+    with the day of the month, catastrophic on the 2nd and flat on the 31st.
+
+    Whole-day boundaries are also what let one query cover both windows and be
+    sliced by date alone.
+    """
+    today = datetime.utcnow().date()
+    cur_end = today + timedelta(days=1)  # end-exclusive, so today counts
+
+    if period == "week":
+        cur_start = today - timedelta(days=today.weekday())
+        prev_start = cur_start - timedelta(days=7)
+    elif period == "quarter":
+        q = (today.month - 1) // 3
+        cur_start = date(today.year, q * 3 + 1, 1)
+        prev_start = date(today.year - 1, 10, 1) if q == 0 else date(today.year, (q - 1) * 3 + 1, 1)
+    elif period == "year":
+        cur_start = date(today.year, 1, 1)
+        prev_start = date(today.year - 1, 1, 1)
+    else:  # month
+        cur_start = date(today.year, today.month, 1)
+        prev_start = (
+            date(today.year - 1, 12, 1) if today.month == 1
+            else date(today.year, today.month - 1, 1)
+        )
+
+    elapsed = (cur_end - cur_start).days
+    return prev_start, prev_start + timedelta(days=elapsed), cur_start, cur_end
+
+
+def _earnings_granularity(period: str) -> str:
+    if period == "year":
+        return "month"
+    if period == "quarter":
         return "week"
-    return "month"
+    return "day"
+
+
+_EARNINGS_COMPARISON_LABEL = {
+    "week": "vs same point last week",
+    "month": "vs same point last month",
+    "quarter": "vs same point last quarter",
+    "year": "vs same point last year",
+}
 
 
 def _zero_streams() -> dict[str, float]:
     return {"saas_hotspot": 0.0, "saas_pppoe": 0.0, "saas_other": 0.0, "reseller": 0.0}
-
-
-def _earnings_windows(span_days: int) -> tuple[date, date, date]:
-    """Whole-day (prev_start, cur_start, cur_end) for a span, cur_end exclusive.
-
-    Snapping to day boundaries keeps buckets whole and — more importantly —
-    lets one query cover both windows without losing precision at the seam,
-    since every row can be assigned to a window by date alone.
-    """
-    cur_end = datetime.utcnow().date() + timedelta(days=1)
-    cur_start = cur_end - timedelta(days=span_days)
-    return cur_start - timedelta(days=span_days), cur_start, cur_end
 
 
 async def _earnings_daily(
@@ -1673,42 +1695,45 @@ def _group_totals(totals: dict[str, float]) -> dict[str, float]:
     return {"system": system, "reseller": reseller, "combined": round(system + reseller, 2)}
 
 
-async def compute_earnings(
-    db: AsyncSession, period: str = "30d", days: int | None = None,
-) -> dict[str, Any]:
+async def compute_earnings(db: AsyncSession, period: str = "month") -> dict[str, Any]:
     """Combined view of every way the platform makes money.
 
     Streams: the SaaS charges other resellers pay us (split into the hotspot
     commission and the per-PPPoE-user fee), and the gross collections of the
     reseller accounts we run ourselves.
 
+    Windows are calendar periods-to-date compared against the same point in the
+    previous period, matching the rest of the admin dashboard.
+
     Costs five queries on a cache miss: the settings lookup, one aggregate per
     source covering both windows, two lifetime sums, and the account names.
     Results are cached briefly — the dashboard refetches on every range change
     and the numbers do not move second to second.
     """
-    span = _earnings_span_days(period, days)
-    granularity = _granularity_for_span(span)
+    if period not in EARNINGS_PERIODS:
+        period = "month"
+    granularity = _earnings_granularity(period)
 
     # Read first: the account set is part of the cache key. This is a
     # single-row primary-key lookup, far cheaper than the aggregates it guards.
     own_ids = await get_own_reseller_ids(db)
-    cache_key = _earnings_cache_key(period, days, own_ids)
+    cache_key = _earnings_cache_key(period, own_ids)
 
-    if cache_key:
-        cached = await cache.get(cache_key)
-        if cached is not None:
-            # Auth already opened a transaction. Close it rather than sit "idle
-            # in transaction" for the whole response — the pool is 15+15 with a
-            # 10s checkout timeout, and this path does no further reads.
-            await db.commit()
-            return cached
+    cached = await cache.get(cache_key)
+    if cached is not None:
+        # Auth already opened a transaction. Close it rather than sit "idle in
+        # transaction" for the whole response — the pool is 15+15 with a 10s
+        # checkout timeout, and this path does no further reads.
+        await db.commit()
+        return cached
 
-    prev_start, cur_start, cur_end = _earnings_windows(span)
+    prev_start, prev_end, cur_start, cur_end = _earnings_windows(period)
 
+    # One span covers both windows; the gap between prev_end and cur_start is
+    # fetched and simply not counted.
     daily = await _earnings_daily(db, own_ids, prev_start, cur_end)
     current_series, current_totals = _earnings_series(daily, cur_start, cur_end, granularity)
-    _, previous_totals = _earnings_series(daily, prev_start, cur_start, granularity)
+    _, previous_totals = _earnings_series(daily, prev_start, prev_end, granularity)
     all_time = await _earnings_all_time(db, own_ids)
     accounts = await own_reseller_accounts(db, own_ids)
     # Last read is done. Release the snapshot before assembling and serialising
@@ -1728,10 +1753,11 @@ async def compute_earnings(
 
     payload = {
         "period": period,
-        "days": span,
+        "days": (cur_end - cur_start).days,
         "granularity": granularity,
         "start_date": cur_start.isoformat(),
         "end_date": (cur_end - timedelta(days=1)).isoformat(),
+        "comparison_label": _EARNINGS_COMPARISON_LABEL[period],
         "streams": streams,
         "totals": {**current_totals, **current_groups},
         "previous_totals": {**previous_totals, **previous_groups},
@@ -1745,6 +1771,5 @@ async def compute_earnings(
         "series": current_series,
         "own_reseller_accounts": accounts,
     }
-    if cache_key:
-        await cache.set(cache_key, payload, EARNINGS_CACHE_TTL)
+    await cache.set(cache_key, payload, EARNINGS_CACHE_TTL)
     return payload
