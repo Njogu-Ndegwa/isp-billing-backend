@@ -348,17 +348,16 @@ class OwnResellerAccountsPut(BaseModel):
 
 @router.get("/api/admin/metrics/earnings")
 async def admin_earnings(
-    period: str = Query("30d", regex="^(7d|30d|90d|1y)$"),
-    days: Optional[int] = Query(
-        None, ge=1, le=1095,
-        description="Custom window in days. Overrides `period` when supplied.",
+    period: str = Query(
+        "month", regex="^(week|month|quarter|year)$",
+        description="Calendar period-to-date, compared against the same point in the previous one.",
     ),
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
     """Everything we earn, split by stream: SaaS charges + our own reseller collections."""
     await _require_admin(token, db)
-    return await svc.compute_earnings(db, period=period, days=days)
+    return await svc.compute_earnings(db, period=period)
 
 
 @router.put("/api/admin/metrics/earnings/accounts")
