@@ -32,6 +32,16 @@ from tests.factories import make_reseller
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+async def _clear_earnings_cache():
+    """compute_earnings memoises by period, and the cache is process-wide."""
+    from app.core.cache import cache
+
+    await cache.clear_pattern(svc.EARNINGS_CACHE_PREFIX)
+    yield
+    await cache.clear_pattern(svc.EARNINGS_CACHE_PREFIX)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
@@ -328,3 +338,84 @@ async def test_window_and_granularity_resolution(
 async def test_custom_day_window_is_clamped(db):
     result = await svc.compute_earnings(db, period="30d", days=5_000)
     assert result["days"] == 1_095
+
+
+# ---------------------------------------------------------------------------
+# 7. Query cost — this runs against a resource-constrained DB
+# ---------------------------------------------------------------------------
+
+class _CountingSession:
+    """Proxies an AsyncSession, tallying round trips."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.queries = 0
+
+    async def execute(self, *args, **kwargs):
+        self.queries += 1
+        return await self._inner.execute(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+async def test_a_cold_load_costs_a_bounded_number_of_queries(db):
+    mine = await make_reseller(db)
+    other = await make_reseller(db)
+    await svc.set_own_reseller_ids(db, [mine.id])
+    invoice = await _add_invoice(
+        db, other.id, hotspot_charge=50, pppoe_charge=50,
+        period_start=datetime.utcnow() - timedelta(days=30),
+    )
+    await _add_saas_payment(db, other.id, 100, invoice=invoice, days_ago=2)
+    await _add_customer_payment(db, mine.id, 500, days_ago=2)
+
+    counting = _CountingSession(db)
+    await svc.compute_earnings(counting, period="30d")
+
+    # One aggregate per source covering BOTH windows, two lifetime sums, and
+    # the account names. (The settings read goes through db.get, not execute.)
+    # Fetching current and previous separately would make it 6.
+    assert counting.queries == 5, f"expected 5 queries, got {counting.queries}"
+
+
+async def test_query_count_does_not_grow_with_the_window(db):
+    other = await make_reseller(db)
+    invoice = await _add_invoice(
+        db, other.id, hotspot_charge=50, pppoe_charge=50,
+        period_start=datetime.utcnow() - timedelta(days=30),
+    )
+    await _add_saas_payment(db, other.id, 100, invoice=invoice, days_ago=2)
+
+    short = _CountingSession(db)
+    await svc.compute_earnings(short, period="7d")
+    long_ = _CountingSession(db)
+    await svc.compute_earnings(long_, period="1y")
+
+    assert short.queries == long_.queries
+
+
+async def test_repeat_loads_are_served_from_cache(db):
+    other = await make_reseller(db)
+    await _add_saas_payment(db, other.id, 100, days_ago=2)
+
+    first = _CountingSession(db)
+    await svc.compute_earnings(first, period="30d")
+    second = _CountingSession(db)
+    await svc.compute_earnings(second, period="30d")
+
+    assert first.queries > 0
+    assert second.queries == 0
+
+
+async def test_changing_accounts_invalidates_the_cache(db):
+    mine = await make_reseller(db)
+    await _add_customer_payment(db, mine.id, 700, days_ago=2)
+
+    before = await svc.compute_earnings(db, period="30d")
+    assert before["totals"]["reseller"] == 0
+
+    await svc.set_own_reseller_ids(db, [mine.id])
+    after = await svc.compute_earnings(db, period="30d")
+
+    assert after["totals"]["reseller"] == 700

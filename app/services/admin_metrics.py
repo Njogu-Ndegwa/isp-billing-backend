@@ -23,6 +23,7 @@ from app.db.models import (
     GrowthTarget,
 )
 from app.services.app_settings import get_setting, set_setting
+from app.core.cache import cache
 
 import logging
 
@@ -1279,6 +1280,11 @@ async def _compute_target_current(db: AsyncSession, target_id: str) -> float:
 # their own alongside the SaaS revenue other resellers pay us.
 OWN_RESELLER_IDS_SETTING = "admin_own_reseller_ids"
 
+# Short enough that the page still feels live, long enough that flipping
+# between ranges and back doesn't re-run the aggregates.
+EARNINGS_CACHE_PREFIX = "admin_earnings:"
+EARNINGS_CACHE_TTL = 90
+
 # Ordered as they stack in the chart, ground up.
 EARNING_STREAMS: list[dict[str, str]] = [
     {"key": "saas_hotspot", "label": "Hotspot commission", "group": "system"},
@@ -1329,6 +1335,8 @@ async def set_own_reseller_ids(db: AsyncSession, ids: list[int]) -> list[int]:
 
     cleaned = sorted(set(valid))
     await set_setting(db, OWN_RESELLER_IDS_SETTING, json.dumps(cleaned))
+    # Every cached window was computed against the old account list.
+    await cache.clear_pattern(EARNINGS_CACHE_PREFIX)
     return cleaned
 
 
@@ -1359,37 +1367,60 @@ def _granularity_for_span(days: int) -> str:
     return "month"
 
 
-def _split_saas_payment(
-    amount: float, hotspot_charge: Any, pppoe_charge: Any,
-) -> tuple[float, float, float]:
-    """Attribute one subscription payment across its invoice's charge lines.
+def _zero_streams() -> dict[str, float]:
+    return {"saas_hotspot": 0.0, "saas_pppoe": 0.0, "saas_other": 0.0, "reseller": 0.0}
 
-    Payments are pro-rated by the invoice's hotspot/PPPoE split so a partial
-    payment lands proportionally. Payments with no linked invoice (or an
-    invoice with no charges) can't be attributed and fall to "other".
+
+def _earnings_windows(span_days: int) -> tuple[date, date, date]:
+    """Whole-day (prev_start, cur_start, cur_end) for a span, cur_end exclusive.
+
+    Snapping to day boundaries keeps buckets whole and — more importantly —
+    lets one query cover both windows without losing precision at the seam,
+    since every row can be assigned to a window by date alone.
     """
-    hotspot = float(hotspot_charge or 0)
-    pppoe = float(pppoe_charge or 0)
-    total_charge = hotspot + pppoe
-    if total_charge <= 0:
-        return 0.0, 0.0, amount
-    return amount * hotspot / total_charge, amount * pppoe / total_charge, 0.0
+    cur_end = datetime.utcnow().date() + timedelta(days=1)
+    cur_start = cur_end - timedelta(days=span_days)
+    return cur_start - timedelta(days=span_days), cur_start, cur_end
 
 
-async def _earnings_series(
-    db: AsyncSession,
-    own_ids: list[int],
-    start: datetime,
-    end: datetime,
-    granularity: str,
-) -> tuple[list[dict[str, Any]], dict[str, float]]:
-    """Bucketed per-stream earnings plus per-stream totals for one window."""
+async def _earnings_daily(
+    db: AsyncSession, own_ids: list[int], start: date, end: date,
+) -> dict[date, dict[str, float]]:
+    """Per-day, per-stream totals across the whole span — two aggregate queries.
+
+    Both the current and previous window are fetched in one pass and sliced in
+    Python, and the hotspot/PPPoE split is done in SQL rather than by reading
+    every payment row. That keeps the result at one row per day instead of one
+    per payment, which is what makes the 1095-day window affordable.
+
+    Index use: the reseller filter leads on idx_cp_reseller_id, so this touches
+    only our own accounts' payments rather than scanning customer_payments.
+    """
+    daily: dict[date, dict[str, float]] = {}
+
+    def bucket(value: Any) -> dict[str, float]:
+        return daily.setdefault(_coerce_date(value), _zero_streams())
+
+    # Pro-rate each payment across its invoice's charge lines. A payment with
+    # no invoice (or an invoice with no charges) leaves `charged` at 0 and
+    # falls to "other" — the CASE guard also keeps us off a divide-by-zero.
+    hotspot = func.coalesce(SubscriptionInvoice.hotspot_charge, 0.0)
+    pppoe = func.coalesce(SubscriptionInvoice.pppoe_charge, 0.0)
+    charged = hotspot + pppoe
+    amount = SubscriptionPayment.amount
+
     saas_stmt = (
         select(
-            SubscriptionPayment.created_at,
-            SubscriptionPayment.amount,
-            SubscriptionInvoice.hotspot_charge,
-            SubscriptionInvoice.pppoe_charge,
+            func.date(SubscriptionPayment.created_at).label("d"),
+            func.coalesce(func.sum(
+                case((charged > 0, amount * hotspot / charged), else_=0.0)
+            ), 0.0).label("hotspot"),
+            func.coalesce(func.sum(
+                case((charged > 0, amount * pppoe / charged), else_=0.0)
+            ), 0.0).label("pppoe"),
+            func.coalesce(func.sum(
+                case((charged > 0, 0.0), else_=amount)
+            ), 0.0).label("other"),
         )
         .outerjoin(
             SubscriptionInvoice,
@@ -1400,27 +1431,17 @@ async def _earnings_series(
             SubscriptionPayment.created_at >= start,
             SubscriptionPayment.created_at < end,
         )
+        .group_by(func.date(SubscriptionPayment.created_at))
     )
     # Money we pay ourselves for our own reseller account isn't income.
     if own_ids:
         saas_stmt = saas_stmt.where(SubscriptionPayment.user_id.notin_(own_ids))
 
-    buckets: dict[date, dict[str, float]] = {}
-
-    def _bucket_for(value: Any) -> dict[str, float]:
-        key = _bucket_start(_coerce_date(value), granularity)
-        return buckets.setdefault(
-            key, {"saas_hotspot": 0.0, "saas_pppoe": 0.0, "saas_other": 0.0, "reseller": 0.0}
-        )
-
     for row in (await db.execute(saas_stmt)).all():
-        hotspot, pppoe, other = _split_saas_payment(
-            float(row.amount or 0), row.hotspot_charge, row.pppoe_charge,
-        )
-        bucket = _bucket_for(row.created_at)
-        bucket["saas_hotspot"] += hotspot
-        bucket["saas_pppoe"] += pppoe
-        bucket["saas_other"] += other
+        target = bucket(row.d)
+        target["saas_hotspot"] += float(row.hotspot or 0)
+        target["saas_pppoe"] += float(row.pppoe or 0)
+        target["saas_other"] += float(row.other or 0)
 
     if own_ids:
         reseller_rows = (await db.execute(
@@ -1437,15 +1458,31 @@ async def _earnings_series(
             .group_by(func.date(CustomerPayment.created_at))
         )).all()
         for row in reseller_rows:
-            _bucket_for(row.d)["reseller"] += float(row.rev or 0)
+            bucket(row.d)["reseller"] += float(row.rev or 0)
 
-    first = _bucket_start(start.date(), granularity)
-    last = _bucket_start((end - timedelta(microseconds=1)).date(), granularity)
+    return daily
+
+
+def _earnings_series(
+    daily: dict[date, dict[str, float]],
+    start: date,
+    end: date,
+    granularity: str,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """Fold the per-day rows falling in [start, end) into display buckets."""
+    buckets: dict[date, dict[str, float]] = {}
+    for day, values in daily.items():
+        if not (start <= day < end):
+            continue
+        target = buckets.setdefault(_bucket_start(day, granularity), _zero_streams())
+        for key, value in values.items():
+            target[key] += value
 
     series: list[dict[str, Any]] = []
-    totals = {"saas_hotspot": 0.0, "saas_pppoe": 0.0, "saas_other": 0.0, "reseller": 0.0}
+    totals = _zero_streams()
     cumulative = 0.0
-    cursor = first
+    cursor = _bucket_start(start, granularity)
+    last = _bucket_start(end - timedelta(days=1), granularity)
     while cursor <= last:
         values = buckets.get(cursor)
         point: dict[str, Any] = {
@@ -1455,10 +1492,10 @@ async def _earnings_series(
         bucket_total = 0.0
         for stream in EARNING_STREAMS:
             key = stream["key"]
-            amount = round(values[key], 2) if values else 0.0
-            point[key] = amount
-            totals[key] += amount
-            bucket_total += amount
+            value = round(values[key], 2) if values else 0.0
+            point[key] = value
+            totals[key] += value
+            bucket_total += value
         cumulative = round(cumulative + bucket_total, 2)
         point["total"] = round(bucket_total, 2)
         point["cumulative_total"] = cumulative
@@ -1506,22 +1543,27 @@ async def compute_earnings(
     Streams: the SaaS charges other resellers pay us (split into the hotspot
     commission and the per-PPPoE-user fee), and the gross collections of the
     reseller accounts we run ourselves.
+
+    Costs five queries on a cache miss: the settings lookup, one aggregate per
+    source covering both windows, two lifetime sums, and the account names.
+    Results are cached briefly — the dashboard refetches on every range change
+    and the numbers do not move second to second.
     """
     span = _earnings_span_days(period, days)
     granularity = _granularity_for_span(span)
+    cache_key = f"{EARNINGS_CACHE_PREFIX}{period}:{days or span}"
 
-    now = datetime.utcnow()
-    cur_start = now - timedelta(days=span)
-    prev_start = cur_start - timedelta(days=span)
+    cached = await cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    prev_start, cur_start, cur_end = _earnings_windows(span)
 
     own_ids = await get_own_reseller_ids(db)
 
-    current_series, current_totals = await _earnings_series(
-        db, own_ids, cur_start, now, granularity,
-    )
-    _, previous_totals = await _earnings_series(
-        db, own_ids, prev_start, cur_start, granularity,
-    )
+    daily = await _earnings_daily(db, own_ids, prev_start, cur_end)
+    current_series, current_totals = _earnings_series(daily, cur_start, cur_end, granularity)
+    _, previous_totals = _earnings_series(daily, prev_start, cur_start, granularity)
     all_time = await _earnings_all_time(db, own_ids)
 
     current_groups = _group_totals(current_totals)
@@ -1535,12 +1577,12 @@ async def compute_earnings(
         if stream["key"] != "saas_other" or current_totals["saas_other"] > 0
     ]
 
-    return {
+    payload = {
         "period": period,
         "days": span,
         "granularity": granularity,
-        "start_date": cur_start.date().isoformat(),
-        "end_date": now.date().isoformat(),
+        "start_date": cur_start.isoformat(),
+        "end_date": (cur_end - timedelta(days=1)).isoformat(),
         "streams": streams,
         "totals": {**current_totals, **current_groups},
         "previous_totals": {**previous_totals, **previous_groups},
@@ -1554,3 +1596,5 @@ async def compute_earnings(
         "series": current_series,
         "own_reseller_accounts": await own_reseller_accounts(db, own_ids),
     }
+    await cache.set(cache_key, payload, EARNINGS_CACHE_TTL)
+    return payload
