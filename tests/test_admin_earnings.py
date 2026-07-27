@@ -14,6 +14,7 @@ TDD order:
   7. window/granularity resolution
 """
 
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -105,17 +106,31 @@ async def test_own_reseller_ids_default_to_empty(db):
 
 async def test_own_reseller_ids_round_trip(db):
     mine = await make_reseller(db)
-    saved = await svc.set_own_reseller_ids(db, [mine.id])
+    saved, rejected = await svc.set_own_reseller_ids(db, [mine.id])
 
     assert saved == [mine.id]
+    assert rejected == []
     assert await svc.get_own_reseller_ids(db) == [mine.id]
 
 
-async def test_set_own_reseller_ids_drops_unknown_ids(db):
+async def test_non_reseller_ids_are_reported_not_swallowed(db):
+    """A silently dropped ID looks exactly like "never configured"."""
     mine = await make_reseller(db)
-    saved = await svc.set_own_reseller_ids(db, [mine.id, 999_999])
+    saved, rejected = await svc.set_own_reseller_ids(db, [mine.id, 999_999])
 
     assert saved == [mine.id]
+    assert rejected == [999_999]
+
+
+async def test_an_admin_account_is_rejected_as_an_own_reseller(db):
+    """The likeliest real cause: picking an account whose role isn't RESELLER."""
+    from app.db.models import UserRole
+
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    saved, rejected = await svc.set_own_reseller_ids(db, [admin.id])
+
+    assert saved == []
+    assert rejected == [admin.id]
 
 
 async def test_get_own_reseller_ids_survives_malformed_setting(db):
@@ -406,6 +421,43 @@ async def test_repeat_loads_are_served_from_cache(db):
 
     assert first.queries > 0
     assert second.queries == 0
+
+
+async def test_cache_key_varies_with_the_account_set():
+    """`cache` is per-process, so the key must carry the accounts.
+
+    Otherwise a multi-worker deploy (uvicorn --workers) leaves every worker
+    that didn't serve the PUT holding the old account list until the TTL runs
+    out — a reseller band reading zero for no visible reason.
+    """
+    a = svc._earnings_cache_key("30d", None, [1])
+    b = svc._earnings_cache_key("30d", None, [2])
+    none = svc._earnings_cache_key("30d", None, [])
+
+    assert a != b != none
+    assert a == svc._earnings_cache_key("30d", None, [1])
+
+
+async def test_ad_hoc_day_windows_are_not_cached():
+    """`days` spans 1..1095 and nothing evicts an entry never read again."""
+    assert svc._earnings_cache_key("30d", 45, []) is None
+    assert svc._earnings_cache_key("30d", None, []) is not None
+
+
+async def test_account_change_is_seen_without_an_explicit_purge(db):
+    """Proves the key alone is enough — no reliance on clear_pattern reaching us."""
+    from app.services.app_settings import set_setting
+
+    mine = await make_reseller(db)
+    await _add_customer_payment(db, mine.id, 1_300, days_ago=2)
+
+    assert (await svc.compute_earnings(db, period="30d"))["totals"]["reseller"] == 0
+
+    # Write the setting directly, as a worker that never handled the PUT would
+    # see it — no cache purge runs in this process.
+    await set_setting(db, svc.OWN_RESELLER_IDS_SETTING, json.dumps([mine.id]))
+
+    assert (await svc.compute_earnings(db, period="30d"))["totals"]["reseller"] == 1_300
 
 
 async def test_changing_accounts_invalidates_the_cache(db):

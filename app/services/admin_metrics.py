@@ -1388,6 +1388,30 @@ OWN_RESELLER_IDS_SETTING = "admin_own_reseller_ids"
 EARNINGS_CACHE_PREFIX = "admin_earnings:"
 EARNINGS_CACHE_TTL = 90
 
+
+def _earnings_cache_key(
+    period: str, days: int | None, own_ids: list[int],
+) -> str | None:
+    """Cache key for a window, or None when the result shouldn't be cached.
+
+    The account list is part of the key rather than something we invalidate
+    around it. `cache` is per-process, so a `clear_pattern` on the PUT only
+    reaches the worker that served it — run uvicorn with `--workers` and the
+    others would keep serving the old account list until the TTL expired,
+    which is the "reseller band reads zero" confusion all over again and far
+    harder to spot. Keying by accounts makes a change miss everywhere at once.
+
+    Ad-hoc `days` windows aren't cached at all: `days` spans 1..1095, nothing
+    evicts an entry that is never read again, and one key per day value is an
+    unbounded hold on memory for windows nobody revisits. The four named
+    periods are what the UI actually uses, so the key space stays at four per
+    account set.
+    """
+    if days:
+        return None
+    accounts = ",".join(str(i) for i in own_ids) or "none"
+    return f"{EARNINGS_CACHE_PREFIX}{period}:{accounts}"
+
 # Ordered as they stack in the chart, ground up.
 EARNING_STREAMS: list[dict[str, str]] = [
     {"key": "saas_hotspot", "label": "Hotspot commission", "group": "system"},
@@ -1419,8 +1443,14 @@ async def get_own_reseller_ids(db: AsyncSession) -> list[int]:
     return sorted(ids)
 
 
-async def set_own_reseller_ids(db: AsyncSession, ids: list[int]) -> list[int]:
-    """Persist the admin's own reseller accounts, dropping non-reseller IDs."""
+async def set_own_reseller_ids(db: AsyncSession, ids: list[int]) -> tuple[list[int], list[int]]:
+    """Persist the admin's own reseller accounts.
+
+    Returns (saved, rejected). IDs that aren't resellers are rejected rather
+    than dropped in silence — swallowing them saves an empty list while the UI
+    reports success, which is indistinguishable from "never configured" and
+    leaves the reseller band reading zero with nothing to explain it.
+    """
     requested: set[int] = set()
     for value in ids:
         try:
@@ -1428,19 +1458,24 @@ async def set_own_reseller_ids(db: AsyncSession, ids: list[int]) -> list[int]:
         except (TypeError, ValueError):
             continue
 
-    valid: list[int] = []
+    valid: set[int] = set()
     if requested:
-        valid = list((await db.execute(
+        valid = set((await db.execute(
             select(User.id).where(
                 User.id.in_(requested), User.role == UserRole.RESELLER,
             )
         )).scalars().all())
 
-    cleaned = sorted(set(valid))
+    cleaned = sorted(valid)
+    rejected = sorted(requested - valid)
     await set_setting(db, OWN_RESELLER_IDS_SETTING, json.dumps(cleaned))
     # Every cached window was computed against the old account list.
     await cache.clear_pattern(EARNINGS_CACHE_PREFIX)
-    return cleaned
+    if rejected:
+        logger.warning(
+            "Earnings accounts: ignored non-reseller IDs %s", rejected,
+        )
+    return cleaned, rejected
 
 
 async def own_reseller_accounts(db: AsyncSession, ids: list[int]) -> list[dict[str, Any]]:
@@ -1654,19 +1689,22 @@ async def compute_earnings(
     """
     span = _earnings_span_days(period, days)
     granularity = _granularity_for_span(span)
-    cache_key = f"{EARNINGS_CACHE_PREFIX}{period}:{days or span}"
 
-    cached = await cache.get(cache_key)
-    if cached is not None:
-        # Auth already opened a transaction. Close it rather than sit "idle in
-        # transaction" for the whole response — the pool is 15+15 with a 10s
-        # checkout timeout, and this path does no further reads.
-        await db.commit()
-        return cached
+    # Read first: the account set is part of the cache key. This is a
+    # single-row primary-key lookup, far cheaper than the aggregates it guards.
+    own_ids = await get_own_reseller_ids(db)
+    cache_key = _earnings_cache_key(period, days, own_ids)
+
+    if cache_key:
+        cached = await cache.get(cache_key)
+        if cached is not None:
+            # Auth already opened a transaction. Close it rather than sit "idle
+            # in transaction" for the whole response — the pool is 15+15 with a
+            # 10s checkout timeout, and this path does no further reads.
+            await db.commit()
+            return cached
 
     prev_start, cur_start, cur_end = _earnings_windows(span)
-
-    own_ids = await get_own_reseller_ids(db)
 
     daily = await _earnings_daily(db, own_ids, prev_start, cur_end)
     current_series, current_totals = _earnings_series(daily, cur_start, cur_end, granularity)
@@ -1707,5 +1745,6 @@ async def compute_earnings(
         "series": current_series,
         "own_reseller_accounts": accounts,
     }
-    await cache.set(cache_key, payload, EARNINGS_CACHE_TTL)
+    if cache_key:
+        await cache.set(cache_key, payload, EARNINGS_CACHE_TTL)
     return payload

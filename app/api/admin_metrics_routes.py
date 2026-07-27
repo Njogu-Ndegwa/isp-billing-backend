@@ -369,7 +369,17 @@ async def admin_set_own_reseller_accounts(
 ):
     """Choose which reseller accounts count as ours in the earnings view."""
     await _require_admin(token, db)
-    saved = await svc.set_own_reseller_ids(db, body.reseller_ids)
+    saved, rejected = await svc.set_own_reseller_ids(db, body.reseller_ids)
+    if rejected:
+        # Saving nothing while reporting success is what makes a zero reseller
+        # band impossible to explain — fail loudly instead.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Not saved: {len(rejected)} account(s) are not resellers "
+                f"(IDs {rejected}). Nothing was changed for them."
+            ),
+        )
     return {
         "reseller_ids": saved,
         "accounts": await svc.own_reseller_accounts(db, saved),
