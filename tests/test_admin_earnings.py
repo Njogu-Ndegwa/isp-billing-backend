@@ -105,17 +105,31 @@ async def test_own_reseller_ids_default_to_empty(db):
 
 async def test_own_reseller_ids_round_trip(db):
     mine = await make_reseller(db)
-    saved = await svc.set_own_reseller_ids(db, [mine.id])
+    saved, rejected = await svc.set_own_reseller_ids(db, [mine.id])
 
     assert saved == [mine.id]
+    assert rejected == []
     assert await svc.get_own_reseller_ids(db) == [mine.id]
 
 
-async def test_set_own_reseller_ids_drops_unknown_ids(db):
+async def test_non_reseller_ids_are_reported_not_swallowed(db):
+    """A silently dropped ID looks exactly like "never configured"."""
     mine = await make_reseller(db)
-    saved = await svc.set_own_reseller_ids(db, [mine.id, 999_999])
+    saved, rejected = await svc.set_own_reseller_ids(db, [mine.id, 999_999])
 
     assert saved == [mine.id]
+    assert rejected == [999_999]
+
+
+async def test_an_admin_account_is_rejected_as_an_own_reseller(db):
+    """The likeliest real cause: picking an account whose role isn't RESELLER."""
+    from app.db.models import UserRole
+
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    saved, rejected = await svc.set_own_reseller_ids(db, [admin.id])
+
+    assert saved == []
+    assert rejected == [admin.id]
 
 
 async def test_get_own_reseller_ids_survives_malformed_setting(db):

@@ -1419,8 +1419,14 @@ async def get_own_reseller_ids(db: AsyncSession) -> list[int]:
     return sorted(ids)
 
 
-async def set_own_reseller_ids(db: AsyncSession, ids: list[int]) -> list[int]:
-    """Persist the admin's own reseller accounts, dropping non-reseller IDs."""
+async def set_own_reseller_ids(db: AsyncSession, ids: list[int]) -> tuple[list[int], list[int]]:
+    """Persist the admin's own reseller accounts.
+
+    Returns (saved, rejected). IDs that aren't resellers are rejected rather
+    than dropped in silence — swallowing them saves an empty list while the UI
+    reports success, which is indistinguishable from "never configured" and
+    leaves the reseller band reading zero with nothing to explain it.
+    """
     requested: set[int] = set()
     for value in ids:
         try:
@@ -1428,19 +1434,24 @@ async def set_own_reseller_ids(db: AsyncSession, ids: list[int]) -> list[int]:
         except (TypeError, ValueError):
             continue
 
-    valid: list[int] = []
+    valid: set[int] = set()
     if requested:
-        valid = list((await db.execute(
+        valid = set((await db.execute(
             select(User.id).where(
                 User.id.in_(requested), User.role == UserRole.RESELLER,
             )
         )).scalars().all())
 
-    cleaned = sorted(set(valid))
+    cleaned = sorted(valid)
+    rejected = sorted(requested - valid)
     await set_setting(db, OWN_RESELLER_IDS_SETTING, json.dumps(cleaned))
     # Every cached window was computed against the old account list.
     await cache.clear_pattern(EARNINGS_CACHE_PREFIX)
-    return cleaned
+    if rejected:
+        logger.warning(
+            "Earnings accounts: ignored non-reseller IDs %s", rejected,
+        )
+    return cleaned, rejected
 
 
 async def own_reseller_accounts(db: AsyncSession, ids: list[int]) -> list[dict[str, Any]]:
