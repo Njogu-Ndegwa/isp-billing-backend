@@ -6,6 +6,22 @@ This file is the handoff map for coding agents working in this repository. Keep 
 
 - Any backend schema change must be wired into an idempotent startup migration in `main.py` and verified as part of the server restart path. A standalone script in `migrations/` is useful for manual repair/backfill, but it is never sufficient on its own.
 
+- **This rule is now enforced by CI, not trust** (`tests/test_schema_migrations.py`, added
+  2026-07-28). A baseline of every table and column lives in `tests/schema_snapshot.json`, and
+  four guards fail the build on: schema drift that hasn't been acknowledged; a column added to
+  a table that already exists in production with no `ADD COLUMN` in `main.py`; a new table
+  nothing creates at startup; and any `ADD COLUMN` that isn't idempotent.
+- Workflow when you change a model: CI fails and names the columns → write the idempotent
+  migration in `main.py` → `python scripts/schema_snapshot.py --write` → commit the refreshed
+  baseline **in the same change**.
+- Why the guard is needed at all: `Base.metadata.create_all()` only creates tables that are
+  MISSING and never alters an existing one, so a new column on a live table is invisible to
+  it — and this app never calls it over the full metadata anyway (both call sites pass an
+  explicit `tables=` list). New tables and new columns both need deliberate wiring.
+- Three idempotency patterns are accepted, all in use: `ADD COLUMN IF NOT EXISTS`; a plain
+  `ADD COLUMN` behind an `information_schema` existence check; and one inside
+  `DO $$ ... EXCEPTION WHEN duplicate_column`.
+
 ## Worktree Rule
 
 - ALL agents do implementation work from a dedicated git worktree, ALWAYS — even for
