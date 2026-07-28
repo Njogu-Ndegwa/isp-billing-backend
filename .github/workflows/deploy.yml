@@ -3,6 +3,22 @@ name: Build and Deploy
 on:
   push:
     branches: [main]
+    # Skip the deploy when a push touches ONLY files that cannot reach the
+    # running container. Every deploy rebuilds the image and restarts the app
+    # for ~40s of refused requests — customers mid-payment feel that — and
+    # because requirements.txt is unpinned and the build is --no-cache, it also
+    # re-resolves the whole dependency stack. On 2026-07-28 three merges
+    # deployed production and only one contained app code.
+    #
+    # Anything that CAN reach the container is deliberately absent from this
+    # list and still deploys: app/**, main.py, scripts/**, requirements*.txt,
+    # Dockerfile, docker-compose.yml, and this workflow itself.
+    # Tests still run on everything — tests.yml has no path filter.
+    paths-ignore:
+      - '.claude/**'
+      - 'docs/**'
+      - '**/*.md'
+  # Manual escape hatch: deploy any time regardless of what changed.
   workflow_dispatch:
 
 env:
