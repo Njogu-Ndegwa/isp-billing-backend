@@ -22,7 +22,11 @@ async def test_new_columns_exist_and_default(db):
     assert s.welcome_message_body is None
     assert s.welcome_support_phone is None
 
-    row = SmsMessage(user_id=1, recipient_phone="254700000000", body="hi",
+    # A real reseller, not a hardcoded id: sms_messages.user_id is a foreign key.
+    # SQLite does not enforce foreign keys by default, so this row was an orphan
+    # and the test passed anyway; Postgres rejects it outright.
+    owner = await make_reseller(db)
+    row = SmsMessage(user_id=owner.id, recipient_phone="254700000000", body="hi",
                      segments=1, credits_charged=1,
                      kind=SmsMessageKind.ADMIN_TO_RESELLER,
                      status=SmsMessageStatus.QUEUED, category="reseller_welcome")

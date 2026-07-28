@@ -68,9 +68,25 @@ async def _fresh_postgres_engine():
     async with eng.begin() as conn:
         # checkfirst is on by default, so this is a no-op after the first test.
         await conn.run_sync(db_module.Base.metadata.create_all)
-        tables = ", ".join(
-            f'"{t.name}"' for t in db_module.Base.metadata.sorted_tables
-        )
+
+        known = {t.name for t in db_module.Base.metadata.sorted_tables}
+
+        # Drop scratch tables that tests build themselves with raw DDL. The
+        # radius_* tables have no ORM model, and two test modules create
+        # radius_check with DIFFERENT columns using CREATE TABLE IF NOT EXISTS.
+        # A fresh database per test hid that forever; on a persistent one,
+        # whichever module runs first wins and the other fails on a missing
+        # column. Dropping them restores the isolation SQLite gave us for free.
+        stray = [
+            row[0] for row in (await conn.execute(sa_text(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            ))).all()
+            if row[0] not in known
+        ]
+        for name in stray:
+            await conn.execute(sa_text(f'DROP TABLE IF EXISTS "{name}" CASCADE'))
+
+        tables = ", ".join(f'"{t.name}"' for t in db_module.Base.metadata.sorted_tables)
         if tables:
             # RESTART IDENTITY so sequence-generated ids don't leak between
             # tests; CASCADE because these tables reference each other.
