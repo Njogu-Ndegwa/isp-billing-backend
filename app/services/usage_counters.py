@@ -69,6 +69,7 @@ async def record_queue_usage_sample(
     max_limit: str = "",
     now: Optional[datetime] = None,
     legacy_keys: Optional[Iterable[str]] = None,
+    first_sample_is_total: bool = False,
 ) -> UsageCounterUpdate:
     """Persist one cumulative queue sample and roll its delta into the period.
 
@@ -76,6 +77,12 @@ async def record_queue_usage_sample(
     normalized MAC for hotspot queues and ``pppoe:<username>`` for PPPoE
     dynamic queues.  ``legacy_keys`` lets callers find old rows stored under a
     compact or raw MAC form, then normalize them in-place.
+
+    ``first_sample_is_total`` changes what an unseen queue means. Polling cannot
+    know how much traffic preceded the first sample it happens to catch, so it
+    records a baseline and counts nothing — the default. A router's on-logout
+    report is different: it carries the whole session total and there is nothing
+    before it, so the first sample IS the usage. Only the push channel sets this.
     """
     now = now or datetime.utcnow()
     keys = [queue_key]
@@ -108,8 +115,8 @@ async def record_queue_usage_sample(
             usage.customer_id = customer.id
     else:
         created = True
-        delta_up = 0
-        delta_dn = 0
+        delta_up = upload_bytes if first_sample_is_total else 0
+        delta_dn = download_bytes if first_sample_is_total else 0
         reset_detected = False
         usage = UserBandwidthUsage(
             mac_address=queue_key,
