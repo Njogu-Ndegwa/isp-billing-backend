@@ -70,10 +70,36 @@
   "name",
   "phone_number"
  ],
+ "agent_runs": [
+  "agent",
+  "ended_at",
+  "heartbeat_at",
+  "id",
+  "outcome",
+  "session_surface",
+  "session_url",
+  "started_at",
+  "summary",
+  "tokens",
+  "work_item_id"
+ ],
  "app_settings": [
   "key",
   "updated_at",
   "value"
+ ],
+ "approvals": [
+  "created_at",
+  "decided_at",
+  "decided_by",
+  "id",
+  "kind",
+  "note",
+  "payload",
+  "proposed_by",
+  "status",
+  "subject",
+  "work_item_id"
  ],
  "b2b_transactions": [
   "account_reference",
@@ -866,6 +892,24 @@
   "status",
   "user_id",
   "voucher_type"
+ ],
+ "work_items": [
+  "blocked_reason",
+  "branch",
+  "code",
+  "completed_at",
+  "created_at",
+  "detail",
+  "id",
+  "owner",
+  "pr_url",
+  "priority",
+  "session_surface",
+  "session_url",
+  "source",
+  "status",
+  "title",
+  "updated_at"
  ],
  "zenopay_transactions": [
   "amount",

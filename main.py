@@ -61,6 +61,7 @@ from app.api.messaging_routes import router as messaging_router
 from app.api.admin_messaging_routes import router as admin_messaging_router
 from app.api.feedback_routes import router as feedback_router
 from app.api.admin_feedback_routes import router as admin_feedback_router
+from app.api.agent_board_routes import router as agent_board_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -100,6 +101,7 @@ app.include_router(messaging_router)
 app.include_router(admin_messaging_router)
 app.include_router(feedback_router)
 app.include_router(admin_feedback_router)
+app.include_router(agent_board_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -1618,6 +1620,39 @@ async def run_portal_settings_migrations():
     logger.info("Portal settings table ready")
 
 
+async def run_agent_queue_migrations():
+    """Create the agent work-queue tables (idempotent).
+
+    work_items / agent_runs / approvals back the admin agent board — the place
+    that answers "what is being worked on, and what needs me?" without asking an
+    agent. `create(checkfirst=True)` issues CREATE TABLE only when the table is
+    absent, so this is safe on every boot.
+    """
+    async with async_engine.begin() as conn:
+        from app.db.models import WorkItem, AgentRun, Approval
+
+        for model in (WorkItem, AgentRun, Approval):
+            await conn.run_sync(
+                lambda c, m=model: m.__table__.create(c, checkfirst=True)
+            )
+
+        # The board's two hot reads: the open queue by priority, and everything
+        # still waiting on Dennis.
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_work_items_status_priority "
+            "ON work_items(status, priority DESC, created_at DESC)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_agent_runs_started "
+            "ON agent_runs(started_at DESC)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_approvals_pending "
+            "ON approvals(status, created_at DESC)"
+        ))
+    logger.info("Agent work-queue tables ready")
+
+
 async def run_shop_migrations():
     """Create shop tables (idempotent)."""
     async with async_engine.begin() as conn:
@@ -2172,6 +2207,12 @@ async def startup_event():
         logger.info("Portal settings migrations completed successfully")
     except Exception as e:
         logger.error(f"Portal settings migration failed (non-fatal): {e}")
+
+    try:
+        await run_agent_queue_migrations()
+        logger.info("Agent work-queue migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Agent work-queue migration failed (non-fatal): {e}")
 
     try:
         await run_c2b_migrations()
