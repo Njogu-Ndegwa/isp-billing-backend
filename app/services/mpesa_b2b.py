@@ -21,6 +21,7 @@ from app.db.database import AsyncSessionLocal
 from app.db.models import (
     B2BTransaction,
     B2BTransactionStatus,
+    CollectionMode,
     CustomerPayment,
     PaymentMethod,
     PaymentStatus,
@@ -1013,10 +1014,36 @@ async def run_b2b_status_reconciliation():
 
 MPESA_FILTER = CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY
 
+# The platform only owes a reseller money it actually collected on their
+# behalf, so the payout-balance revenue side counts a payment only when it is
+# mobile money AND completed AND revenue-bearing AND not collected DIRECTly
+# into the reseller's own paybill/till (C2B to a reseller-registered
+# shortcode stamps CollectionMode.DIRECT — that cash never touched the
+# platform, and counting it made the B2B job pay it out a second time).
+#
+# NULL-safety matters in both directions:
+#   * collection_mode is NULL on legacy rows and on system-credential STK
+#     payments (only the C2B paths stamp it) — NULL must keep counting, or
+#     every reseller's historical balance would vanish.
+#   * status has an ORM default of COMPLETED but no server default — treat a
+#     NULL status as completed rather than silently shorting a reseller.
+PAYOUT_REVENUE_FILTERS = (
+    MPESA_FILTER,
+    or_(
+        CustomerPayment.status.is_(None),
+        CustomerPayment.status == PaymentStatus.COMPLETED,
+    ),
+    CustomerPayment.counts_as_revenue == True,  # noqa: E712 — SQL expression
+    or_(
+        CustomerPayment.collection_mode.is_(None),
+        CustomerPayment.collection_mode != CollectionMode.DIRECT,
+    ),
+)
+
 
 async def _mpesa_revenue(db: AsyncSession, reseller_id: int) -> float:
     stmt = select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
-        CustomerPayment.reseller_id == reseller_id, MPESA_FILTER
+        CustomerPayment.reseller_id == reseller_id, *PAYOUT_REVENUE_FILTERS
     )
     return float((await db.execute(stmt)).scalar())
 

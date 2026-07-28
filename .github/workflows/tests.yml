@@ -1,0 +1,50 @@
+# Backend test suite. Runs on every push and PR; deploy.yml is untouched and
+# independent. Python version matches the Dockerfile (python:3.13-slim).
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # Database Session Discipline guard (AGENTS.md): fails the build when a
+      # DB session opened via async_session()/AsyncSessionLocal() is held
+      # across RouterOS/httpx/payment-provider/sleep/to_thread I/O — the #1
+      # cause of production DB-pool outages. False positives go in
+      # scripts/session_discipline_allowlist.txt with a justification.
+      - name: Session discipline guard
+        run: python scripts/check_session_discipline.py
+
+      # No -x: a review gate should report EVERY failure in one run, not stop at
+      # the first and hide what else is broken. --tb=short keeps the log readable.
+      - name: Run tests
+        run: pytest -q --tb=short --junitxml=pytest-report.xml
+
+      # Renders the run as a pass/fail table on the Actions summary page, naming
+      # any failing test, so the result is readable without opening the log.
+      # always(): the summary matters most when the step above just failed.
+      - name: Test summary
+        if: always()
+        run: python scripts/ci_test_summary.py pytest-report.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: pytest-report.xml
+          if-no-files-found: ignore
