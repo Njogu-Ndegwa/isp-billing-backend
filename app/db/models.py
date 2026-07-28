@@ -1862,3 +1862,146 @@ class FeedbackComment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", foreign_keys=[user_id])
+
+
+# ---------------------------------------------------------------------------
+# Agent work queue — the control surface for the agentic company.
+#
+# Before these tables, the state of agent work lived in a dozen places: markdown
+# queues, a markdown ledger, a drafts log, git branches, GitHub PRs, published
+# artifacts and a session-only cron job. None of them was somewhere Dennis
+# actually looks, so "what is being worked on and what needs me?" could only be
+# answered by asking an agent. These three tables are that answer, in the
+# database he already runs, surfaced in the admin panel he already opens.
+#
+# Design note — why plain strings, not PG enums, for status/source/kind:
+# these are workflow labels that will change as the desks evolve, and
+# `ALTER TYPE ... ADD VALUE` is a migration hazard with no upside for internal
+# bookkeeping. The permitted values live beside each model and are validated at
+# the API boundary instead.
+# ---------------------------------------------------------------------------
+
+# Deliberately spans every desk, not just the software factory: the same board
+# carries a reseller's bug report, a router incident, a content batch for TikTok
+# and a payments sweep. `agent_runs.agent` is likewise free text, so a new desk
+# needs no schema change — only a name.
+WORK_ITEM_SOURCES = (
+    "feedback", "backlog", "whatsapp", "incident", "content", "payments", "manual",
+)
+WORK_ITEM_STATUSES = ("queued", "in_progress", "blocked", "in_review", "done", "cancelled")
+WORK_ITEM_OPEN_STATUSES = ("queued", "in_progress", "blocked", "in_review")
+AGENT_RUN_OUTCOMES = ("running", "green", "blocked", "failed", "skipped")
+APPROVAL_KINDS = ("whatsapp_reply", "pr_merge", "router_change", "payment", "other")
+APPROVAL_STATUSES = ("pending", "approved", "rejected", "expired")
+
+
+class WorkItem(Base):
+    """One unit of work an agent is doing, or waiting to do."""
+
+    __tablename__ = "work_items"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Human-facing handle carried over from the markdown queue (e.g. "PKT-001").
+    code = Column(String(32), unique=True, nullable=True, index=True)
+    title = Column(String(300), nullable=False)
+    detail = Column(String(4000), nullable=True)
+    source = Column(String(32), nullable=False, default="manual", server_default="manual")
+    status = Column(String(32), nullable=False, default="queued",
+                    server_default="queued", index=True)
+    # Who holds it right now: "agent", "dennis", or NULL when unclaimed.
+    owner = Column(String(64), nullable=True)
+    priority = Column(Integer, nullable=False, default=0, server_default="0")
+    branch = Column(String(200), nullable=True)
+    pr_url = Column(String(300), nullable=True)
+    blocked_reason = Column(String(500), nullable=True)
+    # Where the actual conversation lives, so the board can hand you back to it.
+    # A row is not a conversation: steering means sending a message into the
+    # session that holds the context, so the board stores the pointer rather
+    # than pretending to be a chat UI. Cloud sessions (claude.ai/code) are the
+    # ones reachable from a phone; a local CLI session cannot be joined
+    # remotely, which is itself worth seeing on the board.
+    session_url = Column(String(500), nullable=True)
+    session_surface = Column(String(32), nullable=True)  # cloud | cli | scheduled
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class AgentRun(Base):
+    """One execution of one agent — the ledger, as rows instead of markdown."""
+
+    __tablename__ = "agent_runs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent = Column(String(64), nullable=False, index=True)
+    work_item_id = Column(Integer, ForeignKey("work_items.id", ondelete="SET NULL"),
+                          nullable=True, index=True)
+    outcome = Column(String(32), nullable=False, default="running",
+                     server_default="running")
+    summary = Column(String(4000), nullable=True)
+    tokens = Column(Integer, nullable=True)
+    # Same reasoning as WorkItem.session_url: a finished run should still hand
+    # you back to the transcript that produced it.
+    session_url = Column(String(500), nullable=True)
+    session_surface = Column(String(32), nullable=True)  # cloud | cli | scheduled
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
+    ended_at = Column(DateTime, nullable=True)
+    # A run that started and never ended is EITHER still working OR dead, and
+    # those look identical without this. Long-running agents touch it as they
+    # go; the board treats a stale heartbeat as "no longer trustworthy" rather
+    # than quietly showing work that stopped hours ago.
+    heartbeat_at = Column(DateTime, nullable=True)
+
+
+class AgentSchedule(Base):
+    """A standing cadence — what the assistant does without being asked.
+
+    Runs and work items answer "what happened". This answers "what is SUPPOSED
+    to happen", which is the only way to notice that something stopped. On
+    2026-07-27 the nightly factory claimed a packet and silently produced
+    nothing; there was no record that it was meant to run at all, so the failure
+    was invisible until someone went looking a day later.
+
+    `expected_interval_minutes` is what makes silence detectable: a schedule
+    whose last run is older than twice its interval is reported overdue rather
+    than assumed healthy.
+    """
+
+    __tablename__ = "agent_schedules"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(120), unique=True, nullable=False)
+    agent = Column(String(64), nullable=False)
+    description = Column(String(500), nullable=True)
+    cadence = Column(String(120), nullable=True)      # human: "hourly at :13"
+    cron_expr = Column(String(120), nullable=True)    # machine: "13 * * * *"
+    expected_interval_minutes = Column(Integer, nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Where it runs, which decides whether it survives closing a laptop:
+    # session (dies with the Claude Code session) | server | cloud
+    surface = Column(String(32), nullable=True)
+    last_run_at = Column(DateTime, nullable=True)
+    last_outcome = Column(String(32), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Approval(Base):
+    """Something an agent wants to do that only Dennis may authorise.
+
+    Money moves, router writes and outbound messages are capped at
+    act-with-approval permanently, so this table is the queue that gate feeds.
+    """
+
+    __tablename__ = "approvals"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    kind = Column(String(32), nullable=False)
+    subject = Column(String(300), nullable=False)
+    payload = Column(String(4000), nullable=True)
+    proposed_by = Column(String(64), nullable=False, default="agent",
+                         server_default="agent")
+    status = Column(String(32), nullable=False, default="pending",
+                    server_default="pending", index=True)
+    work_item_id = Column(Integer, ForeignKey("work_items.id", ondelete="SET NULL"),
+                          nullable=True, index=True)
+    note = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    decided_at = Column(DateTime, nullable=True)
+    decided_by = Column(String(64), nullable=True)
