@@ -65,6 +65,71 @@ async def test_board_is_admin_only(db, client, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# The migration actually runs
+#
+# test_app_boot proves main.py IMPORTS. It deliberately does not run the
+# @app.on_event("startup") handler, which is where every migration lives — so
+# until now nothing verified that a startup migration executes at all, only that
+# one had been written. This executes it, against a database where the tables
+# have been dropped, and then executes it a SECOND time, because startup runs on
+# every boot and a non-idempotent migration crashes the app the next time it
+# restarts.
+#
+# Limitation, stated plainly: this runs on SQLite. `create(checkfirst=True)` and
+# `CREATE INDEX IF NOT EXISTS` are portable, so it is real evidence for THIS
+# migration; it is not evidence for the Postgres-specific migrations that use
+# information_schema or DO blocks, which cannot execute here.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_agent_queue_migration_runs_and_is_idempotent(engine, monkeypatch):
+    from sqlalchemy import text as sa_text
+
+    import main
+
+    # main.py binds async_engine at import, so rebinding the module attribute in
+    # conftest is not enough — point main itself at the test engine.
+    monkeypatch.setattr(main, "async_engine", engine)
+
+    tables = ("approvals", "agent_runs", "work_items")
+
+    # conftest's create_all already built them; drop them so we are proving the
+    # MIGRATION creates the schema, not that the fixture did.
+    async with engine.begin() as conn:
+        for table in tables:
+            await conn.execute(sa_text(f"DROP TABLE IF EXISTS {table}"))
+
+    async with engine.connect() as conn:
+        present = await conn.run_sync(
+            lambda c: __import__("sqlalchemy").inspect(c).get_table_names()
+        )
+    assert not any(t in present for t in tables), "precondition: tables dropped"
+
+    await main.run_agent_queue_migrations()
+
+    async with engine.connect() as conn:
+        present = await conn.run_sync(
+            lambda c: __import__("sqlalchemy").inspect(c).get_table_names()
+        )
+    for table in tables:
+        assert table in present, f"startup migration did not create {table}"
+
+    # Second boot. A bare CREATE TABLE here would raise and crash-loop the app.
+    await main.run_agent_queue_migrations()
+
+    # And the schema is usable, not just present.
+    async with engine.begin() as conn:
+        await conn.execute(sa_text(
+            "INSERT INTO work_items (title, source, status, priority) "
+            "VALUES ('post-migration write', 'manual', 'queued', 0)"
+        ))
+        count = (await conn.execute(
+            sa_text("SELECT COUNT(*) FROM work_items")
+        )).scalar()
+    assert count == 1
+
+
+# --------------------------------------------------------------------------- #
 # Work items
 # --------------------------------------------------------------------------- #
 
