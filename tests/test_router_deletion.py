@@ -90,10 +90,18 @@ async def test_delete_router_requires_force_when_customers_exist(db, monkeypatch
 
 
 async def test_force_delete_router_preserves_customer_money_history_and_cleans_dependents(db, monkeypatch):
-    await db.execute(text("PRAGMA foreign_keys=ON"))
-    await db.execute(text("""
+    # radius_nas has no ORM model, so the test builds it. The DDL must suit the
+    # backend: SQLite needs FK enforcement switched on explicitly (it is OFF by
+    # default, which is exactly why this test asked for it) and spells
+    # auto-increment differently from Postgres, where foreign keys are always
+    # enforced.
+    on_sqlite = db.bind.dialect.name == "sqlite"
+    if on_sqlite:
+        await db.execute(text("PRAGMA foreign_keys=ON"))
+    pk = "INTEGER PRIMARY KEY AUTOINCREMENT" if on_sqlite else "SERIAL PRIMARY KEY"
+    await db.execute(text(f"""
         CREATE TABLE radius_nas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk},
             nasname VARCHAR(128) NOT NULL,
             secret VARCHAR(60) NOT NULL,
             router_id INTEGER NOT NULL REFERENCES routers(id) ON DELETE RESTRICT
