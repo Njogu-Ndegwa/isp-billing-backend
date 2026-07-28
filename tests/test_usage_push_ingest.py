@@ -433,3 +433,59 @@ async def test_batch_partially_valid_still_records_the_valid_rows(db, session_fa
             )
         ).scalar_one()
     assert period.total_bytes == 8 * MB
+
+
+@pytest.mark.asyncio
+async def test_push_and_poll_can_run_together_without_double_counting(db, session_factory):
+    """No rollout flag needed.
+
+    Both paths track the SAME cumulative router counter in the SAME
+    user_bandwidth_usage row, so whoever reads it next simply sees the delta
+    since the last reader. Interleaving them converges on the true total instead
+    of adding it twice — which means a router can be switched to pushing while
+    the poller still has it in rotation, with no coordination and no schema flag
+    saying who owns it.
+    """
+    from app.services.usage_counters import record_queue_usage_sample
+
+    _, router, plan, customer = await _hotspot_setup(db, mac="AA:BB:CC:5A:5A:5A")
+    key = "AA:BB:CC:5A:5A:5A"
+
+    async def poll(upload, download):
+        async with session_factory() as s:
+            cust = await s.get(type(customer), customer.id)
+            pl = await s.get(type(plan), plan.id)
+            await record_queue_usage_sample(
+                s, customer=cust, plan=pl, queue_key=key,
+                upload_bytes=upload, download_bytes=download,
+            )
+            await s.commit()
+
+    async def push(upload, download, final=False):
+        await usage_push.ingest_usage_reports(
+            router.id,
+            [UsageReport(queue_key=key, upload_bytes=upload, download_bytes=download, final=final)],
+            session_factory=session_factory,
+        )
+
+    # The router's counter climbs steadily; the two readers interleave arbitrarily.
+    await poll(0, 0)                 # baseline
+    await push(1 * MB, 4 * MB)       # +1 / +4
+    await poll(2 * MB, 9 * MB)       # +1 / +5
+    await push(3 * MB, 12 * MB)      # +1 / +3
+    await push(4 * MB, 16 * MB)      # +1 / +4
+    await poll(5 * MB, 20 * MB)      # +1 / +4
+
+    async with session_factory() as s:
+        period = (
+            await s.execute(
+                select(CustomerUsagePeriod).where(
+                    CustomerUsagePeriod.customer_id == customer.id
+                )
+            )
+        ).scalar_one()
+
+    # Exactly the counter's growth from 0 to 5/20 — counted once, not twice.
+    assert period.upload_bytes == 5 * MB
+    assert period.download_bytes == 20 * MB
+    assert period.total_bytes == 25 * MB
