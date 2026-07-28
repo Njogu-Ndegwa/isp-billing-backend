@@ -8,3 +8,4 @@ greenlet>=3.0
 # direct `datetime.utcnow` reference SQLAlchemy captured in column defaults
 # (models.py `created_at`) is frozen too — freezegun misses saved references.
 time-machine>=2.16
+pytest-xdist>=3.5

@@ -43,7 +43,7 @@ import pytest_asyncio
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import NullPool, StaticPool
+from sqlalchemy.pool import StaticPool
 
 # Import models so Base.metadata knows every table before create_all
 from app.db import database as db_module
@@ -58,13 +58,44 @@ def running_on_postgres() -> bool:
     return RUNNING_ON_POSTGRES
 
 
-async def _fresh_postgres_engine():
-    """Real Postgres: build the schema once, then truncate between tests.
+# One engine per pytest worker, reused for every test it runs. Building an
+# engine per test meant a TCP connect and auth handshake ~670 times; the
+# connection is by far the most expensive part of a test that does three
+# INSERTs. Kept alive deliberately — disposing it between tests would throw
+# away exactly the thing we are trying to reuse.
+_PG_ENGINE = None
 
-    NullPool because each test builds its own engine; pooling across engines
-    would just hold connections the next test cannot use.
-    """
-    eng = create_async_engine(DATABASE_URL, future=True, poolclass=NullPool)
+# Under pytest-xdist every worker needs its own tables, or one worker's TRUNCATE
+# wipes the rows another is mid-way through asserting on. A schema per worker is
+# far cheaper than a database per worker and needs no extra privileges.
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "single")
+_SCHEMA = f"test_{_WORKER}"
+
+
+async def _postgres_engine():
+    """The worker's engine, created once, pointed at that worker's own schema."""
+    global _PG_ENGINE
+    if _PG_ENGINE is not None:
+        return _PG_ENGINE
+
+    # CREATE SCHEMA needs its own connection outside the pooled engine, since
+    # the pooled one already wants the schema in its search_path.
+    admin = create_async_engine(DATABASE_URL, isolation_level="AUTOCOMMIT")
+    async with admin.connect() as conn:
+        await conn.execute(sa_text(f'CREATE SCHEMA IF NOT EXISTS "{_SCHEMA}"'))
+    await admin.dispose()
+
+    _PG_ENGINE = create_async_engine(
+        DATABASE_URL,
+        future=True,
+        connect_args={"server_settings": {"search_path": _SCHEMA}},
+    )
+    return _PG_ENGINE
+
+
+async def _fresh_postgres_engine():
+    """Real Postgres: reuse the worker's engine, reset its tables per test."""
+    eng = await _postgres_engine()
     async with eng.begin() as conn:
         # ONE catalog query answers both questions below. The obvious
         # implementation — calling create_all(checkfirst=True) per test — issues
@@ -73,9 +104,10 @@ async def _fresh_postgres_engine():
         # it within two minutes of the job timeout. SQLite hid this because
         # building an empty in-memory database costs nothing.
         existing = {
-            row[0] for row in (await conn.execute(sa_text(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-            ))).all()
+            row[0] for row in (await conn.execute(
+                sa_text("SELECT tablename FROM pg_tables WHERE schemaname = :s"),
+                {"s": _SCHEMA},
+            )).all()
         }
         known = {t.name for t in db_module.Base.metadata.sorted_tables}
 
@@ -152,7 +184,11 @@ async def engine(monkeypatch):
     try:
         yield eng
     finally:
-        await eng.dispose()
+        # SQLite engines are per-test and must go. The Postgres engine is shared
+        # by every test this worker runs — disposing it would discard the pooled
+        # connection we are deliberately reusing.
+        if not RUNNING_ON_POSTGRES:
+            await eng.dispose()
 
 
 @pytest_asyncio.fixture

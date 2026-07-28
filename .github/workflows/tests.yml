@@ -62,7 +62,10 @@ jobs:
       # No -x: a review gate should report EVERY failure in one run, not stop at
       # the first and hide what else is broken. --tb=short keeps the log readable.
       - name: Run tests
-        run: pytest -q --tb=short --junitxml=pytest-report.xml
+        # -n auto splits across the runner's cores. Each xdist worker gets its
+        # own Postgres schema (see conftest), so workers cannot truncate each
+        # other's tables mid-assertion.
+        run: pytest -q --tb=short -n auto --junitxml=pytest-report.xml
 
       # Renders the run as a pass/fail table on the Actions summary page, naming
       # any failing test, so the result is readable without opening the log.
