@@ -123,3 +123,16 @@ Project-level items that should survive across agent sessions.
 - Problem: `deactivate_subscription` defaults to `SUSPENDED` for expired trials, expired paid subscriptions, and admin/billing suspensions alike. `INACTIVE` is effectively unused (0 rows as of 2026-07-26, against 269 SUSPENDED).
 - Why it matters: churn reporting has to infer intent from payment history to tell a failed trial conversion from a lost paying customer. Any future retention, dunning or win-back work needs the same distinction and will re-derive it.
 - Proposed next step: record an explicit reason on deactivation (trial_expired / payment_lapsed / admin_suspended) rather than overloading one status, and have `compute_churn` read it instead of probing `SubscriptionPayment` history.
+
+### Router Push Channel — Other Uses
+
+- Status: idea only; do not build before the usage channel is proved on Router-0721
+- Problem: every fact we know about a router is learned by polling it, which costs
+  per router per fact and degrades as the fleet grows (~49 min per router at 187).
+  Dead routers are polled forever — router 49 has 20,336 checks and 0 successes.
+- Why it matters: once a router reports to us, liveness, expired-binding drift,
+  provisioning acknowledgement, outage-time payments, health and uplink quality all
+  become nearly free, and they get through NAT/Starlink links we cannot reach inbound.
+- Proposed next step: see `docs/agent-memory/router-push-channel-future-uses.md` for
+  the candidate list, the value order, and the design rules that must carry over
+  (cumulative payloads, lifecycle validation, no schema for operational state).

@@ -69,6 +69,7 @@ async def record_queue_usage_sample(
     max_limit: str = "",
     now: Optional[datetime] = None,
     legacy_keys: Optional[Iterable[str]] = None,
+    first_sample_is_total: bool = False,
 ) -> UsageCounterUpdate:
     """Persist one cumulative queue sample and roll its delta into the period.
 
@@ -76,6 +77,12 @@ async def record_queue_usage_sample(
     normalized MAC for hotspot queues and ``pppoe:<username>`` for PPPoE
     dynamic queues.  ``legacy_keys`` lets callers find old rows stored under a
     compact or raw MAC form, then normalize them in-place.
+
+    ``first_sample_is_total`` changes what an unseen queue means. Polling cannot
+    know how much traffic preceded the first sample it happens to catch, so it
+    records a baseline and counts nothing — the default. A router's on-logout
+    report is different: it carries the whole session total and there is nothing
+    before it, so the first sample IS the usage. Only the push channel sets this.
     """
     now = now or datetime.utcnow()
     keys = [queue_key]
@@ -83,12 +90,35 @@ async def record_queue_usage_sample(
         keys.extend(k for k in legacy_keys if k)
     keys = list(dict.fromkeys(keys))
 
-    stmt = select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address.in_(keys)).limit(1)
-    try:
-        stmt = stmt.with_for_update()
-    except Exception:
-        pass
-    usage = (await db.execute(stmt)).scalar_one_or_none()
+    # Scope to the customer whenever we know it. MAC is unique per RESELLER, not
+    # globally, so two resellers legitimately hold the same MAC (randomised phone
+    # MACs collide readily). Looking up on the key alone put both customers on one
+    # counter row: each sample then looked like a counter reset to the other and
+    # both accrued the other's traffic. Legacy rows predate the customer link, so
+    # fall back to the key and adopt the row — it self-heals on first sight.
+    usage = None
+    if customer is not None:
+        by_customer = select(UserBandwidthUsage).where(
+            UserBandwidthUsage.customer_id == customer.id
+        ).limit(1)
+        try:
+            by_customer = by_customer.with_for_update()
+        except Exception:
+            pass
+        usage = (await db.execute(by_customer)).scalar_one_or_none()
+
+    if usage is None:
+        stmt = select(UserBandwidthUsage).where(
+            UserBandwidthUsage.mac_address.in_(keys)
+        )
+        if customer is not None:
+            stmt = stmt.where(UserBandwidthUsage.customer_id.is_(None))
+        stmt = stmt.limit(1)
+        try:
+            stmt = stmt.with_for_update()
+        except Exception:
+            pass
+        usage = (await db.execute(stmt)).scalar_one_or_none()
 
     created = False
     if usage:
@@ -108,8 +138,8 @@ async def record_queue_usage_sample(
             usage.customer_id = customer.id
     else:
         created = True
-        delta_up = 0
-        delta_dn = 0
+        delta_up = upload_bytes if first_sample_is_total else 0
+        delta_dn = download_bytes if first_sample_is_total else 0
         reset_detected = False
         usage = UserBandwidthUsage(
             mac_address=queue_key,
