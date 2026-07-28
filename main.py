@@ -1629,9 +1629,9 @@ async def run_agent_queue_migrations():
     absent, so this is safe on every boot.
     """
     async with async_engine.begin() as conn:
-        from app.db.models import WorkItem, AgentRun, Approval
+        from app.db.models import WorkItem, AgentRun, Approval, AgentSchedule
 
-        for model in (WorkItem, AgentRun, Approval):
+        for model in (WorkItem, AgentRun, Approval, AgentSchedule):
             await conn.run_sync(
                 lambda c, m=model: m.__table__.create(c, checkfirst=True)
             )
@@ -1649,6 +1649,10 @@ async def run_agent_queue_migrations():
         await conn.execute(sa_text(
             "CREATE INDEX IF NOT EXISTS idx_approvals_pending "
             "ON approvals(status, created_at DESC)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_agent_schedules_enabled "
+            "ON agent_schedules(enabled, last_run_at)"
         ))
     logger.info("Agent work-queue tables ready")
 

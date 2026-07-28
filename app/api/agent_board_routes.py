@@ -36,6 +36,7 @@ from app.db.models import (
     WORK_ITEM_SOURCES,
     WORK_ITEM_STATUSES,
     AgentRun,
+    AgentSchedule,
     Approval,
     User,
     UserRole,
@@ -122,6 +123,21 @@ class ApprovalCreate(BaseModel):
     work_item_id: Optional[int] = None
 
 
+class ScheduleUpsert(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    agent: str = Field(min_length=1, max_length=64)
+    description: Optional[str] = Field(default=None, max_length=500)
+    cadence: Optional[str] = Field(default=None, max_length=120)
+    cron_expr: Optional[str] = Field(default=None, max_length=120)
+    expected_interval_minutes: Optional[int] = None
+    enabled: bool = True
+    surface: Optional[str] = None
+
+
+class ScheduleRunReport(BaseModel):
+    outcome: str
+
+
 class ApprovalDecision(BaseModel):
     decision: str  # approved | rejected
     note: Optional[str] = Field(default=None, max_length=500)
@@ -166,6 +182,28 @@ def _run_json(r: AgentRun) -> dict:
         # Surfaced separately from `outcome` on purpose: the agent said
         # "running", and this is the board's own judgement about that claim.
         "stalled": stalled,
+    }
+
+
+def _schedule_json(s: AgentSchedule) -> dict:
+    now = datetime.utcnow()
+    overdue = False
+    if s.enabled and s.expected_interval_minutes:
+        # Two missed intervals, not one — a single skipped tick is noise, a
+        # second one means it stopped.
+        grace = timedelta(minutes=2 * s.expected_interval_minutes)
+        overdue = s.last_run_at is None or (now - s.last_run_at) > grace
+    return {
+        "id": s.id, "name": s.name, "agent": s.agent,
+        "description": s.description, "cadence": s.cadence,
+        "cron_expr": s.cron_expr,
+        "expected_interval_minutes": s.expected_interval_minutes,
+        "enabled": s.enabled, "surface": s.surface,
+        "last_run_at": s.last_run_at, "last_outcome": s.last_outcome,
+        # A schedule that lives in a Claude Code session dies when that session
+        # closes. Saying so on the board is more useful than discovering it.
+        "survives_session_close": s.surface in ("server", "cloud"),
+        "overdue": overdue,
     }
 
 
@@ -234,8 +272,14 @@ async def get_agent_board(
         .where(WorkItem.status.in_(WORK_ITEM_OPEN_STATUSES))
     )).scalar()
 
+    schedules = (await db.execute(
+        select(AgentSchedule).order_by(AgentSchedule.name)
+    )).scalars().all()
+
     live = [_run_json(r) for r in live_runs]
     stalled = [r for r in live if r["stalled"]]
+    sched = [_schedule_json(s) for s in schedules]
+    overdue = [s for s in sched if s["overdue"]]
 
     return {
         # Stamped so you can tell a fresh board from a frozen tab.
@@ -247,12 +291,16 @@ async def get_agent_board(
         "shipped_24h": [_work_item_json(w) for w in shipped],
         "live_runs": live,
         "stalled_runs": stalled,
+        "schedules": sched,
+        "overdue_schedules": overdue,
         "recent_runs": [_run_json(r) for r in recent_runs],
         "counts": {
             "open": open_count,
             "running": len(running),
             "live_runs": len(live),
             "stalled_runs": len(stalled),
+            "schedules": len(sched),
+            "overdue_schedules": len(overdue),
             "waiting_on_you": len(pending),
             "shipped_24h": len(shipped),
         },
@@ -526,3 +574,77 @@ async def decide_approval(
     await db.commit()
     await db.refresh(approval)
     return _approval_json(approval)
+
+
+# --------------------------------------------------------------------------- #
+# Schedules — what the assistant does without being asked
+# --------------------------------------------------------------------------- #
+
+@router.put("/api/admin/agent-schedules")
+async def upsert_schedule(
+    body: ScheduleUpsert,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Register or update a standing cadence, keyed by name.
+
+    Idempotent so a scheduled agent can announce itself on every boot without
+    accumulating duplicates.
+    """
+    await _require_admin(token, db)
+
+    surface = _one_of(body.surface, ("session", "server", "cloud"), "surface")
+    existing = (await db.execute(
+        select(AgentSchedule).where(AgentSchedule.name == body.name.strip())
+    )).scalar_one_or_none()
+
+    if existing is None:
+        existing = AgentSchedule(name=body.name.strip())
+        db.add(existing)
+
+    existing.agent = body.agent.strip()
+    existing.description = body.description
+    existing.cadence = body.cadence
+    existing.cron_expr = body.cron_expr
+    existing.expected_interval_minutes = body.expected_interval_minutes
+    existing.enabled = body.enabled
+    existing.surface = surface
+    existing.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(existing)
+    return _schedule_json(existing)
+
+
+@router.get("/api/admin/agent-schedules")
+async def list_schedules(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    await _require_admin(token, db)
+    rows = (await db.execute(
+        select(AgentSchedule).order_by(AgentSchedule.name)
+    )).scalars().all()
+    return {"schedules": [_schedule_json(s) for s in rows], "count": len(rows)}
+
+
+@router.post("/api/admin/agent-schedules/{schedule_id}/ran")
+async def report_schedule_run(
+    schedule_id: int,
+    body: ScheduleRunReport,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """A schedule reporting that it fired. Silence is what makes it overdue."""
+    await _require_admin(token, db)
+    sched = (await db.execute(
+        select(AgentSchedule).where(AgentSchedule.id == schedule_id)
+    )).scalar_one_or_none()
+    if sched is None:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+
+    sched.last_outcome = _one_of(body.outcome, AGENT_RUN_OUTCOMES, "outcome")
+    sched.last_run_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(sched)
+    return _schedule_json(sched)

@@ -83,6 +83,21 @@
   "tokens",
   "work_item_id"
  ],
+ "agent_schedules": [
+  "agent",
+  "cadence",
+  "created_at",
+  "cron_expr",
+  "description",
+  "enabled",
+  "expected_interval_minutes",
+  "id",
+  "last_outcome",
+  "last_run_at",
+  "name",
+  "surface",
+  "updated_at"
+ ],
  "app_settings": [
   "key",
   "updated_at",

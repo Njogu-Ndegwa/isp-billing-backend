@@ -1951,6 +1951,38 @@ class AgentRun(Base):
     heartbeat_at = Column(DateTime, nullable=True)
 
 
+class AgentSchedule(Base):
+    """A standing cadence — what the assistant does without being asked.
+
+    Runs and work items answer "what happened". This answers "what is SUPPOSED
+    to happen", which is the only way to notice that something stopped. On
+    2026-07-27 the nightly factory claimed a packet and silently produced
+    nothing; there was no record that it was meant to run at all, so the failure
+    was invisible until someone went looking a day later.
+
+    `expected_interval_minutes` is what makes silence detectable: a schedule
+    whose last run is older than twice its interval is reported overdue rather
+    than assumed healthy.
+    """
+
+    __tablename__ = "agent_schedules"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(120), unique=True, nullable=False)
+    agent = Column(String(64), nullable=False)
+    description = Column(String(500), nullable=True)
+    cadence = Column(String(120), nullable=True)      # human: "hourly at :13"
+    cron_expr = Column(String(120), nullable=True)    # machine: "13 * * * *"
+    expected_interval_minutes = Column(Integer, nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Where it runs, which decides whether it survives closing a laptop:
+    # session (dies with the Claude Code session) | server | cloud
+    surface = Column(String(32), nullable=True)
+    last_run_at = Column(DateTime, nullable=True)
+    last_outcome = Column(String(32), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Approval(Base):
     """Something an agent wants to do that only Dennis may authorise.
 

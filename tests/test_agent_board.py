@@ -17,7 +17,7 @@ from sqlalchemy import select
 import app.api.agent_board_routes as abr
 from app.api.agent_board_routes import router as agent_board_router
 from app.db.database import get_db
-from app.db.models import AgentRun, Approval, WorkItem
+from app.db.models import AgentRun, AgentSchedule, Approval, WorkItem
 from app.services.auth import verify_token
 from tests.factories import make_admin, make_reseller
 
@@ -91,7 +91,7 @@ async def test_agent_queue_migration_runs_and_is_idempotent(engine, monkeypatch)
     # conftest is not enough — point main itself at the test engine.
     monkeypatch.setattr(main, "async_engine", engine)
 
-    tables = ("approvals", "agent_runs", "work_items")
+    tables = ("approvals", "agent_runs", "agent_schedules", "work_items")
 
     # conftest's create_all already built them; drop them so we are proving the
     # MIGRATION creates the schema, not that the fixture did.
@@ -338,6 +338,107 @@ async def test_decision_must_be_approved_or_rejected(db, client, monkeypatch):
     resp = await client.post(f"/api/admin/approvals/{approval_id}/decide",
                              json={"decision": "maybe"})
     assert resp.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# Schedules — noticing that something stopped
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_schedule_upsert_is_idempotent_by_name(db, client, monkeypatch):
+    """A scheduled agent announces itself on every boot; that must not pile up."""
+    _auth_as(monkeypatch, await make_admin(db))
+    payload = {
+        "name": "hourly-whatsapp-check", "agent": "whatsapp-frontdesk",
+        "cadence": "hourly at :13", "cron_expr": "13 * * * *",
+        "expected_interval_minutes": 60, "surface": "session",
+    }
+    first = await client.put("/api/admin/agent-schedules", json=payload)
+    assert first.status_code == 200
+
+    payload["cadence"] = "hourly at :07"
+    second = await client.put("/api/admin/agent-schedules", json=payload)
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["cadence"] == "hourly at :07"
+
+    listed = await client.get("/api/admin/agent-schedules")
+    assert listed.json()["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_session_schedule_is_flagged_as_not_surviving_session_close(
+    db, client, monkeypatch
+):
+    """The hourly check dies when the terminal closes — the board should say so."""
+    _auth_as(monkeypatch, await make_admin(db))
+
+    session_bound = await client.put("/api/admin/agent-schedules", json={
+        "name": "hourly-check", "agent": "whatsapp-frontdesk", "surface": "session",
+    })
+    on_server = await client.put("/api/admin/agent-schedules", json={
+        "name": "nightly-factory", "agent": "pr-factory", "surface": "server",
+    })
+
+    assert session_bound.json()["survives_session_close"] is False
+    assert on_server.json()["survives_session_close"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_schedule_that_stopped_firing_is_reported_overdue(
+    db, client, monkeypatch
+):
+    """The 2026-07-27 failure: the factory claimed a packet and produced nothing,
+    and nothing recorded that it was supposed to run."""
+    _auth_as(monkeypatch, await make_admin(db))
+
+    db.add(AgentSchedule(
+        name="nightly-factory", agent="pr-factory", enabled=True,
+        expected_interval_minutes=60 * 24,
+        last_run_at=datetime.utcnow() - timedelta(days=3),
+    ))
+    await db.commit()
+
+    board = (await client.get("/api/admin/agent-board")).json()
+    assert board["counts"]["overdue_schedules"] == 1
+    assert board["overdue_schedules"][0]["name"] == "nightly-factory"
+
+
+@pytest.mark.asyncio
+async def test_reporting_a_run_clears_the_overdue_flag(db, client, monkeypatch):
+    _auth_as(monkeypatch, await make_admin(db))
+    sched = AgentSchedule(
+        name="hourly-check", agent="whatsapp-frontdesk", enabled=True,
+        expected_interval_minutes=60,
+        last_run_at=datetime.utcnow() - timedelta(hours=6),
+    )
+    db.add(sched)
+    await db.commit()
+    await db.refresh(sched)
+
+    before = (await client.get("/api/admin/agent-schedules")).json()["schedules"][0]
+    assert before["overdue"] is True
+
+    reported = await client.post(f"/api/admin/agent-schedules/{sched.id}/ran",
+                                 json={"outcome": "green"})
+    assert reported.status_code == 200
+    assert reported.json()["overdue"] is False
+    assert reported.json()["last_outcome"] == "green"
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_schedule_is_never_overdue(db, client, monkeypatch):
+    """Turning something off is a decision, not a failure."""
+    _auth_as(monkeypatch, await make_admin(db))
+    db.add(AgentSchedule(
+        name="paused-sweep", agent="noc-watchdog", enabled=False,
+        expected_interval_minutes=60,
+        last_run_at=datetime.utcnow() - timedelta(days=30),
+    ))
+    await db.commit()
+
+    board = (await client.get("/api/admin/agent-board")).json()
+    assert board["counts"]["schedules"] == 1
+    assert board["counts"]["overdue_schedules"] == 0
 
 
 @pytest.mark.asyncio
