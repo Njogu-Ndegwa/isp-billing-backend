@@ -20,6 +20,8 @@ Together those are what make a thousand routers pushing survivable when a single
 worker on a 1 GB box is receiving them.
 """
 
+from datetime import datetime, timedelta
+
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
@@ -63,6 +65,9 @@ async def _setup(db, *, identity="Router-0721", mac="AA:BB:CC:11:22:33"):
     customer = await make_customer(
         db, reseller, plan, router,
         mac_address=mac, status=CustomerStatus.ACTIVE,
+        # An unexpired customer: ingest deliberately refuses to bank usage for
+        # anyone whose plan has ended (see test_usage_push_edge_cases).
+        expiry=datetime.utcnow() + timedelta(days=30),
     )
     return router, customer
 

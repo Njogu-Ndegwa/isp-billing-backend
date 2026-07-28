@@ -49,7 +49,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.db.database import async_session
-from app.db.models import ConnectionType, Customer, CustomerUsagePeriod, Plan
+from app.db.models import (
+    ConnectionType,
+    Customer,
+    CustomerStatus,
+    CustomerUsagePeriod,
+    Plan,
+    SubscriptionStatus,
+    User,
+)
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.usage_counters import record_queue_usage_sample
 
@@ -66,6 +74,15 @@ MAX_REPORTS_PER_BATCH = 500
 
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$|^[0-9A-Fa-f]{12}$")
 _PPPOE_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+
+# No real queue counter reaches 9 PB. A value above this is a corrupt read or a
+# hostile router, and banking it would instantly trip FUP and cut off a paying
+# customer — the mirror of the pull channel's free-internet bug. Also keeps every
+# value JSON-safe and inside BIGINT.
+MAX_PLAUSIBLE_COUNTER_BYTES = 2 ** 53
+
+# Reseller subscription states whose routers we still do work for.
+_PAYING_STATUSES = (SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL)
 
 
 @dataclass
@@ -126,6 +143,36 @@ def _index_customers(customers: Iterable[Customer]) -> dict[str, Customer]:
     return index
 
 
+def _customer_is_live(customer: Customer, now: datetime) -> bool:
+    """Whether this customer should still have usage banked against them.
+
+    Both halves matter: the status flag goes stale (357 customers fleet-wide are
+    flagged ACTIVE with an expiry in the past), and expiry alone would count
+    someone an operator has explicitly deactivated.
+    """
+    if customer.status != CustomerStatus.ACTIVE:
+        return False
+    return customer.expiry is not None and customer.expiry > now
+
+
+async def _latest_period_is_closed(db, customer_id: int) -> bool:
+    """True when this customer's most recent period has been closed.
+
+    A fresh customer with no periods at all is fine — the first report opens one.
+    What must not happen is a late report clearing ``closed_at`` on a period that
+    is already settled.
+    """
+    latest = (
+        await db.execute(
+            select(CustomerUsagePeriod.closed_at)
+            .where(CustomerUsagePeriod.customer_id == customer_id)
+            .order_by(CustomerUsagePeriod.period_start.desc(), CustomerUsagePeriod.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return latest is not None
+
+
 def _cap_bytes_for(period: Optional[CustomerUsagePeriod], plan: Optional[Plan]) -> int:
     """Cap in bytes, preferring the period's snapshot so a mid-period plan change
     cannot retroactively move the line (same rule the sampler applies)."""
@@ -166,6 +213,23 @@ async def ingest_usage_reports(
         reports = reports[:MAX_REPORTS_PER_BATCH]
 
     async with factory() as db:
+        # A reseller who stopped paying still has powered-on routers in the field
+        # pushing at us. Do no work for them — this was the single biggest source
+        # of junk in the poll path (one dead reseller's router carried 233 expired
+        # customers).
+        owner_ok = (
+            await db.execute(
+                select(User.subscription_status)
+                .join(Customer, Customer.user_id == User.id)
+                .where(Customer.router_id == router_id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if owner_ok is not None and owner_ok not in _PAYING_STATUSES:
+            result.rejected = len(reports)
+            result.errors.append("owner_not_paying")
+            return result
+
         # Only customers on THIS router are addressable. A report naming anyone
         # else is rejected rather than attributed, because this endpoint is
         # reachable from the field.
@@ -192,13 +256,51 @@ async def ingest_usage_reports(
                 result.errors.append(f"unknown_queue_key:{key}")
                 continue
 
+            upload = int(report.upload_bytes or 0)
+            download = int(report.download_bytes or 0)
+            if (
+                upload < 0 or download < 0
+                or upload > MAX_PLAUSIBLE_COUNTER_BYTES
+                or download > MAX_PLAUSIBLE_COUNTER_BYTES
+            ):
+                result.rejected += 1
+                result.errors.append(f"implausible_counter:{key}")
+                continue
+
             plan = customer.plan
-            if plan is not None and plan.connection_type not in (
+            # Usage cannot be sized without a plan, and silently accepting means
+            # the reseller sees zero with no explanation.
+            if plan is None:
+                result.rejected += 1
+                result.errors.append(f"customer_has_no_plan:{key}")
+                continue
+            if plan.connection_type not in (
                 ConnectionType.HOTSPOT,
                 ConnectionType.PPPOE,
             ):
                 result.rejected += 1
                 result.errors.append(f"unsupported_connection_type:{key}")
+                continue
+
+            # LIFECYCLE BOUND. The pull channel had none, kept serving a command
+            # after the plan ended, and gave away free internet (incident
+            # 2026-07-15). Our version of that mistake is worse in one direction:
+            # a router keeps its queues until cleanup reaches it — which is
+            # exactly what fails during the outages this channel exists to
+            # survive — so it WILL report for customers whose plan ended. Banking
+            # that bills them for traffic after expiry and can trip FUP on
+            # someone who no longer has a subscription at all.
+            if not _customer_is_live(customer, now):
+                result.rejected += 1
+                result.errors.append(f"customer_not_live:{key}")
+                continue
+
+            # Never resurrect a period that has already been closed and reported
+            # on. A late report — a retry over a bad link, or a queue the router
+            # only just flushed — must not reopen last month's books.
+            if await _latest_period_is_closed(db, customer.id):
+                result.rejected += 1
+                result.errors.append(f"period_closed:{key}")
                 continue
 
             try:
@@ -207,8 +309,8 @@ async def ingest_usage_reports(
                     customer=customer,
                     plan=plan,
                     queue_key=key,
-                    upload_bytes=max(0, int(report.upload_bytes or 0)),
-                    download_bytes=max(0, int(report.download_bytes or 0)),
+                    upload_bytes=upload,
+                    download_bytes=download,
                     queue_name=report.queue_name or "",
                     target_ip=report.target_ip or "",
                     max_limit=report.max_limit or "",
