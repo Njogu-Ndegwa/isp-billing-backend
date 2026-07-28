@@ -103,12 +103,16 @@ def main() -> int:
     print(f"| {passed} | {failed} | {errored} | {skipped} | {duration:.0f}s |")
 
     if broken:
+        # A two-column table looks tidy until you see it rendered: pytest node
+        # ids are long enough to eat the full width and push the "why" column
+        # off-screen, hiding the one thing a reader actually needs. A list wraps
+        # instead of truncating, so the reason always stays visible.
         print("\n### What failed\n")
-        print("| Test | Why |")
-        print("|---|---|")
         for test_id, kind, message in broken[:MAX_ROWS]:
-            label = _cell(message) or kind
-            print(f"| `{test_id}` | {label} |")
+            path, _, case = test_id.rpartition("::")
+            print(f"- **`{case or test_id}`** — {_cell(message) or kind}")
+            if path:
+                print(f"  <br>`{path}`")
         if len(broken) > MAX_ROWS:
             print(f"\n_…and {len(broken) - MAX_ROWS} more — see the full log above._")
         print("\nReproduce locally:\n")
