@@ -58,18 +58,64 @@ def running_on_postgres() -> bool:
     return RUNNING_ON_POSTGRES
 
 
+# Reusing ONE engine across tests was tried and reverted. pytest-asyncio gives
+# every test a fresh event loop, and pooled asyncpg connections belong to the
+# loop that opened them — the next test inherits connections attached to a dead
+# loop and fails with "got Future attached to a different loop". Making the loop
+# session-scoped would fix that but changes isolation semantics for all ~670
+# tests, which is not a trade worth making for a few seconds. NullPool it is:
+# a fresh connection per test, and the parallelism below is where the real win
+# comes from anyway.
+_SCHEMA_READY = False
+
+# Under pytest-xdist every worker needs its own tables, or one worker's TRUNCATE
+# wipes the rows another is mid-way through asserting on. A schema per worker is
+# far cheaper than a database per worker and needs no extra privileges.
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "single")
+_SCHEMA = f"test_{_WORKER}"
+
+
+async def _ensure_schema():
+    """Create this worker's schema once per run, on its own connection."""
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    admin = create_async_engine(DATABASE_URL, isolation_level="AUTOCOMMIT")
+    async with admin.connect() as conn:
+        await conn.execute(sa_text(f'CREATE SCHEMA IF NOT EXISTS "{_SCHEMA}"'))
+    await admin.dispose()
+    _SCHEMA_READY = True
+
+
 async def _fresh_postgres_engine():
-    """Real Postgres: build the schema once, then truncate between tests.
-
-    NullPool because each test builds its own engine; pooling across engines
-    would just hold connections the next test cannot use.
-    """
-    eng = create_async_engine(DATABASE_URL, future=True, poolclass=NullPool)
+    """Real Postgres: fresh engine per test, inside this worker's own schema."""
+    await _ensure_schema()
+    eng = create_async_engine(
+        DATABASE_URL,
+        future=True,
+        poolclass=NullPool,
+        connect_args={"server_settings": {"search_path": _SCHEMA}},
+    )
     async with eng.begin() as conn:
-        # checkfirst is on by default, so this is a no-op after the first test.
-        await conn.run_sync(db_module.Base.metadata.create_all)
-
+        # ONE catalog query answers both questions below. The obvious
+        # implementation — calling create_all(checkfirst=True) per test — issues
+        # a reflection query PER TABLE instead: 65 tables x ~670 tests is about
+        # 43,000 round trips, which took the suite from ~7 minutes to 18 and put
+        # it within two minutes of the job timeout. SQLite hid this because
+        # building an empty in-memory database costs nothing.
+        existing = {
+            row[0] for row in (await conn.execute(
+                sa_text("SELECT tablename FROM pg_tables WHERE schemaname = :s"),
+                {"s": _SCHEMA},
+            )).all()
+        }
         known = {t.name for t in db_module.Base.metadata.sorted_tables}
+
+        # Build the schema only when something is actually missing — the first
+        # test of a run, or after a test drops tables on purpose (the startup
+        # migration test does exactly that).
+        if known - existing:
+            await conn.run_sync(db_module.Base.metadata.create_all)
 
         # Drop scratch tables that tests build themselves with raw DDL. The
         # radius_* tables have no ORM model, and two test modules create
@@ -77,13 +123,7 @@ async def _fresh_postgres_engine():
         # A fresh database per test hid that forever; on a persistent one,
         # whichever module runs first wins and the other fails on a missing
         # column. Dropping them restores the isolation SQLite gave us for free.
-        stray = [
-            row[0] for row in (await conn.execute(sa_text(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-            ))).all()
-            if row[0] not in known
-        ]
-        for name in stray:
+        for name in existing - known:
             await conn.execute(sa_text(f'DROP TABLE IF EXISTS "{name}" CASCADE'))
 
         tables = ", ".join(f'"{t.name}"' for t in db_module.Base.metadata.sorted_tables)
