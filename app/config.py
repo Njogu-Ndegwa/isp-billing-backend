@@ -97,6 +97,15 @@ class Settings(BaseSettings):
     SMS_DISPATCH_CHUNK_SIZE: int = 100
     SMS_DISPATCH_ENABLED: bool = True
 
+    # --- Feedback board (Ideas + Bugs) / AI triage -----------------------
+    # ANTHROPIC_API_KEY lives in the server .env only — never committed.
+    # Empty key = AI features degrade gracefully to manual triage.
+    ANTHROPIC_API_KEY: str = ""
+    FEEDBACK_AI_ENABLED: bool = True
+    FEEDBACK_TRIAGE_MODEL: str = "claude-opus-4-8"
+    FEEDBACK_REPLY_MODEL: str = "claude-opus-4-8"
+    FEEDBACK_DAILY_POST_CAP: int = 15
+
     # --- Transactional email (password reset) ----------------------------
     # Credentials live in the server .env only — never committed.
     # SMTP is preferred when SMTP_HOST is set (e.g. smtp.gmail.com + app

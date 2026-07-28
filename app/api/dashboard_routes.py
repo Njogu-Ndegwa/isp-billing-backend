@@ -11,6 +11,7 @@ from app.db.models import (
     Router, Customer, Plan, CustomerStatus, CustomerPayment, PaymentStatus,
     MpesaTransaction, MpesaTransactionStatus,
     ResellerPayout, ResellerTransactionCharge, PaymentMethod,
+    ResellerFinancials,
     ShopOrder, ShopOrderPaymentStatus, UserRole,
 )
 from app.services.auth import verify_token, get_current_user
@@ -1409,11 +1410,17 @@ async def get_reseller_account_statement(
         date_filters_payout.append(ResellerPayout.created_at < ed)
         date_filters_charge.append(ResellerTransactionCharge.created_at < ed)
 
-    # All-time M-Pesa revenue (system-collected)
-    mpesa_filter = CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY
+    # All-time M-Pesa revenue (system-collected). Uses the SAME canonical
+    # filters as the payout engine (app/services/mpesa_b2b.py) so the balance
+    # shown here is the balance the B2B job / withdrawals will actually pay:
+    # completed + revenue-bearing + not DIRECT-collected into the reseller's
+    # own paybill (the platform never held DIRECT money). Previously this
+    # summed every MOBILE_MONEY row, overstating what the platform owed.
+    from app.services.mpesa_b2b import PAYOUT_REVENUE_FILTERS
+
     all_time_mpesa = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
-            CustomerPayment.reseller_id == reseller_id, mpesa_filter
+            CustomerPayment.reseller_id == reseller_id, *PAYOUT_REVENUE_FILTERS
         )
     )).scalar())
 
@@ -1429,7 +1436,17 @@ async def get_reseller_account_statement(
         )
     )).scalar())
 
-    unpaid_balance = round(all_time_mpesa - total_paid - total_charges, 2)
+    # One-time repair credit for payment rows lost to cascading deletes —
+    # part of the canonical unpaid-balance formula (see get_unpaid_balance).
+    balance_correction = float((await db.execute(
+        select(func.coalesce(ResellerFinancials.balance_correction, 0.0)).where(
+            ResellerFinancials.user_id == reseller_id
+        )
+    )).scalar_one_or_none() or 0)
+
+    unpaid_balance = round(
+        all_time_mpesa + balance_correction - total_paid - total_charges, 2
+    )
 
     # Fetch payouts in date range
     payouts_result = await db.execute(
@@ -1486,6 +1503,7 @@ async def get_reseller_account_statement(
             "total_system_collected": all_time_mpesa,
             "total_paid_to_you": total_paid,
             "total_transaction_charges": total_charges,
+            "balance_correction": balance_correction,
             "unpaid_balance": unpaid_balance,
         },
         "period_summary": {

@@ -157,8 +157,11 @@ async def test_confirmation_route_activates_customer_end_to_end(
 
     assert resp.status_code == 200
     body_resp = resp.json()
-    # Safaricom-expected response shape
-    assert body_resp == {"ResultCode": 0, "ResultDesc": "Success"}
+    # Safaricom-expected response shape. ResultCode is the STRING "0" — the
+    # Daraja C2B response contract uses string codes throughout (success "0",
+    # rejections "C2B00012"/"C2B00013"), and this is the shape production has
+    # been acking confirmations with all along.
+    assert body_resp == {"ResultCode": "0", "ResultDesc": "Success"}
 
     # DB state reflects activation
     async with session_factory() as s:
@@ -192,7 +195,7 @@ async def test_confirmation_route_unknown_account_returns_200_buckets_unmatched(
 
     # Safaricom must always see 200 — never tell them to retry on app errors
     assert resp.status_code == 200
-    assert resp.json() == {"ResultCode": 0, "ResultDesc": "Success"}
+    assert resp.json() == {"ResultCode": "0", "ResultDesc": "Success"}
 
     async with session_factory() as s:
         txn = (await s.execute(select(C2BTransaction).where(C2BTransaction.trans_id == "HTTP002"))).scalar_one()
@@ -239,7 +242,7 @@ async def test_confirmation_route_handles_malformed_body(client):
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 200
-    assert resp.json() == {"ResultCode": 0, "ResultDesc": "Success"}
+    assert resp.json() == {"ResultCode": "0", "ResultDesc": "Success"}
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +257,7 @@ async def test_validation_route_accepts_known_account(db, client, patched_provis
     resp = await client.post("/api/c2b/validation", json=body)
 
     assert resp.status_code == 200
-    assert resp.json() == {"ResultCode": 0, "ResultDesc": "Accepted"}
+    assert resp.json() == {"ResultCode": "0", "ResultDesc": "Accepted"}
 
 
 async def test_validation_route_rejects_invalid_luhn(client):
