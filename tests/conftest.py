@@ -2,10 +2,25 @@
 Pytest harness for the isp-billing project.
 
 Sets test-only env vars BEFORE any `app.*` import (so `app.config.Settings`
-doesn't fail), then exposes async fixtures that wire the entire app to a
-single in-memory SQLite database — shared across every connection so that
-service-layer code (which opens its own sessions via `async_session()`) sees
-the same rows the test setup created.
+doesn't fail), then exposes async fixtures that wire the entire app to one
+database — shared across every connection so that service-layer code (which
+opens its own sessions via `async_session()`) sees the rows the test setup
+created.
+
+Two backends are supported, chosen by DATABASE_URL:
+
+* **Postgres** (CI, and anyone who exports a postgres DATABASE_URL) — the same
+  engine and major version production runs. This is what makes the suite
+  *evidence*: Postgres-only syntax in the startup migrations, enum types,
+  and concurrent unique-constraint behaviour simply cannot be exercised
+  anywhere else.
+* **SQLite in memory** (the default, for a fast local loop) — convenient, but
+  an approximation. A green SQLite run is not proof that production is fine.
+
+Isolation differs by necessity. SQLite gets a brand-new in-memory database per
+test, which is free. On Postgres that would be far too slow, so the schema is
+created once and every table is truncated between tests — same guarantee (each
+test starts empty, with identity counters reset), different mechanism.
 """
 
 import os
@@ -25,25 +40,49 @@ from typing import AsyncIterator
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
 # Import models so Base.metadata knows every table before create_all
 from app.db import database as db_module
 from app.db import models as _models  # noqa: F401  (side-effect: registers tables)
 
+DATABASE_URL = os.environ["DATABASE_URL"]
+RUNNING_ON_POSTGRES = DATABASE_URL.startswith(("postgresql", "postgres://"))
 
-@pytest_asyncio.fixture
-async def engine(monkeypatch):
-    """Fresh in-memory SQLite engine per test, shared across connections.
 
-    StaticPool keeps one connection alive for the engine's lifetime so every
-    session sees the same :memory: database. The engine is then rebound onto
-    `app.db.database` (and onto modules that imported `async_session` at load
-    time), so service code that opens its own session via `async_session()`
-    routes to this same DB.
+def running_on_postgres() -> bool:
+    """For tests that must skip when the backend can't express what they check."""
+    return RUNNING_ON_POSTGRES
+
+
+async def _fresh_postgres_engine():
+    """Real Postgres: build the schema once, then truncate between tests.
+
+    NullPool because each test builds its own engine; pooling across engines
+    would just hold connections the next test cannot use.
     """
+    eng = create_async_engine(DATABASE_URL, future=True, poolclass=NullPool)
+    async with eng.begin() as conn:
+        # checkfirst is on by default, so this is a no-op after the first test.
+        await conn.run_sync(db_module.Base.metadata.create_all)
+        tables = ", ".join(
+            f'"{t.name}"' for t in db_module.Base.metadata.sorted_tables
+        )
+        if tables:
+            # RESTART IDENTITY so sequence-generated ids don't leak between
+            # tests; CASCADE because these tables reference each other.
+            await conn.execute(
+                sa_text(f"TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE")
+            )
+    return eng
+
+
+async def _fresh_sqlite_engine():
+    """StaticPool keeps one connection alive so every session sees the same
+    :memory: database."""
     eng = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         future=True,
@@ -52,6 +91,22 @@ async def engine(monkeypatch):
     )
     async with eng.begin() as conn:
         await conn.run_sync(db_module.Base.metadata.create_all)
+    return eng
+
+
+@pytest_asyncio.fixture
+async def engine(monkeypatch):
+    """A clean database per test, on whichever backend DATABASE_URL selects.
+
+    The engine is rebound onto `app.db.database` (and onto modules that imported
+    `async_session` at load time), so service code opening its own session
+    routes to this same DB.
+    """
+    eng = (
+        await _fresh_postgres_engine()
+        if RUNNING_ON_POSTGRES
+        else await _fresh_sqlite_engine()
+    )
 
     factory = sessionmaker(
         bind=eng,
