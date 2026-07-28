@@ -66,10 +66,24 @@ async def _fresh_postgres_engine():
     """
     eng = create_async_engine(DATABASE_URL, future=True, poolclass=NullPool)
     async with eng.begin() as conn:
-        # checkfirst is on by default, so this is a no-op after the first test.
-        await conn.run_sync(db_module.Base.metadata.create_all)
-
+        # ONE catalog query answers both questions below. The obvious
+        # implementation — calling create_all(checkfirst=True) per test — issues
+        # a reflection query PER TABLE instead: 65 tables x ~670 tests is about
+        # 43,000 round trips, which took the suite from ~7 minutes to 18 and put
+        # it within two minutes of the job timeout. SQLite hid this because
+        # building an empty in-memory database costs nothing.
+        existing = {
+            row[0] for row in (await conn.execute(sa_text(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            ))).all()
+        }
         known = {t.name for t in db_module.Base.metadata.sorted_tables}
+
+        # Build the schema only when something is actually missing — the first
+        # test of a run, or after a test drops tables on purpose (the startup
+        # migration test does exactly that).
+        if known - existing:
+            await conn.run_sync(db_module.Base.metadata.create_all)
 
         # Drop scratch tables that tests build themselves with raw DDL. The
         # radius_* tables have no ORM model, and two test modules create
@@ -77,13 +91,7 @@ async def _fresh_postgres_engine():
         # A fresh database per test hid that forever; on a persistent one,
         # whichever module runs first wins and the other fails on a missing
         # column. Dropping them restores the isolation SQLite gave us for free.
-        stray = [
-            row[0] for row in (await conn.execute(sa_text(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-            ))).all()
-            if row[0] not in known
-        ]
-        for name in stray:
+        for name in existing - known:
             await conn.execute(sa_text(f'DROP TABLE IF EXISTS "{name}" CASCADE'))
 
         tables = ", ".join(f'"{t.name}"' for t in db_module.Base.metadata.sorted_tables)

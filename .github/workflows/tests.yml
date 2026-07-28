@@ -9,7 +9,10 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Headroom, not a fix: the real cure for a slow suite is fewer round trips
+    # (see the single catalog query in conftest). This only stops a legitimately
+    # passing run from being killed while the suite grows.
+    timeout-minutes: 30
 
     # The suite runs against the engine production actually uses. SQLite is a
     # fast local approximation, but it cannot execute the Postgres-only syntax
