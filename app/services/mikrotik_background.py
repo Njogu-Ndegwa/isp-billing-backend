@@ -2661,10 +2661,20 @@ async def collect_bandwidth_snapshot():
                                             f"[FUP] Failed to record/enforce usage for {pppoe_user}: {fup_err}"
                                         )
 
-                    snapshot.hotspot_upload_bytes = hotspot_delta_upload_bytes
-                    snapshot.hotspot_download_bytes = hotspot_delta_download_bytes
-                    snapshot.pppoe_upload_bytes = pppoe_delta_upload_bytes
-                    snapshot.pppoe_download_bytes = pppoe_delta_download_bytes
+                    # Add whatever the push channel banked for this router since
+                    # the last snapshot. Push consumes the queue-counter stream
+                    # every ~2 min for customer periods, leaving this visit only
+                    # a sliver — without the bank, the dashboard usage bars
+                    # collapsed to ~0.6% of real traffic on push-enabled routers
+                    # (2026-07-29). The stream is partitioned between readers,
+                    # so own-deltas + banked-deltas is complete and never
+                    # double-counts. Late import: usage_push imports models only.
+                    from app.services.usage_push import drain_bar_deltas as _drain_push_bars
+                    push_hs_up, push_hs_dn, push_ppp_up, push_ppp_dn = _drain_push_bars(router_id)
+                    snapshot.hotspot_upload_bytes = hotspot_delta_upload_bytes + push_hs_up
+                    snapshot.hotspot_download_bytes = hotspot_delta_download_bytes + push_hs_dn
+                    snapshot.pppoe_upload_bytes = pppoe_delta_upload_bytes + push_ppp_up
+                    snapshot.pppoe_download_bytes = pppoe_delta_download_bytes + push_ppp_dn
 
                     logger.debug(f"Collected bandwidth snapshot for router {router.name} (ID: {router_id})")
                     await db.commit()

@@ -52,12 +52,19 @@ def render_usage_push_script(
     identity: str,
     endpoint_url: str,
     interval_seconds: int = 120,
+    include_router_metrics: bool = False,
 ) -> str:
     """Render the installable RouterOS script.
 
     ``interval_seconds`` is the starting cadence only — the server returns
     ``next_push_seconds`` on every accepted push, so the fleet can be retuned
     centrally without reinstalling anything.
+
+    ``include_router_metrics`` appends a ``router`` block to each batch:
+    interface byte counters plus hotspot/PPPoE active counts. Every added
+    command is a READ — ``/interface get``, ``:len [... find]`` — nothing on the
+    router is changed by them. Rolled out separately from the usage reports so a
+    metrics problem can be reverted without touching usage collection.
     """
     identity = _require(identity, _IDENTITY_RE, "identity")
     endpoint_url = _require(endpoint_url, _URL_RE, "endpoint_url")
@@ -65,6 +72,24 @@ def render_usage_push_script(
         raise ValueError("usage-push script: interval must be 30..3600 seconds")
 
     token = derive_router_token(identity)
+
+    # Read-only lookups, guarded so a router missing the hotspot/ppp package or
+    # an ether1 by that name skips metrics instead of losing the whole push.
+    # ``:set first false`` marks the batch as worth sending even with no queues.
+    metrics_block = ""
+    if include_router_metrics:
+        metrics_block = (
+            '    :do {\n'
+            '        :local rxb [/interface get [find name="ether1"] rx-byte]\n'
+            '        :local txb [/interface get [find name="ether1"] tx-byte]\n'
+            '        :local hs [:len [/ip hotspot active find]]\n'
+            '        :local pp [:len [/ppp active find]]\n'
+            '        :set body ($body . ",\\"router\\":{\\"iface_rx_bytes\\":" . $rxb'
+            ' . ",\\"iface_tx_bytes\\":" . $txb . ",\\"hotspot_active\\":" . $hs'
+            ' . ",\\"pppoe_active\\":" . $pp . ",\\"queue_count\\":" . $qcount . "}")\n'
+            '        :set first false\n'
+            '    } on-error={ :log info "usage-push: metrics skipped" }\n'
+        )
 
     # A random start delay spreads the fleet out. Without it, routers that
     # rebooted together — after a power cut, which is common — would come back
@@ -84,6 +109,7 @@ def render_usage_push_script(
     :local ident "{identity}"
     :local body "{{\\"identity\\":\\"$ident\\",\\"reports\\":["
     :local first true
+    :local qcount 0
     :foreach q in=[/queue simple find] do={{
         :local qn [/queue simple get $q name]
         :local qb [/queue simple get $q bytes]
@@ -103,9 +129,11 @@ def render_usage_push_script(
             :set body ($body . "{{\\"queue_key\\":\\"" . $key . \\
                 "\\",\\"upload_bytes\\":" . $up . ",\\"download_bytes\\":" . $dn . "}}")
             :set first false
+            :set qcount ($qcount + 1)
         }}
     }}
-    :set body ($body . "]}}")
+    :set body ($body . "]")
+{metrics_block}    :set body ($body . "}}")
     # Nothing to say is not worth a connection.
     :if (!$first) do={{
         :do {{

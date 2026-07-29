@@ -50,6 +50,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db.database import async_session
 from app.db.models import (
+    BandwidthSnapshot,
     ConnectionType,
     Customer,
     CustomerStatus,
@@ -59,6 +60,7 @@ from app.db.models import (
     User,
 )
 from app.services.mikrotik_api import normalize_mac_address
+from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
 
 logger = logging.getLogger(__name__)
@@ -103,11 +105,77 @@ class UsageReport:
 
 
 @dataclass
+class RouterMetrics:
+    """Router-level numbers a reporter may include alongside its usage batch.
+
+    All values are read-only facts the router already holds; nothing here can
+    instruct the server to change anything.
+    """
+
+    iface_rx_bytes: int
+    iface_tx_bytes: int
+    hotspot_active: int = 0
+    pppoe_active: int = 0
+    queue_count: int = 0
+
+
+@dataclass
 class IngestResult:
     accepted: int = 0
     rejected: int = 0
     over_cap_customer_ids: list[int] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    snapshot_written: bool = False
+
+
+# A push-written snapshot at most this often per router. The fleet pushes every
+# ~120s; unthrottled that multiplies bandwidth_snapshots growth ~15x over the
+# poller. 300s keeps the dashboard ~2.5-5 min fresh at ~2x today's row rate.
+PUSH_SNAPSHOT_MIN_INTERVAL_SECONDS = 300
+
+_MAX_ACTIVE_COUNT = 100_000
+
+# Per-router bank of usage deltas awaiting a snapshot stamp: router_id ->
+# [hotspot_up, hotspot_dn, pppoe_up, pppoe_dn].
+#
+# Why this exists: the queue-counter stream is consumed by whoever reads it
+# first. Once push started reading every 2 minutes for customer periods, the
+# poller's hourly visit found only a 2-minute sliver left — and the dashboard's
+# usage bars (which sum snapshot deltas) collapsed to ~0.6% of real traffic
+# (SkyNet, 2026-07-29: 49 MB shown, 8,667 MB actual). Ingest banks every delta
+# here; whichever snapshot writer runs next — push metrics or the poller —
+# stamps and drains the bank, so the bars sum the full stream exactly once.
+# In-memory on purpose: losing ≤5 min of bar data on a restart is cosmetic.
+_bar_deltas: dict[int, list[int]] = {}
+
+
+def reset_bar_deltas() -> None:
+    """Test hook — the bank is process state."""
+    _bar_deltas.clear()
+
+
+def _bank_bar_delta(router_id: int, key: str, delta_up: int, delta_dn: int) -> None:
+    if not delta_up and not delta_dn:
+        return
+    bank = _bar_deltas.setdefault(router_id, [0, 0, 0, 0])
+    if key.startswith("pppoe:"):
+        bank[2] += delta_up
+        bank[3] += delta_dn
+    else:
+        bank[0] += delta_up
+        bank[1] += delta_dn
+
+
+def drain_bar_deltas(router_id: int) -> tuple[int, int, int, int]:
+    """Return and clear the banked (hs_up, hs_dn, ppp_up, ppp_dn) for a router.
+
+    Called by whichever snapshot writer runs next — the push metrics path below
+    or the bandwidth poller — so each banked byte is stamped exactly once.
+    """
+    bank = _bar_deltas.pop(router_id, None)
+    if not bank:
+        return (0, 0, 0, 0)
+    return (bank[0], bank[1], bank[2], bank[3])
 
 
 def _canonical_key(raw: str) -> Optional[str]:
@@ -184,12 +252,93 @@ def _cap_bytes_for(period: Optional[CustomerUsagePeriod], plan: Optional[Plan]) 
     return int(cap_mb) * 1024 * 1024 if cap_mb and int(cap_mb) > 0 else 0
 
 
+async def _persist_router_metrics(
+    db,
+    router_id: int,
+    metrics: RouterMetrics,
+    now: datetime,
+    result: IngestResult,
+) -> None:
+    """Write a bandwidth snapshot from pushed router metrics, throttled.
+
+    Deliberate zeros in the per-queue byte-delta fields: the Daily Breakdown
+    bars sum those deltas, which only the poller computes from queue counters —
+    a push snapshot claiming them would double-count every bar on mixed-source
+    routers. Push usage lands in customer_usage_periods via the reports instead.
+    """
+    rx = int(metrics.iface_rx_bytes or 0)
+    tx = int(metrics.iface_tx_bytes or 0)
+    hotspot = int(metrics.hotspot_active or 0)
+    pppoe = int(metrics.pppoe_active or 0)
+    queues = int(metrics.queue_count or 0)
+    if (
+        rx < 0 or tx < 0
+        or rx > MAX_PLAUSIBLE_COUNTER_BYTES or tx > MAX_PLAUSIBLE_COUNTER_BYTES
+        or not (0 <= hotspot <= _MAX_ACTIVE_COUNT)
+        or not (0 <= pppoe <= _MAX_ACTIVE_COUNT)
+        or not (0 <= queues <= _MAX_ACTIVE_COUNT)
+    ):
+        result.errors.append("implausible_router_metrics")
+        return
+
+    prev = (
+        await db.execute(
+            select(BandwidthSnapshot)
+            .where(BandwidthSnapshot.router_id == router_id)
+            .order_by(BandwidthSnapshot.recorded_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+    if prev is not None:
+        elapsed = (now - prev.recorded_at).total_seconds()
+        if elapsed < PUSH_SNAPSHOT_MIN_INTERVAL_SECONDS:
+            return  # throttled — not an error, the next push carries the same counters
+
+    avg_download_bps = 0.0
+    avg_upload_bps = 0.0
+    if prev is not None:
+        elapsed = (now - prev.recorded_at).total_seconds()
+        rx_delta = rx - int(prev.interface_rx_bytes or 0)
+        tx_delta = tx - int(prev.interface_tx_bytes or 0)
+        # Negative delta = the router rebooted and its counters reset. Zero
+        # rate, never a negative or a spike.
+        if elapsed > 0 and rx_delta >= 0 and tx_delta >= 0:
+            avg_download_bps = rx_delta * 8 / elapsed
+            avg_upload_bps = tx_delta * 8 / elapsed
+
+    # Stamp the usage deltas banked since the last snapshot (from either
+    # writer), so the dashboard's usage bars sum the full counter stream. The
+    # poller drains the same bank on its visits; each byte lands exactly once.
+    hs_up, hs_dn, ppp_up, ppp_dn = drain_bar_deltas(router_id)
+
+    db.add(BandwidthSnapshot(
+        router_id=router_id,
+        interface_rx_bytes=rx,
+        interface_tx_bytes=tx,
+        active_hotspot_users=hotspot,
+        active_sessions=pppoe,
+        active_queues=queues,
+        total_download_bps=int(avg_download_bps),
+        total_upload_bps=int(avg_upload_bps),
+        avg_download_bps=avg_download_bps,
+        avg_upload_bps=avg_upload_bps,
+        hotspot_upload_bytes=hs_up,
+        hotspot_download_bytes=hs_dn,
+        pppoe_upload_bytes=ppp_up,
+        pppoe_download_bytes=ppp_dn,
+        recorded_at=now,
+    ))
+    result.snapshot_written = True
+
+
 async def ingest_usage_reports(
     router_id: int,
     reports: list[UsageReport],
     *,
     now: Optional[datetime] = None,
     session_factory=None,
+    router_metrics: Optional[RouterMetrics] = None,
 ) -> IngestResult:
     """Apply one router's batch of usage reports.
 
@@ -201,7 +350,7 @@ async def ingest_usage_reports(
     factory = session_factory or async_session
     result = IngestResult()
 
-    if not reports:
+    if not reports and router_metrics is None:
         return result
 
     if len(reports) > MAX_REPORTS_PER_BATCH:
@@ -327,6 +476,9 @@ async def ingest_usage_reports(
 
             result.accepted += 1
             pending += 1
+            _bank_bar_delta(
+                router_id, key, update.delta_upload_bytes, update.delta_download_bytes
+            )
 
             period = update.period
             cap_bytes = _cap_bytes_for(period, plan)
@@ -343,6 +495,22 @@ async def ingest_usage_reports(
                 await db.commit()
                 pending = 0
 
+        if router_metrics is not None:
+            await _persist_router_metrics(db, router_id, router_metrics, now, result)
+
         await db.commit()
+
+    # A push that produced a snapshot is also proof of liveness. The stamp rides
+    # the same throttle so the hot routers row is touched every ~5 min per
+    # router, not every 2. record_router_availability commits in its OWN short
+    # session (lock-convoy discipline; its db parameter is documented unused) —
+    # called here with no transaction held.
+    if result.snapshot_written:
+        try:
+            await record_router_availability(
+                None, router_id, True, "usage_push", checked_at=now
+            )
+        except Exception as exc:
+            logger.warning("[USAGE-PUSH] availability stamp failed for %s: %s", router_id, exc)
 
     return result

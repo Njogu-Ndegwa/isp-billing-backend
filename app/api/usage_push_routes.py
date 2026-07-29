@@ -36,6 +36,7 @@ from app.db.database import async_session, db_pool_snapshot
 from app.db.models import Router as RouterModel
 from app.services.usage_push import (
     MAX_REPORTS_PER_BATCH,
+    RouterMetrics,
     UsageReport,
     ingest_usage_reports,
 )
@@ -90,9 +91,24 @@ class UsageReportIn(BaseModel):
     max_limit: str = Field(default="", max_length=64)
 
 
+class RouterMetricsIn(BaseModel):
+    """Optional router-level readings — interface counters and session counts.
+
+    Everything here is a read-only fact from the router; validation bounds live
+    in the service layer alongside the usage-report bounds.
+    """
+
+    iface_rx_bytes: int = Field(ge=0)
+    iface_tx_bytes: int = Field(ge=0)
+    hotspot_active: int = Field(default=0, ge=0)
+    pppoe_active: int = Field(default=0, ge=0)
+    queue_count: int = Field(default=0, ge=0)
+
+
 class UsagePushIn(BaseModel):
     identity: str = Field(max_length=128)
     reports: list[UsageReportIn] = Field(default_factory=list)
+    router: Optional[RouterMetricsIn] = None
 
 
 @router.post("/api/router/usage-push")
@@ -154,6 +170,16 @@ async def receive_usage_push(
 
     _last_push_at[identity] = now
 
+    metrics = None
+    if payload.router is not None:
+        metrics = RouterMetrics(
+            iface_rx_bytes=payload.router.iface_rx_bytes,
+            iface_tx_bytes=payload.router.iface_tx_bytes,
+            hotspot_active=payload.router.hotspot_active,
+            pppoe_active=payload.router.pppoe_active,
+            queue_count=payload.router.queue_count,
+        )
+
     result = await ingest_usage_reports(
         router_row.id,
         [
@@ -168,6 +194,7 @@ async def receive_usage_push(
             )
             for item in payload.reports
         ],
+        router_metrics=metrics,
     )
 
     if result.over_cap_customer_ids:
