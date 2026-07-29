@@ -136,3 +136,18 @@ Project-level items that should survive across agent sessions.
 - Proposed next step: see `docs/agent-memory/router-push-channel-future-uses.md` for
   the candidate list, the value order, and the design rules that must carry over
   (cumulative payloads, lifecycle validation, no schema for operational state).
+
+### Usage-Push: Weekly Newly-Eligible Sweep
+
+- Status: planned
+- Problem: the 2026-07-28 rollout installed the push reporter on the 40 routers
+  eligible that night. Routers that come online later, new resellers, and renewed
+  subscriptions get nothing — the fleet slowly drifts back to polling-only as it
+  grows. Two known gaps already: router 131 (device-mode lock, needs button press)
+  and router 289 (offline during rollout).
+- Why it matters: every uncovered router reverts to ~49-min sampling and its
+  short-session usage is uncounted again.
+- Proposed next step: small scheduled job (or admin endpoint) that applies the same
+  eligibility filter as the rollout (docs/agent-memory/usage-push-rollout-2026-07-28.md)
+  and installs on any eligible router lacking the scheduler. Reuses the stage-3
+  installer logic.
