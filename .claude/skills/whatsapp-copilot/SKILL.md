@@ -30,9 +30,32 @@ ledger evidence (see Measurement).
    - Known personal (always skip, never record): MHS/Mang'u groups, OMNIVOLTAIC groups,
      GEN Z TOM LINK, family contacts (Aunts, toma, Laban, Munchkn, Rhobii), Meta AI, promos.
    - Ambiguous → open, read the last screen; if personal, close and move on. Record nothing.
-3. **Gather context** for each business message: scroll the thread (2× scroll-up minimum),
-   check `raw/<alias>.md` and `contacts-index.md`. Identify: who, category, what they need,
-   any prior promises in the thread.
+3. **Gather context — OPEN THE THREAD. The preview is never enough.**
+   Open every business thread and read the conversation, including images, before drafting
+   OR reporting on it. Scroll up at least twice. Check `raw/<alias>.md` and
+   `contacts-index.md`. Identify: who, category, what they need, any prior promises.
+
+   Dennis, 2026-07-29: *"I expect you to actually be opening the text, because I want you to
+   have the context of the whole conversation. Just the preview doesn't help anything — a
+   message could be long and there could be many messages."*
+
+   A roster preview is ONE truncated line, with no sender, no images, and no indication of
+   how many messages are in the thread. Two failures in two days came from trusting it:
+
+   - An ACTIVE reseller (93 customers, paid that day) was reported as a "churned operator,
+     five weeks silent", from suspended account rows plus a preview. The thread said
+     "hello bro, I managed to onboard" that same afternoon.
+   - The same reseller then sent six messages and two annotated screenshots — red-circled
+     figures proving two panel views disagreed — and they went unseen for a day, because the
+     preview only ever shows the newest line.
+
+   **Opening marks the chat read. That cost is accepted** — Dennis has explicitly chosen full
+   context over preserving the unread flag. Personal chats still stay unopened (step 2).
+
+   Related: the tab-title `(N)` counts unread CHATS, not messages, so extra messages into an
+   already-unread thread never move it. It is a trigger to look, never a report of what is
+   there. And never merely OFFER a read-only check — read-only needs no permission, so run it
+   and report the result.
 4. **Draft** per the Voice Guide below. One draft per thread. Attach: category, confidence
    (high/med/low), and any data you could not verify (mark inline as [NEEDS: …]).
 5. **Present** the batch to Dennis in chat: alias, their message (short quote), the draft,
