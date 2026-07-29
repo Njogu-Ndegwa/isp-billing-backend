@@ -2200,7 +2200,13 @@ async def collect_bandwidth_snapshot():
         now = datetime.utcnow()
         run_started = time.monotonic()
         async with async_session() as db:
-            routers_result = await db.execute(select(Router))
+            # Stable ordering is what makes the cursor walk a true rotation.
+            # Without it Postgres returns heap order, and every availability
+            # UPDATE relocates a router's row — busy routers kept drifting to
+            # positions the cursor had already passed and were starved for hours
+            # while quiet ones were revisited 5-6x (observed 2026-07-29: 37
+            # distinct routers covered in 210 visit slots).
+            routers_result = await db.execute(select(Router).order_by(Router.id))
             routers = routers_result.scalars().all()
             if not routers:
                 logger.warning("No routers found in database for bandwidth collection")
