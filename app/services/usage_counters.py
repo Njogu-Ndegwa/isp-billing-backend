@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Customer, Plan, UserBandwidthUsage
@@ -90,35 +90,38 @@ async def record_queue_usage_sample(
         keys.extend(k for k in legacy_keys if k)
     keys = list(dict.fromkeys(keys))
 
-    # Scope to the customer whenever we know it. MAC is unique per RESELLER, not
-    # globally, so two resellers legitimately hold the same MAC (randomised phone
-    # MACs collide readily). Looking up on the key alone put both customers on one
-    # counter row: each sample then looked like a counter reset to the other and
-    # both accrued the other's traffic. Legacy rows predate the customer link, so
-    # fall back to the key and adopt the row — it self-heals on first sight.
-    usage = None
+    # The lookup is scoped to THE KEY BEING SAMPLED, and within that key to this
+    # customer (or an unclaimed legacy row). Two invariants, each learned the
+    # hard way:
+    #
+    # * Never another customer's row for the same key — MAC is unique per
+    #   RESELLER, not globally, so two resellers legitimately hold the same MAC;
+    #   sharing one row interleaved their counters and billed each other's
+    #   traffic (fixed in PR #20).
+    # * Never a row for a DIFFERENT key — a customer owns one row per device key
+    #   they have ever used (one in prod owns 25). PR #20's first attempt looked
+    #   up by customer alone, grabbed an arbitrary row and rewrote its key,
+    #   manufacturing duplicate rows per MAC; the bandwidth poller's
+    #   one-row-expected lookup then aborted every run before its rotation
+    #   cursor advanced, freezing router dashboards fleet-wide (2026-07-29).
+    stmt = select(UserBandwidthUsage).where(UserBandwidthUsage.mac_address.in_(keys))
+    order = []
     if customer is not None:
-        by_customer = select(UserBandwidthUsage).where(
-            UserBandwidthUsage.customer_id == customer.id
-        ).limit(1)
-        try:
-            by_customer = by_customer.with_for_update()
-        except Exception:
-            pass
-        usage = (await db.execute(by_customer)).scalar_one_or_none()
-
-    if usage is None:
-        stmt = select(UserBandwidthUsage).where(
-            UserBandwidthUsage.mac_address.in_(keys)
+        stmt = stmt.where(
+            or_(
+                UserBandwidthUsage.customer_id == customer.id,
+                UserBandwidthUsage.customer_id.is_(None),
+            )
         )
-        if customer is not None:
-            stmt = stmt.where(UserBandwidthUsage.customer_id.is_(None))
-        stmt = stmt.limit(1)
-        try:
-            stmt = stmt.with_for_update()
-        except Exception:
-            pass
-        usage = (await db.execute(stmt)).scalar_one_or_none()
+        # Prefer this customer's claimed row over adopting an unclaimed one.
+        order.append((UserBandwidthUsage.customer_id == customer.id).desc())
+    order.append(UserBandwidthUsage.last_updated.desc())
+    stmt = stmt.order_by(*order).limit(1)
+    try:
+        stmt = stmt.with_for_update()
+    except Exception:
+        pass
+    usage = (await db.execute(stmt)).scalars().first()
 
     created = False
     if usage:

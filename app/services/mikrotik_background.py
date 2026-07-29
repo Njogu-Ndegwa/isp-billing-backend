@@ -2236,6 +2236,12 @@ async def collect_bandwidth_snapshot():
             start_index = _bandwidth_router_cursor % len(eligible_routers)
             ordered_routers = eligible_routers[start_index:] + eligible_routers[:start_index]
             routers_to_process = ordered_routers[:BANDWIDTH_MAX_ROUTERS_PER_RUN]
+            # Advance the rotation cursor BEFORE processing. When it was advanced
+            # after the loop, any exception escaping the per-router handler froze
+            # the cursor and the job re-processed the same window forever while
+            # every other router's dashboard flatlined (2026-07-29). Advancing
+            # first costs at most one repeat visit after a crash; never a freeze.
+            _bandwidth_router_cursor = (start_index + len(routers_to_process)) % len(eligible_routers)
             processed_count = 0
             logger.info(
                 "[BANDWIDTH] Processing %d/%d eligible router(s) this run "
@@ -2435,11 +2441,23 @@ async def collect_bandwidth_snapshot():
                                 )
                                 customer = cust_result.scalars().first()
                                 existing = await db.execute(
-                                    select(UserBandwidthUsage).where(
-                                        UserBandwidthUsage.mac_address.in_(mac_variants)
-                                    )
+                                    select(UserBandwidthUsage)
+                                    .where(UserBandwidthUsage.mac_address.in_(mac_variants))
+                                    .order_by(UserBandwidthUsage.last_updated.desc())
                                 )
-                                usage = existing.scalar_one_or_none()
+                                # Several rows can legitimately share a MAC (one per
+                                # customer — randomised phone MACs collide across
+                                # resellers). Pick this customer's row, else an
+                                # unclaimed one; expecting exactly one row aborted the
+                                # whole run and froze the rotation cursor (2026-07-29).
+                                usage_rows = existing.scalars().all()
+                                if customer is not None:
+                                    usage = next(
+                                        (u for u in usage_rows if u.customer_id == customer.id),
+                                        next((u for u in usage_rows if u.customer_id is None), None),
+                                    )
+                                else:
+                                    usage = usage_rows[0] if usage_rows else None
                                 if usage:
                                     delta_up, delta_dn, reset_detected = _usage_counter_delta(
                                         usage, upload_bytes, download_bytes
@@ -2655,8 +2673,6 @@ async def collect_bandwidth_snapshot():
                     except Exception as rb_err:
                         logger.error(f"[BANDWIDTH] Rollback after router error failed: {rb_err}")
                     continue
-
-            _bandwidth_router_cursor = (start_index + processed_count) % len(eligible_routers)
 
             cutoff = now - timedelta(days=BANDWIDTH_HISTORY_RETENTION_DAYS)
             await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
