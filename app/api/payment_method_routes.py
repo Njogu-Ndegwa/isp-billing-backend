@@ -15,10 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.db.models import (
+    PayoutDestinationAction,
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
     Router,
 )
+from app.services import payout_destination_alerts
 from app.services.auth import verify_token, get_current_user
 from app.services.payment_gateway import (
     decrypt_credential,
@@ -322,6 +324,17 @@ async def create_payment_method(
         pm.id, method_type.value, user.id,
     )
 
+    # Audit + owner alert AFTER commit, in its own session (AGENTS.md).
+    await payout_destination_alerts.record_and_notify(
+        user_id=user.id,
+        actor_user_id=user.id,
+        action=PayoutDestinationAction.CREATED,
+        payment_method_id=pm.id,
+        method_type=method_type.value,
+        label=pm.label,
+        destination_after=payout_destination_alerts.describe_destination(pm),
+    )
+
     return _serialize_payment_method(pm)
 
 
@@ -378,6 +391,10 @@ async def update_payment_method(
     if not pm:
         raise HTTPException(status_code=404, detail="Payment method not found")
 
+    # Snapshot BEFORE mutating -- this is what the owner gets told they had.
+    destination_before = payout_destination_alerts.describe_destination(pm)
+    was_active = pm.is_active
+
     if request.label is not None:
         pm.label = request.label
     if request.is_active is not None:
@@ -422,6 +439,26 @@ async def update_payment_method(
     await db.refresh(pm)
 
     logger.info("Payment method updated: id=%s, user=%s", pm.id, user.id)
+
+    # An is_active flip is reported as its own action: deactivating the real
+    # destination is exactly how the 2026-06-11 redirect was staged, and it
+    # must not be buried inside a generic "updated".
+    if was_active and not pm.is_active:
+        action = PayoutDestinationAction.DEACTIVATED
+    elif not was_active and pm.is_active:
+        action = PayoutDestinationAction.REACTIVATED
+    else:
+        action = PayoutDestinationAction.UPDATED
+    await payout_destination_alerts.record_and_notify(
+        user_id=user.id,
+        actor_user_id=user.id,
+        action=action,
+        payment_method_id=pm.id,
+        method_type=getattr(pm.method_type, "value", pm.method_type),
+        label=pm.label,
+        destination_before=destination_before,
+        destination_after=payout_destination_alerts.describe_destination(pm),
+    )
     return _serialize_payment_method(pm)
 
 
@@ -445,6 +482,10 @@ async def delete_payment_method(
     if not pm:
         raise HTTPException(status_code=404, detail="Payment method not found")
 
+    destination_before = payout_destination_alerts.describe_destination(pm)
+    method_type = getattr(pm.method_type, "value", pm.method_type)
+    label = pm.label
+
     pm.is_active = False
 
     # Unassign from any routers using this method
@@ -457,6 +498,16 @@ async def delete_payment_method(
     await db.commit()
 
     logger.info("Payment method deactivated: id=%s, user=%s", pm.id, user.id)
+
+    await payout_destination_alerts.record_and_notify(
+        user_id=user.id,
+        actor_user_id=user.id,
+        action=PayoutDestinationAction.DEACTIVATED,
+        payment_method_id=method_id,
+        method_type=method_type,
+        label=label,
+        destination_before=destination_before,
+    )
     return {"message": "Payment method deactivated", "id": pm.id}
 
 
@@ -569,6 +620,13 @@ async def assign_payment_method_to_router(
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
+    previous_pm = (
+        await db.get(ResellerPaymentMethod, router_obj.payment_method_id)
+        if router_obj.payment_method_id else None
+    )
+    destination_before = payout_destination_alerts.describe_destination(previous_pm)
+
+    pm = None
     if request.payment_method_id is not None:
         pm_result = await db.execute(
             select(ResellerPaymentMethod).where(
@@ -585,12 +643,27 @@ async def assign_payment_method_to_router(
             )
 
     router_obj.payment_method_id = request.payment_method_id
+    router_name = router_obj.name
     await db.commit()
 
     logger.info(
         "Router %s payment method updated to %s",
         router_id, request.payment_method_id,
     )
+
+    destination_after = payout_destination_alerts.describe_destination(pm)
+    if destination_after != destination_before:
+        await payout_destination_alerts.record_and_notify(
+            user_id=user.id,
+            actor_user_id=user.id,
+            action=PayoutDestinationAction.ROUTER_ASSIGNED,
+            payment_method_id=request.payment_method_id,
+            method_type=getattr(pm.method_type, "value", pm.method_type) if pm else None,
+            label=router_name,
+            destination_before=destination_before,
+            destination_after=destination_after,
+            router_id=router_id,
+        )
 
     return {
         "router_id": router_id,

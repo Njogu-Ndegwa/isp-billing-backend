@@ -430,6 +430,20 @@
   "id",
   "paid_on"
  ],
+ "payout_destination_change_log": [
+  "action",
+  "actor_user_id",
+  "created_at",
+  "destination_after",
+  "destination_before",
+  "id",
+  "label",
+  "method_type",
+  "notified",
+  "payment_method_id",
+  "router_id",
+  "user_id"
+ ],
  "plans": [
   "badge_text",
   "connection_type",

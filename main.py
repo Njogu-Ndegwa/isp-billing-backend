@@ -2110,6 +2110,41 @@ async def run_feedback_migrations():
     logger.info("Migration: feedback board tables, enums, indexes ready")
 
 
+async def run_payout_destination_audit_migrations():
+    """Create the payout_destination_change_log table + its enum. Idempotent.
+
+    Append-only audit of every change to where a reseller's money is sent, added
+    after the 2026-06-11 incident where a reseller's payout destination was
+    switched to a third-party paybill for four days with no record of who did it.
+    """
+    from sqlalchemy import text, inspect
+
+    async with async_engine.begin() as conn:
+        await conn.execute(text(
+            "DO $$ BEGIN CREATE TYPE payoutdestinationaction AS ENUM "
+            "('created','updated','deactivated','reactivated','router_assigned'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+        ))
+        # The enum may predate a later-added action (lesson from the missing
+        # 'timeout' label on b2btransactionstatus, 2026-07-18): CREATE TYPE
+        # no-ops above, so every value must also be added explicitly.
+        for value in ("created", "updated", "deactivated",
+                      "reactivated", "router_assigned"):
+            await conn.execute(text(
+                f"ALTER TYPE payoutdestinationaction ADD VALUE IF NOT EXISTS '{value}'"
+            ))
+
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+        from app.db.models import PayoutDestinationChangeLog
+        if PayoutDestinationChangeLog.__tablename__ not in tables:
+            await conn.run_sync(lambda c: Base.metadata.create_all(
+                c, tables=[PayoutDestinationChangeLog.__table__]))
+    logger.info("Migration: payout destination change log ready")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -2267,6 +2302,12 @@ async def startup_event():
         logger.info("Feedback board migrations completed successfully")
     except Exception as e:
         logger.error(f"Feedback board migration failed (non-fatal): {e}")
+
+    try:
+        await run_payout_destination_audit_migrations()
+        logger.info("Payout destination audit migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Payout destination audit migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,

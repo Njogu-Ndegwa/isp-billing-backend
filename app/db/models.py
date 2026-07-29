@@ -1783,6 +1783,44 @@ class ResellerInboxMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class PayoutDestinationAction(str, enum.Enum):
+    CREATED = "created"
+    UPDATED = "updated"
+    DEACTIVATED = "deactivated"
+    REACTIVATED = "reactivated"
+    ROUTER_ASSIGNED = "router_assigned"
+
+
+class PayoutDestinationChangeLog(Base):
+    """Append-only audit trail of every change to where a reseller's money goes.
+
+    Exists because the platform previously recorded no actor for payment-method
+    edits: on 2026-06-11 a reseller's payout destination was switched to a
+    third-party paybill for four days and nothing in the database could say who
+    did it (only Safaricom rejecting the receiver stopped the money leaving).
+    Never updated or deleted -- one row per change, forever.
+    """
+    __tablename__ = "payout_destination_change_log"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Account the destination belongs to (the money's owner).
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # Who performed it. Same as user_id for self-service; an admin id when staff
+    # acted on the account. Nullable only so the log survives user deletion.
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    action = Column(Enum(PayoutDestinationAction), nullable=False)
+    payment_method_id = Column(Integer, nullable=True, index=True)
+    method_type = Column(String(40), nullable=True)
+    label = Column(String(100), nullable=True)
+    # Human-readable destination, e.g. "paybill 852648 / acct 139738".
+    # Deliberately NOT a FK snapshot: it must stay readable after the row it
+    # described has been edited again or deleted.
+    destination_before = Column(String(200), nullable=True)
+    destination_after = Column(String(200), nullable=True)
+    router_id = Column(Integer, nullable=True)
+    notified = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class FeedbackKind(str, enum.Enum):
     BUG = "bug"
     IDEA = "idea"
