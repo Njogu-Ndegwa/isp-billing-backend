@@ -2268,14 +2268,19 @@ async def _swap_unique_indexes_for_table(table):
                     f'ALTER TABLE "{table.name}" DROP CONSTRAINT "{conname}"'
                 ))
 
-            # Drop a pre-existing FULL unique index on these columns (the
-            # unique=True, index=True pattern — e.g. ix_customers_account_number)
-            # unless it is already the partial one we want.
+            # Drop any pre-existing unique index on these columns that is not
+            # our deleted_at partial: the full unique=True/index=True kind
+            # (e.g. ix_customers_account_number) AND hand-created partials
+            # with other predicates (prod has idx_b2b_conversation_id /
+            # idx_sub_payments_checkout with "col IS NOT NULL" — those would
+            # still block re-creating a tombstoned row's value).
             dup_indexes = await conn.execute(text(
                 "SELECT i.relname FROM pg_index x "
                 "JOIN pg_class i ON i.oid = x.indexrelid "
                 "WHERE x.indrelid = to_regclass(:tbl) AND x.indisunique "
-                "AND NOT x.indisprimary AND x.indpred IS NULL "
+                "AND NOT x.indisprimary "
+                "AND (x.indpred IS NULL OR "
+                "     pg_get_expr(x.indpred, x.indrelid) NOT LIKE '%deleted_at%') "
                 "AND x.indnkeyatts = :ncols "
                 "AND (SELECT array_agg(att.attname ORDER BY ord.n) "
                 "     FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS ord(attnum, n) "
