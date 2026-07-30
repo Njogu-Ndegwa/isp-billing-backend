@@ -64,6 +64,7 @@ from app.api.feedback_routes import router as feedback_router
 from app.api.admin_feedback_routes import router as admin_feedback_router
 from app.api.agent_board_routes import router as agent_board_router
 from app.api.load_balancing_routes import router as load_balancing_router
+from app.api.outage_compensation_routes import router as outage_compensation_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -106,6 +107,7 @@ app.include_router(feedback_router)
 app.include_router(admin_feedback_router)
 app.include_router(agent_board_router)
 app.include_router(load_balancing_router)
+app.include_router(outage_compensation_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -2110,6 +2112,31 @@ async def run_compensation_voucher_migrations():
     logger.info("Compensation voucher migrations complete")
 
 
+async def run_outage_compensation_migrations():
+    """Create the outage-compensation audit tables (outage_compensations +
+    outage_compensation_items) on startup. New tables only — no ALTERs — so
+    the checkfirst create_all pattern used by messaging/feedback is enough.
+    Idempotent: safe to run on every startup."""
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+
+        from app.db.models import OutageCompensation, OutageCompensationItem
+        targets = [OutageCompensation, OutageCompensationItem]
+        to_create = [m.__table__ for m in targets if m.__tablename__ not in tables]
+        if to_create:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
+            logger.info(
+                "Outage compensation migration: created %s",
+                ", ".join(t.name for t in to_create),
+            )
+    logger.info("Outage compensation migrations complete")
+
+
 async def run_payment_port_attribution_migrations():
     """Add customer_payments.port_name (varchar, nullable) so revenue can be
     attributed to the router port the paying customer's device was on around
@@ -2398,6 +2425,10 @@ async def startup_event():
         logger.info("Load-balancing migrations completed successfully")
     except Exception as e:
         logger.error(f"Load-balancing migration failed (non-fatal): {e}")
+        await run_outage_compensation_migrations()
+        logger.info("Outage compensation migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Outage compensation migration failed (non-fatal): {e}")
 
     try:
         await run_router_status_alert_migrations()
