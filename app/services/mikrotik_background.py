@@ -21,6 +21,7 @@ from app.db.models import (
     Customer,
     CustomerStatus,
     BandwidthSnapshot,
+    RouterUsageBucket,
     UserBandwidthUsage,
     CustomerUsagePeriod,
     Plan,
@@ -2282,6 +2283,10 @@ async def collect_bandwidth_snapshot():
                     }
                     router_key = f"{router.ip_address}:{router.port}"
                     await db.commit()
+                    # Taken BEFORE the router read: any usage row written after
+                    # this moment (a push landing mid-visit) is fresher than
+                    # what this visit fetched, and must win.
+                    fetched_at = datetime.utcnow()
                     async with router_locks.acquire(router_key):
                         raw = await asyncio.to_thread(_fetch_bandwidth_data_sync_for_router, router_info)
                     if not raw:
@@ -2395,11 +2400,12 @@ async def collect_bandwidth_snapshot():
                     # preserve the historical contract for graphs and other
                     # consumers (see app/api/mikrotik_routes.py bandwidth-history).
                     active_devices = active_hotspot_users + pppoe_active_count
-                    hotspot_delta_upload_bytes = 0
-                    hotspot_delta_download_bytes = 0
-                    pppoe_delta_upload_bytes = 0
-                    pppoe_delta_download_bytes = 0
 
+                    # Snapshot = router HEALTH (interface counters, throughput,
+                    # session counts). The per-queue bar fields stay at their
+                    # zero default: usage bars come from router_usage_buckets,
+                    # written by record_usage in the same transaction that
+                    # credits each customer — one source of truth.
                     snapshot = BandwidthSnapshot(
                         router_id=router_id,
                         total_upload_bps=int(speed_data.get("total_upload_bps", 0)),
@@ -2464,6 +2470,14 @@ async def collect_bandwidth_snapshot():
                                     )
                                 else:
                                     usage = usage_rows[0] if usage_rows else None
+                                if usage and usage.last_updated and fetched_at < usage.last_updated:
+                                    # A fresher writer (push, every ~2 min on
+                                    # push-enabled routers) advanced this row
+                                    # after our counters were read. Applying the
+                                    # stale read would fake a "counter reset"
+                                    # and re-book the queue's lifetime bytes
+                                    # (142-182% bars, 2026-07-30). Skip whole.
+                                    continue
                                 if usage:
                                     delta_up, delta_dn, reset_detected = _usage_counter_delta(
                                         usage, upload_bytes, download_bytes
@@ -2502,8 +2516,6 @@ async def collect_bandwidth_snapshot():
                                     )
                                     db.add(usage)
 
-                                hotspot_delta_upload_bytes += delta_up
-                                hotspot_delta_download_bytes += delta_dn
                                 if customer and customer.plan and customer.plan.connection_type == ConnectionType.HOTSPOT:
                                     try:
                                         period = await record_usage(
@@ -2588,6 +2600,10 @@ async def collect_bandwidth_snapshot():
                                     (u for u in usage_rows if u.mac_address == pppoe_key),
                                     usage_rows[0] if usage_rows else None,
                                 )
+                                if usage and usage.last_updated and fetched_at < usage.last_updated:
+                                    # Stale read vs a fresher writer — same
+                                    # guard as the hotspot branch above.
+                                    continue
 
                                 # --- Reset-safe delta computation ---
                                 if usage:
@@ -2633,9 +2649,6 @@ async def collect_bandwidth_snapshot():
                                     )
                                     db.add(usage)
 
-                                pppoe_delta_upload_bytes += delta_up
-                                pppoe_delta_download_bytes += delta_dn
-
                                 # --- Roll deltas into the open period (PPPoE only) ---
                                 if customer and customer.plan and customer.plan.connection_type == ConnectionType.PPPOE:
                                     try:
@@ -2661,21 +2674,6 @@ async def collect_bandwidth_snapshot():
                                             f"[FUP] Failed to record/enforce usage for {pppoe_user}: {fup_err}"
                                         )
 
-                    # Add whatever the push channel banked for this router since
-                    # the last snapshot. Push consumes the queue-counter stream
-                    # every ~2 min for customer periods, leaving this visit only
-                    # a sliver — without the bank, the dashboard usage bars
-                    # collapsed to ~0.6% of real traffic on push-enabled routers
-                    # (2026-07-29). The stream is partitioned between readers,
-                    # so own-deltas + banked-deltas is complete and never
-                    # double-counts. Late import: usage_push imports models only.
-                    from app.services.usage_push import drain_bar_deltas as _drain_push_bars
-                    push_hs_up, push_hs_dn, push_ppp_up, push_ppp_dn = _drain_push_bars(router_id)
-                    snapshot.hotspot_upload_bytes = hotspot_delta_upload_bytes + push_hs_up
-                    snapshot.hotspot_download_bytes = hotspot_delta_download_bytes + push_hs_dn
-                    snapshot.pppoe_upload_bytes = pppoe_delta_upload_bytes + push_ppp_up
-                    snapshot.pppoe_download_bytes = pppoe_delta_download_bytes + push_ppp_dn
-
                     logger.debug(f"Collected bandwidth snapshot for router {router.name} (ID: {router_id})")
                     await db.commit()
                 except Exception as router_error:
@@ -2692,6 +2690,7 @@ async def collect_bandwidth_snapshot():
 
             cutoff = now - timedelta(days=BANDWIDTH_HISTORY_RETENTION_DAYS)
             await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
+            await db.execute(delete(RouterUsageBucket).where(RouterUsageBucket.bucket_start < cutoff))
             await prune_router_availability_history(db, now=now)
             await db.commit()
 

@@ -1426,10 +1426,39 @@ async def run_fup_usage_migrations():
             "CREATE INDEX IF NOT EXISTS ix_usage_cap_watch_router_due "
             "ON usage_cap_watch_state (router_id, next_poll_at)"
         ))
+
+        # Per-router dashboard-bar ledger: bytes credited to customers, mirrored
+        # by record_usage in the crediting transaction (single source of truth
+        # for usage bars, 2026-07-30).
+        await conn.execute(sa_text(
+            """
+            CREATE TABLE IF NOT EXISTS router_usage_buckets (
+                id SERIAL PRIMARY KEY,
+                router_id INTEGER NOT NULL REFERENCES routers(id),
+                bucket_start TIMESTAMP NOT NULL,
+                hotspot_upload_bytes BIGINT NOT NULL DEFAULT 0,
+                hotspot_download_bytes BIGINT NOT NULL DEFAULT 0,
+                pppoe_upload_bytes BIGINT NOT NULL DEFAULT 0,
+                pppoe_download_bytes BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_router_usage_bucket UNIQUE (router_id, bucket_start)
+            )
+            """
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_router_usage_buckets_router_id "
+            "ON router_usage_buckets (router_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_router_usage_buckets_bucket_start "
+            "ON router_usage_buckets (bucket_start)"
+        ))
+
         logger.info(
             "Migration: Ensured FUP enum, plans/user_bandwidth_usage columns, "
             "bandwidth snapshot service counters, customer_usage_periods table, "
-            "and usage_cap_watch_state table"
+            "usage_cap_watch_state table, and router_usage_buckets ledger"
         )
 
 

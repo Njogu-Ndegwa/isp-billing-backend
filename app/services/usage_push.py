@@ -135,47 +135,12 @@ PUSH_SNAPSHOT_MIN_INTERVAL_SECONDS = 300
 
 _MAX_ACTIVE_COUNT = 100_000
 
-# Per-router bank of usage deltas awaiting a snapshot stamp: router_id ->
-# [hotspot_up, hotspot_dn, pppoe_up, pppoe_dn].
-#
-# Why this exists: the queue-counter stream is consumed by whoever reads it
-# first. Once push started reading every 2 minutes for customer periods, the
-# poller's hourly visit found only a 2-minute sliver left — and the dashboard's
-# usage bars (which sum snapshot deltas) collapsed to ~0.6% of real traffic
-# (SkyNet, 2026-07-29: 49 MB shown, 8,667 MB actual). Ingest banks every delta
-# here; whichever snapshot writer runs next — push metrics or the poller —
-# stamps and drains the bank, so the bars sum the full stream exactly once.
-# In-memory on purpose: losing ≤5 min of bar data on a restart is cosmetic.
-_bar_deltas: dict[int, list[int]] = {}
-
-
-def reset_bar_deltas() -> None:
-    """Test hook — the bank is process state."""
-    _bar_deltas.clear()
-
-
-def _bank_bar_delta(router_id: int, key: str, delta_up: int, delta_dn: int) -> None:
-    if not delta_up and not delta_dn:
-        return
-    bank = _bar_deltas.setdefault(router_id, [0, 0, 0, 0])
-    if key.startswith("pppoe:"):
-        bank[2] += delta_up
-        bank[3] += delta_dn
-    else:
-        bank[0] += delta_up
-        bank[1] += delta_dn
-
-
-def drain_bar_deltas(router_id: int) -> tuple[int, int, int, int]:
-    """Return and clear the banked (hs_up, hs_dn, ppp_up, ppp_dn) for a router.
-
-    Called by whichever snapshot writer runs next — the push metrics path below
-    or the bandwidth poller — so each banked byte is stamped exactly once.
-    """
-    bank = _bar_deltas.pop(router_id, None)
-    if not bank:
-        return (0, 0, 0, 0)
-    return (bank[0], bank[1], bank[2], bank[3])
+# NOTE: dashboard usage bars are NOT written here. Every accepted delta reaches
+# the per-router ledger (router_usage_buckets) inside record_usage — the same
+# transaction that credits the customer's period — so the bars equal the sum of
+# the per-customer numbers by construction. The earlier in-memory delta bank
+# lost bytes on every restart and raced the poller (2.9%-182% capture,
+# 2026-07-30); do not reintroduce process-state bookkeeping for usage.
 
 
 def _canonical_key(raw: str) -> Optional[str]:
@@ -261,10 +226,9 @@ async def _persist_router_metrics(
 ) -> None:
     """Write a bandwidth snapshot from pushed router metrics, throttled.
 
-    Deliberate zeros in the per-queue byte-delta fields: the Daily Breakdown
-    bars sum those deltas, which only the poller computes from queue counters —
-    a push snapshot claiming them would double-count every bar on mixed-source
-    routers. Push usage lands in customer_usage_periods via the reports instead.
+    This is router HEALTH only — interface counters, throughput, session
+    counts. The per-queue byte-delta fields stay zero: usage bars come from
+    the router_usage_buckets ledger written by record_usage.
     """
     rx = int(metrics.iface_rx_bytes or 0)
     tx = int(metrics.iface_tx_bytes or 0)
@@ -307,11 +271,6 @@ async def _persist_router_metrics(
             avg_download_bps = rx_delta * 8 / elapsed
             avg_upload_bps = tx_delta * 8 / elapsed
 
-    # Stamp the usage deltas banked since the last snapshot (from either
-    # writer), so the dashboard's usage bars sum the full counter stream. The
-    # poller drains the same bank on its visits; each byte lands exactly once.
-    hs_up, hs_dn, ppp_up, ppp_dn = drain_bar_deltas(router_id)
-
     db.add(BandwidthSnapshot(
         router_id=router_id,
         interface_rx_bytes=rx,
@@ -323,10 +282,6 @@ async def _persist_router_metrics(
         total_upload_bps=int(avg_upload_bps),
         avg_download_bps=avg_download_bps,
         avg_upload_bps=avg_upload_bps,
-        hotspot_upload_bytes=hs_up,
-        hotspot_download_bytes=hs_dn,
-        pppoe_upload_bytes=ppp_up,
-        pppoe_download_bytes=ppp_dn,
         recorded_at=now,
     ))
     result.snapshot_written = True
@@ -476,9 +431,6 @@ async def ingest_usage_reports(
 
             result.accepted += 1
             pending += 1
-            _bank_bar_delta(
-                router_id, key, update.delta_upload_bytes, update.delta_download_bytes
-            )
 
             period = update.period
             cap_bytes = _cap_bytes_for(period, plan)

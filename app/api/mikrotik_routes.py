@@ -5,7 +5,7 @@ from sqlalchemy import select, func
 from typing import Optional
 from datetime import datetime, timedelta
 from app.db.database import async_session, get_db
-from app.db.models import Router, Customer, Plan, BandwidthSnapshot, UserBandwidthUsage
+from app.db.models import Router, Customer, Plan, BandwidthSnapshot, RouterUsageBucket, UserBandwidthUsage
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.mikrotik_api import MikroTikAPI
@@ -1217,25 +1217,66 @@ async def get_bandwidth_history(
                 BandwidthSnapshot.recorded_at >= since,
                 BandwidthSnapshot.router_id == router_id
             )
+            bucket_query = select(RouterUsageBucket).where(
+                RouterUsageBucket.bucket_start >= since,
+                RouterUsageBucket.router_id == router_id
+            )
         else:
             if user.role.value == "admin":
                 query = select(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at >= since)
+                bucket_query = select(RouterUsageBucket).where(RouterUsageBucket.bucket_start >= since)
             else:
                 owned_router_ids = select(Router.id).where(Router.user_id == user.id)
                 query = select(BandwidthSnapshot).where(
                     BandwidthSnapshot.recorded_at >= since,
                     BandwidthSnapshot.router_id.in_(owned_router_ids)
                 )
-        
+                bucket_query = select(RouterUsageBucket).where(
+                    RouterUsageBucket.bucket_start >= since,
+                    RouterUsageBucket.router_id.in_(owned_router_ids)
+                )
+
         result = await db.execute(query.order_by(BandwidthSnapshot.recorded_at.asc()))
         snapshots = result.scalars().all()
-        
+
+        # Usage bars live in the per-router ledger (router_usage_buckets),
+        # written by record_usage in the same transaction that credits each
+        # customer — the snapshot rows only carry router health plus legacy
+        # pre-cutover bars. Attach each bucket to the first snapshot row of its
+        # router at/after the bucket (or the last row for the tail), so every
+        # ledger byte is displayed exactly once at roughly the right time.
+        buckets = (
+            await db.execute(bucket_query.order_by(RouterUsageBucket.bucket_start.asc()))
+        ).scalars().all()
+        rows_by_router: dict = {}
+        for s in snapshots:
+            rows_by_router.setdefault(s.router_id, []).append(s)
+        cursor_by_router = {rid: 0 for rid in rows_by_router}
+        bucket_bars_by_snapshot: dict = {}
+        orphan_buckets = []
+        for b in buckets:
+            rows = rows_by_router.get(b.router_id)
+            if not rows:
+                orphan_buckets.append(b)
+                continue
+            i = cursor_by_router[b.router_id]
+            while i < len(rows) and rows[i].recorded_at < b.bucket_start:
+                i += 1
+            cursor_by_router[b.router_id] = min(i, len(rows) - 1)
+            target = rows[i] if i < len(rows) else rows[-1]
+            slot = bucket_bars_by_snapshot.setdefault(target.id, [0, 0, 0, 0])
+            slot[0] += b.hotspot_upload_bytes or 0
+            slot[1] += b.hotspot_download_bytes or 0
+            slot[2] += b.pppoe_upload_bytes or 0
+            slot[3] += b.pppoe_download_bytes or 0
+
         data = []
         for s in snapshots:
-            hotspot_upload_mb = _bytes_to_mb(getattr(s, "hotspot_upload_bytes", 0))
-            hotspot_download_mb = _bytes_to_mb(getattr(s, "hotspot_download_bytes", 0))
-            pppoe_upload_mb = _bytes_to_mb(getattr(s, "pppoe_upload_bytes", 0))
-            pppoe_download_mb = _bytes_to_mb(getattr(s, "pppoe_download_bytes", 0))
+            extra = bucket_bars_by_snapshot.get(s.id, (0, 0, 0, 0))
+            hotspot_upload_mb = _bytes_to_mb((getattr(s, "hotspot_upload_bytes", 0) or 0) + extra[0])
+            hotspot_download_mb = _bytes_to_mb((getattr(s, "hotspot_download_bytes", 0) or 0) + extra[1])
+            pppoe_upload_mb = _bytes_to_mb((getattr(s, "pppoe_upload_bytes", 0) or 0) + extra[2])
+            pppoe_download_mb = _bytes_to_mb((getattr(s, "pppoe_download_bytes", 0) or 0) + extra[3])
             active_hotspot = int(getattr(s, "active_hotspot_users", 0) or 0)
             active_pppoe = max(0, int(s.active_queues or 0) - active_hotspot)
             data.append({
@@ -1262,7 +1303,39 @@ async def get_bandwidth_history(
                     2,
                 ),
             })
-        
+
+        # A router the poller cannot reach (outbound-only uplink, e.g. behind
+        # Starlink CGNAT) has ledger buckets but no snapshot rows. Its usage
+        # bars must still display — health metrics honestly read zero.
+        for b in orphan_buckets:
+            hu = _bytes_to_mb(b.hotspot_upload_bytes or 0)
+            hd = _bytes_to_mb(b.hotspot_download_bytes or 0)
+            pu = _bytes_to_mb(b.pppoe_upload_bytes or 0)
+            pd = _bytes_to_mb(b.pppoe_download_bytes or 0)
+            data.append({
+                "timestamp": b.bucket_start.isoformat(),
+                "routerId": b.router_id,
+                "totalUploadMbps": 0,
+                "totalDownloadMbps": 0,
+                "avgUploadMbps": 0,
+                "avgDownloadMbps": 0,
+                "activeQueues": 0,
+                "activeSessions": 0,
+                "activeHotspotUsers": 0,
+                "activePppoeUsers": 0,
+                "hotspotUploadMB": hu,
+                "hotspotDownloadMB": hd,
+                "hotspotTotalMB": round(hu + hd, 2),
+                "pppoeUploadMB": pu,
+                "pppoeDownloadMB": pd,
+                "pppoeTotalMB": round(pu + pd, 2),
+                "trackedUploadMB": round(hu + pu, 2),
+                "trackedDownloadMB": round(hd + pd, 2),
+                "trackedTotalMB": round(hu + hd + pu + pd, 2),
+            })
+        if orphan_buckets:
+            data.sort(key=lambda d: d["timestamp"])
+
         return {
             "router_id": router_id,
             "router_name": router_name,

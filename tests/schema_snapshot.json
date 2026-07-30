@@ -636,6 +636,17 @@
   "topic",
   "username"
  ],
+ "router_usage_buckets": [
+  "bucket_start",
+  "created_at",
+  "hotspot_download_bytes",
+  "hotspot_upload_bytes",
+  "id",
+  "pppoe_download_bytes",
+  "pppoe_upload_bytes",
+  "router_id",
+  "updated_at"
+ ],
  "routers": [
   "auth_method",
   "availability_checks",
