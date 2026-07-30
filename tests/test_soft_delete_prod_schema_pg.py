@@ -49,9 +49,15 @@ async def _make_scratch_db_with_prod_schema():
         await admin.close()
 
     scratch_dsn = admin_dsn.rsplit("/", 1)[0] + "/" + SCRATCH_DB
+    # pg_dump 15.15+ wraps the file in \restrict/\unrestrict psql
+    # meta-commands, which only psql understands — strip every \-line.
+    ddl = "\n".join(
+        line for line in FIXTURE.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("\\")
+    )
     conn = await asyncpg.connect(scratch_dsn)
     try:
-        await conn.execute(FIXTURE.read_text(encoding="utf-8"))
+        await conn.execute(ddl)
     finally:
         await conn.close()
 
