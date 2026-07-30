@@ -124,6 +124,29 @@ async def test_customer_created_after_outage_not_credited(db):
     assert result["total_customers"] == 0
 
 
+async def test_null_created_at_customer_still_credited(db):
+    """Imported customers can lack created_at — unknown creation time must not
+    silently exclude them from the credit."""
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    router = await make_router(db, reseller)
+    customer = await make_customer(
+        db, reseller, plan, router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=10),
+    )
+    # The column default stamps created_at on insert; imported rows have NULL.
+    customer.created_at = None
+    await db.commit()
+    start, end = _window()
+
+    result = await preview_outage_compensation(
+        db, reseller_id=reseller.id, outage_start=start, outage_end=end
+    )
+    assert [c["customer_id"] for c in result["customers"]] == [customer.id]
+    assert result["customers"][0]["credited_seconds"] == int((end - start).total_seconds())
+
+
 async def test_expired_customer_reported_not_credited(db):
     reseller = await make_reseller(db)
     plan = await make_plan(db, reseller)

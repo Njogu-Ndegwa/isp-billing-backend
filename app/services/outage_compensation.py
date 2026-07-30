@@ -24,7 +24,7 @@ Design constraints (see AGENTS.md):
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -126,6 +126,12 @@ async def _collect(
         )
     )
 
+    # NULL created_at (some imported customers) must not silently exclude a
+    # row — treat unknown creation time as "existed before the outage ended".
+    existed_before_end = or_(
+        Customer.created_at.is_(None), Customer.created_at < outage_end
+    )
+
     affected = (
         (
             await db.execute(
@@ -133,7 +139,7 @@ async def _collect(
                     Customer.status == CustomerStatus.ACTIVE,
                     Customer.expiry > now,
                     # Bought after the power came back -> not affected.
-                    Customer.created_at < outage_end,
+                    existed_before_end,
                 ).order_by(Customer.id)
             )
         )
@@ -148,7 +154,7 @@ async def _collect(
                 base.where(
                     Customer.expiry > outage_start,
                     Customer.expiry <= now,
-                    Customer.created_at < outage_end,
+                    existed_before_end,
                 ).order_by(Customer.id)
             )
         )
