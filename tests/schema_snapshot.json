@@ -415,6 +415,27 @@
   "target_environment",
   "updated_at"
  ],
+ "outage_compensation_items": [
+  "compensation_id",
+  "customer_id",
+  "customer_name",
+  "expiry_after",
+  "expiry_before",
+  "id",
+  "router_id",
+  "seconds_credited"
+ ],
+ "outage_compensations": [
+  "created_at",
+  "customers_credited",
+  "id",
+  "note",
+  "outage_end",
+  "outage_start",
+  "router_ids",
+  "total_seconds_credited",
+  "user_id"
+ ],
  "password_reset_tokens": [
   "created_at",
   "expires_at",
