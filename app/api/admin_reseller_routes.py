@@ -1,12 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text, delete, update, case, or_
+from sqlalchemy import update as sa_update
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta, date
 import asyncio
 
-from app.db.database import get_db
+from app.db.database import get_db, Base
+from app.services.soft_deletion import soft_delete_where, soft_delete_reseller_cascade
 from app.db.models import (
     User, UserRole, Router, Customer, CustomerStatus,
     CustomerPayment, Plan, ResellerFinancials, ResellerPayout,
@@ -1771,7 +1773,7 @@ async def delete_reseller(
     Without ?confirm=true, returns a dry-run summary of what would be deleted.
     With ?confirm=true, performs the actual deletion.
     """
-    await _require_admin(token, db)
+    admin = await _require_admin(token, db)
     reseller = await _get_reseller_or_404(db, reseller_id)
 
     summary = await _reseller_deletion_summary(db, reseller_id)
@@ -1789,295 +1791,7 @@ async def delete_reseller(
             "message": "Add ?confirm=true to actually delete this reseller and all associated data.",
         }
 
-    # ── Phase 1: WireGuard cleanup (best-effort) ──
-    tokens_result = await db.execute(
-        select(
-            ProvisioningToken.id,
-            ProvisioningToken.vpn_type,
-            ProvisioningToken.l2tp_username,
-            ProvisioningToken.wg_public_key,
-        ).where(
-            ProvisioningToken.user_id == reseller_id,
-            ProvisioningToken.wg_public_key.isnot(None),
-        )
-    )
-    vpn_peers = [dict(row) for row in tokens_result.mappings().all()]
-
-    # Release the read transaction before calling the VPN manager.
-    await db.commit()
-
-    wg_failures = []
-    for tk in vpn_peers:
-        try:
-            if tk["vpn_type"] == "l2tp" and tk["l2tp_username"]:
-                await remove_l2tp_peer(tk["l2tp_username"])
-            elif tk["wg_public_key"]:
-                await remove_wireguard_peer(tk["wg_public_key"])
-        except Exception as e:
-            wg_failures.append({"token_id": tk["id"], "error": str(e)})
-            logger.warning(f"[DELETE-RESELLER] VPN peer removal failed for token {tk['id']}: {e}")
-
-    # ── Phase 2: DB cascade deletion (bottom-up) ──
-    customer_ids = select(Customer.id).where(Customer.user_id == reseller_id)
-    router_ids = select(Router.id).where(Router.user_id == reseller_id)
-    plan_ids = select(Plan.id).where(Plan.user_id == reseller_id)
-    campaign_ids = select(SmsCampaign.id).where(SmsCampaign.user_id == reseller_id)
-    shop_order_ids = select(ShopOrder.id).where(ShopOrder.user_id == reseller_id)
-    shop_product_ids = select(ShopProduct.id).where(ShopProduct.user_id == reseller_id)
-    payment_method_ids = select(ResellerPaymentMethod.id).where(
-        ResellerPaymentMethod.user_id == reseller_id
-    )
-
-    # 1. Null out vouchers.redeemed_by pointing to this reseller's customers
-    await db.execute(
-        update(Voucher).where(Voucher.redeemed_by.in_(customer_ids)).values(redeemed_by=None)
-    )
-
-    # 2-3. RADIUS tables (raw SQL since no ORM models)
-    await db.execute(text(
-        "DELETE FROM radius_check WHERE customer_id IN (SELECT id FROM customers WHERE user_id = :uid)"
-    ).bindparams(uid=reseller_id))
-    await db.execute(text(
-        "DELETE FROM radius_reply WHERE customer_id IN (SELECT id FROM customers WHERE user_id = :uid)"
-    ).bindparams(uid=reseller_id))
-
-    # Messaging/SMS tables added after this deleter was first written.
-    await db.execute(delete(SmsMessage).where(or_(
-        SmsMessage.user_id == reseller_id,
-        SmsMessage.customer_id.in_(customer_ids),
-        SmsMessage.campaign_id.in_(campaign_ids),
-    )))
-    await db.execute(delete(SmsCampaign).where(SmsCampaign.user_id == reseller_id))
-    await db.execute(delete(MessageTemplate).where(MessageTemplate.user_id == reseller_id))
-    await db.execute(delete(SmsCreditOrder).where(SmsCreditOrder.user_id == reseller_id))
-    await db.execute(delete(SmsCreditTransaction).where(SmsCreditTransaction.user_id == reseller_id))
-    await db.execute(delete(SmsCreditAccount).where(SmsCreditAccount.user_id == reseller_id))
-    await db.execute(delete(ResellerInboxMessage).where(or_(
-        ResellerInboxMessage.recipient_user_id == reseller_id,
-        ResellerInboxMessage.sender_user_id == reseller_id,
-    )))
-
-    # Preserve C2B audit rows but remove links to the deleted reseller/customers.
-    await db.execute(
-        update(C2BTransaction)
-        .where(C2BTransaction.matched_customer_id.in_(customer_ids))
-        .values(matched_customer_id=None)
-    )
-    await db.execute(
-        update(C2BTransaction)
-        .where(C2BTransaction.matched_reseller_id == reseller_id)
-        .values(matched_reseller_id=None)
-    )
-    await db.execute(
-        update(UnmatchedC2BPayment)
-        .where(UnmatchedC2BPayment.assigned_reseller_id == reseller_id)
-        .values(assigned_reseller_id=None)
-    )
-    await db.execute(
-        update(UnmatchedC2BPayment)
-        .where(UnmatchedC2BPayment.resolved_by_user_id == reseller_id)
-        .values(resolved_by_user_id=None)
-    )
-    await db.execute(
-        update(UnmatchedC2BPayment)
-        .where(UnmatchedC2BPayment.resolution_customer_id.in_(customer_ids))
-        .values(resolution_customer_id=None)
-    )
-
-    # Captive portal/shop data and cross-row shop references.
-    await db.execute(delete(PortalSettings).where(PortalSettings.user_id == reseller_id))
-    await db.execute(
-        update(ShopOrderTracking)
-        .where(ShopOrderTracking.updated_by_user_id == reseller_id)
-        .values(updated_by_user_id=None)
-    )
-    await db.execute(delete(ShopOrderTracking).where(ShopOrderTracking.order_id.in_(shop_order_ids)))
-    await db.execute(delete(ShopOrderItem).where(ShopOrderItem.order_id.in_(shop_order_ids)))
-    await db.execute(
-        update(ShopOrderItem)
-        .where(ShopOrderItem.product_id.in_(shop_product_ids))
-        .values(product_id=None)
-    )
-    await db.execute(delete(ShopOrder).where(ShopOrder.user_id == reseller_id))
-    await db.execute(delete(ShopProduct).where(ShopProduct.user_id == reseller_id))
-
-    await db.execute(delete(SubscriptionShareCode).where(or_(
-        SubscriptionShareCode.owner_customer_id.in_(customer_ids),
-        SubscriptionShareCode.redeemed_customer_id.in_(customer_ids),
-        SubscriptionShareCode.router_id.in_(router_ids),
-    )))
-    await db.execute(
-        update(Customer)
-        .where(Customer.subscription_owner_id.in_(customer_ids))
-        .values(subscription_owner_id=None)
-    )
-    await db.execute(
-        update(DevicePairing)
-        .where(DevicePairing.subscription_owner_customer_id.in_(customer_ids))
-        .values(subscription_owner_customer_id=None)
-    )
-    await db.execute(delete(AccessCredential).where(or_(
-        AccessCredential.user_id == reseller_id,
-        AccessCredential.router_id.in_(router_ids),
-    )))
-    await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.reseller_id == reseller_id))
-    await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id.in_(customer_ids)))
-
-    # 4. Customer ratings
-    await db.execute(delete(CustomerRating).where(CustomerRating.customer_id.in_(customer_ids)))
-
-    # 5. User bandwidth usage
-    await db.execute(delete(UserBandwidthUsage).where(UserBandwidthUsage.customer_id.in_(customer_ids)))
-
-    # 5b. Customer usage periods (NOT NULL customer_id FK — must be deleted
-    #     explicitly; SQLAlchemy's default would try to NULL the FK and fail).
-    await db.execute(delete(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id.in_(customer_ids)))
-    await db.execute(delete(UsageCapWatchState).where(or_(
-        UsageCapWatchState.customer_id.in_(customer_ids),
-        UsageCapWatchState.router_id.in_(router_ids),
-    )))
-
-    # 6. Provisioning logs (customer-side + router-side)
-    await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id.in_(customer_ids)))
-    await db.execute(delete(ProvisioningLog).where(ProvisioningLog.router_id.in_(router_ids)))
-
-    # 6b. Provisioning attempts (references customers and routers; logs point here via attempt_id)
-    await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.customer_id.in_(customer_ids)))
-    await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.router_id.in_(router_ids)))
-
-    # 7. M-Pesa transactions
-    await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id.in_(customer_ids)))
-
-    # 8. Payments (old table)
-    await db.execute(delete(Payment).where(Payment.customer_id.in_(customer_ids)))
-
-    # 9. Customer payments (delete by both reseller_id and customer_id to
-    #    catch cross-reseller references)
-    await db.execute(delete(CustomerPayment).where(CustomerPayment.reseller_id == reseller_id))
-    await db.execute(delete(CustomerPayment).where(CustomerPayment.customer_id.in_(customer_ids)))
-
-    # 9b. ZenoPay transactions (same cross-reference treatment)
-    await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.reseller_id == reseller_id))
-    await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.customer_id.in_(customer_ids)))
-
-    # 9c. Device pairings (references customers and routers)
-    await db.execute(delete(DevicePairing).where(DevicePairing.customer_id.in_(customer_ids)))
-    await db.execute(delete(DevicePairing).where(DevicePairing.router_id.in_(router_ids)))
-
-    # 9d. Reconnection attempts (references customers and routers; customer_id is nullable)
-    await db.execute(delete(ReconnectionAttempt).where(ReconnectionAttempt.customer_id.in_(customer_ids)))
-    await db.execute(delete(ReconnectionAttempt).where(ReconnectionAttempt.router_id.in_(router_ids)))
-
-    # 10. Customers
-    await db.execute(delete(Customer).where(Customer.user_id == reseller_id))
-
-    # 11. Bandwidth snapshots
-    await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.router_id.in_(router_ids)))
-
-    # 12. Router log entries
-    await db.execute(delete(RouterLogEntry).where(RouterLogEntry.router_id.in_(router_ids)))
-
-    # 13. Router availability checks
-    await db.execute(delete(RouterAvailabilityCheck).where(RouterAvailabilityCheck.router_id.in_(router_ids)))
-
-    # 14. RADIUS NAS (raw SQL, no ORM model)
-    await db.execute(text(
-        "DELETE FROM radius_nas WHERE router_id IN (SELECT id FROM routers WHERE user_id = :uid)"
-    ).bindparams(uid=reseller_id))
-
-    # 15. Provisioning tokens (unlink router_id first, then delete)
-    await db.execute(
-        update(ProvisioningToken)
-        .where(ProvisioningToken.router_id.in_(router_ids))
-        .values(router_id=None)
-    )
-    await db.execute(delete(ProvisioningToken).where(ProvisioningToken.user_id == reseller_id))
-
-    # 16. Vouchers
-    await db.execute(delete(Voucher).where(Voucher.user_id == reseller_id))
-
-    # 16b. Null out cross-reseller references: other resellers' customers or
-    #       vouchers may point to this reseller's routers/plans.
-    await db.execute(
-        update(Customer).where(Customer.router_id.in_(router_ids)).values(router_id=None)
-    )
-    await db.execute(
-        update(Customer).where(Customer.plan_id.in_(plan_ids)).values(plan_id=None)
-    )
-    await db.execute(
-        update(Voucher).where(Voucher.router_id.in_(router_ids)).values(router_id=None)
-    )
-    await db.execute(delete(Voucher).where(Voucher.plan_id.in_(plan_ids)))
-    await db.execute(
-        update(Router).where(Router.payment_method_id.in_(payment_method_ids)).values(payment_method_id=None)
-    )
-
-    # 17. Routers
-    await db.execute(delete(Router).where(Router.user_id == reseller_id))
-
-    # 18. Plans
-    await db.execute(delete(Plan).where(Plan.user_id == reseller_id))
-
-    # 19. Reseller financials
-    await db.execute(delete(ResellerFinancials).where(ResellerFinancials.user_id == reseller_id))
-
-    # 20. B2B transactions (must precede payouts/charges due to FK)
-    await db.execute(delete(B2BTransaction).where(B2BTransaction.reseller_id == reseller_id))
-
-    # 21. Reseller payouts
-    await db.execute(delete(ResellerPayout).where(ResellerPayout.reseller_id == reseller_id))
-
-    # 21b. Reseller transaction charges
-    created_charge_ids = select(ResellerTransactionCharge.id).where(
-        ResellerTransactionCharge.created_by == reseller_id
-    )
-    await db.execute(
-        update(B2BTransaction)
-        .where(B2BTransaction.charge_id.in_(created_charge_ids))
-        .values(charge_id=None)
-    )
-    await db.execute(delete(ResellerTransactionCharge).where(or_(
-        ResellerTransactionCharge.reseller_id == reseller_id,
-        ResellerTransactionCharge.created_by == reseller_id,
-    )))
-
-    # 21c. Subscription payments (must precede invoices due to FK)
-    await db.execute(delete(SubscriptionPayment).where(SubscriptionPayment.user_id == reseller_id))
-
-    # 21d. Subscription invoices
-    await db.execute(delete(SubscriptionInvoice).where(SubscriptionInvoice.user_id == reseller_id))
-
-    # 21e. Subscriptions
-    await db.execute(delete(Subscription).where(Subscription.user_id == reseller_id))
-
-    # 22. Reseller payment methods
-    await db.execute(delete(ResellerPaymentMethod).where(ResellerPaymentMethod.user_id == reseller_id))
-
-    # 22d. CRM / Lead pipeline cleanup
-    #   - Drop activities/follow-ups this reseller created on OTHER resellers'
-    #     leads (created_by is NOT NULL so we can't null them out).
-    #   - Delete this reseller's own leads (lead_activities/lead_follow_ups
-    #     cascade via ondelete="CASCADE" on lead_id).
-    #   - Null out leads.converted_user_id pointing to this user so we don't
-    #     trip the leads_converted_user_id_fkey constraint.
-    #   - Delete this reseller's lead sources.
-    lead_source_ids = select(LeadSource.id).where(LeadSource.user_id == reseller_id)
-    await db.execute(delete(LeadActivity).where(LeadActivity.created_by == reseller_id))
-    await db.execute(delete(LeadFollowUp).where(LeadFollowUp.created_by == reseller_id))
-    await db.execute(delete(Lead).where(Lead.user_id == reseller_id))
-    await db.execute(
-        update(Lead).where(Lead.converted_user_id == reseller_id).values(converted_user_id=None)
-    )
-    await db.execute(update(Lead).where(Lead.source_id.in_(lead_source_ids)).values(source_id=None))
-    await db.execute(delete(LeadSource).where(LeadSource.user_id == reseller_id))
-
-    # 23. Null out created_by references from other users
-    await db.execute(update(User).where(User.created_by == reseller_id).values(created_by=None))
-
-    # 24. Delete the user row
-    await db.execute(delete(User).where(User.id == reseller_id))
-
-    await db.commit()
+    wg_failures = await soft_delete_reseller_cascade(db, reseller_id, deleted_by=admin.id)
 
     logger.info(f"[DELETE-RESELLER] Deleted reseller {reseller_id} ({reseller_info['email']}): {summary}")
 
@@ -2459,4 +2173,137 @@ async def update_compensation_limit_setting(
         "daily_limit": payload.daily_limit,
         "default": settings.COMPENSATION_DAILY_LIMIT,
         "is_overridden": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Soft-delete recycle bin: list tombstoned entities and restore a whole
+# deletion group (everything stamped with the same deleted_at timestamp —
+# each delete flow uses ONE shared timestamp exactly so this works).
+# docs/SOFT_DELETE_PLAN.md
+# ---------------------------------------------------------------------------
+
+_RESTORABLE_ENTITIES = {
+    "customer": Customer,
+    "router": Router,
+    "reseller": User,
+    "plan": Plan,
+    "lead": Lead,
+}
+
+
+def _tombstone_label(row) -> str:
+    for attr in ("name", "organization_name", "email", "identity"):
+        value = getattr(row, attr, None)
+        if value:
+            return str(value)
+    return f"#{row.id}"
+
+
+@router.get("/api/admin/soft-deleted")
+async def list_soft_deleted(
+    entity: str = Query("customer"),
+    limit: int = Query(50, le=200),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """List tombstoned rows of one entity type, newest deletions first."""
+    await _require_admin(token, db)
+    model = _RESTORABLE_ENTITIES.get(entity)
+    if model is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown entity. Use one of: {', '.join(_RESTORABLE_ENTITIES)}",
+        )
+    rows = (
+        await db.execute(
+            select(model)
+            .where(model.deleted_at.isnot(None))
+            .order_by(model.deleted_at.desc())
+            .limit(limit)
+            .execution_options(include_deleted=True)
+        )
+    ).scalars().all()
+    return {
+        "entity": entity,
+        "items": [
+            {
+                "id": r.id,
+                "label": _tombstone_label(r),
+                "deleted_at": r.deleted_at.isoformat() if r.deleted_at else None,
+                "deleted_by": r.deleted_by,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/api/admin/soft-deleted/{entity}/{item_id}/restore")
+async def restore_soft_deleted(
+    entity: str,
+    item_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Restore a tombstoned entity together with everything deleted in the
+    same operation (same shared deleted_at timestamp across all tables).
+
+    RADIUS rows and on-router state are NOT restored — a restored customer
+    reappears in the DB and portal but must re-provision on next payment or
+    via the normal provisioning flows.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    await _require_admin(token, db)
+    model = _RESTORABLE_ENTITIES.get(entity)
+    if model is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown entity. Use one of: {', '.join(_RESTORABLE_ENTITIES)}",
+        )
+    row = (
+        await db.execute(
+            select(model)
+            .where(model.id == item_id, model.deleted_at.isnot(None))
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such tombstoned row")
+
+    group_ts = row.deleted_at
+    restored: dict[str, int] = {}
+    try:
+        for table in Base.metadata.tables.values():
+            if "deleted_at" not in table.c:
+                continue
+            result = await db.execute(
+                sa_update(table)
+                .where(table.c.deleted_at == group_ts)
+                .values(deleted_at=None, deleted_by=None)
+            )
+            if result.rowcount:
+                restored[table.name] = result.rowcount
+        await db.commit()
+    except IntegrityError as e:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Restore conflicts with live data created after the deletion "
+                "(e.g. the same MAC/code/email was re-registered). Resolve the "
+                f"conflict first. DB error: {getattr(e, 'orig', e)}"
+            ),
+        )
+
+    logger.info(
+        "[RESTORE] %s #%s restored (group %s): %s",
+        entity, item_id, group_ts.isoformat(), restored,
+    )
+    return {
+        "restored": restored,
+        "entity": entity,
+        "id": item_id,
+        "group_deleted_at": group_ts.isoformat(),
+        "note": "On-router/RADIUS state is not restored; re-provision as needed.",
     }

@@ -9,7 +9,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.database import get_db
+from app.db.database import get_db, soft_delete
 from app.db.models import (
     User, UserRole,
     MessagingSettings, MessageTemplate,
@@ -318,7 +318,7 @@ async def delete_template(template_id: int, db: AsyncSession = Depends(get_db),
     )).scalar_one_or_none()
     if not tpl:
         raise HTTPException(status_code=404, detail="Template not found")
-    await db.delete(tpl)
+    soft_delete(tpl, deleted_by=user.id)
     await db.commit()
     return {"deleted": template_id}
 

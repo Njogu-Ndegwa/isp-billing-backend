@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     # PostgreSQL connection - set via environment variable
     DATABASE_URL: str = "postgresql+asyncpg://isp_user:isp_secure_pass_2024@localhost:5434/isp_billing_db"
     DB_POOL_SIZE: int = 15
+    # Days a soft-deleted (tombstoned) row is kept recoverable before the
+    # daily purge job hard-deletes it (docs/SOFT_DELETE_PLAN.md).
+    SOFT_DELETE_RETENTION_DAYS: int = 90
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10
     DB_POOL_RECYCLE_SECONDS: int = 1800

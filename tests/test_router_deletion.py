@@ -257,9 +257,16 @@ async def test_force_delete_router_preserves_customer_money_history_and_cleans_d
     assert response["mikrotik_cleaned"] == 1
     assert ("user", "AABBCC000001") in _FakeMikroTikAPI.removed
 
-    assert await db.get(Router, router.id) is None
+    # Soft delete: clear the identity map so db.get() re-queries (a fresh
+    # session — i.e. every real request — sees the tombstoned router as gone).
+    router_id_ = router.id
+    customer_id_ = customer.id
+    available_id_ = available_voucher.id
+    redeemed_id_ = redeemed_voucher.id
+    db.expunge_all()
+    assert await db.get(Router, router_id_) is None
 
-    await db.refresh(customer)
+    customer = await db.get(Customer, customer_id_)
     assert customer.router_id is None
     assert customer.status == CustomerStatus.INACTIVE
 
@@ -277,13 +284,13 @@ async def test_force_delete_router_preserves_customer_money_history_and_cleans_d
     assert preserved_log.router_id is None
     assert preserved_log.attempt_id is None
 
-    available_after = await db.get(Voucher, available_voucher.id)
-    redeemed_after = await db.get(Voucher, redeemed_voucher.id)
+    available_after = await db.get(Voucher, available_id_)
+    redeemed_after = await db.get(Voucher, redeemed_id_)
     assert available_after.router_id is None
     assert available_after.status == VoucherStatus.DISABLED
     assert redeemed_after.router_id is None
     assert redeemed_after.status == VoucherStatus.REDEEMED
-    assert redeemed_after.redeemed_by == customer.id
+    assert redeemed_after.redeemed_by == customer_id_
 
     assert await _count(db, ProvisioningAttempt) == 0
     assert await _count(db, BandwidthSnapshot) == 0

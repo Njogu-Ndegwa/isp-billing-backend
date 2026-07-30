@@ -6,7 +6,8 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 
-from app.db.database import get_db
+from app.db.database import get_db, soft_delete
+from app.services.soft_deletion import soft_delete_where
 from app.db.models import (
     Lead, LeadSource, LeadActivity, LeadFollowUp,
     LeadStage, LeadActivityType, User, UserRole,
@@ -974,10 +975,17 @@ async def delete_lead(
     db: AsyncSession = Depends(get_db),
     token: dict = Depends(verify_token),
 ):
-    """Delete a lead and all its activities/follow-ups."""
+    """Delete a lead and all its activities/follow-ups (soft delete)."""
     admin = await _require_admin(token, db)
     lead = await _get_lead_or_404(lead_id, admin.id, db)
-    await db.delete(lead)
+    deleted_ts = datetime.utcnow()
+    # DB-level ON DELETE CASCADE no longer fires (the lead row stays), so
+    # tombstone the children explicitly with the same timestamp.
+    await soft_delete_where(db, LeadActivity, LeadActivity.lead_id == lead_id,
+                            when=deleted_ts, deleted_by=admin.id)
+    await soft_delete_where(db, LeadFollowUp, LeadFollowUp.lead_id == lead_id,
+                            when=deleted_ts, deleted_by=admin.id)
+    soft_delete(lead, deleted_by=admin.id, when=deleted_ts)
     await db.commit()
     return {"detail": "Lead deleted", "id": lead_id}
 

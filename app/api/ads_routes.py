@@ -5,7 +5,8 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
 
-from app.db.database import get_db
+from app.db.database import get_db, soft_delete
+from app.services.soft_deletion import soft_delete_where
 from app.db.models import Ad, AdClick, AdImpression, AdClickType, Advertiser, AdBadgeType
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -224,10 +225,15 @@ async def delete_ad(
         if not ad:
             raise HTTPException(status_code=404, detail="Ad not found")
         
-        # Delete related clicks first
-        await db.execute(delete(AdClick).where(AdClick.ad_id == ad_id))
-        
-        await db.delete(ad)
+        # Tombstone clicks AND impressions (impressions were previously
+        # leaked — the old hard delete removed only clicks and would have
+        # FK-violated on any ad with impressions).
+        deleted_ts = datetime.utcnow()
+        await soft_delete_where(db, AdClick, AdClick.ad_id == ad_id,
+                                when=deleted_ts, deleted_by=user.id)
+        await soft_delete_where(db, AdImpression, AdImpression.ad_id == ad_id,
+                                when=deleted_ts, deleted_by=user.id)
+        soft_delete(ad, deleted_by=user.id, when=deleted_ts)
         await db.commit()
         
         logger.info(f"Ad deleted: #{ad_id}")

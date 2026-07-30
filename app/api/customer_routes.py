@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 import secrets
 import string
 
-from app.db.database import get_db
+from app.db.database import get_db, soft_delete
+from app.services.soft_deletion import soft_delete_where
 from app.db.models import (
     Router, Customer, Plan, CustomerStatus, ConnectionType,
     CustomerPayment, PaymentMethod, PaymentStatus, DurationUnit,
@@ -449,8 +450,9 @@ async def delete_customer(
             deprovision_result = "ok"
 
         # -----------------------------------------------------------------
-        # Snapshot the customer name into every payment row BEFORE we null
-        # out the FK, so the history UI can still show who paid.
+        # Snapshot the customer name into every payment row, so the history
+        # UI still shows who paid even after the tombstoned customer is
+        # eventually purged.
         # -----------------------------------------------------------------
         await db.execute(
             update(CustomerPayment)
@@ -462,62 +464,54 @@ async def delete_customer(
         )
 
         # -----------------------------------------------------------------
-        # Clean up child rows before deleting the parent.
+        # Soft delete (docs/SOFT_DELETE_PLAN.md): tombstone the customer and
+        # its child rows with one shared timestamp; the purge job hard-deletes
+        # them after the retention window.
         # Rules:
-        #   • Operational rows (RADIUS, bandwidth, usage periods,
-        #     provisioning logs, device pairings, reconnections, ratings)
-        #     — DELETE: no audit value.
-        #   • CustomerPayment — SET customer_id = NULL: this is the
-        #     financial ledger used by balance calculations; preserving
-        #     these rows keeps total_revenue and unpaid_balance correct.
-        #   • MpesaTransaction / ZenoPay / MtnMomo raw event logs — DELETE:
-        #     the transactions list query filters on "customer_id IS NULL"
-        #     which is visible to all users, so nulling these out would
-        #     leak data across resellers. Balance is covered by
-        #     CustomerPayment, so deleting these is safe.
-        #   • Legacy Payment rows — NOT NULL column, deprecated, DELETE.
+        #   • RADIUS rows — still HARD deleted right now: FreeRADIUS reads
+        #     those tables directly, so a tombstone would keep the customer
+        #     online.
+        #   • CustomerPayment — stays LIVE with customer_id intact: it is the
+        #     financial ledger behind total_revenue/unpaid_balance. Joins to
+        #     the tombstoned customer behave exactly as the old
+        #     customer_id=NULL approach did (inner joins drop the row, outer
+        #     joins keep it with NULL columns), and keeping the FK avoids the
+        #     cross-tenant "customer_id IS NULL" leak. The FK is nulled at
+        #     purge time instead.
+        #   • Voucher.redeemed_by — same reasoning, FK kept until purge.
+        #   • Everything else (ratings, usage, provisioning, pairings,
+        #     reconnections, raw payment event logs, legacy Payment rows) —
+        #     tombstoned; invisible to every query from this commit on.
         # -----------------------------------------------------------------
-        await db.execute(
-            update(Voucher).where(Voucher.redeemed_by == customer_id).values(redeemed_by=None)
-        )
+        deleted_ts = datetime.utcnow()
         await db.execute(text(
             "DELETE FROM radius_check WHERE customer_id = :cid"
         ).bindparams(cid=customer_id))
         await db.execute(text(
             "DELETE FROM radius_reply WHERE customer_id = :cid"
         ).bindparams(cid=customer_id))
-        await db.execute(delete(CustomerRating).where(CustomerRating.customer_id == customer_id))
-        await db.execute(delete(UserBandwidthUsage).where(UserBandwidthUsage.customer_id == customer_id))
-        await db.execute(delete(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id == customer_id))
-        await db.execute(delete(UsageCapWatchState).where(UsageCapWatchState.customer_id == customer_id))
-        await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id == customer_id))
-        await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.customer_id == customer_id))
-        await db.execute(delete(DevicePairing).where(DevicePairing.customer_id == customer_id))
-        await db.execute(delete(ReconnectionAttempt).where(ReconnectionAttempt.customer_id == customer_id))
+        for child_model, fk in (
+            (CustomerRating, CustomerRating.customer_id),
+            (UserBandwidthUsage, UserBandwidthUsage.customer_id),
+            (CustomerUsagePeriod, CustomerUsagePeriod.customer_id),
+            (UsageCapWatchState, UsageCapWatchState.customer_id),
+            (ProvisioningLog, ProvisioningLog.customer_id),
+            (ProvisioningAttempt, ProvisioningAttempt.customer_id),
+            (DevicePairing, DevicePairing.customer_id),
+            (ReconnectionAttempt, ReconnectionAttempt.customer_id),
+            (MpesaTransaction, MpesaTransaction.customer_id),
+            (ZenoPayTransaction, ZenoPayTransaction.customer_id),
+            (MtnMomoTransaction, MtnMomoTransaction.customer_id),
+            (Payment, Payment.customer_id),
+        ):
+            await soft_delete_where(
+                db, child_model, fk == customer_id,
+                when=deleted_ts, deleted_by=user.id,
+            )
 
-        # CustomerPayment: NULL out customer FK to preserve revenue history.
-        # Balance calculations read CustomerPayment, so this keeps all totals intact.
-        await db.execute(
-            update(CustomerPayment)
-            .where(CustomerPayment.customer_id == customer_id)
-            .values(customer_id=None)
-        )
-
-        # MpesaTransaction / ZenoPay / MtnMomo: DELETE these raw event-log tables.
-        # Reason: the transactions list query uses "customer_id IS NULL" as a
-        # catch-all that is visible to every authenticated user — setting NULL
-        # would expose this customer's history to other resellers. Financial
-        # accuracy is already fully covered by the CustomerPayment rows above.
-        await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id == customer_id))
-        await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.customer_id == customer_id))
-        await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id == customer_id))
-
-        # Legacy table — NOT NULL column, table is deprecated, safe to delete
-        await db.execute(delete(Payment).where(Payment.customer_id == customer_id))
-
-        # Delete the customer first, then flush so the upcoming count queries
-        # from update_reseller_financials already see N-1 customers.
-        await db.delete(customer)
+        # Tombstone the customer first, then flush so the upcoming count
+        # queries from update_reseller_financials already see N-1 customers.
+        soft_delete(customer, deleted_by=user.id, when=deleted_ts)
         await db.flush()
 
         from app.services.reseller_payments import update_reseller_financials

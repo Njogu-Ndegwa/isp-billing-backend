@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, func, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.database import get_db
+from app.db.database import get_db, soft_delete
 from app.db.models import (
     AccessCredential, AccessCredStatus, Router, UserRole,
 )
@@ -503,6 +503,6 @@ async def delete_credential(
         await db.commit()
         await deprovision_credential(db, cred, router_obj)
 
-    await db.delete(cred)
+    soft_delete(cred, deleted_by=user.id)
     await db.commit()
     return {"success": True, "id": cred_id}

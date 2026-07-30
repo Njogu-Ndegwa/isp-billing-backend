@@ -186,12 +186,16 @@ async def delete_profile(
     token: str = Depends(verify_token),
 ):
     """
-    Permanently delete the authenticated user's account.
-    This is irreversible — all routers, plans, customers, and payment
-    methods owned by this user will be orphaned or cascade-deleted
-    depending on DB constraints.
+    Delete the authenticated user's account and all associated data
+    (routers, plans, customers, payment methods, message history, ...).
+
+    Soft delete (docs/SOFT_DELETE_PLAN.md): everything is tombstoned and
+    disappears immediately; permanent removal happens after the retention
+    window. Previously this endpoint issued a bare hard DELETE that
+    crashed on FK constraints for any account with data.
     """
+    from app.services.soft_deletion import soft_delete_reseller_cascade
+
     user = await get_current_user(token, db)
-    await db.delete(user)
-    await db.commit()
+    await soft_delete_reseller_cascade(db, user.id, deleted_by=user.id)
     return {"detail": "Account deleted successfully"}

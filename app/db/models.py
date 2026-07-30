@@ -4,7 +4,7 @@ from sqlalchemy.orm import relationship
 from datetime import datetime
 import enum
 from sqlalchemy import JSON
-from app.db.database import Base  # Import Base from database.py
+from app.db.database import Base, SoftDeleteMixin  # Import Base from database.py
 
 class MpesaTransactionStatus(enum.Enum):
     pending = "pending"
@@ -115,7 +115,7 @@ class SubscriptionPaymentStatus(str, enum.Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
-class User(Base):
+class User(Base, SoftDeleteMixin):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_code = Column(BigInteger, unique=True, nullable=False)
@@ -138,7 +138,7 @@ class User(Base):
     )
     subscription_expires_at = Column(DateTime, nullable=True)
 
-class PasswordResetToken(Base):
+class PasswordResetToken(Base, SoftDeleteMixin):
     __tablename__ = "password_reset_tokens"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
@@ -148,7 +148,7 @@ class PasswordResetToken(Base):
     expires_at = Column(DateTime, nullable=False)
     used_at = Column(DateTime, nullable=True)
 
-class Customer(Base):
+class Customer(Base, SoftDeleteMixin):
     __tablename__ = "customers"
     __table_args__ = (
         UniqueConstraint("mac_address", "user_id", name="uq_customer_mac_per_reseller"),
@@ -195,7 +195,7 @@ class Customer(Base):
         backref="shared_subscription_customers",
     )
 
-class CustomerRating(Base):
+class CustomerRating(Base, SoftDeleteMixin):
     """Customer ratings/feedback after purchase - identified by phone number"""
     __tablename__ = "customer_ratings"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -213,7 +213,7 @@ class CustomerRating(Base):
     customer = relationship("Customer", backref="ratings")
 
 
-class Plan(Base):
+class Plan(Base, SoftDeleteMixin):
     __tablename__ = "plans"
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=False)
@@ -244,7 +244,7 @@ class Plan(Base):
     # Total customers/devices allowed on one paid subscription. 1 = no sharing.
     max_shared_users = Column(Integer, nullable=False, default=1, server_default="1")
 
-class Payment(Base):
+class Payment(Base, SoftDeleteMixin):
     __tablename__ = "payments"
     id = Column(Integer, primary_key=True, autoincrement=True)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
@@ -253,7 +253,7 @@ class Payment(Base):
     paid_on = Column(DateTime, default=datetime.utcnow)
     customer = relationship("Customer")
 
-class CustomerPayment(Base):
+class CustomerPayment(Base, SoftDeleteMixin):
     __tablename__ = "customer_payments"
     id = Column(Integer, primary_key=True, autoincrement=True)
     # Nullable so that deleting a customer preserves the payment history (SET NULL, not CASCADE DELETE)
@@ -288,7 +288,7 @@ class CustomerPayment(Base):
     reseller = relationship("User", backref="received_payments", foreign_keys=[reseller_id])
 
 
-class ResellerFinancials(Base):
+class ResellerFinancials(Base, SoftDeleteMixin):
     __tablename__ = "reseller_financials"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
@@ -310,7 +310,7 @@ class ResellerFinancials(Base):
     payout_interval_days = Column(Integer, nullable=True)
     user = relationship("User", backref="financials")
 
-class Subscription(Base):
+class Subscription(Base, SoftDeleteMixin):
     __tablename__ = "subscriptions"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
@@ -335,7 +335,7 @@ class Subscription(Base):
     cost = Column(Float, nullable=True)
 
 
-class SubscriptionInvoice(Base):
+class SubscriptionInvoice(Base, SoftDeleteMixin):
     __tablename__ = "subscription_invoices"
     __table_args__ = (
         UniqueConstraint("user_id", "period_start", name="uq_subscription_invoice_user_period"),
@@ -362,7 +362,7 @@ class SubscriptionInvoice(Base):
     user = relationship("User", backref="subscription_invoices")
 
 
-class SubscriptionPayment(Base):
+class SubscriptionPayment(Base, SoftDeleteMixin):
     __tablename__ = "subscription_payments"
     id = Column(Integer, primary_key=True, autoincrement=True)
     invoice_id = Column(Integer, ForeignKey("subscription_invoices.id"), nullable=True, index=True)
@@ -383,7 +383,7 @@ class SubscriptionPayment(Base):
     invoice = relationship("SubscriptionInvoice", backref="payments")
 
 
-class Router(Base):
+class Router(Base, SoftDeleteMixin):
     __tablename__ = "routers"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -435,7 +435,7 @@ class Router(Base):
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 
-class ProvisioningLog(Base):
+class ProvisioningLog(Base, SoftDeleteMixin):
     __tablename__ = "provisioning_logs"
     id = Column(Integer, primary_key=True, autoincrement=True)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
@@ -449,7 +449,7 @@ class ProvisioningLog(Base):
     log_date = Column(DateTime, default=datetime.utcnow)
 
 
-class ProvisioningAttempt(Base):
+class ProvisioningAttempt(Base, SoftDeleteMixin):
     __tablename__ = "provisioning_attempts"
     __table_args__ = (
         UniqueConstraint("source_table", "source_pk", name="uq_provisioning_attempt_source"),
@@ -506,7 +506,7 @@ class ProvisioningAttempt(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
-class MpesaTransaction(Base):
+class MpesaTransaction(Base, SoftDeleteMixin):
     __tablename__ = "mpesa_transactions"
     id = Column(Integer, primary_key=True, index=True)
     checkout_request_id = Column(String(255), unique=True, nullable=False, index=True)
@@ -536,7 +536,7 @@ class MpesaTransaction(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class BandwidthSnapshot(Base):
+class BandwidthSnapshot(Base, SoftDeleteMixin):
     __tablename__ = "bandwidth_snapshots"
     id = Column(Integer, primary_key=True, autoincrement=True)
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
@@ -560,7 +560,7 @@ class BandwidthSnapshot(Base):
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
-class RouterUsageBucket(Base):
+class RouterUsageBucket(Base, SoftDeleteMixin):
     """Per-router 5-minute ledger of bytes credited to customers.
 
     Written by ``record_usage`` in the SAME transaction that credits a
@@ -586,7 +586,7 @@ class RouterUsageBucket(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
-class UserBandwidthUsage(Base):
+class UserBandwidthUsage(Base, SoftDeleteMixin):
     """Track cumulative bandwidth usage per user for top downloaders.
 
     ``upload_bytes`` / ``download_bytes`` keep the latest cumulative router
@@ -608,7 +608,7 @@ class UserBandwidthUsage(Base):
     last_updated = Column(DateTime, default=datetime.utcnow, index=True)
 
 
-class CustomerUsagePeriod(Base):
+class CustomerUsagePeriod(Base, SoftDeleteMixin):
     """Per-customer billing-period bandwidth aggregate, anchored to ``customer.expiry``.
 
     A new row is opened on each renewal (payment that extends ``expiry``) and the
@@ -645,7 +645,7 @@ class CustomerUsagePeriod(Base):
     customer = relationship("Customer", backref="usage_periods")
 
 
-class UsageCapWatchState(Base):
+class UsageCapWatchState(Base, SoftDeleteMixin):
     """Durable scheduler state for lightweight capped-usage polling.
 
     Usage totals intentionally stay in ``user_bandwidth_usage`` and
@@ -707,7 +707,7 @@ class AdClickType(str, enum.Enum):
     CALL = "call"
     WHATSAPP = "whatsapp"
 
-class Voucher(Base):
+class Voucher(Base, SoftDeleteMixin):
     __tablename__ = "vouchers"
     id = Column(Integer, primary_key=True, autoincrement=True)
     code = Column(String(9), unique=True, nullable=False, index=True)  # 8 digits (new) or legacy "XXXX-XXXX"
@@ -735,7 +735,7 @@ class Voucher(Base):
     customer = relationship("Customer", foreign_keys=[redeemed_by])
 
 
-class Advertiser(Base):
+class Advertiser(Base, SoftDeleteMixin):
     __tablename__ = "advertisers"
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(100), nullable=False)
@@ -746,7 +746,7 @@ class Advertiser(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     ads = relationship("Ad", back_populates="advertiser")
 
-class Ad(Base):
+class Ad(Base, SoftDeleteMixin):
     __tablename__ = "ads"
     id = Column(Integer, primary_key=True, autoincrement=True)
     advertiser_id = Column(Integer, ForeignKey("advertisers.id"), nullable=False)
@@ -770,7 +770,7 @@ class Ad(Base):
     expires_at = Column(DateTime, nullable=True, index=True)
     advertiser = relationship("Advertiser", back_populates="ads")
 
-class AdClick(Base):
+class AdClick(Base, SoftDeleteMixin):
     __tablename__ = "ad_clicks"
     id = Column(Integer, primary_key=True, autoincrement=True)
     ad_id = Column(Integer, ForeignKey("ads.id"), nullable=False, index=True)
@@ -783,7 +783,7 @@ class AdClick(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     ad = relationship("Ad")
 
-class AdImpression(Base):
+class AdImpression(Base, SoftDeleteMixin):
     __tablename__ = "ad_impressions"
     id = Column(Integer, primary_key=True, autoincrement=True)
     device_id = Column(String(100), nullable=True)
@@ -799,7 +799,7 @@ class ProvisioningTokenStatus(str, enum.Enum):
     EXPIRED = "expired"
 
 
-class ProvisioningToken(Base):
+class ProvisioningToken(Base, SoftDeleteMixin):
     __tablename__ = "provisioning_tokens"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -843,7 +843,7 @@ class RouterLogSeverity(str, enum.Enum):
     ERROR = "error"
 
 
-class RouterLogEntry(Base):
+class RouterLogEntry(Base, SoftDeleteMixin):
     """Notable router log entries persisted for historical tracking."""
     __tablename__ = "router_log_entries"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -861,7 +861,7 @@ class RouterLogEntry(Base):
     router = relationship("Router")
 
 
-class RouterAvailabilityCheck(Base):
+class RouterAvailabilityCheck(Base, SoftDeleteMixin):
     """Per-poll router reachability history used for uptime reporting."""
     __tablename__ = "router_availability_checks"
     __table_args__ = (
@@ -905,7 +905,7 @@ class MtnMomoTransactionStatus(str, enum.Enum):
     FAILED = "failed"
 
 
-class ResellerPaymentMethod(Base):
+class ResellerPaymentMethod(Base, SoftDeleteMixin):
     """Payment method configured by a reseller, assignable to individual routers."""
     __tablename__ = "reseller_payment_methods"
 
@@ -962,7 +962,7 @@ class ResellerPaymentMethod(Base):
     routers = relationship("Router", back_populates="assigned_payment_method")
 
 
-class ZenoPayTransaction(Base):
+class ZenoPayTransaction(Base, SoftDeleteMixin):
     """Tracks ZenoPay payment lifecycle (analogous to MpesaTransaction)."""
     __tablename__ = "zenopay_transactions"
 
@@ -989,7 +989,7 @@ class ZenoPayTransaction(Base):
     reseller = relationship("User")
 
 
-class MtnMomoTransaction(Base):
+class MtnMomoTransaction(Base, SoftDeleteMixin):
     """Tracks MTN MoMo Collection (RequestToPay) lifecycle per reseller."""
     __tablename__ = "mtn_momo_transactions"
 
@@ -1030,7 +1030,7 @@ class MtnMomoTransaction(Base):
     reseller = relationship("User")
 
 
-class ResellerPayout(Base):
+class ResellerPayout(Base, SoftDeleteMixin):
     """Manual payout recorded by admin when system-collected funds are sent to a reseller."""
     __tablename__ = "reseller_payouts"
 
@@ -1047,7 +1047,7 @@ class ResellerPayout(Base):
     reseller = relationship("User", backref="payouts")
 
 
-class ResellerTransactionCharge(Base):
+class ResellerTransactionCharge(Base, SoftDeleteMixin):
     """Deduction recorded by admin against a reseller's balance (e.g. bank fees, M-Pesa charges)."""
     __tablename__ = "reseller_transaction_charges"
 
@@ -1070,7 +1070,7 @@ class B2BTransactionStatus(str, enum.Enum):
     TIMEOUT = "timeout"
 
 
-class B2BTransaction(Base):
+class B2BTransaction(Base, SoftDeleteMixin):
     """Tracks M-Pesa B2B payout API calls to resellers."""
     __tablename__ = "b2b_transactions"
 
@@ -1114,7 +1114,7 @@ class DeviceType(str, enum.Enum):
     OTHER = "other"
 
 
-class DevicePairing(Base):
+class DevicePairing(Base, SoftDeleteMixin):
     """Tracks companion device pairings (TVs, consoles, etc.) linked to a customer."""
     __tablename__ = "device_pairings"
     __table_args__ = (
@@ -1150,7 +1150,7 @@ class DevicePairing(Base):
     plan = relationship("Plan")
 
 
-class SubscriptionShareCode(Base):
+class SubscriptionShareCode(Base, SoftDeleteMixin):
     """One-time code used to add a device to a paid subscription."""
     __tablename__ = "subscription_share_codes"
 
@@ -1172,7 +1172,7 @@ class SubscriptionShareCode(Base):
     redeemed_pairing = relationship("DevicePairing")
 
 
-class GrowthTarget(Base):
+class GrowthTarget(Base, SoftDeleteMixin):
     __tablename__ = "growth_targets"
     id = Column(Integer, primary_key=True, autoincrement=True)
     target_id = Column(String(100), unique=True, nullable=False)
@@ -1185,7 +1185,7 @@ class GrowthTarget(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class ReconnectionAttempt(Base):
+class ReconnectionAttempt(Base, SoftDeleteMixin):
     """Tracks self-service reconnection attempts for rate limiting and audit."""
     __tablename__ = "reconnection_attempts"
 
@@ -1226,7 +1226,7 @@ class LeadActivityType(str, enum.Enum):
     OTHER = "other"
 
 
-class LeadSource(Base):
+class LeadSource(Base, SoftDeleteMixin):
     """Managed list of lead sources for consistent analytics."""
     __tablename__ = "lead_sources"
 
@@ -1240,7 +1240,7 @@ class LeadSource(Base):
     user = relationship("User")
 
 
-class Lead(Base):
+class Lead(Base, SoftDeleteMixin):
     """Tracks potential reseller customers through the sales pipeline."""
     __tablename__ = "leads"
 
@@ -1274,7 +1274,7 @@ class Lead(Base):
     follow_ups = relationship("LeadFollowUp", back_populates="lead", order_by="LeadFollowUp.due_at.asc()")
 
 
-class LeadActivity(Base):
+class LeadActivity(Base, SoftDeleteMixin):
     """Timeline entry recording an interaction or event on a lead."""
     __tablename__ = "lead_activities"
 
@@ -1294,7 +1294,7 @@ class LeadActivity(Base):
     creator = relationship("User")
 
 
-class LeadFollowUp(Base):
+class LeadFollowUp(Base, SoftDeleteMixin):
     """Scheduled follow-up reminder on a lead."""
     __tablename__ = "lead_follow_ups"
 
@@ -1320,7 +1320,7 @@ class AccessCredStatus(str, enum.Enum):
     REVOKED = "revoked"
 
 
-class AccessCredential(Base):
+class AccessCredential(Base, SoftDeleteMixin):
     """Persistent username/password credential a reseller hands to someone for free
     hotspot access. Not tied to a Plan, no expiry, single concurrent device enforced
     via ``bound_mac_address`` plus MikroTik ``shared-users=1`` / RADIUS ``Simultaneous-Use``.
@@ -1387,7 +1387,7 @@ class ShopOrderPaymentStatus(str, enum.Enum):
     REFUNDED = "refunded"
 
 
-class ShopProduct(Base):
+class ShopProduct(Base, SoftDeleteMixin):
     __tablename__ = "shop_products"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1406,7 +1406,7 @@ class ShopProduct(Base):
     order_items = relationship("ShopOrderItem", back_populates="product")
 
 
-class ShopOrder(Base):
+class ShopOrder(Base, SoftDeleteMixin):
     __tablename__ = "shop_orders"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1445,7 +1445,7 @@ class ShopOrder(Base):
     )
 
 
-class ShopOrderItem(Base):
+class ShopOrderItem(Base, SoftDeleteMixin):
     __tablename__ = "shop_order_items"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1460,7 +1460,7 @@ class ShopOrderItem(Base):
     product = relationship("ShopProduct", back_populates="order_items")
 
 
-class ShopOrderTracking(Base):
+class ShopOrderTracking(Base, SoftDeleteMixin):
     __tablename__ = "shop_order_tracking"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1478,7 +1478,7 @@ class ShopOrderTracking(Base):
 # PORTAL CUSTOMIZATION SETTINGS
 # ========================================
 
-class PortalSettings(Base):
+class PortalSettings(Base, SoftDeleteMixin):
     """
     Per-reseller customization settings for the public captive portal.
     One row per user (unique on user_id). Missing rows are treated as defaults.
@@ -1568,7 +1568,7 @@ class UnmatchedC2BReason(str, enum.Enum):
     INVALID_LUHN = "invalid_luhn"            # BillRefNumber failed Luhn check
 
 
-class C2BTransaction(Base):
+class C2BTransaction(Base, SoftDeleteMixin):
     """Every Safaricom C2B confirmation we receive, archived in full.
 
     Idempotency anchor: trans_id is Safaricom's globally-unique TransID. The
@@ -1599,7 +1599,7 @@ class C2BTransaction(Base):
     matched_reseller = relationship("User")
 
 
-class AppSetting(Base):
+class AppSetting(Base, SoftDeleteMixin):
     """Generic key/value table for platform-wide admin-editable settings.
 
     Keys are short ASCII identifiers (e.g. "compensation_daily_limit").
@@ -1611,7 +1611,7 @@ class AppSetting(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class UnmatchedC2BPayment(Base):
+class UnmatchedC2BPayment(Base, SoftDeleteMixin):
     """Buffer for C2B payments that couldn't be auto-applied.
 
     Resellers see these on their dashboard and can attribute them to a
@@ -1681,7 +1681,7 @@ class SmsMessageKind(str, enum.Enum):
     ADMIN_TO_RESELLER = "admin_to_reseller"
 
 
-class MessagingSettings(Base):
+class MessagingSettings(Base, SoftDeleteMixin):
     __tablename__ = "messaging_settings"
     id = Column(Integer, primary_key=True, autoincrement=True)
     price_per_sms_kes = Column(DECIMAL(6, 2), nullable=False, default=0.5, server_default="0.50")
@@ -1699,7 +1699,7 @@ class MessagingSettings(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class SmsCreditAccount(Base):
+class SmsCreditAccount(Base, SoftDeleteMixin):
     __tablename__ = "sms_credit_accounts"
     __table_args__ = (
         CheckConstraint("balance >= 0", name="ck_sms_credit_balance_non_negative"),
@@ -1712,7 +1712,7 @@ class SmsCreditAccount(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class SmsCreditTransaction(Base):
+class SmsCreditTransaction(Base, SoftDeleteMixin):
     __tablename__ = "sms_credit_transactions"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
@@ -1725,7 +1725,7 @@ class SmsCreditTransaction(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
-class SmsCreditOrder(Base):
+class SmsCreditOrder(Base, SoftDeleteMixin):
     __tablename__ = "sms_credit_orders"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
@@ -1743,7 +1743,7 @@ class SmsCreditOrder(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class MessageTemplate(Base):
+class MessageTemplate(Base, SoftDeleteMixin):
     __tablename__ = "message_templates"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
@@ -1753,7 +1753,7 @@ class MessageTemplate(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class SmsCampaign(Base):
+class SmsCampaign(Base, SoftDeleteMixin):
     __tablename__ = "sms_campaigns"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
@@ -1772,7 +1772,7 @@ class SmsCampaign(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class SmsMessage(Base):
+class SmsMessage(Base, SoftDeleteMixin):
     __tablename__ = "sms_messages"
     id = Column(Integer, primary_key=True, autoincrement=True)
     campaign_id = Column(Integer, ForeignKey("sms_campaigns.id"), nullable=True, index=True)
@@ -1795,7 +1795,7 @@ class SmsMessage(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class ResellerInboxMessage(Base):
+class ResellerInboxMessage(Base, SoftDeleteMixin):
     __tablename__ = "reseller_inbox_messages"
     id = Column(Integer, primary_key=True, autoincrement=True)
     recipient_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
@@ -1825,7 +1825,7 @@ class FeedbackStatus(str, enum.Enum):
     SPAM = "spam"
 
 
-class FeedbackPost(Base):
+class FeedbackPost(Base, SoftDeleteMixin):
     """A bug report or feature idea on the shared reseller feedback board."""
     __tablename__ = "feedback_posts"
     __table_args__ = (
@@ -1864,7 +1864,7 @@ class FeedbackPost(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
-class FeedbackVote(Base):
+class FeedbackVote(Base, SoftDeleteMixin):
     __tablename__ = "feedback_votes"
     __table_args__ = (
         UniqueConstraint("post_id", "user_id", name="uq_feedback_votes_post_user"),
@@ -1877,7 +1877,7 @@ class FeedbackVote(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class FeedbackComment(Base):
+class FeedbackComment(Base, SoftDeleteMixin):
     __tablename__ = "feedback_comments"
     id = Column(Integer, primary_key=True, autoincrement=True)
     post_id = Column(Integer, ForeignKey("feedback_posts.id", ondelete="CASCADE"),
@@ -1921,7 +1921,7 @@ APPROVAL_KINDS = ("whatsapp_reply", "pr_merge", "router_change", "payment", "oth
 APPROVAL_STATUSES = ("pending", "approved", "rejected", "expired")
 
 
-class WorkItem(Base):
+class WorkItem(Base, SoftDeleteMixin):
     """One unit of work an agent is doing, or waiting to do."""
 
     __tablename__ = "work_items"
@@ -1952,7 +1952,7 @@ class WorkItem(Base):
     completed_at = Column(DateTime, nullable=True)
 
 
-class AgentRun(Base):
+class AgentRun(Base, SoftDeleteMixin):
     """One execution of one agent — the ledger, as rows instead of markdown."""
 
     __tablename__ = "agent_runs"
@@ -1977,7 +1977,7 @@ class AgentRun(Base):
     heartbeat_at = Column(DateTime, nullable=True)
 
 
-class AgentSchedule(Base):
+class AgentSchedule(Base, SoftDeleteMixin):
     """A standing cadence — what the assistant does without being asked.
 
     Runs and work items answer "what happened". This answers "what is SUPPOSED
@@ -2009,7 +2009,7 @@ class AgentSchedule(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class Approval(Base):
+class Approval(Base, SoftDeleteMixin):
     """Something an agent wants to do that only Dennis may authorise.
 
     Money moves, router writes and outbound messages are capped at
@@ -2031,3 +2031,45 @@ class Approval(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     decided_at = Column(DateTime, nullable=True)
     decided_by = Column(String(64), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# System-wide soft delete: convert every unique constraint / unique index on
+# soft-deletable tables into a PARTIAL unique index (WHERE deleted_at IS NULL)
+# so a tombstoned row never blocks re-creating the same value (customer MAC,
+# account number, router identity, voucher code, one-row-per-user tables...).
+# Runs once at import time over Base.metadata, so fresh databases (and the
+# SQLite test suite) natively match what run_soft_delete_migrations() converts
+# existing production tables to. Future models declared with unique=True are
+# picked up automatically. See docs/SOFT_DELETE_PLAN.md.
+# ---------------------------------------------------------------------------
+
+def _pg_name(name: str) -> str:
+    return name[:63]  # Postgres identifier limit
+
+
+def _convert_uniques_to_partial_indexes(metadata) -> None:
+    for table in metadata.tables.values():
+        if "deleted_at" not in table.c:
+            continue
+        live = table.c.deleted_at.is_(None)
+
+        for uc in [c for c in list(table.constraints) if isinstance(c, UniqueConstraint)]:
+            table.constraints.discard(uc)
+            cols = list(uc.columns)
+            name = uc.name or _pg_name("uq_live_" + table.name + "_" + "_".join(c.name for c in cols))
+            Index(name, *cols, unique=True, postgresql_where=live, sqlite_where=live)
+
+        for ix in [i for i in list(table.indexes) if i.unique]:
+            cols = list(ix.columns)
+            table.indexes.discard(ix)
+            Index(ix.name, *cols, unique=True, postgresql_where=live, sqlite_where=live)
+
+        # Tiny partial index over tombstones only — keeps the daily purge job's
+        # scans off full-table seq scans while costing ~nothing when empty.
+        Index(_pg_name(f"ix_{table.name}_tombstones"), table.c.deleted_at,
+              postgresql_where=table.c.deleted_at.isnot(None),
+              sqlite_where=table.c.deleted_at.isnot(None))
+
+
+_convert_uniques_to_partial_indexes(Base.metadata)

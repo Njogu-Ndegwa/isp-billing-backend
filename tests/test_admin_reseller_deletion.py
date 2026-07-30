@@ -159,7 +159,11 @@ async def test_delete_reseller_cleans_messaging_and_related_fk_rows(db, monkeypa
     result = await admin_resellers.delete_reseller(reseller.id, True, db, "token")
 
     assert result["dry_run"] is False
-    assert await db.get(User, reseller.id) is None
+    # Soft delete: clear the identity map so db.get() re-queries (a fresh
+    # session — i.e. every real request — sees the tombstoned reseller as gone).
+    reseller_id, c2b_id, unmatched_id = reseller.id, c2b.id, unmatched.id
+    db.expunge_all()
+    assert await db.get(User, reseller_id) is None
 
     for model in (
         SmsMessage,
@@ -179,8 +183,8 @@ async def test_delete_reseller_cleans_messaging_and_related_fk_rows(db, monkeypa
     ):
         assert await _count(db, model) == 0
 
-    c2b_after = await db.get(C2BTransaction, c2b.id)
-    unmatched_after = await db.get(UnmatchedC2BPayment, unmatched.id)
+    c2b_after = await db.get(C2BTransaction, c2b_id)
+    unmatched_after = await db.get(UnmatchedC2BPayment, unmatched_id)
     assert c2b_after is not None
     assert c2b_after.matched_customer_id is None
     assert c2b_after.matched_reseller_id is None

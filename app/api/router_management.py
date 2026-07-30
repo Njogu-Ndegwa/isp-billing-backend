@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 import httpx
 
 from app.config import settings
-from app.db.database import get_db
+from app.db.database import get_db, soft_delete
+from app.services.soft_deletion import soft_delete_where
 from app.db.models import (
     AccessCredential,
     BandwidthSnapshot,
@@ -2015,7 +2016,10 @@ async def delete_router(
         
         # Clean up related records that reference this router. Customer and
         # payment history is preserved; router-owned operational state is
-        # explicitly removed before deleting the router.
+        # tombstoned (soft delete, docs/SOFT_DELETE_PLAN.md) before the router
+        # itself is tombstoned. The purge job hard-deletes everything together
+        # after the retention window.
+        deleted_ts = datetime.utcnow()
         router_attempt_ids = select(ProvisioningAttempt.id).where(
             ProvisioningAttempt.router_id == router_id
         )
@@ -2030,18 +2034,6 @@ async def delete_router(
             .values(router_id=None, attempt_id=None)
         )
         await db.execute(
-            sql_delete(ProvisioningAttempt)
-            .where(ProvisioningAttempt.router_id == router_id)
-        )
-        await db.execute(
-            sql_delete(BandwidthSnapshot)
-            .where(BandwidthSnapshot.router_id == router_id)
-        )
-        await db.execute(
-            sql_delete(ProvisioningToken)
-            .where(ProvisioningToken.router_id == router_id)
-        )
-        await db.execute(
             update(Voucher)
             .where(
                 Voucher.router_id == router_id,
@@ -2054,27 +2046,22 @@ async def delete_router(
             .where(Voucher.router_id == router_id)
             .values(router_id=None)
         )
-        await db.execute(
-            sql_delete(DevicePairing)
-            .where(DevicePairing.router_id == router_id)
-        )
-        await db.execute(
-            sql_delete(ReconnectionAttempt)
-            .where(ReconnectionAttempt.router_id == router_id)
-        )
-        await db.execute(
-            sql_delete(AccessCredential)
-            .where(AccessCredential.router_id == router_id)
-        )
-        await db.execute(
-            sql_delete(RouterLogEntry)
-            .where(RouterLogEntry.router_id == router_id)
-        )
-        # RouterAvailabilityCheck FK is RESTRICT (not CASCADE) — must delete explicitly
-        await db.execute(
-            sql_delete(RouterAvailabilityCheck)
-            .where(RouterAvailabilityCheck.router_id == router_id)
-        )
+        for child_model, fk in (
+            (ProvisioningAttempt, ProvisioningAttempt.router_id),
+            (BandwidthSnapshot, BandwidthSnapshot.router_id),
+            (ProvisioningToken, ProvisioningToken.router_id),
+            (DevicePairing, DevicePairing.router_id),
+            (ReconnectionAttempt, ReconnectionAttempt.router_id),
+            (AccessCredential, AccessCredential.router_id),
+            (RouterLogEntry, RouterLogEntry.router_id),
+            # RouterAvailabilityCheck FK is RESTRICT — the purge job deletes
+            # these before the router row itself.
+            (RouterAvailabilityCheck, RouterAvailabilityCheck.router_id),
+        ):
+            await soft_delete_where(
+                db, child_model, fk == router_id,
+                when=deleted_ts, deleted_by=user.id,
+            )
         # radius_nas is a raw RADIUS table with ON DELETE CASCADE in its
         # migration. Delete it explicitly, when present, so router deletion has
         # no hidden DB cascade side effects.
@@ -2088,7 +2075,7 @@ async def delete_router(
                 {"router_id": router_id},
             )
 
-        await db.delete(router_obj)
+        soft_delete(router_obj, deleted_by=user.id, when=deleted_ts)
         await db.commit()
         
         logger.info(f"Deleted router: {router_name} ({router_ip})")

@@ -5,7 +5,7 @@ from sqlalchemy.orm import selectinload
 from typing import Optional
 from datetime import datetime, timedelta
 
-from app.db.database import get_db
+from app.db.database import get_db, soft_delete
 from app.db.models import Router, Customer, Plan, CustomerStatus
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
@@ -287,8 +287,8 @@ async def delete_orphaned_customers(
                     "status": c.status.value if c.status else "unknown",
                     "reason": reason
                 })
-                await db.delete(c)
-        
+                soft_delete(c, deleted_by=user.id, when=now)
+
         await db.commit()
         
         logger.info(f"[ORPHANED] Deleted {len(deleted)} orphaned customers, skipped {len(skipped)}")

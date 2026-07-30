@@ -2,9 +2,9 @@ from collections import deque
 from datetime import datetime, timedelta
 from threading import Lock
 
-from sqlalchemy import event
+from sqlalchemy import event, Column, DateTime, Integer
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import sessionmaker, declarative_base, Session, with_loader_criteria
 from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from app.config import settings
@@ -14,6 +14,44 @@ logger = logging.getLogger(__name__)
 
 # ✅ Required for defining models
 Base = declarative_base()
+
+
+class SoftDeleteMixin:
+    """Tombstone columns for system-wide soft delete.
+
+    Rows with deleted_at set are invisible to every ORM SELECT via the
+    _filter_soft_deleted listener below. RADIUS tables are deliberately NOT
+    covered (FreeRADIUS reads them directly — a tombstoned radius_check row
+    would still authenticate), and retention prunes stay hard deletes.
+    See docs/SOFT_DELETE_PLAN.md.
+    """
+
+    deleted_at = Column(DateTime, nullable=True)  # naive UTC, matches created_at convention
+    deleted_by = Column(Integer, nullable=True)  # acting users.id; no FK so purge order stays free
+
+
+def soft_delete(obj, deleted_by: int | None = None, when: datetime | None = None) -> None:
+    """Tombstone a single ORM object. Callers doing cascades pass one shared
+    `when` so parent and children purge together at the same retention cutoff."""
+    obj.deleted_at = when or datetime.utcnow()
+    obj.deleted_by = deleted_by
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _filter_soft_deleted(execute_state):
+    if (
+        execute_state.is_select
+        and not execute_state.is_column_load
+        and not execute_state.is_relationship_load
+        and not execute_state.execution_options.get("include_deleted", False)
+    ):
+        execute_state.statement = execute_state.statement.options(
+            with_loader_criteria(
+                SoftDeleteMixin,
+                lambda cls: cls.deleted_at.is_(None),
+                include_aliases=True,
+            )
+        )
 
 # Replace sync driver with async driver
 DATABASE_URL = settings.DATABASE_URL

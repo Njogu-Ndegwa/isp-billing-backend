@@ -124,6 +124,7 @@ from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_bac
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
 from app.services.subscription import reconcile_pending_subscription_payments
 from app.services.mpesa_b2b import run_daily_payouts
+from app.services.soft_delete_purge import purge_expired_tombstones_background
 
 scheduler = AsyncIOScheduler()
 
@@ -2139,6 +2140,98 @@ async def run_feedback_migrations():
     logger.info("Migration: feedback board tables, enums, indexes ready")
 
 
+async def run_soft_delete_migrations():
+    """System-wide soft delete (docs/SOFT_DELETE_PLAN.md). Idempotent.
+
+    Data-driven from Base.metadata so it can never drift from the models:
+    1. Every soft-deletable table gets deleted_at/deleted_by columns.
+    2. Every unique constraint / full unique index is swapped for the partial
+       unique index (WHERE deleted_at IS NULL) that models.py now declares, so
+       a tombstoned row never blocks re-creating the same value. PKs untouched.
+    3. A tiny tombstone-only index per table keeps the purge job off seq scans.
+
+    Must run AFTER the table-creating migrations (wired last in startup_event).
+    RADIUS tables have no ORM model, so they are naturally excluded.
+    """
+    from sqlalchemy import text
+    import app.db.models  # noqa: F401 — ensure every table is registered
+
+    async with async_engine.begin() as conn:
+        if conn.dialect.name != "postgresql":
+            return
+
+        existing = {
+            r[0] for r in await conn.execute(text(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            ))
+        }
+
+        for table in Base.metadata.tables.values():
+            if "deleted_at" not in table.c or table.name not in existing:
+                continue
+
+            await conn.execute(text(
+                f'ALTER TABLE "{table.name}" '
+                f'ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP NULL'
+            ))
+            await conn.execute(text(
+                f'ALTER TABLE "{table.name}" '
+                f'ADD COLUMN IF NOT EXISTS deleted_by INTEGER NULL'
+            ))
+
+            for ix in table.indexes:
+                if not ix.unique or ix.dialect_options["postgresql"]["where"] is None:
+                    continue
+                cols = [c.name for c in ix.columns]
+
+                # Drop a pre-existing UNIQUE CONSTRAINT covering exactly these
+                # columns (its backing index shares the constraint's name, so it
+                # must go before we can create the partial index).
+                dup_constraints = await conn.execute(text(
+                    "SELECT con.conname FROM pg_constraint con "
+                    "WHERE con.conrelid = to_regclass(:tbl) AND con.contype = 'u' "
+                    "AND (SELECT array_agg(att.attname ORDER BY ord.n) "
+                    "     FROM unnest(con.conkey) WITH ORDINALITY AS ord(attnum, n) "
+                    "     JOIN pg_attribute att ON att.attrelid = con.conrelid "
+                    "     AND att.attnum = ord.attnum) = CAST(:cols AS name[])"
+                ), {"tbl": f'public."{table.name}"', "cols": cols})
+                for (conname,) in dup_constraints:
+                    await conn.execute(text(
+                        f'ALTER TABLE "{table.name}" DROP CONSTRAINT "{conname}"'
+                    ))
+
+                # Drop a pre-existing FULL unique index on these columns (the
+                # unique=True, index=True pattern — e.g. ix_customers_account_number)
+                # unless it is already the partial one we want.
+                dup_indexes = await conn.execute(text(
+                    "SELECT i.relname FROM pg_index x "
+                    "JOIN pg_class i ON i.oid = x.indexrelid "
+                    "WHERE x.indrelid = to_regclass(:tbl) AND x.indisunique "
+                    "AND NOT x.indisprimary AND x.indpred IS NULL "
+                    "AND x.indnkeyatts = :ncols "
+                    "AND (SELECT array_agg(att.attname ORDER BY ord.n) "
+                    "     FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS ord(attnum, n) "
+                    "     JOIN pg_attribute att ON att.attrelid = x.indrelid "
+                    "     AND att.attnum = ord.attnum) = CAST(:cols AS name[])"
+                ), {"tbl": f'public."{table.name}"', "cols": cols, "ncols": len(cols)})
+                for (idxname,) in dup_indexes:
+                    await conn.execute(text(f'DROP INDEX IF EXISTS "{idxname}"'))
+
+                quoted_cols = ", ".join(f'"{c}"' for c in cols)
+                await conn.execute(text(
+                    f'CREATE UNIQUE INDEX IF NOT EXISTS "{ix.name}" '
+                    f'ON "{table.name}" ({quoted_cols}) WHERE deleted_at IS NULL'
+                ))
+
+            tombstone_ix = f"ix_{table.name}_tombstones"[:63]  # matches models._pg_name
+            await conn.execute(text(
+                f'CREATE INDEX IF NOT EXISTS "{tombstone_ix}" '
+                f'ON "{table.name}" (deleted_at) WHERE deleted_at IS NOT NULL'
+            ))
+
+    logger.info("Migration: soft-delete columns and partial unique indexes ready")
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -2297,6 +2390,22 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Feedback board migration failed (non-fatal): {e}")
 
+    # Must stay LAST among migrations: it sweeps every table the earlier
+    # migrations may have created (docs/SOFT_DELETE_PLAN.md).
+    try:
+        await run_soft_delete_migrations()
+        logger.info("Soft-delete migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Soft-delete migration failed (non-fatal): {e}")
+
+    scheduler.add_job(
+        purge_expired_tombstones_background,
+        trigger=IntervalTrigger(hours=24),
+        id='soft_delete_purge',
+        name='Purge soft-deleted rows past the retention window',
+        replace_existing=True,
+        max_instances=1
+    )
     scheduler.add_job(
         cleanup_expired_users_background,
         trigger=IntervalTrigger(seconds=67),

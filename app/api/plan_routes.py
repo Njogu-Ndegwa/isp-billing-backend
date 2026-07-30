@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
 
-from app.db.database import get_db
+from app.db.database import get_db, soft_delete
 from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router, FupAction
 from app.services.auth import verify_token, get_current_user
 from app.services.plan_cache import get_plans_cached, invalidate_plan_cache
@@ -385,8 +385,8 @@ async def delete_plan(
         await db.execute(
             update(Customer).where(Customer.plan_id == plan_id).values(plan_id=None)
         )
-        
-        await db.delete(plan)
+
+        soft_delete(plan, deleted_by=user.id)
         await db.commit()
         
         # Invalidate plan cache after deletion
