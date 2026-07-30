@@ -23,6 +23,7 @@ from app.db.models import (
     Router,
     RouterAvailabilityCheck,
     RouterLogEntry,
+    RouterUsageBucket,
     User,
     UserRole,
     Voucher,
@@ -2005,10 +2006,11 @@ async def delete_router(
                 except Exception as e:
                     logger.warning(f"MikroTik cleanup failed for router {router_name}: {e}. Proceeding with DB cleanup.")
             
-            # Set all customers on this router to INACTIVE and unassign
+            # Set all LIVE customers on this router to INACTIVE and unassign
+            # (tombstoned customers keep their state for faithful restore)
             update_customers_stmt = (
                 update(Customer)
-                .where(Customer.router_id == router_id)
+                .where(Customer.router_id == router_id, Customer.deleted_at.is_(None))
                 .values(router_id=None, status=CustomerStatus.INACTIVE)
             )
             await db.execute(update_customers_stmt)
@@ -2038,17 +2040,19 @@ async def delete_router(
             .where(
                 Voucher.router_id == router_id,
                 Voucher.status == VoucherStatus.AVAILABLE,
+                Voucher.deleted_at.is_(None),
             )
             .values(router_id=None, status=VoucherStatus.DISABLED)
         )
         await db.execute(
             update(Voucher)
-            .where(Voucher.router_id == router_id)
+            .where(Voucher.router_id == router_id, Voucher.deleted_at.is_(None))
             .values(router_id=None)
         )
         for child_model, fk in (
             (ProvisioningAttempt, ProvisioningAttempt.router_id),
             (BandwidthSnapshot, BandwidthSnapshot.router_id),
+            (RouterUsageBucket, RouterUsageBucket.router_id),
             (ProvisioningToken, ProvisioningToken.router_id),
             (DevicePairing, DevicePairing.router_id),
             (ReconnectionAttempt, ReconnectionAttempt.router_id),

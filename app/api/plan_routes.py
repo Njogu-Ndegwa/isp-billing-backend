@@ -381,9 +381,12 @@ async def delete_plan(
                 detail=f"Cannot delete plan. {active_count} active customer(s) are using this plan"
             )
         
-        # Set plan_id to NULL for inactive/expired customers
+        # Set plan_id to NULL for LIVE inactive/expired customers (tombstoned
+        # customers keep theirs for faithful restore)
         await db.execute(
-            update(Customer).where(Customer.plan_id == plan_id).values(plan_id=None)
+            update(Customer)
+            .where(Customer.plan_id == plan_id, Customer.deleted_at.is_(None))
+            .values(plan_id=None)
         )
 
         soft_delete(plan, deleted_by=user.id)

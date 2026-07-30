@@ -88,6 +88,39 @@ async def _null_live_ledger_refs(cutoff: datetime) -> None:
         await db.commit()
 
 
+async def _purge_rows_individually(table, cutoff: datetime) -> int:
+    """Fallback after a failed batch DELETE: try each expired tombstone in its
+    own short transaction, skipping the rows a live FK still pins. Capped at
+    one batch per run to bound the extra round-trips."""
+    if "id" not in table.c:
+        return 0
+    async with async_session() as db:
+        ids = (
+            await db.execute(
+                select(table.c.id)
+                .where(table.c.deleted_at.isnot(None), table.c.deleted_at < cutoff)
+                .limit(PURGE_BATCH_SIZE)
+            )
+        ).scalars().all()
+
+    purged = 0
+    skipped = 0
+    for row_id in ids:
+        try:
+            async with async_session() as db:
+                await db.execute(sql_delete(table).where(table.c.id == row_id))
+                await db.commit()
+            purged += 1
+        except Exception:
+            skipped += 1
+    if skipped:
+        logger.warning(
+            "[PURGE] %s: %d row(s) still pinned by live references; retrying "
+            "next run", table.name, skipped,
+        )
+    return purged
+
+
 async def purge_expired_tombstones(retention_days: int | None = None) -> dict:
     """Hard-delete rows whose deleted_at is older than the retention window.
 
@@ -130,10 +163,15 @@ async def purge_expired_tombstones(retention_days: int | None = None) -> dict:
                     await db.commit()
                     count = result.rowcount or 0
             except Exception as e:
+                # One row still referenced by a live row aborts the whole
+                # batch DELETE. Fall back to per-row deletes so a single
+                # stuck row can't block the entire table's purge forever;
+                # unpurgeable rows just retry on the next daily run.
                 logger.warning(
-                    "[PURGE] Skipping table %s this run (%s); will retry next run",
+                    "[PURGE] Batch delete failed for %s (%s); retrying row-by-row",
                     table.name, e,
                 )
+                total += await _purge_rows_individually(table, cutoff)
                 break
             total += count
             if batch_ids is None or count < PURGE_BATCH_SIZE:

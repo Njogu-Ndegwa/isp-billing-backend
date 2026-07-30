@@ -196,6 +196,7 @@ async def _bulk_load_customers(
         FROM customers c
         LEFT JOIN plans p ON c.plan_id = p.id
         WHERE c.router_id IN ({placeholders})
+          AND c.deleted_at IS NULL
           AND c.status::text IN ('active', 'inactive', 'pending')
           AND (c.expiry IS NULL OR c.expiry > :cutoff)
         ORDER BY c.router_id, c.expiry ASC
@@ -219,6 +220,7 @@ async def _bulk_load_last_payments(
                 ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY payment_date DESC) as rn
             FROM customer_payments
             WHERE customer_id IN ({placeholders})
+              AND deleted_at IS NULL
         ) sub WHERE rn = 1
     """), params)
 
@@ -251,6 +253,7 @@ async def _bulk_load_last_provisioning(
                 ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY updated_at DESC, id DESC) as rn
             FROM provisioning_attempts
             WHERE customer_id IN ({placeholders})
+              AND deleted_at IS NULL
         ) sub WHERE rn = 1
     """), params)
 
@@ -281,6 +284,7 @@ async def _bulk_load_last_provisioning(
                 ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY log_date DESC) as rn
             FROM provisioning_logs
             WHERE customer_id IN ({placeholders})
+              AND deleted_at IS NULL
         ) sub WHERE rn = 1
     """), params)
 
@@ -742,7 +746,7 @@ async def session_monitor_overview(
 
     routers_result = await db.execute(text("""
         SELECT id, name, ip_address, auth_method
-        FROM routers WHERE user_id = :uid ORDER BY name
+        FROM routers WHERE user_id = :uid AND deleted_at IS NULL ORDER BY name
     """), {'uid': user_id})
     all_routers = routers_result.fetchall()
     router_map = {r.id: r for r in all_routers}
@@ -754,7 +758,8 @@ async def session_monitor_overview(
 
     cut_off = await db.execute(text("""
         SELECT COUNT(*) as cnt FROM customers
-        WHERE user_id = :uid AND status::text = 'inactive' AND expiry > NOW()
+        WHERE user_id = :uid AND deleted_at IS NULL
+          AND status::text = 'inactive' AND expiry > NOW()
     """), {'uid': user_id})
     early_count = cut_off.fetchone().cnt
 
@@ -791,7 +796,8 @@ async def session_monitor_router(
     now = datetime.utcnow()
 
     r = await db.execute(text(
-        "SELECT id, name, ip_address, auth_method FROM routers WHERE id = :rid"
+        "SELECT id, name, ip_address, auth_method FROM routers "
+        "WHERE id = :rid AND deleted_at IS NULL"
     ), {'rid': router_id})
     rtr = r.fetchone()
     if not rtr:
@@ -826,7 +832,7 @@ async def session_monitor_customer(
         FROM customers c
         LEFT JOIN plans p ON c.plan_id = p.id
         LEFT JOIN routers r ON c.router_id = r.id
-        WHERE c.id = :cid
+        WHERE c.id = :cid AND c.deleted_at IS NULL
     """), {'cid': customer_id})
     row = r.fetchone()
     if not row:

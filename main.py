@@ -2156,80 +2156,146 @@ async def run_soft_delete_migrations():
     from sqlalchemy import text
     import app.db.models  # noqa: F401 — ensure every table is registered
 
-    async with async_engine.begin() as conn:
-        if conn.dialect.name != "postgresql":
-            return
+    if async_engine.dialect.name != "postgresql":
+        return
 
+    async with async_engine.begin() as conn:
         existing = {
             r[0] for r in await conn.execute(text(
                 "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
             ))
         }
 
-        for table in Base.metadata.tables.values():
-            if "deleted_at" not in table.c or table.name not in existing:
-                continue
+    soft_tables = [
+        t for t in Base.metadata.tables.values()
+        if "deleted_at" in t.c and t.name in existing
+    ]
 
-            await conn.execute(text(
-                f'ALTER TABLE "{table.name}" '
-                f'ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP NULL'
-            ))
-            await conn.execute(text(
-                f'ALTER TABLE "{table.name}" '
-                f'ADD COLUMN IF NOT EXISTS deleted_by INTEGER NULL'
-            ))
-
-            for ix in table.indexes:
-                if not ix.unique or ix.dialect_options["postgresql"]["where"] is None:
-                    continue
-                cols = [c.name for c in ix.columns]
-
-                # Drop a pre-existing UNIQUE CONSTRAINT covering exactly these
-                # columns (its backing index shares the constraint's name, so it
-                # must go before we can create the partial index).
-                dup_constraints = await conn.execute(text(
-                    "SELECT con.conname FROM pg_constraint con "
-                    "WHERE con.conrelid = to_regclass(:tbl) AND con.contype = 'u' "
-                    "AND (SELECT array_agg(att.attname ORDER BY ord.n) "
-                    "     FROM unnest(con.conkey) WITH ORDINALITY AS ord(attnum, n) "
-                    "     JOIN pg_attribute att ON att.attrelid = con.conrelid "
-                    "     AND att.attnum = ord.attnum) = CAST(:cols AS name[])"
-                ), {"tbl": f'public."{table.name}"', "cols": cols})
-                for (conname,) in dup_constraints:
+    # Phase A — columns, ONE SHORT TRANSACTION PER TABLE (two attempts, for
+    # transient lock_timeout hits). A single failure must never roll back the
+    # other tables' columns: with the global soft-delete SELECT filter active,
+    # a table missing deleted_at would 500 on every query. verify_soft_delete_schema()
+    # in startup_event hard-fails the app if any column is still missing after this.
+    for table in soft_tables:
+        for attempt in (1, 2):
+            try:
+                async with async_engine.begin() as conn:
                     await conn.execute(text(
-                        f'ALTER TABLE "{table.name}" DROP CONSTRAINT "{conname}"'
+                        f'ALTER TABLE "{table.name}" '
+                        f'ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP NULL'
                     ))
+                    await conn.execute(text(
+                        f'ALTER TABLE "{table.name}" '
+                        f'ADD COLUMN IF NOT EXISTS deleted_by INTEGER NULL'
+                    ))
+                break
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(
+                        "Soft-delete columns FAILED for table %s: %s", table.name, e
+                    )
 
-                # Drop a pre-existing FULL unique index on these columns (the
-                # unique=True, index=True pattern — e.g. ix_customers_account_number)
-                # unless it is already the partial one we want.
-                dup_indexes = await conn.execute(text(
-                    "SELECT i.relname FROM pg_index x "
-                    "JOIN pg_class i ON i.oid = x.indexrelid "
-                    "WHERE x.indrelid = to_regclass(:tbl) AND x.indisunique "
-                    "AND NOT x.indisprimary AND x.indpred IS NULL "
-                    "AND x.indnkeyatts = :ncols "
-                    "AND (SELECT array_agg(att.attname ORDER BY ord.n) "
-                    "     FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS ord(attnum, n) "
-                    "     JOIN pg_attribute att ON att.attrelid = x.indrelid "
-                    "     AND att.attnum = ord.attnum) = CAST(:cols AS name[])"
-                ), {"tbl": f'public."{table.name}"', "cols": cols, "ncols": len(cols)})
-                for (idxname,) in dup_indexes:
-                    await conn.execute(text(f'DROP INDEX IF EXISTS "{idxname}"'))
-
-                quoted_cols = ", ".join(f'"{c}"' for c in cols)
-                await conn.execute(text(
-                    f'CREATE UNIQUE INDEX IF NOT EXISTS "{ix.name}" '
-                    f'ON "{table.name}" ({quoted_cols}) WHERE deleted_at IS NULL'
-                ))
-
-            tombstone_ix = f"ix_{table.name}_tombstones"[:63]  # matches models._pg_name
-            await conn.execute(text(
-                f'CREATE INDEX IF NOT EXISTS "{tombstone_ix}" '
-                f'ON "{table.name}" (deleted_at) WHERE deleted_at IS NOT NULL'
-            ))
+    # Phase B — index/constraint swaps, per table, best-effort. A failure here
+    # is genuinely non-fatal: the old (stricter) full unique constraint simply
+    # stays in force for that table until the next restart retries.
+    for table in soft_tables:
+        try:
+            await _swap_unique_indexes_for_table(table)
+        except Exception as e:
+            logger.error(
+                "Soft-delete index swap failed for table %s (non-fatal, retries "
+                "next restart): %s", table.name, e
+            )
 
     logger.info("Migration: soft-delete columns and partial unique indexes ready")
+
+
+async def verify_soft_delete_schema():
+    """HARD startup gate (docs/SOFT_DELETE_PLAN.md).
+
+    With the global soft-delete SELECT filter active, any existing table
+    missing deleted_at would 500 on every single query — a total outage that
+    the non-fatal migration wrapper would hide. Better to crash startup
+    loudly, with the table names in the log, so the deploy is rolled back.
+    """
+    from sqlalchemy import text
+    import app.db.models  # noqa: F401
+
+    if async_engine.dialect.name != "postgresql":
+        return
+
+    async with async_engine.begin() as conn:
+        rows = await conn.execute(text(
+            "SELECT t.tablename FROM pg_tables t "
+            "WHERE t.schemaname = 'public' AND NOT EXISTS ("
+            "  SELECT 1 FROM information_schema.columns c "
+            "  WHERE c.table_schema = 'public' AND c.table_name = t.tablename "
+            "  AND c.column_name = 'deleted_at')"
+        ))
+        missing_in_db = {r[0] for r in rows}
+
+    modeled = {t.name for t in Base.metadata.tables.values() if "deleted_at" in t.c}
+    broken = sorted(missing_in_db & modeled)
+    if broken:
+        raise RuntimeError(
+            "soft-delete columns missing on existing tables (every query on "
+            f"them would fail): {broken} — aborting startup"
+        )
+
+
+async def _swap_unique_indexes_for_table(table):
+    from sqlalchemy import text
+
+    async with async_engine.begin() as conn:
+        for ix in table.indexes:
+            if not ix.unique or ix.dialect_options["postgresql"]["where"] is None:
+                continue
+            cols = [c.name for c in ix.columns]
+
+            # Drop a pre-existing UNIQUE CONSTRAINT covering exactly these
+            # columns (its backing index shares the constraint's name, so it
+            # must go before we can create the partial index).
+            dup_constraints = await conn.execute(text(
+                "SELECT con.conname FROM pg_constraint con "
+                "WHERE con.conrelid = to_regclass(:tbl) AND con.contype = 'u' "
+                "AND (SELECT array_agg(att.attname ORDER BY ord.n) "
+                "     FROM unnest(con.conkey) WITH ORDINALITY AS ord(attnum, n) "
+                "     JOIN pg_attribute att ON att.attrelid = con.conrelid "
+                "     AND att.attnum = ord.attnum) = CAST(:cols AS name[])"
+            ), {"tbl": f'public."{table.name}"', "cols": cols})
+            for (conname,) in dup_constraints:
+                await conn.execute(text(
+                    f'ALTER TABLE "{table.name}" DROP CONSTRAINT "{conname}"'
+                ))
+
+            # Drop a pre-existing FULL unique index on these columns (the
+            # unique=True, index=True pattern — e.g. ix_customers_account_number)
+            # unless it is already the partial one we want.
+            dup_indexes = await conn.execute(text(
+                "SELECT i.relname FROM pg_index x "
+                "JOIN pg_class i ON i.oid = x.indexrelid "
+                "WHERE x.indrelid = to_regclass(:tbl) AND x.indisunique "
+                "AND NOT x.indisprimary AND x.indpred IS NULL "
+                "AND x.indnkeyatts = :ncols "
+                "AND (SELECT array_agg(att.attname ORDER BY ord.n) "
+                "     FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS ord(attnum, n) "
+                "     JOIN pg_attribute att ON att.attrelid = x.indrelid "
+                "     AND att.attnum = ord.attnum) = CAST(:cols AS name[])"
+            ), {"tbl": f'public."{table.name}"', "cols": cols, "ncols": len(cols)})
+            for (idxname,) in dup_indexes:
+                await conn.execute(text(f'DROP INDEX IF EXISTS "{idxname}"'))
+
+            quoted_cols = ", ".join(f'"{c}"' for c in cols)
+            await conn.execute(text(
+                f'CREATE UNIQUE INDEX IF NOT EXISTS "{ix.name}" '
+                f'ON "{table.name}" ({quoted_cols}) WHERE deleted_at IS NULL'
+            ))
+
+        tombstone_ix = f"ix_{table.name}_tombstones"[:63]  # matches models._pg_name
+        await conn.execute(text(
+            f'CREATE INDEX IF NOT EXISTS "{tombstone_ix}" '
+            f'ON "{table.name}" (deleted_at) WHERE deleted_at IS NOT NULL'
+        ))
 
 
 @app.on_event("startup")
@@ -2397,6 +2463,10 @@ async def startup_event():
         logger.info("Soft-delete migrations completed successfully")
     except Exception as e:
         logger.error(f"Soft-delete migration failed (non-fatal): {e}")
+
+    # Deliberately OUTSIDE any try/except: if deleted_at is missing anywhere,
+    # every query on that table would 500 — crash startup loudly instead.
+    await verify_soft_delete_schema()
 
     scheduler.add_job(
         purge_expired_tombstones_background,

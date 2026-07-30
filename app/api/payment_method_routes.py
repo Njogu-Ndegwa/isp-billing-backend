@@ -447,10 +447,11 @@ async def delete_payment_method(
 
     pm.is_active = False
 
-    # Unassign from any routers using this method
+    # Unassign from any LIVE routers using this method (tombstoned routers
+    # keep theirs for faithful restore)
     await db.execute(
         update(Router)
-        .where(Router.payment_method_id == method_id)
+        .where(Router.payment_method_id == method_id, Router.deleted_at.is_(None))
         .values(payment_method_id=None)
     )
 

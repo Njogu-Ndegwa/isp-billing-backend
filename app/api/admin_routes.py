@@ -6,6 +6,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from app.db.database import get_db, soft_delete
+from app.services.soft_deletion import soft_delete_customer_children
 from app.db.models import Router, Customer, Plan, CustomerStatus
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
@@ -287,6 +288,12 @@ async def delete_orphaned_customers(
                     "status": c.status.value if c.status else "unknown",
                     "reason": reason
                 })
+                # Same child cascade as DELETE /api/customers/{id} — bare
+                # tombstones would leave child rows pinning the customer at
+                # purge time.
+                await soft_delete_customer_children(
+                    db, c.id, when=now, deleted_by=user.id
+                )
                 soft_delete(c, deleted_by=user.id, when=now)
 
         await db.commit()

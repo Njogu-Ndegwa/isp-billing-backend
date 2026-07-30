@@ -2054,13 +2054,17 @@ def _convert_uniques_to_partial_indexes(metadata) -> None:
             continue
         live = table.c.deleted_at.is_(None)
 
+        # Snapshot existing unique indexes BEFORE the constraint loop below
+        # adds its replacement partial indexes into table.indexes.
+        preexisting_unique_ixs = [i for i in table.indexes if i.unique]
+
         for uc in [c for c in list(table.constraints) if isinstance(c, UniqueConstraint)]:
             table.constraints.discard(uc)
             cols = list(uc.columns)
             name = uc.name or _pg_name("uq_live_" + table.name + "_" + "_".join(c.name for c in cols))
             Index(name, *cols, unique=True, postgresql_where=live, sqlite_where=live)
 
-        for ix in [i for i in list(table.indexes) if i.unique]:
+        for ix in preexisting_unique_ixs:
             cols = list(ix.columns)
             table.indexes.discard(ix)
             Index(ix.name, *cols, unique=True, postgresql_where=live, sqlite_where=live)

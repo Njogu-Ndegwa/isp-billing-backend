@@ -119,7 +119,7 @@ async def enable_radius_for_router(
     See the RADIUS_SETUP.md guide for MikroTik configuration.
     """
     result = await db.execute(text("""
-        SELECT id, name, user_id, auth_method FROM routers WHERE id = :router_id
+        SELECT id, name, user_id, auth_method FROM routers WHERE id = :router_id AND deleted_at IS NULL
     """), {'router_id': router_id})
     
     db_router = result.fetchone()
@@ -173,7 +173,7 @@ async def disable_radius_for_router(
     direct API provisioning method.
     """
     result = await db.execute(text("""
-        SELECT id, name, user_id FROM routers WHERE id = :router_id
+        SELECT id, name, user_id FROM routers WHERE id = :router_id AND deleted_at IS NULL
     """), {'router_id': router_id})
     
     db_router = result.fetchone()
@@ -210,7 +210,7 @@ async def get_router_radius_status(
     """Get RADIUS configuration status for a router"""
     result = await db.execute(text("""
         SELECT id, name, user_id, auth_method, radius_secret, radius_nas_identifier, ip_address
-        FROM routers WHERE id = :router_id
+        FROM routers WHERE id = :router_id AND deleted_at IS NULL
     """), {'router_id': router_id})
     
     db_router = result.fetchone()
@@ -246,7 +246,7 @@ async def list_radius_enabled_routers(
     """List all routers with their RADIUS status for a given user"""
     result = await db.execute(text("""
         SELECT id, name, auth_method, radius_secret, radius_nas_identifier, ip_address
-        FROM routers WHERE user_id = :user_id
+        FROM routers WHERE user_id = :user_id AND deleted_at IS NULL
         ORDER BY name
     """), {'user_id': user_id})
     
@@ -364,7 +364,7 @@ async def delete_radius_user(
     disconnect_result = None
     if disconnect and router_id:
         result = await db.execute(text("""
-            SELECT ip_address, radius_secret FROM routers WHERE id = :router_id
+            SELECT ip_address, radius_secret FROM routers WHERE id = :router_id AND deleted_at IS NULL
         """), {'router_id': router_id})
         db_router = result.fetchone()
         
@@ -401,7 +401,7 @@ async def list_active_sessions(
     nas_ip = None
     if router_id:
         result = await db.execute(text("""
-            SELECT ip_address FROM routers WHERE id = :router_id
+            SELECT ip_address FROM routers WHERE id = :router_id AND deleted_at IS NULL
         """), {'router_id': router_id})
         db_router = result.fetchone()
         if db_router:
@@ -439,7 +439,7 @@ async def disconnect_user_session(
     """
     # Get router info
     result = await db.execute(text("""
-        SELECT ip_address, radius_secret FROM routers WHERE id = :router_id
+        SELECT ip_address, radius_secret FROM routers WHERE id = :router_id AND deleted_at IS NULL
     """), {'router_id': router_id})
     
     db_router = result.fetchone()
@@ -527,7 +527,7 @@ async def test_radius_connectivity(
     # Get router info
     result = await db.execute(text("""
         SELECT id, name, ip_address, auth_method, radius_secret
-        FROM routers WHERE id = :router_id
+        FROM routers WHERE id = :router_id AND deleted_at IS NULL
     """), {'router_id': router_id})
     
     db_router = result.fetchone()

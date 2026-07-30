@@ -225,13 +225,11 @@ async def delete_ad(
         if not ad:
             raise HTTPException(status_code=404, detail="Ad not found")
         
-        # Tombstone clicks AND impressions (impressions were previously
-        # leaked — the old hard delete removed only clicks and would have
-        # FK-violated on any ad with impressions).
+        # Tombstone the clicks with the ad. (AdImpression has no ad FK —
+        # one impression row covers many ads via the ad_ids JSON list — so
+        # impressions are left alone, exactly as the old hard delete did.)
         deleted_ts = datetime.utcnow()
         await soft_delete_where(db, AdClick, AdClick.ad_id == ad_id,
-                                when=deleted_ts, deleted_by=user.id)
-        await soft_delete_where(db, AdImpression, AdImpression.ad_id == ad_id,
                                 when=deleted_ts, deleted_by=user.id)
         soft_delete(ad, deleted_by=user.id, when=deleted_ts)
         await db.commit()

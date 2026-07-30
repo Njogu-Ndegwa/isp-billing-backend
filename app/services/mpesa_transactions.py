@@ -490,6 +490,10 @@ async def _handle_successful_reconciliation(
             .where(
                 MpesaTransaction.checkout_request_id == txn.checkout_request_id,
                 MpesaTransaction.status == MpesaTransactionStatus.pending,
+                # Don't complete a transaction tombstoned by a customer/reseller
+                # deletion between the sweep's read and this claim (bulk UPDATEs
+                # bypass the soft-delete SELECT filter).
+                MpesaTransaction.deleted_at.is_(None),
             )
             .values(
                 status=MpesaTransactionStatus.completed,
@@ -510,7 +514,10 @@ async def _handle_successful_reconciliation(
             MpesaTransaction.checkout_request_id == txn.checkout_request_id
         )
         res = await db.execute(stmt)
-        mpesa_txn = res.scalar_one()
+        mpesa_txn = res.scalar_one_or_none()
+        if mpesa_txn is None:
+            # Tombstoned between claim and re-fetch — the deletion wins.
+            return
 
         logger.info(
             "[RECONCILE] Marked %s as completed via STK Query",

@@ -2242,11 +2242,16 @@ async def list_soft_deleted(
 async def restore_soft_deleted(
     entity: str,
     item_id: int,
+    confirm: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
     """Restore a tombstoned entity together with everything deleted in the
     same operation (same shared deleted_at timestamp across all tables).
+
+    Without ?confirm=true, returns a dry-run of what WOULD be restored —
+    important because restoring e.g. one plan from a full reseller deletion
+    brings back the entire reseller account (same deletion group).
 
     RADIUS rows and on-router state are NOT restored — a restored customer
     reappears in the DB and portal but must re-provision on next payment or
@@ -2272,6 +2277,30 @@ async def restore_soft_deleted(
         raise HTTPException(status_code=404, detail="No such tombstoned row")
 
     group_ts = row.deleted_at
+
+    if not confirm:
+        would_restore: dict[str, int] = {}
+        for table in Base.metadata.tables.values():
+            if "deleted_at" not in table.c:
+                continue
+            count = (
+                await db.execute(
+                    select(func.count()).select_from(table)
+                    .where(table.c.deleted_at == group_ts)
+                )
+            ).scalar()
+            if count:
+                would_restore[table.name] = count
+        return {
+            "dry_run": True,
+            "entity": entity,
+            "id": item_id,
+            "label": _tombstone_label(row),
+            "group_deleted_at": group_ts.isoformat(),
+            "will_restore": would_restore,
+            "message": "Add ?confirm=true to restore this whole deletion group.",
+        }
+
     restored: dict[str, int] = {}
     try:
         for table in Base.metadata.tables.values():
@@ -2301,6 +2330,7 @@ async def restore_soft_deleted(
         entity, item_id, group_ts.isoformat(), restored,
     )
     return {
+        "dry_run": False,
         "restored": restored,
         "entity": entity,
         "id": item_id,

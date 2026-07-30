@@ -416,7 +416,7 @@ async def should_use_radius(db: AsyncSession, router_id: int) -> Tuple[bool, Opt
     """
     result = await db.execute(text("""
         SELECT id, auth_method, radius_secret, radius_nas_identifier, ip_address
-        FROM routers WHERE id = :router_id
+        FROM routers WHERE id = :router_id AND deleted_at IS NULL
     """), {'router_id': router_id})
     
     row = result.fetchone()

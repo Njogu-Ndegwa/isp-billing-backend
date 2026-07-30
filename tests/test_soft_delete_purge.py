@@ -137,7 +137,13 @@ async def test_restore_brings_back_whole_group(db):
         listing = await arr.list_soft_deleted("customer", 50, db, "token")
         assert any(i["id"] == cust_id for i in listing["items"])
 
-        result = await arr.restore_soft_deleted("customer", cust_id, db, "token")
+        preview = await arr.restore_soft_deleted("customer", cust_id, False, db, "token")
+        assert preview["dry_run"] is True
+        assert preview["will_restore"].get("customers") == 1
+        assert preview["will_restore"].get("plans") == 1
+
+        result = await arr.restore_soft_deleted("customer", cust_id, True, db, "token")
+        assert result["dry_run"] is False
     finally:
         arr._require_admin = orig
 

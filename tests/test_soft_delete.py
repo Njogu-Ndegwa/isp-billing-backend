@@ -149,3 +149,37 @@ async def test_no_behavior_change_when_nothing_deleted(db):
 
     assert (await db.execute(select(func.count()).select_from(Customer))).scalar() == 2
     assert (await db.execute(select(func.count()).select_from(User))).scalar() == 1
+
+
+async def test_delete_ad_endpoint_soft_deletes_ad_and_clicks(db, monkeypatch):
+    """Regression: the first soft-delete conversion referenced a non-existent
+    AdImpression.ad_id column, 500ing every ad deletion — and no test caught
+    it. This pins the whole endpoint."""
+    from app.api import ads_routes
+    from app.db.models import Ad, AdClick, AdClickType, Advertiser
+    from tests.factories import make_reseller
+
+    user = await make_reseller(db)
+    advertiser = Advertiser(name="Adv", phone_number="0700000000")
+    db.add(advertiser)
+    await db.commit()
+    ad = Ad(advertiser_id=advertiser.id, title="Router promo",
+            image_url="https://x/i.png", seller_name="S", phone_number="0700000001")
+    db.add(ad)
+    await db.commit()
+    click = AdClick(ad_id=ad.id, click_type=AdClickType.CALL)
+    db.add(click)
+    await db.commit()
+    ad_id, click_id = ad.id, click.id
+
+    async def _fake_user(token, _db):
+        return user
+    monkeypatch.setattr(ads_routes, "get_current_user", _fake_user)
+    monkeypatch.setattr(ads_routes, "enforce_active_subscription", lambda u: None)
+
+    result = await ads_routes.delete_ad(ad_id, db, "token")
+    assert "deleted" in result["message"]
+
+    db.expunge_all()
+    assert await db.get(Ad, ad_id) is None
+    assert await db.get(AdClick, click_id) is None

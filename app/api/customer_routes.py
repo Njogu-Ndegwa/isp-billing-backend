@@ -9,7 +9,7 @@ import secrets
 import string
 
 from app.db.database import get_db, soft_delete
-from app.services.soft_deletion import soft_delete_where
+from app.services.soft_deletion import soft_delete_customer_children
 from app.db.models import (
     Router, Customer, Plan, CustomerStatus, ConnectionType,
     CustomerPayment, PaymentMethod, PaymentStatus, DurationUnit,
@@ -18,6 +18,7 @@ from app.db.models import (
     ProvisioningAttempt, ProvisioningAttemptEntrypoint,
     ProvisioningAttemptSource, DevicePairing, ReconnectionAttempt,
     ZenoPayTransaction, MtnMomoTransaction,
+    SmsMessage, C2BTransaction, UnmatchedC2BPayment, SubscriptionShareCode,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -484,30 +485,9 @@ async def delete_customer(
         #     tombstoned; invisible to every query from this commit on.
         # -----------------------------------------------------------------
         deleted_ts = datetime.utcnow()
-        await db.execute(text(
-            "DELETE FROM radius_check WHERE customer_id = :cid"
-        ).bindparams(cid=customer_id))
-        await db.execute(text(
-            "DELETE FROM radius_reply WHERE customer_id = :cid"
-        ).bindparams(cid=customer_id))
-        for child_model, fk in (
-            (CustomerRating, CustomerRating.customer_id),
-            (UserBandwidthUsage, UserBandwidthUsage.customer_id),
-            (CustomerUsagePeriod, CustomerUsagePeriod.customer_id),
-            (UsageCapWatchState, UsageCapWatchState.customer_id),
-            (ProvisioningLog, ProvisioningLog.customer_id),
-            (ProvisioningAttempt, ProvisioningAttempt.customer_id),
-            (DevicePairing, DevicePairing.customer_id),
-            (ReconnectionAttempt, ReconnectionAttempt.customer_id),
-            (MpesaTransaction, MpesaTransaction.customer_id),
-            (ZenoPayTransaction, ZenoPayTransaction.customer_id),
-            (MtnMomoTransaction, MtnMomoTransaction.customer_id),
-            (Payment, Payment.customer_id),
-        ):
-            await soft_delete_where(
-                db, child_model, fk == customer_id,
-                when=deleted_ts, deleted_by=user.id,
-            )
+        await soft_delete_customer_children(
+            db, customer_id, when=deleted_ts, deleted_by=user.id
+        )
 
         # Tombstone the customer first, then flush so the upcoming count
         # queries from update_reseller_financials already see N-1 customers.

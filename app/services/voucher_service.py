@@ -486,6 +486,7 @@ async def expire_stale_vouchers(db: AsyncSession) -> int:
             Voucher.status == VoucherStatus.AVAILABLE,
             Voucher.expires_at != None,
             Voucher.expires_at <= datetime.utcnow(),
+            Voucher.deleted_at.is_(None),
         )
         .values(status=VoucherStatus.EXPIRED)
     )

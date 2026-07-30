@@ -48,9 +48,10 @@ from app.db.models import (
     UsageCapWatchState, Lead, LeadActivity, LeadFollowUp, LeadSource,
     MtnMomoTransaction, AccessCredential, PortalSettings, ShopProduct,
     ShopOrder, ShopOrderItem, ShopOrderTracking, SubscriptionShareCode,
-    C2BTransaction, UnmatchedC2BPayment, SmsCreditAccount,
+    RouterUsageBucket, C2BTransaction, UnmatchedC2BPayment, SmsCreditAccount,
     SmsCreditTransaction, SmsCreditOrder, MessageTemplate, SmsCampaign,
-    SmsMessage, ResellerInboxMessage,
+    SmsMessage, ResellerInboxMessage, PasswordResetToken,
+    FeedbackPost, FeedbackVote, FeedbackComment,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
 
     # 1. Null out vouchers.redeemed_by pointing to this reseller's customers
     await db.execute(
-        update(Voucher).where(Voucher.redeemed_by.in_(customer_ids)).values(redeemed_by=None)
+        update(Voucher).where(Voucher.deleted_at.is_(None), Voucher.redeemed_by.in_(customer_ids)).values(redeemed_by=None)
     )
 
     # 2-3. RADIUS tables (raw SQL since no ORM models)
@@ -141,6 +142,24 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
         ResellerInboxMessage.recipient_user_id == reseller_id,
         ResellerInboxMessage.sender_user_id == reseller_id,
     ), when=deleted_ts, deleted_by=deleted_by)
+
+    # Added with soft delete: these user-owned rows were never handled by the
+    # old deleter (a NOT NULL / no-ondelete FK back to users) and would pin
+    # the tombstoned User forever at purge time.
+    await soft_delete_where(db, PasswordResetToken,
+                            PasswordResetToken.user_id == reseller_id,
+                            when=deleted_ts, deleted_by=deleted_by)
+    feedback_post_ids = select(FeedbackPost.id).where(FeedbackPost.user_id == reseller_id)
+    await soft_delete_where(db, FeedbackVote, or_(
+        FeedbackVote.user_id == reseller_id,
+        FeedbackVote.post_id.in_(feedback_post_ids),
+    ), when=deleted_ts, deleted_by=deleted_by)
+    await soft_delete_where(db, FeedbackComment, or_(
+        FeedbackComment.user_id == reseller_id,
+        FeedbackComment.post_id.in_(feedback_post_ids),
+    ), when=deleted_ts, deleted_by=deleted_by)
+    await soft_delete_where(db, FeedbackPost, FeedbackPost.user_id == reseller_id,
+                            when=deleted_ts, deleted_by=deleted_by)
 
     # Preserve C2B audit rows but remove links to the deleted reseller/customers.
     await db.execute(
@@ -173,14 +192,16 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
     await soft_delete_where(db, PortalSettings, PortalSettings.user_id == reseller_id, when=deleted_ts, deleted_by=deleted_by)
     await db.execute(
         update(ShopOrderTracking)
-        .where(ShopOrderTracking.updated_by_user_id == reseller_id)
+        .where(ShopOrderTracking.deleted_at.is_(None),
+               ShopOrderTracking.updated_by_user_id == reseller_id)
         .values(updated_by_user_id=None)
     )
     await soft_delete_where(db, ShopOrderTracking, ShopOrderTracking.order_id.in_(shop_order_ids), when=deleted_ts, deleted_by=deleted_by)
     await soft_delete_where(db, ShopOrderItem, ShopOrderItem.order_id.in_(shop_order_ids), when=deleted_ts, deleted_by=deleted_by)
     await db.execute(
         update(ShopOrderItem)
-        .where(ShopOrderItem.product_id.in_(shop_product_ids))
+        .where(ShopOrderItem.deleted_at.is_(None),
+               ShopOrderItem.product_id.in_(shop_product_ids))
         .values(product_id=None)
     )
     await soft_delete_where(db, ShopOrder, ShopOrder.user_id == reseller_id, when=deleted_ts, deleted_by=deleted_by)
@@ -193,12 +214,14 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
     ), when=deleted_ts, deleted_by=deleted_by)
     await db.execute(
         update(Customer)
-        .where(Customer.subscription_owner_id.in_(customer_ids))
+        .where(Customer.deleted_at.is_(None),
+               Customer.subscription_owner_id.in_(customer_ids))
         .values(subscription_owner_id=None)
     )
     await db.execute(
         update(DevicePairing)
-        .where(DevicePairing.subscription_owner_customer_id.in_(customer_ids))
+        .where(DevicePairing.deleted_at.is_(None),
+               DevicePairing.subscription_owner_customer_id.in_(customer_ids))
         .values(subscription_owner_customer_id=None)
     )
     await soft_delete_where(db, AccessCredential, or_(
@@ -256,8 +279,10 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
     # 10. Customers
     await soft_delete_where(db, Customer, Customer.user_id == reseller_id, when=deleted_ts, deleted_by=deleted_by)
 
-    # 11. Bandwidth snapshots
+    # 11. Bandwidth snapshots + usage-push buckets (added with soft delete:
+    #     live buckets would FK-pin tombstoned routers and stall the purge)
     await soft_delete_where(db, BandwidthSnapshot, BandwidthSnapshot.router_id.in_(router_ids), when=deleted_ts, deleted_by=deleted_by)
+    await soft_delete_where(db, RouterUsageBucket, RouterUsageBucket.router_id.in_(router_ids), when=deleted_ts, deleted_by=deleted_by)
 
     # 12. Router log entries
     await soft_delete_where(db, RouterLogEntry, RouterLogEntry.router_id.in_(router_ids), when=deleted_ts, deleted_by=deleted_by)
@@ -273,7 +298,8 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
     # 15. Provisioning tokens (unlink router_id first, then delete)
     await db.execute(
         update(ProvisioningToken)
-        .where(ProvisioningToken.router_id.in_(router_ids))
+        .where(ProvisioningToken.deleted_at.is_(None),
+               ProvisioningToken.router_id.in_(router_ids))
         .values(router_id=None)
     )
     await soft_delete_where(db, ProvisioningToken, ProvisioningToken.user_id == reseller_id, when=deleted_ts, deleted_by=deleted_by)
@@ -284,17 +310,17 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
     # 16b. Null out cross-reseller references: other resellers' customers or
     #       vouchers may point to this reseller's routers/plans.
     await db.execute(
-        update(Customer).where(Customer.router_id.in_(router_ids)).values(router_id=None)
+        update(Customer).where(Customer.deleted_at.is_(None), Customer.router_id.in_(router_ids)).values(router_id=None)
     )
     await db.execute(
-        update(Customer).where(Customer.plan_id.in_(plan_ids)).values(plan_id=None)
+        update(Customer).where(Customer.deleted_at.is_(None), Customer.plan_id.in_(plan_ids)).values(plan_id=None)
     )
     await db.execute(
-        update(Voucher).where(Voucher.router_id.in_(router_ids)).values(router_id=None)
+        update(Voucher).where(Voucher.deleted_at.is_(None), Voucher.router_id.in_(router_ids)).values(router_id=None)
     )
     await soft_delete_where(db, Voucher, Voucher.plan_id.in_(plan_ids), when=deleted_ts, deleted_by=deleted_by)
     await db.execute(
-        update(Router).where(Router.payment_method_id.in_(payment_method_ids)).values(payment_method_id=None)
+        update(Router).where(Router.deleted_at.is_(None), Router.payment_method_id.in_(payment_method_ids)).values(payment_method_id=None)
     )
 
     # 17. Routers
@@ -318,7 +344,8 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
     )
     await db.execute(
         update(B2BTransaction)
-        .where(B2BTransaction.charge_id.in_(created_charge_ids))
+        .where(B2BTransaction.deleted_at.is_(None),
+               B2BTransaction.charge_id.in_(created_charge_ids))
         .values(charge_id=None)
     )
     await soft_delete_where(db, ResellerTransactionCharge, or_(
@@ -351,13 +378,13 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
     await soft_delete_where(db, LeadFollowUp, LeadFollowUp.created_by == reseller_id, when=deleted_ts, deleted_by=deleted_by)
     await soft_delete_where(db, Lead, Lead.user_id == reseller_id, when=deleted_ts, deleted_by=deleted_by)
     await db.execute(
-        update(Lead).where(Lead.converted_user_id == reseller_id).values(converted_user_id=None)
+        update(Lead).where(Lead.deleted_at.is_(None), Lead.converted_user_id == reseller_id).values(converted_user_id=None)
     )
-    await db.execute(update(Lead).where(Lead.source_id.in_(lead_source_ids)).values(source_id=None))
+    await db.execute(update(Lead).where(Lead.deleted_at.is_(None), Lead.source_id.in_(lead_source_ids)).values(source_id=None))
     await soft_delete_where(db, LeadSource, LeadSource.user_id == reseller_id, when=deleted_ts, deleted_by=deleted_by)
 
     # 23. Null out created_by references from other users
-    await db.execute(update(User).where(User.created_by == reseller_id).values(created_by=None))
+    await db.execute(update(User).where(User.deleted_at.is_(None), User.created_by == reseller_id).values(created_by=None))
 
     # 24. Delete the user row
     await soft_delete_where(db, User, User.id == reseller_id, when=deleted_ts, deleted_by=deleted_by)
@@ -365,3 +392,72 @@ async def soft_delete_reseller_cascade(db, reseller_id: int, deleted_by: int | N
     await db.commit()
 
     return wg_failures
+
+
+async def soft_delete_customer_children(db, customer_id: int, when, deleted_by: int | None = None):
+    """Tombstone one customer's child rows and unlink live cross-references.
+
+    Shared by DELETE /api/customers/{id} and the orphaned-customer sweep.
+    Does NOT tombstone the customer row itself, and does not touch
+    CustomerPayment (the revenue ledger stays live with its FK intact; the
+    purge job nulls it later — see docs/SOFT_DELETE_PLAN.md).
+    RADIUS rows are hard-deleted right now: FreeRADIUS reads them directly.
+    """
+    await db.execute(text(
+        "DELETE FROM radius_check WHERE customer_id = :cid"
+    ).bindparams(cid=customer_id))
+    await db.execute(text(
+        "DELETE FROM radius_reply WHERE customer_id = :cid"
+    ).bindparams(cid=customer_id))
+
+    for child_model, fk in (
+        (CustomerRating, CustomerRating.customer_id),
+        (UserBandwidthUsage, UserBandwidthUsage.customer_id),
+        (CustomerUsagePeriod, CustomerUsagePeriod.customer_id),
+        (UsageCapWatchState, UsageCapWatchState.customer_id),
+        (ProvisioningLog, ProvisioningLog.customer_id),
+        (ProvisioningAttempt, ProvisioningAttempt.customer_id),
+        (DevicePairing, DevicePairing.customer_id),
+        (ReconnectionAttempt, ReconnectionAttempt.customer_id),
+        (MpesaTransaction, MpesaTransaction.customer_id),
+        (ZenoPayTransaction, ZenoPayTransaction.customer_id),
+        (MtnMomoTransaction, MtnMomoTransaction.customer_id),
+        (Payment, Payment.customer_id),
+        (SmsMessage, SmsMessage.customer_id),
+    ):
+        await soft_delete_where(db, child_model, fk == customer_id,
+                                when=when, deleted_by=deleted_by)
+
+    # Share codes used to vanish via DB-level ON DELETE CASCADE, which a
+    # tombstone doesn't trigger — replicate it explicitly.
+    await soft_delete_where(db, SubscriptionShareCode,
+                            SubscriptionShareCode.owner_customer_id == customer_id,
+                            when=when, deleted_by=deleted_by)
+    await db.execute(
+        update(SubscriptionShareCode)
+        .where(SubscriptionShareCode.deleted_at.is_(None),
+               SubscriptionShareCode.redeemed_customer_id == customer_id)
+        .values(redeemed_customer_id=None)
+    )
+
+    # Live customers sharing this customer's subscription lose the link
+    # (mirrors the old DB-level ON DELETE SET NULL that purge still gets).
+    await db.execute(
+        update(Customer)
+        .where(Customer.deleted_at.is_(None),
+               Customer.subscription_owner_id == customer_id)
+        .values(subscription_owner_id=None)
+    )
+
+    # C2B audit rows are never deleted — just unlink them (their FKs would
+    # otherwise pin this customer at purge time).
+    await db.execute(
+        update(C2BTransaction)
+        .where(C2BTransaction.matched_customer_id == customer_id)
+        .values(matched_customer_id=None)
+    )
+    await db.execute(
+        update(UnmatchedC2BPayment)
+        .where(UnmatchedC2BPayment.resolution_customer_id == customer_id)
+        .values(resolution_customer_id=None)
+    )

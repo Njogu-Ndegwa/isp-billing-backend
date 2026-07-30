@@ -1,6 +1,20 @@
 # System-Wide Soft Delete — Design & Rollout Plan
 
-Status: in progress (feat/soft-delete). Owner: Claude agent, requested by Dennis 2026-07-30.
+Status: implemented + review-hardened (feat/soft-delete). Owner: Claude agent,
+requested by Dennis 2026-07-30. Four independent audit passes (raw-SQL leaks,
+db.get/bulk-update flows, unique-constraint dependencies, full diff review)
+ran after implementation; all confirmed findings are fixed:
+raw-SQL `deleted_at IS NULL` guards in session_monitor/radius_endpoints/
+radius_provisioning; live-row guards on every FK-nulling bulk update (restore
+fidelity); per-table migration transactions + `verify_soft_delete_schema()`
+hard startup gate; RouterUsageBucket/SmsMessage/PasswordResetToken/feedback
+rows added to cascades (purge-stall blockers); shared
+`soft_delete_customer_children()` used by both customer delete and the orphan
+sweep; restore endpoint dry-runs unless `?confirm=true`; purge falls back to
+per-row deletes when a batch hits a pinned row; the ads delete no longer
+references a non-existent `AdImpression.ad_id` (regression-tested).
+Suite: 762 passed; Postgres constraint-swap rehearsal runs in CI
+(`tests/test_soft_delete_migration_pg.py`).
 
 ## Goal
 
