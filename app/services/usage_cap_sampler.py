@@ -70,6 +70,11 @@ class QueueSample:
     item: WatchItem
     queue: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    # When the counters were read from the router (taken BEFORE the fetch).
+    # Lets record_queue_usage_sample discard this sample if a fresher writer
+    # (the 2-minute push channel) advanced the usage row mid-poll, instead of
+    # mistaking the stale read for a counter reset.
+    sampled_at: Optional[datetime] = None
 
 
 cap_sampler_running = False
@@ -356,6 +361,7 @@ def _find_queue_for_item(item: WatchItem, indexes: dict[str, dict[str, dict[str,
 async def _poll_router(router_id: int, items: list[WatchItem], semaphore: asyncio.Semaphore) -> list[QueueSample]:
     router_info = items[0].router_info
     async with semaphore:
+        sampled_at = datetime.utcnow()
         raw = await asyncio.to_thread(_fetch_queue_usage_for_router_sync, router_info)
 
     if raw.get("error"):
@@ -371,7 +377,7 @@ async def _poll_router(router_id: int, items: list[WatchItem], semaphore: asynci
         if not queue:
             samples.append(QueueSample(item=item, error="queue_not_found"))
         else:
-            samples.append(QueueSample(item=item, queue=queue))
+            samples.append(QueueSample(item=item, queue=queue, sampled_at=sampled_at))
     return samples
 
 
@@ -488,7 +494,21 @@ async def _persist_samples(samples: list[QueueSample], now: datetime) -> list[in
                 max_limit=queue.get("max-limit", ""),
                 now=now,
                 legacy_keys=legacy_keys,
+                sampled_at=sample.sampled_at,
             )
+            if update.stale:
+                # A fresher writer (push) advanced the row mid-poll; the bytes
+                # this read carried are already accounted for. Keep the current
+                # poll tier — update.period is None here, and rescheduling from
+                # it would wrongly demote a near-cap customer to the slow tier.
+                state.consecutive_errors = 0
+                state.backoff_until = None
+                state.last_polled_at = now
+                state.next_poll_at = now + timedelta(
+                    seconds=state.poll_interval_seconds or 300
+                )
+                state.last_error = None
+                continue
             if update.reset_detected:
                 logger.info(
                     "[CAP-WATCH] Counter reset for customer=%s key=%s now=%s/%s",

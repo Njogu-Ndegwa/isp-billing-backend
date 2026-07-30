@@ -140,10 +140,24 @@ async def test_bandwidth_snapshot_records_hotspot_and_pppoe_usage_deltas(
     assert pppoe_period.upload_bytes == 400
     assert pppoe_period.download_bytes == 1000
     assert pppoe_period.total_bytes == 1400
-    assert latest_snapshot.hotspot_upload_bytes == 1000
-    assert latest_snapshot.hotspot_download_bytes == 3000
-    assert latest_snapshot.pppoe_upload_bytes == 400
-    assert latest_snapshot.pppoe_download_bytes == 1000
+    # Snapshots carry router health only; credited bytes live in the
+    # router_usage_buckets ledger via record_usage (one source of truth).
+    assert latest_snapshot.hotspot_upload_bytes == 0
+    assert latest_snapshot.hotspot_download_bytes == 0
+    assert latest_snapshot.pppoe_upload_bytes == 0
+    assert latest_snapshot.pppoe_download_bytes == 0
+    async with session_factory() as s:
+        from app.db.models import RouterUsageBucket
+
+        buckets = (
+            await s.execute(
+                select(RouterUsageBucket).where(RouterUsageBucket.router_id == router.id)
+            )
+        ).scalars().all()
+    assert sum(b.hotspot_upload_bytes for b in buckets) == 1000
+    assert sum(b.hotspot_download_bytes for b in buckets) == 3000
+    assert sum(b.pppoe_upload_bytes for b in buckets) == 400
+    assert sum(b.pppoe_download_bytes for b in buckets) == 1000
     assert hotspot_usage.last_upload_bytes == 2000
     assert hotspot_usage.last_download_bytes == 6000
 

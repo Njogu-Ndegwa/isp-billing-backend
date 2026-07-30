@@ -97,11 +97,9 @@ async def test_router_block_writes_a_snapshot(db, session_factory):
 
 @pytest.mark.asyncio
 async def test_first_sample_push_snapshot_carries_zero_deltas(db, session_factory):
-    """A first sample is a baseline — it banks nothing, so the snapshot's bar
-    fields stay zero. (Subsequent samples DO stamp banked deltas; see the
-    partition tests below.)"""
+    """A first sample is a baseline — nothing is credited, so neither the
+    snapshot bars (always zero now) nor the ledger gain any bytes."""
     router, _ = await _setup(db)
-    usage_push.reset_bar_deltas()
 
     await usage_push.ingest_usage_reports(
         router.id,
@@ -269,18 +267,33 @@ async def test_metrics_push_updates_router_liveness_stamps(db, session_factory):
 
 
 # ---------------------------------------------------------------------------
-# Dashboard-bars partition: the fix for "customer usage and dashboard disagree".
-# Push consumes the queue-counter stream every 2 min for customer periods, so
-# the poller's hourly visit only saw a 2-minute sliver — SkyNet's daily bars
-# showed 49 MB against 8,667 MB of real traffic (2026-07-29). Ingest now BANKS
-# every delta per router; whichever snapshot writer runs next stamps the banked
-# amount, so the bars sum the full stream exactly once.
+# Dashboard bars: snapshots are router HEALTH only. Credited bytes land in the
+# router_usage_buckets ledger inside record_usage — same transaction as the
+# customer's period credit — so bars equal per-customer usage by construction.
+# (The earlier in-memory bank was lost on restart and raced the poller:
+# 2.9%-182% capture across the fleet, 2026-07-30.)
 # ---------------------------------------------------------------------------
 
 
+async def _ledger_totals(session_factory, router_id):
+    from app.db.models import RouterUsageBucket
+
+    async with session_factory() as s:
+        buckets = (
+            await s.execute(
+                select(RouterUsageBucket).where(RouterUsageBucket.router_id == router_id)
+            )
+        ).scalars().all()
+    return (
+        sum(b.hotspot_upload_bytes for b in buckets),
+        sum(b.hotspot_download_bytes for b in buckets),
+        sum(b.pppoe_upload_bytes for b in buckets),
+        sum(b.pppoe_download_bytes for b in buckets),
+    )
+
+
 @pytest.mark.asyncio
-async def test_push_snapshot_carries_banked_usage_deltas(db, session_factory):
-    usage_push.reset_bar_deltas()
+async def test_push_deltas_land_in_the_ledger_not_the_snapshot(db, session_factory):
     router, _ = await _setup(db)
     key = "AA:BB:CC:11:22:33"
 
@@ -302,24 +315,22 @@ async def test_push_snapshot_carries_banked_usage_deltas(db, session_factory):
             .order_by(BandwidthSnapshot.recorded_at.desc()).limit(1)
         )).scalars().first()
 
-    assert snap.hotspot_upload_bytes == 2 * MB
-    assert snap.hotspot_download_bytes == 10 * MB
-    # Stamped once — the bank must be empty afterwards.
-    assert usage_push.drain_bar_deltas(router.id) == (0, 0, 0, 0)
+    assert snap.hotspot_upload_bytes == 0
+    assert snap.hotspot_download_bytes == 0
+    assert await _ledger_totals(session_factory, router.id) == (2 * MB, 10 * MB, 0, 0)
 
 
 @pytest.mark.asyncio
-async def test_banked_deltas_survive_the_snapshot_throttle(db, session_factory):
-    """A throttled push must not drop its deltas — they wait for the next
-    snapshot, from either writer."""
-    usage_push.reset_bar_deltas()
+async def test_ledger_deltas_survive_the_snapshot_throttle(db, session_factory):
+    """The snapshot throttle must never cost usage bytes: the ledger write
+    rides the credit transaction, not the snapshot."""
     router, _ = await _setup(db)
     key = "AA:BB:CC:11:22:33"
 
     await usage_push.ingest_usage_reports(
         router.id,
         [UsageReport(queue_key=key, upload_bytes=0, download_bytes=0)],
-        router_metrics=_metrics(rx=10 * MB),      # writes snapshot 1, banks nothing yet
+        router_metrics=_metrics(rx=10 * MB),      # writes snapshot 1
         session_factory=session_factory,
     )
     await usage_push.ingest_usage_reports(
@@ -329,12 +340,11 @@ async def test_banked_deltas_survive_the_snapshot_throttle(db, session_factory):
         session_factory=session_factory,
     )
 
-    assert usage_push.drain_bar_deltas(router.id) == (MB, 5 * MB, 0, 0)
+    assert await _ledger_totals(session_factory, router.id) == (MB, 5 * MB, 0, 0)
 
 
 @pytest.mark.asyncio
-async def test_pppoe_deltas_bank_into_the_pppoe_bars(db, session_factory):
-    usage_push.reset_bar_deltas()
+async def test_pppoe_deltas_land_in_the_pppoe_ledger_fields(db, session_factory):
     reseller = await make_reseller(db)
     router = await make_router(db, reseller, identity="Router-PPP")
     plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
@@ -353,4 +363,4 @@ async def test_pppoe_deltas_bank_into_the_pppoe_bars(db, session_factory):
         session_factory=session_factory,
     )
 
-    assert usage_push.drain_bar_deltas(router.id) == (0, 0, MB, 3 * MB)
+    assert await _ledger_totals(session_factory, router.id) == (0, 0, MB, 3 * MB)

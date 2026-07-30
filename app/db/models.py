@@ -560,6 +560,32 @@ class BandwidthSnapshot(Base):
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+class RouterUsageBucket(Base):
+    """Per-router 5-minute ledger of bytes credited to customers.
+
+    Written by ``record_usage`` in the SAME transaction that credits a
+    customer's usage period, so the dashboard's usage bars are the sum of the
+    per-customer numbers by construction — one source of truth. Replaces the
+    snapshot bar fields (still summed for pre-cutover history) and the
+    in-memory push bank, which lost bytes on restart and double-counted when
+    the poller raced the push channel (bars at 2.9%-182% of real traffic,
+    2026-07-30).
+    """
+    __tablename__ = "router_usage_buckets"
+    __table_args__ = (
+        UniqueConstraint("router_id", "bucket_start", name="uq_router_usage_bucket"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=False, index=True)
+    bucket_start = Column(DateTime, nullable=False, index=True)
+    hotspot_upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    hotspot_download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    pppoe_upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    pppoe_download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class UserBandwidthUsage(Base):
     """Track cumulative bandwidth usage per user for top downloaders.
 

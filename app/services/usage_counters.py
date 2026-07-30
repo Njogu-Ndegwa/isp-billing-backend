@@ -27,6 +27,7 @@ class UsageCounterUpdate:
     delta_download_bytes: int
     reset_detected: bool
     created: bool
+    stale: bool = False
 
 
 def parse_queue_bytes(bytes_str: str) -> tuple[int, int]:
@@ -70,6 +71,7 @@ async def record_queue_usage_sample(
     now: Optional[datetime] = None,
     legacy_keys: Optional[Iterable[str]] = None,
     first_sample_is_total: bool = False,
+    sampled_at: Optional[datetime] = None,
 ) -> UsageCounterUpdate:
     """Persist one cumulative queue sample and roll its delta into the period.
 
@@ -83,8 +85,19 @@ async def record_queue_usage_sample(
     records a baseline and counts nothing — the default. A router's on-logout
     report is different: it carries the whole session total and there is nothing
     before it, so the first sample IS the usage. Only the push channel sets this.
+
+    ``sampled_at`` is when the counters were READ FROM THE ROUTER, as opposed to
+    ``now`` (when they are applied). The counter stream has three readers (push
+    ingest, the bandwidth poller, the cap sampler); a reader that fetched before
+    another reader's write but applies after it would see a counter below the
+    baseline, trip the reset rule, and re-book the queue's whole lifetime
+    counter (bars at 142-182% of real traffic, 2026-07-30). Any sample older
+    than the row's last write is therefore discarded whole — the fresher reader
+    already accounted for those bytes. Genuine reboot/relogin resets are
+    unaffected: their reads are fresh.
     """
     now = now or datetime.utcnow()
+    sampled_at = sampled_at or now
     keys = [queue_key]
     if legacy_keys:
         keys.extend(k for k in legacy_keys if k)
@@ -124,6 +137,21 @@ async def record_queue_usage_sample(
     usage = (await db.execute(stmt)).scalars().first()
 
     created = False
+    if usage and usage.last_updated and sampled_at < usage.last_updated:
+        # Stale read: a fresher writer has already advanced this row past the
+        # moment these counters were fetched. Applying them would regress the
+        # baseline and/or fake a reset. Drop the sample entirely — no counter
+        # update, no period credit. The bytes it carried were (or will be)
+        # accounted for by the fresher reader's own delta.
+        return UsageCounterUpdate(
+            usage=usage,
+            period=None,
+            delta_upload_bytes=0,
+            delta_download_bytes=0,
+            reset_detected=False,
+            created=False,
+            stale=True,
+        )
     if usage:
         delta_up, delta_dn, reset_detected = usage_counter_delta(
             usage, upload_bytes, download_bytes

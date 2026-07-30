@@ -20,11 +20,66 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
+    ConnectionType,
     Customer,
     CustomerUsagePeriod,
     DurationUnit,
     Plan,
+    RouterUsageBucket,
 )
+
+# Dashboard-bar ledger granularity. Five minutes matches the push snapshot
+# throttle, so bars stay as fresh as the rest of the dashboard.
+USAGE_BUCKET_SECONDS = 300
+
+
+def bucket_start_for(now: datetime) -> datetime:
+    """Floor a timestamp to its 5-minute ledger bucket."""
+    return now.replace(
+        minute=(now.minute // 5) * 5, second=0, microsecond=0
+    )
+
+
+async def _add_usage_to_router_bucket(
+    db: AsyncSession,
+    router_id: int,
+    *,
+    is_pppoe: bool,
+    delta_upload_bytes: int,
+    delta_download_bytes: int,
+    now: datetime,
+) -> None:
+    """Accumulate credited deltas onto the router's current 5-minute bucket.
+
+    Rides the caller's transaction on purpose: a byte appears in the dashboard
+    ledger if and only if the same commit credited it to a customer period.
+    Plain select-then-upsert (no dialect-specific ON CONFLICT): pushes are
+    per-router serialized by the endpoint rate limit and the app runs a single
+    worker, so contention on one router's current bucket is negligible.
+    """
+    start = bucket_start_for(now)
+    bucket = (
+        await db.execute(
+            select(RouterUsageBucket).where(
+                RouterUsageBucket.router_id == router_id,
+                RouterUsageBucket.bucket_start == start,
+            )
+        )
+    ).scalars().first()
+    if bucket is None:
+        bucket = RouterUsageBucket(router_id=router_id, bucket_start=start)
+        db.add(bucket)
+        # Sessions here run with autoflush off; without a flush a second credit
+        # in the same 5-minute window would miss this pending row and violate
+        # the (router_id, bucket_start) unique constraint.
+        await db.flush()
+    if is_pppoe:
+        bucket.pppoe_upload_bytes = (bucket.pppoe_upload_bytes or 0) + delta_upload_bytes
+        bucket.pppoe_download_bytes = (bucket.pppoe_download_bytes or 0) + delta_download_bytes
+    else:
+        bucket.hotspot_upload_bytes = (bucket.hotspot_upload_bytes or 0) + delta_upload_bytes
+        bucket.hotspot_download_bytes = (bucket.hotspot_download_bytes or 0) + delta_download_bytes
+    bucket.updated_at = now
 
 
 def _plan_duration(plan: Optional[Plan]) -> timedelta:
@@ -155,6 +210,26 @@ async def record_usage(
         period.download_bytes = (period.download_bytes or 0) + delta_download_bytes
         period.total_bytes = (period.total_bytes or 0) + delta_upload_bytes + delta_download_bytes
         period.updated_at = now or datetime.utcnow()
+
+        # Mirror the credit into the router's dashboard-bar ledger, same
+        # transaction. Every crediting path (push ingest, bandwidth poller,
+        # cap sampler) flows through here, which is what makes the bars equal
+        # the per-customer numbers by construction.
+        effective_plan = plan if plan is not None else customer.plan
+        if customer.router_id is not None:
+            is_pppoe = (
+                effective_plan.connection_type == ConnectionType.PPPOE
+                if effective_plan is not None
+                else bool(customer.pppoe_username)
+            )
+            await _add_usage_to_router_bucket(
+                db,
+                customer.router_id,
+                is_pppoe=is_pppoe,
+                delta_upload_bytes=delta_upload_bytes,
+                delta_download_bytes=delta_download_bytes,
+                now=now or datetime.utcnow(),
+            )
     return period
 
 
