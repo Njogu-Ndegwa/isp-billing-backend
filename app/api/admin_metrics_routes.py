@@ -194,11 +194,14 @@ async def admin_signups_summary(
 @router.get("/api/admin/metrics/customer-signups")
 async def admin_customer_signups(
     period: str = Query("30d", regex="^(7d|30d|90d|1y)$"),
+    offset: int = Query(0, ge=0, le=svc.MAX_PERIOD_OFFSET),
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
     await _require_admin(token, db)
-    return await svc.compute_customer_signups_timeseries(db, period=period)
+    return await svc.compute_customer_signups_timeseries(
+        db, period=period, offset=offset,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -208,11 +211,14 @@ async def admin_customer_signups(
 @router.get("/api/admin/metrics/subscription-revenue-history")
 async def admin_subscription_revenue_history(
     period: str = Query("30d", regex="^(7d|30d|90d|1y)$"),
+    offset: int = Query(0, ge=0, le=svc.MAX_PERIOD_OFFSET),
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
     await _require_admin(token, db)
-    return await svc.compute_subscription_revenue_history(db, period=period)
+    return await svc.compute_subscription_revenue_history(
+        db, period=period, offset=offset,
+    )
 
 
 # ---------------------------------------------------------------------------
