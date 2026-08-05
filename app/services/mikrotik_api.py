@@ -19,7 +19,28 @@ QUEUE_FASTTRACK_BYPASS_LIST = "isp_queue_limited_clients"
 QUEUE_FASTTRACK_BYPASS_SRC_COMMENT = "ISP_BILLING_QUEUE_BYPASS_SRC"
 QUEUE_FASTTRACK_BYPASS_DST_COMMENT = "ISP_BILLING_QUEUE_BYPASS_DST"
 
+HOTSPOT_BRIDGE_NAME = "bridge"
+PLAIN_BRIDGE_NAME = "bridge-plain"
+PPPOE_BRIDGE_NAME = "bridge-pppoe"
 DUAL_BRIDGE_NAME = "bridge-dual"
+
+# Every bridge this platform creates and owns. Provisioning uses it to tell a
+# deliberate layout from a foreign leftover: a LAN port found on one of these was
+# put there on purpose (plain / PPPoE / legacy dual mode) and is left alone,
+# while a port on any OTHER bridge is a leftover base -- an ex-provider config or
+# an old RouterOS default whose bridge is `bridgeLocal` -- and gets moved onto
+# the hotspot bridge.
+#
+# Adding a new managed bridge? Add it here in the same change. Nothing else needs
+# updating, and `tests/test_provisioning_bridge_ports.py` fails the build if a
+# `/interface/bridge/add` anywhere in `app/` names a bridge missing from this set.
+MANAGED_BRIDGE_NAMES = (
+    HOTSPOT_BRIDGE_NAME,
+    PLAIN_BRIDGE_NAME,
+    PPPOE_BRIDGE_NAME,
+    DUAL_BRIDGE_NAME,
+)
+
 DUAL_BRIDGE_IP = "192.168.91.1/24"
 DUAL_HOTSPOT_POOL_NAME = "dual-hotspot-pool"
 DUAL_HOTSPOT_POOL_RANGE = "192.168.91.2-192.168.91.254"

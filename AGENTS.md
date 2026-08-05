@@ -159,8 +159,11 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   (1) **foreign management tunnels** (ovpn/l2tp/pptp out-interface) + schedulers that re-arm them —
   delete scheduler FIRST, then disable tunnel; (2) **`html-directory-override`** on the hotspot
   profile — silently overrides `html-directory`; clear with `set html-directory-override=""`; 
-  (3) **ether2–5 in wrong bridge** — bridgeLocal vs. bridge (additive script fails silently if port
-  already in a bridge); (4) **conflicting subnet on bridge** — if the old ISP used `10.0.0.x/y`,
+  (3) **ether2–5 in wrong bridge** — bridgeLocal vs. bridge. **Fixed at the source 2026-08-05**:
+  provisioning now moves a LAN port off a foreign bridge instead of skipping it, and parks the
+  emptied leftover. Guarded by `tests/test_provisioning_bridge_ports.py`. Still worth checking on
+  routers provisioned before that date — see the incident note for the sweep script;
+  (4) **conflicting subnet on bridge** — if the old ISP used `10.0.0.x/y`,
   the router may own `10.0.0.1`, causing `ping 10.0.0.1` to return 0ms (self-ping, not our server);
   real server RTT ~200ms. Detailed incident notes + cleanup script:
   see `project-secondhand-router-onboarding` memory and
