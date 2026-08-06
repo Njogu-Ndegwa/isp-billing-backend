@@ -90,9 +90,11 @@ async def test_router_block_writes_a_snapshot(db, session_factory):
 
     assert snap.interface_rx_bytes == 100 * MB
     assert snap.interface_tx_bytes == 20 * MB
+    # No queue reports in this batch, so the router's own hotspot figure stands.
     assert snap.active_hotspot_users == 5
-    assert snap.active_sessions == 2
-    assert snap.active_queues == 6
+    assert snap.active_sessions == 5
+    # active_queues is the COMBINED count the health endpoint subtracts from.
+    assert snap.active_queues == 7
 
 
 @pytest.mark.asyncio
@@ -364,3 +366,63 @@ async def test_pppoe_deltas_land_in_the_pppoe_ledger_fields(db, session_factory)
     )
 
     assert await _ledger_totals(session_factory, router.id) == (0, 0, MB, 3 * MB)
+
+
+@pytest.mark.asyncio
+async def test_hotspot_customers_are_not_republished_as_pppoe(db, session_factory):
+    """Regression: 2026-08-06 — router 10 showed 0 hotspot / 99 PPPoE.
+
+    The push writer stored the raw simple-queue count in ``active_queues``
+    while the health endpoint computes the PPPoE tile as
+    ``active_queues - active_hotspot_users``. With ``/ip hotspot active``
+    reading 0 on a MAC-bypass hotspot, every hotspot customer surfaced as a
+    phantom PPPoE user.
+    """
+    router, _ = await _setup(db)
+
+    # A hotspot-only router: three plan_<MAC> queues, no PPPoE anywhere, and a
+    # hotspot portal-login count of 0 because customers are admitted by MAC.
+    reports = [
+        UsageReport(queue_key="AA:BB:CC:11:22:33", upload_bytes=0, download_bytes=0),
+        UsageReport(queue_key="AA:BB:CC:11:22:44", upload_bytes=0, download_bytes=0),
+        UsageReport(queue_key="AA:BB:CC:11:22:55", upload_bytes=0, download_bytes=0),
+    ]
+    await usage_push.ingest_usage_reports(
+        router.id, reports,
+        router_metrics=_metrics(hotspot=0, pppoe=0, queues=3),
+        session_factory=session_factory,
+    )
+
+    async with session_factory() as s:
+        snap = (await s.execute(
+            select(BandwidthSnapshot).where(BandwidthSnapshot.router_id == router.id)
+        )).scalar_one()
+
+    assert snap.active_hotspot_users == 3
+    # What the dashboard tile actually renders.
+    assert max(0, snap.active_queues - snap.active_hotspot_users) == 0
+
+
+@pytest.mark.asyncio
+async def test_mixed_router_splits_hotspot_and_pppoe(db, session_factory):
+    router, _ = await _setup(db)
+
+    reports = [
+        UsageReport(queue_key="AA:BB:CC:11:22:33", upload_bytes=0, download_bytes=0),
+        UsageReport(queue_key="AA:BB:CC:11:22:44", upload_bytes=0, download_bytes=0),
+        UsageReport(queue_key="pppoe:alex", upload_bytes=0, download_bytes=0),
+    ]
+    await usage_push.ingest_usage_reports(
+        router.id, reports,
+        router_metrics=_metrics(hotspot=0, pppoe=1, queues=3),
+        session_factory=session_factory,
+    )
+
+    async with session_factory() as s:
+        snap = (await s.execute(
+            select(BandwidthSnapshot).where(BandwidthSnapshot.router_id == router.id)
+        )).scalar_one()
+
+    assert snap.active_hotspot_users == 2
+    assert snap.active_queues == 3
+    assert max(0, snap.active_queues - snap.active_hotspot_users) == 1

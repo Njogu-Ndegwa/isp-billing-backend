@@ -217,30 +217,65 @@ def _cap_bytes_for(period: Optional[CustomerUsagePeriod], plan: Optional[Plan]) 
     return int(cap_mb) * 1024 * 1024 if cap_mb and int(cap_mb) > 0 else 0
 
 
+def _split_queue_keys(reports: list["UsageReport"]) -> tuple[int, int]:
+    """Count the batch's queue keys as (hotspot, pppoe).
+
+    The router names our queues ``plan_<MAC>`` for hotspot and
+    ``<pppoe-USERNAME>`` for PPPoE, and the push script already reports only
+    those two shapes (see ``usage_push_script``). Counting them here gives a
+    hotspot figure that does not depend on ``/ip hotspot active``, which is
+    empty on MAC-bypass hotspots — the model most of our resellers run.
+    """
+    hotspot = 0
+    pppoe = 0
+    for report in reports:
+        key = _canonical_key(report.queue_key)
+        if not key:
+            continue
+        if key.startswith("pppoe:"):
+            pppoe += 1
+        else:
+            hotspot += 1
+    return hotspot, pppoe
+
+
 async def _persist_router_metrics(
     db,
     router_id: int,
     metrics: RouterMetrics,
     now: datetime,
     result: IngestResult,
+    reports: list["UsageReport"],
 ) -> None:
     """Write a bandwidth snapshot from pushed router metrics, throttled.
 
     This is router HEALTH only — interface counters, throughput, session
     counts. The per-queue byte-delta fields stay zero: usage bars come from
     the router_usage_buckets ledger written by record_usage.
+
+    ``active_queues`` MUST stay the COMBINED hotspot + PPPoE count. The health
+    endpoint derives the PPPoE tile as ``active_queues - active_hotspot_users``
+    (``mikrotik_routes._health_payload_from_live_result``), so writing the raw
+    simple-queue count here republishes every hotspot customer as a phantom
+    PPPoE user — see docs/agent-memory/incidents/2026-08-06-hotspot-shown-as-pppoe.md.
     """
     rx = int(metrics.iface_rx_bytes or 0)
     tx = int(metrics.iface_tx_bytes or 0)
-    hotspot = int(metrics.hotspot_active or 0)
-    pppoe = int(metrics.pppoe_active or 0)
-    queues = int(metrics.queue_count or 0)
+    # ``/ip hotspot active`` is empty whenever customers are admitted by MAC
+    # ip-binding/bypass rather than a portal login, so it reads 0 fleet-wide.
+    # The per-customer queues the same push already carries are the honest
+    # count; fall back to the router's own figure only if we got no queues.
+    queue_hotspot, queue_pppoe = _split_queue_keys(reports)
+    hotspot_sessions = int(metrics.hotspot_active or 0)
+    hotspot = queue_hotspot or hotspot_sessions
+    pppoe = int(metrics.pppoe_active or 0) or queue_pppoe
+    queues = hotspot + pppoe
     if (
         rx < 0 or tx < 0
         or rx > MAX_PLAUSIBLE_COUNTER_BYTES or tx > MAX_PLAUSIBLE_COUNTER_BYTES
         or not (0 <= hotspot <= _MAX_ACTIVE_COUNT)
         or not (0 <= pppoe <= _MAX_ACTIVE_COUNT)
-        or not (0 <= queues <= _MAX_ACTIVE_COUNT)
+        or not (0 <= queues <= 2 * _MAX_ACTIVE_COUNT)
     ):
         result.errors.append("implausible_router_metrics")
         return
@@ -276,7 +311,9 @@ async def _persist_router_metrics(
         interface_rx_bytes=rx,
         interface_tx_bytes=tx,
         active_hotspot_users=hotspot,
-        active_sessions=pppoe,
+        # Hotspot portal logins, matching what mikrotik_background writes here.
+        # PPPoE is NOT stored in this column — it is active_queues - hotspot.
+        active_sessions=hotspot_sessions,
         active_queues=queues,
         total_download_bps=int(avg_download_bps),
         total_upload_bps=int(avg_upload_bps),
@@ -448,7 +485,9 @@ async def ingest_usage_reports(
                 pending = 0
 
         if router_metrics is not None:
-            await _persist_router_metrics(db, router_id, router_metrics, now, result)
+            await _persist_router_metrics(
+                db, router_id, router_metrics, now, result, reports
+            )
 
         await db.commit()
 
