@@ -151,3 +151,26 @@ Project-level items that should survive across agent sessions.
   eligibility filter as the rollout (docs/agent-memory/usage-push-rollout-2026-07-28.md)
   and installs on any eligible router lacking the scheduler. Reuses the stage-3
   installer logic.
+
+### Dashboard Metrics: `created_at` Is Unindexed On Every Aggregated Table
+
+- Status: measured, not fixed; not blocking the chart time-travel feature
+- Problem: `subscription_payments`, `customer_payments`, `customers` and `users`
+  all declare `created_at` with no index, so every windowed dashboard aggregate
+  (`/admin/metrics/subscription-revenue-history`, `/admin/metrics/customer-signups`,
+  `/admin/resellers/stats`) is a full table scan. Cost tracks TOTAL table size, not
+  the size of the window asked for. Measured on the real service functions against
+  a seeded DB: a 30-day window costs ~3.5 ms at 1k rows, 25 ms at 50k, and 152 ms at
+  200k; `1y` is ~3x worse (461 ms at 200k). Panning to an older window costs the same
+  as the live one — offset does not change the work.
+- Why it matters: it is already paid on every admin dashboard load (four charts at
+  once), and it grows with the payments table forever. It is the reason the chart
+  pan control had to debounce and abort rather than query per drag step.
+- Proposed next step: add an index on `created_at` for those four tables — most
+  valuable on `customer_payments` and `subscription_payments`. Needs the usual
+  idempotent startup migration in `main.py` (`CREATE INDEX IF NOT EXISTS`), and on a
+  live table should be `CONCURRENTLY`, which cannot run inside a transaction — so it
+  needs its own autocommit connection, not the normal migration block.
+- Unknown: real prod row counts were not checked (agent SSH to prod is blocked by the
+  auto-mode classifier). `SELECT count(*) FROM customer_payments;` decides whether this
+  is urgent or cosmetic. Under ~50k rows it is cosmetic.
