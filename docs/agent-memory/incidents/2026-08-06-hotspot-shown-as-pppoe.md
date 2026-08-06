@@ -89,26 +89,64 @@ Blast radius at the time of diagnosis (latest snapshot per router, 30 min window
 | 224 | RB951 UI | muchocyro@gmail.com | 6 | 5 | 1 |
 | 258 | ENNIKO PROJECT #1 | lukhafenossichari@gmail.com | 8 | 7 | 1 |
 
+## What "active hotspot user" must mean
+
+Rejected definitions, and why:
+
+| Candidate | Problem |
+|---|---|
+| `:len [/ip hotspot active]` | Portal logins only — permanently 0 on MAC-bypass. The original bug. |
+| Count of `plan_<MAC>` queues | A **subscriber** count. The queue survives the customer switching their phone off, so it overstates who is on the router. |
+| ARP / DHCP leases | Includes devices that never paid and cannot pass traffic. |
+
+Adopted: **host-table entries flagged `authorized` or `bypassed`.** A device
+only holds a `/ip hotspot host` entry while it is actually present on the
+hotspot network, and the flag filter drops connected-but-unpaid devices (they
+sit in the host table unauthorized, seeing only the portal). This matches the
+definition `mikrotik_background` already uses (`bypassed + authorized`).
+
 ## Fix
 
-`app/services/usage_push._persist_router_metrics`:
+**Router side** — `app/services/usage_push_script.py`:
 
-- Derive the hotspot/PPPoE split from the **queue keys already in the push**
-  (`plan_<MAC>` → hotspot, `pppoe:<user>` → PPPoE) via `_split_queue_keys`.
-  This needs no router-side change and does not depend on `/ip hotspot active`.
+```
+:local hs 0
+:foreach h in=[/ip hotspot host find] do={
+    :local ha [/ip hotspot host get $h authorized]
+    :local hb [/ip hotspot host get $h bypassed]
+    :if ($ha || $hb) do={ :set hs ($hs + 1) }
+}
+```
+
+Counted per host rather than as two summed `find` lengths, so a host carrying
+both flags is not double-counted. New `METRICS_VERSION = 2` is reported in the
+payload.
+
+**Server side** — `app/services/usage_push._persist_router_metrics`:
+
+- Trust `hotspot_active` only from `metrics_version >= 2`. A router still on
+  version 1 reports 0, which would overwrite the poller's real figure every two
+  minutes; carry the previous snapshot's value instead — the same choice
+  `mikrotik_background` makes when its own hotspot fetch fails.
 - Write `active_queues = hotspot + pppoe`, honouring the contract the health
   endpoint subtracts from.
-- Write the router's own hotspot-login count to `active_sessions`, matching what
-  the poller stores there. PPPoE is no longer stashed in that column.
+- Stop stashing PPPoE in `active_sessions`.
 
-Regression tests: `tests/test_usage_push_router_metrics.py::
-test_hotspot_customers_are_not_republished_as_pppoe` and
-`::test_mixed_router_splits_hotspot_and_pppoe`.
+Regression tests in `tests/test_usage_push_router_metrics.py`
+(`test_hotspot_count_is_who_is_connected_not_who_holds_a_queue`,
+`test_old_script_does_not_zero_the_hotspot_count`,
+`test_mixed_router_splits_hotspot_and_pppoe`) and
+`tests/test_usage_push_script.py`.
+
+## Rollout
+
+The server change alone stops the phantom PPPoE immediately. The **real**
+hotspot number needs the version-2 script re-installed per router — the script
+has no automated fleet installer, and `render_usage_push_script` is called with
+`include_router_metrics=True` only where metrics are wanted. Until a router is
+re-scripted it carries its last poller-derived hotspot figure rather than 0.
 
 ## Verification
-
-The tile reads the latest snapshot, so each router self-corrects on its next
-push (~2 min after deploy). Confirm with:
 
 ```sql
 SELECT router_id, active_queues, active_hotspot_users,
@@ -117,7 +155,9 @@ FROM bandwidth_snapshots WHERE router_id = 10
 ORDER BY recorded_at DESC LIMIT 3;
 ```
 
-Router 10 should read `active_hotspot_users ≈ 102`, `pppoe_on_tile = 0`.
+Router 10 should read `pppoe_on_tile = 0`, and `active_hotspot_users` should
+track the live host table (69 hosts / 31 bypassed at diagnosis time) — **not**
+the 102 provisioned queues.
 
 ## Follow-up work (not in this change)
 
