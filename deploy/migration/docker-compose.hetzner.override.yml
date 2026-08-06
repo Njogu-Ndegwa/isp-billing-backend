@@ -1,0 +1,24 @@
+# Hetzner-only compose override — memory caps + loopback binds + OOM ordering.
+# Placed on the box as ~/apps/isp-billing/docker-compose.override.yml (H7).
+# NOT used on AWS prod. Rationale: the box is shared with the software factory,
+# whose CI builds run with --memory=2g; these caps + oom_score_adj make sure the
+# kernel kills a factory build (score 0) before any billing service under pressure.
+# Postgres is the most protected (-600), then web (-400).
+services:
+  db:
+    mem_limit: 512m
+    oom_score_adj: -600
+    ports:
+      - "127.0.0.1:5434:5432"   # loopback-only (prod publishes 0.0.0.0 — do not copy that here)
+  web:
+    mem_limit: 768m
+    oom_score_adj: -400
+    ports:
+      - "127.0.0.1:8000:8000"   # Caddy proxies from 80/443
+  freeradius:
+    mem_limit: 128m
+    oom_score_adj: -200
+    # 1812/1813 published as udp; DOCKER-USER rules restrict to 10.0.0.0/16 + 10.250.0.0/16
+  wg-manager:
+    mem_limit: 128m
+    oom_score_adj: -200
