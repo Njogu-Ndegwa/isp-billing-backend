@@ -546,6 +546,11 @@ class BandwidthSnapshot(Base):
     avg_download_bps = Column(Float, default=0)
     active_queues = Column(Integer, default=0)  # combined hotspot hosts + PPPoE sessions (legacy field; kept for back-compat)
     active_hotspot_users = Column(Integer, default=0)  # hotspot-only host count at snapshot time (authorized + bypassed)
+    # PPPoE sessions at snapshot time. Persisted separately so nothing has to
+    # recover it as active_queues - active_hotspot_users; that subtraction
+    # republished hotspot customers as PPPoE users (incident 2026-08-06).
+    # NULL only on rows written before this column existed.
+    active_pppoe_users = Column(Integer, nullable=True)
     active_sessions = Column(Integer, default=0)
     # Interface-based counters for accurate averaging
     interface_rx_bytes = Column(BigInteger, default=0)

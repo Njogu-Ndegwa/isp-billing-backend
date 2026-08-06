@@ -318,8 +318,8 @@ async def _persist_router_metrics(
         interface_rx_bytes=rx,
         interface_tx_bytes=tx,
         active_hotspot_users=hotspot,
+        active_pppoe_users=pppoe,
         # Hotspot session count, matching what mikrotik_background writes here.
-        # PPPoE is NOT stored in this column — it is active_queues - hotspot.
         active_sessions=hotspot,
         active_queues=queues,
         total_download_bps=int(avg_download_bps),

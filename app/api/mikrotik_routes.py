@@ -41,6 +41,41 @@ def _bytes_to_mb(value: int) -> float:
 # ASYNC WRAPPERS FOR MIKROTIK OPERATIONS
 # =============================================================================
 
+_HEALTH_OPTIONAL_READ_TIMEOUT = 2
+
+
+def _guarded_read(api, router_info: dict, label: str, fn) -> dict:
+    """Run one optional RouterOS read under a short socket timeout.
+
+    Returns ``{"skipped": True}`` instead of raising, so one slow read costs
+    that single number and never the whole health payload.
+    """
+    if not (api.connected and api.sock):
+        return {"success": False, "skipped": True}
+
+    original_timeout = api.sock.gettimeout()
+    try:
+        api.sock.settimeout(_HEALTH_OPTIONAL_READ_TIMEOUT)
+        result = fn()
+        if result.get("success"):
+            return result
+        return {"success": False, "skipped": True}
+    except Exception as exc:
+        logger.warning(
+            "Skipping %s for router %s (%s): %s",
+            label,
+            router_info.get("name", "Unknown"),
+            router_info.get("ip"),
+            exc,
+        )
+        return {"success": False, "skipped": True}
+    finally:
+        try:
+            api.sock.settimeout(original_timeout)
+        except Exception:
+            pass
+
+
 def _run_mikrotik_health_sync(router_info: dict) -> dict:
     """
     Synchronous function to fetch health data from MikroTik.
@@ -87,14 +122,31 @@ def _run_mikrotik_health_sync(router_info: dict) -> dict:
                 except Exception:
                     pass
 
-        # Keep /api/mikrotik/health fast. Live PPPoE session detail can be
-        # slow on old RouterOS builds and has a dedicated drill-down endpoint.
-        # The route below derives the count from the latest bandwidth snapshot.
-        pppoe_active = {"success": True, "data": [], "count": 0, "skipped": True}
+        # Both user counts are READ HERE, on the connection that is already
+        # open, and neither is ever derived from the other.
+        #
+        # This endpoint used to skip the PPPoE read "to keep health fast" and
+        # let the route compute pppoe = active_queues - active_hotspot_users.
+        # That subtraction is what turned a hotspot count into a PPPoE count
+        # the moment any writer disagreed about what active_queues meant:
+        # router 10 showed 0 hotspot / 99 PPPoE with no PPPoE customers at all
+        # (docs/agent-memory/incidents/2026-08-06-hotspot-shown-as-pppoe.md).
+        # Measuring both is the only way that class of bug stays fixed.
+        #
+        # Each read is individually guarded and short-timeout'd, so a slow or
+        # old RouterOS degrades that one number to the snapshot rather than
+        # hanging the tile or losing the rest of the payload.
+        hotspot_hosts = _guarded_read(
+            api, router_info, "hotspot hosts", api.get_hotspot_hosts_minimal
+        )
+        pppoe_active = _guarded_read(
+            api, router_info, "PPPoE actives", api.get_active_pppoe_sessions
+        )
         return {
             "success": True,
             "resources": resources,
             "health": health,
+            "hotspot_hosts": hotspot_hosts,
             "pppoe_active": pppoe_active,
             "router_name": router_info.get("name", "Unknown")
         }
@@ -239,6 +291,68 @@ def _shape_health_response(
     return result
 
 
+def _is_routeros_true(value) -> bool:
+    """RouterOS reports booleans as the strings ``"true"``/``"false"``."""
+    return str(value).strip().lower() == "true"
+
+
+def _count_admitted_hotspot_hosts(hotspot_hosts: dict) -> Optional[int]:
+    """Hotspot devices on the router RIGHT NOW that are allowed through.
+
+    A device holds a ``/ip hotspot host`` entry only while it is present on the
+    hotspot network, and ``authorized``/``bypassed`` separates the customers
+    who paid from the ones sitting on the captive portal. Counted per host, so
+    a device carrying both flags is not counted twice.
+
+    Deliberately NOT ``/ip hotspot active`` (portal logins only — permanently
+    empty wherever customers are admitted by MAC ip-binding) and NOT the number
+    of provisioned queues (a subscriber count: the queue outlives the customer
+    switching their device off).
+
+    Returns None when the read could not be taken, so the caller can fall back
+    to the persisted figure rather than publish a zero.
+    """
+    if not hotspot_hosts.get("success"):
+        return None
+    return sum(
+        1
+        for host in hotspot_hosts.get("data", []) or []
+        if _is_routeros_true(host.get("authorized"))
+        or _is_routeros_true(host.get("bypassed"))
+    )
+
+
+def _count_live_pppoe(pppoe_active: dict) -> Optional[int]:
+    """Live ``/ppp/active`` session count, or None if the read failed."""
+    if not pppoe_active.get("success"):
+        return None
+    return int(pppoe_active.get("count", len(pppoe_active.get("data", []) or [])))
+
+
+def _persisted_hotspot_users(snapshot: Optional[BandwidthSnapshot]) -> int:
+    if snapshot is None:
+        return 0
+    return max(0, int(getattr(snapshot, "active_hotspot_users", 0) or 0))
+
+
+def _persisted_pppoe_users(snapshot: Optional[BandwidthSnapshot]) -> int:
+    """Last persisted PPPoE count.
+
+    Falls back to ``active_queues - active_hotspot_users`` ONLY for rows written
+    before ``active_pppoe_users`` existed, where that subtraction is the only
+    information available. New rows carry the real number.
+    """
+    if snapshot is None:
+        return 0
+    persisted = getattr(snapshot, "active_pppoe_users", None)
+    if persisted is not None:
+        return max(0, int(persisted))
+    return max(
+        0,
+        int(snapshot.active_queues or 0) - _persisted_hotspot_users(snapshot),
+    )
+
+
 def _health_payload_from_snapshot(
     *,
     latest_snapshot: Optional[BandwidthSnapshot],
@@ -247,25 +361,19 @@ def _health_payload_from_snapshot(
     reason: str,
 ) -> dict:
     """Build a contract-compatible health payload from the latest snapshot."""
-    snapshot_active_queues = 0
-    active_hotspot_users = 0
     current_download_mbps = 0.0
     current_upload_mbps = 0.0
     snapshot_age = None
 
     if latest_snapshot:
-        snapshot_active_queues = latest_snapshot.active_queues or 0
-        persisted_hotspot = getattr(latest_snapshot, "active_hotspot_users", None)
-        active_hotspot_users = (
-            max(0, snapshot_active_queues)
-            if persisted_hotspot is None
-            else max(0, int(persisted_hotspot))
-        )
         current_download_mbps = round((latest_snapshot.avg_download_bps or 0) / 1000000, 2)
         current_upload_mbps = round((latest_snapshot.avg_upload_bps or 0) / 1000000, 2)
         snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
 
-    active_pppoe_users = max(0, snapshot_active_queues - active_hotspot_users)
+    # The router was unreachable, so both numbers are as old as the snapshot.
+    # They are read back independently — no subtraction between them.
+    active_hotspot_users = _persisted_hotspot_users(latest_snapshot)
+    active_pppoe_users = _persisted_pppoe_users(latest_snapshot)
     total_active_users = active_hotspot_users + active_pppoe_users
 
     return {
@@ -297,6 +405,8 @@ def _health_payload_from_snapshot(
         "active_hotspot_users": active_hotspot_users,
         "active_pppoe_users": active_pppoe_users,
         "active_total_users": total_active_users,
+        "hotspot_count_live": False,
+        "pppoe_count_live": False,
         "_full_pppoe_sessions": [],
         "bandwidth": {
             "download_mbps": current_download_mbps,
@@ -322,6 +432,7 @@ def _health_payload_from_live_result(
     resources = mikrotik_result.get("resources", {})
     health = mikrotik_result.get("health", {})
     pppoe_active = mikrotik_result.get("pppoe_active", {}) or {}
+    hotspot_hosts = mikrotik_result.get("hotspot_hosts", {}) or {}
 
     if resources.get("error"):
         raise ValueError(resources["error"])
@@ -332,41 +443,37 @@ def _health_payload_from_live_result(
     total_hdd = res_data.get("total_hdd_space", 1)
     free_hdd = res_data.get("free_hdd_space", 0)
 
-    # Active users come from two different clocks:
-    #   * Hotspot count   -> persisted on the snapshot (background job, ~min stale)
-    #   * PPPoE count     -> live from ``/ppp/active/print`` on this very request
-    # We do NOT derive hotspot from ``active_queues - live_pppoe`` anymore: the
-    # combined ``active_queues`` is from time T, while live PPPoE is from now,
-    # so subtraction can flip negative if PPPoE sessions reconnected in between
-    # (that is the "pppoe(16) > total(14)" symptom). Instead we trust the
-    # snapshot's persisted hotspot figure and add the live PPPoE on top, which
-    # always yields a self-consistent total = hotspot + pppoe.
-    snapshot_hotspot_users = 0
+    # Both counts are measured on this request, each from its own source, and
+    # neither is ever inferred from the other or from ``active_queues``. A read
+    # that could not be taken falls back to the last persisted value for THAT
+    # number only — a stale hotspot count never becomes a PPPoE count.
     current_download_mbps = 0.0
     current_upload_mbps = 0.0
     snapshot_age = None
 
     if latest_snapshot:
-        persisted_hotspot = getattr(latest_snapshot, "active_hotspot_users", None)
-        if persisted_hotspot is None:
-            snapshot_hotspot_users = max(0, latest_snapshot.active_queues or 0)
-        else:
-            snapshot_hotspot_users = max(0, int(persisted_hotspot))
         current_download_mbps = round((latest_snapshot.avg_download_bps or 0) / 1000000, 2)
         current_upload_mbps = round((latest_snapshot.avg_upload_bps or 0) / 1000000, 2)
         snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
 
-    active_hotspot_users = snapshot_hotspot_users
-    if pppoe_active.get("skipped") and latest_snapshot:
-        active_pppoe_users = max(0, (latest_snapshot.active_queues or 0) - active_hotspot_users)
+    live_hotspot = _count_admitted_hotspot_hosts(hotspot_hosts)
+    if live_hotspot is None:
+        active_hotspot_users = _persisted_hotspot_users(latest_snapshot)
+        hotspot_is_live = False
     else:
-        active_pppoe_users = (
-            pppoe_active.get("count", len(pppoe_active.get("data", []) or []))
-            if not pppoe_active.get("error")
-            else 0
-        )
+        active_hotspot_users = live_hotspot
+        hotspot_is_live = True
+
+    live_pppoe = _count_live_pppoe(pppoe_active)
+    if live_pppoe is None:
+        active_pppoe_users = _persisted_pppoe_users(latest_snapshot)
+        pppoe_is_live = False
+    else:
+        active_pppoe_users = live_pppoe
+        pppoe_is_live = True
+
     active_pppoe_sessions = (
-        pppoe_active.get("data", []) if not pppoe_active.get("error") else []
+        pppoe_active.get("data", []) if pppoe_active.get("success") else []
     )
     total_active_users = active_hotspot_users + active_pppoe_users
 
@@ -399,6 +506,11 @@ def _health_payload_from_live_result(
         "active_hotspot_users": active_hotspot_users,
         "active_pppoe_users": active_pppoe_users,
         "active_total_users": total_active_users,
+        # Per-number freshness. The tile used to caption PPPoE "live"
+        # unconditionally while showing snapshot data; these let it tell the
+        # truth about each figure independently.
+        "hotspot_count_live": hotspot_is_live,
+        "pppoe_count_live": pppoe_is_live,
         "_full_pppoe_sessions": active_pppoe_sessions,
         "bandwidth": {
             "download_mbps": current_download_mbps,
@@ -1277,8 +1389,10 @@ async def get_bandwidth_history(
             hotspot_download_mb = _bytes_to_mb((getattr(s, "hotspot_download_bytes", 0) or 0) + extra[1])
             pppoe_upload_mb = _bytes_to_mb((getattr(s, "pppoe_upload_bytes", 0) or 0) + extra[2])
             pppoe_download_mb = _bytes_to_mb((getattr(s, "pppoe_download_bytes", 0) or 0) + extra[3])
-            active_hotspot = int(getattr(s, "active_hotspot_users", 0) or 0)
-            active_pppoe = max(0, int(s.active_queues or 0) - active_hotspot)
+            active_hotspot = _persisted_hotspot_users(s)
+            # Real persisted number on new rows; the legacy subtraction only for
+            # rows written before active_pppoe_users existed.
+            active_pppoe = _persisted_pppoe_users(s)
             data.append({
                 "timestamp": s.recorded_at.isoformat(),
                 "routerId": s.router_id,

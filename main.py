@@ -1312,6 +1312,14 @@ async def run_fup_usage_migrations():
                 f"ADD COLUMN IF NOT EXISTS {col_name} BIGINT NOT NULL DEFAULT 0"
             ))
 
+        # Nullable on purpose: NULL distinguishes "written before we measured
+        # PPPoE" (where the legacy subtraction is the only estimate available)
+        # from a genuine zero.
+        await conn.execute(sa_text(
+            "ALTER TABLE bandwidth_snapshots "
+            "ADD COLUMN IF NOT EXISTS active_pppoe_users INTEGER NULL"
+        ))
+
         await conn.execute(sa_text(
             """
             CREATE TABLE IF NOT EXISTS customer_usage_periods (
