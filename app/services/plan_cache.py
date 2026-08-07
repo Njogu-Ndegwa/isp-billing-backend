@@ -100,11 +100,18 @@ def select_portal_plans(
     `visible_plans` must already exclude hidden/expired plans; `all_plans` is the
     include_hidden view, needed because emergency plans are conventionally left
     hidden while things are normal.
+
+    Emergency plans are returned with is_hidden forced False. The captive portal
+    re-filters on is_hidden client-side, so leaving the legacy flag set would
+    make it drop every plan and render an empty portal on exactly the router
+    that is having an outage. Whether an emergency plan shows is decided here,
+    by the router's flag — not by a fleet-wide column.
     """
     if emergency_active:
         now = datetime.utcnow()
         emergency = [
-            p for p in all_plans
+            {**p, "is_hidden": False}
+            for p in all_plans
             if p.get("plan_type") == "emergency" and not _plan_expired(p, now)
         ]
         # Never hand back an empty portal: a router with emergency mode on but no

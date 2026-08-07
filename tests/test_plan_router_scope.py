@@ -168,6 +168,33 @@ async def test_non_emergency_router_is_unaffected_by_emergency_plans():
     assert [p["id"] for p in chosen] == [1, 2]
 
 
+async def test_emergency_plans_are_returned_unhidden():
+    """The captive portal drops any plan with is_hidden set.
+
+    isp-landing-page/script.js filters `if (p.is_hidden) return false` before
+    rendering. Emergency plans are conventionally left hidden while things are
+    normal, so returning them with the flag still set would render an empty
+    portal on exactly the router that is having an outage.
+    """
+    visible = [_plan(1)]
+    all_plans = visible + [_plan(9, "emergency", is_hidden=True)]
+
+    chosen = select_portal_plans(visible, all_plans, emergency_active=True)
+
+    assert [p["id"] for p in chosen] == [9]
+    assert chosen[0]["is_hidden"] is False
+
+
+async def test_selecting_portal_plans_does_not_mutate_cached_plans():
+    """The cache hands out shared dicts — unhiding must not leak into them."""
+    cached_emergency = _plan(9, "emergency", is_hidden=True)
+    all_plans = [_plan(1), cached_emergency]
+
+    select_portal_plans([_plan(1)], all_plans, emergency_active=True)
+
+    assert cached_emergency["is_hidden"] is True
+
+
 async def test_emergency_without_emergency_plans_still_sells():
     """A router must never be left with an empty portal."""
     visible = [_plan(1), _plan(2)]
