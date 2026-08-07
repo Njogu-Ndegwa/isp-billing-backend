@@ -388,37 +388,52 @@ async def list_resellers(
 # ---------------------------------------------------------------------------
 # 1b. GET /api/admin/resellers/stats -- Reseller Stats Over Time
 # ---------------------------------------------------------------------------
+def _shift_months(d: date, months: int) -> date:
+    """Move `d` by whole months, landing on the 1st."""
+    total = (d.year * 12 + (d.month - 1)) + months
+    return date(total // 12, total % 12 + 1, 1)
+
+
 @router.get("/api/admin/resellers/stats")
 async def reseller_stats(
     period: str = Query("30d", regex="^(7d|30d|90d|1y|all)$"),
+    offset: int = Query(0, ge=0, le=36),
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
     """
     Aggregate reseller statistics over time: revenue, M-Pesa revenue,
     and new reseller sign-ups, bucketed by the requested period.
+
+    `offset` pans the window backwards in whole windows -- 1 is the window
+    immediately before the current one -- so the dashboard charts can walk
+    back through history. `all` already spans everything, so it ignores it.
     """
     await _require_admin(token, db)
 
     now = datetime.utcnow()
     today = now.date()
+    if period == "all":
+        offset = 0
 
     if period == "7d":
-        start = today - timedelta(days=6)
+        end = today - timedelta(days=7 * offset)
+        start = end - timedelta(days=6)
         trunc_unit = "day"
     elif period == "30d":
-        start = today - timedelta(days=29)
+        end = today - timedelta(days=30 * offset)
+        start = end - timedelta(days=29)
         trunc_unit = "day"
     elif period == "90d":
-        start = today - timedelta(days=89)
+        end = today - timedelta(days=90 * offset)
+        start = end - timedelta(days=89)
         trunc_unit = "week"
     elif period == "1y":
-        m = today.month - 11
-        y = today.year
-        if m <= 0:
-            m += 12
-            y -= 1
-        start = date(y, m, 1)
+        # Month-aligned rather than 365-day, to keep the monthly buckets whole.
+        anchor = _shift_months(today, -12 * offset)
+        start = _shift_months(anchor, -11)
+        # The live window runs to today; panned windows run to their month end.
+        end = today if offset == 0 else _shift_months(anchor, 1) - timedelta(days=1)
         trunc_unit = "month"
     else:
         earliest_user = (await db.execute(
@@ -430,9 +445,12 @@ async def reseller_stats(
         candidates = [d for d in [earliest_user, earliest_payment] if d]
         start = min(candidates).date() if candidates else today
         start = start.replace(day=1)
+        end = today
         trunc_unit = "month"
 
     start_dt = datetime(start.year, start.month, start.day)
+    # Exclusive upper bound: `end` is the last day that belongs in the window.
+    end_dt = datetime(end.year, end.month, end.day) + timedelta(days=1)
 
     def _make_buckets(trunc, s, end):
         out = []
@@ -462,7 +480,7 @@ async def reseller_stats(
             return d.strftime("%b %Y")
         return f"{d.day} {d.strftime('%b')}"
 
-    buckets = _make_buckets(trunc_unit, start, today)
+    buckets = _make_buckets(trunc_unit, start, end)
 
     rev_stmt = (
         select(
@@ -488,7 +506,8 @@ async def reseller_stats(
                 0,
             ).label("mpesa_revenue"),
         )
-        .where(CustomerPayment.created_at >= start_dt)
+        .where(CustomerPayment.created_at >= start_dt,
+               CustomerPayment.created_at < end_dt)
         .group_by(text("1"))
         .order_by(text("1"))
     )
@@ -500,7 +519,9 @@ async def reseller_stats(
             func.date_trunc(trunc_unit, User.created_at).label("bucket"),
             func.count(User.id).label("cnt"),
         )
-        .where(User.role == UserRole.RESELLER, User.created_at >= start_dt)
+        .where(User.role == UserRole.RESELLER,
+               User.created_at >= start_dt,
+               User.created_at < end_dt)
         .group_by(text("1"))
         .order_by(text("1"))
     )
@@ -530,8 +551,18 @@ async def reseller_stats(
             "date": ds, "label": lbl, "count": cnt,
         })
 
+    if start.year == end.year:
+        window_label = f"{start.strftime('%b %d')} – {end.strftime('%b %d, %Y')}"
+    else:
+        window_label = f"{start.strftime('%b %d, %Y')} – {end.strftime('%b %d, %Y')}"
+
     return {
         "period": period,
+        "offset": offset,
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "window_label": window_label,
+        "max_offset": 0 if period == "all" else 36,
         "revenue_over_time": revenue_over_time,
         "signups_over_time": signups_over_time,
         "totals": {

@@ -63,16 +63,63 @@ def _period_range(period: str) -> tuple[datetime, datetime, datetime, datetime]:
     return cur_start, cur_end, prev_start, prev_end
 
 
-def _days_period_range(period: str) -> tuple[datetime, datetime, datetime, datetime]:
-    """Return ranges for '7d', '30d', '90d', '1y' style periods."""
+PERIOD_DAYS = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
+
+# How far back the dashboard is allowed to pan. 36 windows is three years of
+# monthly views and ~9 months of 30-day views -- past that the charts are
+# reading pre-launch history and the queries stop being cheap.
+MAX_PERIOD_OFFSET = 36
+
+
+def _period_days(period: str) -> int:
+    return PERIOD_DAYS.get(period, 30)
+
+
+def _days_period_range(
+    period: str, offset: int = 0,
+) -> tuple[datetime, datetime, datetime, datetime]:
+    """Return ranges for '7d', '30d', '90d', '1y' style periods.
+
+    ``offset`` walks the whole window backwards in units of itself: 0 is the
+    window ending now, 1 is the window before that, and so on. The comparison
+    window always sits immediately before the one being returned, so the
+    dashboard's "compare" overlay keeps meaning "vs the period before this
+    one" no matter how far back the user has panned.
+    """
     now = datetime.utcnow()
-    days_map = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
-    days = days_map.get(period, 30)
-    cur_start = now - timedelta(days=days)
-    cur_end = now
-    prev_start = cur_start - timedelta(days=days)
+    days = _period_days(period)
+    shift = timedelta(days=days * max(offset, 0))
+    cur_end = now - shift
+    cur_start = cur_end - timedelta(days=days)
     prev_end = cur_start
+    prev_start = cur_start - timedelta(days=days)
     return cur_start, cur_end, prev_start, prev_end
+
+
+def _window_meta(
+    period: str, offset: int, cur_start: datetime, cur_end: datetime,
+) -> dict[str, Any]:
+    """Describe the window a panned response actually covers.
+
+    The dashboard cannot label a panned chart from `period` alone -- "30d" says
+    nothing about *which* 30 days -- so every offsettable response carries its
+    resolved bounds. `end` is inclusive (the last day with data in the window)
+    because that is what a human reads off the axis.
+    """
+    start_d = cur_start.date()
+    end_d = (cur_end - timedelta(microseconds=1)).date()
+    if start_d.year == end_d.year:
+        label = f"{start_d.strftime('%b %d')} – {end_d.strftime('%b %d, %Y')}"
+    else:
+        label = f"{start_d.strftime('%b %d, %Y')} – {end_d.strftime('%b %d, %Y')}"
+    return {
+        "offset": offset,
+        "window_start": start_d.isoformat(),
+        "window_end": end_d.isoformat(),
+        "window_label": label,
+        "period_days": _period_days(period),
+        "max_offset": MAX_PERIOD_OFFSET,
+    }
 
 
 def _pct_change(current: float, previous: float) -> float:
@@ -620,9 +667,9 @@ async def compute_dashboard_v2_extras(db: AsyncSession) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def compute_customer_signups_timeseries(
-    db: AsyncSession, period: str = "30d",
+    db: AsyncSession, period: str = "30d", offset: int = 0,
 ) -> dict[str, Any]:
-    cur_start, cur_end, prev_start, prev_end = _days_period_range(period)
+    cur_start, cur_end, prev_start, prev_end = _days_period_range(period, offset)
 
     async def _series(start: datetime, end: datetime):
         rows = (await db.execute(
@@ -641,6 +688,7 @@ async def compute_customer_signups_timeseries(
 
     return {
         "period": period,
+        **_window_meta(period, offset, cur_start, cur_end),
         "customer_signups_over_time": await _series(cur_start, cur_end),
         "previous_period": await _series(prev_start, prev_end),
     }
@@ -651,9 +699,9 @@ async def compute_customer_signups_timeseries(
 # ---------------------------------------------------------------------------
 
 async def compute_subscription_revenue_history(
-    db: AsyncSession, period: str = "30d",
+    db: AsyncSession, period: str = "30d", offset: int = 0,
 ) -> dict[str, Any]:
-    cur_start, cur_end, prev_start, prev_end = _days_period_range(period)
+    cur_start, cur_end, prev_start, prev_end = _days_period_range(period, offset)
     granularity = _subscription_revenue_granularity(period)
 
     async def _series(start: datetime, end: datetime):
@@ -701,6 +749,7 @@ async def compute_subscription_revenue_history(
 
     return {
         "period": period,
+        **_window_meta(period, offset, cur_start, cur_end),
         "granularity": granularity,
         "total_revenue": total_revenue,
         "previous_total_revenue": previous_total_revenue,
