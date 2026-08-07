@@ -243,6 +243,12 @@ class Plan(Base):
     fup_throttle_profile = Column(String(100), nullable=True)
     # Total customers/devices allowed on one paid subscription. 1 = no sharing.
     max_shared_users = Column(Integer, nullable=False, default=1, server_default="1")
+    # Routers this plan is offered on, e.g. [12, 47]. NULL means "every router the
+    # owner has" — that is the pre-existing behaviour and stays the default, so no
+    # existing plan changes when this column is added. An empty list is normalised
+    # back to NULL on write and read as "all routers": a plan must never silently
+    # vanish from every portal and stop earning. See app/services/plan_cache.py.
+    router_ids = Column(JSON, nullable=True)
 
 class Payment(Base):
     __tablename__ = "payments"

@@ -2,13 +2,18 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update, case
 from pydantic import BaseModel
-from typing import Optional
+from typing import List, Optional
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
 from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router, FupAction
 from app.services.auth import verify_token, get_current_user
-from app.services.plan_cache import get_plans_cached, invalidate_plan_cache
+from app.services.plan_cache import (
+    get_plans_cached,
+    invalidate_plan_cache,
+    normalize_router_ids,
+    plan_allows_router,
+)
 from app.services.subscription import enforce_active_subscription
 import logging
 
@@ -68,6 +73,45 @@ def _serialize_plan_sharing(plan: Plan) -> dict:
     }
 
 
+def _serialize_plan_routers(plan: Plan) -> dict:
+    router_ids = normalize_router_ids(getattr(plan, "router_ids", None))
+    return {
+        "router_ids": router_ids,
+        "all_routers": router_ids is None,
+    }
+
+
+async def _validate_router_scope(
+    db: AsyncSession,
+    user_id: int,
+    router_ids,
+) -> Optional[List[int]]:
+    """Validate a requested per-router plan scope and return it normalised.
+
+    None/[] both mean "every router this reseller owns" — the default. Anything
+    else must reference routers the caller actually owns, otherwise a typo would
+    silently hide the plan from the whole fleet.
+    """
+    normalized = normalize_router_ids(router_ids)
+    if normalized is None:
+        return None
+
+    owned_result = await db.execute(
+        select(Router.id).where(Router.user_id == user_id, Router.id.in_(normalized))
+    )
+    owned = {row[0] for row in owned_result}
+    unknown = [rid for rid in normalized if rid not in owned]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unknown router(s) for this account: "
+                f"{', '.join(str(r) for r in unknown)}"
+            ),
+        )
+    return normalized
+
+
 class PlanCreateRequest(BaseModel):
     name: str
     speed: str
@@ -85,6 +129,8 @@ class PlanCreateRequest(BaseModel):
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
     max_shared_users: Optional[int] = 1
+    # Omit or send null/[] to offer the plan on every router the reseller owns.
+    router_ids: Optional[List[int]] = None
 
 
 class PlanUpdateRequest(BaseModel):
@@ -104,6 +150,9 @@ class PlanUpdateRequest(BaseModel):
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
     max_shared_users: Optional[int] = None
+    # Send null/[] to revert the plan to "all routers". Only applied when the
+    # field is actually present in the request body.
+    router_ids: Optional[List[int]] = None
 
 
 @router.post("/api/plans/create")
@@ -173,6 +222,7 @@ async def create_plan_api(
         if request.data_cap_mb is not None and request.data_cap_mb < 0:
             raise HTTPException(status_code=400, detail="data_cap_mb cannot be negative")
         max_shared_users = _validate_max_shared_users(request.max_shared_users)
+        scoped_router_ids = await _validate_router_scope(db, user.id, request.router_ids)
 
         plan = Plan(
             name=request.name,
@@ -192,8 +242,9 @@ async def create_plan_api(
             fup_action=fup_action_enum,
             fup_throttle_profile=request.fup_throttle_profile,
             max_shared_users=max_shared_users,
+            router_ids=scoped_router_ids,
         )
-        
+
         db.add(plan)
         await db.commit()
         await db.refresh(plan)
@@ -220,6 +271,7 @@ async def create_plan_api(
             "created_at": plan.created_at.isoformat(),
             **_serialize_plan_fup(plan),
             **_serialize_plan_sharing(plan),
+            **_serialize_plan_routers(plan),
         }
     except HTTPException:
         raise
@@ -243,6 +295,50 @@ async def get_plans_api(
     except Exception as e:
         logger.error(f"Error fetching plans: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch plans")
+
+
+@router.get("/api/plans/by-router/{router_id}")
+async def get_plans_for_router_api(
+    router_id: int,
+    connection_type: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """Plans offered on one of the caller's routers, including hidden ones.
+
+    Backs the "Plans on this router" panel on the Routers page. Includes both
+    plans scoped to this router and fleet-wide plans, flagged so the UI can tell
+    them apart.
+    """
+    try:
+        user = await get_current_user(token, db)
+
+        router_result = await db.execute(
+            select(Router).where(Router.id == router_id, Router.user_id == user.id)
+        )
+        router_obj = router_result.scalar_one_or_none()
+        if not router_obj:
+            raise HTTPException(status_code=404, detail="Router not found or does not belong to you")
+
+        all_plans = await get_plans_cached(db, user.id, connection_type, include_hidden=True)
+        offered = [p for p in all_plans if plan_allows_router(p, router_id)]
+
+        return {
+            "router_id": router_id,
+            "router_name": router_obj.name,
+            "emergency_active": bool(router_obj.emergency_active),
+            "plans": [
+                {**p, "scoped_to_this_router": p.get("router_ids") is not None}
+                for p in offered
+            ],
+            "total_plans": len(all_plans),
+            "offered_here": len(offered),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching plans for router {router_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch plans for router")
 
 
 @router.put("/api/plans/{plan_id}")
@@ -316,6 +412,8 @@ async def update_plan_api(
             plan.fup_throttle_profile = request.fup_throttle_profile if request.fup_throttle_profile else None
         if request.max_shared_users is not None:
             plan.max_shared_users = _validate_max_shared_users(request.max_shared_users)
+        if "router_ids" in fields_set:
+            plan.router_ids = await _validate_router_scope(db, user.id, request.router_ids)
 
         await db.commit()
         await db.refresh(plan)
@@ -339,6 +437,7 @@ async def update_plan_api(
             "valid_until": plan.valid_until.isoformat() if plan.valid_until else None,
             **_serialize_plan_fup(plan),
             **_serialize_plan_sharing(plan),
+            **_serialize_plan_routers(plan),
         }
     except HTTPException:
         raise
@@ -524,8 +623,12 @@ async def activate_emergency_mode(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Activate emergency mode on a specific router: persist the flag and message,
-    then hide all REGULAR plans and show all EMERGENCY plans for this user."""
+    """Activate emergency mode on a specific router.
+
+    Only this router's flag is written. Which plans the portal then offers is
+    decided per router at read time (see select_portal_plans), so turning
+    emergency on here no longer changes what the reseller's other routers show.
+    """
     try:
         user = await get_current_user(token, db)
         enforce_active_subscription(user)
@@ -539,29 +642,31 @@ async def activate_emergency_mode(
         router_obj.emergency_active = True
         router_obj.emergency_message = request.message
 
-        hidden_result = await db.execute(
-            update(Plan)
-            .where(Plan.user_id == user.id, Plan.plan_type == PlanType.REGULAR)
-            .values(is_hidden=True)
-        )
-        shown_result = await db.execute(
-            update(Plan)
-            .where(Plan.user_id == user.id, Plan.plan_type == PlanType.EMERGENCY)
-            .values(is_hidden=False)
+        emergency_available = await db.scalar(
+            select(func.count(Plan.id)).where(
+                Plan.user_id == user.id,
+                Plan.plan_type == PlanType.EMERGENCY,
+            )
         )
 
         await db.commit()
         await invalidate_plan_cache()
 
-        logger.info(f"Emergency mode activated on router {request.router_id} by user {user.id}: {hidden_result.rowcount} regular hidden, {shown_result.rowcount} emergency shown")
+        logger.info(
+            f"Emergency mode activated on router {request.router_id} by user {user.id}: "
+            f"{emergency_available} emergency plan(s) available for this router"
+        )
 
         return {
             "success": True,
             "message": "Emergency mode activated",
             "router_id": request.router_id,
             "emergency_message": request.message,
-            "regular_plans_hidden": hidden_result.rowcount,
-            "emergency_plans_shown": shown_result.rowcount,
+            "emergency_plans_available": emergency_available or 0,
+            # Kept for existing dashboard clients. Emergency mode no longer edits
+            # plan rows, so nothing is hidden fleet-wide any more.
+            "regular_plans_hidden": 0,
+            "emergency_plans_shown": emergency_available or 0,
         }
     except HTTPException:
         raise
@@ -577,8 +682,16 @@ async def deactivate_emergency_mode(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Deactivate emergency mode on a specific router: clear the flag and message,
-    then show all REGULAR plans and hide all EMERGENCY plans for this user."""
+    """Deactivate emergency mode on a specific router.
+
+    Clears this router's flag only. It also repairs the one side effect the old
+    fleet-wide implementation left behind: that version hid EVERY regular plan
+    when emergency was switched on anywhere, so a reseller who was mid-emergency
+    at upgrade time would otherwise be left with an empty portal on their other
+    routers. The repair is deliberately narrow — it runs only when every regular
+    plan is hidden (the signature of the old mass update) and no other router is
+    still in emergency mode, so a plan the reseller hid by hand stays hidden.
+    """
     try:
         user = await get_current_user(token, db)
         enforce_active_subscription(user)
@@ -592,28 +705,51 @@ async def deactivate_emergency_mode(
         router_obj.emergency_active = False
         router_obj.emergency_message = None
 
-        shown_result = await db.execute(
-            update(Plan)
-            .where(Plan.user_id == user.id, Plan.plan_type == PlanType.REGULAR)
-            .values(is_hidden=False)
+        still_in_emergency = await db.scalar(
+            select(func.count(Router.id)).where(
+                Router.user_id == user.id,
+                Router.id != request.router_id,
+                Router.emergency_active == True,
+            )
         )
-        hidden_result = await db.execute(
-            update(Plan)
-            .where(Plan.user_id == user.id, Plan.plan_type == PlanType.EMERGENCY)
-            .values(is_hidden=True)
+        regular_total = await db.scalar(
+            select(func.count(Plan.id)).where(
+                Plan.user_id == user.id, Plan.plan_type == PlanType.REGULAR
+            )
         )
+        regular_hidden = await db.scalar(
+            select(func.count(Plan.id)).where(
+                Plan.user_id == user.id,
+                Plan.plan_type == PlanType.REGULAR,
+                Plan.is_hidden == True,
+            )
+        )
+
+        restored = 0
+        if not still_in_emergency and regular_total and regular_hidden == regular_total:
+            restore_result = await db.execute(
+                update(Plan)
+                .where(Plan.user_id == user.id, Plan.plan_type == PlanType.REGULAR)
+                .values(is_hidden=False)
+            )
+            restored = restore_result.rowcount
 
         await db.commit()
         await invalidate_plan_cache()
 
-        logger.info(f"Emergency mode deactivated on router {request.router_id} by user {user.id}: {shown_result.rowcount} regular shown, {hidden_result.rowcount} emergency hidden")
+        logger.info(
+            f"Emergency mode deactivated on router {request.router_id} by user {user.id}: "
+            f"{restored} regular plan(s) un-hidden by legacy repair"
+        )
 
         return {
             "success": True,
             "message": "Emergency mode deactivated. Regular plans restored.",
             "router_id": request.router_id,
-            "regular_plans_shown": shown_result.rowcount,
-            "emergency_plans_hidden": hidden_result.rowcount,
+            "regular_plans_shown": restored,
+            # Emergency plans are now excluded per router at read time instead of
+            # being hidden fleet-wide, so nothing is written here.
+            "emergency_plans_hidden": 0,
         }
     except HTTPException:
         raise

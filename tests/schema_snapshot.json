@@ -446,6 +446,7 @@
   "original_price",
   "plan_type",
   "price",
+  "router_ids",
   "router_profile",
   "speed",
   "user_id",

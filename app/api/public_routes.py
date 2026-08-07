@@ -14,7 +14,7 @@ from app.db.models import (
 )
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
-from app.services.plan_cache import get_plans_cached
+from app.services.plan_cache import get_plans_cached, select_portal_plans
 from app.config import settings
 
 import logging
@@ -745,13 +745,20 @@ async def get_portal_data(
 
     router_obj, reseller = row
 
-    plans = await get_plans_cached(db, router_obj.user_id, connection_type)
+    # Both views are scoped to this router: a plan tied to other routers must not
+    # appear here, and must not drive this router's plan flags either.
+    visible_plans = await get_plans_cached(
+        db, router_obj.user_id, connection_type, router_id=router_obj.id
+    )
     all_plans_for_flags = await get_plans_cached(
         db,
         router_obj.user_id,
         connection_type,
         include_hidden=True,
+        router_id=router_obj.id,
     )
+    emergency_active = bool(getattr(router_obj, "emergency_active", False))
+    plans = select_portal_plans(visible_plans, all_plans_for_flags, emergency_active)
     ads_data = await _fetch_active_ads(db)
     portal_settings_result = await db.execute(
         select(PortalSettings).where(PortalSettings.user_id == router_obj.user_id)
@@ -789,7 +796,7 @@ async def get_portal_data(
         "plan_flags": {
             "has_emergency_plans": has_emergency,
             "has_special_offers": has_special,
-            "emergency_mode_active": getattr(router_obj, 'emergency_active', False),
+            "emergency_mode_active": emergency_active,
             "emergency_message": getattr(router_obj, 'emergency_message', None),
             "sharing_enabled": bool(shareable_plans),
             "max_shared_users": max_shared_users,
@@ -1422,13 +1429,21 @@ async def get_public_plans(
     """
     Get available plans for a specific router (public, no auth required).
     Used by the captive portal to show plans to guests before they pay.
-    Only returns plans belonging to the router's owner.
+    Only returns the owner's plans that are offered on this specific router.
     """
     router_obj = await get_router_by_id(db, router_id)
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
-    return await get_plans_cached(db, router_obj.user_id, connection_type)
+    visible_plans = await get_plans_cached(
+        db, router_obj.user_id, connection_type, router_id=router_obj.id
+    )
+    all_plans = await get_plans_cached(
+        db, router_obj.user_id, connection_type, include_hidden=True, router_id=router_obj.id
+    )
+    return select_portal_plans(
+        visible_plans, all_plans, bool(getattr(router_obj, "emergency_active", False))
+    )
 
 
 @router.get("/api/public/ads")

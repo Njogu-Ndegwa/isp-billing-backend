@@ -965,6 +965,25 @@ async def run_subscription_sharing_migrations():
 
 
 # ============================================================================
+# Per-Router Plan Scoping Migration (runs on startup, idempotent)
+# ============================================================================
+async def run_plan_router_scope_migrations():
+    """Add plans.router_ids so a plan can be tied to specific routers.
+
+    Mirrors migrations/add_plan_router_scope.py. Nullable with no default: every
+    existing plan keeps router_ids = NULL, which every read path treats as
+    "offered on all of the owner's routers" — i.e. exactly today's behaviour.
+    """
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE plans
+            ADD COLUMN IF NOT EXISTS router_ids JSON NULL
+        """))
+
+    logger.info("Migration: plans.router_ids ready (NULL = plan offered on all routers)")
+
+
+# ============================================================================
 # B2B Payout Migrations (runs on startup, idempotent)
 # ============================================================================
 async def run_b2b_migrations():
@@ -2188,6 +2207,12 @@ async def startup_event():
         logger.info("Subscription sharing migrations completed successfully")
     except Exception as e:
         logger.error(f"Subscription sharing migration failed (non-fatal): {e}")
+
+    try:
+        await run_plan_router_scope_migrations()
+        logger.info("Plan router scope migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Plan router scope migration failed (non-fatal): {e}")
 
     try:
         await run_b2b_migrations()

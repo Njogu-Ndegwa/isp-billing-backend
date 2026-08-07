@@ -53,6 +53,7 @@ from app.services.radius_service import (
     parse_speed_to_radius_format
 )
 from app.services.mikrotik_api import normalize_mac_address
+from app.services.plan_cache import plan_model_allows_router
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +278,16 @@ async def radius_register_and_pay(
         plan = plan_result.scalar_one_or_none()
         if not plan:
             raise HTTPException(status_code=404, detail="Plan not found")
+        if user_id and plan.user_id != user_id:
+            raise HTTPException(status_code=400, detail="Selected plan does not belong to this router")
+        if not plan_model_allows_router(plan, request.router_id):
+            logger.warning(
+                "[RADIUS PAY] Rejected plan %s scoped to routers %s for router %s",
+                plan.id,
+                plan.router_ids,
+                request.router_id,
+            )
+            raise HTTPException(status_code=400, detail="Selected plan is not available on this router")
 
         # Validate phone number
         if not request.phone or len(request.phone.strip()) < 10:
