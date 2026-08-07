@@ -11,6 +11,7 @@ from app.services.subscription import enforce_active_subscription
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.router_helpers import get_router_by_id
 from app.services.router_availability import record_router_availability
+from app.core.local_time import resolve_usage_window
 from app.config import settings
 import logging
 import asyncio
@@ -1191,22 +1192,53 @@ async def get_mikrotik_active_sessions(
 @router.get("/api/mikrotik/bandwidth-history")
 async def get_bandwidth_history(
     hours: int = 24,
+    days: Optional[int] = None,
+    preset: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     router_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
     """
-    Get historical bandwidth data for graphing. Default last 24 hours.
-    
-    Query params:
-    - hours: Number of hours of history (default 24)
+    Get historical bandwidth data for graphing.
+
+    Query params (priority: start_date/end_date > preset > days > hours):
+    - start_date / end_date: YYYY-MM-DD, inclusive, local (EAT) calendar dates
+    - preset: today | yesterday | this_month, on the local calendar
+    - days: Local calendar days back, today included (1..30)
+    - hours: Rolling "now minus N hours" window (legacy default, 24)
     - router_id: Optional router ID to filter bandwidth history for a specific router
+
+    Calendar windows start at local midnight, so "today" means 00:00 EAT until
+    now instead of a rolling 24h window that bleeds into yesterday evening.
+    Callers that pass only ``hours`` keep the old rolling behaviour.
     """
     try:
         user = await get_current_user(token, db)
-        hours = max(1, min(int(hours or 24), 24 * 30))
-        since = datetime.utcnow() - timedelta(hours=hours)
-        
+        try:
+            window = resolve_usage_window(
+                hours=hours,
+                days=days,
+                preset=preset,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        since = window["start"]
+        until = window["end"]
+        # Only calendar windows get an upper bound. The rolling window ends at
+        # "now", and rows dated a little ahead of it are legitimate — a tail
+        # ledger bucket written after the last health snapshot, or mild clock
+        # skew — so bounding it there would drop usage the old query showed.
+        snapshot_bounds = [BandwidthSnapshot.recorded_at >= since]
+        bucket_bounds = [RouterUsageBucket.bucket_start >= since]
+        if window["mode"] == "calendar":
+            snapshot_bounds.append(BandwidthSnapshot.recorded_at < until)
+            bucket_bounds.append(RouterUsageBucket.bucket_start < until)
+
         router_name = None
         if router_id:
             router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
@@ -1214,25 +1246,25 @@ async def get_bandwidth_history(
                 raise HTTPException(status_code=404, detail="Router not found or not accessible")
             router_name = router_obj.name
             query = select(BandwidthSnapshot).where(
-                BandwidthSnapshot.recorded_at >= since,
+                *snapshot_bounds,
                 BandwidthSnapshot.router_id == router_id
             )
             bucket_query = select(RouterUsageBucket).where(
-                RouterUsageBucket.bucket_start >= since,
+                *bucket_bounds,
                 RouterUsageBucket.router_id == router_id
             )
         else:
             if user.role.value == "admin":
-                query = select(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at >= since)
-                bucket_query = select(RouterUsageBucket).where(RouterUsageBucket.bucket_start >= since)
+                query = select(BandwidthSnapshot).where(*snapshot_bounds)
+                bucket_query = select(RouterUsageBucket).where(*bucket_bounds)
             else:
                 owned_router_ids = select(Router.id).where(Router.user_id == user.id)
                 query = select(BandwidthSnapshot).where(
-                    BandwidthSnapshot.recorded_at >= since,
+                    *snapshot_bounds,
                     BandwidthSnapshot.router_id.in_(owned_router_ids)
                 )
                 bucket_query = select(RouterUsageBucket).where(
-                    RouterUsageBucket.bucket_start >= since,
+                    *bucket_bounds,
                     RouterUsageBucket.router_id.in_(owned_router_ids)
                 )
 
@@ -1341,7 +1373,14 @@ async def get_bandwidth_history(
             "router_name": router_name,
             "history": data,
             "count": len(data),
-            "periodHours": hours,
+            "periodHours": window["hours"],
+            "periodMode": window["mode"],
+            "periodLabel": window["label"],
+            "periodDays": window["days"],
+            "periodStart": since.isoformat(),
+            "periodEnd": until.isoformat(),
+            "periodTruncated": window["truncated"],
+            "timezoneOffsetHours": settings.LOCAL_UTC_OFFSET_HOURS,
             "generatedAt": datetime.utcnow().isoformat()
         }
     except HTTPException:
