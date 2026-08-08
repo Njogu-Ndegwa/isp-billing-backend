@@ -361,3 +361,110 @@ async def test_any_router_scoped_payout_blocks_an_unscoped_call(db):
     await add_pending_txn(db, reseller, site.id)
 
     assert await has_unresolved_b2b(db, reseller.id) is True
+
+
+# ---------------------------------------------------------------------------
+# A reseller-level payout must not leave router buckets looking unpaid
+# ---------------------------------------------------------------------------
+
+async def test_manual_withdrawal_then_earnings_does_not_overpay(db):
+    """The double-pay hole: a withdrawal drains the DEFAULT bucket negative.
+
+    Hitting Withdraw pays the whole balance as one reseller-level payout, so
+    the settlement lands entirely in the None bucket and pushes it negative
+    while the router buckets still look unpaid. If the planner then treats
+    buckets independently it proposes far more than the reseller is owed.
+    """
+    reseller = await make_reseller(db)
+    till_a = await make_method(db, reseller, "Till A", "1111111")
+    till_b = await make_method(db, reseller, "Till B", "2222222")
+    site_a = await make_router(db, reseller, payment_method_id=till_a.id)
+    site_b = await make_router(db, reseller, payment_method_id=till_b.id)
+
+    await add_payment(db, reseller, 900, None)
+    await add_payment(db, reseller, 500, site_a.id)
+    await add_payment(db, reseller, 300, site_b.id)
+
+    # Reseller hits Withdraw: one reseller-level payout of the whole balance.
+    await add_payout(db, reseller, 1700, None)
+    # Then earns a little more on router A during the same day.
+    await add_payment(db, reseller, 100, site_a.id)
+
+    total = await get_unpaid_balance(db, reseller.id)
+    assert total == 100
+
+    plan = await resolve_router_payout_plan(db, reseller.id)
+    proposed = sum(bal for _, _, bal in (plan or []))
+
+    assert proposed <= total, (
+        f"planner proposed {proposed} but reseller is only owed {total} — overpayment"
+    )
+
+
+async def test_negative_default_bucket_is_netted_off_router_buckets(db):
+    """Money already advanced against one bucket reduces what the others can draw."""
+    reseller = await make_reseller(db)
+    till_a = await make_method(db, reseller, "Till A", "1111111")
+    till_b = await make_method(db, reseller, "Till B", "2222222")
+    site_a = await make_router(db, reseller, payment_method_id=till_a.id)
+    site_b = await make_router(db, reseller, payment_method_id=till_b.id)
+
+    await add_payment(db, reseller, 500, site_a.id)
+    await add_payment(db, reseller, 300, site_b.id)
+    await add_payout(db, reseller, 600, None)   # advanced against the default bucket
+
+    total = await get_unpaid_balance(db, reseller.id)
+    assert total == 200
+
+    plan = await resolve_router_payout_plan(db, reseller.id)
+    proposed = sum(bal for _, _, bal in (plan or []))
+    assert proposed <= total
+
+
+async def test_plan_never_exceeds_balance_across_many_ledger_shapes(db):
+    """Property sweep: whatever the ledger looks like, never propose too much.
+
+    Walks combinations of attributed/unattributed revenue and reseller-level
+    versus router-level payouts, including the shapes produced by manual
+    withdrawals, refunds and corrections. The single rule that must hold in
+    every one: the payout plan cannot exceed what the reseller is actually owed.
+    """
+    shapes = [
+        # (revenue by bucket, payouts by bucket)
+        ({None: 900, "a": 500, "b": 300}, {None: 1700}),
+        ({None: 900, "a": 500, "b": 300}, {None: 900}),
+        ({None: 0, "a": 500, "b": 300}, {None: 700}),
+        ({None: 100, "a": 500, "b": 300}, {"a": 500}),
+        ({None: 100, "a": 500, "b": 300}, {None: 50, "a": 200, "b": 100}),
+        ({None: 50, "a": 40, "b": 30}, {None: 100}),
+        ({None: 1000, "a": 25, "b": 25}, {None: 1000}),
+        ({None: 0, "a": 1000, "b": 0}, {None: 900}),
+        ({None: 500, "a": 0, "b": 0}, {"a": 200}),
+    ]
+
+    for index, (revenue, payouts) in enumerate(shapes):
+        reseller = await make_reseller(db)
+        till_a = await make_method(db, reseller, f"A{index}", f"11111{index}")
+        till_b = await make_method(db, reseller, f"B{index}", f"22222{index}")
+        site_a = await make_router(db, reseller, payment_method_id=till_a.id)
+        site_b = await make_router(db, reseller, payment_method_id=till_b.id)
+        key_map = {None: None, "a": site_a.id, "b": site_b.id}
+
+        for key, amount in revenue.items():
+            if amount:
+                await add_payment(db, reseller, amount, key_map[key])
+        for key, amount in payouts.items():
+            if amount:
+                await add_payout(db, reseller, amount, key_map[key])
+
+        total = await get_unpaid_balance(db, reseller.id)
+        plan = await resolve_router_payout_plan(db, reseller.id)
+        proposed = round(sum(bal for _, _, bal in (plan or [])), 2)
+
+        assert proposed <= max(total, 0) + 0.01, (
+            f"shape {index}: proposed {proposed} > owed {total} "
+            f"(revenue={revenue}, payouts={payouts})"
+        )
+        assert all(bal >= MIN_SPLIT_PAYOUT for _, _, bal in (plan or [])), (
+            f"shape {index}: a leg fell below the minimum payout"
+        )

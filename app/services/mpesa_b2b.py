@@ -1377,7 +1377,28 @@ async def resolve_router_payout_plan(db: AsyncSession, reseller_id: int) -> Opti
         return None
 
     balances = await get_unpaid_balance_by_router(db, reseller_id)
+    total_balance = await get_unpaid_balance(db, reseller_id)
     default_method = await resolve_b2b_payment_method(db, reseller_id)
+
+    # A negative bucket is money already advanced against it — most often a
+    # manual Withdraw, which settles the WHOLE balance as one reseller-level
+    # payout and so drives the default bucket negative while the router buckets
+    # still read as unpaid. Paying those buckets at face value would send the
+    # same money twice, so the advance is absorbed across the positive buckets
+    # first. Conservation guarantees the positives then sum to the true total.
+    deficit = -sum(value for value in balances.values() if value < 0)
+    positives = {key: value for key, value in balances.items() if value > 0}
+    positive_total = sum(positives.values())
+
+    if deficit > 0:
+        if deficit >= positive_total:
+            # Already paid at least everything owed; nothing left to send.
+            return None
+        for key in list(positives):
+            share = positives[key] / positive_total
+            positives[key] = round(positives[key] - deficit * share, 2)
+
+    balances = positives
 
     plan = []
     for key, balance in balances.items():
@@ -1399,6 +1420,25 @@ async def resolve_router_payout_plan(db: AsyncSession, reseller_id: int) -> Opti
     if not plan:
         return None
     plan.sort(key=lambda item: item[2], reverse=True)
+
+    # Backstop. The netting above should already guarantee this, but a split
+    # payout must NEVER be able to send more than the reseller is owed, so the
+    # invariant is enforced rather than assumed: trim from the smallest leg up
+    # until the plan fits, dropping legs that no longer clear the minimum.
+    while plan and round(sum(item[2] for item in plan), 2) > total_balance:
+        overshoot = round(sum(item[2] for item in plan) - total_balance, 2)
+        router_key, method, amount = plan[-1]
+        if amount - overshoot >= MIN_SPLIT_PAYOUT:
+            plan[-1] = (router_key, method, round(amount - overshoot, 2))
+            break
+        plan.pop()
+
+    if not plan:
+        return None
+    logger.info(
+        "Payout plan for reseller %s: %s leg(s) totalling %s of %s owed",
+        reseller_id, len(plan), round(sum(i[2] for i in plan), 2), total_balance,
+    )
     return plan
 
 
