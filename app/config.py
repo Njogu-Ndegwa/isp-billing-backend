@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     # ~43x tighter than the wedge this guards against. See incident note.
     DB_IDLE_TX_TIMEOUT_MS: int = 60000
     DB_LOCK_TIMEOUT_MS: int = 5000
+    # Local billing calendar offset from UTC. Everything is stored in UTC, but
+    # "today" on a dashboard means the local calendar day (00:00 EAT -> now),
+    # not a rolling 24h window. Kenya/EAT = UTC+3 and has no DST.
+    LOCAL_UTC_OFFSET_HOURS: int = 3
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440

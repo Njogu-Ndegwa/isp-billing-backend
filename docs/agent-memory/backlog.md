@@ -174,3 +174,21 @@ Project-level items that should survive across agent sessions.
 - Unknown: real prod row counts were not checked (agent SSH to prod is blocked by the
   auto-mode classifier). `SELECT count(*) FROM customer_payments;` decides whether this
   is urgent or cosmetic. Under ~50k rows it is cosmetic.
+
+### Dashboard "Today" Means UTC Midnight Everywhere Except Usage
+
+- Status: planned (usage half is done)
+- Problem: usage/bandwidth history now cuts its windows at local midnight
+  (`app/core/local_time.py`, `LOCAL_UTC_OFFSET_HOURS=3`), so "Today" on the usage
+  chart is 00:00 EAT → now. Every other dated dashboard filter still builds its
+  day from `datetime.utcnow()` — `/api/dashboard/analytics` presets
+  (`today`, `yesterday`, `this_week`, `this_month`, ...) and the `start_date` /
+  `end_date` branches in `dashboard_routes.py`, plus `/admin/resellers/stats` and
+  the `admin_metrics` period helpers. Those days start at 03:00 EAT.
+- Why it matters: two cards on the same screen can disagree about what "today" is.
+  Revenue booked between 00:00 and 03:00 EAT lands on the previous day's bar, which
+  also shifts daily revenue totals and any reseller commission read off them.
+- Proposed next step: reuse `resolve_usage_window` / `local_midnight_utc` in
+  `dashboard_routes.py` and `app/services/admin_metrics.py`. Do it as its own change,
+  not bundled: it moves money into different day buckets, so historical daily revenue
+  numbers will shift by up to 3h of payments and Dennis should sign off first.
