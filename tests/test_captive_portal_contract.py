@@ -484,3 +484,114 @@ async def test_plan_scoped_to_a_deleted_router_reverts_to_fleet_wide(db):
     _, rendered = await portal_for(db, site)
 
     assert ids(rendered) == [plan.id]
+
+
+# ---------------------------------------------------------------------------
+# The portal must be indifferent to payout configuration
+# ---------------------------------------------------------------------------
+
+async def test_portal_is_unaffected_by_per_router_payout_setup(db):
+    """Payout wiring must never change what a customer is offered.
+
+    Plans and payout destinations are independent axes. A reseller splitting
+    their payouts across two tills, or leaving one router unassigned, must not
+    alter a single plan on any portal — otherwise a billing settings change
+    silently becomes a customer-facing change.
+    """
+    from app.db.models import ResellerPaymentMethod, ResellerPaymentMethodType
+
+    reseller = await make_reseller(db)
+    site_a = await make_site(db, reseller, "payout-portal-a")
+    site_b = await make_site(db, reseller, "payout-portal-b")
+    plan = await make_plan(db, reseller, name="Daily", price=100)
+
+    _, before_a = await portal_for(db, site_a)
+    _, before_b = await portal_for(db, site_b)
+
+    till_a = ResellerPaymentMethod(
+        user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_TILL,
+        label="Till A", mpesa_till_number="1111111", is_active=True,
+    )
+    till_b = ResellerPaymentMethod(
+        user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_TILL,
+        label="Till B", mpesa_till_number="2222222", is_active=True,
+    )
+    db.add_all([till_a, till_b])
+    await db.commit()
+    await db.refresh(till_a)
+    await db.refresh(till_b)
+    site_a.payment_method_id = till_a.id
+    site_b.payment_method_id = till_b.id
+    await db.commit()
+
+    _, after_a = await portal_for(db, site_a)
+    _, after_b = await portal_for(db, site_b)
+
+    assert ids(after_a) == ids(before_a) == [plan.id]
+    assert ids(after_b) == ids(before_b) == [plan.id]
+
+
+async def test_portal_still_works_with_plans_and_payouts_both_scoped(db):
+    """Everything switched on at once: scoped plans AND split payouts."""
+    from app.db.models import ResellerPaymentMethod, ResellerPaymentMethodType
+
+    reseller = await make_reseller(db)
+    site_a = await make_site(db, reseller, "combo-a")
+    site_b = await make_site(db, reseller, "combo-b")
+
+    till_a = ResellerPaymentMethod(
+        user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_TILL,
+        label="Till A", mpesa_till_number="1111111", is_active=True,
+    )
+    till_b = ResellerPaymentMethod(
+        user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_TILL,
+        label="Till B", mpesa_till_number="2222222", is_active=True,
+    )
+    db.add_all([till_a, till_b])
+    await db.commit()
+    await db.refresh(till_a)
+    await db.refresh(till_b)
+    site_a.payment_method_id = till_a.id
+    site_b.payment_method_id = till_b.id
+    await db.commit()
+
+    shared = await make_plan(db, reseller, name="Shared", price=50)
+    a_only = await make_plan(db, reseller, name="A only", price=80,
+                             router_ids=[site_a.id])
+    b_only = await make_plan(db, reseller, name="B only", price=90,
+                             router_ids=[site_b.id])
+
+    _, rendered_a = await portal_for(db, site_a)
+    _, rendered_b = await portal_for(db, site_b)
+
+    assert ids(rendered_a) == sorted([shared.id, a_only.id])
+    assert ids(rendered_b) == sorted([shared.id, b_only.id])
+
+
+async def test_emergency_mode_still_works_on_a_split_payout_reseller(db):
+    """The two features must not interfere at their intersection."""
+    from app.db.models import ResellerPaymentMethod, ResellerPaymentMethodType
+
+    reseller = await make_reseller(db)
+    down = await make_site(db, reseller, "combo-down", emergency_active=True)
+    healthy = await make_site(db, reseller, "combo-healthy")
+
+    till = ResellerPaymentMethod(
+        user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_TILL,
+        label="Till", mpesa_till_number="1111111", is_active=True,
+    )
+    db.add(till)
+    await db.commit()
+    await db.refresh(till)
+    down.payment_method_id = till.id
+    await db.commit()
+
+    daily = await make_plan(db, reseller, name="Daily", price=100)
+    rescue = await make_plan(db, reseller, name="Rescue", price=10,
+                             plan_type=PlanType.EMERGENCY, is_hidden=True)
+
+    _, down_rendered = await portal_for(db, down)
+    _, healthy_rendered = await portal_for(db, healthy)
+
+    assert ids(down_rendered) == [rescue.id]
+    assert ids(healthy_rendered) == [daily.id]

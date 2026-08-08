@@ -984,6 +984,45 @@ async def run_plan_router_scope_migrations():
 
 
 # ============================================================================
+# Per-Router Payout Attribution Migration (runs on startup, idempotent)
+# ============================================================================
+async def run_router_payout_attribution_migrations():
+    """Add the router columns needed to pay each router's earnings separately.
+
+    Mirrors migrations/add_router_payout_attribution.py. All three are nullable
+    with no default, and NULL everywhere means "reseller-level", which is
+    exactly how payouts behaved before this existed — so no historical row
+    changes meaning and no backfill is required.
+    """
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE customer_payments
+            ADD COLUMN IF NOT EXISTS router_id INTEGER NULL
+            REFERENCES routers(id) ON DELETE SET NULL
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_customer_payments_router_id
+            ON customer_payments(router_id)
+        """))
+        await conn.execute(sa_text("""
+            ALTER TABLE reseller_payouts
+            ADD COLUMN IF NOT EXISTS router_id INTEGER NULL
+            REFERENCES routers(id) ON DELETE SET NULL
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_reseller_payouts_router_id
+            ON reseller_payouts(router_id)
+        """))
+        await conn.execute(sa_text("""
+            ALTER TABLE b2b_transactions
+            ADD COLUMN IF NOT EXISTS router_id INTEGER NULL
+            REFERENCES routers(id) ON DELETE SET NULL
+        """))
+
+    logger.info("Migration: per-router payout attribution columns ready (NULL = reseller-level)")
+
+
+# ============================================================================
 # B2B Payout Migrations (runs on startup, idempotent)
 # ============================================================================
 async def run_b2b_migrations():
@@ -2213,6 +2252,12 @@ async def startup_event():
         logger.info("Plan router scope migrations completed successfully")
     except Exception as e:
         logger.error(f"Plan router scope migration failed (non-fatal): {e}")
+
+    try:
+        await run_router_payout_attribution_migrations()
+        logger.info("Router payout attribution migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Router payout attribution migration failed (non-fatal): {e}")
 
     try:
         await run_b2b_migrations()

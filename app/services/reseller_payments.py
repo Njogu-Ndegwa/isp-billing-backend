@@ -53,6 +53,10 @@ async def record_customer_payment(
         # Snapshot the plan being paid for — customer.plan_id is already set
         # to the purchased plan by the time any payment is recorded.
         plan_id=customer.plan_id,
+        # Snapshot the earning router for payout attribution, for the same
+        # reason: the customer may later be moved to a different site, and the
+        # money owed for this payment must not move with them.
+        router_id=customer.router_id,
         collection_mode=collection_mode,
         counts_as_revenue=counts_as_revenue,
     )

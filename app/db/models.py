@@ -273,6 +273,13 @@ class CustomerPayment(Base):
     # Snapshot of the plan purchased in THIS payment. Customer.plan_id is
     # overwritten on every purchase, so it cannot be used for history.
     plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
+    # Snapshot of the router that earned this payment, for per-router payout
+    # attribution. Same reasoning as plan_id: Customer.router_id follows the
+    # customer, so a customer moving sites would otherwise drag their whole
+    # payment history — and the money owed for it — to the new router's till.
+    # NULL means unattributed (pre-dates this column, or customer deleted) and
+    # is paid out to the reseller's default method.
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="SET NULL"), nullable=True)
     status = Column(Enum(PaymentStatus), default=PaymentStatus.COMPLETED)
     notes = Column(String(500), nullable=True)
     # Snapshot of customer name at payment time — preserved after customer deletion
@@ -1048,6 +1055,11 @@ class ResellerPayout(Base):
     notes = Column(String(500), nullable=True)
     period_start = Column(DateTime, nullable=True)
     period_end = Column(DateTime, nullable=True)
+    # Which router's earnings this payout settled. NULL = the reseller-level
+    # (default/unattributed) bucket, which is every payout made before
+    # per-router payouts existed. Without this the next cycle could not tell
+    # what had already been paid for a given router and would pay it again.
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     reseller = relationship("User", backref="payouts")
@@ -1103,6 +1115,11 @@ class B2BTransaction(Base):
     transaction_id = Column(String(255), nullable=True)
     payout_id = Column(Integer, ForeignKey("reseller_payouts.id"), nullable=True)
     charge_id = Column(Integer, ForeignKey("reseller_transaction_charges.id"), nullable=True)
+    # The payout completes asynchronously: the result callback builds the
+    # ResellerPayout from this row, so the router has to travel with the
+    # transaction or the settlement ledger cannot be attributed. Also scopes
+    # the double-spend guard to one balance bucket. NULL = reseller-level.
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="SET NULL"), nullable=True)
     triggered_by = Column(String(20), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     completed_at = Column(DateTime, nullable=True)
