@@ -30,6 +30,7 @@ from app.db.models import (
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
     ResellerTransactionCharge,
+    Router,
     User,
     UserRole,
 )
@@ -265,6 +266,7 @@ async def initiate_b2b_payment(
     fee: float = 0,
     triggered_by: str = "manual",
     command_id: str = "BusinessPayBill",
+    router_id: Optional[int] = None,
 ) -> B2BTransaction:
     """
     Initiate a B2B payment via Safaricom API and persist the transaction.
@@ -309,9 +311,10 @@ async def initiate_b2b_payment(
         raise PayoutInFlightError(
             f"Another payout for reseller {reseller_id} is being initiated right now"
         )
-    if await has_unresolved_b2b(db, reseller_id):
+    if await has_unresolved_b2b(db, reseller_id, router_id=router_id):
         raise PayoutInFlightError(
             f"Reseller {reseller_id} has an unresolved B2B transaction"
+            + (f" for router {router_id}" if router_id is not None else "")
         )
 
     txn = B2BTransaction(
@@ -328,6 +331,7 @@ async def initiate_b2b_payment(
         remarks=remarks,
         status=B2BTransactionStatus.PENDING,
         triggered_by=triggered_by,
+        router_id=router_id,
     )
     db.add(txn)
     # Intent becomes visible to every other payout path; advisory lock released.
@@ -491,6 +495,9 @@ async def _settle_completed_transaction(
         payment_method="mpesa_b2b",
         reference=reference,
         notes=f"Auto B2B payout via {txn.party_b} (acc: {txn.account_reference})",
+        # Settle against the same bucket the payout was drawn from, otherwise
+        # that router's balance stays full and gets paid again next cycle.
+        router_id=txn.router_id,
     )
     db.add(payout)
     await db.flush()
@@ -616,12 +623,39 @@ async def process_b2b_timeout(db: AsyncSession, body: dict) -> Optional[B2BTrans
 UNRESOLVED_STATUSES = [B2BTransactionStatus.PENDING, B2BTransactionStatus.TIMEOUT]
 
 
-async def has_unresolved_b2b(db: AsyncSession, reseller_id: int) -> bool:
-    """True if the reseller has a B2B transaction whose outcome is unknown."""
+async def has_unresolved_b2b(
+    db: AsyncSession, reseller_id: int, router_id: Optional[int] = None
+) -> bool:
+    """True if a B2B transaction whose outcome is unknown could be re-paid.
+
+    The guard exists because a PENDING payout has not yet written its
+    ResellerPayout row, so the balance it is settling still looks unpaid — a
+    second attempt would send the same money twice (2026-07-18 incident).
+
+    Balances are partitioned per router, and those buckets are disjoint: a
+    pending payout for router A is subtracted only from A's bucket and cannot
+    make B's bucket look richer than it is. So when paying a specific bucket
+    the guard is scoped to that bucket, which is what lets a split reseller be
+    paid in one nightly run instead of one router per day.
+
+    Two properties this must keep:
+      * `router_id=None` (every caller that existed before per-router payouts,
+        and every reseller who has not split) behaves exactly as before —
+        blocked by ANY unresolved transaction, including router-scoped ones.
+      * a router-scoped call is still blocked by an unresolved reseller-level
+        payout, because that one draws on the shared default bucket.
+    """
     stmt = select(func.count(B2BTransaction.id)).where(
         B2BTransaction.reseller_id == reseller_id,
         B2BTransaction.status.in_(UNRESOLVED_STATUSES),
     )
+    if router_id is not None:
+        stmt = stmt.where(
+            or_(
+                B2BTransaction.router_id == router_id,
+                B2BTransaction.router_id.is_(None),
+            )
+        )
     return int((await db.execute(stmt)).scalar()) > 0
 
 
@@ -1080,6 +1114,60 @@ async def get_unpaid_balance(db: AsyncSession, reseller_id: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Per-router balances
+# ---------------------------------------------------------------------------
+#
+# A reseller's balance splits into disjoint buckets keyed by router id, plus a
+# None bucket for revenue that carries no router (payments predating the
+# snapshot column, or whose customer was deleted). Reseller-level adjustments —
+# charges and the manual balance correction — belong to no single site, so they
+# land in the None bucket, which is also the one paid to the default method.
+#
+# Invariant, asserted in tests: the buckets always sum to get_unpaid_balance().
+# If that ever drifts, the reseller is being over- or under-paid.
+
+async def _mpesa_revenue_by_router(db: AsyncSession, reseller_id: int) -> dict:
+    stmt = (
+        select(
+            CustomerPayment.router_id,
+            func.coalesce(func.sum(CustomerPayment.amount), 0),
+        )
+        .where(CustomerPayment.reseller_id == reseller_id, *PAYOUT_REVENUE_FILTERS)
+        .group_by(CustomerPayment.router_id)
+    )
+    return {row[0]: float(row[1]) for row in (await db.execute(stmt)).all()}
+
+
+async def _payouts_by_router(db: AsyncSession, reseller_id: int) -> dict:
+    stmt = (
+        select(
+            ResellerPayout.router_id,
+            func.coalesce(func.sum(ResellerPayout.amount), 0),
+        )
+        .where(ResellerPayout.reseller_id == reseller_id)
+        .group_by(ResellerPayout.router_id)
+    )
+    return {row[0]: float(row[1]) for row in (await db.execute(stmt)).all()}
+
+
+async def get_unpaid_balance_by_router(db: AsyncSession, reseller_id: int) -> dict:
+    """Unpaid balance split per router. Key None = the default bucket."""
+    revenue = await _mpesa_revenue_by_router(db, reseller_id)
+    paid = await _payouts_by_router(db, reseller_id)
+    charges = await _total_charges(db, reseller_id)
+    correction = await _balance_correction(db, reseller_id)
+
+    buckets = {}
+    for key in set(revenue) | set(paid):
+        buckets[key] = revenue.get(key, 0.0) - paid.get(key, 0.0)
+
+    # Reseller-wide adjustments settle against the default bucket.
+    buckets[None] = buckets.get(None, 0.0) + correction - charges
+
+    return {key: round(value, 2) for key, value in buckets.items()}
+
+
+# ---------------------------------------------------------------------------
 # Payout schedule (per-reseller frequency)
 # ---------------------------------------------------------------------------
 
@@ -1201,6 +1289,11 @@ B2B_ELIGIBLE_TYPES = [
     ResellerPaymentMethodType.MPESA_TILL,
 ]
 
+# Smallest per-router balance worth sending on its own. Safaricom's fee plus
+# the Kadogo surcharge make tiny transfers wasteful, so anything under this
+# stays owed and rolls into a later cycle rather than being dropped.
+MIN_SPLIT_PAYOUT = 20.0
+
 
 async def resolve_b2b_payment_method(
     db: AsyncSession, reseller_id: int
@@ -1241,19 +1334,92 @@ async def resolve_b2b_payment_method(
 # Single-reseller payout (used by both manual trigger and daily job)
 # ---------------------------------------------------------------------------
 
+async def resolve_router_payout_plan(db: AsyncSession, reseller_id: int) -> Optional[list]:
+    """Plan a split payout, or None when this reseller should be paid as one.
+
+    A split only happens when the reseller has deliberately pointed routers at
+    DIFFERENT payout destinations. One method across the fleet — or none at all
+    — keeps the existing single payout, so nobody who did not ask for this pays
+    an extra transaction fee.
+
+    Returns a list of (router_id, payment_method, balance), largest first. The
+    default bucket (router_id None: unattributed revenue, charges, correction)
+    is included using the reseller's default method so no money is stranded.
+    """
+    router_rows = (
+        await db.execute(
+            select(Router.id, Router.payment_method_id).where(
+                Router.user_id == reseller_id,
+                Router.payment_method_id.isnot(None),
+            )
+        )
+    ).all()
+    if not router_rows:
+        return None
+
+    method_ids = {row[1] for row in router_rows}
+    methods = {
+        m.id: m
+        for m in (
+            await db.execute(
+                select(ResellerPaymentMethod).where(
+                    ResellerPaymentMethod.id.in_(method_ids),
+                    ResellerPaymentMethod.is_active == True,
+                    ResellerPaymentMethod.method_type.in_(B2B_ELIGIBLE_TYPES),
+                )
+            )
+        ).scalars()
+    }
+    # Distinct *payout destinations* is the trigger, not distinct assignments:
+    # three routers all pointing at one till is still a single payout.
+    usable = {rid: mid for rid, mid in router_rows if mid in methods}
+    if len(set(usable.values())) < 2:
+        return None
+
+    balances = await get_unpaid_balance_by_router(db, reseller_id)
+    default_method = await resolve_b2b_payment_method(db, reseller_id)
+
+    plan = []
+    for key, balance in balances.items():
+        if balance < MIN_SPLIT_PAYOUT:
+            # Too small to send on its own; it stays owed and rolls into a
+            # later cycle rather than being silently dropped.
+            continue
+        if key is None:
+            if default_method is not None:
+                plan.append((None, default_method, balance))
+            continue
+        method = methods.get(usable.get(key))
+        if method is None:
+            # Router has no usable destination of its own — leave its balance
+            # in place rather than guessing a till to send money to.
+            continue
+        plan.append((key, method, balance))
+
+    if not plan:
+        return None
+    plan.sort(key=lambda item: item[2], reverse=True)
+    return plan
+
+
 async def payout_reseller(
     db: AsyncSession,
     reseller_id: int,
     payment_method: ResellerPaymentMethod,
     balance: Optional[float] = None,
     triggered_by: str = "manual",
+    router_id: Optional[int] = None,
 ) -> B2BTransaction:
     """
     Pay out a single reseller via B2B.
     Calculates fee, determines PartyB/AccountReference from their payment method.
     """
     if balance is None:
-        balance = await get_unpaid_balance(db, reseller_id)
+        balance = (
+            await get_unpaid_balance(db, reseller_id)
+            if router_id is None
+            else (await get_unpaid_balance_by_router(db, reseller_id)).get(router_id, 0.0)
+        )
 
     if balance < 1:
         raise ValueError("Balance must be at least KES 1")
@@ -1293,6 +1459,7 @@ async def payout_reseller(
         fee=fee,
         triggered_by=triggered_by,
         command_id=command_id,
+        router_id=router_id,
     )
     return txn
 
@@ -1423,30 +1590,61 @@ async def run_daily_payouts():
                         skip_count += 1
                         continue
 
-                    pm = await resolve_b2b_payment_method(db, reseller_id)
-                    if not pm:
-                        skip_count += 1
-                        continue
+                    # Resellers who point routers at different destinations get
+                    # one payout per router; everyone else keeps a single one.
+                    split_plan = await resolve_router_payout_plan(db, reseller_id)
 
-                    try:
-                        txn = await payout_reseller(
-                            db, reseller_id, pm, balance, triggered_by="scheduled"
-                        )
-                    except PayoutInFlightError:
-                        # Another initiator won the race between our check and
-                        # the send — that payout covers the balance.
-                        skip_count += 1
-                        continue
-                    await db.commit()
-
-                    if txn.status == B2BTransactionStatus.PENDING:
-                        paid_count += 1
-                        logger.info(
-                            "B2B payout initiated: reseller=%s amount=%s net=%s fee=%s -> %s",
-                            reseller_id, txn.amount, txn.net_amount, txn.fee, txn.party_b,
-                        )
+                    if split_plan is None:
+                        pm = await resolve_b2b_payment_method(db, reseller_id)
+                        if not pm:
+                            skip_count += 1
+                            continue
+                        legs = [(None, pm, balance)]
                     else:
-                        fail_count += 1
+                        legs = split_plan
+                        logger.info(
+                            "Reseller %s has %s payout destinations, splitting balance %s",
+                            reseller_id, len(legs), balance,
+                        )
+
+                    for leg_router_id, leg_pm, leg_balance in legs:
+                        # An unsplit reseller is paid with exactly the arguments
+                        # this call always used — no new kwarg — so the default
+                        # path stays identical rather than merely equivalent.
+                        leg_kwargs = (
+                            {} if leg_router_id is None else {"router_id": leg_router_id}
+                        )
+                        try:
+                            txn = await payout_reseller(
+                                db, reseller_id, leg_pm, leg_balance,
+                                triggered_by="scheduled", **leg_kwargs,
+                            )
+                        except PayoutInFlightError:
+                            # Another initiator won the race between our check
+                            # and the send — that payout covers this bucket.
+                            skip_count += 1
+                            continue
+                        except ValueError as leg_error:
+                            # e.g. a destination with no number configured. One
+                            # bad leg must not strand the other routers' money.
+                            fail_count += 1
+                            logger.error(
+                                "B2B payout leg failed: reseller=%s router=%s: %s",
+                                reseller_id, leg_router_id, leg_error,
+                            )
+                            continue
+                        await db.commit()
+
+                        if txn.status == B2BTransactionStatus.PENDING:
+                            paid_count += 1
+                            logger.info(
+                                "B2B payout initiated: reseller=%s router=%s amount=%s "
+                                "net=%s fee=%s -> %s",
+                                reseller_id, leg_router_id, txn.amount, txn.net_amount,
+                                txn.fee, txn.party_b,
+                            )
+                        else:
+                            fail_count += 1
 
         except Exception as e:
             fail_count += 1

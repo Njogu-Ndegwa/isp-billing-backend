@@ -135,6 +135,7 @@
   "reseller_id",
   "result_code",
   "result_desc",
+  "router_id",
   "status",
   "transaction_id",
   "triggered_by"
@@ -188,6 +189,7 @@
   "plan_id",
   "port_name",
   "reseller_id",
+  "router_id",
   "status"
  ],
  "customer_ratings": [
@@ -446,6 +448,7 @@
   "original_price",
   "plan_type",
   "price",
+  "router_ids",
   "router_profile",
   "speed",
   "user_id",
@@ -608,7 +611,8 @@
   "period_end",
   "period_start",
   "reference",
-  "reseller_id"
+  "reseller_id",
+  "router_id"
  ],
  "reseller_transaction_charges": [
   "amount",
