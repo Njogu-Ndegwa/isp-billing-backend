@@ -1334,7 +1334,11 @@ async def resolve_b2b_payment_method(
 # Single-reseller payout (used by both manual trigger and daily job)
 # ---------------------------------------------------------------------------
 
-async def resolve_router_payout_plan(db: AsyncSession, reseller_id: int) -> Optional[list]:
+async def resolve_router_payout_plan(
+    db: AsyncSession,
+    reseller_id: int,
+    default_method: Optional[ResellerPaymentMethod] = None,
+) -> Optional[list]:
     """Plan a split payout, or None when this reseller should be paid as one.
 
     A split only happens when the reseller has deliberately pointed routers at
@@ -1378,7 +1382,8 @@ async def resolve_router_payout_plan(db: AsyncSession, reseller_id: int) -> Opti
 
     balances = await get_unpaid_balance_by_router(db, reseller_id)
     total_balance = await get_unpaid_balance(db, reseller_id)
-    default_method = await resolve_b2b_payment_method(db, reseller_id)
+    if default_method is None:
+        default_method = await resolve_b2b_payment_method(db, reseller_id)
 
     # A negative bucket is money already advanced against it — most often a
     # manual Withdraw, which settles the WHOLE balance as one reseller-level
@@ -1440,6 +1445,94 @@ async def resolve_router_payout_plan(db: AsyncSession, reseller_id: int) -> Opti
         reseller_id, len(plan), round(sum(i[2] for i in plan), 2), total_balance,
     )
     return plan
+
+
+class PayoutLegResult:
+    """Outcome of one leg of a payout, so callers can report partial success."""
+
+    __slots__ = ("router_id", "method", "amount", "transaction", "error")
+
+    def __init__(self, router_id, method, amount, transaction=None, error=None):
+        self.router_id = router_id
+        self.method = method
+        self.amount = amount
+        self.transaction = transaction
+        self.error = error
+
+    @property
+    def ok(self) -> bool:
+        return self.transaction is not None
+
+
+async def execute_payout(
+    db: AsyncSession,
+    reseller_id: int,
+    *,
+    triggered_by: str,
+    payment_method: Optional[ResellerPaymentMethod] = None,
+    default_method: Optional[ResellerPaymentMethod] = None,
+    balance: Optional[float] = None,
+) -> list:
+    """Pay a reseller what they are owed. The ONE way payouts are initiated.
+
+    Used by the nightly job, the reseller's own Withdraw button, and the admin
+    trigger, so all three behave identically. They diverged once — the nightly
+    run split per router while Withdraw sent everything to one destination —
+    and that divergence is what let a manual withdrawal leave router buckets
+    looking unpaid.
+
+    Splits per router when the reseller points routers at different
+    destinations; otherwise sends a single payout exactly as before. Passing an
+    explicit payment_method forces a single payout to it (admin override).
+
+    Returns a PayoutLegResult per leg. A leg that fails does not stop the rest:
+    one misconfigured till must not strand the other routers' money.
+    """
+    if payment_method is not None:
+        if balance is None:
+            balance = await get_unpaid_balance(db, reseller_id)
+        legs = [(None, payment_method, balance)]
+    else:
+        plan = await resolve_router_payout_plan(
+            db, reseller_id, default_method=default_method
+        )
+        if plan is None:
+            if default_method is None:
+                default_method = await resolve_b2b_payment_method(db, reseller_id)
+            if default_method is None:
+                return []
+            if balance is None:
+                balance = await get_unpaid_balance(db, reseller_id)
+            legs = [(None, default_method, balance)]
+        else:
+            legs = plan
+
+    results = []
+    for leg_router_id, leg_method, leg_balance in legs:
+        # A single-destination payout calls payout_reseller with exactly the
+        # arguments it always did, so the unsplit path stays identical.
+        leg_kwargs = {} if leg_router_id is None else {"router_id": leg_router_id}
+        try:
+            txn = await payout_reseller(
+                db, reseller_id, leg_method, leg_balance,
+                triggered_by=triggered_by, **leg_kwargs,
+            )
+            await db.commit()
+            results.append(PayoutLegResult(leg_router_id, leg_method, leg_balance, txn))
+        except PayoutInFlightError as exc:
+            results.append(
+                PayoutLegResult(leg_router_id, leg_method, leg_balance, error=exc)
+            )
+        except ValueError as exc:
+            logger.error(
+                "Payout leg failed: reseller=%s router=%s: %s",
+                reseller_id, leg_router_id, exc,
+            )
+            results.append(
+                PayoutLegResult(leg_router_id, leg_method, leg_balance, error=exc)
+            )
+
+    return results
 
 
 async def payout_reseller(
@@ -1630,57 +1723,33 @@ async def run_daily_payouts():
                         skip_count += 1
                         continue
 
-                    # Resellers who point routers at different destinations get
-                    # one payout per router; everyone else keeps a single one.
-                    split_plan = await resolve_router_payout_plan(db, reseller_id)
+                    # One shared path with the Withdraw button and the admin
+                    # trigger — see execute_payout. Splits per router when the
+                    # reseller uses different destinations, else a single payout.
+                    results = await execute_payout(
+                        db, reseller_id, triggered_by="scheduled", balance=balance
+                    )
+                    if not results:
+                        skip_count += 1
+                        continue
 
-                    if split_plan is None:
-                        pm = await resolve_b2b_payment_method(db, reseller_id)
-                        if not pm:
-                            skip_count += 1
+                    for leg in results:
+                        if not leg.ok:
+                            if isinstance(leg.error, PayoutInFlightError):
+                                # Another initiator won the race between our
+                                # check and the send — it covers this bucket.
+                                skip_count += 1
+                            else:
+                                fail_count += 1
                             continue
-                        legs = [(None, pm, balance)]
-                    else:
-                        legs = split_plan
-                        logger.info(
-                            "Reseller %s has %s payout destinations, splitting balance %s",
-                            reseller_id, len(legs), balance,
-                        )
 
-                    for leg_router_id, leg_pm, leg_balance in legs:
-                        # An unsplit reseller is paid with exactly the arguments
-                        # this call always used — no new kwarg — so the default
-                        # path stays identical rather than merely equivalent.
-                        leg_kwargs = (
-                            {} if leg_router_id is None else {"router_id": leg_router_id}
-                        )
-                        try:
-                            txn = await payout_reseller(
-                                db, reseller_id, leg_pm, leg_balance,
-                                triggered_by="scheduled", **leg_kwargs,
-                            )
-                        except PayoutInFlightError:
-                            # Another initiator won the race between our check
-                            # and the send — that payout covers this bucket.
-                            skip_count += 1
-                            continue
-                        except ValueError as leg_error:
-                            # e.g. a destination with no number configured. One
-                            # bad leg must not strand the other routers' money.
-                            fail_count += 1
-                            logger.error(
-                                "B2B payout leg failed: reseller=%s router=%s: %s",
-                                reseller_id, leg_router_id, leg_error,
-                            )
-                            continue
-                        await db.commit()
-
+                        txn = leg.transaction
                         if txn.status == B2BTransactionStatus.PENDING:
                             paid_count += 1
                             logger.info(
                                 "B2B payout initiated: reseller=%s router=%s amount=%s "
                                 "net=%s fee=%s -> %s",
-                                reseller_id, leg_router_id, txn.amount, txn.net_amount,
+                                reseller_id, leg.router_id, txn.amount, txn.net_amount,
                                 txn.fee, txn.party_b,
                             )
                         else:
