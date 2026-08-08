@@ -468,3 +468,99 @@ async def test_plan_never_exceeds_balance_across_many_ledger_shapes(db):
         assert all(bal >= MIN_SPLIT_PAYOUT for _, _, bal in (plan or [])), (
             f"shape {index}: a leg fell below the minimum payout"
         )
+
+
+# ---------------------------------------------------------------------------
+# Withdraw and the nightly run must not diverge again
+# ---------------------------------------------------------------------------
+
+async def _capture_legs(db, reseller, triggered_by, monkeypatch):
+    """Run execute_payout with the Safaricom send stubbed, return the legs."""
+    from app.services import mpesa_b2b as b2b
+
+    sent = []
+
+    async def fake_payout(db_, reseller_id, pm, balance=None, triggered_by="manual",
+                          router_id=None):
+        sent.append({
+            "router_id": router_id,
+            "destination": pm.mpesa_till_number or pm.label,
+            "amount": balance,
+        })
+        txn = B2BTransaction(
+            reseller_id=reseller_id, amount=balance or 0, fee=0,
+            net_amount=balance or 0, party_a="600980",
+            party_b=pm.mpesa_till_number or "x",
+            status=B2BTransactionStatus.PENDING, triggered_by=triggered_by,
+            router_id=router_id,
+        )
+        db_.add(txn)
+        await db_.flush()
+        return txn
+
+    monkeypatch.setattr(b2b, "payout_reseller", fake_payout)
+    await b2b.execute_payout(db, reseller.id, triggered_by=triggered_by)
+    return sent
+
+
+async def test_withdraw_and_nightly_run_produce_the_same_transfers(db, monkeypatch):
+    """The divergence that caused the overpayment bug must be impossible.
+
+    Withdraw used to send everything to one destination while the nightly run
+    split per router. Both now go through execute_payout, so the same ledger
+    must produce the same transfers whichever fires.
+    """
+    reseller = await make_reseller(db)
+    till_a = await make_method(db, reseller, "Till A", "1111111")
+    till_b = await make_method(db, reseller, "Till B", "2222222")
+    site_a = await make_router(db, reseller, payment_method_id=till_a.id)
+    site_b = await make_router(db, reseller, payment_method_id=till_b.id)
+    await add_payment(db, reseller, 500, site_a.id)
+    await add_payment(db, reseller, 300, site_b.id)
+
+    withdraw_legs = await _capture_legs(db, reseller, "reseller", monkeypatch)
+
+    # Undo the stub transactions so the second run sees the same ledger.
+    for txn in (await db.execute(
+        __import__("sqlalchemy").select(B2BTransaction)
+    )).scalars().all():
+        await db.delete(txn)
+    await db.commit()
+
+    nightly_legs = await _capture_legs(db, reseller, "scheduled", monkeypatch)
+
+    normalise = lambda legs: sorted(
+        (l["router_id"], l["destination"], l["amount"]) for l in legs
+    )
+    assert normalise(withdraw_legs) == normalise(nightly_legs)
+    assert len(withdraw_legs) == 2, "a split reseller should get one transfer per till"
+
+
+async def test_withdraw_splits_to_each_configured_till(db, monkeypatch):
+    """Withdraw now respects the per-router destinations, as expected."""
+    reseller = await make_reseller(db)
+    till_a = await make_method(db, reseller, "Till A", "1111111")
+    till_b = await make_method(db, reseller, "Till B", "2222222")
+    site_a = await make_router(db, reseller, payment_method_id=till_a.id)
+    site_b = await make_router(db, reseller, payment_method_id=till_b.id)
+    await add_payment(db, reseller, 500, site_a.id)
+    await add_payment(db, reseller, 300, site_b.id)
+
+    legs = await _capture_legs(db, reseller, "reseller", monkeypatch)
+
+    by_dest = {l["destination"]: l["amount"] for l in legs}
+    assert by_dest == {"1111111": 500, "2222222": 300}
+
+
+async def test_withdraw_for_an_unsplit_reseller_is_still_one_transfer(db, monkeypatch):
+    """No regression for the resellers who never configured anything."""
+    reseller = await make_reseller(db)
+    pm = await make_method(db, reseller, "Only till", "1111111")
+    site = await make_router(db, reseller, payment_method_id=pm.id)
+    await add_payment(db, reseller, 800, site.id)
+
+    legs = await _capture_legs(db, reseller, "reseller", monkeypatch)
+
+    assert len(legs) == 1
+    assert legs[0]["router_id"] is None, "unsplit payouts stay reseller-level"
+    assert legs[0]["amount"] == 800

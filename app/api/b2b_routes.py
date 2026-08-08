@@ -32,6 +32,7 @@ from app.services.mpesa_b2b import (
     _settle_completed_transaction,
     compute_fee_breakdown,
     get_payout_schedule,
+    execute_payout,
     get_unpaid_balance,
     has_unresolved_b2b,
     payout_lock,
@@ -183,23 +184,40 @@ async def trigger_b2b_payout(
         if balance <= 0:
             raise HTTPException(status_code=400, detail="No unpaid balance to pay out")
 
+        # An explicit payment_method_id is an admin override: send the whole
+        # balance there, no split. Otherwise use the same shared path as the
+        # nightly run and the reseller's own Withdraw button.
+        forced_pm = None
+        default_pm = None
         if request.payment_method_id:
-            pm = await db.get(ResellerPaymentMethod, request.payment_method_id)
-            if not pm or pm.user_id != reseller_id:
+            forced_pm = await db.get(ResellerPaymentMethod, request.payment_method_id)
+            if not forced_pm or forced_pm.user_id != reseller_id:
                 raise HTTPException(status_code=404, detail="Payment method not found for this reseller")
         else:
-            pm = await resolve_b2b_payment_method(db, reseller_id)
-
-        if not pm:
-            raise HTTPException(
-                status_code=400,
-                detail="No eligible payment method (bank_account or mpesa_paybill) found for this reseller",
-            )
+            default_pm = await resolve_b2b_payment_method(db, reseller_id)
+            if not default_pm:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No eligible payment method (bank_account or mpesa_paybill) found for this reseller",
+                )
 
         try:
-            txn = await payout_reseller(db, reseller_id, pm, balance)
-            await db.commit()
-            await db.refresh(txn)
+            results = await execute_payout(
+                db, reseller_id, triggered_by="manual",
+                payment_method=forced_pm, default_method=default_pm, balance=balance,
+            )
+            if not results:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No eligible payment method (bank_account or mpesa_paybill) found for this reseller",
+                )
+            sent = [leg for leg in results if leg.ok]
+            if not sent:
+                raise results[0].error
+            for leg in sent:
+                await db.refresh(leg.transaction)
+            pm = sent[0].method
+            txn = sent[0].transaction
         except PayoutInFlightError:
             raise HTTPException(
                 status_code=409,
@@ -445,21 +463,13 @@ async def reseller_withdraw(
             )
 
         try:
-            txn = await payout_reseller(
-                db, user.id, pm, balance, triggered_by=RESELLER_TRIGGER
+            # Exactly the path the nightly run uses. A reseller who points
+            # routers at different destinations gets one transfer per router;
+            # everyone else gets the single transfer they always got.
+            results = await execute_payout(
+                db, user.id, triggered_by=RESELLER_TRIGGER,
+                default_method=pm, balance=balance,
             )
-            await db.commit()
-            await db.refresh(txn)
-        except PayoutInFlightError:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Another payout to you is already in flight — "
-                    "please try again once it completes."
-                ),
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             logger.error("Self-service withdrawal failed for reseller %s: %s", user.id, e)
             raise HTTPException(
@@ -467,24 +477,65 @@ async def reseller_withdraw(
                 detail="Withdrawal could not be initiated. Please try again later.",
             )
 
-    if txn.status == B2BTransactionStatus.FAILED:
-        # Safaricom rejected it synchronously (e.g. invalid paybill). The failed
-        # transaction is already committed for audit; surface a clear error.
+    if not results:
         raise HTTPException(
-            status_code=502,
-            detail=f"Safaricom rejected the withdrawal: {txn.result_desc or 'unknown error'}",
+            status_code=400,
+            detail="No eligible payout destination for your current balance.",
         )
 
-    logger.info(
-        "Self-service withdrawal initiated: reseller=%s amount=%s net=%s fee=%s -> %s",
-        user.id, txn.amount, txn.net_amount, txn.fee, txn.party_b,
-    )
+    sent = [leg for leg in results if leg.ok]
+    if not sent:
+        first_error = results[0].error
+        if isinstance(first_error, PayoutInFlightError):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Another payout to you is already in flight — "
+                    "please try again once it completes."
+                ),
+            )
+        raise HTTPException(status_code=400, detail=str(first_error))
+
+    for leg in sent:
+        await db.refresh(leg.transaction)
+
+    if all(leg.transaction.status == B2BTransactionStatus.FAILED for leg in sent):
+        # Safaricom rejected every transfer synchronously (e.g. invalid
+        # paybill). They are committed for audit; surface a clear error.
+        desc = sent[0].transaction.result_desc or "unknown error"
+        raise HTTPException(
+            status_code=502,
+            detail=f"Safaricom rejected the withdrawal: {desc}",
+        )
+
+    for leg in sent:
+        logger.info(
+            "Self-service withdrawal initiated: reseller=%s router=%s amount=%s "
+            "net=%s fee=%s -> %s",
+            user.id, leg.router_id, leg.transaction.amount,
+            leg.transaction.net_amount, leg.transaction.fee, leg.transaction.party_b,
+        )
+
+    primary = sent[0]
+    txn = primary.transaction
     return {
+        # The original single-transfer fields stay, so an older dashboard build
+        # keeps working; `transfers` carries the full split.
         "transaction": _serialize_withdrawal_txn(txn),
         "balance_before": balance,
-        "fee": txn.fee,
-        "net_payout": txn.net_amount,
-        "destination_label": pm.label,
+        "fee": sum(leg.transaction.fee for leg in sent),
+        "net_payout": sum(leg.transaction.net_amount for leg in sent),
+        "destination_label": primary.method.label,
+        "transfers": [
+            {
+                **_serialize_withdrawal_txn(leg.transaction),
+                "router_id": leg.router_id,
+                "destination_label": leg.method.label,
+            }
+            for leg in sent
+        ],
+        "transfer_count": len(sent),
+        "split_by_router": len(sent) > 1,
     }
 
 

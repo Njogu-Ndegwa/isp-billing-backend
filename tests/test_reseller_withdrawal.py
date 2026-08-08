@@ -77,6 +77,7 @@ def _patch_payout_env(b2b, monkeypatch, session_factory, balance=500.0):
             amount=balance, net_amount=balance, fee=0, party_b="247247",
         )
 
+    from app.services import mpesa_b2b as b2b  # noqa: F811
     monkeypatch.setattr(b2b, "payout_reseller", fake_payout)
     return attempted
 
@@ -355,7 +356,12 @@ async def test_withdraw_success_records_reseller_trigger(engine, db, monkeypatch
         await db_.flush()
         return txn
 
+    # The withdraw endpoint now goes through the shared execute_payout
+    # orchestrator (same path as the nightly run), so the stub belongs on
+    # the service module where payout_reseller actually lives.
     monkeypatch.setattr(routes, "payout_reseller", fake_payout)
+    from app.services import mpesa_b2b as b2b  # noqa: F811
+    monkeypatch.setattr(b2b, "payout_reseller", fake_payout)
 
     result = await routes.reseller_withdraw(db=db, token="t")
 
@@ -393,7 +399,12 @@ async def test_withdraw_synchronous_safaricom_rejection_is_surfaced(
         await db_.flush()
         return txn
 
+    # The withdraw endpoint now goes through the shared execute_payout
+    # orchestrator (same path as the nightly run), so the stub belongs on
+    # the service module where payout_reseller actually lives.
     monkeypatch.setattr(routes, "payout_reseller", fake_payout)
+    from app.services import mpesa_b2b as b2b  # noqa: F811
+    monkeypatch.setattr(b2b, "payout_reseller", fake_payout)
 
     with pytest.raises(HTTPException) as exc:
         await routes.reseller_withdraw(db=db, token="t")
@@ -453,7 +464,12 @@ async def test_concurrent_withdrawals_only_one_proceeds(engine, db, monkeypatch)
         await db_.flush()
         return txn
 
+    # The withdraw endpoint now goes through the shared execute_payout
+    # orchestrator (same path as the nightly run), so the stub belongs on
+    # the service module where payout_reseller actually lives.
     monkeypatch.setattr(routes, "payout_reseller", fake_payout)
+    from app.services import mpesa_b2b as b2b  # noqa: F811
+    monkeypatch.setattr(b2b, "payout_reseller", fake_payout)
 
     results = await asyncio.gather(
         routes.reseller_withdraw(db=db, token="t"),
