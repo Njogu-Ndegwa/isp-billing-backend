@@ -28,7 +28,14 @@ def derive_insurance_ip(router_ip: str, target_subnet: str | None = None) -> str
             f"Router IP {router_ip} is outside {SOURCE_MGMT_SUBNET}; cannot derive insurance IP"
         )
 
-    target = ipaddress.IPv4Network(target_subnet or str(DEFAULT_INSURANCE_SUBNET))
+    # Default to the configured insurance subnet so the derived backup IP always
+    # matches the server the env points at (10.251.x for Hetzner wg2). The old
+    # hardcoded 10.250.0.0/16 fallback silently collided with the AWS-era
+    # wg-aws2 addressing when the env was pivoted to a new subnet.
+    configured = (getattr(settings, "INSURANCE_WG_SUBNET", "") or "").strip()
+    target = ipaddress.IPv4Network(
+        target_subnet or configured or str(DEFAULT_INSURANCE_SUBNET)
+    )
     if target.prefixlen != SOURCE_MGMT_SUBNET.prefixlen:
         raise InsuranceWireGuardError(
             f"Insurance subnet {target} must use /16 to preserve router host offsets"
