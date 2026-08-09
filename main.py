@@ -63,6 +63,7 @@ from app.api.admin_messaging_routes import router as admin_messaging_router
 from app.api.feedback_routes import router as feedback_router
 from app.api.admin_feedback_routes import router as admin_feedback_router
 from app.api.agent_board_routes import router as agent_board_router
+from app.api.load_balancing_routes import router as load_balancing_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -104,6 +105,7 @@ app.include_router(admin_messaging_router)
 app.include_router(feedback_router)
 app.include_router(admin_feedback_router)
 app.include_router(agent_board_router)
+app.include_router(load_balancing_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -117,6 +119,7 @@ from app.services.mikrotik_background import (
     _cleanup_single_router_hotspot_sync,
 )
 from app.services.usage_cap_sampler import sample_capped_usage_background
+from app.services.mikrotik_lb_background import reconcile_lb_paid_background
 from app.services.payment_port_attribution import attribute_recent_payment_ports_background
 from app.services.router_status_alerts import scan_and_notify_offline_routers
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
@@ -2127,6 +2130,22 @@ async def run_pull_channel_migrations():
     logger.info("Pull-channel migrations complete")
 
 
+async def run_load_balancing_migrations():
+    """Add routers.lb_enabled / lb_config / lb_applied_at for hotspot-safe
+    multi-WAN PCC load balancing (app/services/mikrotik_lb.py). lb_config keeps
+    the WAN port list ({"wan_ports": [...], "applied_at": iso8601}) and survives
+    a disable so re-enabling reuses the same ports. Idempotent: ADD COLUMN
+    IF NOT EXISTS, safe to run on every startup."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS lb_enabled BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS lb_config JSON NULL,
+            ADD COLUMN IF NOT EXISTS lb_applied_at TIMESTAMP NULL
+        """))
+    logger.info("Load-balancing migrations complete")
+
+
 async def run_router_status_alert_migrations():
     """Add routers.status_alerts_enabled (default-on offline/back-online alerts,
     per-router opt-out) plus the online_notified_at / offline_notified_at
@@ -2350,6 +2369,12 @@ async def startup_event():
         logger.error(f"Pull-channel migration failed (non-fatal): {e}")
 
     try:
+        await run_load_balancing_migrations()
+        logger.info("Load-balancing migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Load-balancing migration failed (non-fatal): {e}")
+
+    try:
         await run_router_status_alert_migrations()
         logger.info("Router status-alert migrations completed successfully")
     except Exception as e:
@@ -2372,6 +2397,14 @@ async def startup_event():
         trigger=IntervalTrigger(seconds=67),
         id='cleanup_expired_users',
         name='Remove expired hotspot users from MikroTik',
+        replace_existing=True,
+        max_instances=1
+    )
+    scheduler.add_job(
+        reconcile_lb_paid_background,
+        trigger=IntervalTrigger(seconds=271),
+        id='reconcile_lb_paid',
+        name='Reconcile LB_PAID address lists on load-balanced routers',
         replace_existing=True,
         max_instances=1
     )
