@@ -420,6 +420,12 @@ class Router(Base):
     pppoe_ports = Column(JSON, nullable=True)  # e.g. ["ether4", "ether5"]
     plain_ports = Column(JSON, nullable=True)  # e.g. ["ether6", "ether7"]
     dual_ports = Column(JSON, nullable=True)   # e.g. ["ether3"] — PPPoE + Hotspot on same port
+    # Multi-WAN PCC load balancing (hotspot-safe; see app/services/mikrotik_lb.py).
+    # lb_config shape: {"wan_ports": ["ether1", "ether2"], "applied_at": iso8601}.
+    # lb_config survives a disable so re-enabling reuses the same WAN ports.
+    lb_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    lb_config = Column(JSON, nullable=True)
+    lb_applied_at = Column(DateTime, nullable=True)
     last_status = Column(Boolean, nullable=True)
     last_checked_at = Column(DateTime, nullable=True)
     last_online_at = Column(DateTime, nullable=True)
