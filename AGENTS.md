@@ -334,6 +334,45 @@ Keep backlog items concrete. Prefer:
 
 ## Testing Notes
 
+### Every bug fix ships with a test. Every new feature ships with tests.
+
+Not a preference — the rule. A change that fixes a bug or adds behaviour and carries no test
+does not get pushed.
+
+- **Fixing a bug?** Write the test that REPRODUCES it first, watch it fail, then fix it and
+  watch it pass. A test written after the fix, never having failed, proves nothing — it can
+  pass for reasons unrelated to the bug. If the root cause turns out to be router-side or
+  config rather than code, write the runbook and an incident note instead, and say so.
+- **Adding a feature?** Tests land in the same commit range, covering the behaviour a user
+  depends on and the way it fails — not just the happy path.
+- **Name what the test forbids.** `test_expired_customer_is_disconnected` beats
+  `test_cleanup_2`. The name is the specification.
 - Prefer focused tests for the area touched.
 - If tests cannot run because dependencies are missing, say that explicitly in the final handoff.
 - For router/MikroTik work, distinguish DB-only behavior from live-router behavior.
+
+Why this is worth the discipline, from this repo's own history:
+
+- The **PPPoE usage 0 MB** defect (PKT-001) was fixed only after a test reproduced it —
+  which is how we learned the real cause was case-drifted secrets dropping usage deltas
+  silently, not the queue collection everyone assumed.
+- The **payout over-pay** fix is pinned by tests that fail with the exact shilling amounts
+  (`assert 975.0 == 675.0`). When someone later removed the DIRECT filter as an experiment,
+  seven tests across three suites named the money difference immediately.
+- Every incident note under `docs/agent-memory/incidents/` that has a matching regression
+  test cannot recur silently. Every one that does not, can.
+
+### Tests run against Postgres, the engine production uses
+
+CI runs the suite against `postgres:15-alpine`, matching the production container. SQLite
+remains the fast local default, but a green SQLite run is **not** evidence about production:
+it cannot execute the Postgres-only syntax in the startup migrations, cannot create enum
+types, and does not enforce foreign keys by default. On 2026-07-28 the switch to real
+Postgres immediately exposed an orphaned foreign key that had passed for months, and two test
+modules silently fighting over the shape of a shared `radius_check` table.
+
+Run the suite the way CI does when a change is risky:
+
+```bash
+DATABASE_URL=postgresql+asyncpg://... python -m pytest -q
+```
