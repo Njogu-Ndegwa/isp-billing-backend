@@ -401,6 +401,26 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                 if client_ip:
                     logger.info(f"[CRON] Found client IP: {client_ip} for MAC {normalized_mac}")
 
+                # Load-balancing hook: an LB_PAID entry outliving its ip-binding
+                # breaks the portal for the next holder of that IP, so remove it
+                # alongside the binding. Best-effort — MUST NOT break cleanup.
+                if router_info.get("lb_enabled") and client_ip:
+                    try:
+                        from app.services.mikrotik_lb import lb_remove_paid_entry
+
+                        lb_removed = lb_remove_paid_entry(api, client_ip)
+                        removed["lb_paid"] = lb_removed.get("removed", 0)
+                        if lb_removed.get("removed"):
+                            logger.info(
+                                f"[CRON] Removed {lb_removed['removed']} LB_PAID "
+                                f"entrie(s) for {client_ip}"
+                            )
+                    except Exception as lb_exc:
+                        logger.warning(
+                            f"[CRON] LB_PAID removal failed for {client_ip} "
+                            f"(ignored): {lb_exc}"
+                        )
+
                 binding_found = False
                 binding_fetch_failed = False
                 bindings = api.send_command("/ip/hotspot/ip-binding/print")
@@ -1012,7 +1032,9 @@ async def cleanup_expired_users_background():
                             "router": {
                                 "id": c.router.id,
                                 "ip": c.router.ip_address, "username": c.router.username,
-                                "password": c.router.password, "port": c.router.port, "name": c.router.name
+                                "password": c.router.password, "port": c.router.port, "name": c.router.name,
+                                # so cleanup also drops the customer's LB_PAID entry
+                                "lb_enabled": bool(getattr(c.router, "lb_enabled", False)),
                             },
                             "customers": []
                         }

@@ -1241,7 +1241,9 @@ async def cleanup_expired_customers_for_router(
                     "username": router_obj.username,
                     "password": router_obj.password,
                     "port": router_obj.port,
-                    "name": router_obj.name
+                    "name": router_obj.name,
+                    # so cleanup also drops the customer's LB_PAID entry
+                    "lb_enabled": bool(getattr(router_obj, "lb_enabled", False)),
                 },
                 "customers": [
                     {

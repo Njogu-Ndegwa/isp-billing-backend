@@ -101,6 +101,10 @@ def build_hotspot_payload(customer: Customer, plan: Plan, router: Router, commen
         "router_username": router.username,
         "router_password": router.password,
         "router_port": router.port,
+        # Multi-WAN load balancing: bypassed customers only balance while
+        # listed in LB_PAID, so provisioning adds the entry when LB is on.
+        "lb_enabled": bool(getattr(router, "lb_enabled", False)),
+        "customer_expiry": customer.expiry,
     }
 
 
@@ -516,11 +520,39 @@ def _call_mikrotik_bypass_sync(hotspot_payload: dict, verify_only: bool = False)
                 "provision_result": provision_result,
             }
 
+        # Load-balancing hook: the bypass binding is in place, so list the
+        # client in LB_PAID (with a timeout capped to expiry) while the API
+        # connection is still usable. MUST NOT fail provisioning — a paid
+        # customer missing from LB_PAID just doesn't balance, which is benign.
+        lb_paid_result = None
+        if hotspot_payload.get("lb_enabled"):
+            try:
+                from app.services.mikrotik_lb import lb_add_paid_entry
+
+                lb_paid_result = lb_add_paid_entry(
+                    api,
+                    hotspot_payload["mac_address"],
+                    hotspot_payload.get("customer_expiry"),
+                )
+                if not lb_paid_result.get("ok"):
+                    logger.warning(
+                        "[PROVISION] LB_PAID add skipped/failed for %s: %s",
+                        hotspot_payload["mac_address"],
+                        lb_paid_result.get("reason"),
+                    )
+            except Exception as lb_exc:
+                logger.warning(
+                    "[PROVISION] LB_PAID add crashed for %s (ignored): %s",
+                    hotspot_payload["mac_address"],
+                    lb_exc,
+                )
+
         online_result = _poll_online_state(api, hotspot_payload["mac_address"])
         return {
             "success": True,
             "provision_result": provision_result,
             "verification_result": verification_result,
+            "lb_paid_result": lb_paid_result,
             "online_result": online_result,
             "online_state": (
                 ProvisioningOnlineState.ONLINE.value
