@@ -93,3 +93,36 @@ def test_logout_hook_attach_rejects_an_unsafe_profile_name():
     assert "on-logout" in render_logout_hook_attach("pppoe_5M_5M")
     with pytest.raises(ValueError):
         render_logout_hook_attach('x"; /system reset-configuration')
+
+
+def test_metrics_block_counts_connected_authorized_hosts_not_portal_logins():
+    """Regression: 2026-08-06.
+
+    ``/ip hotspot active`` lists portal LOGINS, which is permanently empty on
+    the MAC-bypass model most resellers run. Reporting that zero made every
+    hotspot customer surface as a phantom PPPoE user. The count must come from
+    the host table, filtered to devices allowed through.
+    """
+    script = render_usage_push_script(
+        identity="Router-0721", endpoint_url=URL, include_router_metrics=True
+    )
+
+    assert "/ip hotspot host find" in script
+    assert "[:len [/ip hotspot active find]]" not in script
+    # Unpaid devices sit in the host table unauthorized; they must not count.
+    assert "authorized" in script and "bypassed" in script
+    # Each host counted once, not two summed find lengths.
+    assert "($ha || $hb) do={ :set hs ($hs + 1) }" in script
+
+
+def test_metrics_block_declares_its_version():
+    script = render_usage_push_script(
+        identity="Router-0721", endpoint_url=URL, include_router_metrics=True
+    )
+    assert '\\"metrics_version\\":2' in script
+
+
+def test_metrics_block_is_still_opt_in():
+    script = render_usage_push_script(identity="Router-0721", endpoint_url=URL)
+    assert "hotspot host find" not in script
+    assert "metrics_version" not in script

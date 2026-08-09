@@ -39,6 +39,12 @@ SCHEDULER_NAME = "bitwave-usage-push"
 SCRIPT_NAME = "bitwave-usage-push"
 LOGOUT_SCRIPT_NAME = "bitwave-usage-final"
 
+# Bumped whenever the meaning of a reported metric changes, so the server can
+# tell a re-scripted router from one still running the previous version.
+#   1 — hotspot_active = :len [/ip hotspot active]  (portal logins only)
+#   2 — hotspot_active = host-table entries that are authorized or bypassed
+METRICS_VERSION = 2
+
 
 def _require(value: str, rx: re.Pattern, name: str) -> str:
     v = str(value or "").strip()
@@ -76,17 +82,36 @@ def render_usage_push_script(
     # Read-only lookups, guarded so a router missing the hotspot/ppp package or
     # an ether1 by that name skips metrics instead of losing the whole push.
     # ``:set first false`` marks the batch as worth sending even with no queues.
+    #
+    # ``hotspot_active`` counts HOST-TABLE entries that are authorized or
+    # bypassed, NOT ``/ip hotspot active``. A device only holds a host entry
+    # while it is actually present on the hotspot network, so this is "who is
+    # in the router right now" — and the authorized/bypassed filter drops the
+    # devices that are connected but have not paid (they sit in the host table
+    # unauthorized, seeing only the portal). ``/ip hotspot active`` lists portal
+    # LOGINS only, so it reads 0 forever on the MAC-bypass model most of our
+    # resellers run — that zero is what surfaced every hotspot customer as a
+    # phantom PPPoE user on 2026-08-06.
+    #
+    # A host can in principle carry both flags, so this counts each host once
+    # rather than adding two ``find`` lengths.
     metrics_block = ""
     if include_router_metrics:
         metrics_block = (
             '    :do {\n'
             '        :local rxb [/interface get [find name="ether1"] rx-byte]\n'
             '        :local txb [/interface get [find name="ether1"] tx-byte]\n'
-            '        :local hs [:len [/ip hotspot active find]]\n'
+            '        :local hs 0\n'
+            '        :foreach h in=[/ip hotspot host find] do={\n'
+            '            :local ha [/ip hotspot host get $h authorized]\n'
+            '            :local hb [/ip hotspot host get $h bypassed]\n'
+            '            :if ($ha || $hb) do={ :set hs ($hs + 1) }\n'
+            '        }\n'
             '        :local pp [:len [/ppp active find]]\n'
             '        :set body ($body . ",\\"router\\":{\\"iface_rx_bytes\\":" . $rxb'
             ' . ",\\"iface_tx_bytes\\":" . $txb . ",\\"hotspot_active\\":" . $hs'
-            ' . ",\\"pppoe_active\\":" . $pp . ",\\"queue_count\\":" . $qcount . "}")\n'
+            ' . ",\\"pppoe_active\\":" . $pp . ",\\"queue_count\\":" . $qcount'
+            ' . ",\\"metrics_version\\":' + str(METRICS_VERSION) + '}")\n'
             '        :set first false\n'
             '    } on-error={ :log info "usage-push: metrics skipped" }\n'
         )

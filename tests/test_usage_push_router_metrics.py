@@ -55,10 +55,11 @@ async def _setup(db):
     return router, customer
 
 
-def _metrics(rx=100 * MB, tx=20 * MB, hotspot=5, pppoe=2, queues=6):
+def _metrics(rx=100 * MB, tx=20 * MB, hotspot=5, pppoe=2, queues=6, version=2):
     return RouterMetrics(
         iface_rx_bytes=rx, iface_tx_bytes=tx,
         hotspot_active=hotspot, pppoe_active=pppoe, queue_count=queues,
+        metrics_version=version,
     )
 
 
@@ -91,8 +92,9 @@ async def test_router_block_writes_a_snapshot(db, session_factory):
     assert snap.interface_rx_bytes == 100 * MB
     assert snap.interface_tx_bytes == 20 * MB
     assert snap.active_hotspot_users == 5
-    assert snap.active_sessions == 2
-    assert snap.active_queues == 6
+    assert snap.active_sessions == 5
+    # active_queues is the COMBINED count the health endpoint subtracts from.
+    assert snap.active_queues == 7
 
 
 @pytest.mark.asyncio
@@ -364,3 +366,85 @@ async def test_pppoe_deltas_land_in_the_pppoe_ledger_fields(db, session_factory)
     )
 
     assert await _ledger_totals(session_factory, router.id) == (0, 0, MB, 3 * MB)
+
+
+@pytest.mark.asyncio
+async def test_hotspot_count_is_who_is_connected_not_who_holds_a_queue(db, session_factory):
+    """Three paid-up customers hold queues; only one is actually on the router.
+
+    The tile must say 1, not 3. A queue survives the customer switching their
+    phone off; the hotspot host table does not.
+    """
+    router, _ = await _setup(db)
+
+    reports = [
+        UsageReport(queue_key="AA:BB:CC:11:22:33", upload_bytes=0, download_bytes=0),
+        UsageReport(queue_key="AA:BB:CC:11:22:44", upload_bytes=0, download_bytes=0),
+        UsageReport(queue_key="AA:BB:CC:11:22:55", upload_bytes=0, download_bytes=0),
+    ]
+    await usage_push.ingest_usage_reports(
+        router.id, reports,
+        router_metrics=_metrics(hotspot=1, pppoe=0, queues=3),
+        session_factory=session_factory,
+    )
+
+    async with session_factory() as s:
+        snap = (await s.execute(
+            select(BandwidthSnapshot).where(BandwidthSnapshot.router_id == router.id)
+        )).scalar_one()
+
+    assert snap.active_hotspot_users == 1
+    # Regression: this used to render as 3 phantom PPPoE users.
+    assert max(0, snap.active_queues - snap.active_hotspot_users) == 0
+
+
+@pytest.mark.asyncio
+async def test_old_script_does_not_zero_the_hotspot_count(db, session_factory):
+    """A router still on METRICS_VERSION 1 reports hotspot_active=0 because
+    /ip hotspot active is empty on MAC-bypass. That 0 must not overwrite the
+    poller's real figure every two minutes."""
+    router, _ = await _setup(db)
+    await _seed_snapshot(session_factory, router.id, rx=1 * MB, tx=1 * MB, minutes_ago=30)
+
+    await usage_push.ingest_usage_reports(
+        router.id,
+        [UsageReport(queue_key="AA:BB:CC:11:22:33", upload_bytes=0, download_bytes=0)],
+        router_metrics=_metrics(rx=2 * MB, tx=2 * MB, hotspot=0, pppoe=0, queues=1, version=1),
+        session_factory=session_factory,
+    )
+
+    async with session_factory() as s:
+        snap = (await s.execute(
+            select(BandwidthSnapshot)
+            .where(BandwidthSnapshot.router_id == router.id)
+            .order_by(BandwidthSnapshot.recorded_at.desc()).limit(1)
+        )).scalars().first()
+
+    # _seed_snapshot wrote active_hotspot_users=1; it is carried, not zeroed.
+    assert snap.active_hotspot_users == 1
+    assert max(0, snap.active_queues - snap.active_hotspot_users) == 0
+
+
+@pytest.mark.asyncio
+async def test_mixed_router_splits_hotspot_and_pppoe(db, session_factory):
+    router, _ = await _setup(db)
+
+    reports = [
+        UsageReport(queue_key="AA:BB:CC:11:22:33", upload_bytes=0, download_bytes=0),
+        UsageReport(queue_key="AA:BB:CC:11:22:44", upload_bytes=0, download_bytes=0),
+        UsageReport(queue_key="pppoe:alex", upload_bytes=0, download_bytes=0),
+    ]
+    await usage_push.ingest_usage_reports(
+        router.id, reports,
+        router_metrics=_metrics(hotspot=2, pppoe=1, queues=3),
+        session_factory=session_factory,
+    )
+
+    async with session_factory() as s:
+        snap = (await s.execute(
+            select(BandwidthSnapshot).where(BandwidthSnapshot.router_id == router.id)
+        )).scalar_one()
+
+    assert snap.active_hotspot_users == 2
+    assert snap.active_queues == 3
+    assert max(0, snap.active_queues - snap.active_hotspot_users) == 1

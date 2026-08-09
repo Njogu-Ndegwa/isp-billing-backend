@@ -2414,6 +2414,7 @@ async def collect_bandwidth_snapshot():
                         avg_download_bps=avg_download_bps,
                         active_queues=active_devices,
                         active_hotspot_users=active_hotspot_users,
+                        active_pppoe_users=pppoe_active_count,
                         active_sessions=len(active_sessions.get("data", [])),
                         interface_rx_bytes=total_rx,
                         interface_tx_bytes=total_tx,

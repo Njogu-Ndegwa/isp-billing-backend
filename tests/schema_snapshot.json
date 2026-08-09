@@ -142,6 +142,7 @@
  ],
  "bandwidth_snapshots": [
   "active_hotspot_users",
+  "active_pppoe_users",
   "active_queues",
   "active_sessions",
   "avg_download_bps",

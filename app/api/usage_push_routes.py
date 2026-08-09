@@ -103,6 +103,9 @@ class RouterMetricsIn(BaseModel):
     hotspot_active: int = Field(default=0, ge=0)
     pppoe_active: int = Field(default=0, ge=0)
     queue_count: int = Field(default=0, ge=0)
+    # usage_push_script.METRICS_VERSION; absent means the router still runs
+    # the script whose hotspot_active counts portal logins only.
+    metrics_version: int = Field(default=1, ge=1)
 
 
 class UsagePushIn(BaseModel):
@@ -178,6 +181,7 @@ async def receive_usage_push(
             hotspot_active=payload.router.hotspot_active,
             pppoe_active=payload.router.pppoe_active,
             queue_count=payload.router.queue_count,
+            metrics_version=payload.router.metrics_version,
         )
 
     result = await ingest_usage_reports(
