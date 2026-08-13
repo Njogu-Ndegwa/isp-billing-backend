@@ -288,19 +288,25 @@ def lb_apply(api, wan_ports: List[str]) -> dict:
             _checked_comment(i),
         ))
     for i in range(n):
-        own = probes[i]
-        fallback = probes[(i + 1) % n]
         route_plan.append((
-            {"dst-address": "0.0.0.0/0", "gateway": own, "routing-table": _table_name(i),
-             "distance": "1", "check-gateway": "ping", "target-scope": "11"},
+            {"dst-address": "0.0.0.0/0", "gateway": probes[i],
+             "routing-table": _table_name(i), "distance": "1",
+             "check-gateway": "ping", "target-scope": "11"},
             _table_route_comment(i),
         ))
-        route_plan.append((
-            {"dst-address": "0.0.0.0/0", "gateway": fallback,
-             "routing-table": _table_name(i), "distance": "2",
-             "check-gateway": "ping", "target-scope": "11"},
-            _table_route_comment(i) + "_FALLBACK",
-        ))
+        # Full fallback chain: every OTHER WAN in rotation at increasing distance.
+        # A single fallback is sufficient for n=2 (it always lands on the live WAN)
+        # but not beyond: with two dormant WANs a 3-WAN table had NO active route,
+        # so every flow PCC-marked into it black-holed. Found live on router 247
+        # (2026-08-13) between apply and the second/third lines being plugged in.
+        for step in range(1, n):
+            suffix = "_FALLBACK" if step == 1 else f"_FALLBACK{step}"
+            route_plan.append((
+                {"dst-address": "0.0.0.0/0", "gateway": probes[(i + step) % n],
+                 "routing-table": _table_name(i), "distance": str(step + 1),
+                 "check-gateway": "ping", "target-scope": "11"},
+                _table_route_comment(i) + suffix,
+            ))
 
     # 3. management VPN pins: wg-aws -> WAN1, wg-aws2 -> WAN2 (when present),
     #    other endpoints round-robin; each gets a fallback via the next WAN.

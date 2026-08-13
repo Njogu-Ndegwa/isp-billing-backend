@@ -424,6 +424,36 @@ def test_apply_dormant_wan_gets_table_with_fallback_but_no_probe():
     assert fallback["distance"] == "2"
 
 
+def test_apply_three_wans_every_table_falls_back_to_every_other_wan():
+    """With 3+ WANs a single cross-fallback is not enough: if two WANs are
+    dormant, a table whose own probe AND whose one fallback are both dead has no
+    active route left and every flow marked into it black-holes (router 247,
+    2026-08-13). Each table must chain through all the other WANs."""
+    api = FakeLBAPI()
+    report = mikrotik_lb.lb_apply(api, ["ether1", "ether2", "ether3"])
+    assert report["success"] is True
+
+    route_adds = _commands(api, "/ip/route/add")
+    probes = ["8.8.8.8", "1.1.1.1", "9.9.9.9"]
+    for i in range(3):
+        table = f"to_wan{i + 1}"
+        rows = [r for r in route_adds if r.get("routing-table") == table]
+        # own probe first, then the other two at increasing distance
+        assert [r["gateway"] for r in sorted(rows, key=lambda r: int(r["distance"]))] == [
+            probes[i], probes[(i + 1) % 3], probes[(i + 2) % 3]
+        ]
+        assert [r["distance"] for r in sorted(rows, key=lambda r: int(r["distance"]))] == \
+            ["1", "2", "3"]
+        # WAN1 is the only bound WAN here, so every table must be able to reach it
+        assert probes[0] in {r["gateway"] for r in rows}
+        assert all(r["check-gateway"] == "ping" for r in rows)
+        assert all(r["target-scope"] == "11" for r in rows)
+
+    comments = {r["comment"] for r in route_adds}
+    assert "ISP_BILLING_PCC_WAN2_FALLBACK" in comments
+    assert "ISP_BILLING_PCC_WAN2_FALLBACK2" in comments
+
+
 # ---------------------------------------------------------------------------
 # preflight + convert safety
 # ---------------------------------------------------------------------------
