@@ -10,9 +10,13 @@ from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.router_helpers import get_router_by_id
-from app.services.router_availability import record_router_availability
+from app.services.router_availability import (
+    record_router_availability,
+    router_recently_offline,
+)
 from app.core.local_time import resolve_usage_window
 from app.config import settings
+from copy import deepcopy
 import logging
 import asyncio
 
@@ -240,6 +244,38 @@ def _shape_health_response(
     return result
 
 
+def _health_payload_offline(
+    payload: dict,
+    *,
+    reason: str,
+    last_online_at=None,
+) -> dict:
+    """Zero every live counter on a health payload for an unreachable router.
+
+    The dashboard tiles ("active users", live bandwidth) are read as a statement
+    about right now. When the site has lost power, the last persisted counters
+    describe a moment that has passed — replaying them told resellers their
+    customers were still connected to a router that was switched off
+    (reported 2026-08-14). System fields (uptime/CPU/memory) are left as they
+    were; they are self-evidently historical once the payload says the router
+    is unreachable.
+    """
+    result = deepcopy(payload)
+    result["active_users"] = 0
+    result["active_hotspot_users"] = 0
+    result["active_pppoe_users"] = 0
+    result["active_total_users"] = 0
+    result["_full_pppoe_sessions"] = []
+    result["bandwidth"] = {"download_mbps": 0.0, "upload_mbps": 0.0}
+    result["live"] = False
+    result["router_reachable"] = False
+    result["fallback_reason"] = reason
+    result["router_last_online_at"] = (
+        last_online_at.isoformat() if isinstance(last_online_at, datetime) else last_online_at
+    )
+    return result
+
+
 def _health_payload_from_snapshot(
     *,
     latest_snapshot: Optional[BandwidthSnapshot],
@@ -410,6 +446,7 @@ def _health_payload_from_live_result(
         "router_name": router_name,
         "generated_at": datetime.utcnow().isoformat(),
         "live": True,
+        "router_reachable": True,
     }
 
 
@@ -585,6 +622,7 @@ async def get_mikrotik_health(
                 "name": router.name
             }
             router_name = router.name
+            router_obj = router
         else:
             router_info = {
                 "ip": settings.MIKROTIK_HOST,
@@ -594,6 +632,9 @@ async def get_mikrotik_health(
                 "name": "Default Router"
             }
             router_name = "Default Router"
+            router_obj = None
+
+        last_online_at = getattr(router_obj, "last_online_at", None)
 
         snapshot_query = select(BandwidthSnapshot).order_by(BandwidthSnapshot.recorded_at.desc()).limit(1)
         if router_id:
@@ -601,6 +642,10 @@ async def get_mikrotik_health(
 
         snapshot_result = await db.execute(snapshot_query)
         latest_snapshot = snapshot_result.scalar_one_or_none()
+
+        # A router we already know is dark cannot have live users behind it, so
+        # the fast path must not replay the last snapshot's counters as current.
+        router_is_down = bool(router_obj) and router_recently_offline(router_obj)
 
         if prefer_snapshot and not include_sessions:
             refresh_meta = _queue_health_cache_refresh(
@@ -612,8 +657,15 @@ async def get_mikrotik_health(
             )
 
             if cached_entry and cached_age is not None and cached_age < _health_cache_stale_ttl:
+                payload = cached_entry["data"]
+                if router_is_down:
+                    payload = _health_payload_offline(
+                        payload,
+                        reason="router_recently_offline",
+                        last_online_at=last_online_at,
+                    )
                 return _shape_health_response(
-                    cached_entry["data"],
+                    payload,
                     include_sessions=False,
                     cached=True,
                     cache_age_seconds=cached_age,
@@ -629,6 +681,12 @@ async def get_mikrotik_health(
                     router_name=router_name,
                     reason="dashboard_fast_snapshot",
                 )
+                if router_is_down:
+                    snapshot_payload = _health_payload_offline(
+                        snapshot_payload,
+                        reason="router_recently_offline",
+                        last_online_at=last_online_at,
+                    )
                 return _shape_health_response(
                     snapshot_payload,
                     include_sessions=False,
@@ -657,7 +715,11 @@ async def get_mikrotik_health(
                 cached_entry = _health_cache[cache_key]
                 age = (datetime.utcnow() - cached_entry["timestamp"]).total_seconds()
                 return _shape_health_response(
-                    cached_entry["data"],
+                    _health_payload_offline(
+                        cached_entry["data"],
+                        reason="live_health_timeout",
+                        last_online_at=last_online_at,
+                    ),
                     include_sessions=include_sessions,
                     cached=True,
                     cache_age_seconds=age,
@@ -671,7 +733,11 @@ async def get_mikrotik_health(
                     reason="live_health_timeout",
                 )
                 return _shape_health_response(
-                    fallback,
+                    _health_payload_offline(
+                        fallback,
+                        reason="live_health_timeout",
+                        last_online_at=last_online_at,
+                    ),
                     include_sessions=include_sessions,
                     cached=False,
                     cache_age_seconds=None,
@@ -685,12 +751,18 @@ async def get_mikrotik_health(
         if mikrotik_result.get("error"):
             if router_id and not latest_snapshot:
                 await record_router_availability(db, router_id, False, "mikrotik_health")
-            # Return stale cache if available when router unreachable
+            # Router unreachable: serve what we have, but with every live
+            # counter zeroed — see _health_payload_offline.
+            unreachable_reason = mikrotik_result.get("error") or "live_health_failed"
             if cache_key in _health_cache:
                 cached_entry = _health_cache[cache_key]
                 age = (datetime.utcnow() - cached_entry["timestamp"]).total_seconds()
                 return _shape_health_response(
-                    cached_entry["data"],
+                    _health_payload_offline(
+                        cached_entry["data"],
+                        reason=unreachable_reason,
+                        last_online_at=last_online_at,
+                    ),
                     include_sessions=include_sessions,
                     cached=True,
                     cache_age_seconds=age,
@@ -701,10 +773,14 @@ async def get_mikrotik_health(
                     latest_snapshot=latest_snapshot,
                     router_id=router_id,
                     router_name=router_name,
-                    reason=mikrotik_result.get("error") or "live_health_failed",
+                    reason=unreachable_reason,
                 )
                 return _shape_health_response(
-                    fallback,
+                    _health_payload_offline(
+                        fallback,
+                        reason=unreachable_reason,
+                        last_online_at=last_online_at,
+                    ),
                     include_sessions=include_sessions,
                     cached=False,
                     cache_age_seconds=None,
