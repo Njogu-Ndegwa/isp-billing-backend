@@ -7,13 +7,17 @@ from datetime import datetime
 
 
 from app.db.database import get_db
-from app.db.models import Customer
+from app.db.models import Customer, Router, UserBandwidthUsage
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
 from app.services.log_persistence import persist_notable_logs
 from app.services.router_concurrency import run_with_guard
-from app.services.router_availability import record_router_availability
+from app.services.router_availability import (
+    record_router_availability,
+    router_recently_offline,
+)
+from app.services.monitor_liveness import clear_live_state
 
 import asyncio
 import logging
@@ -261,6 +265,166 @@ def _hotspot_logs_sync(router_info: dict, search: str = "", limit: int = 50) -> 
 
 
 # ---------------------------------------------------------------------------
+# Unreachable-router fallbacks
+# ---------------------------------------------------------------------------
+
+def _stale_hotspot_overview(router_id: int, reason: str) -> dict:
+    """Last infrastructure overview for a router that has stopped answering.
+
+    The configuration checks are still worth showing (they describe how the
+    router is set up, which does not change while it is off), but
+    ``active_sessions`` is a live count and must not be replayed.
+    """
+    cached = _hotspot_overview_cache[router_id]
+    stale = cached["data"].copy()
+    stale["cached"] = True
+    stale["stale"] = True
+    stale["live"] = False
+    stale["router_reachable"] = False
+    stale["fallback_reason"] = reason
+    stale["active_sessions"] = 0
+    stale["cache_age_seconds"] = round(
+        (datetime.utcnow() - cached["timestamp"]).total_seconds(), 1
+    )
+    return stale
+
+
+def _offline_hotspot_users_cache(
+    router_id: int,
+    reason: str,
+    router_obj: Optional[Router] = None,
+) -> Optional[dict]:
+    """Last snapshot for a router we now know is unreachable, with liveness stripped.
+
+    The roster and cumulative counters are still useful; the online flags and
+    live rates are not — nobody is connected to a router that isn't answering.
+    """
+    cached = _hotspot_users_cache.get(router_id)
+    if not cached:
+        return None
+    age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
+    return clear_live_state(
+        cached["data"],
+        reason=reason,
+        age_seconds=age,
+        last_online_at=getattr(router_obj, "last_online_at", None),
+    )
+
+
+async def _build_hotspot_users_db_fallback(
+    db: AsyncSession,
+    router_obj: Router,
+    reason: str,
+) -> dict:
+    """Hotspot monitor-shaped data for an unreachable router, from the DB only.
+
+    Used when the router is down and we have no cached snapshot to strip (a
+    fresh process, or a router that has been dark since the last restart). The
+    reseller still gets their customer list and data usage — everyone offline,
+    which is the truth.
+    """
+    stmt = (
+        select(Customer)
+        .options(selectinload(Customer.plan))
+        .where(
+            Customer.router_id == router_obj.id,
+            Customer.mac_address.isnot(None),
+        )
+        .order_by(Customer.name.asc(), Customer.id.asc())
+    )
+    result = await db.execute(stmt)
+    customers = result.scalars().all()
+
+    usage_by_customer_id: dict = {}
+    usage_by_mac: dict = {}
+    customer_ids = [c.id for c in customers]
+    macs = [c.mac_address for c in customers if c.mac_address]
+    if customer_ids or macs:
+        from sqlalchemy import or_
+
+        usage_filters = []
+        if customer_ids:
+            usage_filters.append(UserBandwidthUsage.customer_id.in_(customer_ids))
+        if macs:
+            usage_filters.append(UserBandwidthUsage.mac_address.in_(macs))
+        usage_stmt = select(UserBandwidthUsage).where(
+            usage_filters[0] if len(usage_filters) == 1 else or_(*usage_filters)
+        )
+        usage_result = await db.execute(usage_stmt)
+        for usage in usage_result.scalars().all():
+            if usage.customer_id:
+                usage_by_customer_id[usage.customer_id] = usage
+            if usage.mac_address:
+                usage_by_mac[usage.mac_address.upper()] = usage
+
+    users = []
+    for customer in customers:
+        mac = customer.mac_address or ""
+        try:
+            mac = normalize_mac_address(mac) if mac else ""
+        except Exception:
+            mac = mac.upper()
+        usage = usage_by_customer_id.get(customer.id) or usage_by_mac.get(mac)
+        users.append({
+            "username": mac.replace(":", "").lower(),
+            "mac_address": mac,
+            "profile": "",
+            "disabled": customer.status.value != "active" if customer.status else False,
+            "comment": "Router unreachable; live RouterOS state not queried",
+            "online": False,
+            "online_source": None,
+            "address": None,
+            "uptime": None,
+            "idle_time": None,
+            "login_by": "",
+            "upload_bytes": int(usage.upload_bytes or 0) if usage else 0,
+            "download_bytes": int(usage.download_bytes or 0) if usage else 0,
+            "upload_rate": "0",
+            "download_rate": "0",
+            "max_limit": (usage.max_limit if usage else None) or (customer.plan.speed if customer.plan else ""),
+            "binding_type": "",
+            "bypassed": False,
+            "authorized": False,
+            "has_queue": False,
+            "customer": {
+                "id": customer.id,
+                "name": customer.name,
+                "phone": customer.phone,
+                "status": customer.status.value if customer.status else "unknown",
+                "plan": customer.plan.name if customer.plan else None,
+                "plan_speed": customer.plan.speed if customer.plan else None,
+                "expiry": customer.expiry.isoformat() if customer.expiry else None,
+            },
+        })
+
+    return {
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "generated_at": datetime.utcnow().isoformat(),
+        "cached": True,
+        "stale": True,
+        "live": False,
+        "router_reachable": False,
+        "cache_age_seconds": None,
+        "fallback_reason": reason,
+        "router_last_online_at": (
+            router_obj.last_online_at.isoformat()
+            if getattr(router_obj, "last_online_at", None) else None
+        ),
+        "success": True,
+        "users": users,
+        "summary": {
+            "total": len(users),
+            "online": 0,
+            "offline": len(users),
+            "disabled": sum(1 for u in users if u["disabled"]),
+            "total_upload_rate_bps": 0,
+            "total_download_rate_bps": 0,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -301,19 +465,13 @@ async def hotspot_overview(
     if result.get("error") == "connect_failed":
         await record_router_availability(db, router_id, False, "hotspot_overview")
         if router_id in _hotspot_overview_cache:
-            stale = _hotspot_overview_cache[router_id]["data"].copy()
-            stale["cached"] = True
-            stale["stale"] = True
-            stale["cache_age_seconds"] = (datetime.utcnow() - _hotspot_overview_cache[router_id]["timestamp"]).total_seconds()
+            stale = _stale_hotspot_overview(router_id, "connect_failed")
             return stale
         raise HTTPException(status_code=503, detail="Failed to connect to router")
     if result.get("error") == "timeout":
         await record_router_availability(db, router_id, False, "hotspot_overview")
         if router_id in _hotspot_overview_cache:
-            stale = _hotspot_overview_cache[router_id]["data"].copy()
-            stale["cached"] = True
-            stale["stale"] = True
-            return stale
+            return _stale_hotspot_overview(router_id, "timeout")
         raise HTTPException(status_code=504, detail=result.get("detail", "Diagnostic timed out"))
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
@@ -423,6 +581,18 @@ async def hotspot_users(
             result["cache_age_seconds"] = round(age, 1)
             return result
 
+    # Known-dark router: answer from what we have instead of spending a
+    # connect timeout per poll on a device that is not going to answer.
+    if not refresh and router_recently_offline(router_obj):
+        stale = _offline_hotspot_users_cache(
+            router_id, "router_recently_offline", router_obj,
+        )
+        if stale:
+            return stale
+        return await _build_hotspot_users_db_fallback(
+            db, router_obj, "router_recently_offline",
+        )
+
     router_info = {
         "ip": router_obj.ip_address, "username": router_obj.username,
         "password": router_obj.password, "port": router_obj.port,
@@ -430,25 +600,16 @@ async def hotspot_users(
     await db.commit()
     result = await run_with_guard(router_id, _hotspot_users_sync, router_info)
 
-    if result.get("error") == "connect_failed":
+    # The router did not answer. Whatever we serve now must not claim anyone is
+    # online: the usual cause is that the site has lost power, which is exactly
+    # when the reseller is looking at this table.
+    if result.get("error") in {"connect_failed", "timeout"}:
+        reason = result["error"]
         await record_router_availability(db, router_id, False, "hotspot_users")
-        if router_id in _hotspot_users_cache:
-            stale = _hotspot_users_cache[router_id]["data"].copy()
-            stale["cached"] = True
-            stale["stale"] = True
-            stale["cache_age_seconds"] = (
-                datetime.utcnow() - _hotspot_users_cache[router_id]["timestamp"]
-            ).total_seconds()
+        stale = _offline_hotspot_users_cache(router_id, reason, router_obj)
+        if stale:
             return stale
-        raise HTTPException(status_code=503, detail="Failed to connect to router")
-    if result.get("error") == "timeout":
-        await record_router_availability(db, router_id, False, "hotspot_users")
-        if router_id in _hotspot_users_cache:
-            stale = _hotspot_users_cache[router_id]["data"].copy()
-            stale["cached"] = True
-            stale["stale"] = True
-            return stale
-        raise HTTPException(status_code=504, detail=result.get("detail", "Operation timed out"))
+        return await _build_hotspot_users_db_fallback(db, router_obj, reason)
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
 
@@ -497,6 +658,11 @@ async def hotspot_users(
         "router_name": router_obj.name,
         "generated_at": datetime.utcnow().isoformat(),
         "cached": False,
+        "stale": False,
+        "live": True,
+        "router_reachable": True,
+        "cache_age_seconds": None,
+        "fallback_reason": None,
         **result,
     }
 

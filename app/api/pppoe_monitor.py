@@ -15,6 +15,7 @@ from app.services.router_helpers import get_router_by_id
 from app.services.log_persistence import persist_notable_logs
 from app.services.router_concurrency import run_with_guard
 from app.services.router_availability import record_router_availability, router_recently_offline
+from app.services.monitor_liveness import clear_live_state, mark_snapshot_unverified
 
 import asyncio
 import logging
@@ -1247,16 +1248,54 @@ def _pppoe_users_pool_is_busy() -> bool:
     )
 
 
-def _stale_pppoe_users_cache(router_id: int) -> dict | None:
+def _offline_pppoe_users_cache(
+    router_id: int,
+    reason: str,
+    router_obj: Router | None = None,
+) -> dict | None:
+    """Last snapshot for a router we know is unreachable, with liveness stripped.
+
+    Nobody is online through a router that isn't answering, so the online flags
+    and live rates go; the roster and cumulative counters stay.
+    """
     cached = _pppoe_users_cache.get(router_id)
     if not cached:
         return None
     age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
-    response = cached["data"].copy()
-    response["cached"] = True
-    response["stale"] = True
-    response["cache_age_seconds"] = round(age, 1)
-    return response
+    return clear_live_state(
+        cached["data"],
+        reason=reason,
+        age_seconds=age,
+        last_online_at=getattr(router_obj, "last_online_at", None),
+    )
+
+
+def _unverified_pppoe_users_cache(
+    router_id: int,
+    reason: str,
+    router_obj: Router | None = None,
+) -> dict | None:
+    """Last snapshot served without re-checking a router we have no news about.
+
+    Used when we chose not to ask (DB pool pressure). Online flags are kept —
+    there is no evidence against them — but the response is flagged as not live
+    and carries its age.
+    """
+    cached = _pppoe_users_cache.get(router_id)
+    if not cached:
+        return None
+    age = (datetime.utcnow() - cached["timestamp"]).total_seconds()
+    return mark_snapshot_unverified(
+        cached["data"],
+        reason=reason,
+        age_seconds=age,
+        last_online_at=getattr(router_obj, "last_online_at", None),
+    )
+
+
+# Fallback reasons that mean "the router itself is unreachable", as opposed to
+# "we chose not to ask it right now".
+_ROUTER_DOWN_REASONS = {"router_recently_offline", "connect_failed", "timeout"}
 
 
 async def _build_pppoe_users_db_fallback(
@@ -1342,6 +1381,13 @@ async def _build_pppoe_users_db_fallback(
         "stale": True,
         "cache_age_seconds": None,
         "live": False,
+        # Unknown (None) when we merely declined to ask; False only when the
+        # router itself is known to be dark.
+        "router_reachable": False if reason in _ROUTER_DOWN_REASONS else None,
+        "router_last_online_at": (
+            router_obj.last_online_at.isoformat()
+            if getattr(router_obj, "last_online_at", None) else None
+        ),
         "fallback_reason": reason,
         "success": True,
         "users": users,
@@ -1452,9 +1498,10 @@ async def pppoe_users(
 
     if not refresh:
         if router_recently_offline(router_obj):
-            stale = _stale_pppoe_users_cache(router_id)
+            stale = _offline_pppoe_users_cache(
+                router_id, "router_recently_offline", router_obj,
+            )
             if stale:
-                stale["fallback_reason"] = "router_recently_offline"
                 return stale
             return await _build_pppoe_users_db_fallback(
                 db,
@@ -1462,9 +1509,12 @@ async def pppoe_users(
                 "router_recently_offline",
             )
         if _pppoe_users_pool_is_busy():
-            stale = _stale_pppoe_users_cache(router_id)
+            # We skipped the check to protect the pool, not because the router
+            # is down — keep the last known state, but don't call it live.
+            stale = _unverified_pppoe_users_cache(
+                router_id, "db_pool_pressure", router_obj,
+            )
             if stale:
-                stale["fallback_reason"] = "db_pool_pressure"
                 return stale
             return await _build_pppoe_users_db_fallback(
                 db,
@@ -1479,25 +1529,14 @@ async def pppoe_users(
     await db.commit()
     result = await run_with_guard(router_id, _pppoe_users_sync, router_info)
 
-    if result.get("error") == "connect_failed":
+    # The router did not answer: serve the roster, never the liveness.
+    if result.get("error") in {"connect_failed", "timeout"}:
+        reason = result["error"]
         await record_router_availability(db, router_id, False, "pppoe_users")
-        if router_id in _pppoe_users_cache:
-            stale = _pppoe_users_cache[router_id]["data"].copy()
-            stale["cached"] = True
-            stale["stale"] = True
-            stale["cache_age_seconds"] = (
-                datetime.utcnow() - _pppoe_users_cache[router_id]["timestamp"]
-            ).total_seconds()
+        stale = _offline_pppoe_users_cache(router_id, reason, router_obj)
+        if stale:
             return stale
-        raise HTTPException(status_code=503, detail="Failed to connect to router")
-    if result.get("error") == "timeout":
-        await record_router_availability(db, router_id, False, "pppoe_users")
-        if router_id in _pppoe_users_cache:
-            stale = _pppoe_users_cache[router_id]["data"].copy()
-            stale["cached"] = True
-            stale["stale"] = True
-            return stale
-        raise HTTPException(status_code=504, detail=result.get("detail", "Operation timed out"))
+        return await _build_pppoe_users_db_fallback(db, router_obj, reason)
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
 
@@ -1536,7 +1575,11 @@ async def pppoe_users(
         "router_name": router_obj.name,
         "generated_at": datetime.utcnow().isoformat(),
         "cached": False,
+        "stale": False,
         "live": True,
+        "router_reachable": True,
+        "cache_age_seconds": None,
+        "fallback_reason": None,
         **result,
     }
 
