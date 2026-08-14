@@ -151,3 +151,59 @@ async def test_till_without_number_raises(db, monkeypatch):
 
     with pytest.raises(ValueError, match="no destination paybill/till"):
         await b2b.payout_reseller(db, reseller.id, pm, balance=500.0)
+
+
+# ---------------------------------------------------------------------------
+# Payout settings surface the till as the destination (added 2026-08-14)
+# ---------------------------------------------------------------------------
+
+async def test_payout_settings_shows_till_as_destination(db, session_factory, monkeypatch):
+    """
+    The Account Statement card reads `payment_method.destination`. Before this,
+    the field only fell back to bank/paybill, so a till reseller saw "Paid to
+    Shop Till" with no number at all.
+    """
+    import pytest_asyncio  # noqa: F401  (fixtures come from conftest)
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from app.api import b2b_routes as b2b_api
+    from app.db.database import get_db
+    from app.services.auth import verify_token
+
+    reseller = await make_reseller(db)
+    db.add(ResellerPaymentMethod(
+        user_id=reseller.id,
+        method_type=ResellerPaymentMethodType.MPESA_TILL,
+        label="Shop Till",
+        is_active=True,
+        mpesa_till_number="5678901",
+    ))
+    await db.commit()
+
+    app = FastAPI()
+    app.include_router(b2b_api.router)
+
+    async def _override_get_db():
+        async with session_factory() as s:
+            try:
+                yield s
+                await s.commit()
+            except Exception:
+                await s.rollback()
+                raise
+
+    async def _fake_current_user(token, db):
+        return reseller
+
+    app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[verify_token] = lambda: "tok"
+    monkeypatch.setattr(b2b_api, "get_current_user", _fake_current_user)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/api/reseller/payout-settings")
+
+    assert resp.status_code == 200, resp.text
+    pm = resp.json()["payment_method"]
+    assert pm["method_type"] == "mpesa_till"
+    assert pm["destination"] == "5678901"

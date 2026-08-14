@@ -106,6 +106,31 @@ class AssignPaymentMethodRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _normalize_till_number(raw: Optional[str]) -> str:
+    """
+    Strip and validate a Buy Goods till number.
+
+    Resellers keep entering their M-Pesa phone number here (seen in production:
+    07XXXXXXXX as a payout destination, which B2B can never pay). Tills are 4-9
+    digits and don't start with 0.
+    """
+    till = (raw or "").strip().replace(" ", "")
+    if not till:
+        raise HTTPException(
+            status_code=400,
+            detail="mpesa_till_number is required for M-Pesa Till (Buy Goods)",
+        )
+    if not till.isdigit() or not (4 <= len(till) <= 9) or till.startswith("0"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "mpesa_till_number must be a Buy Goods till number (4-9 digits, "
+                "not starting with 0) — a phone number cannot receive B2B payouts"
+            ),
+        )
+    return till
+
+
 def _validate_fields(method_type: ResellerPaymentMethodType, data: PaymentMethodCreate):
     if method_type == ResellerPaymentMethodType.BANK_ACCOUNT:
         if not data.bank_paybill_number or not data.bank_account_number:
@@ -122,24 +147,7 @@ def _validate_fields(method_type: ResellerPaymentMethodType, data: PaymentMethod
             )
 
     elif method_type == ResellerPaymentMethodType.MPESA_TILL:
-        till = (data.mpesa_till_number or "").strip().replace(" ", "")
-        if not till:
-            raise HTTPException(
-                status_code=400,
-                detail="mpesa_till_number is required for M-Pesa Till (Buy Goods)",
-            )
-        # Resellers keep entering their M-Pesa phone number here (seen in
-        # production: 07XXXXXXXX as a payout destination, which B2B can never
-        # pay). Tills are 4-9 digits and don't start with 0.
-        if not till.isdigit() or not (4 <= len(till) <= 9) or till.startswith("0"):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "mpesa_till_number must be a Buy Goods till number (4-9 digits, "
-                    "not starting with 0) — a phone number cannot receive B2B payouts"
-                ),
-            )
-        data.mpesa_till_number = till
+        data.mpesa_till_number = _normalize_till_number(data.mpesa_till_number)
 
     elif method_type == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS:
         missing = []
@@ -391,7 +399,9 @@ async def update_payment_method(
     if request.mpesa_paybill_number is not None:
         pm.mpesa_paybill_number = request.mpesa_paybill_number
     if request.mpesa_till_number is not None:
-        pm.mpesa_till_number = request.mpesa_till_number.strip().replace(" ", "")
+        # Edits go through the same rule as creates — otherwise a good till can
+        # be replaced with a phone number and payouts silently stop landing.
+        pm.mpesa_till_number = _normalize_till_number(request.mpesa_till_number)
     if request.mpesa_shortcode is not None:
         pm.mpesa_shortcode = request.mpesa_shortcode
 

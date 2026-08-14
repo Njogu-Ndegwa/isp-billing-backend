@@ -360,7 +360,11 @@ async def get_reseller_payout_settings(
                 "id": pm.id,
                 "label": pm.label,
                 "method_type": pm.method_type.value if hasattr(pm.method_type, "value") else pm.method_type,
-                "destination": pm.bank_paybill_number or pm.mpesa_paybill_number,
+                "destination": (
+                    pm.bank_paybill_number
+                    or pm.mpesa_paybill_number
+                    or pm.mpesa_till_number
+                ),
             }
             if pm
             else None
@@ -457,8 +461,8 @@ async def reseller_withdraw(
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "No eligible payout destination. Add a bank account or "
-                    "M-Pesa paybill under payment methods first."
+                    "No eligible payout destination. Add a bank account, "
+                    "M-Pesa paybill or M-Pesa till under payment methods first."
                 ),
             )
 

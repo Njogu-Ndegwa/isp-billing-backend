@@ -166,6 +166,8 @@ def _serialize_payment_method_for_admin(pm: ResellerPaymentMethod) -> dict:
         result["bank_account_number"] = pm.bank_account_number
     elif method_type_value == ResellerPaymentMethodType.MPESA_PAYBILL.value:
         result["mpesa_paybill_number"] = pm.mpesa_paybill_number
+    elif method_type_value == ResellerPaymentMethodType.MPESA_TILL.value:
+        result["mpesa_till_number"] = pm.mpesa_till_number
     elif method_type_value == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS.value:
         result["mpesa_shortcode"] = pm.mpesa_shortcode
     elif method_type_value == ResellerPaymentMethodType.ZENOPAY.value:
