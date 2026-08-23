@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     MPESA_B2B_STATUS_TIMEOUT_URL: str = ""
     MPESA_B2B_DAILY_PAYOUT_ENABLED: bool = False
 
+    # A parallel standby must never run billing, payment reconciliation, or
+    # router-maintenance jobs while the production instance is active.
+    RUN_SCHEDULER: bool = True
+
     # Router Auto-Provisioning
     SERVER_PUBLIC_IP: str = ""
     WG_MANAGER_URL: str = "http://host.docker.internal:8729"

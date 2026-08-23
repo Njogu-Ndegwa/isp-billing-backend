@@ -13,6 +13,12 @@ services:
   web:
     mem_limit: 768m
     oom_score_adj: -400
+    environment:
+      # Safe standby defaults. RUN_SCHEDULER must stay false until the manual
+      # cutover step explicitly disables the AWS scheduler first.
+      RUN_SCHEDULER: "${RUN_SCHEDULER:-false}"
+      SERVER_PUBLIC_IP: "${SERVER_PUBLIC_IP:-91.98.238.12}"
+      PULL_SERVICE_URL: "${PULL_SERVICE_URL:-http://91.98.238.12:8443}"
     ports:
       - "127.0.0.1:8000:8000"   # Caddy proxies from 80/443
   freeradius:
