@@ -15,9 +15,11 @@ then every shilling is collected by the platform and paid out afterwards.
 """
 
 import pytest
+from sqlalchemy import select
 
 from app.db.models import (
     CollectionMode,
+    MpesaTransaction,
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
 )
@@ -156,6 +158,14 @@ async def test_assigned_paybill_or_till_does_not_collect_the_money(
     )
 
     assert result["collection_mode"] == CollectionMode.SYSTEM_COLLECTED
+    transaction = (
+        await db.execute(
+            select(MpesaTransaction).where(
+                MpesaTransaction.checkout_request_id == result["checkout_request_id"]
+            )
+        )
+    ).scalar_one()
+    assert transaction.collection_mode == CollectionMode.SYSTEM_COLLECTED
     # No shortcode/passkey/keys passed => initiate_stk_push_direct falls back to
     # the platform's settings.MPESA_* credentials.
     assert stk.last.get("shortcode") is None
@@ -187,6 +197,14 @@ async def test_only_a_reseller_with_daraja_keys_collects_directly(db, stk):
     )
 
     assert result["collection_mode"] == CollectionMode.DIRECT
+    transaction = (
+        await db.execute(
+            select(MpesaTransaction).where(
+                MpesaTransaction.checkout_request_id == result["checkout_request_id"]
+            )
+        )
+    ).scalar_one()
+    assert transaction.collection_mode == CollectionMode.DIRECT
     assert stk.last["shortcode"] == "777777"
     assert stk.last["consumer_key"] == "ck-value"
     assert stk.last["consumer_secret"] == "cs-value"

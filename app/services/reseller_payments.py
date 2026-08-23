@@ -3,10 +3,53 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta
 from fastapi import HTTPException
-from app.db.models import CollectionMode, Customer, CustomerPayment, ResellerFinancials, PaymentMethod, CustomerStatus, PaymentStatus
+from app.db.models import (
+    CollectionMode,
+    Customer,
+    CustomerPayment,
+    MpesaTransaction,
+    PaymentMethod,
+    PaymentStatus,
+    ResellerFinancials,
+    ResellerPaymentMethod,
+    ResellerPaymentMethodType,
+    Router,
+    CustomerStatus,
+)
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+async def resolve_mpesa_collection_mode(
+    db: AsyncSession,
+    transaction: MpesaTransaction,
+    customer: Customer,
+) -> CollectionMode:
+    """Return the immutable collection owner for an M-Pesa transaction.
+
+    New transactions snapshot this at initiation. The router lookup is only a
+    compatibility fallback for transactions created before that column existed
+    or orphan callbacks recovered without their original transaction row.
+    """
+    if transaction.collection_mode is not None:
+        return transaction.collection_mode
+
+    method_type = None
+    if customer.router_id:
+        result = await db.execute(
+            select(ResellerPaymentMethod.method_type)
+            .join(Router, Router.payment_method_id == ResellerPaymentMethod.id)
+            .where(
+                Router.id == customer.router_id,
+                ResellerPaymentMethod.is_active == True,
+            )
+        )
+        method_type = result.scalar_one_or_none()
+
+    if method_type == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS:
+        return CollectionMode.DIRECT
+    return CollectionMode.SYSTEM_COLLECTED
 
 async def record_customer_payment(
     db: AsyncSession,

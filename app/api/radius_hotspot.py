@@ -41,7 +41,7 @@ from pydantic import BaseModel, Field
 
 from app.db.database import get_db
 from app.db.models import (
-    Customer, Plan, Router, CustomerStatus,
+    CollectionMode, Customer, Plan, Router, CustomerStatus,
     MpesaTransaction, MpesaTransactionStatus,
     PaymentMethod, User,
 )
@@ -433,6 +433,7 @@ async def radius_register_and_pay(
                         reference=reference,
                         customer_id=customer.id,
                         plan_id=plan.id,
+                        collection_mode=CollectionMode.SYSTEM_COLLECTED,
                         status=MpesaTransactionStatus.pending
                     )
                     db.add(mpesa_txn)
@@ -634,7 +635,10 @@ async def radius_mpesa_callback(payload: dict, db: AsyncSession = Depends(get_db
             duration_unit = plan.duration_unit.value.upper()
 
             # Record payment
-            from app.services.reseller_payments import record_customer_payment
+            from app.services.reseller_payments import (
+                record_customer_payment,
+                resolve_mpesa_collection_mode,
+            )
 
             if duration_unit == "MINUTES":
                 days_paid_for = max(1, duration_value // (24 * 60))
@@ -653,7 +657,10 @@ async def radius_mpesa_callback(payload: dict, db: AsyncSession = Depends(get_db
                 payment_reference=receipt_number,
                 notes=f"RADIUS M-Pesa STK Push. TX: {checkout_request_id}",
                 duration_value=duration_value,
-                duration_unit=duration_unit
+                duration_unit=duration_unit,
+                collection_mode=await resolve_mpesa_collection_mode(
+                    db, mpesa_txn, customer
+                ),
             )
 
             logger.info(f"[RADIUS CALLBACK] Payment recorded: ID {payment.id}")

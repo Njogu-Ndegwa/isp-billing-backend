@@ -382,6 +382,7 @@
  "mpesa_transactions": [
   "amount",
   "checkout_request_id",
+  "collection_mode",
   "created_at",
   "customer_id",
   "failure_source",

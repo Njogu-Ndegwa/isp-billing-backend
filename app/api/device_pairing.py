@@ -21,6 +21,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db.database import get_db
 from app.db.models import (
+    CollectionMode,
     ConnectionType,
     Customer,
     CustomerStatus,
@@ -1301,6 +1302,7 @@ async def pair_device_and_pay(
                     reference=reference,
                     customer_id=customer.id,
                     plan_id=plan.id,
+                    collection_mode=CollectionMode.SYSTEM_COLLECTED,
                     status=MpesaTransactionStatus.pending,
                 )
                 db.add(mpesa_txn)

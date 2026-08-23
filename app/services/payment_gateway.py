@@ -205,6 +205,7 @@ async def _initiate_mpesa_with_reseller_keys(
         reference=reference,
         customer_id=customer.id,
         plan_id=customer.plan_id,
+        collection_mode=CollectionMode.DIRECT,
         status=MpesaTransactionStatus.pending,
     )
     db.add(mpesa_txn)
@@ -248,6 +249,7 @@ async def _initiate_mpesa_system_collected(
         reference=reference,
         customer_id=customer.id,
         plan_id=customer.plan_id,
+        collection_mode=CollectionMode.SYSTEM_COLLECTED,
         status=MpesaTransactionStatus.pending,
     )
     db.add(mpesa_txn)

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.db.models import (
     Router, Customer, Plan, MpesaTransaction, MpesaTransactionStatus,
-    CustomerStatus, CustomerPayment, ConnectionType, User, PaymentMethod,
+    CustomerStatus, CustomerPayment, CollectionMode, ConnectionType, User, PaymentMethod,
     ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
     C2BTransaction, C2BTransactionStatus,
 )
@@ -144,7 +144,10 @@ async def _finalize_pending_mobile_money_transaction(
     customer: Customer,
     actor_user_id: int,
 ) -> tuple[Plan, CustomerPayment]:
-    from app.services.reseller_payments import record_customer_payment
+    from app.services.reseller_payments import (
+        record_customer_payment,
+        resolve_mpesa_collection_mode,
+    )
 
     plan, duration_value, duration_unit = await _resolve_customer_payment_plan(db, customer)
     if not plan:
@@ -173,6 +176,7 @@ async def _finalize_pending_mobile_money_transaction(
         notes=f"Manual completion from pending M-Pesa TX: {tx.checkout_request_id}",
         duration_value=duration_value,
         duration_unit=duration_unit,
+        collection_mode=await resolve_mpesa_collection_mode(db, tx, customer),
     )
     await db.refresh(customer)
     return plan, payment
@@ -273,9 +277,14 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                         reference=f"RECOVERED-{checkout_request_id}",
                         customer_id=orphan_customer.id,
                         plan_id=orphan_customer.plan_id,
+                        collection_mode=None,
                         status=MpesaTransactionStatus.pending,
                         created_at=datetime.utcnow(),
                         updated_at=datetime.utcnow(),
+                    )
+                    from app.services.reseller_payments import resolve_mpesa_collection_mode
+                    mpesa_txn.collection_mode = await resolve_mpesa_collection_mode(
+                        db, mpesa_txn, orphan_customer
                     )
                     db.add(mpesa_txn)
                     await db.flush()
@@ -363,7 +372,10 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             logger.info(f"PAYMENT CONFIRMED for customer {customer.id}")
             
             # Record payment
-            from app.services.reseller_payments import record_customer_payment
+            from app.services.reseller_payments import (
+                record_customer_payment,
+                resolve_mpesa_collection_mode,
+            )
             from app.db.models import PaymentMethod
             
             # Check for pending plan change (customer paying for a different plan)
@@ -415,7 +427,10 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                 payment_reference=receipt_number,
                 notes=f"M-Pesa STK Push. TX: {checkout_request_id}",
                 duration_value=duration_value,
-                duration_unit=duration_unit
+                duration_unit=duration_unit,
+                collection_mode=await resolve_mpesa_collection_mode(
+                    db, mpesa_txn, customer
+                ),
             )
             
             logger.info(f"[AUDIT] Payment recorded: ID {payment.id}, Amount: {amount}, Days: {days_paid_for}")
@@ -627,6 +642,7 @@ async def initiate_mpesa_payment_api(
                         reference=reference,
                         customer_id=request.customer_id,
                         plan_id=purchased_plan_id,
+                        collection_mode=CollectionMode.SYSTEM_COLLECTED,
                         status=MpesaTransactionStatus.failed,
                         failure_source=FailureSource.MPESA_API,
                         result_code="STK_PUSH_FAILED",
@@ -900,6 +916,7 @@ async def register_hotspot_and_pay_api(
                         reference=reference,
                         customer_id=customer.id,
                         plan_id=plan.id,
+                        collection_mode=CollectionMode.SYSTEM_COLLECTED,
                         status=MpesaTransactionStatus.pending
                     )
                     db.add(mpesa_txn)
@@ -925,6 +942,7 @@ async def register_hotspot_and_pay_api(
                                 reference=reference,
                                 customer_id=customer_id,
                                 plan_id=plan.id,
+                                collection_mode=CollectionMode.SYSTEM_COLLECTED,
                                 status=MpesaTransactionStatus.failed,
                                 failure_source=FailureSource.MPESA_API,
                                 result_code="STK_PUSH_FAILED",

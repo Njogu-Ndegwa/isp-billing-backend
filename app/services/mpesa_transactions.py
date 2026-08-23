@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 from app.db.models import (
     MpesaTransaction, MpesaTransactionStatus, FailureSource,
-    Customer, Plan, CustomerStatus, ConnectionType, PaymentMethod,
+    CollectionMode, Customer, Plan, CustomerStatus, ConnectionType, PaymentMethod,
     ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
 )
 from datetime import datetime, timedelta
@@ -22,7 +22,8 @@ async def save_mpesa_transaction(
     amount: float, 
     reference: str,
     merchant_request_id: str = None,
-    plan_id: int = None
+    plan_id: int = None,
+    collection_mode: CollectionMode = CollectionMode.SYSTEM_COLLECTED,
 ) -> MpesaTransaction:
     """
     Save a new M-Pesa transaction to the database.
@@ -35,6 +36,7 @@ async def save_mpesa_transaction(
             reference=reference,
             merchant_request_id=merchant_request_id,
             plan_id=plan_id,
+            collection_mode=collection_mode,
             status=MpesaTransactionStatus.pending,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
@@ -476,6 +478,7 @@ async def _handle_successful_reconciliation(
 ):
     """Complete a transaction that Safaricom confirms as paid, then provision."""
     from app.db.database import async_session
+    from app.services.reseller_payments import resolve_mpesa_collection_mode
     import json
 
     pppoe_payload = None
@@ -580,6 +583,9 @@ async def _handle_successful_reconciliation(
             notes=f"M-Pesa reconciliation. TX: {txn.checkout_request_id}",
             duration_value=duration_value,
             duration_unit=duration_unit,
+            collection_mode=await resolve_mpesa_collection_mode(
+                db, mpesa_txn, customer
+            ),
         )
         logger.info("[RECONCILE] Payment recorded: ID %s for customer %s", payment.id, customer.id)
 

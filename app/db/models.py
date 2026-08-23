@@ -538,6 +538,14 @@ class MpesaTransaction(Base):
     # Snapshot of the plan purchased in THIS transaction. Customer.plan_id is
     # overwritten on every purchase, so it cannot be used for history.
     plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
+    # Snapshot who collected this transaction. Router payment-method assignments
+    # can change before a delayed callback/reconciliation arrives, so payout
+    # accounting must not infer this from the router's current configuration.
+    collection_mode = Column(
+        Enum(CollectionMode, name="collectionmode",
+             values_callable=lambda e: [x.value for x in e]),
+        nullable=True,
+    )
     merchant_request_id = Column(String(255), nullable=True)
     mpesa_receipt_number = Column(String(255), nullable=True)
     result_code = Column(String(50), nullable=True)

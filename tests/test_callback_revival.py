@@ -26,6 +26,7 @@ from sqlalchemy import select
 from app.api.payment_routes import router as payment_router
 from app.db.database import get_db
 from app.db.models import (
+    CollectionMode,
     Customer,
     CustomerPayment,
     CustomerStatus,
@@ -137,6 +138,7 @@ async def _seed_txn(
     *,
     status: MpesaTransactionStatus,
     failure_source=None,
+    collection_mode=None,
 ):
     """Seed a hotspot customer + an MpesaTransaction in the given status.
 
@@ -162,6 +164,7 @@ async def _seed_txn(
             amount=10.0,
             reference=f"customer-{customer.id}",
             customer_id=customer.id,
+            collection_mode=collection_mode,
             status=status,
             failure_source=failure_source,
             created_at=five_min_ago,
@@ -225,6 +228,28 @@ async def test_success_callback_revives_failed_txn(
     # Revived txn must still trigger hotspot provisioning
     hotspot_calls = [c for c in provision_calls if c[0] == "hotspot"]
     assert len(hotspot_calls) == 1, f"Expected one hotspot provision; got {provision_calls!r}"
+
+
+async def test_direct_stk_callback_marks_payment_direct(
+    session_factory, client, patched_provisioning
+):
+    """Money collected on reseller keys must never enter the payout balance."""
+    customer_id, checkout_id = await _seed_txn(
+        session_factory,
+        status=MpesaTransactionStatus.pending,
+        collection_mode=CollectionMode.DIRECT,
+    )
+
+    resp = await client.post("/api/mpesa/callback", json=_success_payload(checkout_id))
+    assert resp.status_code == 200
+
+    async with session_factory() as s:
+        payment = (
+            await s.execute(
+                select(CustomerPayment).where(CustomerPayment.customer_id == customer_id)
+            )
+        ).scalar_one()
+        assert payment.collection_mode == CollectionMode.DIRECT
 
 
 async def test_callback_for_completed_txn_still_ignored(

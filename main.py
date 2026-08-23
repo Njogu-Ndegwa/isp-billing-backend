@@ -693,6 +693,14 @@ async def run_payment_method_migrations():
             """))
             logger.info("Migration: Added collection_mode column to customer_payments")
 
+        # Snapshot collection ownership on the STK transaction itself. Without
+        # this, callbacks infer from mutable router configuration and direct
+        # reseller collections can be included in platform payout balances.
+        await conn.execute(sa_text("""
+            ALTER TABLE mpesa_transactions
+            ADD COLUMN IF NOT EXISTS collection_mode collectionmode NULL
+        """))
+
         # Add plan_id snapshot to mpesa_transactions and customer_payments if
         # missing. Records the plan purchased in each transaction so history
         # doesn't follow the customer's current plan (see
