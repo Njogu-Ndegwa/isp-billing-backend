@@ -36,6 +36,7 @@ from app.db.models import (
     CustomerStatus,
     Router,
 )
+from app.api.mikrotik_routes import _health_payload_from_snapshot
 from app.services import usage_push
 from app.services.usage_push import RouterMetrics, UsageReport
 from tests.factories import make_customer, make_plan, make_reseller, make_router
@@ -92,7 +93,54 @@ async def test_router_block_writes_a_snapshot(db, session_factory):
     assert snap.interface_tx_bytes == 20 * MB
     assert snap.active_hotspot_users == 5
     assert snap.active_sessions == 2
-    assert snap.active_queues == 6
+    assert snap.active_queues == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hotspot", "pppoe", "queues", "expected_hotspot", "expected_pppoe"),
+    [
+        pytest.param(12, 0, 80, 12, 0, id="hotspot-only"),
+        pytest.param(0, 9, 80, 0, 9, id="pppoe-only"),
+        pytest.param(4, 6, 80, 4, 6, id="mixed"),
+        pytest.param(0, 0, 80, 0, 0, id="no-active-users"),
+    ],
+)
+async def test_router_activity_counts_drive_dashboard_not_simple_queues(
+    db,
+    session_factory,
+    hotspot,
+    pppoe,
+    queues,
+    expected_hotspot,
+    expected_pppoe,
+):
+    """Simple queues are configured customer limits, not active sessions."""
+    router, _ = await _setup(db)
+
+    result = await usage_push.ingest_usage_reports(
+        router.id,
+        [],
+        router_metrics=_metrics(hotspot=hotspot, pppoe=pppoe, queues=queues),
+        session_factory=session_factory,
+    )
+    assert result.snapshot_written is True
+
+    async with session_factory() as s:
+        snap = (await s.execute(
+            select(BandwidthSnapshot).where(BandwidthSnapshot.router_id == router.id)
+        )).scalar_one()
+
+    payload = _health_payload_from_snapshot(
+        latest_snapshot=snap,
+        router_id=router.id,
+        router_name=router.name,
+        reason="test",
+    )
+    assert snap.active_queues == hotspot + pppoe
+    assert payload["active_hotspot_users"] == expected_hotspot
+    assert payload["active_pppoe_users"] == expected_pppoe
+    assert payload["active_total_users"] == expected_hotspot + expected_pppoe
 
 
 @pytest.mark.asyncio

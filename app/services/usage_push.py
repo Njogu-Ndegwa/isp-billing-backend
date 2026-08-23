@@ -277,7 +277,11 @@ async def _persist_router_metrics(
         interface_tx_bytes=tx,
         active_hotspot_users=hotspot,
         active_sessions=pppoe,
-        active_queues=queues,
+        # ``active_queues`` is a legacy name. Dashboard consumers treat it as
+        # the combined number of active Hotspot and PPPoE users, matching the
+        # background poller. A router's simple-queue count is configuration,
+        # not activity, and must never be presented as active PPPoE users.
+        active_queues=hotspot + pppoe,
         total_download_bps=int(avg_download_bps),
         total_upload_bps=int(avg_upload_bps),
         avg_download_bps=avg_download_bps,
