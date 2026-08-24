@@ -19,6 +19,7 @@ Pins:
 from datetime import datetime, timedelta
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 
@@ -43,6 +44,8 @@ from app.services.subscription import (
     MINIMUM_CHARGE,
     PPPOE_PER_USER,
     PRE_EXPIRY_DAYS,
+    MAX_INVOICE_PERIOD_DAYS,
+    cap_invoice_period_start,
     calculate_reseller_charges,
     generate_catchup_invoices,
     generate_invoice_for_reseller,
@@ -203,6 +206,41 @@ async def test_invoice_generated_with_correct_fields(db):
     assert invoice.due_date == PERIOD_END + timedelta(days=GRACE_PERIOD_DAYS)
 
 
+async def test_invoice_period_and_revenue_are_capped_at_30_days(db):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    customer = await make_customer(db, reseller, plan)
+    period_end = datetime(2026, 8, 24, 6, 0)
+    requested_start = period_end - timedelta(days=57)
+    capped_start = period_end - timedelta(days=MAX_INVOICE_PERIOD_DAYS)
+
+    await _add_payment(
+        db, reseller, customer, 30000.0,
+        created_at=capped_start - timedelta(seconds=1),
+    )
+    await _add_payment(
+        db, reseller, customer, 20000.0,
+        created_at=capped_start,
+    )
+
+    invoice = await generate_invoice_for_reseller(
+        db, reseller.id, requested_start, period_end
+    )
+    await db.commit()
+
+    assert invoice.period_start == capped_start
+    assert invoice.period_end == period_end
+    assert invoice.hotspot_revenue == 20000.0
+    assert invoice.final_charge == 600.0
+
+
+def test_invoice_period_cap_keeps_more_recent_start():
+    period_end = datetime(2026, 8, 24, 6, 0)
+    recent_start = period_end - timedelta(days=12)
+
+    assert cap_invoice_period_start(recent_start, period_end) == recent_start
+
+
 async def test_duplicate_generation_same_user_period_is_noop(db):
     reseller = await make_reseller(db)
 
@@ -280,7 +318,7 @@ async def test_monthly_invoices_only_active_and_trial_resellers(db):
             select(SubscriptionInvoice).where(SubscriptionInvoice.user_id == active.id)
         )
     ).scalar_one()
-    assert invoice.period_start == expected_start
+    assert invoice.period_start == cap_invoice_period_start(expected_start, expected_end)
     assert invoice.period_end == expected_end
     assert invoice.final_charge == MINIMUM_CHARGE  # no usage -> minimum charge
 
@@ -426,6 +464,67 @@ async def test_pre_expiry_period_resumes_from_last_invoice(db):
         )
     ).scalar_one()
     assert new_invoice.period_start == last_end
+
+
+async def test_pre_expiry_drops_sales_older_than_30_days(db):
+    now = datetime.utcnow()
+    reseller = await make_reseller(
+        db,
+        subscription_status=SubscriptionStatus.ACTIVE,
+        subscription_expires_at=now + timedelta(days=2),
+    )
+    stale_end = now - timedelta(days=57)
+    db.add(
+        SubscriptionInvoice(
+            user_id=reseller.id,
+            period_start=stale_end - timedelta(days=30),
+            period_end=stale_end,
+            final_charge=500.0,
+            status=InvoiceStatus.PAID,
+            due_date=stale_end,
+            paid_at=stale_end,
+        )
+    )
+    await db.commit()
+
+    before = datetime.utcnow()
+    result = await generate_pre_expiry_invoices(db)
+    after = datetime.utcnow()
+
+    assert result["created"] == 1
+    invoice = (
+        await db.execute(
+            select(SubscriptionInvoice)
+            .where(
+                SubscriptionInvoice.user_id == reseller.id,
+                SubscriptionInvoice.status == InvoiceStatus.PENDING,
+            )
+        )
+    ).scalar_one()
+    assert before - timedelta(days=30) <= invoice.period_start <= after - timedelta(days=30)
+
+
+async def test_request_invoice_rejects_premature_invoice_after_renewal(db, monkeypatch):
+    from app.api import subscription_routes
+
+    now = datetime.utcnow()
+    reseller = await make_reseller(
+        db,
+        subscription_status=SubscriptionStatus.ACTIVE,
+        subscription_expires_at=now + timedelta(days=25),
+    )
+
+    async def fake_current_user(token, _db):
+        return reseller
+
+    monkeypatch.setattr(subscription_routes, "get_current_user", fake_current_user)
+
+    with pytest.raises(HTTPException) as exc:
+        await subscription_routes.request_my_invoice(db=db, token="test-token")
+
+    assert exc.value.status_code == 400
+    assert "within 5 days" in exc.value.detail
+    assert await _invoice_count(db, reseller.id) == 0
 
 
 # ---------------------------------------------------------------------------

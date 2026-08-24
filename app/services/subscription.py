@@ -43,6 +43,18 @@ MINIMUM_CHARGE = 500.0        # 500 KES minimum monthly charge
 TRIAL_DAYS = 7
 GRACE_PERIOD_DAYS = 5
 DUE_SOON_THRESHOLD_DAYS = 5
+MAX_INVOICE_PERIOD_DAYS = 30
+
+
+def cap_invoice_period_start(period_start: datetime, period_end: datetime) -> datetime:
+    """Keep every reseller invoice inside the trailing 30-day billing window.
+
+    ``period_start`` is still useful when the prior invoice ended recently: in
+    that case it prevents two invoices from covering the same sale.  A stale
+    prior invoice must never pull older, previously unbilled sales into the
+    current invoice.
+    """
+    return max(period_start, period_end - timedelta(days=MAX_INVOICE_PERIOD_DAYS))
 
 
 def add_calendar_months(dt: datetime, months: int) -> datetime:
@@ -107,6 +119,7 @@ async def generate_invoice_for_reseller(
     db: AsyncSession, user_id: int, period_start: datetime, period_end: datetime
 ) -> SubscriptionInvoice | None:
     """Generate an invoice for a single reseller. Returns None if already exists."""
+    period_start = cap_invoice_period_start(period_start, period_end)
     existing = (await db.execute(
         select(SubscriptionInvoice).where(
             SubscriptionInvoice.user_id == user_id,
@@ -885,8 +898,8 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
     (e.g. due to server downtime).
 
     Billing period logic:
-      period_start = last invoice's period_end  (or subscription start)
-      period_end   = now  (so the *next* cycle resumes from here)
+      period_start = later of the prior invoice end and trailing-30-day cutoff
+      period_end   = now
       due_date     = subscription_expires_at
     """
     now = datetime.utcnow()
@@ -940,6 +953,7 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
                 )
 
             period_end = now
+            period_start = cap_invoice_period_start(period_start, period_end)
             if period_start >= period_end:
                 skipped += 1
                 continue
@@ -1063,6 +1077,7 @@ async def generate_catchup_invoices(db: AsyncSession) -> dict:
                     period_start = reseller.subscription_expires_at - timedelta(days=30)
 
             period_end = now
+            period_start = cap_invoice_period_start(period_start, period_end)
             if period_start >= period_end:
                 skipped += 1
                 continue

@@ -1255,6 +1255,19 @@ async def run_subscription_migrations():
             "CREATE INDEX IF NOT EXISTS idx_sub_invoices_due ON subscription_invoices(due_date)"
         )
 
+    # Existing historical rows include periods longer than 30 days, so add the
+    # guard NOT VALID: PostgreSQL enforces it for every new or repaired invoice
+    # without blocking startup on old audit records.
+    await _run_sql("Guard subscription invoice period at 30 days",
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+        "WHERE conname = 'ck_subscription_invoices_max_30_days') THEN "
+        "ALTER TABLE subscription_invoices "
+        "ADD CONSTRAINT ck_subscription_invoices_max_30_days "
+        "CHECK (period_end <= period_start + INTERVAL '30 days') NOT VALID; "
+        "END IF; END $$"
+    )
+
     # Step 5: Create subscription_payments table
     async with async_engine.begin() as conn:
         result = await conn.execute(sa_text(

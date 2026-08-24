@@ -22,7 +22,8 @@ from app.services.subscription import (
     generate_invoice_for_reseller, record_subscription_payment,
     get_invoice_alert_for_user,
     verify_subscription_payments_for_reseller,
-    TRIAL_DAYS, GRACE_PERIOD_DAYS,
+    cap_invoice_period_start,
+    TRIAL_DAYS, GRACE_PERIOD_DAYS, PRE_EXPIRY_DAYS,
 )
 from app.services.mpesa import initiate_stk_push_direct
 from app.services.mpesa_b2b import (
@@ -199,6 +200,20 @@ async def request_my_invoice(
     expires = user.subscription_expires_at
     now = datetime.utcnow()
 
+    status = (
+        user.subscription_status.value
+        if hasattr(user.subscription_status, "value")
+        else user.subscription_status
+    )
+    if status in ("active", "trial") and expires > now + timedelta(days=PRE_EXPIRY_DAYS):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Your next invoice will be available within {PRE_EXPIRY_DAYS} "
+                "days of subscription expiry."
+            ),
+        )
+
     # period_start = last invoice's period_end, or subscription start
     last_invoice = (await db.execute(
         select(SubscriptionInvoice)
@@ -218,6 +233,7 @@ async def request_my_invoice(
         )
 
     period_end = now
+    period_start = cap_invoice_period_start(period_start, period_end)
     if period_start >= period_end:
         raise HTTPException(
             status_code=400,
