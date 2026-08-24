@@ -49,13 +49,34 @@ The production audit on August 24 found:
 - 25 open invoices covered more than 30 days.
 - Five open invoices exceeded a strict trailing-30-day price, by KES 1,086.54
   in total.
-- Fourteen paid invoices across nine resellers were KES 1,708.56 above the same
+- Fourteen paid invoices across nine resellers were KES 1,715.46 above the same
   trailing-30-day calculation.
 
 Kennice Networks accounted for KES 861.75 of the open difference before the
-separate duplicate-payment-reference adjustment. Central Kiddoh had already
-paid KES 450 above the trailing-30-day calculation on invoice #377 and had an
-additional KES 80.25 difference on pending invoice #489.
+separate duplicate-payment-reference adjustment. Kennice had also paid an
+estimated KES 8.85 extra on invoice #270. Central Kiddoh had already paid an
+estimated KES 451.50 above the trailing-30-day calculation on invoice #377 and
+had an additional KES 80.25 difference on pending invoice #489.
+
+### Customers who had already paid an estimated excess
+
+Status is the live subscription status checked on August 24, 2026. The estimate
+keeps the PPPoE charge recorded on each original invoice and recalculates only
+the hotspot revenue inside the strict trailing-30-day window.
+
+| Customer | Email | Estimated excess | Current status |
+|---|---|---:|---|
+| Bitwave Soko Wifi | dennisndegwa001@gmail.com | KES 49.47 | Active |
+| SIMNET | salomonkiptanui@gmail.com | KES 52.68 | Suspended |
+| Kaloleni SkyNet Pro | festusyaa30@gmail.com | KES 123.90 | Active |
+| Major1 net | abudojunior3@gmail.com | KES 145.17 | Active |
+| Lightning Fast Hotspot | muchocyro@gmail.com | KES 118.50 | Active |
+| Major1 Net | abudojunior5@gmail.com | KES 743.16 | Active |
+| Kennice Networks | mikekariuki697@gmail.com | KES 8.85 | Active |
+| Central Kiddoh | dennis1486@gmail.com | KES 451.50 | Active |
+| YahWeh Tech | vincentmuchele5@gmail.com | KES 22.23 | Active |
+
+Kennice Networks is the customer whose August invoice exposed the wider issue.
 
 Historical paid amounts are an audit list, not an automatic refund instruction.
 They need a separate decision on refund or account-credit handling.
@@ -87,5 +108,12 @@ The subscription tests cover:
 - the pre-expiry job capping a stale prior period; and
 - an invoice request immediately after renewal being rejected.
 
-After deployment, verify that the scheduled invoice job creates no period longer
-than 30 days and run the repair tool in dry-run mode before changing open invoices.
+The fix was deployed on August 24, 2026. The repair was previewed first, then
+applied to all 25 open invoices that exceeded 30 days. Five payable amounts were
+reduced by KES 1,086.54 in total; the remaining 20 stayed at the same payable
+amount, usually because the KES 500 minimum still applied.
+
+Post-repair verification found no pending or overdue invoice longer than 30 days.
+Kennice invoice #497 is now KES 1,752.05 for exactly 30 days, and Central Kiddoh
+invoice #489 is now KES 2,203.50 for exactly 30 days. The database guard is also
+present and rejects any new or updated invoice longer than 30 days.
