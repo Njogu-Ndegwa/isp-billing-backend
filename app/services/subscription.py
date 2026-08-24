@@ -100,6 +100,8 @@ async def calculate_reseller_charges(
         .where(
             Customer.user_id == user_id,
             Customer.status == CustomerStatus.ACTIVE,
+            Customer.expiry.is_not(None),
+            Customer.expiry > period_end,
             Plan.connection_type == ConnectionType.PPPOE,
         )
     )).scalar() or 0

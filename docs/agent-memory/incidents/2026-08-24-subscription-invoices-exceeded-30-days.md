@@ -103,6 +103,35 @@ historical rows remain readable.
 The one-off repair tool recalculates selected pending or overdue invoices. It is
 dry-run by default and refuses to alter paid or waived invoices.
 
+### PPPoE snapshot rule
+
+The review also found that the PPPoE portion counted every customer whose
+status field was `ACTIVE`, even when that customer's access had already
+expired. Future invoices now apply one simple cutoff rule: charge KES 25 only
+when the customer is on a PPPoE plan, is marked active, has an expiry, and that
+expiry is later than the invoice-generation cutoff. There is no daily
+proration. Customers expired before the cutoff are excluded; customers renewed
+after the cutoff appear on the next invoice.
+
+The current hotspot and PPPoE selections are disjoint by plan type, so a single
+customer is not charged as both hotspot revenue and a PPPoE seat on the same
+invoice.
+
+An audit of all 353 open invoices found eight stored PPPoE snapshots that differ
+from a reconstruction using today's customer records. Those old rows were not
+blindly rewritten because later renewals can change a customer's current expiry
+and make a historical reconstruction wrong. Kennice invoice #497 is an example:
+17 customers were active and unexpired at its August 24 cutoff; an eighteenth
+renewed three hours later and must not be added retroactively.
+
+MACROFIBERWAVE invoice #213 was separately verified. It recorded 240 PPPoE
+customers at the June 6 cutoff, but only 216 had an expiry later than that
+cutoff. All 216 are still marked active, none was created after the cutoff, and
+there are no recorded post-cutoff payments. The router is offline now and was
+last online June 3, but present-day connectivity cannot erase a historical
+entitlement. The defensible unpaid correction is therefore 216 × KES 25 = KES
+5,400, down from KES 6,000.
+
 ## Verification
 
 The subscription tests cover:
@@ -112,8 +141,12 @@ The subscription tests cover:
 - a valid 31-day calendar month being retained without a gap;
 - February producing the correct shorter calendar window;
 - a recent previous-invoice end remaining unchanged;
-- the pre-expiry job capping a stale prior period; and
-- an invoice request immediately after renewal being rejected.
+- the pre-expiry job capping a stale prior period;
+- an invoice request immediately after renewal being rejected;
+- PPPoE customers being counted only when active and unexpired at the invoice
+  cutoff; and
+- the repair tool preserving the original PPPoE snapshot unless a separately
+  verified replacement is explicitly requested.
 
 A temporary fixed-30-day guard was deployed first and repaired the 25 open
 invoices. Before any of the materially affected invoices was paid, the policy

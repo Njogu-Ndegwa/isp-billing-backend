@@ -2,7 +2,7 @@
 
 The platform bills resellers a SaaS subscription — this is real money:
   * 3% of hotspot revenue collected in the billing period
-  * KES 25 per ACTIVE PPPoE user
+  * KES 25 per ACTIVE PPPoE user whose access is unexpired at invoice time
   * KES 500 minimum monthly charge
 
 Pins:
@@ -116,7 +116,11 @@ async def test_charges_hotspot_percent_plus_pppoe_per_user(db):
 
     for _ in range(4):
         await make_customer(
-            db, reseller, pppoe_plan, status=CustomerStatus.ACTIVE
+            db,
+            reseller,
+            pppoe_plan,
+            status=CustomerStatus.ACTIVE,
+            expiry=PERIOD_END + timedelta(days=1),
         )
 
     charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
@@ -167,16 +171,50 @@ async def test_charges_exclude_non_qualifying_payments(db):
     assert charges["hotspot_charge"] == 300.0
 
 
-async def test_charges_pppoe_counts_only_active_pppoe_customers(db):
+async def test_charges_pppoe_counts_only_active_unexpired_customers_at_cutoff(db):
     reseller = await make_reseller(db)
     pppoe_plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
     hotspot_plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
 
-    await make_customer(db, reseller, pppoe_plan, status=CustomerStatus.ACTIVE)
-    await make_customer(db, reseller, pppoe_plan, status=CustomerStatus.INACTIVE)
-    await make_customer(db, reseller, pppoe_plan, status=CustomerStatus.PENDING)
+    await make_customer(
+        db,
+        reseller,
+        pppoe_plan,
+        status=CustomerStatus.ACTIVE,
+        expiry=PERIOD_END + timedelta(seconds=1),
+    )
+    await make_customer(
+        db,
+        reseller,
+        pppoe_plan,
+        status=CustomerStatus.ACTIVE,
+        expiry=PERIOD_END,
+    )
+    await make_customer(
+        db, reseller, pppoe_plan, status=CustomerStatus.ACTIVE, expiry=None
+    )
+    await make_customer(
+        db,
+        reseller,
+        pppoe_plan,
+        status=CustomerStatus.INACTIVE,
+        expiry=PERIOD_END + timedelta(days=1),
+    )
+    await make_customer(
+        db,
+        reseller,
+        pppoe_plan,
+        status=CustomerStatus.PENDING,
+        expiry=PERIOD_END + timedelta(days=1),
+    )
     # ACTIVE hotspot customer must not be billed the PPPoE per-user fee
-    await make_customer(db, reseller, hotspot_plan, status=CustomerStatus.ACTIVE)
+    await make_customer(
+        db,
+        reseller,
+        hotspot_plan,
+        status=CustomerStatus.ACTIVE,
+        expiry=PERIOD_END + timedelta(days=1),
+    )
 
     charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
 
@@ -261,15 +299,39 @@ def test_invoice_calendar_month_tracks_short_february():
 def test_invoice_repair_preserves_original_pppoe_charge_snapshot():
     from scripts.repair_subscription_invoice_windows import repaired_charge_fields
 
-    invoice = SimpleNamespace(pppoe_charge=425.0)
+    invoice = SimpleNamespace(pppoe_user_count=17, pppoe_charge=425.0)
 
     charges = repaired_charge_fields(invoice, hotspot_revenue=45725.0)
 
     assert charges == {
         "hotspot_revenue": 45725.0,
         "hotspot_charge": 1371.75,
+        "pppoe_user_count": 17,
+        "pppoe_charge": 425.0,
         "gross_charge": 1796.75,
         "final_charge": 1796.75,
+    }
+
+
+def test_invoice_repair_can_replace_verified_pppoe_snapshot():
+    from scripts.repair_subscription_invoice_windows import repaired_charge_fields
+
+    invoice = SimpleNamespace(pppoe_user_count=240, pppoe_charge=6000.0)
+
+    charges = repaired_charge_fields(
+        invoice,
+        hotspot_revenue=0.0,
+        pppoe_user_count=216,
+        pppoe_charge=5400.0,
+    )
+
+    assert charges == {
+        "hotspot_revenue": 0.0,
+        "hotspot_charge": 0.0,
+        "pppoe_user_count": 216,
+        "pppoe_charge": 5400.0,
+        "gross_charge": 5400.0,
+        "final_charge": 5400.0,
     }
 
 
@@ -324,6 +386,58 @@ async def test_invoice_repair_restores_full_calendar_month(db, monkeypatch):
     assert invoice.period_start == datetime(2026, 7, 24, 6, 0)
     assert invoice.hotspot_revenue == 21000.0
     assert invoice.final_charge == 630.0
+
+
+async def test_invoice_repair_recalculates_pppoe_only_when_requested(db, monkeypatch):
+    from app.db import database as db_module
+    from scripts import repair_subscription_invoice_windows as repair_script
+
+    monkeypatch.setattr(
+        repair_script, "AsyncSessionLocal", db_module.AsyncSessionLocal
+    )
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    await make_customer(
+        db,
+        reseller,
+        plan,
+        status=CustomerStatus.ACTIVE,
+        expiry=PERIOD_END + timedelta(days=1),
+    )
+    await make_customer(
+        db,
+        reseller,
+        plan,
+        status=CustomerStatus.ACTIVE,
+        expiry=PERIOD_END,
+    )
+    invoice = SubscriptionInvoice(
+        user_id=reseller.id,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        hotspot_revenue=0.0,
+        hotspot_charge=0.0,
+        pppoe_user_count=24,
+        pppoe_charge=600.0,
+        gross_charge=600.0,
+        final_charge=600.0,
+        status=InvoiceStatus.OVERDUE,
+        due_date=PERIOD_END,
+    )
+    db.add(invoice)
+    await db.commit()
+
+    result = await repair_script.run(
+        [invoice.id], apply=True, recalculate_pppoe=True
+    )
+    await db.refresh(invoice)
+
+    assert result[0]["old_pppoe_user_count"] == 24
+    assert result[0]["new_pppoe_user_count"] == 1
+    assert invoice.pppoe_user_count == 1
+    assert invoice.pppoe_charge == PPPOE_PER_USER
+    assert invoice.final_charge == MINIMUM_CHARGE
 
 
 async def test_duplicate_generation_same_user_period_is_noop(db):
