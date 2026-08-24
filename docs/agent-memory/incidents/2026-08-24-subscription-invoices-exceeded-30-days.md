@@ -129,7 +129,7 @@ customers at the June 6 cutoff, but only 216 had an expiry later than that
 cutoff. All 216 are still marked active, none was created after the cutoff, and
 there are no recorded post-cutoff payments. The router is offline now and was
 last online June 3, but present-day connectivity cannot erase a historical
-entitlement. The defensible unpaid correction is therefore 216 × KES 25 = KES
+entitlement. Invoice #213 was therefore corrected to 216 × KES 25 = KES
 5,400, down from KES 6,000.
 
 ## Verification
@@ -161,5 +161,7 @@ repair was previewed before it was applied. Final production verification found:
   its end;
 - Kennice invoice #497 at KES 1,796.75 for July 24-August 24;
 - Central Kiddoh invoice #489 at KES 2,283.75 for July 23-August 23;
-- FLUX NET invoice #186 at KES 517.13 for April 28-May 28; and
+- FLUX NET invoice #186 at KES 517.13 for April 28-May 28;
+- MACROFIBERWAVE invoice #213 corrected from 240 to 216 PPPoE customers,
+  reducing the unpaid balance from KES 6,000 to KES 5,400; and
 - paid historical invoices #366 and #377 unchanged.
