@@ -120,3 +120,13 @@ invoices. Before any of the materially affected invoices was paid, the policy
 was clarified and the implementation was changed to calendar-month semantics.
 The final repair restores the correct calendar boundary on open invoices only;
 paid and waived invoices are never changed by the repair tool.
+
+The calendar-month fix was deployed in commit `450b202` and the open-invoice
+repair was previewed before it was applied. Final production verification found:
+
+- no pending or overdue invoice starting earlier than one calendar month before
+  its end;
+- Kennice invoice #497 at KES 1,796.75 for July 24-August 24;
+- Central Kiddoh invoice #489 at KES 2,283.75 for July 23-August 23;
+- FLUX NET invoice #186 at KES 517.13 for April 28-May 28; and
+- paid historical invoices #366 and #377 unchanged.
