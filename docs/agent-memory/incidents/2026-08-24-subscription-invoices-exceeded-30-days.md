@@ -1,4 +1,4 @@
-# Subscription invoices exceeded the 30-day billing window
+# Subscription invoices exceeded one calendar billing month
 
 ## What happened
 
@@ -42,58 +42,63 @@ short invoice ended.
 
 ## Scope and financial exposure
 
-The production audit on August 24 found:
+The initial production audit on August 24 found:
 
 - 502 subscription invoices in total.
 - 79 invoices across 51 resellers covered more than 30 days.
 - 25 open invoices covered more than 30 days.
-- Five open invoices exceeded a strict trailing-30-day price, by KES 1,086.54
-  in total.
-- Fourteen paid invoices across nine resellers were KES 1,715.46 above the same
-  trailing-30-day calculation.
 
-Kennice Networks accounted for KES 861.75 of the open difference before the
-separate duplicate-payment-reference adjustment. Kennice had also paid an
-estimated KES 8.85 extra on invoice #270. Central Kiddoh had already paid an
-estimated KES 451.50 above the trailing-30-day calculation on invoice #377 and
-had an additional KES 80.25 difference on pending invoice #489.
+That first pass used a fixed 30-day comparison. The billing policy was then
+clarified: renewal is from the same date in one month to the same date in the
+next, so a legitimate billing month may contain 28, 29, 30, or 31 days. The
+fixed-30-day comparison incorrectly treated ordinary 31-day cycles as excess.
+
+Under the final calendar-month policy, two open invoices had a monetary excess:
+
+- Kennice Networks invoice #497: KES 2,613.80 to KES 1,796.75, a KES 817.05
+  reduction.
+- FLUX NET invoice #186: KES 581.15 to KES 517.13, a KES 64.02 reduction.
+
+The total correction on unpaid invoices is KES 881.07. Other open invoices may
+need their displayed date boundary restored or capped to one calendar month,
+but their payable value does not change.
 
 ### Customers who had already paid an estimated excess
 
 Status is the live subscription status checked on August 24, 2026. The estimate
 keeps the PPPoE charge recorded on each original invoice and recalculates only
-the hotspot revenue inside the strict trailing-30-day window.
+the hotspot revenue inside the final one-calendar-month window.
 
 | Customer | Email | Estimated excess | Current status |
 |---|---|---:|---|
-| Bitwave Soko Wifi | dennisndegwa001@gmail.com | KES 49.47 | Active |
-| SIMNET | salomonkiptanui@gmail.com | KES 52.68 | Suspended |
-| Kaloleni SkyNet Pro | festusyaa30@gmail.com | KES 123.90 | Active |
-| Major1 net | abudojunior3@gmail.com | KES 145.17 | Active |
-| Lightning Fast Hotspot | muchocyro@gmail.com | KES 118.50 | Active |
-| Major1 Net | abudojunior5@gmail.com | KES 743.16 | Active |
-| Kennice Networks | mikekariuki697@gmail.com | KES 8.85 | Active |
+| Lightning Fast Hotspot | muchocyro@gmail.com | KES 60.90 | Active |
+| Major1 Net | abudojunior5@gmail.com | KES 724.62 | Active |
+| Kennice Networks | mikekariuki697@gmail.com | KES 3.45 | Active |
 | Central Kiddoh | dennis1486@gmail.com | KES 451.50 | Active |
-| YahWeh Tech | vincentmuchele5@gmail.com | KES 22.23 | Active |
+
+The four historical estimates total KES 1,240.47. They are not changed in the
+system; refunds or credits will be handled separately.
 
 Kennice Networks is the customer whose August invoice exposed the wider issue.
-
-Historical paid amounts are an audit list, not an automatic refund instruction.
-They need a separate decision on refund or account-credit handling.
 
 ## Fix
 
 All invoice creation paths now set the start to the later of:
 
 - the natural start (normally the previous invoice's end), and
-- exactly 30 days before the invoice end.
+- the same date one calendar month before the invoice end.
+
+This keeps normal cycles continuous while allowing February and 31-day months.
+If the previous boundary is stale because of the historical bug, old backlog is
+not pulled into the current invoice.
 
 The Request Invoice endpoint now rejects requests from active or trial resellers
 until they are within five days of expiry. Expired and suspended resellers can
 still request the invoice they need to renew.
 
-PostgreSQL also has a `NOT VALID` check constraint that rejects new or updated
-invoice periods over 30 days. Existing historical rows remain readable.
+PostgreSQL also has a `NOT VALID` check constraint that rejects a new or updated
+invoice starting earlier than one calendar month before its end. Existing
+historical rows remain readable.
 
 The one-off repair tool recalculates selected pending or overdue invoices. It is
 dry-run by default and refuses to alter paid or waived invoices.
@@ -102,18 +107,16 @@ dry-run by default and refuses to alter paid or waived invoices.
 
 The subscription tests cover:
 
-- a 57-day requested period being reduced to 30 days;
+- a 57-day requested period being reduced to one calendar month;
 - revenue before the cutoff being excluded;
+- a valid 31-day calendar month being retained without a gap;
+- February producing the correct shorter calendar window;
 - a recent previous-invoice end remaining unchanged;
 - the pre-expiry job capping a stale prior period; and
 - an invoice request immediately after renewal being rejected.
 
-The fix was deployed on August 24, 2026. The repair was previewed first, then
-applied to all 25 open invoices that exceeded 30 days. Five payable amounts were
-reduced by KES 1,086.54 in total; the remaining 20 stayed at the same payable
-amount, usually because the KES 500 minimum still applied.
-
-Post-repair verification found no pending or overdue invoice longer than 30 days.
-Kennice invoice #497 is now KES 1,752.05 for exactly 30 days, and Central Kiddoh
-invoice #489 is now KES 2,203.50 for exactly 30 days. The database guard is also
-present and rejects any new or updated invoice longer than 30 days.
+A temporary fixed-30-day guard was deployed first and repaired the 25 open
+invoices. Before any of the materially affected invoices was paid, the policy
+was clarified and the implementation was changed to calendar-month semantics.
+The final repair restores the correct calendar boundary on open invoices only;
+paid and waived invoices are never changed by the repair tool.

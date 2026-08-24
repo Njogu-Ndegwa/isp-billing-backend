@@ -45,13 +45,14 @@ from app.services.subscription import (
     MINIMUM_CHARGE,
     PPPOE_PER_USER,
     PRE_EXPIRY_DAYS,
-    MAX_INVOICE_PERIOD_DAYS,
+    MAX_INVOICE_PERIOD_MONTHS,
     cap_invoice_period_start,
     calculate_reseller_charges,
     generate_catchup_invoices,
     generate_invoice_for_reseller,
     generate_monthly_invoices,
     generate_pre_expiry_invoices,
+    invoice_calendar_month_start,
     record_subscription_payment,
 )
 from tests.factories import make_customer, make_plan, make_reseller
@@ -207,13 +208,14 @@ async def test_invoice_generated_with_correct_fields(db):
     assert invoice.due_date == PERIOD_END + timedelta(days=GRACE_PERIOD_DAYS)
 
 
-async def test_invoice_period_and_revenue_are_capped_at_30_days(db):
+async def test_invoice_period_and_revenue_are_capped_at_one_calendar_month(db):
     reseller = await make_reseller(db)
     plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
     customer = await make_customer(db, reseller, plan)
     period_end = datetime(2026, 8, 24, 6, 0)
     requested_start = period_end - timedelta(days=57)
-    capped_start = period_end - timedelta(days=MAX_INVOICE_PERIOD_DAYS)
+    assert MAX_INVOICE_PERIOD_MONTHS == 1
+    capped_start = datetime(2026, 7, 24, 6, 0)
 
     await _add_payment(
         db, reseller, customer, 30000.0,
@@ -242,19 +244,86 @@ def test_invoice_period_cap_keeps_more_recent_start():
     assert cap_invoice_period_start(recent_start, period_end) == recent_start
 
 
+def test_invoice_period_cap_keeps_full_31_day_calendar_month():
+    period_start = datetime(2026, 7, 23, 6, 0)
+    period_end = datetime(2026, 8, 23, 6, 0)
+
+    assert (period_end - period_start).days == 31
+    assert cap_invoice_period_start(period_start, period_end) == period_start
+
+
+def test_invoice_calendar_month_tracks_short_february():
+    period_end = datetime(2027, 3, 17, 6, 0)
+
+    assert invoice_calendar_month_start(period_end) == datetime(2027, 2, 17, 6, 0)
+
+
 def test_invoice_repair_preserves_original_pppoe_charge_snapshot():
     from scripts.repair_subscription_invoice_windows import repaired_charge_fields
 
     invoice = SimpleNamespace(pppoe_charge=425.0)
 
-    charges = repaired_charge_fields(invoice, hotspot_revenue=44235.0)
+    charges = repaired_charge_fields(invoice, hotspot_revenue=45725.0)
 
     assert charges == {
-        "hotspot_revenue": 44235.0,
-        "hotspot_charge": 1327.05,
-        "gross_charge": 1752.05,
-        "final_charge": 1752.05,
+        "hotspot_revenue": 45725.0,
+        "hotspot_charge": 1371.75,
+        "gross_charge": 1796.75,
+        "final_charge": 1796.75,
     }
+
+
+async def test_invoice_repair_restores_full_calendar_month(db, monkeypatch):
+    from app.db import database as db_module
+    from scripts import repair_subscription_invoice_windows as repair_script
+
+    monkeypatch.setattr(
+        repair_script, "AsyncSessionLocal", db_module.AsyncSessionLocal
+    )
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    customer = await make_customer(db, reseller, plan)
+    period_end = datetime(2026, 8, 24, 6, 0)
+    invoice = SubscriptionInvoice(
+        user_id=reseller.id,
+        period_start=datetime(2026, 7, 25, 6, 0),
+        period_end=period_end,
+        hotspot_revenue=20000.0,
+        hotspot_charge=600.0,
+        pppoe_user_count=0,
+        pppoe_charge=0.0,
+        gross_charge=600.0,
+        final_charge=600.0,
+        status=InvoiceStatus.PENDING,
+        due_date=period_end,
+    )
+    db.add(invoice)
+    await _add_payment(
+        db,
+        reseller,
+        customer,
+        1000.0,
+        created_at=datetime(2026, 7, 24, 12, 0),
+    )
+    await _add_payment(
+        db,
+        reseller,
+        customer,
+        20000.0,
+        created_at=datetime(2026, 8, 1, 12, 0),
+    )
+    await db.commit()
+
+    result = await repair_script.run(
+        [invoice.id], apply=True, restore_calendar_month=True
+    )
+    await db.refresh(invoice)
+
+    assert result[0]["new_period_start"] == "2026-07-24T06:00:00"
+    assert invoice.period_start == datetime(2026, 7, 24, 6, 0)
+    assert invoice.hotspot_revenue == 21000.0
+    assert invoice.final_charge == 630.0
 
 
 async def test_duplicate_generation_same_user_period_is_noop(db):
@@ -482,7 +551,7 @@ async def test_pre_expiry_period_resumes_from_last_invoice(db):
     assert new_invoice.period_start == last_end
 
 
-async def test_pre_expiry_drops_sales_older_than_30_days(db):
+async def test_pre_expiry_drops_sales_older_than_one_calendar_month(db):
     now = datetime.utcnow()
     reseller = await make_reseller(
         db,
@@ -517,7 +586,11 @@ async def test_pre_expiry_drops_sales_older_than_30_days(db):
             )
         )
     ).scalar_one()
-    assert before - timedelta(days=30) <= invoice.period_start <= after - timedelta(days=30)
+    assert (
+        invoice_calendar_month_start(before)
+        <= invoice.period_start
+        <= invoice_calendar_month_start(after)
+    )
 
 
 async def test_request_invoice_rejects_premature_invoice_after_renewal(db, monkeypatch):

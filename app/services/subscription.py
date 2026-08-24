@@ -43,18 +43,7 @@ MINIMUM_CHARGE = 500.0        # 500 KES minimum monthly charge
 TRIAL_DAYS = 7
 GRACE_PERIOD_DAYS = 5
 DUE_SOON_THRESHOLD_DAYS = 5
-MAX_INVOICE_PERIOD_DAYS = 30
-
-
-def cap_invoice_period_start(period_start: datetime, period_end: datetime) -> datetime:
-    """Keep every reseller invoice inside the trailing 30-day billing window.
-
-    ``period_start`` is still useful when the prior invoice ended recently: in
-    that case it prevents two invoices from covering the same sale.  A stale
-    prior invoice must never pull older, previously unbilled sales into the
-    current invoice.
-    """
-    return max(period_start, period_end - timedelta(days=MAX_INVOICE_PERIOD_DAYS))
+MAX_INVOICE_PERIOD_MONTHS = 1
 
 
 def add_calendar_months(dt: datetime, months: int) -> datetime:
@@ -66,6 +55,21 @@ def add_calendar_months(dt: datetime, months: int) -> datetime:
     month = (month - 1) % 12 + 1
     day = min(dt.day, calendar.monthrange(year, month)[1])
     return dt.replace(year=year, month=month, day=day)
+
+
+def invoice_calendar_month_start(period_end: datetime) -> datetime:
+    """Return the same billing date one calendar month before ``period_end``."""
+    return add_calendar_months(period_end, -MAX_INVOICE_PERIOD_MONTHS)
+
+
+def cap_invoice_period_start(period_start: datetime, period_end: datetime) -> datetime:
+    """Keep an invoice within one calendar month without creating normal-cycle gaps.
+
+    A month may contain 28, 29, 30, or 31 days.  ``period_start`` remains the
+    continuity boundary from the prior invoice; only a stale boundary older
+    than one calendar month is moved forward.
+    """
+    return max(period_start, invoice_calendar_month_start(period_end))
 
 
 async def calculate_reseller_charges(
@@ -898,7 +902,7 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
     (e.g. due to server downtime).
 
     Billing period logic:
-      period_start = later of the prior invoice end and trailing-30-day cutoff
+      period_start = later of the prior invoice end and one-calendar-month cutoff
       period_end   = now
       due_date     = subscription_expires_at
     """

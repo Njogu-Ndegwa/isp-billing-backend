@@ -1,4 +1,4 @@
-"""Reprice selected open subscription invoices to the trailing 30-day window.
+"""Reprice selected open subscription invoices to a one-calendar-month window.
 
 Dry-run is the default. Pass ``--apply`` only after reviewing the printed
 before/after values. Paid and waived invoices are never changed by this tool.
@@ -23,6 +23,7 @@ from app.services.subscription import (
     MINIMUM_CHARGE,
     calculate_reseller_charges,
     cap_invoice_period_start,
+    invoice_calendar_month_start,
 )
 
 
@@ -54,12 +55,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Commit the recalculated 30-day periods and charges.",
+        help="Commit the recalculated calendar-month periods and charges.",
+    )
+    parser.add_argument(
+        "--restore-calendar-month",
+        action="store_true",
+        help=(
+            "Set each selected invoice to the full calendar month ending at "
+            "period_end. Use to undo an earlier fixed-30-day repair."
+        ),
     )
     return parser.parse_args()
 
 
-async def run(invoice_ids: list[int], apply: bool) -> list[dict]:
+async def run(
+    invoice_ids: list[int], apply: bool, restore_calendar_month: bool = False
+) -> list[dict]:
     results = []
     async with AsyncSessionLocal() as db:
         invoices = list((await db.execute(
@@ -80,7 +91,12 @@ async def run(invoice_ids: list[int], apply: bool) -> list[dict]:
                     f"Invoice #{invoice.id} is {invoice.status.value}; only open invoices can be repaired"
                 )
 
-            new_start = cap_invoice_period_start(invoice.period_start, invoice.period_end)
+            if restore_calendar_month:
+                new_start = invoice_calendar_month_start(invoice.period_end)
+            else:
+                new_start = cap_invoice_period_start(
+                    invoice.period_start, invoice.period_end
+                )
             current_window = await calculate_reseller_charges(
                 db, invoice.user_id, new_start, invoice.period_end
             )
@@ -119,7 +135,9 @@ async def run(invoice_ids: list[int], apply: bool) -> list[dict]:
 async def main() -> None:
     args = parse_args()
     try:
-        results = await run(args.invoice_ids, args.apply)
+        results = await run(
+            args.invoice_ids, args.apply, args.restore_calendar_month
+        )
         print(json.dumps({"applied": args.apply, "invoices": results}, indent=2))
     finally:
         await async_engine.dispose()
