@@ -19,12 +19,26 @@ from sqlalchemy import select
 from app.db.database import AsyncSessionLocal, async_engine
 from app.db.models import InvoiceStatus, SubscriptionInvoice
 from app.services.subscription import (
+    HOTSPOT_RATE,
+    MINIMUM_CHARGE,
     calculate_reseller_charges,
     cap_invoice_period_start,
 )
 
 
 OPEN_STATUSES = (InvoiceStatus.PENDING, InvoiceStatus.OVERDUE)
+
+
+def repaired_charge_fields(invoice: SubscriptionInvoice, hotspot_revenue: float) -> dict:
+    """Reprice hotspot revenue without changing the invoice's PPPoE snapshot."""
+    hotspot_charge = round(hotspot_revenue * HOTSPOT_RATE, 2)
+    gross_charge = round(hotspot_charge + invoice.pppoe_charge, 2)
+    return {
+        "hotspot_revenue": hotspot_revenue,
+        "hotspot_charge": hotspot_charge,
+        "gross_charge": gross_charge,
+        "final_charge": max(gross_charge, MINIMUM_CHARGE),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,8 +81,11 @@ async def run(invoice_ids: list[int], apply: bool) -> list[dict]:
                 )
 
             new_start = cap_invoice_period_start(invoice.period_start, invoice.period_end)
-            charges = await calculate_reseller_charges(
+            current_window = await calculate_reseller_charges(
                 db, invoice.user_id, new_start, invoice.period_end
+            )
+            charges = repaired_charge_fields(
+                invoice, current_window["hotspot_revenue"]
             )
             result = {
                 "invoice_id": invoice.id,
@@ -88,8 +105,6 @@ async def run(invoice_ids: list[int], apply: bool) -> list[dict]:
                 invoice.period_start = new_start
                 invoice.hotspot_revenue = charges["hotspot_revenue"]
                 invoice.hotspot_charge = charges["hotspot_charge"]
-                invoice.pppoe_user_count = charges["pppoe_user_count"]
-                invoice.pppoe_charge = charges["pppoe_charge"]
                 invoice.gross_charge = charges["gross_charge"]
                 invoice.final_charge = charges["final_charge"]
 

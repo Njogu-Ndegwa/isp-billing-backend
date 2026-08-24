@@ -17,6 +17,7 @@ Pins:
 """
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -239,6 +240,21 @@ def test_invoice_period_cap_keeps_more_recent_start():
     recent_start = period_end - timedelta(days=12)
 
     assert cap_invoice_period_start(recent_start, period_end) == recent_start
+
+
+def test_invoice_repair_preserves_original_pppoe_charge_snapshot():
+    from scripts.repair_subscription_invoice_windows import repaired_charge_fields
+
+    invoice = SimpleNamespace(pppoe_charge=425.0)
+
+    charges = repaired_charge_fields(invoice, hotspot_revenue=44235.0)
+
+    assert charges == {
+        "hotspot_revenue": 44235.0,
+        "hotspot_charge": 1327.05,
+        "gross_charge": 1752.05,
+        "final_charge": 1752.05,
+    }
 
 
 async def test_duplicate_generation_same_user_period_is_noop(db):
