@@ -49,6 +49,7 @@ class ProvisioningAttemptSource(str, enum.Enum):
     MPESA_TRANSACTION = "mpesa_transaction"
     CUSTOMER_PAYMENT = "customer_payment"
     SUBSCRIPTION_SHARE = "subscription_share"
+    OUTAGE_COMPENSATION = "outage_compensation"
 
 
 class ProvisioningAttemptEntrypoint(str, enum.Enum):
@@ -57,6 +58,7 @@ class ProvisioningAttemptEntrypoint(str, enum.Enum):
     VOUCHER_DIRECT_API = "voucher_direct_api"
     MANUAL_TRANSACTION_PROVISION = "manual_transaction_provision"
     SUBSCRIPTION_SHARE = "subscription_share"
+    OUTAGE_COMPENSATION = "outage_compensation"
 
 
 class ProvisioningState(str, enum.Enum):
@@ -2088,6 +2090,14 @@ class OutageCompensation(Base):
     outage_end = Column(DateTime, nullable=False)
     customers_credited = Column(Integer, nullable=False, default=0)
     total_seconds_credited = Column(BigInteger, nullable=False, default=0)
+    # Whether the run also revived customers whose subscription had already
+    # run out (they are credited from "now" and pushed back onto the router).
+    include_expired = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    customers_reactivated = Column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     note = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
@@ -2118,3 +2128,14 @@ class OutageCompensationItem(Base):
     seconds_credited = Column(Integer, nullable=False)
     expiry_before = Column(DateTime, nullable=True)
     expiry_after = Column(DateTime, nullable=True)
+    # Set when this customer had already expired and was revived by the run.
+    # Reviving is not enough on its own -- the cleanup cron has removed them
+    # from the router, so they also need re-provisioning. That happens after
+    # the transaction commits (never across DB I/O); this column is the
+    # per-customer outcome, so a partial failure is visible instead of silent.
+    was_expired = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    reprovision_state = Column(String(32), nullable=True, index=True)
+    reprovision_error = Column(String(500), nullable=True)
+    reprovision_attempted_at = Column(DateTime, nullable=True)

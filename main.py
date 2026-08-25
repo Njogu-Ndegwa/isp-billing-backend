@@ -2134,6 +2134,53 @@ async def run_outage_compensation_migrations():
                 "Outage compensation migration: created %s",
                 ", ".join(t.name for t in to_create),
             )
+
+        # --- expired-customer revival (added 2026-08-25) --------------------
+        # create_all above never ALTERs an existing table, so these columns
+        # need explicit idempotent wiring for deployments that already have
+        # the tables from the first version of this feature.
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensations "
+            "ADD COLUMN IF NOT EXISTS include_expired BOOLEAN NOT NULL DEFAULT false"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensations "
+            "ADD COLUMN IF NOT EXISTS customers_reactivated INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensation_items "
+            "ADD COLUMN IF NOT EXISTS was_expired BOOLEAN NOT NULL DEFAULT false"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensation_items "
+            "ADD COLUMN IF NOT EXISTS reprovision_state VARCHAR(32)"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensation_items "
+            "ADD COLUMN IF NOT EXISTS reprovision_error VARCHAR(500)"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensation_items "
+            "ADD COLUMN IF NOT EXISTS reprovision_attempted_at TIMESTAMP"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_outage_compensation_items_reprovision_state "
+            "ON outage_compensation_items (reprovision_state)"
+        ))
+
+        # Reviving a customer re-provisions them, and that goes through the
+        # same ProvisioningAttempt machinery as a payment -- which means both
+        # native enums need the new label. Postgres will not add it implicitly
+        # (lesson from the missing 'timeout' label on b2btransactionstatus,
+        # 2026-07-18).
+        await conn.execute(sa_text(
+            "ALTER TYPE provisioningattemptsource "
+            "ADD VALUE IF NOT EXISTS 'outage_compensation'"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TYPE provisioningattemptentrypoint "
+            "ADD VALUE IF NOT EXISTS 'outage_compensation'"
+        ))
     logger.info("Outage compensation migrations complete")
 
 

@@ -29,6 +29,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.services.outage_reprovision import (
+    REPROVISION_FAILED,
+    REPROVISION_PENDING,
+    REPROVISION_ROUTER_OFFLINE,
+    schedule_reprovision,
+)
 from app.db.models import (
     Customer,
     CustomerStatus,
@@ -94,12 +100,21 @@ async def _resolve_routers(
 
 
 def _credit_seconds(customer: Customer, outage_start: datetime, outage_end: datetime) -> int:
-    """Downtime this customer is owed: the outage window, clamped to when the
-    customer first existed (someone registered mid-outage only lost the tail)."""
+    """Downtime this customer is owed: the outage window, clamped at both ends
+    to the time they were actually paying for.
+
+    Start clamp: someone registered mid-outage only lost the tail.
+    End clamp: someone whose subscription ran out *during* the outage only lost
+    the hours up to their expiry -- they were not paying for the rest of the
+    dark window, so crediting it would be a gift, not a refund.
+    """
     start = outage_start
     if customer.created_at and customer.created_at > start:
         start = customer.created_at
-    return max(0, int((outage_end - start).total_seconds()))
+    end = outage_end
+    if customer.expiry and customer.expiry < end:
+        end = customer.expiry
+    return max(0, int((end - start).total_seconds()))
 
 
 async def _collect(
@@ -161,6 +176,10 @@ async def _collect(
         .scalars()
         .all()
     )
+    # The exclusion list has to reach this group too: now that expired
+    # customers can be revived, unticking one in the preview must actually
+    # keep them out of the run rather than being silently ignored.
+    skipped_expired = [c for c in skipped_expired if c.id not in excluded]
     return affected, skipped_expired
 
 
@@ -208,6 +227,30 @@ def _customer_row(c: Customer, credit: int) -> dict:
     }
 
 
+def _revival_row(c: Customer, credit: int, now: datetime) -> dict:
+    """An expired customer's row.
+
+    Note the different expiry arithmetic: adding the credit to an expiry that
+    is already in the past would hand them time that has itself already
+    elapsed -- a "compensation" worth nothing. Their lost hours are instead
+    granted from now, which is what restores what the outage actually took.
+    """
+    return {
+        "customer_id": c.id,
+        "name": c.name,
+        "phone": c.phone,
+        "router_id": c.router_id,
+        "plan_name": c.plan.name if c.plan else None,
+        "connection_type": (
+            c.plan.connection_type.value if c.plan and c.plan.connection_type else None
+        ),
+        "expiry": c.expiry.isoformat() if c.expiry else None,
+        "credited_seconds": credit,
+        "new_expiry": (now + timedelta(seconds=credit)).isoformat(),
+        "was_expired": True,
+    }
+
+
 def _skipped_row(c: Customer) -> dict:
     return {
         "customer_id": c.id,
@@ -226,6 +269,7 @@ async def preview_outage_compensation(
     outage_end: datetime,
     router_ids: Optional[Sequence[int]] = None,
     exclude_customer_ids: Optional[Sequence[int]] = None,
+    include_expired: bool = False,
 ) -> dict:
     """Dry run: who would be credited and by how much. No writes."""
     now = datetime.utcnow()
@@ -247,15 +291,45 @@ async def preview_outage_compensation(
     customers = [
         _customer_row(c, _credit_seconds(c, outage_start, outage_end)) for c in affected
     ]
+
+    # Expired customers are shown either way so the reseller can see who the
+    # outage stranded; include_expired decides whether they are acted on.
+    expired_rows = [
+        _revival_row(c, _credit_seconds(c, outage_start, outage_end), now)
+        for c in skipped_expired
+    ]
+    expired_rows = [r for r in expired_rows if r["credited_seconds"] > 0]
+
+    # Counts and totals are computed over everyone; only the rows sent for
+    # display are capped. A town-wide outage on a large reseller would
+    # otherwise ship thousands of rows to a phone browser, which is where this
+    # actually hurts -- the server side of building them is cheap.
+    total_customers = len(customers)
+    total_expired = len(expired_rows)
+    total_seconds = sum(c["credited_seconds"] for c in customers)
+    cap = settings.OUTAGE_COMPENSATION_PREVIEW_ROWS
+    customers_truncated = total_customers > cap
+    expired_truncated = total_expired > cap
+
     return {
         "outage_start": outage_start.isoformat(),
         "outage_end": outage_end.isoformat(),
         "outage_seconds": int((outage_end - outage_start).total_seconds()),
         "routers": [{"id": r.id, "name": r.name} for r in routers],
-        "customers": customers,
-        "total_customers": len(customers),
-        "total_seconds_credited": sum(c["credited_seconds"] for c in customers),
-        "skipped_expired": [_skipped_row(c) for c in skipped_expired],
+        "customers": customers[:cap],
+        "total_customers": total_customers,
+        "customers_truncated": customers_truncated,
+        "total_seconds_credited": total_seconds,
+        "include_expired": include_expired,
+        "expired_customers": expired_rows[:cap],
+        "total_expired": total_expired,
+        "expired_truncated": expired_truncated,
+        "preview_row_cap": cap,
+        # Backwards-compatible view: with include_expired these are no longer
+        # skipped, so the list is empty rather than misleading.
+        "skipped_expired": (
+            [] if include_expired else [_skipped_row(c) for c in skipped_expired]
+        ),
         "already_compensated": [
             {
                 "id": r.id,
@@ -279,9 +353,16 @@ async def apply_outage_compensation(
     exclude_customer_ids: Optional[Sequence[int]] = None,
     note: Optional[str] = None,
     allow_duplicate: bool = False,
+    include_expired: bool = False,
 ) -> dict:
-    """Credit every affected customer with the downtime. One transaction,
-    committed here; pure DB work throughout (see module docstring)."""
+    """Credit every affected customer with the downtime.
+
+    All DB work happens in one short transaction which is committed here. When
+    ``include_expired`` revives customers the cleanup cron already removed from
+    their router, the router writes needed to actually restore their internet
+    are handed to ``outage_reprovision`` *after* that commit -- never inline,
+    so no pooled connection is held across RouterOS I/O.
+    """
     now = datetime.utcnow()
     outage_start = _to_naive_utc(outage_start)
     outage_end = _to_naive_utc(outage_end)
@@ -314,6 +395,7 @@ async def apply_outage_compensation(
         outage_start=outage_start,
         outage_end=outage_end,
         note=note,
+        include_expired=include_expired,
     )
     db.add(run)
     await db.flush()
@@ -342,6 +424,46 @@ async def apply_outage_compensation(
             )
         )
         credited_rows.append(_customer_row(customer, credit))
+
+    # --- revive customers the outage stranded -------------------------------
+    # Their expiry is in the past, so unlike an active customer the credit is
+    # granted from now (see _revival_row). They also need putting back on the
+    # router, which is queued after the commit below.
+    revived_rows: list[dict] = []
+    reprovision_item_ids: list[int] = []
+    new_items: list[OutageCompensationItem] = []
+    if include_expired:
+        for customer in skipped_expired:
+            credit = _credit_seconds(customer, outage_start, outage_end)
+            if credit <= 0:
+                continue
+            expiry_before = customer.expiry
+            customer.expiry = now + timedelta(seconds=credit)
+            customer.status = CustomerStatus.ACTIVE
+            owner_new_expiry[customer.id] = customer.expiry
+            total_seconds += credit
+            item = OutageCompensationItem(
+                compensation_id=run.id,
+                customer_id=customer.id,
+                customer_name=customer.name,
+                router_id=customer.router_id,
+                seconds_credited=credit,
+                expiry_before=expiry_before,
+                expiry_after=customer.expiry,
+                was_expired=True,
+                reprovision_state=REPROVISION_PENDING,
+            )
+            db.add(item)
+            new_items.append(item)
+            revived_rows.append(_revival_row(customer, credit, now))
+
+    # One round trip for the whole group. Flushing per customer inside the
+    # loop cost a DB round trip each, which on a big outage is the difference
+    # between one short transaction and a long one holding a pooled
+    # connection while it chats.
+    if new_items:
+        await db.flush()
+        reprovision_item_ids = [i.id for i in new_items]
 
     owner_ids = list(owner_new_expiry.keys())
     companions_updated = 0
@@ -398,9 +520,16 @@ async def apply_outage_compensation(
         for period in open_periods:
             period.period_end = owner_new_expiry[period.customer_id]
 
-    run.customers_credited = len(credited_rows)
+    run.customers_credited = len(credited_rows) + len(revived_rows)
+    run.customers_reactivated = len(revived_rows)
     run.total_seconds_credited = total_seconds
     await db.commit()
+
+    # --- transaction is closed: only now do we touch routers ----------------
+    # Detached, so the reseller's request does not wait on hardware that may
+    # still be dark. Each customer's outcome lands on its item row.
+    if reprovision_item_ids:
+        schedule_reprovision(reprovision_item_ids)
 
     logger.info(
         "[OUTAGE-COMP] Reseller %s credited %s customer(s) %ss total for outage "
@@ -419,11 +548,19 @@ async def apply_outage_compensation(
         "outage_start": outage_start.isoformat(),
         "outage_end": outage_end.isoformat(),
         "routers": [{"id": r.id, "name": r.name} for r in routers],
-        "customers_credited": len(credited_rows),
+        "customers_credited": len(credited_rows) + len(revived_rows),
         "total_seconds_credited": total_seconds,
         "companion_devices_updated": companions_updated,
         "customers": credited_rows,
-        "skipped_expired": [_skipped_row(c) for c in skipped_expired],
+        "include_expired": include_expired,
+        "customers_reactivated": len(revived_rows),
+        "reactivated": revived_rows,
+        # Revived customers are queued for re-provisioning; until that
+        # finishes they have paid time but are not yet back on the router.
+        "reprovisioning_queued": len(reprovision_item_ids),
+        "skipped_expired": (
+            [] if include_expired else [_skipped_row(c) for c in skipped_expired]
+        ),
     }
 
 
@@ -456,3 +593,112 @@ async def list_outage_compensations(
         }
         for r in runs
     ]
+
+
+async def get_outage_compensation(
+    db: AsyncSession, *, reseller_id: int, compensation_id: int
+) -> Optional[dict]:
+    """One run plus its per-customer rows, or None if it isn't this reseller's.
+
+    The re-provisioning outcome is per customer on purpose: after a power cut
+    some routers are back and some are not, so "the run succeeded" is rarely
+    true of everybody in it.
+    """
+    run = (
+        await db.execute(
+            select(OutageCompensation).where(
+                OutageCompensation.id == compensation_id,
+                OutageCompensation.user_id == reseller_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        return None
+
+    items = (
+        (
+            await db.execute(
+                select(OutageCompensationItem)
+                .where(OutageCompensationItem.compensation_id == run.id)
+                .order_by(OutageCompensationItem.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return {
+        "id": run.id,
+        "outage_start": run.outage_start.isoformat(),
+        "outage_end": run.outage_end.isoformat(),
+        "router_ids": run.router_ids,
+        "customers_credited": run.customers_credited,
+        "customers_reactivated": run.customers_reactivated,
+        "include_expired": run.include_expired,
+        "total_seconds_credited": run.total_seconds_credited,
+        "note": run.note,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "items": [
+            {
+                "id": i.id,
+                "customer_id": i.customer_id,
+                "customer_name": i.customer_name,
+                "router_id": i.router_id,
+                "seconds_credited": i.seconds_credited,
+                "expiry_before": i.expiry_before.isoformat() if i.expiry_before else None,
+                "expiry_after": i.expiry_after.isoformat() if i.expiry_after else None,
+                "was_expired": bool(i.was_expired),
+                "reprovision_state": i.reprovision_state,
+                "reprovision_error": i.reprovision_error,
+                "reprovision_attempted_at": (
+                    i.reprovision_attempted_at.isoformat()
+                    if i.reprovision_attempted_at
+                    else None
+                ),
+            }
+            for i in items
+        ],
+    }
+
+
+async def list_retryable_items(
+    db: AsyncSession, *, reseller_id: int, compensation_id: int
+) -> Optional[list[int]]:
+    """Item ids whose router write still needs doing.
+
+    Returns None when the run isn't this reseller's. Only revived customers who
+    did not get back online qualify -- a success is never re-pushed, and the
+    time credit is never re-applied by this path.
+    """
+    run = (
+        await db.execute(
+            select(OutageCompensation).where(
+                OutageCompensation.id == compensation_id,
+                OutageCompensation.user_id == reseller_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        return None
+
+    rows = (
+        (
+            await db.execute(
+                select(OutageCompensationItem.id).where(
+                    OutageCompensationItem.compensation_id == run.id,
+                    OutageCompensationItem.was_expired == True,  # noqa: E712
+                    OutageCompensationItem.customer_id.isnot(None),
+                    OutageCompensationItem.reprovision_state.in_(
+                        [
+                            REPROVISION_PENDING,
+                            REPROVISION_FAILED,
+                            REPROVISION_ROUTER_OFFLINE,
+                        ]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows)

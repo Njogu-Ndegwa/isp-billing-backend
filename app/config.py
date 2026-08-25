@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     # Fat-finger guard: a mistyped year-long window would hand everyone a year
     # of free time. Genuinely longer outages = multiple runs.
     OUTAGE_COMPENSATION_MAX_HOURS: int = 72
+    # Rows the preview ships for display. Totals are always computed over
+    # everyone; this only bounds the payload sent to the browser.
+    OUTAGE_COMPENSATION_PREVIEW_ROWS: int = 500
 
     # M-Pesa Configuration
     MPESA_CONSUMER_KEY: str
