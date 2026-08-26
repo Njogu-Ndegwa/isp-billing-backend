@@ -20,6 +20,7 @@ from sqlalchemy import select, func
 from app.db.models import Router, ProvisioningToken, ProvisioningTokenStatus, User
 from app.db.database import AsyncSessionLocal
 from app.config import settings
+from app.services.mikrotik_api import MANAGED_BRIDGE_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -418,8 +419,23 @@ def _rsc_preflight_hotspot(token: ProvisioningToken) -> str:
 }}"""
 
 
+def _rsc_bridge_name_array(names=MANAGED_BRIDGE_NAMES) -> str:
+    """Render bridge names as a RouterOS array literal: {"bridge";"bridge-plain"}.
+
+    Kept as a helper so the generated script can never drift from
+    MANAGED_BRIDGE_NAMES -- the .rsc must classify bridges exactly the way the
+    rest of the app does.
+    """
+    return "{" + ";".join(f'"{n}"' for n in names) + "}"
+
+
 def _rsc_wan_setup() -> str:
-    return """
+    # .replace() rather than an f-string: this block is dense with RouterOS
+    # `do={...}` braces that would all need doubling.
+    return _WAN_SETUP_TEMPLATE.replace("__OUR_BRIDGES__", _rsc_bridge_name_array())
+
+
+_WAN_SETUP_TEMPLATE = """
 # ---- STEP 1: WAN / INITIAL SETUP ----
 
 :do { /interface wireless cap set enabled=no } on-error={}
@@ -431,28 +447,79 @@ def _rsc_wan_setup() -> str:
     :log info "Provisioning: bridge interface already exists"
 }
 
-:foreach iface in={ether2;ether3;ether4;ether5} do={
+# Bridges this platform owns. A LAN port sitting on any of these was put there
+# deliberately (plain / PPPoE / legacy dual mode) and must be left alone;
+# anything else is a foreign leftover.
+:local bwOurBridges __OUR_BRIDGES__
+
+# Attach every LAN port to OUR hotspot bridge, moving it off a FOREIGN bridge
+# first.
+#
+# This used to be `add only if the port is in NO bridge at all`, which is a
+# silent no-op on any router carrying a leftover bridge -- an ex-provider base,
+# or an old RouterOS default config whose bridge is named `bridgeLocal` /
+# `bridge-local`. The ports stayed on the foreign bridge, so they never reached
+# the hotspot, the DHCP server or 192.168.88.1, and the captive portal could
+# never appear even though every other provisioning step reported success.
+# Field-verified on Router-0826 (id 316, 2026-08-05): ether2-5 sat in
+# `bridgeLocal` while `bridge` had received 0 bytes since provisioning.
+#
+# A port already on one of OUR bridges is left untouched, so re-running
+# provisioning neither flaps a live LAN port nor destroys a reseller's
+# plain-port / PPPoE layout.
+:foreach iface in={ether2;ether3;ether4;ether5;wlan1;wifi1} do={
     :do {
         :if ([:len [/interface find where name=$iface]] > 0) do={
-            :if ([:len [/interface bridge port find where interface=$iface]] = 0) do={
+            :local bwKeep false
+            :foreach bwPort in=[/interface bridge port find where interface=$iface] do={
+                :local bwOn [/interface bridge port get $bwPort bridge]
+                :if ([:typeof [:find $bwOurBridges $bwOn]] != "nil") do={
+                    :set bwKeep true
+                } else={
+                    /interface bridge port remove $bwPort
+                    :log info ("Provisioning: moved " . $iface . " off foreign bridge " . $bwOn)
+                }
+            }
+            :if (!$bwKeep) do={
                 /interface bridge port add interface=$iface bridge=bridge
             }
         }
     } on-error={}
 }
 
-:do {
-    :if ([:len [/interface find where name=wlan1]] > 0) do={
-        :if ([:len [/interface bridge port find where interface=wlan1]] = 0) do={
-            /interface bridge port add interface=wlan1 bridge=bridge
-        }
-    }
-} on-error={}
-
 :do { /interface bridge port remove [find where interface=ether1] } on-error={}
 :do { /ip dhcp-client add interface=ether1 disabled=no comment="WAN uplink" } on-error={}
 :do { /ip firewall nat add chain=srcnat out-interface=ether1 action=masquerade comment="NAT for internet access" } on-error={}
 /ip dns set servers=8.8.8.8,8.8.4.4 allow-remote-requests=yes
+
+# Neutralise a foreign bridge we have just emptied. An orphaned bridge that keeps
+# its own address and `defconf` DHCP client installs a SECOND default route, and
+# when the upstream hands out the same /24 as the WAN it makes that subnet
+# reachable via two interfaces -- ambiguous routing that drops internet at
+# random. Router-0826 had exactly this: WAN 192.168.0.100/24 on ether1 and
+# 192.168.0.103/24 on bridgeLocal, two default routes via 192.168.0.1.
+#
+# Deliberately runs AFTER the ether1 DHCP client and NAT exist, so the router
+# never sits with no route at all. Strictly scoped: never one of OUR bridges,
+# and only when the leftover has no ports left -- a foreign bridge still holding
+# ether6-10 on a larger board is left alone rather than half-dismantled.
+:foreach bwBr in=[/interface bridge find] do={
+    :do {
+        :local bwName [/interface bridge get $bwBr name]
+        :if ([:typeof [:find $bwOurBridges $bwName]] = "nil") do={
+            :if ([:len [/interface bridge port find where bridge=$bwName]] = 0) do={
+                :foreach bwC in=[/ip dhcp-client find where interface=$bwName] do={
+                    /ip dhcp-client remove $bwC
+                }
+                :foreach bwA in=[/ip address find where interface=$bwName] do={
+                    /ip address remove $bwA
+                }
+                /interface bridge set $bwBr disabled=yes
+                :log info ("Provisioning: parked leftover bridge " . $bwName)
+            }
+        }
+    } on-error={}
+}
 
 :log info "Provisioning: WAN setup complete, waiting for DHCP lease..."
 :delay 8s"""
