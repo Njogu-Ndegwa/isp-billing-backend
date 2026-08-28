@@ -9,13 +9,19 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import db_pool_snapshot, get_db
-from app.db.models import User, UserRole
+from app.db.models import Router, User, UserRole
 from app.services.auth import verify_token, get_current_user
 from app.services import admin_metrics as svc
+from app.services.management_tunnel_health import (
+    build_management_tunnel_health,
+    fetch_manager_health,
+    fleet_counts,
+    manager_error_code,
+)
 
 router = APIRouter(tags=["admin-metrics"])
 
@@ -157,6 +163,33 @@ async def admin_db_pool_status(
         "postgres_activity": activity,
         "long_running_connections": long_running,
     }
+
+
+@router.get("/api/admin/management-tunnels")
+async def admin_management_tunnel_status(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Return platform-level WireGuard and L2TP/IPsec health for superadmins."""
+    await _require_admin(token, db)
+    router_rows = (
+        await db.execute(select(Router.ip_address, Router.last_status))
+    ).all()
+    fleet = fleet_counts(router_rows)
+
+    # Release the DB transaction before the external manager call. A tunnel
+    # outage must never pin a pooled DB connection while this request times out.
+    await db.commit()
+
+    try:
+        manager = await fetch_manager_health()
+        return build_management_tunnel_health(manager, fleet)
+    except Exception as exc:
+        return build_management_tunnel_health(
+            None,
+            fleet,
+            error=manager_error_code(exc),
+        )
 
 
 # ---------------------------------------------------------------------------
