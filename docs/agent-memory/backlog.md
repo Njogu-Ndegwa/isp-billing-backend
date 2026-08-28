@@ -11,6 +11,14 @@ Project-level items that should survive across agent sessions.
 - Why it matters: stale users and queues confuse diagnosis and could become authorization-bearing again if another repair path recreates matching state.
 - Proposed next step: from an operator workstation, run a rate-limited per-router audit against historical reconnect moves, re-check the customer's current DB MAC immediately before each removal, and delete only old-MAC artifacts. Do not fan out from the 1 GB production server.
 
+### Shared Management Tunnel Health And Recovery
+
+- Status: started
+- Problem: the 2026-08-28 unattended-upgrade restart cascade left `xl2tpd` failed while customer routers retained WAN internet, silently removing the application's management path to RouterOS v6 devices.
+- Why it matters: L2TP and WireGuard are fleet-wide dependencies. A single listener failure can make dozens of otherwise-online routers unreachable without any customer-facing internet symptom.
+- Done so far: restored L2TP, added combined WireGuard/L2TP manager health, an admin API and frontend incident panel, focused tests, and a systemd recovery drop-in under `ops/systemd/`. See `incidents/2026-08-28-xl2tpd-maintenance-restart-failure.md`.
+- Proposed next step: install the drop-in and deploy the application changes; then connect the health endpoint to an out-of-band notification channel so an operator is alerted without having the admin page open.
+
 ### M-Pesa Callback Handler Atomic Completion Claim
 
 - Status: planned
