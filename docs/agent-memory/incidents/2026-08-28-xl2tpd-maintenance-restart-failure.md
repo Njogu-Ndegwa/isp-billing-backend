@@ -17,6 +17,15 @@ A second report was matched to MSANII's Router 224 (`Router-0582`,
 shared service recovery, confirming this was the same fleet incident rather
 than an unrelated router fault.
 
+The post-incident insurance audit found that both reported routers also had
+live Hetzner L2TP tunnels (`10.251.100.9` and `10.251.100.35`). Hetzner could
+ping both; TCP 8728 was open for router 224 but blocked for router 330. These
+tunnels did not restore application control because the production AWS host has
+no private route to `10.251.0.0/16`, normal router calls use only the DB's
+primary `10.0.x` address, and the insurance manager verifies reachability but
+does not proxy RouterOS operations. The insurance plane was a manual rescue
+path, not automatic failover.
+
 ## Symptoms
 
 - At 2026-08-28 09:17:55 EAT (06:17:55 UTC), `xl2tpd.service` entered `failed`.
@@ -47,7 +56,8 @@ unit, and made no recovery attempt after the failed start.
   `10.0.100.9/32` route.
 - Router 224 re-established `ppp9` and regained its `10.0.100.35/32` route;
   no router-side change was needed.
-- Added a combined WireGuard/L2TP manager health response and admin API.
+- Added combined primary AWS and Hetzner emergency WireGuard/L2TP manager health
+  responses and an admin API.
 - Added an admin frontend monitor with 30-second polling, a detailed dashboard
   view, and a critical alert across admin pages.
 - Added `ops/systemd/xl2tpd-recovery.conf` for daemon tracking, child-process
@@ -70,5 +80,10 @@ unit, and made no recovery attempt after the failed start.
   restarting the live service.
 - Deploy the manager/API/frontend health feature through the normal release
   path.
+- Design automatic fallback through a central router I/O gateway. Do not bolt
+  fallback onto only one endpoint: RouterOS calls are currently scattered
+  across routes, jobs, provisioning and payment flows.
+- Repair and verify Hetzner API access for router 330; tunnel-up and
+  control-ready must be tracked as different states.
 - Add an out-of-band notification channel if admin-page visibility alone is not
   sufficient; the health endpoint now supplies the source signal.

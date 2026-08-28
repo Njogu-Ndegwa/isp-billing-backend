@@ -4,6 +4,7 @@ Admin dashboard metrics endpoints.
 All routes require admin role (same auth as /api/admin/* endpoints).
 """
 
+import asyncio
 from datetime import datetime
 from typing import Optional
 
@@ -18,6 +19,7 @@ from app.services.auth import verify_token, get_current_user
 from app.services import admin_metrics as svc
 from app.services.management_tunnel_health import (
     build_management_tunnel_health,
+    fetch_insurance_manager_health,
     fetch_manager_health,
     fleet_counts,
     manager_error_code,
@@ -181,15 +183,30 @@ async def admin_management_tunnel_status(
     # outage must never pin a pooled DB connection while this request times out.
     await db.commit()
 
-    try:
-        manager = await fetch_manager_health()
-        return build_management_tunnel_health(manager, fleet)
-    except Exception as exc:
-        return build_management_tunnel_health(
-            None,
-            fleet,
-            error=manager_error_code(exc),
-        )
+    primary_result, insurance_result = await asyncio.gather(
+        fetch_manager_health(),
+        fetch_insurance_manager_health(),
+        return_exceptions=True,
+    )
+    primary_error = (
+        manager_error_code(primary_result)
+        if isinstance(primary_result, Exception)
+        else None
+    )
+    insurance_error = (
+        manager_error_code(insurance_result)
+        if isinstance(insurance_result, Exception)
+        else None
+    )
+    return build_management_tunnel_health(
+        None if isinstance(primary_result, Exception) else primary_result,
+        fleet,
+        error=primary_error,
+        insurance_manager=(
+            None if isinstance(insurance_result, Exception) else insurance_result
+        ),
+        insurance_error=insurance_error,
+    )
 
 
 # ---------------------------------------------------------------------------

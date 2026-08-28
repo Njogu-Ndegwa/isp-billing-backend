@@ -3,7 +3,9 @@ from pydantic import BaseModel
 import subprocess
 import os
 import logging
+import shlex
 import socket
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,6 +17,129 @@ WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0")
 SERVER_PUBLIC_KEY_PATH = os.environ.get("WG_SERVER_PUBKEY_PATH", "/etc/wireguard/server_public.key")
 L2TP_CHAP_SECRETS_PATH = os.environ.get("L2TP_CHAP_SECRETS_PATH", "/etc/ppp/chap-secrets")
 L2TP_SERVER_NAME = "l2tp-server"
+WG_RECENT_HANDSHAKE_SECONDS = int(os.environ.get("WG_RECENT_HANDSHAKE_SECONDS", "180"))
+
+
+def _listening_udp_ports(paths=None):
+    """Return UDP ports bound in this host-network container's namespace."""
+    paths = paths or ("/proc/net/udp", "/proc/net/udp6")
+    ports = set()
+    for path in paths:
+        try:
+            with open(path) as proc_file:
+                next(proc_file, None)
+                for line in proc_file:
+                    fields = line.split()
+                    if len(fields) < 2 or ":" not in fields[1]:
+                        continue
+                    try:
+                        ports.add(int(fields[1].rsplit(":", 1)[1], 16))
+                    except ValueError:
+                        continue
+        except OSError:
+            continue
+    return ports
+
+
+def _configured_l2tp_peers(path=L2TP_CHAP_SECRETS_PATH):
+    usernames = set()
+    try:
+        with open(path) as secrets_file:
+            for line in secrets_file:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                try:
+                    fields = shlex.split(stripped)
+                except ValueError:
+                    continue
+                if len(fields) < 2 or fields[1] not in {L2TP_SERVER_NAME, "*"}:
+                    continue
+                usernames.add(fields[0])
+    except OSError:
+        return 0
+    return len(usernames)
+
+
+def _active_ppp_sessions(path="/sys/class/net"):
+    try:
+        return sum(
+            1 for name in os.listdir(path)
+            if name.startswith("ppp") and name[3:].isdigit()
+        )
+    except OSError:
+        return 0
+
+
+def _wireguard_health():
+    try:
+        result = subprocess.run(
+            ["wg", "show", WG_INTERFACE, "dump"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        result = None
+
+    if result is None or result.returncode != 0:
+        return {
+            "available": False,
+            "interface": WG_INTERFACE,
+            "listening_port": None,
+            "configured_peers": 0,
+            "recent_handshakes": 0,
+            "stale_handshakes": 0,
+            "never_handshaken": 0,
+        }
+
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    interface_fields = lines[0].split("\t") if lines else []
+    peers = [line.split("\t") for line in lines[1:]]
+    now = int(time.time())
+    handshakes = []
+    for peer in peers:
+        try:
+            handshakes.append(int(peer[4]))
+        except (IndexError, ValueError):
+            handshakes.append(0)
+
+    recent = sum(1 for value in handshakes if 0 < now - value <= WG_RECENT_HANDSHAKE_SECONDS)
+    stale = sum(1 for value in handshakes if value > 0 and now - value > WG_RECENT_HANDSHAKE_SECONDS)
+    never = sum(1 for value in handshakes if value <= 0)
+    try:
+        listening_port = int(interface_fields[2])
+    except (IndexError, ValueError):
+        listening_port = None
+    return {
+        "available": True,
+        "interface": WG_INTERFACE,
+        "listening_port": listening_port,
+        "configured_peers": len(peers),
+        "recent_handshakes": recent,
+        "stale_handshakes": stale,
+        "never_handshaken": never,
+        "recent_window_seconds": WG_RECENT_HANDSHAKE_SECONDS,
+    }
+
+
+def _l2tp_health():
+    ports = _listening_udp_ports()
+    configured_peers = _configured_l2tp_peers()
+    listener_available = 1701 in ports
+    ipsec_ports = {port: port in ports for port in (500, 4500)}
+    ipsec_available = all(ipsec_ports.values())
+    required = configured_peers > 0
+    return {
+        "available": listener_available and ipsec_available,
+        "required": required,
+        "listener_available": listener_available,
+        "ipsec_available": ipsec_available,
+        "listening_port": 1701,
+        "ipsec_ports": ipsec_ports,
+        "configured_peers": configured_peers,
+        "active_sessions": _active_ppp_sessions(),
+    }
 
 
 def verify_secret(x_api_key: str = Header(...)):
@@ -217,18 +342,16 @@ def server_info(_=Depends(verify_secret)):
 
 @app.get("/health")
 def health():
-    try:
-        result = subprocess.run(
-            ["wg", "show", WG_INTERFACE],
-            capture_output=True, text=True, timeout=5
-        )
-        return {
-            "status": "healthy" if result.returncode == 0 else "degraded",
-            "interface": WG_INTERFACE,
-            "wg_available": result.returncode == 0
-        }
-    except Exception:
-        return {"status": "unhealthy", "interface": WG_INTERFACE, "wg_available": False}
+    wireguard = _wireguard_health()
+    l2tp = _l2tp_health()
+    healthy = wireguard["available"] and (not l2tp["required"] or l2tp["available"])
+    return {
+        "status": "healthy" if healthy else "unhealthy",
+        "interface": WG_INTERFACE,
+        "wg_available": wireguard["available"],
+        "wireguard": wireguard,
+        "l2tp": l2tp,
+    }
 
 
 if __name__ == "__main__":
