@@ -17,13 +17,30 @@ from app.services.management_tunnel_health import (
 from tests.factories import make_admin, make_reseller, make_router
 
 
-def _load_wg_manager_module():
-    path = Path(__file__).parents[1] / "wg-manager" / "main.py"
-    spec = importlib.util.spec_from_file_location("wg_manager_main_for_tests", path)
+def _load_wg_manager_module(directory="wg-manager"):
+    path = Path(__file__).parents[1] / directory / "main.py"
+    module_name = f"{directory.replace('-', '_')}_main_for_tests"
+    spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _healthy_insurance_manager():
+    return {
+        "wireguard": {
+            "available": True,
+            "configured_peers": 36,
+            "recent_handshakes": 30,
+        },
+        "l2tp": {
+            "required": True,
+            "available": True,
+            "configured_peers": 59,
+            "active_sessions": 16,
+        },
+    }
 
 
 @pytest_asyncio.fixture
@@ -92,6 +109,19 @@ def test_manager_health_is_unhealthy_when_l2tp_is_down(monkeypatch):
     assert result["wg_available"] is True
 
 
+def test_insurance_manager_reports_wireguard_and_l2tp(monkeypatch):
+    module = _load_wg_manager_module("wg-manager-insurance")
+    monkeypatch.setattr(module, "_wireguard_health", lambda: {"available": True})
+    monkeypatch.setattr(
+        module,
+        "_l2tp_health",
+        lambda: {"required": True, "available": True, "active_sessions": 16},
+    )
+    result = module.health()
+    assert result["status"] == "healthy"
+    assert result["l2tp"]["active_sessions"] == 16
+
+
 def test_combined_health_names_l2tp_blast_radius():
     fleet = {
         "wireguard": {"registered_routers": 100, "online_routers": 90},
@@ -101,9 +131,17 @@ def test_combined_health_names_l2tp_blast_radius():
         "wireguard": {"available": True},
         "l2tp": {"required": True, "available": False, "active_sessions": 0},
     }
-    result = build_management_tunnel_health(manager, fleet)
+    result = build_management_tunnel_health(
+        manager,
+        fleet,
+        insurance_manager=_healthy_insurance_manager(),
+    )
     assert result["overall_status"] == "critical"
     assert "59 registered routers" in result["summary"]
+    assert "Hetzner emergency tunnels are operational" in result["summary"]
+    assert "application failover is manual" in result["summary"]
+    assert result["insurance"]["overall_status"] == "healthy"
+    assert result["automatic_failover_enabled"] is False
 
 
 @pytest.mark.asyncio
@@ -131,8 +169,16 @@ async def test_admin_endpoint_combines_manager_and_router_counts(db, client, mon
             },
         }
 
+    async def fake_insurance_manager_health():
+        return _healthy_insurance_manager()
+
     monkeypatch.setattr(routes_module, "get_current_user", fake_current_user)
     monkeypatch.setattr(routes_module, "fetch_manager_health", fake_manager_health)
+    monkeypatch.setattr(
+        routes_module,
+        "fetch_insurance_manager_health",
+        fake_insurance_manager_health,
+    )
 
     response = await client.get("/api/admin/management-tunnels")
     assert response.status_code == 200
@@ -142,3 +188,5 @@ async def test_admin_endpoint_combines_manager_and_router_counts(db, client, mon
     assert payload["services"]["wireguard"]["online_routers"] == 1
     assert payload["services"]["l2tp"]["registered_routers"] == 1
     assert payload["services"]["l2tp"]["online_routers"] == 0
+    assert payload["insurance"]["services"]["l2tp"]["online_routers"] == 16
+    assert payload["automatic_failover_enabled"] is False

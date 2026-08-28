@@ -16,8 +16,8 @@ Project-level items that should survive across agent sessions.
 - Status: started
 - Problem: the 2026-08-28 unattended-upgrade restart cascade left `xl2tpd` failed while customer routers retained WAN internet, silently removing the application's management path to RouterOS v6 devices.
 - Why it matters: L2TP and WireGuard are fleet-wide dependencies. A single listener failure can make dozens of otherwise-online routers unreachable without any customer-facing internet symptom.
-- Done so far: restored L2TP, added combined WireGuard/L2TP manager health, an admin API and frontend incident panel, focused tests, and a systemd recovery drop-in under `ops/systemd/`. See `incidents/2026-08-28-xl2tpd-maintenance-restart-failure.md`.
-- Proposed next step: install the drop-in and deploy the application changes; then connect the health endpoint to an out-of-band notification channel so an operator is alerted without having the admin page open.
+- Done so far: restored L2TP, added combined primary AWS plus Hetzner emergency WireGuard/L2TP health, an admin API and frontend incident panel, focused tests, and a systemd recovery drop-in under `ops/systemd/`. The panel explicitly labels Hetzner as manual rescue because no automatic application fallback exists. See `incidents/2026-08-28-xl2tpd-maintenance-restart-failure.md`.
+- Proposed next step: install the drop-in and deploy the application/manager changes; then connect the health endpoint to an out-of-band notification channel. Design automatic Hetzner fallback through the planned central router I/O gateway, with per-router control-ready verification—not just tunnel-up state.
 
 ### M-Pesa Callback Handler Atomic Completion Claim
 
