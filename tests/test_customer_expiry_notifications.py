@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.db.models import (
     ConnectionType,
@@ -11,6 +12,8 @@ from app.db.models import (
     SmsCampaign,
     SmsCreditAccount,
     SmsMessage,
+    SmsMessageKind,
+    SmsMessageStatus,
 )
 from app.services import customer_expiry_notifications, mikrotik_background
 from tests.factories import (
@@ -114,6 +117,32 @@ async def test_same_customer_period_is_never_queued_twice(db, session_factory):
     assert count == 1
 
 
+async def test_database_key_blocks_concurrent_duplicate_reminder(db, session_factory):
+    reseller, _, customer = await _seed_expired_pppoe(db)
+    await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [customer.id], session_factory=session_factory
+    )
+    original = (
+        await db.execute(select(SmsMessage).where(SmsMessage.customer_id == customer.id))
+    ).scalar_one()
+    db.add(SmsMessage(
+        campaign_id=original.campaign_id,
+        user_id=reseller.id,
+        customer_id=customer.id,
+        recipient_phone=customer.phone,
+        body=original.body,
+        segments=original.segments,
+        credits_charged=original.credits_charged,
+        kind=SmsMessageKind.RESELLER_TO_CUSTOMER,
+        status=SmsMessageStatus.QUEUED,
+        category=original.category,
+    ))
+
+    with pytest.raises(IntegrityError):
+        await db.commit()
+    await db.rollback()
+
+
 async def test_insufficient_credits_skips_campaign(db, session_factory):
     _, _, customer = await _seed_expired_pppoe(db, credits=0)
 
@@ -214,6 +243,60 @@ async def test_pre_expiry_scan_honors_offsets_and_deduplicates(
         customer.expiry, 120
     )
     assert "expire soon" in messages[0].body
+
+
+async def test_steady_state_batch_read_is_constant_query_count(
+    db, session_factory, engine,
+):
+    """Adding resellers/offsets must not add polling queries.
+
+    The steady state is exactly: global messaging setting, enabled preferences
+    joined to positive credit accounts, and one fleet customer query. There are
+    no due customers here, so the optional dedupe query is not needed.
+    """
+    now = datetime.utcnow().replace(microsecond=0)
+    db.add(MessagingSettings(id=1, enabled=True))
+    await db.commit()
+    offsets = [10080, 4320, 1440, 120, 30]
+    for index in range(8):
+        reseller = await make_reseller(db)
+        await make_sms_account(db, reseller, balance=10)
+        db.add(CustomerExpirySmsSettings(
+            user_id=reseller.id,
+            enabled=True,
+            reminder_offsets_minutes=offsets,
+            send_at_expiry=True,
+        ))
+        await db.commit()
+        plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+        await make_customer(
+            db,
+            reseller,
+            plan,
+            status=CustomerStatus.ACTIVE,
+            expiry=now + timedelta(days=8),
+            pppoe_username=f"outside-window-{index}",
+            phone=f"2547111000{index:02d}",
+        )
+
+    selects = []
+
+    def _record_select(_conn, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _record_select)
+    try:
+        groups = await customer_expiry_notifications.collect_due_reminder_groups(
+            session_factory=session_factory,
+            now=now,
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _record_select)
+
+    assert groups == {}
+    assert len(selects) == 3
+    assert sum("FROM customers" in statement for statement in selects) == 1
 
 
 async def test_pppoe_cleanup_notifies_only_after_router_enforcement(

@@ -159,6 +159,7 @@ class Customer(Base):
     __tablename__ = "customers"
     __table_args__ = (
         UniqueConstraint("mac_address", "user_id", name="uq_customer_mac_per_reseller"),
+        Index("ix_customers_status_expiry_user", "status", "expiry", "user_id"),
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=True)
@@ -1829,6 +1830,13 @@ class SmsCampaign(Base):
 
 class SmsMessage(Base):
     __tablename__ = "sms_messages"
+    __table_args__ = (
+        Index(
+            "uq_sms_messages_customer_category_user",
+            "customer_id", "category", "user_id",
+            unique=True,
+        ),
+    )
     id = Column(Integer, primary_key=True, autoincrement=True)
     campaign_id = Column(Integer, ForeignKey("sms_campaigns.id"), nullable=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)

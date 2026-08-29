@@ -2032,6 +2032,15 @@ async def run_messaging_migrations():
             "ON sms_messages(created_at) WHERE status = 'failed'"
         ))
         await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_customers_status_expiry_user "
+            "ON customers(status, expiry, user_id)"
+        ))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_sms_messages_customer_category_user "
+            "ON sms_messages(customer_id, category, user_id)"
+        ))
+        await conn.execute(text(
             "ALTER TABLE messaging_settings "
             "ALTER COLUMN price_per_sms_kes SET DEFAULT 0.50"
         ))

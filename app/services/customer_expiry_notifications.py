@@ -24,6 +24,7 @@ from app.db.models import (
     MessagingSettings,
     SmsCampaign,
     SmsCampaignStatus,
+    SmsCreditAccount,
     SmsMessage,
     SmsMessageKind,
     SmsMessageStatus,
@@ -265,9 +266,124 @@ async def queue_customer_expiry_notifications(
     return campaign_ids
 
 
+def _valid_offsets(raw_offsets) -> list[int]:
+    return sorted(
+        {
+            int(value) for value in (raw_offsets or [])
+            if isinstance(value, int)
+            and MIN_REMINDER_OFFSET_MINUTES
+            <= value
+            <= MAX_REMINDER_OFFSET_MINUTES
+        },
+        reverse=True,
+    )[:MAX_REMINDER_OFFSETS]
+
+
+async def collect_due_reminder_groups(
+    *,
+    session_factory: Callable,
+    now: datetime,
+) -> dict[tuple[int, int], list[int]]:
+    """Return due customer ids grouped by (reseller, offset) in 2-4 reads.
+
+    This is the steady-state polling path. It performs one fleet customer query,
+    regardless of how many resellers or reminder offsets are enabled. Resellers
+    without a positive SMS balance are excluded because no campaign could be
+    queued for them; they become eligible automatically after a top-up.
+    """
+    async with session_factory() as db:
+        settings_row = await db.get(MessagingSettings, 1)
+        if settings_row is not None and not settings_row.enabled:
+            return {}
+
+        preference_rows = (
+            await db.execute(
+                select(
+                    CustomerExpirySmsSettings.user_id,
+                    CustomerExpirySmsSettings.reminder_offsets_minutes,
+                )
+                .join(
+                    SmsCreditAccount,
+                    SmsCreditAccount.user_id == CustomerExpirySmsSettings.user_id,
+                )
+                .where(
+                    CustomerExpirySmsSettings.enabled.is_(True),
+                    SmsCreditAccount.balance > 0,
+                )
+            )
+        ).all()
+        offsets_by_reseller = {
+            user_id: offsets
+            for user_id, raw_offsets in preference_rows
+            if (offsets := _valid_offsets(raw_offsets))
+        }
+        if not offsets_by_reseller:
+            return {}
+
+        max_offset = max(
+            offset
+            for offsets in offsets_by_reseller.values()
+            for offset in offsets
+        )
+        customer_rows = (
+            await db.execute(
+                select(
+                    Customer.id,
+                    Customer.user_id,
+                    Customer.phone,
+                    Customer.expiry,
+                )
+                .where(
+                    Customer.user_id.in_(offsets_by_reseller),
+                    Customer.status == CustomerStatus.ACTIVE,
+                    Customer.expiry.isnot(None),
+                    Customer.expiry > now,
+                    Customer.expiry <= now + timedelta(minutes=max_offset),
+                    Customer.phone.isnot(None),
+                    Customer.subscription_owner_id.is_(None),
+                )
+                .order_by(Customer.user_id, Customer.id)
+            )
+        ).all()
+        if not customer_rows:
+            return {}
+
+        existing = set(
+            (
+                await db.execute(
+                    select(SmsMessage.customer_id, SmsMessage.category).where(
+                        SmsMessage.customer_id.in_([row.id for row in customer_rows]),
+                        SmsMessage.category.like(f"{REMINDER_CATEGORY_PREFIX}%"),
+                    )
+                )
+            ).all()
+        )
+
+    groups: dict[tuple[int, int], list[int]] = {}
+    seen_phones: dict[tuple[int, int], set[str]] = {}
+    for row in customer_rows:
+        phone_key = _phone_key((row.phone or "").strip())
+        if not phone_key:
+            continue
+        for offset_minutes in offsets_by_reseller[row.user_id]:
+            if row.expiry > now + timedelta(minutes=offset_minutes):
+                continue
+            category = reminder_message_category(row.expiry, offset_minutes)
+            if (row.id, category) in existing:
+                continue
+            group_key = (row.user_id, offset_minutes)
+            group_phone_keys = seen_phones.setdefault(group_key, set())
+            if phone_key in group_phone_keys:
+                continue
+            group_phone_keys.add(phone_key)
+            groups.setdefault(group_key, []).append(row.id)
+    return groups
+
+
 async def _queue_reseller_reminder_campaign(
     reseller_id: int,
     offset_minutes: int,
+    customer_ids: list[int],
     *,
     session_factory: Callable,
     now: datetime,
@@ -297,6 +413,7 @@ async def _queue_reseller_reminder_campaign(
             await db.execute(
                 select(Customer.id, Customer.phone, Customer.expiry)
                 .where(
+                    Customer.id.in_(customer_ids),
                     Customer.user_id == reseller_id,
                     Customer.status == CustomerStatus.ACTIVE,
                     Customer.expiry.isnot(None),
@@ -371,37 +488,22 @@ async def scan_customer_expiry_reminders(now: datetime | None = None) -> int:
         return 0
 
     now = now or datetime.utcnow()
-    async with database.async_session() as db:
-        rows = (
-            await db.execute(
-                select(
-                    CustomerExpirySmsSettings.user_id,
-                    CustomerExpirySmsSettings.reminder_offsets_minutes,
-                ).where(CustomerExpirySmsSettings.enabled.is_(True))
-            )
-        ).all()
+    groups = await collect_due_reminder_groups(
+        session_factory=database.async_session,
+        now=now,
+    )
 
     campaign_ids: list[int] = []
-    for reseller_id, raw_offsets in rows:
-        offsets = sorted(
-            {
-                int(value) for value in (raw_offsets or [])
-                if isinstance(value, int)
-                and MIN_REMINDER_OFFSET_MINUTES
-                <= value
-                <= MAX_REMINDER_OFFSET_MINUTES
-            },
-            reverse=True,
-        )[:MAX_REMINDER_OFFSETS]
-        for offset_minutes in offsets:
-            campaign_id = await _queue_reseller_reminder_campaign(
-                reseller_id,
-                offset_minutes,
-                session_factory=database.async_session,
-                now=now,
-            )
-            if campaign_id is not None:
-                campaign_ids.append(campaign_id)
+    for (reseller_id, offset_minutes), customer_ids in groups.items():
+        campaign_id = await _queue_reseller_reminder_campaign(
+            reseller_id,
+            offset_minutes,
+            customer_ids,
+            session_factory=database.async_session,
+            now=now,
+        )
+        if campaign_id is not None:
+            campaign_ids.append(campaign_id)
 
     spawn_expiry_campaign_dispatch(campaign_ids)
     if campaign_ids:
