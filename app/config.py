@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     PPPOE_RATE_LIMIT_HEADROOM: float = 1.08
     # Max compensation (zero-revenue) vouchers a reseller may issue per UTC day.
     COMPENSATION_DAILY_LIMIT: int = 10
+    # Longest power-outage window a single bulk compensation run may credit.
+    # Fat-finger guard: a mistyped year-long window would hand everyone a year
+    # of free time. Genuinely longer outages = multiple runs.
+    OUTAGE_COMPENSATION_MAX_HOURS: int = 72
+    # Rows the preview ships for display. Totals are always computed over
+    # everyone; this only bounds the payload sent to the browser.
+    OUTAGE_COMPENSATION_PREVIEW_ROWS: int = 500
 
     # M-Pesa Configuration
     MPESA_CONSUMER_KEY: str
