@@ -43,6 +43,7 @@ from app.services.router_availability import (
 )
 from app.services.usage_tracking import record_usage
 from app.services.fup import hotspot_throttle_rate_for_plan
+from app.services import customer_expiry_notifications
 from app.core.protected_devices import is_protected_device
 from app.config import settings
 import asyncio
@@ -964,6 +965,7 @@ async def cleanup_expired_users_background():
             no_router_customers = []
             offline_skipped = []
             batch_deferred = []
+            directly_deactivated_ids: set[int] = set()
             scheduled_router_cleanup_count = 0
             per_router_cleanup_counts: dict[str, int] = {}
 
@@ -989,6 +991,7 @@ async def cleanup_expired_users_background():
                 if is_pppoe:
                     if not c.router:
                         c.status = CustomerStatus.INACTIVE
+                        directly_deactivated_ids.add(c.id)
                         continue
                     if _router_recently_offline(c.router, now):
                         offline_skipped.append(c.id)
@@ -1015,6 +1018,7 @@ async def cleanup_expired_users_background():
                     continue
                 if c.router and getattr(c.router, 'auth_method', None) == 'RADIUS':
                     c.status = CustomerStatus.INACTIVE
+                    directly_deactivated_ids.add(c.id)
                     continue
                 if c.router and _router_recently_offline(c.router, now):
                     offline_skipped.append(c.id)
@@ -1136,6 +1140,7 @@ async def cleanup_expired_users_background():
             now_after_cleanup = datetime.utcnow()
             post_cleanup_deactivated_count = 0
             skipped_repaid_count = 0
+            newly_deactivated_ids = set(directly_deactivated_ids)
             for router_id in offline_router_ids:
                 try:
                     await record_router_availability(
@@ -1165,7 +1170,25 @@ async def cleanup_expired_users_background():
                     if customer.status != CustomerStatus.INACTIVE:
                         customer.status = CustomerStatus.INACTIVE
                         post_cleanup_deactivated_count += 1
+                        newly_deactivated_ids.add(customer.id)
             await db.commit()
+
+            # Expiry SMS is deliberately downstream of successful enforcement
+            # and the INACTIVE commit. It uses its own short DB sessions and
+            # dispatches provider I/O in background tasks.
+            if newly_deactivated_ids:
+                try:
+                    campaign_ids = await customer_expiry_notifications.queue_customer_expiry_notifications(
+                        sorted(newly_deactivated_ids),
+                        session_factory=async_session,
+                        now=now_after_cleanup,
+                    )
+                    customer_expiry_notifications.spawn_expiry_campaign_dispatch(campaign_ids)
+                except Exception as notification_err:
+                    logger.exception(
+                        "[CRON] Customer expiry notification queue failed: %s",
+                        notification_err,
+                    )
             if skipped_repaid_count:
                 logger.warning(
                     "[CRON] Skipped %d customer(s) that received new payments during cleanup",
