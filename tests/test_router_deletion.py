@@ -28,6 +28,8 @@ from app.db.models import (
     Router,
     RouterAvailabilityCheck,
     RouterLogEntry,
+    RouterUsageBucket,
+    UsageCapWatchState,
     UserBandwidthUsage,
     Voucher,
     VoucherStatus,
@@ -198,6 +200,16 @@ async def test_force_delete_router_preserves_customer_money_history_and_cleans_d
         ),
         RouterLogEntry(router_id=router.id, topic="hotspot", message="test log"),
         RouterAvailabilityCheck(router_id=router.id, is_online=True, source="test"),
+        RouterUsageBucket(
+            router_id=router.id,
+            bucket_start=datetime.utcnow(),
+            hotspot_upload_bytes=10,
+        ),
+        UsageCapWatchState(
+            customer_id=customer.id,
+            router_id=router.id,
+            next_poll_at=datetime.utcnow(),
+        ),
         Payment(customer_id=customer.id, amount=100, days_paid_for=1),
         CustomerPayment(
             customer_id=customer.id,
@@ -293,4 +305,6 @@ async def test_force_delete_router_preserves_customer_money_history_and_cleans_d
     assert await _count(db, AccessCredential) == 0
     assert await _count(db, RouterLogEntry) == 0
     assert await _count(db, RouterAvailabilityCheck) == 0
+    assert await _count(db, RouterUsageBucket) == 0
+    assert await _count(db, UsageCapWatchState) == 0
     assert await db.scalar(text("SELECT COUNT(*) FROM radius_nas")) == 0

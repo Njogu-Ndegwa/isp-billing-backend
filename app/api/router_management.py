@@ -22,6 +22,8 @@ from app.db.models import (
     Router,
     RouterAvailabilityCheck,
     RouterLogEntry,
+    RouterUsageBucket,
+    UsageCapWatchState,
     User,
     UserRole,
     Voucher,
@@ -2036,6 +2038,17 @@ async def delete_router(
         await db.execute(
             sql_delete(BandwidthSnapshot)
             .where(BandwidthSnapshot.router_id == router_id)
+        )
+        # These rows are router-owned operational telemetry/scheduler state.
+        # Their restrictive foreign keys otherwise block the router delete.
+        # Customer usage periods and all payment history are intentionally kept.
+        await db.execute(
+            sql_delete(RouterUsageBucket)
+            .where(RouterUsageBucket.router_id == router_id)
+        )
+        await db.execute(
+            sql_delete(UsageCapWatchState)
+            .where(UsageCapWatchState.router_id == router_id)
         )
         await db.execute(
             sql_delete(ProvisioningToken)
