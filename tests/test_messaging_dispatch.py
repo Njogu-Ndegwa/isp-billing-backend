@@ -143,6 +143,69 @@ async def test_dispatch_all_success_marks_completed(db, session_factory, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_dispatch_sends_each_personalized_message_body(
+        db, session_factory, monkeypatch):
+    r = await make_reseller(db)
+    p = await make_plan(db, r)
+    c1 = await make_customer(db, r, p, phone="254700000001")
+    c2 = await make_customer(db, r, p, phone="254700000002")
+    await make_sms_account(db, r, balance=10)
+    await sms_credits.try_deduct(db, r.id, 2, reference="pending")
+    camp = SmsCampaign(user_id=r.id, body="Pay Account [customer account]",
+                       recipient_count=2, segments_per_message=1, total_credits=2,
+                       status=SmsCampaignStatus.QUEUED, sender_id="BRAND")
+    db.add(camp)
+    await db.flush()
+    bodies = {
+        c1.phone: "Pay Account 12345674",
+        c2.phone: "Pay Account 20000028",
+    }
+    for customer in (c1, c2):
+        db.add(SmsMessage(
+            campaign_id=camp.id,
+            user_id=r.id,
+            customer_id=customer.id,
+            recipient_phone=customer.phone,
+            body=bodies[customer.phone],
+            segments=1,
+            credits_charged=1,
+            kind=SmsMessageKind.RESELLER_TO_CUSTOMER,
+            status=SmsMessageStatus.QUEUED,
+        ))
+    await db.commit()
+    camp_id = camp.id
+    calls = []
+
+    class _FakeProvider:
+        name = "fake"
+
+        async def send_bulk(self, recipients, body, sender_id):
+            calls.append((recipients, body, sender_id))
+            return [
+                SendResult(
+                    recipient=recipients[0],
+                    success=True,
+                    provider_message_id=f"sent-{len(calls)}",
+                    status="Success",
+                )
+            ]
+
+    monkeypatch.setattr(sms_dispatch, "get_provider", lambda: _FakeProvider())
+    monkeypatch.setattr(sms_dispatch, "async_session", session_factory)
+
+    await sms_dispatch.dispatch_campaign(camp_id)
+
+    assert calls == [
+        ([c1.phone], bodies[c1.phone], "BRAND"),
+        ([c2.phone], bodies[c2.phone], "BRAND"),
+    ]
+    async with session_factory() as s:
+        campaign = await s.get(SmsCampaign, camp_id)
+        assert campaign.status == SmsCampaignStatus.COMPLETED
+        assert campaign.sent_count == 2
+
+
+@pytest.mark.asyncio
 async def test_dispatch_admin_sms_messages_updates_per_recipient_status(
         db, session_factory, monkeypatch):
     r1 = await make_reseller(db, support_phone="254700000001")

@@ -18,10 +18,12 @@ from sqlalchemy import select
 from app.config import settings
 from app.db import database
 from app.db.models import (
+    ConnectionType,
     Customer,
     CustomerExpirySmsSettings,
     CustomerStatus,
     MessagingSettings,
+    Plan,
     SmsCampaign,
     SmsCampaignStatus,
     SmsCreditAccount,
@@ -48,8 +50,34 @@ def expiry_message_category(expiry: datetime) -> str:
     return f"{EXPIRY_CATEGORY_PREFIX}{expiry.strftime('%Y%m%d%H%M%S')}"
 
 
-def render_expiry_message(organization_name: str | None) -> str:
+def _payment_instruction(
+    *,
+    paybill_number: str | None,
+    account_number: str | None,
+) -> str | None:
+    paybill = (paybill_number or "").strip()
+    account = (account_number or "").strip()
+    if not paybill or not account:
+        return None
+    return f"Pay via M-Pesa Paybill {paybill}, Account {account}"
+
+
+def render_expiry_message(
+    organization_name: str | None,
+    *,
+    paybill_number: str | None = None,
+    account_number: str | None = None,
+) -> str:
     brand = (organization_name or "Your internet provider").strip()
+    payment = _payment_instruction(
+        paybill_number=paybill_number,
+        account_number=account_number,
+    )
+    if payment:
+        return (
+            f"Your internet has expired. {payment} to restore service. "
+            f"- {brand}"
+        )
     return (
         "Your internet package has expired. Please renew to restore service. "
         f"- {brand}"
@@ -64,8 +92,22 @@ def reminder_message_category(expiry: datetime, offset_minutes: int) -> str:
     )
 
 
-def render_reminder_message(organization_name: str | None) -> str:
+def render_reminder_message(
+    organization_name: str | None,
+    *,
+    paybill_number: str | None = None,
+    account_number: str | None = None,
+) -> str:
     brand = (organization_name or "Your internet provider").strip()
+    payment = _payment_instruction(
+        paybill_number=paybill_number,
+        account_number=account_number,
+    )
+    if payment:
+        return (
+            f"Reminder: Your internet expires soon. {payment} to avoid "
+            f"disconnection. - {brand}"
+        )
     return (
         "Reminder: Your internet package will expire soon. "
         f"Please renew to avoid disconnection. - {brand}"
@@ -80,14 +122,15 @@ async def _create_campaign(
     db,
     *,
     reseller_id: int,
-    recipients: list[tuple[int, str, str]],
+    recipients: list[tuple[int, str, str, str]],
     body: str,
     settings_row: MessagingSettings | None,
     credit_note: str,
 ) -> int | None:
     """Persist one credit-backed campaign. Caller owns the session."""
-    segments = count_segments(body)
-    total_credits = segments * len(recipients)
+    message_segments = [count_segments(recipient[3]) for recipient in recipients]
+    segments = max(message_segments)
+    total_credits = sum(message_segments)
     sender_id = resolve_sender_id(
         settings_row.sender_id if settings_row else None
     )
@@ -119,16 +162,18 @@ async def _create_campaign(
         )
         return None
 
-    for customer_id, phone, category in recipients:
+    for (customer_id, phone, category, message_body), segments_for_message in zip(
+        recipients, message_segments
+    ):
         db.add(
             SmsMessage(
                 campaign_id=campaign.id,
                 user_id=reseller_id,
                 customer_id=customer_id,
                 recipient_phone=phone,
-                body=body,
-                segments=segments,
-                credits_charged=segments,
+                body=message_body,
+                segments=segments_for_message,
+                credits_charged=segments_for_message,
                 kind=SmsMessageKind.RESELLER_TO_CUSTOMER,
                 status=SmsMessageStatus.QUEUED,
                 category=category,
@@ -172,7 +217,14 @@ async def _queue_reseller_expired_campaign(
 
         rows = (
             await db.execute(
-                select(Customer.id, Customer.phone, Customer.expiry)
+                select(
+                    Customer.id,
+                    Customer.phone,
+                    Customer.expiry,
+                    Customer.account_number,
+                    Plan.connection_type,
+                )
+                .outerjoin(Plan, Customer.plan_id == Plan.id)
                 .where(
                     Customer.id.in_(customer_ids),
                     Customer.user_id == reseller_id,
@@ -199,8 +251,10 @@ async def _queue_reseller_expired_campaign(
             ).all()
         )
 
-        recipients: list[tuple[int, str, str]] = []
+        brand = reseller.business_name or reseller.organization_name
+        recipients: list[tuple[int, str, str, str]] = []
         seen_phones: set[str] = set()
+        uses_paybill = False
         for row in rows:
             phone = (row.phone or "").strip()
             phone_key = _phone_key(phone)
@@ -210,7 +264,22 @@ async def _queue_reseller_expired_campaign(
             if (row.id, category) in existing:
                 continue
             seen_phones.add(phone_key)
-            recipients.append((row.id, phone, category))
+            payment_account = (
+                row.account_number
+                if row.connection_type == ConnectionType.PPPOE
+                else None
+            )
+            uses_paybill = uses_paybill or bool(payment_account)
+            recipients.append((
+                row.id,
+                phone,
+                category,
+                render_expiry_message(
+                    brand,
+                    paybill_number=settings.MPESA_SHORTCODE,
+                    account_number=payment_account,
+                ),
+            ))
 
         if not recipients:
             return None
@@ -220,7 +289,9 @@ async def _queue_reseller_expired_campaign(
             reseller_id=reseller_id,
             recipients=recipients,
             body=render_expiry_message(
-                reseller.business_name or reseller.organization_name
+                brand,
+                paybill_number=settings.MPESA_SHORTCODE,
+                account_number="[customer account]" if uses_paybill else None,
             ),
             settings_row=settings_row,
             credit_note="Automatic customer expiry notifications",
@@ -411,7 +482,14 @@ async def _queue_reseller_reminder_campaign(
 
         rows = (
             await db.execute(
-                select(Customer.id, Customer.phone, Customer.expiry)
+                select(
+                    Customer.id,
+                    Customer.phone,
+                    Customer.expiry,
+                    Customer.account_number,
+                    Plan.connection_type,
+                )
+                .outerjoin(Plan, Customer.plan_id == Plan.id)
                 .where(
                     Customer.id.in_(customer_ids),
                     Customer.user_id == reseller_id,
@@ -439,8 +517,10 @@ async def _queue_reseller_reminder_campaign(
             ).all()
         )
 
-        recipients: list[tuple[int, str, str]] = []
+        brand = reseller.business_name or reseller.organization_name
+        recipients: list[tuple[int, str, str, str]] = []
         seen_phones: set[str] = set()
+        uses_paybill = False
         for row in rows:
             phone = (row.phone or "").strip()
             phone_key = _phone_key(phone)
@@ -450,7 +530,22 @@ async def _queue_reseller_reminder_campaign(
             if (row.id, category) in existing:
                 continue
             seen_phones.add(phone_key)
-            recipients.append((row.id, phone, category))
+            payment_account = (
+                row.account_number
+                if row.connection_type == ConnectionType.PPPOE
+                else None
+            )
+            uses_paybill = uses_paybill or bool(payment_account)
+            recipients.append((
+                row.id,
+                phone,
+                category,
+                render_reminder_message(
+                    brand,
+                    paybill_number=settings.MPESA_SHORTCODE,
+                    account_number=payment_account,
+                ),
+            ))
 
         if not recipients:
             return None
@@ -460,7 +555,9 @@ async def _queue_reseller_reminder_campaign(
             reseller_id=reseller_id,
             recipients=recipients,
             body=render_reminder_message(
-                reseller.business_name or reseller.organization_name
+                brand,
+                paybill_number=settings.MPESA_SHORTCODE,
+                account_number="[customer account]" if uses_paybill else None,
             ),
             settings_row=settings_row,
             credit_note=(

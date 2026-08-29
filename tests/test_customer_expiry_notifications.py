@@ -61,6 +61,7 @@ async def _seed_expired_pppoe(db, *, credits=5):
         mac_address=None,
         name="Joe",
         phone="+254700087474",
+        account_number="12345674",
     )
     return reseller, router, customer
 
@@ -91,12 +92,115 @@ async def test_queues_expiry_sms_in_campaign_history_and_debits_credit(
     assert campaign.total_credits == 1
     assert "expired" in campaign.body
     assert "Twork Links Limited" in campaign.body
+    assert "Paybill 600980" in campaign.body
+    assert "Account [customer account]" in campaign.body
     assert message.customer_id == customer.id
     assert message.recipient_phone == "+254700087474"
+    assert "Paybill 600980" in message.body
+    assert "Account 12345674" in message.body
     assert message.category == customer_expiry_notifications.expiry_message_category(
         customer.expiry
     )
     assert credits.balance == 4
+
+
+async def test_reminder_uses_each_customers_unique_payment_account(
+    db, session_factory,
+):
+    now = datetime.utcnow().replace(microsecond=0)
+    reseller = await make_reseller(db, organization_name="Payment ISP")
+    await make_sms_account(db, reseller, balance=5)
+    db.add(MessagingSettings(id=1, enabled=True))
+    db.add(CustomerExpirySmsSettings(
+        user_id=reseller.id,
+        enabled=True,
+        reminder_offsets_minutes=[120],
+        send_at_expiry=False,
+    ))
+    await db.commit()
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    first = await make_customer(
+        db,
+        reseller,
+        plan,
+        status=CustomerStatus.ACTIVE,
+        expiry=now + timedelta(minutes=90),
+        pppoe_username="first",
+        phone="254700000001",
+        account_number="12345674",
+    )
+    second = await make_customer(
+        db,
+        reseller,
+        plan,
+        status=CustomerStatus.ACTIVE,
+        expiry=now + timedelta(minutes=90),
+        pppoe_username="second",
+        phone="254700000002",
+        account_number="20000028",
+    )
+
+    campaign_id = await customer_expiry_notifications._queue_reseller_reminder_campaign(
+        reseller.id,
+        120,
+        [first.id, second.id],
+        session_factory=session_factory,
+        now=now,
+    )
+
+    campaign = await db.get(SmsCampaign, campaign_id)
+    messages = (
+        await db.execute(
+            select(SmsMessage).where(SmsMessage.campaign_id == campaign_id)
+            .order_by(SmsMessage.customer_id)
+        )
+    ).scalars().all()
+
+    assert campaign.recipient_count == 2
+    assert campaign.total_credits == 2
+    assert "Account [customer account]" in campaign.body
+    assert "Account 12345674" in messages[0].body
+    assert "Account 20000028" in messages[1].body
+    assert all(message.segments == 1 for message in messages)
+
+
+async def test_hotspot_expiry_does_not_advertise_pppoe_paybill(
+    db, session_factory,
+):
+    reseller = await make_reseller(db, organization_name="Hotspot ISP")
+    await make_sms_account(db, reseller, balance=5)
+    db.add(MessagingSettings(id=1, enabled=True))
+    db.add(CustomerExpirySmsSettings(
+        user_id=reseller.id,
+        enabled=True,
+        reminder_offsets_minutes=[1440],
+        send_at_expiry=True,
+    ))
+    await db.commit()
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        status=CustomerStatus.INACTIVE,
+        expiry=datetime.utcnow() - timedelta(minutes=1),
+        phone="254700000003",
+        account_number="30000036",
+    )
+
+    campaign_ids = await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [customer.id], session_factory=session_factory
+    )
+    campaign = await db.get(SmsCampaign, campaign_ids[0])
+    message = (
+        await db.execute(
+            select(SmsMessage).where(SmsMessage.campaign_id == campaign.id)
+        )
+    ).scalar_one()
+
+    assert "Paybill" not in campaign.body
+    assert "Paybill" not in message.body
+    assert "Please renew" in message.body
 
 
 async def test_same_customer_period_is_never_queued_twice(db, session_factory):
