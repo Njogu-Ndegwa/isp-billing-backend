@@ -49,6 +49,7 @@ class ProvisioningAttemptSource(str, enum.Enum):
     MPESA_TRANSACTION = "mpesa_transaction"
     CUSTOMER_PAYMENT = "customer_payment"
     SUBSCRIPTION_SHARE = "subscription_share"
+    OUTAGE_COMPENSATION = "outage_compensation"
 
 
 class ProvisioningAttemptEntrypoint(str, enum.Enum):
@@ -57,6 +58,7 @@ class ProvisioningAttemptEntrypoint(str, enum.Enum):
     VOUCHER_DIRECT_API = "voucher_direct_api"
     MANUAL_TRANSACTION_PROVISION = "manual_transaction_provision"
     SUBSCRIPTION_SHARE = "subscription_share"
+    OUTAGE_COMPENSATION = "outage_compensation"
 
 
 class ProvisioningState(str, enum.Enum):
@@ -141,7 +143,12 @@ class User(Base):
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     # sha256 hex of the raw token; the raw token only ever lives in the email link
     token_hash = Column(String(64), unique=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -2068,3 +2075,72 @@ class Approval(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     decided_at = Column(DateTime, nullable=True)
     decided_by = Column(String(64), nullable=True)
+
+
+class OutageCompensation(Base):
+    """Audit header for one bulk power-outage compensation run.
+
+    A reseller picks the outage window and the routers it hit; every customer
+    whose paid time overlapped the window gets their expiry pushed forward by
+    the downtime. No money moves and no CustomerPayment row is written -- the
+    credit is free time, so revenue and commission are untouched by design.
+    """
+
+    __tablename__ = "outage_compensations"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # Snapshot of the router ids the run targeted (list of ints).
+    router_ids = Column(JSON, nullable=False)
+    outage_start = Column(DateTime, nullable=False)
+    outage_end = Column(DateTime, nullable=False)
+    customers_credited = Column(Integer, nullable=False, default=0)
+    total_seconds_credited = Column(BigInteger, nullable=False, default=0)
+    # Whether the run also revived customers whose subscription had already
+    # run out (they are credited from "now" and pushed back onto the router).
+    include_expired = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    customers_reactivated = Column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    note = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class OutageCompensationItem(Base):
+    """One customer's credit within an OutageCompensation run.
+
+    customer_id is SET NULL on customer deletion so the audit trail survives;
+    customer_name/router_id are snapshots for the same reason.
+    """
+
+    __tablename__ = "outage_compensation_items"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    compensation_id = Column(
+        Integer,
+        ForeignKey("outage_compensations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    customer_id = Column(
+        Integer,
+        ForeignKey("customers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    customer_name = Column(String, nullable=True)
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="SET NULL"), nullable=True)
+    seconds_credited = Column(Integer, nullable=False)
+    expiry_before = Column(DateTime, nullable=True)
+    expiry_after = Column(DateTime, nullable=True)
+    # Set when this customer had already expired and was revived by the run.
+    # Reviving is not enough on its own -- the cleanup cron has removed them
+    # from the router, so they also need re-provisioning. That happens after
+    # the transaction commits (never across DB I/O); this column is the
+    # per-customer outcome, so a partial failure is visible instead of silent.
+    was_expired = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    reprovision_state = Column(String(32), nullable=True, index=True)
+    reprovision_error = Column(String(500), nullable=True)
+    reprovision_attempted_at = Column(DateTime, nullable=True)

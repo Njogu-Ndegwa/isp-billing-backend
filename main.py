@@ -64,6 +64,7 @@ from app.api.feedback_routes import router as feedback_router
 from app.api.admin_feedback_routes import router as admin_feedback_router
 from app.api.agent_board_routes import router as agent_board_router
 from app.api.load_balancing_routes import router as load_balancing_router
+from app.api.outage_compensation_routes import router as outage_compensation_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -106,6 +107,7 @@ app.include_router(feedback_router)
 app.include_router(admin_feedback_router)
 app.include_router(agent_board_router)
 app.include_router(load_balancing_router)
+app.include_router(outage_compensation_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -2110,6 +2112,78 @@ async def run_compensation_voucher_migrations():
     logger.info("Compensation voucher migrations complete")
 
 
+async def run_outage_compensation_migrations():
+    """Create the outage-compensation audit tables (outage_compensations +
+    outage_compensation_items) on startup. New tables only — no ALTERs — so
+    the checkfirst create_all pattern used by messaging/feedback is enough.
+    Idempotent: safe to run on every startup."""
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+
+        from app.db.models import OutageCompensation, OutageCompensationItem
+        targets = [OutageCompensation, OutageCompensationItem]
+        to_create = [m.__table__ for m in targets if m.__tablename__ not in tables]
+        if to_create:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
+            logger.info(
+                "Outage compensation migration: created %s",
+                ", ".join(t.name for t in to_create),
+            )
+
+        # --- expired-customer revival (added 2026-08-25) --------------------
+        # create_all above never ALTERs an existing table, so these columns
+        # need explicit idempotent wiring for deployments that already have
+        # the tables from the first version of this feature.
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensations "
+            "ADD COLUMN IF NOT EXISTS include_expired BOOLEAN NOT NULL DEFAULT false"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensations "
+            "ADD COLUMN IF NOT EXISTS customers_reactivated INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensation_items "
+            "ADD COLUMN IF NOT EXISTS was_expired BOOLEAN NOT NULL DEFAULT false"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensation_items "
+            "ADD COLUMN IF NOT EXISTS reprovision_state VARCHAR(32)"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensation_items "
+            "ADD COLUMN IF NOT EXISTS reprovision_error VARCHAR(500)"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE outage_compensation_items "
+            "ADD COLUMN IF NOT EXISTS reprovision_attempted_at TIMESTAMP"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_outage_compensation_items_reprovision_state "
+            "ON outage_compensation_items (reprovision_state)"
+        ))
+
+        # Reviving a customer re-provisions them, and that goes through the
+        # same ProvisioningAttempt machinery as a payment -- which means both
+        # native enums need the new label. Postgres will not add it implicitly
+        # (lesson from the missing 'timeout' label on b2btransactionstatus,
+        # 2026-07-18).
+        await conn.execute(sa_text(
+            "ALTER TYPE provisioningattemptsource "
+            "ADD VALUE IF NOT EXISTS 'outage_compensation'"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TYPE provisioningattemptentrypoint "
+            "ADD VALUE IF NOT EXISTS 'outage_compensation'"
+        ))
+    logger.info("Outage compensation migrations complete")
+
+
 async def run_payment_port_attribution_migrations():
     """Add customer_payments.port_name (varchar, nullable) so revenue can be
     attributed to the router port the paying customer's device was on around
@@ -2398,6 +2472,12 @@ async def startup_event():
         logger.info("Load-balancing migrations completed successfully")
     except Exception as e:
         logger.error(f"Load-balancing migration failed (non-fatal): {e}")
+
+    try:
+        await run_outage_compensation_migrations()
+        logger.info("Outage compensation migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Outage compensation migration failed (non-fatal): {e}")
 
     try:
         await run_router_status_alert_migrations()

@@ -17,6 +17,7 @@ The baseline lives in tests/schema_snapshot.json. After writing your migration:
     python scripts/schema_snapshot.py --write
 """
 
+import ast
 import pathlib
 import sys
 
@@ -147,3 +148,37 @@ def test_every_add_column_is_idempotent():
         "information_schema check. Startup migrations run on EVERY boot, so this "
         "crashes the app the second time it starts:\n  " + "\n  ".join(unguarded)
     )
+
+
+def test_outage_compensation_migration_runs_on_normal_startup():
+    """The outage tables must be created on a healthy startup path.
+
+    A migration call accidentally nested in another migration's ``except`` block
+    is syntactically valid but only runs when that unrelated migration fails.
+    """
+    tree = ast.parse(migration_source())
+    startup = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "startup_event"
+    )
+
+    def calls_outage_migration(statements):
+        block = ast.Module(body=statements, type_ignores=[])
+        return any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run_outage_compensation_migrations"
+            for node in ast.walk(block)
+        )
+
+    startup_tries = [node for node in startup.body if isinstance(node, ast.Try)]
+    assert any(calls_outage_migration(node.body) for node in startup_tries), (
+        "run_outage_compensation_migrations() is not called from a normal "
+        "startup try block; production would start without creating its tables"
+    )
+    assert not any(
+        calls_outage_migration(handler.body)
+        for node in startup_tries
+        for handler in node.handlers
+    ), "The outage migration must not be conditional on another migration failing"
