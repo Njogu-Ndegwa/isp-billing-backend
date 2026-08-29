@@ -12,13 +12,13 @@ from app.config import settings
 from app.db.database import get_db
 from app.db.models import (
     User, UserRole,
-    MessagingSettings, MessageTemplate,
+    MessagingSettings, MessageTemplate, CustomerExpirySmsSettings,
     SmsCreditOrder, SmsCreditOrderStatus, SmsCreditTxnKind, SmsCreditTransaction,
     SmsCampaign, SmsCampaignStatus, SmsMessage, SmsMessageStatus, SmsMessageKind,
     ResellerInboxMessage, Customer,
 )
 from app.services.auth import verify_token, get_current_user
-from app.services import sms_credits, sms_dispatch
+from app.services import customer_expiry_notifications, sms_credits, sms_dispatch
 from app.services.messaging import count_segments, resolve_sender_id
 from app.services.mpesa import initiate_stk_push_direct
 
@@ -59,6 +59,84 @@ async def get_credits(db: AsyncSession = Depends(get_db),
         "bundles": s.bundles or [],
         "enabled": s.enabled,
     }
+
+
+# ---- Automatic expiry reminders -----------------------------------------
+
+class ExpirySettingsIn(BaseModel):
+    enabled: bool
+    reminder_offsets_minutes: list[int]
+    send_at_expiry: bool
+
+
+def _expiry_settings_payload(row: CustomerExpirySmsSettings) -> dict:
+    return {
+        "enabled": row.enabled,
+        "reminder_offsets_minutes": row.reminder_offsets_minutes or [],
+        "send_at_expiry": row.send_at_expiry,
+    }
+
+
+@router.get("/api/messaging/expiry-settings")
+async def get_expiry_settings(db: AsyncSession = Depends(get_db),
+                              token: str = Depends(verify_token)):
+    user = await _require_reseller(token, db)
+    row = await db.get(CustomerExpirySmsSettings, user.id)
+    if row is None:
+        row = CustomerExpirySmsSettings(
+            user_id=user.id,
+            reminder_offsets_minutes=list(
+                customer_expiry_notifications.DEFAULT_REMINDER_OFFSETS_MINUTES
+            ),
+        )
+        db.add(row)
+        await db.flush()
+    return _expiry_settings_payload(row)
+
+
+@router.put("/api/messaging/expiry-settings")
+async def update_expiry_settings(body: ExpirySettingsIn,
+                                 db: AsyncSession = Depends(get_db),
+                                 token: str = Depends(verify_token)):
+    user = await _require_reseller(token, db)
+    offsets = sorted(set(body.reminder_offsets_minutes), reverse=True)
+    if body.enabled and not offsets:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose at least one reminder time before expiry",
+        )
+    if len(offsets) > customer_expiry_notifications.MAX_REMINDER_OFFSETS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Choose no more than "
+                f"{customer_expiry_notifications.MAX_REMINDER_OFFSETS} reminder times"
+            ),
+        )
+    invalid = [
+        value for value in offsets
+        if value < customer_expiry_notifications.MIN_REMINDER_OFFSET_MINUTES
+        or value > customer_expiry_notifications.MAX_REMINDER_OFFSET_MINUTES
+    ]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Reminder times must be between 30 minutes and 30 days "
+                "before expiry"
+            ),
+        )
+
+    row = await db.get(CustomerExpirySmsSettings, user.id)
+    if row is None:
+        row = CustomerExpirySmsSettings(user_id=user.id)
+        db.add(row)
+    row.enabled = body.enabled
+    row.reminder_offsets_minutes = offsets
+    row.send_at_expiry = body.send_at_expiry
+    await db.commit()
+    await db.refresh(row)
+    return _expiry_settings_payload(row)
 
 
 class PurchaseRequest(BaseModel):

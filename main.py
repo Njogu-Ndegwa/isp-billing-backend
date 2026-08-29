@@ -124,6 +124,7 @@ from app.services.usage_cap_sampler import sample_capped_usage_background
 from app.services.mikrotik_lb_background import reconcile_lb_paid_background
 from app.services.payment_port_attribution import attribute_recent_payment_ports_background
 from app.services.router_status_alerts import scan_and_notify_offline_routers
+from app.services.customer_expiry_notifications import scan_customer_expiry_reminders
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
@@ -2013,11 +2014,12 @@ async def run_messaging_migrations():
 
         from app.db.models import (
             MessagingSettings, SmsCreditAccount, SmsCreditTransaction,
-            SmsCreditOrder, MessageTemplate, SmsCampaign, SmsMessage,
+            CustomerExpirySmsSettings, SmsCreditOrder, MessageTemplate, SmsCampaign, SmsMessage,
             ResellerInboxMessage,
         )
+        # Explicit startup create_all target: customer_expiry_sms_settings.
         targets = [
-            MessagingSettings, SmsCreditAccount, SmsCreditTransaction,
+            MessagingSettings, SmsCreditAccount, CustomerExpirySmsSettings, SmsCreditTransaction,
             SmsCreditOrder, MessageTemplate, SmsCampaign, SmsMessage,
             ResellerInboxMessage,
         ]
@@ -2536,6 +2538,15 @@ async def startup_event():
         name='Send opt-in router offline alerts (DB-only, debounced)',
         replace_existing=True,
         max_instances=1
+    )
+    scheduler.add_job(
+        scan_customer_expiry_reminders,
+        trigger=IntervalTrigger(minutes=5),
+        id='customer_expiry_reminders',
+        name='Send opt-in customer pre-expiry reminders',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=120,
     )
     scheduler.add_job(
         attribute_recent_payment_ports_background,

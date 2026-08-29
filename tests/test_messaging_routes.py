@@ -7,7 +7,12 @@ import app.api.messaging_routes as mr
 from app.api.messaging_routes import router as messaging_router
 from app.db.database import get_db
 from app.services.auth import verify_token
-from app.db.models import SmsCreditOrder, SmsCreditOrderStatus, UserRole
+from app.db.models import (
+    CustomerExpirySmsSettings,
+    SmsCreditOrder,
+    SmsCreditOrderStatus,
+    UserRole,
+)
 from app.services import sms_credits
 from tests.factories import make_reseller, make_plan, make_customer, make_sms_account
 
@@ -70,6 +75,52 @@ async def test_credits_endpoint_exposes_default_half_shilling_price(db, client, 
     resp = await client.get("/api/messaging/credits")
     assert resp.status_code == 200
     assert resp.json()["price_per_sms_kes"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_expiry_settings_default_and_update(db, client, monkeypatch):
+    reseller = await make_reseller(db)
+    _auth_as(monkeypatch, reseller)
+
+    default = await client.get("/api/messaging/expiry-settings")
+    assert default.status_code == 200
+    assert default.json() == {
+        "enabled": False,
+        "reminder_offsets_minutes": [1440],
+        "send_at_expiry": True,
+    }
+
+    updated = await client.put("/api/messaging/expiry-settings", json={
+        "enabled": True,
+        "reminder_offsets_minutes": [120, 1440, 120],
+        "send_at_expiry": False,
+    })
+    assert updated.status_code == 200
+    assert updated.json() == {
+        "enabled": True,
+        "reminder_offsets_minutes": [1440, 120],
+        "send_at_expiry": False,
+    }
+    row = await db.get(CustomerExpirySmsSettings, reseller.id)
+    await db.refresh(row)
+    assert row.enabled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offsets", [[], [29], [43201], [30, 60, 90, 120, 150, 180]])
+async def test_expiry_settings_reject_invalid_schedules(
+    db, client, monkeypatch, offsets,
+):
+    reseller = await make_reseller(db)
+    _auth_as(monkeypatch, reseller)
+
+    response = await client.put("/api/messaging/expiry-settings", json={
+        "enabled": True,
+        "reminder_offsets_minutes": offsets,
+        "send_at_expiry": True,
+    })
+
+    assert response.status_code == 400
 
 
 @pytest.mark.asyncio

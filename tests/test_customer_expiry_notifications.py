@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 
 from app.db.models import (
     ConnectionType,
+    CustomerExpirySmsSettings,
     CustomerStatus,
     MessagingSettings,
     SmsCampaign,
@@ -31,6 +32,12 @@ async def _seed_expired_pppoe(db, *, credits=5):
     )
     await make_sms_account(db, reseller, balance=credits)
     db.add(MessagingSettings(id=1, enabled=True))
+    db.add(CustomerExpirySmsSettings(
+        user_id=reseller.id,
+        enabled=True,
+        reminder_offsets_minutes=[1440],
+        send_at_expiry=True,
+    ))
     await db.commit()
     plan = await make_plan(
         db,
@@ -130,6 +137,83 @@ async def test_active_or_renewed_customer_is_not_notified(db, session_factory):
     )
 
     assert campaigns == []
+
+
+async def test_at_expiry_toggle_can_disable_final_message(db, session_factory):
+    reseller, _, customer = await _seed_expired_pppoe(db)
+    preferences = await db.get(CustomerExpirySmsSettings, reseller.id)
+    preferences.send_at_expiry = False
+    await db.commit()
+
+    campaigns = await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [customer.id], session_factory=session_factory
+    )
+
+    assert campaigns == []
+
+
+async def test_pre_expiry_scan_honors_offsets_and_deduplicates(
+    db, session_factory, monkeypatch,
+):
+    now = datetime.utcnow().replace(microsecond=0)
+    reseller = await make_reseller(db, organization_name="Reminder ISP")
+    await make_sms_account(db, reseller, balance=5)
+    db.add(MessagingSettings(id=1, enabled=True))
+    db.add(CustomerExpirySmsSettings(
+        user_id=reseller.id,
+        enabled=True,
+        reminder_offsets_minutes=[120, 30],
+        send_at_expiry=False,
+    ))
+    await db.commit()
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        status=CustomerStatus.ACTIVE,
+        expiry=now + timedelta(minutes=90),
+        pppoe_username="due-soon",
+        name="Due Soon",
+        phone="254700000099",
+    )
+
+    monkeypatch.setattr(
+        customer_expiry_notifications.database,
+        "async_session",
+        session_factory,
+    )
+    monkeypatch.setattr(
+        customer_expiry_notifications.database,
+        "db_pool_snapshot",
+        lambda: {"pressure": {"level": "healthy"}},
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        customer_expiry_notifications,
+        "spawn_expiry_campaign_dispatch",
+        lambda ids: dispatched.extend(ids),
+    )
+
+    first_count = await customer_expiry_notifications.scan_customer_expiry_reminders(
+        now=now
+    )
+    second_count = await customer_expiry_notifications.scan_customer_expiry_reminders(
+        now=now + timedelta(minutes=5)
+    )
+    messages = (
+        await db.execute(select(SmsMessage).order_by(SmsMessage.id))
+    ).scalars().all()
+
+    assert first_count == 1
+    assert second_count == 0
+    assert len(dispatched) == 1
+    assert len(messages) == 1
+    assert messages[0].customer_id == customer.id
+    assert messages[0].category == customer_expiry_notifications.reminder_message_category(
+        customer.expiry, 120
+    )
+    assert "expire soon" in messages[0].body
 
 
 async def test_pppoe_cleanup_notifies_only_after_router_enforcement(

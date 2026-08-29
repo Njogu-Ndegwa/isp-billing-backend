@@ -1756,6 +1756,17 @@ class SmsCreditAccount(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class CustomerExpirySmsSettings(Base):
+    """A reseller's opt-in schedule for automatic customer expiry messages."""
+    __tablename__ = "customer_expiry_sms_settings"
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    reminder_offsets_minutes = Column(JSON, nullable=False, default=lambda: [1440])
+    send_at_expiry = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class SmsCreditTransaction(Base):
     __tablename__ = "sms_credit_transactions"
     id = Column(Integer, primary_key=True, autoincrement=True)
