@@ -85,11 +85,10 @@ async def dispatch_campaign(campaign_id: int) -> None:
             return
         camp.status = SmsCampaignStatus.SENDING
         msgs = (await db.execute(
-            select(SmsMessage.id, SmsMessage.recipient_phone)
+            select(SmsMessage.id, SmsMessage.recipient_phone, SmsMessage.body)
             .where(SmsMessage.campaign_id == campaign_id,
                    SmsMessage.status == SmsMessageStatus.QUEUED)
         )).all()
-        body = camp.body
         sender_id = camp.sender_id or default_sender_id()
         user_id = camp.user_id
         await db.commit()
@@ -102,57 +101,62 @@ async def dispatch_campaign(campaign_id: int) -> None:
     provider = get_provider()
     chunk_size = settings.SMS_DISPATCH_CHUNK_SIZE
 
-    for chunk in _chunks(msgs, chunk_size):
-        phones = [m.recipient_phone for m in chunk]
+    messages_by_body: dict[str, list] = {}
+    for message in msgs:
+        messages_by_body.setdefault(message.body, []).append(message)
 
-        # --- Network call: no DB session held ---
-        try:
-            results = await provider.send_bulk(phones, body, sender_id)
-        except Exception as e:
-            logger.error("Provider send failed for campaign %s: %s", campaign_id, e)
-            results = []
-        # --- End network call ---
+    for body, body_messages in messages_by_body.items():
+        for chunk in _chunks(body_messages, chunk_size):
+            phones = [m.recipient_phone for m in chunk]
 
-        by_phone = {_phone_key(r.recipient): r for r in results}
+            # --- Network call: no DB session held ---
+            try:
+                results = await provider.send_bulk(phones, body, sender_id)
+            except Exception as e:
+                logger.error("Provider send failed for campaign %s: %s", campaign_id, e)
+                results = []
+            # --- End network call ---
 
-        failed_credits = 0
-        sent_count = 0
-        failed_count = 0
-        # --- Short DB session: persist per-message results ---
-        async with async_session() as db:
-            for m in chunk:
-                row = await db.get(SmsMessage, m.id)
-                res = by_phone.get(_phone_key(m.recipient_phone))
-                if res is not None and res.success:
-                    row.status = SmsMessageStatus.SENT
-                    row.provider_message_id = res.provider_message_id
-                    row.provider = provider.name
-                    row.error = None
-                    sent_count += 1
-                else:
-                    row.status = SmsMessageStatus.FAILED
-                    row.error = (res.error if res else "no_response")[:255]
-                    failed_credits += row.credits_charged
-                    failed_count += 1
-            await db.commit()
-        # --- DB session closed ---
+            by_phone = {_phone_key(r.recipient): r for r in results}
 
-        logger.info(
-            "SMS campaign %s provider batch settled: provider=%s requested=%s "
-            "sent=%s failed=%s",
-            campaign_id, provider.name, len(chunk), sent_count, failed_count,
-        )
-
-        if failed_credits:
-            # --- Short DB session: refund failed credits ---
+            failed_credits = 0
+            sent_count = 0
+            failed_count = 0
+            # --- Short DB session: persist per-message results ---
             async with async_session() as db:
-                await sms_credits.refund(db, user_id, failed_credits,
-                                         reference=f"campaign:{campaign_id}",
-                                         note="failed recipients")
-                camp = await db.get(SmsCampaign, campaign_id)
-                camp.refunded_credits += failed_credits
+                for m in chunk:
+                    row = await db.get(SmsMessage, m.id)
+                    res = by_phone.get(_phone_key(m.recipient_phone))
+                    if res is not None and res.success:
+                        row.status = SmsMessageStatus.SENT
+                        row.provider_message_id = res.provider_message_id
+                        row.provider = provider.name
+                        row.error = None
+                        sent_count += 1
+                    else:
+                        row.status = SmsMessageStatus.FAILED
+                        row.error = (res.error if res else "no_response")[:255]
+                        failed_credits += row.credits_charged
+                        failed_count += 1
                 await db.commit()
             # --- DB session closed ---
+
+            logger.info(
+                "SMS campaign %s provider batch settled: provider=%s requested=%s "
+                "sent=%s failed=%s",
+                campaign_id, provider.name, len(chunk), sent_count, failed_count,
+            )
+
+            if failed_credits:
+                # --- Short DB session: refund failed credits ---
+                async with async_session() as db:
+                    await sms_credits.refund(db, user_id, failed_credits,
+                                             reference=f"campaign:{campaign_id}",
+                                             note="failed recipients")
+                    camp = await db.get(SmsCampaign, campaign_id)
+                    camp.refunded_credits += failed_credits
+                    await db.commit()
+                # --- DB session closed ---
 
     await _finalize(campaign_id)
 
