@@ -172,6 +172,14 @@
   "trans_amount",
   "trans_id"
  ],
+ "customer_expiry_sms_settings": [
+  "created_at",
+  "enabled",
+  "reminder_offsets_minutes",
+  "send_at_expiry",
+  "updated_at",
+  "user_id"
+ ],
  "customer_payments": [
   "amount",
   "collection_mode",

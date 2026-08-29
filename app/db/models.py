@@ -159,6 +159,7 @@ class Customer(Base):
     __tablename__ = "customers"
     __table_args__ = (
         UniqueConstraint("mac_address", "user_id", name="uq_customer_mac_per_reseller"),
+        Index("ix_customers_status_expiry_user", "status", "expiry", "user_id"),
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=True)
@@ -1756,6 +1757,17 @@ class SmsCreditAccount(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class CustomerExpirySmsSettings(Base):
+    """A reseller's opt-in schedule for automatic customer expiry messages."""
+    __tablename__ = "customer_expiry_sms_settings"
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    reminder_offsets_minutes = Column(JSON, nullable=False, default=lambda: [1440])
+    send_at_expiry = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class SmsCreditTransaction(Base):
     __tablename__ = "sms_credit_transactions"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1818,6 +1830,13 @@ class SmsCampaign(Base):
 
 class SmsMessage(Base):
     __tablename__ = "sms_messages"
+    __table_args__ = (
+        Index(
+            "uq_sms_messages_customer_category_user",
+            "customer_id", "category", "user_id",
+            unique=True,
+        ),
+    )
     id = Column(Integer, primary_key=True, autoincrement=True)
     campaign_id = Column(Integer, ForeignKey("sms_campaigns.id"), nullable=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
