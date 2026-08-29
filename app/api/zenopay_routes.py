@@ -28,6 +28,7 @@ from app.db.models import (
     ZenoPayTransactionStatus,
 )
 from app.services.payment_gateway import decrypt_credential
+from app.services.billing import apply_failed_payment_customer_status
 from app.services.zenopay import validate_zenopay_webhook
 
 logger = logging.getLogger(__name__)
@@ -247,8 +248,8 @@ async def zenopay_webhook(
                 select(Customer).where(Customer.id == txn.customer_id)
             )
             cust = cust_result.scalar_one_or_none()
-            if cust and cust.status == CustomerStatus.PENDING:
-                cust.status = CustomerStatus.INACTIVE
+            if cust:
+                apply_failed_payment_customer_status(cust)
 
         await db.commit()
         logger.info("[ZENOPAY WEBHOOK] Payment FAILED for order %s", order_id)
@@ -347,8 +348,8 @@ async def _sync_zenopay_status(db: AsyncSession, txn: ZenoPayTransaction):
                     select(Customer).where(Customer.id == txn.customer_id)
                 )
                 cust = cust_result.scalar_one_or_none()
-                if cust and cust.status == CustomerStatus.PENDING:
-                    cust.status = CustomerStatus.INACTIVE
+                if cust:
+                    apply_failed_payment_customer_status(cust)
 
             await db.commit()
             logger.info("[ZENOPAY POLL] Order %s now FAILED", txn.order_id)

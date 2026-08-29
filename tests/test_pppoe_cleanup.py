@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from unittest.mock import Mock
 
 import pytest
 from fastapi import HTTPException
@@ -15,10 +16,12 @@ from app.db.models import (
     ProvisioningAttempt,
     ProvisioningAttemptEntrypoint,
     ProvisioningAttemptSource,
+    ProvisioningLog,
     ProvisioningOnlineState,
     ProvisioningState,
 )
 from app.services import pppoe_provisioning
+from app.services.mikrotik_api import MikroTikAPI
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
 
@@ -102,6 +105,116 @@ async def test_delete_customer_keeps_db_row_when_pppoe_cleanup_fails(db, monkeyp
         await db.execute(select(Customer).where(Customer.id == customer.id))
     ).scalar_one_or_none()
     assert remaining is not None
+
+
+async def test_deactivate_pppoe_keeps_customer_active_when_router_cleanup_fails(
+    db, monkeypatch,
+):
+    reseller, _, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+
+    async def _cleanup(_payload):
+        return {"error": "Secret removal failed: Not connected"}
+
+    monkeypatch.setattr(customer_routes, "call_pppoe_remove", _cleanup)
+
+    with pytest.raises(HTTPException) as exc:
+        await customer_routes.deactivate_pppoe_customer(
+            customer.id,
+            db,
+            _token(reseller),
+        )
+
+    assert exc.value.status_code == 503
+    assert "status was not changed" in exc.value.detail
+    await db.refresh(customer)
+    assert customer.status == CustomerStatus.ACTIVE
+
+
+async def test_deactivate_pppoe_marks_inactive_only_after_router_cleanup_succeeds(
+    db, monkeypatch,
+):
+    reseller, _, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+
+    async def _cleanup(_payload):
+        return {
+            "success": True,
+            "disconnect_result": {"success": True, "disconnected": 1},
+            "remove_result": {"success": True, "action": "removed"},
+        }
+
+    monkeypatch.setattr(customer_routes, "call_pppoe_remove", _cleanup)
+
+    response = await customer_routes.deactivate_pppoe_customer(
+        customer.id,
+        db,
+        _token(reseller),
+    )
+
+    assert response["success"] is True
+    assert response["remove_result"] == "ok"
+    await db.refresh(customer)
+    assert customer.status == CustomerStatus.INACTIVE
+    cleanup_log = (
+        await db.execute(
+            select(ProvisioningLog).where(
+                ProvisioningLog.customer_id == customer.id,
+                ProvisioningLog.action == "pppoe_deactivation",
+                ProvisioningLog.status == "success",
+            )
+        )
+    ).scalar_one()
+    assert "Manual deactivation" in cleanup_log.details
+
+
+def _api_with_commands(*results):
+    api = MikroTikAPI.__new__(MikroTikAPI)
+    api.connected = True
+    api.send_command = Mock(side_effect=results)
+    return api
+
+
+async def test_remove_pppoe_secret_propagates_secret_listing_failure():
+    api = _api_with_commands({"error": "Not connected"})
+
+    result = api.remove_pppoe_secret("Festo")
+
+    assert result == {"error": "Not connected"}
+    api.send_command.assert_called_once_with("/ppp/secret/print")
+
+
+async def test_remove_pppoe_secret_propagates_remove_failure():
+    api = _api_with_commands(
+        {"success": True, "data": [{".id": "*A", "name": "Festo"}]},
+        {"error": "Read timeout"},
+    )
+
+    result = api.remove_pppoe_secret("Festo")
+
+    assert result == {"error": "Read timeout"}
+    assert api.send_command.call_args_list[-1].args == (
+        "/ppp/secret/remove",
+        {"numbers": "*A"},
+    )
+
+
+async def test_disconnect_pppoe_session_propagates_session_listing_failure():
+    api = _api_with_commands({"error": "Not connected"})
+
+    result = api.disconnect_pppoe_session("Festo")
+
+    assert result == {"error": "Not connected"}
+    api.send_command.assert_called_once_with("/ppp/active/print")
+
+
+async def test_disconnect_pppoe_session_does_not_count_failed_remove_as_disconnected():
+    api = _api_with_commands(
+        {"success": True, "data": [{".id": "*B", "name": "Festo"}]},
+        {"error": "Read timeout"},
+    )
+
+    result = api.disconnect_pppoe_session("Festo")
+
+    assert result == {"error": "Read timeout", "disconnected": 0}
 
 
 async def test_cleanup_pppoe_user_endpoint_removes_orphan_router_secret(db, monkeypatch):

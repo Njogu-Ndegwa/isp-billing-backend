@@ -11,6 +11,27 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def apply_failed_payment_customer_status(
+    customer: Customer,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Set the post-failure status without revoking already-paid access.
+
+    Payment initiation temporarily uses PENDING for both new purchases and
+    renewals. A failed renewal must restore ACTIVE while paid time remains;
+    only a customer without current paid time should become INACTIVE.
+    """
+    now = now or datetime.utcnow()
+    if customer.expiry and customer.expiry > now:
+        customer.status = CustomerStatus.ACTIVE
+        return "preserved_active"
+    if customer.status == CustomerStatus.PENDING:
+        customer.status = CustomerStatus.INACTIVE
+        return "marked_inactive"
+    return "unchanged"
+
 async def get_customers_by_user(db: AsyncSession, user_id: int, role: str):
     """
     Fetch customers for a user, filtered by user_id for resellers.

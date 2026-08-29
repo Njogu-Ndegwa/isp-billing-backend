@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db.database import get_db
+from app.services.billing import apply_failed_payment_customer_status
 from app.db.models import (
     ConnectionType,
     Customer,
@@ -139,8 +140,8 @@ async def _apply_remote_status(
                 select(Customer).where(Customer.id == txn.customer_id)
             )
             cust = cust_result.scalar_one_or_none()
-            if cust and cust.status == CustomerStatus.PENDING:
-                cust.status = CustomerStatus.INACTIVE
+            if cust:
+                apply_failed_payment_customer_status(cust)
 
         logger.info(
             "[MTN MOMO] Payment FAILED for reference %s (reason=%s)",
