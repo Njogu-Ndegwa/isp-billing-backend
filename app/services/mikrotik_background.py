@@ -30,6 +30,9 @@ from app.db.models import (
     RouterAuthMethod,
     AccessCredential,
     AccessCredStatus,
+    CustomerPayment,
+    PaymentStatus,
+    ProvisioningLog,
 )
 from app.services.mikrotik_api import (
     MikroTikAPI,
@@ -63,6 +66,8 @@ ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL = timedelta(minutes=5)
 BANDWIDTH_MAX_ROUTERS_PER_RUN = 8
 BANDWIDTH_RUN_TIME_BUDGET_SECONDS = 90
 BANDWIDTH_HISTORY_RETENTION_DAYS = 30
+INACTIVE_PPPOE_RECONCILE_BATCH_SIZE = 20
+INACTIVE_PPPOE_RECONCILE_MAX_PER_ROUTER = 5
 
 
 class RouterLockManager:
@@ -90,10 +95,12 @@ router_locks = RouterLockManager()
 # Shared state for background jobs
 cleanup_running = False
 queue_sync_running = False
+inactive_pppoe_reconcile_running = False
 _last_safety_net_cleanup_at: datetime | None = None
 _last_access_credential_reaper_at: datetime | None = None
 _bandwidth_router_cursor = 0
 _queue_sync_router_cursor = 0
+_inactive_pppoe_reconcile_cursor = 0
 
 # Rate limiting constants for queue sync
 SYNC_DELAY_BETWEEN_COMMANDS = 0.1
@@ -890,6 +897,281 @@ def _cleanup_pppoe_customers_sync(router_pppoe_map: dict) -> dict:
     return merged
 
 
+def _inactive_pppoe_candidates_stmt(after_customer_id: int):
+    """Bounded candidates whose last known access grant lacks later cleanup proof."""
+    last_deactivation = (
+        select(func.max(ProvisioningLog.log_date))
+        .where(
+            ProvisioningLog.customer_id == Customer.id,
+            ProvisioningLog.action == "pppoe_deactivation",
+            ProvisioningLog.status == "success",
+        )
+        .correlate(Customer)
+        .scalar_subquery()
+    )
+    last_payment = (
+        select(func.max(CustomerPayment.payment_date))
+        .where(
+            CustomerPayment.customer_id == Customer.id,
+            CustomerPayment.status == PaymentStatus.COMPLETED,
+        )
+        .correlate(Customer)
+        .scalar_subquery()
+    )
+    last_pppoe_delivery = (
+        select(func.max(ProvisioningLog.log_date))
+        .where(
+            ProvisioningLog.customer_id == Customer.id,
+            ProvisioningLog.status == "success",
+            or_(
+                ProvisioningLog.action.like("pppoe%"),
+                ProvisioningLog.action == "outage_compensation",
+            ),
+        )
+        .correlate(Customer)
+        .scalar_subquery()
+    )
+    return (
+        select(Customer)
+        .join(Router, Customer.router_id == Router.id)
+        .options(selectinload(Customer.router))
+        .where(
+            Customer.id > after_customer_id,
+            Customer.status == CustomerStatus.INACTIVE,
+            Customer.pppoe_username.isnot(None),
+            Customer.pppoe_username != "",
+            Customer.router_id.isnot(None),
+            Router.auth_method == RouterAuthMethod.DIRECT_API,
+            or_(
+                last_deactivation.is_(None),
+                last_payment > last_deactivation,
+                last_pppoe_delivery > last_deactivation,
+            ),
+        )
+        .order_by(Customer.id.asc())
+        .limit(INACTIVE_PPPOE_RECONCILE_BATCH_SIZE)
+    )
+
+
+async def _load_inactive_pppoe_reconcile_batch() -> list[dict]:
+    global _inactive_pppoe_reconcile_cursor
+
+    async with async_session() as db:
+        candidates = (
+            await db.execute(
+                _inactive_pppoe_candidates_stmt(_inactive_pppoe_reconcile_cursor)
+            )
+        ).scalars().all()
+        if not candidates and _inactive_pppoe_reconcile_cursor:
+            _inactive_pppoe_reconcile_cursor = 0
+            candidates = (
+                await db.execute(_inactive_pppoe_candidates_stmt(0))
+            ).scalars().all()
+
+        if candidates:
+            _inactive_pppoe_reconcile_cursor = candidates[-1].id
+
+        now = datetime.utcnow()
+        batch = []
+        per_router_counts: dict[int, int] = {}
+        for customer in candidates:
+            router = customer.router
+            if not router or router.auth_method == RouterAuthMethod.RADIUS:
+                continue
+            if _router_recently_offline(router, now):
+                continue
+            router_count = per_router_counts.get(router.id, 0)
+            if router_count >= INACTIVE_PPPOE_RECONCILE_MAX_PER_ROUTER:
+                continue
+            per_router_counts[router.id] = router_count + 1
+            batch.append({
+                "id": customer.id,
+                "name": customer.name,
+                "pppoe_username": customer.pppoe_username,
+                "expiry": customer.expiry,
+                "router_id": router.id,
+                "router": {
+                    "id": router.id,
+                    "ip": router.ip_address,
+                    "username": router.username,
+                    "password": router.password,
+                    "port": router.port,
+                    "name": router.name,
+                },
+            })
+        await db.commit()
+        return batch
+
+
+async def _filter_still_inactive_pppoe_candidates(batch: list[dict]) -> list[dict]:
+    """Recheck lifecycle state after selection and immediately before RouterOS I/O."""
+    if not batch:
+        return []
+    by_id = {item["id"]: item for item in batch}
+    async with async_session() as db:
+        rows = await db.execute(
+            select(
+                Customer.id,
+                Customer.status,
+                Customer.router_id,
+                Customer.pppoe_username,
+            ).where(Customer.id.in_(by_id))
+        )
+        current = []
+        for customer_id, status, router_id, pppoe_username in rows.all():
+            candidate = by_id[customer_id]
+            if (
+                status == CustomerStatus.INACTIVE
+                and router_id == candidate["router_id"]
+                and pppoe_username == candidate["pppoe_username"]
+            ):
+                current.append(candidate)
+        await db.commit()
+        return current
+
+
+async def reconcile_inactive_pppoe_access_background() -> dict:
+    """Repair inactive DB rows that still have RouterOS PPPoE access.
+
+    This is the PPPoE counterpart to the hotspot orphan-binding safety net. It
+    rotates through a bounded batch, records durable cleanup proof, and repairs
+    the rare renewal race by re-provisioning a customer that became active while
+    RouterOS cleanup was in flight.
+    """
+    global inactive_pppoe_reconcile_running
+    if inactive_pppoe_reconcile_running:
+        return {"skipped": "already_running"}
+    if _background_db_pool_is_busy("PPPOE-SAFETY-NET"):
+        return {"skipped": "db_pool_busy"}
+
+    inactive_pppoe_reconcile_running = True
+    try:
+        batch = await _load_inactive_pppoe_reconcile_batch()
+        batch = await _filter_still_inactive_pppoe_candidates(batch)
+        if not batch:
+            return {"selected": 0, "removed": 0, "failed": 0, "restored": 0}
+
+        router_groups: dict[str, dict] = {}
+        for candidate in batch:
+            router_info = candidate["router"]
+            router_key = f"{router_info['ip']}:{router_info['port']}"
+            group = router_groups.setdefault(
+                router_key,
+                {"router": router_info, "customers": []},
+            )
+            group["customers"].append({
+                key: candidate[key]
+                for key in ("id", "name", "pppoe_username", "expiry", "router_id")
+            })
+
+        async def _cleanup_group(router_key: str, group: dict):
+            async with router_locks.acquire(router_key):
+                return await asyncio.to_thread(
+                    _cleanup_single_router_pppoe_sync,
+                    group["router"],
+                    group["customers"],
+                )
+
+        group_items = list(router_groups.items())
+        outcomes = await asyncio.gather(
+            *[_cleanup_group(router_key, group) for router_key, group in group_items],
+            return_exceptions=True,
+        )
+
+        removed_ids: set[int] = set()
+        failed = 0
+        for (router_key, group), outcome in zip(group_items, outcomes):
+            if isinstance(outcome, Exception):
+                failed += len(group["customers"])
+                logger.error(
+                    "[PPPOE-SAFETY-NET] Router cleanup failed for %s: %s",
+                    router_key,
+                    outcome,
+                )
+                continue
+            removed_ids.update(row["id"] for row in outcome.get("removed", []))
+            failed += len(outcome.get("failed", []))
+
+        restore_payloads = []
+        durable_removed = 0
+        if removed_ids:
+            async with async_session() as db:
+                refreshed = (
+                    await db.execute(
+                        select(Customer)
+                        .options(selectinload(Customer.plan), selectinload(Customer.router))
+                        .where(Customer.id.in_(removed_ids))
+                    )
+                ).scalars().all()
+                from app.services.pppoe_provisioning import build_pppoe_payload
+
+                for customer in refreshed:
+                    if customer.status == CustomerStatus.INACTIVE:
+                        db.add(ProvisioningLog(
+                            customer_id=customer.id,
+                            router_id=customer.router_id,
+                            action="pppoe_deactivation",
+                            status="success",
+                            details="Inactive PPPoE safety net confirmed session and secret absent",
+                        ))
+                        durable_removed += 1
+                    elif (
+                        customer.router
+                        and customer.plan
+                        and customer.pppoe_username
+                        and customer.pppoe_password
+                        and (
+                            customer.status == CustomerStatus.ACTIVE
+                            or (
+                                customer.status == CustomerStatus.PENDING
+                                and customer.expiry
+                                and customer.expiry > datetime.utcnow()
+                            )
+                        )
+                    ):
+                        restore_payloads.append(build_pppoe_payload(customer, customer.router))
+                await db.commit()
+
+        restored = 0
+        if restore_payloads:
+            from app.services.pppoe_provisioning import call_pppoe_provision
+
+            async def _restore_customer(payload: dict):
+                router_key = f"{payload['router_ip']}:{payload['router_port']}"
+                async with router_locks.acquire(router_key):
+                    return await call_pppoe_provision(payload)
+
+            restore_results = await asyncio.gather(
+                *[_restore_customer(payload) for payload in restore_payloads],
+                return_exceptions=True,
+            )
+            restored = sum(
+                1
+                for result in restore_results
+                if isinstance(result, dict) and result.get("success")
+            )
+            if restored != len(restore_payloads):
+                logger.error(
+                    "[PPPOE-SAFETY-NET] Restored %d/%d customer(s) that renewed during cleanup",
+                    restored,
+                    len(restore_payloads),
+                )
+
+        if durable_removed:
+            logger.warning(
+                "[PPPOE-SAFETY-NET] Confirmed access removed for %d inactive customer(s)",
+                durable_removed,
+            )
+        return {
+            "selected": len(batch),
+            "removed": durable_removed,
+            "failed": failed,
+            "restored": restored,
+        }
+    finally:
+        inactive_pppoe_reconcile_running = False
+
+
 async def cleanup_expired_users_background():
     global cleanup_running, _last_safety_net_cleanup_at, _last_access_credential_reaper_at
     if cleanup_running:
@@ -1132,6 +1414,9 @@ async def cleanup_expired_users_background():
                 [r["id"] for r in mikrotik_results["removed"]] +
                 [r["id"] for r in pppoe_results["removed"]]
             )
+            pppoe_successful_ids = {
+                r["id"] for r in pppoe_results["removed"]
+            }
             all_failed_ids = set(
                 [r["id"] for r in mikrotik_results["failed"]] +
                 [r["id"] for r in pppoe_results["failed"]]
@@ -1170,6 +1455,14 @@ async def cleanup_expired_users_background():
                     if customer.status != CustomerStatus.INACTIVE:
                         customer.status = CustomerStatus.INACTIVE
                         post_cleanup_deactivated_count += 1
+                        if customer.id in pppoe_successful_ids:
+                            db.add(ProvisioningLog(
+                                customer_id=customer.id,
+                                router_id=customer.router_id,
+                                action="pppoe_deactivation",
+                                status="success",
+                                details="Expiry cleanup confirmed session and secret absent",
+                            ))
                         newly_deactivated_ids.add(customer.id)
             await db.commit()
 

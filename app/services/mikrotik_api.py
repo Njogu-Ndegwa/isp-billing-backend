@@ -3002,14 +3002,25 @@ class MikroTikAPI:
             return {"error": "Not connected"}
         try:
             secrets = self.send_command("/ppp/secret/print")
-            if secrets.get("success") and secrets.get("data"):
-                for secret in secrets["data"]:
-                    if secret.get("name") == username:
-                        secret_id = secret.get(".id")
-                        if secret_id:
-                            result = self.send_command("/ppp/secret/remove", {"numbers": secret_id})
-                            logger.info(f"Removed PPPoE secret for '{username}'")
-                            return {"success": True, "action": "removed"}
+            if not secrets.get("success"):
+                return {
+                    "error": secrets.get("error") or "Failed to list PPPoE secrets",
+                }
+
+            for secret in secrets.get("data", []):
+                if secret.get("name") != username:
+                    continue
+                secret_id = secret.get(".id")
+                if not secret_id:
+                    return {"error": f"PPPoE secret '{username}' has no RouterOS id"}
+
+                result = self.send_command("/ppp/secret/remove", {"numbers": secret_id})
+                if not result.get("success"):
+                    return {
+                        "error": result.get("error") or "Failed to remove PPPoE secret",
+                    }
+                logger.info(f"Removed PPPoE secret for '{username}'")
+                return {"success": True, "action": "removed"}
 
             return {"success": True, "action": "not_found"}
         except Exception as e:
@@ -3022,15 +3033,30 @@ class MikroTikAPI:
             return {"error": "Not connected"}
         try:
             active = self.send_command("/ppp/active/print")
+            if not active.get("success"):
+                return {
+                    "error": active.get("error") or "Failed to list active PPPoE sessions",
+                }
+
             disconnected = 0
-            if active.get("success") and active.get("data"):
-                for session in active["data"]:
-                    if session.get("name") == username:
-                        session_id = session.get(".id")
-                        if session_id:
-                            self.send_command("/ppp/active/remove", {"numbers": session_id})
-                            disconnected += 1
-                            logger.info(f"Disconnected PPPoE session for '{username}'")
+            for session in active.get("data", []):
+                if session.get("name") != username:
+                    continue
+                session_id = session.get(".id")
+                if not session_id:
+                    return {
+                        "error": f"Active PPPoE session '{username}' has no RouterOS id",
+                        "disconnected": disconnected,
+                    }
+
+                result = self.send_command("/ppp/active/remove", {"numbers": session_id})
+                if not result.get("success"):
+                    return {
+                        "error": result.get("error") or "Failed to disconnect PPPoE session",
+                        "disconnected": disconnected,
+                    }
+                disconnected += 1
+                logger.info(f"Disconnected PPPoE session for '{username}'")
 
             return {"success": True, "disconnected": disconnected}
         except Exception as e:

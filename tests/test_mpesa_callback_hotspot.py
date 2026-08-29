@@ -132,7 +132,7 @@ def _stk_callback_payload(
     }
 
 
-async def _seed_pending_hotspot_payment(session_factory):
+async def _seed_pending_hotspot_payment(session_factory, *, expiry=None):
     """Set up a pending hotspot payment ready for callback. Returns (customer_id, checkout_id)."""
     async with session_factory() as s:
         reseller = await make_reseller(s)
@@ -141,7 +141,7 @@ async def _seed_pending_hotspot_payment(session_factory):
         customer = await make_customer(
             s, reseller, plan, router,
             status=CustomerStatus.PENDING,
-            expiry=None,
+            expiry=expiry,
             mac_address="AA:BB:CC:DD:EE:01",
         )
         checkout_id = "ws_CO_TEST_001"
@@ -239,6 +239,29 @@ async def test_failed_callback_marks_failed_and_no_provisioning(
             await s.execute(select(Customer).where(Customer.id == customer_id))
         ).scalar_one()
         assert refreshed_customer.status == CustomerStatus.INACTIVE
+
+    assert provision_calls == []
+
+
+async def test_failed_renewal_restores_active_status_while_paid_time_remains(
+    session_factory, client, patched_provisioning, provision_calls
+):
+    paid_until = datetime.utcnow() + timedelta(days=5)
+    customer_id, checkout_id = await _seed_pending_hotspot_payment(
+        session_factory,
+        expiry=paid_until,
+    )
+    payload = _stk_callback_payload(checkout_id, result_code=1)
+
+    resp = await client.post("/api/mpesa/callback", json=payload)
+    assert resp.status_code == 200
+
+    async with session_factory() as s:
+        refreshed_customer = (
+            await s.execute(select(Customer).where(Customer.id == customer_id))
+        ).scalar_one()
+        assert refreshed_customer.status == CustomerStatus.ACTIVE
+        assert refreshed_customer.expiry == paid_until
 
     assert provision_calls == []
 

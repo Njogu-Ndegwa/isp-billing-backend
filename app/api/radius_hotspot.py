@@ -45,6 +45,7 @@ from app.db.models import (
     MpesaTransaction, MpesaTransactionStatus,
     PaymentMethod, User,
 )
+from app.services.billing import apply_failed_payment_customer_status
 from app.config import settings
 from app.services.radius_provisioning import RadiusProvisioning
 from app.services.radius_service import (
@@ -704,7 +705,7 @@ async def radius_mpesa_callback(payload: dict, db: AsyncSession = Depends(get_db
             # Payment failed
             logger.info(f"[RADIUS CALLBACK] Payment FAILED for customer {customer.id}")
             mpesa_txn.status = MpesaTransactionStatus.failed
-            customer.status = CustomerStatus.INACTIVE
+            apply_failed_payment_customer_status(customer)
             await db.commit()
             return {"ResultCode": 0, "ResultDesc": "Payment failed"}
 

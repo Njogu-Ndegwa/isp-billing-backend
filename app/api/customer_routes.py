@@ -953,8 +953,36 @@ async def deactivate_pppoe_customer(
             payload = build_pppoe_remove_payload(customer, customer.router)
             await db.commit()
             remove_result = await call_pppoe_remove(payload)
+            if not remove_result or not remove_result.get("success"):
+                error = (
+                    remove_result.get("error") or "Router cleanup did not confirm success"
+                    if isinstance(remove_result, dict)
+                    else "PPPoE removal returned no result"
+                )
+                logger.error(
+                    "Refusing to deactivate PPPoE customer %s because router "
+                    "enforcement failed: %s",
+                    customer_id,
+                    error,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Failed to disconnect this customer from the router; "
+                        "customer status was not changed. Please retry. "
+                        f"Router error: {error}"
+                    ),
+                )
 
         customer.status = CustomerStatus.INACTIVE
+        if remove_result and remove_result.get("success"):
+            db.add(ProvisioningLog(
+                customer_id=customer.id,
+                router_id=customer.router_id,
+                action="pppoe_deactivation",
+                status="success",
+                details="Manual deactivation confirmed session and secret absent",
+            ))
         await db.commit()
 
         return {

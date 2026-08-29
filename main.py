@@ -112,6 +112,7 @@ app.include_router(outage_compensation_router)
 # --- Background job imports ---
 from app.services.mikrotik_background import (
     cleanup_expired_users_background,
+    reconcile_inactive_pppoe_access_background,
     collect_bandwidth_snapshot,
     sync_active_user_queues,
     # Exported for late-imports from router files
@@ -2515,6 +2516,15 @@ async def startup_event():
         name='Remove expired hotspot users from MikroTik',
         replace_existing=True,
         max_instances=1
+    )
+    scheduler.add_job(
+        reconcile_inactive_pppoe_access_background,
+        trigger=IntervalTrigger(minutes=10),
+        id='reconcile_inactive_pppoe_access',
+        name='Repair inactive PPPoE users left on MikroTik routers',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=120,
     )
     scheduler.add_job(
         reconcile_lb_paid_background,

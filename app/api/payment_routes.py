@@ -25,7 +25,7 @@ from app.services.hotspot_provisioning import (
     serialize_delivery_attempt,
 )
 from app.services.mpesa_transactions import update_mpesa_transaction_status
-from app.services.billing import make_payment
+from app.services.billing import apply_failed_payment_customer_status, make_payment
 from app.services.plan_cache import plan_model_allows_router
 from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
 import logging
@@ -501,7 +501,7 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
         
         else:
             logger.info(f"Payment failed for customer {customer.id}")
-            customer.status = CustomerStatus.INACTIVE
+            apply_failed_payment_customer_status(customer)
             await db.commit()
             return {"ResultCode": 0, "ResultDesc": "Payment failed"}
             
