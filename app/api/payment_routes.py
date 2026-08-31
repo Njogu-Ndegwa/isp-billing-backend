@@ -1133,6 +1133,14 @@ async def get_mpesa_transactions(
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid end_date format")
 
+        # Each source is ordered independently before the three ledgers are
+        # merged.  A row below the first ``offset + page_size`` rows in its own
+        # source cannot appear in that many newest rows globally, so bounding
+        # every source here preserves the response while avoiding an unbounded
+        # history load and serialization pass.
+        page_size = max(0, min(limit, 500))
+        source_limit = max(0, offset) + page_size
+
         results = []
         mpesa_source_ids = []
         customer_payment_source_ids = []
@@ -1164,6 +1172,12 @@ async def get_mpesa_transactions(
                     mpesa_stmt = mpesa_stmt.where(MpesaTransaction.status == mpesa_status)
                 except ValueError:
                     pass
+
+            mpesa_stmt = (
+                mpesa_stmt
+                .order_by(MpesaTransaction.created_at.desc().nulls_last())
+                .limit(source_limit)
+            )
 
             mpesa_rows = (await db.execute(mpesa_stmt)).all()
 
@@ -1263,6 +1277,12 @@ async def get_mpesa_transactions(
                     except ValueError:
                         pass
 
+            cp_stmt = (
+                cp_stmt
+                .order_by(CustomerPayment.created_at.desc().nulls_last())
+                .limit(source_limit)
+            )
+
             cp_rows = (await db.execute(cp_stmt)).all()
 
             for pay, customer, rtr, plan in cp_rows:
@@ -1352,6 +1372,12 @@ async def get_mpesa_transactions(
                         C2BTransactionStatus.UNMATCHED, C2BTransactionStatus.REJECTED,
                     ]))
 
+            c2b_stmt = (
+                c2b_stmt
+                .order_by(C2BTransaction.received_at.desc().nulls_last())
+                .limit(source_limit)
+            )
+
             c2b_rows = (await db.execute(c2b_stmt)).all()
 
             for tx, customer, rtr, plan in c2b_rows:
@@ -1412,7 +1438,7 @@ async def get_mpesa_transactions(
 
         # Merge and sort by date descending, then paginate
         results.sort(key=lambda r: r["created_at"] or "", reverse=True)
-        paginated = results[offset: offset + min(limit, 500)]
+        paginated = results[offset: offset + page_size]
 
         return paginated
 
