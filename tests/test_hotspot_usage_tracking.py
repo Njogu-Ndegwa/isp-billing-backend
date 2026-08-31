@@ -2,7 +2,7 @@ from collections import deque
 from datetime import datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from app.db.models import (
     BandwidthSnapshot,
@@ -160,6 +160,87 @@ async def test_bandwidth_snapshot_records_hotspot_and_pppoe_usage_deltas(
     assert sum(b.pppoe_download_bytes for b in buckets) == 1000
     assert hotspot_usage.last_upload_bytes == 2000
     assert hotspot_usage.last_download_bytes == 6000
+
+
+@pytest.mark.asyncio
+async def test_bandwidth_snapshot_loads_router_customers_once(
+    db,
+    engine,
+    session_factory,
+    monkeypatch,
+):
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    expiry = datetime.utcnow() + timedelta(days=30)
+    await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        mac_address="AA:BB:CC:DD:EE:01",
+        phone="254700000011",
+        expiry=expiry,
+    )
+    await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        mac_address="AA:BB:CC:DD:EE:02",
+        phone="254700000012",
+        expiry=expiry,
+    )
+
+    payload = _raw_snapshot(
+        router.id,
+        hotspot_bytes="1000/3000",
+        pppoe_bytes="0/0",
+        rx=10_000,
+        tx=5_000,
+    )
+    payload["queues"]["data"] = [
+        {
+            "name": "plan_AABBCCDDEE01",
+            "comment": "MAC:AA:BB:CC:DD:EE:01|Plan rate limit",
+            "bytes": "1000/3000",
+            "max-limit": "5M/5M",
+            "target": "192.168.88.11/32",
+        },
+        {
+            "name": "plan_AABBCCDDEE02",
+            "comment": "MAC:AA:BB:CC:DD:EE:02|Plan rate limit",
+            "bytes": "2000/6000",
+            "max-limit": "5M/5M",
+            "target": "192.168.88.12/32",
+        },
+    ]
+
+    monkeypatch.setattr(mikrotik_background, "async_session", session_factory)
+    monkeypatch.setattr(mikrotik_background, "_background_db_pool_is_busy", lambda _job: False)
+    monkeypatch.setattr(mikrotik_background, "_router_recently_offline", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(mikrotik_background, "_fetch_bandwidth_data_sync_for_router", lambda _info: payload)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mikrotik_background, "record_router_availability", _noop)
+    monkeypatch.setattr(mikrotik_background, "prune_router_availability_history", _noop)
+
+    customer_selects = []
+
+    def _capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+        normalized = " ".join(statement.lower().split())
+        if "from customers" in normalized and "customers.router_id" in normalized:
+            customer_selects.append(normalized)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _capture_sql)
+    try:
+        await mikrotik_background.collect_bandwidth_snapshot()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _capture_sql)
+
+    assert len(customer_selects) == 1
 
 
 @pytest.mark.asyncio

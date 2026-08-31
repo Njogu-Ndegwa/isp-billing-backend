@@ -2392,6 +2392,33 @@ def _parse_queue_bytes(bytes_str: str) -> tuple[int, int]:
     return upload, download
 
 
+def _find_hotspot_customer(
+    customers: list[Customer], mac_variants: list[str]
+) -> Customer | None:
+    """Match the old case-insensitive substring lookup without a query per queue."""
+    needles = [value.lower() for value in mac_variants if value]
+    for customer in customers:
+        stored_mac = str(customer.mac_address or "").lower()
+        if stored_mac and any(needle in stored_mac for needle in needles):
+            return customer
+    return None
+
+
+def _find_pppoe_customer(
+    customers: list[Customer], pppoe_username: str
+) -> Customer | None:
+    """Return the same first router-scoped, case-insensitive PPPoE match as before."""
+    wanted = pppoe_username.lower()
+    return next(
+        (
+            customer
+            for customer in customers
+            if str(customer.pppoe_username or "").lower() == wanted
+        ),
+        None,
+    )
+
+
 def _usage_counter_delta(
     usage: UserBandwidthUsage,
     upload_bytes: int,
@@ -2761,6 +2788,18 @@ async def collect_bandwidth_snapshot():
 
                     queues = raw.get("queues", {})
                     if queues.get("success") and queues.get("data"):
+                        # Load the router's customer/plan rows once. Previously
+                        # every simple queue issued its own customer SELECT and
+                        # selectinload plan SELECT, producing hundreds of
+                        # repeated reads for larger routers and keeping this
+                        # background transaction checked out much longer.
+                        router_customers = (
+                            await db.execute(
+                                select(Customer)
+                                .options(selectinload(Customer.plan))
+                                .where(Customer.router_id == router_id)
+                            )
+                        ).scalars().all()
                         for q in queues["data"]:
                             qname = q.get("name", "")
                             comment = q.get("comment", "")
@@ -2777,19 +2816,9 @@ async def collect_bandwidth_snapshot():
                                 compact_mac = normalized_mac.replace(":", "")
                                 mac_variants = list({mac, normalized_mac, compact_mac})
                                 upload_bytes, download_bytes = _parse_queue_bytes(q.get("bytes", "0/0"))
-                                cust_result = await db.execute(
-                                    select(Customer)
-                                    .options(selectinload(Customer.plan))
-                                    .where(
-                                        Customer.router_id == router_id,
-                                        or_(
-                                            Customer.mac_address.ilike(f"%{normalized_mac}%"),
-                                            Customer.mac_address.ilike(f"%{compact_mac}%"),
-                                            Customer.mac_address.ilike(f"%{mac}%"),
-                                        ),
-                                    )
+                                customer = _find_hotspot_customer(
+                                    router_customers, mac_variants
                                 )
-                                customer = cust_result.scalars().first()
                                 existing = await db.execute(
                                     select(UserBandwidthUsage)
                                     .where(UserBandwidthUsage.mac_address.in_(mac_variants))
@@ -2892,15 +2921,9 @@ async def collect_bandwidth_snapshot():
                                 # Match case-insensitively on the sampled router first
                                 # (resellers hand-recreate secrets in Winbox with
                                 # different case) ...
-                                cust_result = await db.execute(
-                                    select(Customer)
-                                    .options(selectinload(Customer.plan))
-                                    .where(
-                                        func.lower(Customer.pppoe_username) == pppoe_user.lower(),
-                                        Customer.router_id == router_id,
-                                    )
+                                customer = _find_pppoe_customer(
+                                    router_customers, pppoe_user
                                 )
-                                customer = cust_result.scalars().first()
                                 if customer is None:
                                     # ... then fall back to the globally unique
                                     # username (create/update/import all enforce
