@@ -41,3 +41,28 @@ Router availability was stored as one shared `last_status` value per router. Adv
 - Produce a read-only reconciliation preview for failed, active, unexpired paid attempts and compare each candidate against the current router user list.
 - After approval, requeue or repair only confirmed missing users; do not charge customers again.
 - Continue the existing work toward a durable router-command outbox so genuine long outages can recover after the current retry window.
+
+## Post-Deployment Retry Observation
+
+The first hour of the production watch found a second reliability gap after the
+status fix itself was deployed. A completed hotspot payment on router 293 reached
+the direct API five times between 19:03:59 and 19:12:19 UTC. The management path
+accepted a diagnostic connection but stalled during reads, and the fifth failed
+attempt became terminal. Five attempts had therefore exhausted in about eight
+minutes even though the configured retry window was four hours.
+
+The follow-up candidate on `fix/paid-retry-resilience`:
+
+- shares one retry policy between hotspot and PPPoE;
+- raises the bounded ceiling to 14 attempts while retaining the four-hour limit;
+- spaces attempts at 1, 2, 3, 5, 8, 13, 21, then 30-minute capped delays;
+- resumes legacy terminal attempts below the new ceiling only when their error is
+  transport-shaped (`connect`, `timeout`, or `unreachable`), leaving deterministic
+  RouterOS configuration failures terminal;
+- keeps the existing batch limits, per-router serialization/concurrency caps, and
+  60% DB-pool shedding threshold unchanged.
+
+Verification before deployment approval: focused provisioning/status regressions
+passed (56 tests), the session-discipline gate passed, and the full local suite
+passed (1,037 tests). Production deployment and automatic legacy-attempt recovery
+remain pending explicit approval.
