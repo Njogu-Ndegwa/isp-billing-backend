@@ -27,7 +27,17 @@ from app.services.router_agent_fleet import (  # noqa: E402
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stage or roll back the router command agent")
-    parser.add_argument("mode", choices=["status", "install", "uninstall", "global-on", "global-off"])
+    parser.add_argument(
+        "mode",
+        choices=[
+            "status",
+            "install",
+            "upgrade",
+            "uninstall",
+            "global-on",
+            "global-off",
+        ],
+    )
     parser.add_argument("--router-id", action="append", type=int, default=[])
     parser.add_argument("--limit", type=int)
     parser.add_argument("--endpoint-base-url")

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
-import random
 from typing import Iterable
 
 from sqlalchemy import select
@@ -22,6 +21,7 @@ from app.services.router_agent_commands import AGENT_ENABLED_SETTING
 from app.services.router_agent_script import (
     SCRIPT_NAME,
     SCHEDULER_NAME,
+    SCHEDULER_TICK_SECONDS,
     render_router_agent_source,
 )
 
@@ -29,6 +29,30 @@ from app.services.router_agent_script import (
 # RouterOS requires the ftp policy for scripts/schedulers that create, remove,
 # or import files. The agent fetches its response to a temporary .rsc file.
 AGENT_ROUTEROS_POLICY = "ftp,read,write,test,policy,sensitive"
+AGENT_SOURCE_MARKERS = (
+    "bitwaveAgentRuntimeVersion",
+    "bitwaveAgentLockTicks",
+    "bitwavePollSkips",
+    "bitwaveFailureSkips",
+)
+
+
+def _source_is_current(source: str, identity: str) -> bool:
+    return bool(
+        identity in source
+        and "/api/router/agent/poll" in source
+        and all(marker in source for marker in AGENT_SOURCE_MARKERS)
+        and ":rndnum" not in source
+        and "/system scheduler set" not in source
+    )
+
+
+def _scheduler_is_current(row: dict) -> bool:
+    return bool(
+        row.get("disabled") != "true"
+        and SCRIPT_NAME in (row.get("on-event") or "")
+        and row.get("interval") in {"30s", "00:00:30"}
+    )
 
 
 @dataclass(frozen=True)
@@ -188,7 +212,7 @@ def install_router_agent_sync(
         )
         scheduler_params = {
             "name": SCHEDULER_NAME,
-            "interval": f"{random.randint(90, 150)}s",
+            "interval": f"{SCHEDULER_TICK_SECONDS}s",
             "start-time": "startup",
             "on-event": f"/system script run {SCRIPT_NAME}",
             "policy": AGENT_ROUTEROS_POLICY,
@@ -225,13 +249,14 @@ def install_router_agent_sync(
         )
         source_ok = bool(
             verified_scripts
-            and candidate.identity in (verified_scripts[0].get("source") or "")
-            and "/api/router/agent/poll" in (verified_scripts[0].get("source") or "")
+            and _source_is_current(
+                verified_scripts[0].get("source") or "",
+                candidate.identity,
+            )
         )
         scheduler_ok = bool(
             verified_schedulers
-            and verified_schedulers[0].get("disabled") != "true"
-            and SCRIPT_NAME in (verified_schedulers[0].get("on-event") or "")
+            and _scheduler_is_current(verified_schedulers[0])
         )
         required_policies = set(AGENT_ROUTEROS_POLICY.split(","))
         script_policy_ok = bool(
@@ -338,16 +363,24 @@ async def run_router_agent_fleet_change(
 ) -> list[dict]:
     """Apply one bounded sequential batch and return a result per router."""
 
-    if mode not in {"install", "uninstall"}:
-        raise ValueError("mode must be install or uninstall")
+    if mode not in {"install", "upgrade", "uninstall"}:
+        raise ValueError("mode must be install, upgrade, or uninstall")
+    selected_ids = list(router_ids or [])
+    if mode == "upgrade" and not selected_ids:
+        raise ValueError("upgrade mode requires explicit router_ids")
     candidates = await load_router_agent_candidates(
-        router_ids=router_ids,
+        router_ids=selected_ids,
         limit=limit,
         enabled=False if mode == "install" else True,
     )
     results: list[dict] = []
     for candidate in candidates:
-        if mode == "install":
+        if mode in {"install", "upgrade"}:
+            if mode == "upgrade":
+                # Fail closed while replacing an active router's script. A
+                # partial write or failed read-back must not leave it eligible
+                # for command delivery when the global switch is enabled.
+                await _set_router_enabled(candidate.router_id, False)
             result = await asyncio.to_thread(
                 install_router_agent_sync,
                 candidate,

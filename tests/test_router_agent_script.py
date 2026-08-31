@@ -1,9 +1,14 @@
+from types import SimpleNamespace
+
 import pytest
 
+from app.api import router_agent_routes
 from app.services.router_agent_auth import derive_router_agent_token
 from app.services.router_agent_script import (
+    AGENT_VERSION,
     COMMAND_FILE,
     SCHEDULER_NAME,
+    SCHEDULER_TICK_SECONDS,
     render_router_agent_source,
     rollback_router_agent_rsc,
 )
@@ -24,8 +29,14 @@ def test_wireguard_agent_is_authenticated_adaptive_and_non_overlapping():
     assert "output=file" in source
     assert f"dst-path=$fileName" in source
     assert "/import file-name=$fileName" in source
-    assert "45" in source and "90" in source and "180" in source and "300" in source
-    assert ":rndnum" in source
+    assert "bitwavePollSkips" in source
+    assert "bitwaveFailureSkips" in source
+    assert ":rndnum" not in source
+    assert "/system scheduler set" not in source
+    assert SCHEDULER_TICK_SECONDS == 30
+    assert AGENT_VERSION == "2"
+    assert "bitwaveAgentRuntimeVersion" in source
+    assert "recovered stale poll lock" in source
     assert "/file get" not in source
     assert len(source.encode("utf-8")) < 8192
 
@@ -68,3 +79,26 @@ def test_rollback_disables_scheduler_before_removing_script():
     assert rollback.index("scheduler remove") < rollback.index("script remove")
     assert SCHEDULER_NAME in rollback
     assert COMMAND_FILE in rollback
+
+
+@pytest.mark.parametrize(
+    "seconds,skips",
+    [(30, 0), (60, 1), (90, 2), (91, 3), (120, 3), (150, 4)],
+)
+def test_server_delay_uses_fixed_scheduler_ticks_without_polling_early(seconds, skips):
+    assert router_agent_routes._poll_skip_count(seconds) == skips
+
+
+def test_idle_and_command_responses_never_retune_scheduler_interval():
+    idle = router_agent_routes._poll_skip_directive(120)
+    command = router_agent_routes._command_envelope(
+        SimpleNamespace(id=7, action_script=":put ok"),
+        "Router-0001",
+        URL,
+        60,
+    )
+
+    assert ":set bitwavePollSkips 3" in idle
+    assert ":set bitwavePollSkips 1" in command
+    assert "/system scheduler set" not in idle
+    assert "/system scheduler set" not in command

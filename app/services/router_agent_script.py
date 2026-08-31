@@ -10,7 +10,8 @@ from app.services.router_agent_auth import derive_router_agent_token
 SCRIPT_NAME = "bitwave-command-agent"
 SCHEDULER_NAME = "bitwave-command-agent"
 COMMAND_FILE = "bitwave-agent-command.rsc"
-AGENT_VERSION = "1"
+AGENT_VERSION = "2"
+SCHEDULER_TICK_SECONDS = 30
 
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _URL_RE = re.compile(r"^https?://[A-Za-z0-9._:/-]{3,200}$")
@@ -57,51 +58,78 @@ def render_router_agent_source(
         else f':if ([/ping {probe_ip} count=1 interval=500ms] > 0) do={{ :set tunnel "up" }}'
     )
 
-    return f""":global bitwaveAgentRunning
+    return f""":global bitwaveAgentRuntimeVersion
+:global bitwaveAgentRunning
+:global bitwaveAgentLockTicks
+:global bitwaveAgentFailures
+:global bitwaveFailureSkips
+:global bitwavePollSkips
+:if ([:typeof $bitwaveAgentRuntimeVersion] = "nil" or $bitwaveAgentRuntimeVersion != "{AGENT_VERSION}") do={{
+    :set bitwaveAgentRuntimeVersion "{AGENT_VERSION}"
+    :set bitwaveAgentRunning false
+    :set bitwaveAgentLockTicks 0
+    :set bitwaveAgentFailures 0
+    :set bitwaveFailureSkips 0
+    :set bitwavePollSkips 0
+}}
+:if ([:typeof $bitwaveAgentLockTicks] = "nil") do={{ :set bitwaveAgentLockTicks 0 }}
+:if ([:typeof $bitwaveAgentFailures] = "nil") do={{ :set bitwaveAgentFailures 0 }}
+:if ([:typeof $bitwaveFailureSkips] = "nil") do={{ :set bitwaveFailureSkips 0 }}
+:if ([:typeof $bitwavePollSkips] = "nil") do={{ :set bitwavePollSkips 0 }}
 :if ([:typeof $bitwaveAgentRunning] = "bool" and $bitwaveAgentRunning) do={{
-    :log info "bitwave-agent: previous poll still running"
-    :return
+    :set bitwaveAgentLockTicks ($bitwaveAgentLockTicks + 1)
+    :if ($bitwaveAgentLockTicks < 3) do={{
+        :log info "bitwave-agent: previous poll still running"
+        :return
+    }}
+    :log warning "bitwave-agent: recovered stale poll lock"
+    :set bitwaveAgentRunning false
+    :set bitwaveAgentLockTicks 0
 }}
 :set bitwaveAgentRunning true
-:global bitwaveAgentFailures
-:if ([:typeof $bitwaveAgentFailures] = "nil") do={{ :set bitwaveAgentFailures 0 }}
+:set bitwaveAgentLockTicks 0
+:if ($bitwaveFailureSkips > 0) do={{
+    :set bitwaveFailureSkips ($bitwaveFailureSkips - 1)
+    :set bitwaveAgentRunning false
+    :set bitwaveAgentLockTicks 0
+    :return
+}}
 :local tunnel "down"
 :do {{
     {tunnel_probe}
 }} on-error={{}}
+:if ($tunnel = "up" and $bitwavePollSkips > 0) do={{
+    :set bitwavePollSkips ($bitwavePollSkips - 1)
+    :set bitwaveAgentRunning false
+    :set bitwaveAgentLockTicks 0
+    :return
+}}
+:if ($tunnel = "down") do={{ :set bitwavePollSkips 0 }}
 :local url ("{endpoint}/api/router/agent/poll?identity={identity}&tunnel=" . $tunnel . "&version={AGENT_VERSION}")
 :local fileName "{COMMAND_FILE}"
 :do {{ /file remove [find name=$fileName] }} on-error={{}}
 :do {{
     /tool fetch url=$url http-method=get http-header-field="Authorization: Bearer {token}" dst-path=$fileName output=file{certificate_flag}
-    :local bitwaveImportOk true
     # Every authenticated response is an importable RouterOS script. Idle
-    # responses only retune this scheduler; command responses retune, apply and
-    # acknowledge. Importing directly keeps this compatible with the smaller
+    # responses set a local skip counter; command responses set it, apply and
+    # acknowledge. The scheduler itself stays on a fixed tick so RouterOS does
+    # not recalculate an already-due next-run when an interval is changed.
+    # Importing directly keeps this compatible with the smaller
     # file-content read limits on older RouterOS builds.
-    :do {{ /import file-name=$fileName }} on-error={{
-        :set bitwaveImportOk false
-        :log warning "bitwave-agent: response import failed; server will retry"
-    }}
-    :if ($bitwaveImportOk) do={{
-        :set bitwaveAgentFailures 0
-    }} else={{
-        :set bitwaveAgentFailures ($bitwaveAgentFailures + 1)
-        /system scheduler set [find name="{SCHEDULER_NAME}"] interval=90s
-    }}
+    /import file-name=$fileName
+    :set bitwaveAgentFailures 0
+    :set bitwaveFailureSkips 0
 }} on-error={{
     :set bitwaveAgentFailures ($bitwaveAgentFailures + 1)
-    :local backoff 60
-    :if ($bitwaveAgentFailures = 1) do={{ :set backoff 45 }}
-    :if ($bitwaveAgentFailures = 2) do={{ :set backoff 90 }}
-    :if ($bitwaveAgentFailures = 3) do={{ :set backoff 180 }}
-    :if ($bitwaveAgentFailures > 3) do={{ :set backoff 300 }}
-    :set backoff ($backoff + [:rndnum from=0 to=30])
-    /system scheduler set [find name="{SCHEDULER_NAME}"] interval=($backoff . "s")
+    :set bitwaveFailureSkips 1
+    :if ($bitwaveAgentFailures = 2) do={{ :set bitwaveFailureSkips 2 }}
+    :if ($bitwaveAgentFailures = 3) do={{ :set bitwaveFailureSkips 5 }}
+    :if ($bitwaveAgentFailures > 3) do={{ :set bitwaveFailureSkips 9 }}
     :log info "bitwave-agent: poll deferred"
 }}
 :do {{ /file remove [find name=$fileName] }} on-error={{}}
 :set bitwaveAgentRunning false
+:set bitwaveAgentLockTicks 0
 """
 
 
