@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
@@ -112,6 +113,65 @@ async def test_cleanup_marks_customer_inactive_after_router_cleanup_succeeds(
 
     assert customer.status == CustomerStatus.INACTIVE
     assert cleanup_calls == [[customer.id]]
+
+
+async def test_hotspot_customer_renewed_during_cleanup_is_immediately_repaired(
+    db,
+    session_factory,
+    monkeypatch,
+):
+    _patch_cleanup_side_effects(monkeypatch, session_factory)
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    router = await make_router(db, reseller)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() - timedelta(minutes=5),
+        mac_address="AA:BB:CC:DD:EE:45",
+    )
+    loop = asyncio.get_running_loop()
+    new_expiry = datetime.utcnow() + timedelta(days=30)
+    repairs = []
+
+    async def _renew():
+        async with session_factory() as session:
+            row = await session.get(type(customer), customer.id)
+            row.expiry = new_expiry
+            await session.commit()
+
+    def fake_router_cleanup(_router_info, customers_data):
+        asyncio.run_coroutine_threadsafe(_renew(), loop).result(timeout=10)
+        return {
+            "removed": [{"id": row["id"], "details": {}} for row in customers_data],
+            "failed": [],
+            "connected": True,
+        }
+
+    async def fake_repair(**kwargs):
+        repairs.append(kwargs)
+        return {"success": True}
+
+    import app.services.hotspot_provisioning as hotspot_provisioning
+
+    monkeypatch.setattr(
+        mikrotik_background,
+        "_cleanup_single_router_hotspot_sync",
+        fake_router_cleanup,
+    )
+    monkeypatch.setattr(hotspot_provisioning, "provision_hotspot_customer", fake_repair)
+
+    await mikrotik_background.cleanup_expired_users_background()
+    await db.refresh(customer)
+
+    assert customer.status == CustomerStatus.ACTIVE
+    assert customer.expiry == new_expiry
+    assert len(repairs) == 1
+    assert repairs[0]["customer_id"] == customer.id
+    assert repairs[0]["action"] == "expiry_race_repair"
 
 
 async def test_cleanup_batches_router_removal_and_leaves_deferred_customers_active(

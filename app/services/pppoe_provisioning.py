@@ -424,10 +424,40 @@ async def provision_pppoe_customer(
                 attempt.updated_at = now
                 await db.commit()
 
+    # Persist the agent fallback before RouterOS I/O, then attempt the tunnel
+    # immediately. Both transports close the same idempotent command.
+    agent_command_id = None
+    if router_id:
+        try:
+            from app.services.router_agent_commands import queue_pppoe_provision_command
+
+            agent_command_id = await queue_pppoe_provision_command(
+                router_id=router_id,
+                customer_id=customer_id,
+                attempt_id=attempt_id,
+                pppoe_payload=pppoe_payload,
+            )
+        except Exception as command_exc:
+            logger.warning(
+                "[PPPoE] Router-agent command skipped for customer %s: %s",
+                customer_id,
+                command_exc,
+            )
+
     # A persisted status is advisory telemetry, not permission to discard a
-    # paid activation.  Always make the bounded RouterOS attempt; otherwise one
-    # stale/false offline sample turns a successful payment into a real outage.
+    # paid activation. Always make the bounded RouterOS attempt.
     result = await call_pppoe_provision(pppoe_payload)
+    if agent_command_id is not None and result and result.get("success"):
+        try:
+            from app.services.router_agent_commands import complete_command_from_push
+
+            await complete_command_from_push(agent_command_id)
+        except Exception as command_exc:
+            logger.warning(
+                "[PPPoE] Could not close router-agent command %s after direct push: %s",
+                agent_command_id,
+                command_exc,
+            )
     return await _persist_pppoe_provisioning_result(
         result=result or {"success": False, "error": "PPPoE provisioning returned no result"},
         customer_id=customer_id,

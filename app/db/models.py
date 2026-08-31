@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint
+from sqlalchemy import Column, Integer, String, Text, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -451,6 +451,15 @@ class Router(Base):
     # instead handed to the secondary-server pull service for the router to fetch.
     # The queue itself lives on the secondary server; the old box keeps only this flag.
     pull_channel_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Fleet command agent; separate from the retired secondary pull service so
+    # enabling the new channel can never reactivate the legacy 8443 handoff.
+    router_agent_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Outbound command-agent telemetry is deliberately separate from
+    # ``last_status``: a router can have working customer internet while its
+    # WireGuard/L2TP management tunnel is unavailable.
+    agent_last_seen_at = Column(DateTime, nullable=True)
+    agent_tunnel_state = Column(String(20), nullable=True)
+    agent_version = Column(String(20), nullable=True)
     # On by default, per-router opt-out: when true, the owner gets an inbox message
     # (and an SMS charged to their credits, when phone+balance allow) when the
     # router stays offline past a debounce threshold and again when it comes back
@@ -532,6 +541,62 @@ class ProvisioningAttempt(Base):
     last_online_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class RouterCommand(Base):
+    """Durable, idempotent command delivered by an outbound router agent.
+
+    The action script contains no authentication token.  The authenticated
+    router-facing endpoint wraps it with an acknowledgement for the owning
+    router when it is delivered.
+    """
+
+    __tablename__ = "router_commands"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_router_commands_idempotency_key"),
+        Index(
+            "idx_router_commands_router_state_available",
+            "router_id",
+            "state",
+            "available_at",
+        ),
+        Index("idx_router_commands_attempt", "provisioning_attempt_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    router_id = Column(
+        Integer,
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    customer_id = Column(
+        Integer,
+        ForeignKey("customers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    provisioning_attempt_id = Column(
+        Integer,
+        ForeignKey("provisioning_attempts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    idempotency_key = Column(String(128), nullable=False)
+    command_type = Column(String(32), nullable=False)
+    action_script = Column(Text, nullable=False)
+    metadata_json = Column(JSON, nullable=True)
+    state = Column(String(20), nullable=False, default="pending", server_default="pending")
+    available_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
+    delivery_count = Column(Integer, nullable=False, default=0, server_default="0")
+    failure_count = Column(Integer, nullable=False, default=0, server_default="0")
+    first_delivered_at = Column(DateTime, nullable=True)
+    last_delivered_at = Column(DateTime, nullable=True)
+    acknowledged_at = Column(DateTime, nullable=True)
+    acknowledgement_source = Column(String(20), nullable=True)
+    last_error = Column(String(500), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class MpesaTransaction(Base):
     __tablename__ = "mpesa_transactions"

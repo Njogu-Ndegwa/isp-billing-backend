@@ -180,6 +180,12 @@ async def engine(monkeypatch):
     # Patch modules that imported `async_session` at module load time
     import app.services.hotspot_provisioning as _hsp
     monkeypatch.setattr(_hsp, "async_session", factory)
+    import app.services.router_agent_commands as _router_agent_commands
+    monkeypatch.setattr(_router_agent_commands, "async_session", factory)
+    import app.api.router_agent_routes as _router_agent_routes
+    monkeypatch.setattr(_router_agent_routes, "async_session", factory)
+    import app.services.router_agent_fleet as _router_agent_fleet
+    monkeypatch.setattr(_router_agent_fleet, "async_session", factory)
 
     try:
         yield eng

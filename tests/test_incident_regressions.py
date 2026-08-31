@@ -4,12 +4,9 @@ One class per incident. Only invariants NOT already pinned elsewhere are added
 here; each class documents what the neighbouring suites already cover:
 
 * 2026-07-15-pull-channel-free-internet-expiry.md
-    - pull SERVICE behavior (PULL-EXPIRES honored on serve, expiry beats the
-      mtime TTL, background pruner) is pinned by tests/test_pull_service.py;
-      header rendering by tests/test_pull_provisioning.py.
-    - the APP-side guards in hotspot_provisioning (never hand an expired
-      customer to the pull channel, bound the command to the paid window,
-      clear the queue after a successful push) had no tests -> pinned below.
+    - the retired service remains pinned by its own tests.
+    - the replacement app outbox must reject expired grants, scope commands to
+      the entitlement, and close the fallback when direct push wins.
 * 2026-06-01-pppoe-orphan-secret.md
     - deletion-side invariants (deprovision before DB delete, refuse delete on
       router-cleanup failure, orphan endpoint refusal without force) are
@@ -21,12 +18,12 @@ here; each class documents what the neighbouring suites already cover:
       Nothing added here on purpose.
 """
 
-import calendar
 from datetime import datetime, timedelta
 
 from fastapi import HTTPException
 
-from app.db.models import ConnectionType, CustomerStatus
+from app.db.models import AppSetting, ConnectionType, CustomerStatus, RouterCommand
+from sqlalchemy import select
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
 
@@ -46,7 +43,10 @@ class TestPullChannelFreeInternetExpiry:
             db, reseller,
             identity=f"Router-{2000 + reseller.id}",
             pull_channel_enabled=True,
+            router_agent_enabled=True,
         )
+        db.add(AppSetting(key="router_agent_enabled", value="true"))
+        await db.commit()
         customer = await make_customer(
             db, reseller, plan, router,
             status=CustomerStatus.ACTIVE,
@@ -66,24 +66,6 @@ class TestPullChannelFreeInternetExpiry:
         }
         return reseller, router, customer, payload
 
-    def _patch_pull_io(self, monkeypatch):
-        import app.services.pull_provisioning as pull_mod
-
-        handoffs = []
-        clears = []
-
-        async def fake_handoff(identity, key, rsc):
-            handoffs.append({"identity": identity, "key": key, "rsc": rsc})
-            return {"queued": True}
-
-        async def fake_clear(identity, key):
-            clears.append({"identity": identity, "key": key})
-            return {"cleared": True}
-
-        monkeypatch.setattr(pull_mod, "handoff_to_pull_service", fake_handoff)
-        monkeypatch.setattr(pull_mod, "clear_pull_service", fake_clear)
-        return handoffs, clears
-
     async def test_expired_customer_is_never_handed_to_pull_channel(
         self, db, monkeypatch
     ):
@@ -94,8 +76,6 @@ class TestPullChannelFreeInternetExpiry:
         _, router, customer, payload = await self._seed(
             db, expiry=datetime.utcnow() - timedelta(hours=2)
         )
-        handoffs, _ = self._patch_pull_io(monkeypatch)
-        monkeypatch.setattr(hsp, "derive_router_status", lambda r: "offline")
         pushes = []
 
         async def fake_push(hotspot_payload, verify_only=False):
@@ -110,20 +90,17 @@ class TestPullChannelFreeInternetExpiry:
             hotspot_payload=payload,
         )
 
-        assert handoffs == []
+        commands = (await db.execute(select(RouterCommand))).scalars().all()
+        assert commands == []
         assert len(pushes) == 1  # status is advisory; paid delivery is still attempted
         assert result["success"] is False
 
-    async def test_pull_command_is_bounded_by_customer_expiry(self, db, monkeypatch):
-        """A queued command must carry the customer's real expiry as a
-        PULL-EXPIRES header so the pull service stops serving it at plan end."""
+    async def test_durable_command_is_bounded_and_generation_scoped(self, db, monkeypatch):
+        """A grant is durable, but cannot be delivered after the paid state ends."""
         import app.services.hotspot_provisioning as hsp
 
         expiry = datetime.utcnow() + timedelta(days=2)
         _, router, customer, payload = await self._seed(db, expiry=expiry)
-        handoffs, _ = self._patch_pull_io(monkeypatch)
-        monkeypatch.setattr(hsp, "derive_router_status", lambda r: "offline")
-
         async def fake_push(hotspot_payload, verify_only=False):
             return {"success": False, "error": "router unavailable"}
 
@@ -135,11 +112,12 @@ class TestPullChannelFreeInternetExpiry:
             hotspot_payload=payload,
         )
 
-        assert len(handoffs) == 1
-        assert handoffs[0]["identity"] == router.identity
-        assert handoffs[0]["key"] == f"cust{customer.id}"
-        expected_ts = calendar.timegm(expiry.utctimetuple())
-        assert f"# PULL-EXPIRES {expected_ts}" in handoffs[0]["rsc"]
+        command = (await db.execute(select(RouterCommand))).scalar_one()
+        assert command.router_id == router.id
+        assert command.customer_id == customer.id
+        assert command.state == "pending"
+        assert command.expires_at <= datetime.utcnow() + timedelta(hours=4, seconds=5)
+        assert command.metadata_json["original_expiry"] == expiry.isoformat()
 
     async def test_false_offline_status_never_suppresses_direct_paid_delivery(
         self, db, monkeypatch
@@ -151,7 +129,6 @@ class TestPullChannelFreeInternetExpiry:
         )
         router.pull_channel_enabled = False
         await db.commit()
-        monkeypatch.setattr(hsp, "derive_router_status", lambda r: "offline")
         pushes = []
 
         async def fake_push(hotspot_payload, verify_only=False):
@@ -169,17 +146,13 @@ class TestPullChannelFreeInternetExpiry:
         assert result["success"] is True
         assert pushes == [payload]
 
-    async def test_successful_push_clears_pending_pull_command(self, db, monkeypatch):
-        """Delivered over the tunnel -> the queued pull copy must be cleared so
-        a later outbound fetch can't re-apply it."""
+    async def test_successful_push_closes_pending_agent_command(self, db, monkeypatch):
+        """Direct delivery wins and makes the durable fallback terminal."""
         import app.services.hotspot_provisioning as hsp
 
         _, router, customer, payload = await self._seed(
             db, expiry=datetime.utcnow() + timedelta(days=2)
         )
-        handoffs, clears = self._patch_pull_io(monkeypatch)
-        monkeypatch.setattr(hsp, "derive_router_status", lambda r: "online")
-
         async def fake_push(hotspot_payload, verify_only=False):
             return {"success": True}
 
@@ -192,10 +165,9 @@ class TestPullChannelFreeInternetExpiry:
         )
 
         assert result["success"] is True
-        assert handoffs == []  # push worked; nothing queued
-        assert clears == [
-            {"identity": router.identity, "key": f"cust{customer.id}"}
-        ]
+        command = (await db.execute(select(RouterCommand))).scalar_one()
+        assert command.state == "applied"
+        assert command.acknowledgement_source == "direct_push"
 
 
 class TestPppoeOrphanSecret:

@@ -687,6 +687,28 @@
   "router_id",
   "source"
  ],
+ "router_commands": [
+  "acknowledged_at",
+  "acknowledgement_source",
+  "action_script",
+  "available_at",
+  "command_type",
+  "created_at",
+  "customer_id",
+  "delivery_count",
+  "expires_at",
+  "failure_count",
+  "first_delivered_at",
+  "id",
+  "idempotency_key",
+  "last_delivered_at",
+  "last_error",
+  "metadata_json",
+  "provisioning_attempt_id",
+  "router_id",
+  "state",
+  "updated_at"
+ ],
  "router_log_entries": [
   "created_at",
   "id",
@@ -709,6 +731,9 @@
   "updated_at"
  ],
  "routers": [
+  "agent_last_seen_at",
+  "agent_tunnel_state",
+  "agent_version",
   "auth_method",
   "availability_checks",
   "availability_successes",
@@ -739,6 +764,7 @@
   "pull_channel_enabled",
   "radius_nas_identifier",
   "radius_secret",
+  "router_agent_enabled",
   "status_alerts_enabled",
   "user_id",
   "username"
