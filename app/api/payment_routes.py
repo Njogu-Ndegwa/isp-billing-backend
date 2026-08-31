@@ -1649,7 +1649,13 @@ async def get_mpesa_transactions_summary(
 
         if want_mpesa:
             mpesa_stmt = (
-                select(MpesaTransaction, Customer, Router, Plan)
+                select(
+                    MpesaTransaction.amount,
+                    MpesaTransaction.status,
+                    Router.name,
+                    Router.id,
+                    Plan.connection_type,
+                )
                 .join(Customer, MpesaTransaction.customer_id == Customer.id, isouter=True)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
                 .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
@@ -1664,20 +1670,30 @@ async def get_mpesa_transactions_summary(
             if date_end:
                 mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at <= date_end)
 
-            for tx, customer, rtr, plan in (await db.execute(mpesa_stmt)).all():
+            for amount, tx_status, router_name, router_pk, connection_type in (
+                await db.execute(mpesa_stmt)
+            ).all():
                 rows.append({
-                    "amount": float(tx.amount),
-                    "status": tx.status.value,
+                    "amount": float(amount),
+                    "status": tx_status.value,
                     "method": "mobile_money",
-                    "router_name": rtr.name if rtr else None,
-                    "router_id": rtr.id if rtr else None,
+                    "router_name": router_name,
+                    "router_id": router_pk,
                     "counts_as_revenue": True,
-                    "connection_type": plan.connection_type.value if plan and plan.connection_type else None,
+                    "connection_type": connection_type.value if connection_type else None,
                 })
 
         if want_other:
             cp_stmt = (
-                select(CustomerPayment, Customer, Router, Plan)
+                select(
+                    CustomerPayment.amount,
+                    CustomerPayment.status,
+                    CustomerPayment.payment_method,
+                    CustomerPayment.counts_as_revenue,
+                    Router.name,
+                    Router.id,
+                    Plan.connection_type,
+                )
                 .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
                 .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
@@ -1699,15 +1715,23 @@ async def get_mpesa_transactions_summary(
             if date_end:
                 cp_stmt = cp_stmt.where(CustomerPayment.created_at <= date_end)
 
-            for pay, customer, rtr, plan in (await db.execute(cp_stmt)).all():
+            for (
+                amount,
+                payment_status,
+                method,
+                counts_as_revenue,
+                router_name,
+                router_pk,
+                connection_type,
+            ) in (await db.execute(cp_stmt)).all():
                 rows.append({
-                    "amount": float(pay.amount),
-                    "status": pay.status.value if pay.status else "completed",
-                    "method": pay.payment_method.value,
-                    "router_name": rtr.name if rtr else None,
-                    "router_id": rtr.id if rtr else None,
-                    "counts_as_revenue": bool(pay.counts_as_revenue),
-                    "connection_type": plan.connection_type.value if plan and plan.connection_type else None,
+                    "amount": float(amount),
+                    "status": payment_status.value if payment_status else "completed",
+                    "method": method.value,
+                    "router_name": router_name,
+                    "router_id": router_pk,
+                    "counts_as_revenue": bool(counts_as_revenue),
+                    "connection_type": connection_type.value if connection_type else None,
                 })
 
         total_transactions = len(rows)
