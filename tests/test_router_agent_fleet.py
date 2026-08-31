@@ -1,3 +1,5 @@
+import pytest
+
 from app.services import router_agent_fleet as fleet
 from tests.factories import make_reseller, make_router
 
@@ -7,6 +9,35 @@ def test_agent_policy_can_create_and_import_command_files():
 
     assert "ftp" in policies
     assert {"read", "write", "test", "policy", "sensitive"}.issubset(policies)
+
+
+def test_current_source_and_scheduler_verification_rejects_old_cadence():
+    source = fleet.render_router_agent_source(
+        identity="Router-Verify",
+        endpoint_base_url="https://isp.bitwavetechnologies.net",
+        tunnel_type="wireguard",
+    )
+
+    assert fleet._source_is_current(source, "Router-Verify") is True
+    assert fleet._source_is_current(
+        source.replace("bitwavePollSkips", "oldPollSkips"),
+        "Router-Verify",
+    ) is False
+    assert fleet._source_is_current(source + "\n:rndnum from=0 to=1", "Router-Verify") is False
+    assert fleet._scheduler_is_current(
+        {
+            "disabled": "false",
+            "on-event": "/system script run bitwave-command-agent",
+            "interval": "30s",
+        }
+    ) is True
+    assert fleet._scheduler_is_current(
+        {
+            "disabled": "false",
+            "on-event": "/system script run bitwave-command-agent",
+            "interval": "90s",
+        }
+    ) is False
 
 
 def test_installer_applies_and_verifies_file_policy_on_script_and_scheduler(monkeypatch):
@@ -61,6 +92,7 @@ def test_installer_applies_and_verifies_file_policy_on_script_and_scheduler(monk
     api = FakeAPI.instances[0]
     assert "ftp" in api.script["policy"].split(",")
     assert "ftp" in api.scheduler["policy"].split(",")
+    assert api.scheduler["interval"] == "30s"
 
 
 async def test_install_batches_advance_past_already_enabled_routers(db):
@@ -168,3 +200,69 @@ async def test_uninstall_disables_db_even_when_router_is_unreachable(db, monkeyp
     await db.refresh(router)
     assert results[0]["ok"] is False
     assert router.router_agent_enabled is False
+
+
+async def test_upgrade_selects_enabled_router_and_reenables_after_verification(
+    db, monkeypatch
+):
+    reseller = await make_reseller(db)
+    router = await make_router(
+        db,
+        reseller,
+        identity="Router-Upgrade",
+        router_agent_enabled=True,
+    )
+    monkeypatch.setattr(
+        fleet,
+        "install_router_agent_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "router_id": router.id,
+            "identity": router.identity,
+            "tunnel_type": "wireguard",
+            "script_bytes": 2048,
+        },
+    )
+
+    results = await fleet.run_router_agent_fleet_change(
+        mode="upgrade",
+        router_ids=[router.id],
+    )
+
+    await db.refresh(router)
+    assert results[0]["ok"] is True
+    assert results[0]["already_enabled"] is True
+    assert router.router_agent_enabled is True
+
+
+async def test_failed_upgrade_leaves_router_disabled(db, monkeypatch):
+    reseller = await make_reseller(db)
+    router = await make_router(
+        db,
+        reseller,
+        identity="Router-Upgrade-Failed",
+        router_agent_enabled=True,
+    )
+    monkeypatch.setattr(
+        fleet,
+        "install_router_agent_sync",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "router_id": router.id,
+            "error": "verification_failed",
+        },
+    )
+
+    results = await fleet.run_router_agent_fleet_change(
+        mode="upgrade",
+        router_ids=[router.id],
+    )
+
+    await db.refresh(router)
+    assert results[0]["ok"] is False
+    assert router.router_agent_enabled is False
+
+
+async def test_upgrade_requires_explicit_router_ids():
+    with pytest.raises(ValueError, match="explicit router_ids"):
+        await fleet.run_router_agent_fleet_change(mode="upgrade")

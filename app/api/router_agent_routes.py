@@ -22,9 +22,11 @@ from app.services.router_agent_auth import (
     derive_router_agent_token,
     verify_router_agent_token,
 )
+from app.services.router_agent_script import SCHEDULER_TICK_SECONDS
 from app.services.router_agent_commands import (
     ACTIVE_COMMAND_STATES,
     acknowledge_command,
+    expire_active_commands,
     has_active_commands,
     next_command_for_router,
 )
@@ -212,23 +214,11 @@ async def _refresh_pending_cache_if_due(force: bool = False) -> None:
         now = time.monotonic()
         if not force and now - _pending_refreshed_at < PENDING_CACHE_REFRESH_SECONDS:
             return
+        utc_now = datetime.utcnow()
+        # The service queues precautionary cleanup for a grant that may have
+        # applied before its acknowledgement was lost.
+        await expire_active_commands(utc_now)
         async with async_session() as db:
-            utc_now = datetime.utcnow()
-            expired = await db.execute(
-                update(RouterCommand)
-                .where(
-                    RouterCommand.state.in_(ACTIVE_COMMAND_STATES),
-                    RouterCommand.expires_at.isnot(None),
-                    RouterCommand.expires_at <= utc_now,
-                )
-                .values(
-                    state="expired",
-                    last_error="Command expired before acknowledgement",
-                    updated_at=utc_now,
-                )
-            )
-            if expired.rowcount:
-                await db.commit()
             rows = (
                 await db.execute(
                     select(RouterCommand.router_id)
@@ -269,6 +259,22 @@ def _next_poll_seconds(tunnel: str) -> int:
         low = _setting_int("router_agent_normal_min_seconds", 90, 30, 600)
         high = _setting_int("router_agent_normal_max_seconds", 150, low, 900)
     return random.randint(low, high)
+
+
+def _poll_skip_count(next_poll_seconds: int) -> int:
+    """Convert a server delay to fixed local scheduler ticks without polling early."""
+
+    ticks = (
+        max(1, int(next_poll_seconds)) + SCHEDULER_TICK_SECONDS - 1
+    ) // SCHEDULER_TICK_SECONDS
+    return max(0, ticks - 1)
+
+
+def _poll_skip_directive(next_poll_seconds: int) -> str:
+    return (
+        ":global bitwavePollSkips\n"
+        f":set bitwavePollSkips {_poll_skip_count(next_poll_seconds)}\n"
+    )
 
 
 async def _persist_heartbeat(router_id: int, tunnel: str, version: str) -> None:
@@ -319,7 +325,7 @@ def _command_envelope(
     ack = f"{base_url}/api/router/agent/commands/{command.id}/ack?identity={identity}"
     action = command.action_script.rstrip()
     return f"""# BITWAVE-COMMAND {next_poll_seconds} {command.id}
-/system scheduler set [find name="bitwave-command-agent"] interval={next_poll_seconds}s
+{_poll_skip_directive(next_poll_seconds).rstrip()}
 :local bitwaveCommandOk true
 :do {{
 {action}
@@ -443,8 +449,7 @@ async def poll_router_agent(
             _metrics["polls_idle"] += 1
             return PlainTextResponse(
                 f"# BITWAVE-IDLE {next_seconds}\n"
-                f'/system scheduler set [find name="bitwave-command-agent"] '
-                f"interval={next_seconds}s\n",
+                f"{_poll_skip_directive(next_seconds)}",
                 headers=headers,
             )
         _metrics["polls_command"] += 1

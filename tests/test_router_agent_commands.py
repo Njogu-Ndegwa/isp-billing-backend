@@ -218,6 +218,213 @@ async def test_stale_grant_ack_queues_verified_cleanup(db, session_factory, monk
 
 
 @pytest.mark.asyncio
+async def test_active_but_expired_customer_never_receives_queued_grant(
+    db, session_factory, monkeypatch
+):
+    monkeypatch.setattr(commands, "async_session", session_factory)
+    reseller, plan, router = await _enabled_hotspot(db)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(hours=1),
+    )
+    command_id = await commands.queue_hotspot_provision_command(
+        router_id=router.id,
+        customer_id=customer.id,
+        attempt_id=None,
+        hotspot_payload=_payload(customer, router),
+    )
+    customer.expiry = datetime.utcnow() - timedelta(seconds=1)
+    await db.commit()
+
+    assert await commands.next_command_for_router(router.id) is None
+    command = await db.get(RouterCommand, command_id)
+    await db.refresh(command)
+    assert command.state == "cancelled"
+    assert "ended" in command.last_error
+
+
+@pytest.mark.asyncio
+async def test_provision_command_expiry_is_capped_to_paid_entitlement(
+    db, session_factory, monkeypatch
+):
+    monkeypatch.setattr(commands, "async_session", session_factory)
+    reseller, plan, router = await _enabled_hotspot(db)
+    paid_expiry = datetime.utcnow() + timedelta(minutes=20)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=paid_expiry,
+    )
+    command_id = await commands.queue_hotspot_provision_command(
+        router_id=router.id,
+        customer_id=customer.id,
+        attempt_id=None,
+        hotspot_payload=_payload(customer, router),
+    )
+
+    command = await db.get(RouterCommand, command_id)
+    assert command.expires_at == paid_expiry
+
+
+@pytest.mark.asyncio
+async def test_expired_customer_after_delivery_queues_precautionary_cleanup(
+    db, session_factory, monkeypatch
+):
+    monkeypatch.setattr(commands, "async_session", session_factory)
+    reseller, plan, router = await _enabled_hotspot(db)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(hours=1),
+    )
+    command_id = await commands.queue_hotspot_provision_command(
+        router_id=router.id,
+        customer_id=customer.id,
+        attempt_id=None,
+        hotspot_payload=_payload(customer, router),
+    )
+    assert (await commands.next_command_for_router(router.id)).id == command_id
+    command = await db.get(RouterCommand, command_id)
+    command.available_at = datetime.utcnow() - timedelta(seconds=1)
+    customer.expiry = datetime.utcnow() - timedelta(seconds=1)
+    await db.commit()
+
+    assert await commands.next_command_for_router(router.id) is None
+    await db.refresh(command)
+    assert command.state == "cancelled"
+    cleanup = (
+        await db.execute(
+            select(RouterCommand).where(
+                RouterCommand.idempotency_key == f"cleanup-after-stale-grant:{command_id}"
+            )
+        )
+    ).scalar_one()
+    assert cleanup.command_type == "hotspot_remove"
+
+
+@pytest.mark.asyncio
+async def test_expired_delivered_command_keeps_live_customer_connected(
+    db, session_factory, monkeypatch
+):
+    monkeypatch.setattr(commands, "async_session", session_factory)
+    reseller, plan, router = await _enabled_hotspot(db)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(hours=1),
+    )
+    command_id = await commands.queue_hotspot_provision_command(
+        router_id=router.id,
+        customer_id=customer.id,
+        attempt_id=None,
+        hotspot_payload=_payload(customer, router),
+    )
+    assert (await commands.next_command_for_router(router.id)).id == command_id
+    command = await db.get(RouterCommand, command_id)
+    command.expires_at = datetime.utcnow() - timedelta(seconds=1)
+    await db.commit()
+
+    assert await commands.expire_active_commands() == 1
+    await db.refresh(command)
+    assert command.state == "expired"
+    assert "entitlement remains active" in command.last_error
+    cleanup = (
+        await db.execute(
+            select(RouterCommand).where(
+                RouterCommand.idempotency_key == f"cleanup-after-stale-grant:{command_id}"
+            )
+        )
+    ).scalar_one_or_none()
+    assert cleanup is None
+
+
+@pytest.mark.asyncio
+async def test_expired_delivered_command_cleans_up_ended_entitlement(
+    db, session_factory, monkeypatch
+):
+    monkeypatch.setattr(commands, "async_session", session_factory)
+    reseller, plan, router = await _enabled_hotspot(db)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(hours=1),
+    )
+    command_id = await commands.queue_hotspot_provision_command(
+        router_id=router.id,
+        customer_id=customer.id,
+        attempt_id=None,
+        hotspot_payload=_payload(customer, router),
+    )
+    assert (await commands.next_command_for_router(router.id)).id == command_id
+    command = await db.get(RouterCommand, command_id)
+    customer.expiry = datetime.utcnow() - timedelta(seconds=1)
+    command.expires_at = datetime.utcnow() - timedelta(seconds=1)
+    await db.commit()
+
+    assert await commands.expire_active_commands() == 1
+    await db.refresh(command)
+    assert command.state == "expired"
+    assert "cleanup queued" in command.last_error
+    cleanup = (
+        await db.execute(
+            select(RouterCommand).where(
+                RouterCommand.idempotency_key == f"cleanup-after-stale-grant:{command_id}"
+            )
+        )
+    ).scalar_one()
+    assert cleanup.command_type == "hotspot_remove"
+
+
+@pytest.mark.asyncio
+async def test_expired_delivered_command_flags_unrenderable_stale_cleanup(
+    db, session_factory, monkeypatch
+):
+    monkeypatch.setattr(commands, "async_session", session_factory)
+    reseller, plan, router = await _enabled_hotspot(db)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(hours=1),
+    )
+    command_id = await commands.queue_hotspot_provision_command(
+        router_id=router.id,
+        customer_id=customer.id,
+        attempt_id=None,
+        hotspot_payload=_payload(customer, router),
+    )
+    assert (await commands.next_command_for_router(router.id)).id == command_id
+    command = await db.get(RouterCommand, command_id)
+    command.metadata_json = {}
+    customer.expiry = datetime.utcnow() - timedelta(seconds=1)
+    command.expires_at = datetime.utcnow() - timedelta(seconds=1)
+    await db.commit()
+
+    assert await commands.expire_active_commands() == 1
+    await db.refresh(command)
+    assert command.state == "expired"
+    assert command.last_error.startswith("CRITICAL:")
+
+
+@pytest.mark.asyncio
 async def test_delayed_agent_ack_aligns_paid_time_usage_and_sharing(
     db, session_factory, monkeypatch
 ):

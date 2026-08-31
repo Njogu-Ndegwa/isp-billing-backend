@@ -309,7 +309,7 @@ async def queue_hotspot_provision_command(
             "username": hotspot_payload.get("username"),
             "lb_enabled": bool(hotspot_payload.get("lb_enabled")),
         },
-        expires_at=now + COMMAND_MAX_AGE,
+        expires_at=min(now + COMMAND_MAX_AGE, original_expiry),
     )
 
 
@@ -367,7 +367,7 @@ async def queue_pppoe_provision_command(
             "entitlement_seconds": duration,
             "username": pppoe_payload.get("pppoe_username"),
         },
-        expires_at=now + COMMAND_MAX_AGE,
+        expires_at=min(now + COMMAND_MAX_AGE, original_expiry),
     )
 
 
@@ -481,9 +481,24 @@ async def next_command_for_router(router_id: int) -> RouterCommand | None:
         for command in commands:
             customer = await db.get(Customer, command.customer_id) if command.customer_id else None
             is_remove = command.command_type.endswith("_remove")
+            is_provision = command.command_type.endswith("_provision")
             if command.customer_id is not None and customer is None:
                 command.state = "cancelled"
-                command.last_error = "Customer no longer exists"
+                queued_cleanup = bool(
+                    is_provision
+                    and command.first_delivered_at is not None
+                    and await _queue_cleanup_after_stale_grant(
+                        db,
+                        command=command,
+                        customer=None,
+                        now=now,
+                    )
+                )
+                command.last_error = (
+                    "Customer no longer exists; precautionary cleanup queued"
+                    if queued_cleanup
+                    else "Customer no longer exists"
+                )
                 command.updated_at = now
                 continue
             if customer is not None:
@@ -506,15 +521,24 @@ async def next_command_for_router(router_id: int) -> RouterCommand | None:
                     )
                     command.updated_at = now
                     continue
-                if (
-                    not is_remove
-                    and (
-                        customer.status != CustomerStatus.ACTIVE
-                        or customer.router_id != command.router_id
-                    )
+                if is_provision and (
+                    not customer_is_live or customer.router_id != command.router_id
                 ):
                     command.state = "cancelled"
-                    command.last_error = "Customer is inactive or moved to another router"
+                    queued_cleanup = bool(
+                        command.first_delivered_at is not None
+                        and await _queue_cleanup_after_stale_grant(
+                            db,
+                            command=command,
+                            customer=customer,
+                            now=now,
+                        )
+                    )
+                    command.last_error = (
+                        "Paid entitlement ended or moved after delivery; cleanup queued"
+                        if queued_cleanup
+                        else "Paid entitlement ended or moved before delivery"
+                    )
                     command.updated_at = now
                     continue
 
@@ -531,6 +555,76 @@ async def next_command_for_router(router_id: int) -> RouterCommand | None:
         if commands:
             await db.commit()
     return None
+
+
+async def expire_active_commands(now: datetime | None = None) -> int:
+    """Terminalize expired commands and clean up grants that may have applied."""
+
+    now = now or datetime.utcnow()
+    async with async_session() as db:
+        expired_commands = (
+            await db.execute(
+                select(RouterCommand)
+                .where(
+                    RouterCommand.state.in_(ACTIVE_COMMAND_STATES),
+                    RouterCommand.expires_at.isnot(None),
+                    RouterCommand.expires_at <= now,
+                )
+                .order_by(RouterCommand.id.asc())
+                .limit(100)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().all()
+        for command in expired_commands:
+            command.state = "expired"
+            command.updated_at = now
+            queued_cleanup = False
+            delivered_provision = bool(
+                command.command_type.endswith("_provision")
+                and command.first_delivered_at is not None
+            )
+            customer_is_live_here = False
+            if (
+                delivered_provision
+            ):
+                customer = (
+                    await db.get(Customer, command.customer_id)
+                    if command.customer_id
+                    else None
+                )
+                customer_is_live_here = bool(
+                    customer is not None
+                    and customer.status == CustomerStatus.ACTIVE
+                    and customer.expiry is not None
+                    and customer.expiry > now
+                    and customer.router_id == command.router_id
+                )
+                if not customer_is_live_here:
+                    queued_cleanup = await _queue_cleanup_after_stale_grant(
+                        db,
+                        command=command,
+                        customer=customer,
+                        now=now,
+                    )
+            if queued_cleanup:
+                command.last_error = (
+                    "Command expired after delivery; precautionary cleanup queued"
+                )
+            elif delivered_provision and customer_is_live_here:
+                command.last_error = (
+                    "Command expired after delivery while entitlement remains active; "
+                    "no cleanup issued"
+                )
+            elif delivered_provision:
+                command.last_error = (
+                    "CRITICAL: command expired after delivery for a stale entitlement; "
+                    "cleanup could not be rendered"
+                )
+            else:
+                command.last_error = "Command expired before acknowledgement"
+        if expired_commands:
+            await db.commit()
+        return len(expired_commands)
 
 
 async def _queue_cleanup_after_stale_grant(
