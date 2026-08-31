@@ -25,7 +25,7 @@ from app.db.models import (
 )
 from app.services.mikrotik_api import MikroTikAPI
 from app.config import settings
-from app.services.router_availability import derive_router_status, record_router_availability
+from app.services.router_availability import record_router_availability
 
 logger = logging.getLogger("pppoe_provisioning")
 
@@ -424,27 +424,9 @@ async def provision_pppoe_customer(
                 attempt.updated_at = now
                 await db.commit()
 
-    if router_id:
-        try:
-            async with db_module.async_session() as db:
-                router_obj = await db.get(Router, router_id)
-                if router_obj and derive_router_status(router_obj) == "offline":
-                    result = {
-                        "success": False,
-                        "error": f"Router {router_ip} is known offline, will retry",
-                    }
-                    return await _persist_pppoe_provisioning_result(
-                        result=result,
-                        customer_id=customer_id,
-                        router_id=router_id,
-                        router_ip=router_ip,
-                        pppoe_username=pppoe_username,
-                        action=action,
-                        attempt_id=attempt_id,
-                    )
-        except Exception:
-            pass
-
+    # A persisted status is advisory telemetry, not permission to discard a
+    # paid activation.  Always make the bounded RouterOS attempt; otherwise one
+    # stale/false offline sample turns a successful payment into a real outage.
     result = await call_pppoe_provision(pppoe_payload)
     return await _persist_pppoe_provisioning_result(
         result=result or {"success": False, "error": "PPPoE provisioning returned no result"},

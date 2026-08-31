@@ -96,6 +96,13 @@ class TestPullChannelFreeInternetExpiry:
         )
         handoffs, _ = self._patch_pull_io(monkeypatch)
         monkeypatch.setattr(hsp, "derive_router_status", lambda r: "offline")
+        pushes = []
+
+        async def fake_push(hotspot_payload, verify_only=False):
+            pushes.append(hotspot_payload)
+            return {"success": False, "error": "router unavailable"}
+
+        monkeypatch.setattr(hsp, "_run_mikrotik_operation", fake_push)
 
         result = await hsp.provision_hotspot_customer(
             customer_id=customer.id,
@@ -104,7 +111,8 @@ class TestPullChannelFreeInternetExpiry:
         )
 
         assert handoffs == []
-        assert result["success"] is False  # push also skipped: router offline
+        assert len(pushes) == 1  # status is advisory; paid delivery is still attempted
+        assert result["success"] is False
 
     async def test_pull_command_is_bounded_by_customer_expiry(self, db, monkeypatch):
         """A queued command must carry the customer's real expiry as a
@@ -115,6 +123,11 @@ class TestPullChannelFreeInternetExpiry:
         _, router, customer, payload = await self._seed(db, expiry=expiry)
         handoffs, _ = self._patch_pull_io(monkeypatch)
         monkeypatch.setattr(hsp, "derive_router_status", lambda r: "offline")
+
+        async def fake_push(hotspot_payload, verify_only=False):
+            return {"success": False, "error": "router unavailable"}
+
+        monkeypatch.setattr(hsp, "_run_mikrotik_operation", fake_push)
 
         await hsp.provision_hotspot_customer(
             customer_id=customer.id,
@@ -127,6 +140,34 @@ class TestPullChannelFreeInternetExpiry:
         assert handoffs[0]["key"] == f"cust{customer.id}"
         expected_ts = calendar.timegm(expiry.utctimetuple())
         assert f"# PULL-EXPIRES {expected_ts}" in handoffs[0]["rsc"]
+
+    async def test_false_offline_status_never_suppresses_direct_paid_delivery(
+        self, db, monkeypatch
+    ):
+        import app.services.hotspot_provisioning as hsp
+
+        _, router, customer, payload = await self._seed(
+            db, expiry=datetime.utcnow() + timedelta(hours=2)
+        )
+        router.pull_channel_enabled = False
+        await db.commit()
+        monkeypatch.setattr(hsp, "derive_router_status", lambda r: "offline")
+        pushes = []
+
+        async def fake_push(hotspot_payload, verify_only=False):
+            pushes.append(hotspot_payload)
+            return {"success": True}
+
+        monkeypatch.setattr(hsp, "_run_mikrotik_operation", fake_push)
+
+        result = await hsp.provision_hotspot_customer(
+            customer_id=customer.id,
+            router_id=router.id,
+            hotspot_payload=payload,
+        )
+
+        assert result["success"] is True
+        assert pushes == [payload]
 
     async def test_successful_push_clears_pending_pull_command(self, db, monkeypatch):
         """Delivered over the tunnel -> the queued pull copy must be cleared so

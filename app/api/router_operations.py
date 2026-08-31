@@ -3898,7 +3898,18 @@ async def reboot_router(
         await record_router_availability(db, router_id, False, "router_reboot")
         raise HTTPException(status_code=500, detail=result.get("message") or result["error"])
 
-    await record_router_availability(db, router_id, True, "router_reboot")
+    # Command acceptance proves the router was reachable before the command,
+    # but the command immediately takes it down.  Recording this as online made
+    # the UI lie during the reboot window and could let other work race the
+    # restart.  This is a deliberate, authoritative transition to offline;
+    # the first post-boot success/heartbeat moves it online again.
+    await record_router_availability(
+        db,
+        router_id,
+        False,
+        "router_reboot",
+        confirm_offline=True,
+    )
 
     logger.info(
         "Remote reboot sent for router %s (id=%s) by user_id=%s%s",
