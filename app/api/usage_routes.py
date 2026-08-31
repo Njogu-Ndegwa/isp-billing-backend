@@ -53,6 +53,10 @@ class UsageOut(BaseModel):
     period: Optional[PeriodOut]
 
 
+class BulkUsageRequest(BaseModel):
+    customer_ids: list[int]
+
+
 class TopUsageItem(BaseModel):
     customer_id: int
     customer_name: Optional[str]
@@ -104,6 +108,22 @@ def _serialize_period(p: CustomerUsagePeriod) -> PeriodOut:
     )
 
 
+def _serialize_usage(
+    customer: Customer,
+    open_period: Optional[CustomerUsagePeriod],
+) -> UsageOut:
+    plan = customer.plan
+    return UsageOut(
+        customer_id=customer.id,
+        connection_type=plan.connection_type.value if (plan and plan.connection_type) else None,
+        pppoe_username=customer.pppoe_username,
+        plan_name=plan.name if plan else None,
+        plan_data_cap_mb=plan.data_cap_mb if plan else None,
+        plan_fup_action=plan.fup_action.value if (plan and plan.fup_action) else None,
+        period=_serialize_period(open_period) if open_period else None,
+    )
+
+
 async def _load_customer_scoped(
     db: AsyncSession, customer_id: int, user
 ) -> Customer:
@@ -134,18 +154,66 @@ async def get_customer_usage(
     """Current open billing period for the customer + FUP status."""
     user = await get_current_user(token, db)
     customer = await _load_customer_scoped(db, customer_id, user)
-    plan = customer.plan
     open_period = await get_open_period(db, customer.id)
 
-    return UsageOut(
-        customer_id=customer.id,
-        connection_type=plan.connection_type.value if (plan and plan.connection_type) else None,
-        pppoe_username=customer.pppoe_username,
-        plan_name=plan.name if plan else None,
-        plan_data_cap_mb=plan.data_cap_mb if plan else None,
-        plan_fup_action=plan.fup_action.value if (plan and plan.fup_action) else None,
-        period=_serialize_period(open_period) if open_period else None,
+    return _serialize_usage(customer, open_period)
+
+
+@router.post("/api/customers/usage/bulk", response_model=list[UsageOut])
+async def get_customer_usage_bulk(
+    body: BulkUsageRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Current usage for up to 100 customers in one bounded DB round-trip set."""
+    if not body.customer_ids:
+        raise HTTPException(status_code=400, detail="customer_ids must not be empty")
+    if len(body.customer_ids) > 100:
+        raise HTTPException(status_code=400, detail="A maximum of 100 customer IDs is allowed")
+    if any(customer_id <= 0 for customer_id in body.customer_ids):
+        raise HTTPException(status_code=400, detail="customer_ids must contain positive integers")
+
+    requested_ids = list(dict.fromkeys(body.customer_ids))
+    user = await get_current_user(token, db)
+
+    customer_stmt = (
+        select(Customer)
+        .options(selectinload(Customer.plan))
+        .where(Customer.id.in_(requested_ids))
     )
+    if user.role != UserRole.ADMIN:
+        customer_stmt = customer_stmt.where(Customer.user_id == user.id)
+
+    customers = (await db.execute(customer_stmt)).scalars().all()
+    customers_by_id = {customer.id: customer for customer in customers}
+    accessible_ids = list(customers_by_id)
+
+    periods_by_customer_id: dict[int, CustomerUsagePeriod] = {}
+    if accessible_ids:
+        periods = (
+            await db.execute(
+                select(CustomerUsagePeriod)
+                .where(
+                    CustomerUsagePeriod.customer_id.in_(accessible_ids),
+                    CustomerUsagePeriod.closed_at.is_(None),
+                )
+                .order_by(
+                    CustomerUsagePeriod.customer_id,
+                    CustomerUsagePeriod.period_start.desc(),
+                )
+            )
+        ).scalars().all()
+        for period in periods:
+            periods_by_customer_id.setdefault(period.customer_id, period)
+
+    return [
+        _serialize_usage(
+            customers_by_id[customer_id],
+            periods_by_customer_id.get(customer_id),
+        )
+        for customer_id in requested_ids
+        if customer_id in customers_by_id
+    ]
 
 
 @router.get(
