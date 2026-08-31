@@ -1,9 +1,10 @@
-"""Shared bounded backoff policy for paid direct-router provisioning.
+"""Shared rapid-first retry policy for paid direct-router provisioning.
 
-Five attempts on every scheduler tick exhausted in only a few minutes during a
-management-tunnel flap. Keep the existing four-hour retry window, but spread a
-bounded number of attempts across it. Both hotspot and PPPoE use the same policy
-so a successful payment has consistent delivery behavior.
+Paid access must feel immediate.  Keep the first several attempts eligible on
+consecutive worker ticks so a short management-tunnel flap recovers quickly,
+then retain a bounded slow tail for longer outages instead of declaring a paid
+delivery permanently failed after only a few minutes.  Both hotspot and PPPoE
+use the same policy.
 """
 
 from __future__ import annotations
@@ -15,18 +16,22 @@ from sqlalchemy import and_, or_
 
 PAID_PROVISIONING_RETRY_MAX_ATTEMPTS = 14
 
-# Delay after N completed attempts before attempt N+1. After the eighth
-# attempt, cap at 30 minutes. Fourteen total attempts fit inside four hours:
-# immediate, then approximately 1, 3, 6, 11, 19, 32, 53, 83, ... 233 minutes.
+# Delay after N completed attempts before attempt N+1.  The first five delays
+# are all below both existing worker cadences (97s hotspot / 113s PPPoE), so a
+# new paid activation remains eligible on every early worker tick.  After that
+# rapid lane, progressively back off and cap at 40 minutes.  This changes no
+# scheduler cadence, batch size, worker concurrency, or DB-pool threshold.
 PAID_PROVISIONING_RETRY_BACKOFF_SECONDS = (
+    30,
+    45,
     60,
-    120,
+    75,
+    90,
     180,
     300,
-    480,
-    780,
-    1260,
-    1800,
+    600,
+    1200,
+    2400,
 )
 
 

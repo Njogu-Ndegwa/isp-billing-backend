@@ -55,14 +55,17 @@ The follow-up candidate on `fix/paid-retry-resilience`:
 
 - shares one retry policy between hotspot and PPPoE;
 - raises the bounded ceiling to 14 attempts while retaining the four-hour limit;
-- spaces attempts at 1, 2, 3, 5, 8, 13, 21, then 30-minute capped delays;
+- preserves the immediate payment-triggered attempt, then keeps the first five
+  retries eligible on consecutive existing worker ticks (97s hotspot / 113s PPPoE)
+  before moving to a bounded slow tail capped at 40-minute delays;
 - resumes legacy terminal attempts below the new ceiling only when their error is
   transport-shaped (`connect`, `timeout`, or `unreachable`), leaving deterministic
   RouterOS configuration failures terminal;
 - keeps the existing batch limits, per-router serialization/concurrency caps, and
-  60% DB-pool shedding threshold unchanged.
+  60% DB-pool shedding threshold unchanged, so the rapid paid-user lane adds no
+  scheduler scans, worker concurrency, or DB-pool pressure.
 
-Verification before deployment approval: focused provisioning/status regressions
-passed (56 tests), the session-discipline gate passed, and the full local suite
-passed (1,037 tests). Production deployment and automatic legacy-attempt recovery
-remain pending explicit approval.
+Verification after the rapid-first adjustment: the focused provisioning/status
+selection passed (39 tests), the session-discipline gate passed, and the full
+local suite passed (1,047 tests). Production deployment and automatic
+legacy-attempt recovery remain pending explicit approval.

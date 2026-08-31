@@ -75,26 +75,30 @@ async def _seed_attempt(
     return attempt, customer, router
 
 
-def test_shared_retry_policy_spreads_attempts_across_four_hours():
+def test_shared_retry_policy_keeps_rapid_front_then_spreads_attempts():
     assert PAID_PROVISIONING_RETRY_MAX_ATTEMPTS == 14
-    assert [retry_delay_seconds(count) for count in range(1, 9)] == [
+    assert [retry_delay_seconds(count) for count in range(1, 11)] == [
+        30,
+        45,
         60,
-        120,
+        75,
+        90,
         180,
         300,
-        480,
-        780,
-        1260,
-        1800,
+        600,
+        1200,
+        2400,
     ]
-    assert retry_delay_seconds(13) == 1800
+    assert retry_delay_seconds(13) == 2400
+    assert max(retry_delay_seconds(count) for count in range(1, 6)) < 97
+    assert sum(retry_delay_seconds(count) for count in range(1, 14)) < 4 * 60 * 60
 
 
 async def test_hotspot_recent_retry_is_not_replayed_before_backoff(db, monkeypatch):
     await _seed_attempt(
         db,
         attempt_count=5,
-        last_attempt_at=datetime.utcnow() - timedelta(seconds=479),
+        last_attempt_at=datetime.utcnow() - timedelta(seconds=89),
     )
     groups_seen = []
 
@@ -119,7 +123,7 @@ async def test_hotspot_legacy_connectivity_failure_resumes_after_backoff(db, mon
         state=ProvisioningState.FAILED,
         attempt_count=5,
         last_error="Failed to connect",
-        last_attempt_at=datetime.utcnow() - timedelta(seconds=481),
+        last_attempt_at=datetime.utcnow() - timedelta(seconds=91),
     )
     captured_attempt_ids = []
 
@@ -170,7 +174,7 @@ async def test_pppoe_recent_retry_is_not_replayed_before_backoff(db, monkeypatch
         db,
         connection_type=ConnectionType.PPPOE,
         attempt_count=5,
-        last_attempt_at=datetime.utcnow() - timedelta(seconds=479),
+        last_attempt_at=datetime.utcnow() - timedelta(seconds=89),
     )
     calls = []
 
@@ -193,7 +197,7 @@ async def test_pppoe_legacy_connectivity_failure_resumes_after_backoff(db, monke
         state=ProvisioningState.FAILED,
         attempt_count=5,
         last_error="Connection timed out",
-        last_attempt_at=datetime.utcnow() - timedelta(seconds=481),
+        last_attempt_at=datetime.utcnow() - timedelta(seconds=91),
     )
     calls = []
 
