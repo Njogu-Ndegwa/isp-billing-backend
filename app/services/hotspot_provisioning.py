@@ -27,6 +27,11 @@ from app.db.models import (
     RouterAuthMethod,
 )
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.provisioning_retry_policy import (
+    PAID_PROVISIONING_RETRY_MAX_ATTEMPTS,
+    retry_due_clause,
+    retryable_connectivity_error_clause,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +39,7 @@ HOTSPOT_PROVISIONING_TIMEOUT_SECONDS = 75
 HOTSPOT_RETRY_STALE_IN_PROGRESS_SECONDS = 90
 HOTSPOT_RETRY_BATCH_SIZE = 25
 HOTSPOT_RETRY_MAX_CONCURRENT_ROUTER_GROUPS = 4
-HOTSPOT_RETRY_MAX_ATTEMPTS = 5
+HOTSPOT_RETRY_MAX_ATTEMPTS = PAID_PROVISIONING_RETRY_MAX_ATTEMPTS
 HOTSPOT_RETRY_MAX_AGE = timedelta(hours=4)
 HOTSPOT_VERIFY_REFRESH_WINDOW = timedelta(minutes=15)
 HOTSPOT_RECENT_DELIVERY_WINDOW = timedelta(minutes=30)
@@ -901,9 +906,10 @@ async def retry_pending_hotspot_provisioning_background():
 
     Rules:
     - scheduled or stale in_progress older than 90s: full provisioning
-    - retry_pending while attempts < 5 and age < 4h: full provisioning
+    - retry_pending while attempts < 14 and age < 4h: backoff-spaced provisioning
+    - legacy failed connectivity attempts below the new limit: resume with backoff
     - router_updated with online_state != online within 15m: verify-only refresh
-    - after 5 attempts or 4h age: mark failed
+    - after 14 attempts or 4h age: mark failed
 
     Safety net:
     - recent completed DIRECT_API hotspot M-Pesa transactions with no attempt
@@ -974,6 +980,22 @@ async def retry_pending_hotspot_provisioning_background():
                                 ProvisioningAttempt.provisioning_state == ProvisioningState.RETRY_PENDING,
                                 ProvisioningAttempt.attempt_count < HOTSPOT_RETRY_MAX_ATTEMPTS,
                                 ProvisioningAttempt.created_at > expiry_cutoff,
+                                retry_due_clause(
+                                    ProvisioningAttempt,
+                                    now,
+                                    max_attempts=HOTSPOT_RETRY_MAX_ATTEMPTS,
+                                ),
+                            ),
+                            and_(
+                                ProvisioningAttempt.provisioning_state == ProvisioningState.FAILED,
+                                ProvisioningAttempt.attempt_count < HOTSPOT_RETRY_MAX_ATTEMPTS,
+                                ProvisioningAttempt.created_at > expiry_cutoff,
+                                retryable_connectivity_error_clause(ProvisioningAttempt),
+                                retry_due_clause(
+                                    ProvisioningAttempt,
+                                    now,
+                                    max_attempts=HOTSPOT_RETRY_MAX_ATTEMPTS,
+                                ),
                             ),
                             and_(
                                 ProvisioningAttempt.provisioning_state == ProvisioningState.ROUTER_UPDATED,

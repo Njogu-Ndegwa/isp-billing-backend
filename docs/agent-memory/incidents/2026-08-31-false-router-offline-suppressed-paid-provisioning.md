@@ -41,3 +41,31 @@ Router availability was stored as one shared `last_status` value per router. Adv
 - Produce a read-only reconciliation preview for failed, active, unexpired paid attempts and compare each candidate against the current router user list.
 - After approval, requeue or repair only confirmed missing users; do not charge customers again.
 - Continue the existing work toward a durable router-command outbox so genuine long outages can recover after the current retry window.
+
+## Post-Deployment Retry Observation
+
+The first hour of the production watch found a second reliability gap after the
+status fix itself was deployed. A completed hotspot payment on router 293 reached
+the direct API five times between 19:03:59 and 19:12:19 UTC. The management path
+accepted a diagnostic connection but stalled during reads, and the fifth failed
+attempt became terminal. Five attempts had therefore exhausted in about eight
+minutes even though the configured retry window was four hours.
+
+The follow-up candidate on `fix/paid-retry-resilience`:
+
+- shares one retry policy between hotspot and PPPoE;
+- raises the bounded ceiling to 14 attempts while retaining the four-hour limit;
+- preserves the immediate payment-triggered attempt, then keeps the first five
+  retries eligible on consecutive existing worker ticks (97s hotspot / 113s PPPoE)
+  before moving to a bounded slow tail capped at 40-minute delays;
+- resumes legacy terminal attempts below the new ceiling only when their error is
+  transport-shaped (`connect`, `timeout`, or `unreachable`), leaving deterministic
+  RouterOS configuration failures terminal;
+- keeps the existing batch limits, per-router serialization/concurrency caps, and
+  60% DB-pool shedding threshold unchanged, so the rapid paid-user lane adds no
+  scheduler scans, worker concurrency, or DB-pool pressure.
+
+Verification after the rapid-first adjustment: the focused provisioning/status
+selection passed (39 tests), the session-discipline gate passed, and the full
+local suite passed (1,047 tests). Production deployment and automatic
+legacy-attempt recovery remain pending explicit approval.
