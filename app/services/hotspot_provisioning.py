@@ -785,6 +785,7 @@ async def provision_hotspot_customer(
     pull_identity = None
     pull_rsc = None
     pull_key = None
+    pull_handed_off = False
     if router_id and not verify_only:
         offline = False
         try:
@@ -830,25 +831,17 @@ async def provision_hotspot_customer(
             if offline and pull_identity and pull_rsc:
                 from app.services.pull_provisioning import handoff_to_pull_service
                 handoff = await handoff_to_pull_service(pull_identity, pull_key, pull_rsc)
+                pull_handed_off = True
                 logger.info(
                     "[PROVISION] pull-channel queued for offline router %s customer %s: %s",
                     pull_identity, customer_id, handoff,
                 )
             if offline:
                 logger.warning(
-                    "[PROVISION] Skipping push for customer %s — router %s is known offline",
-                    customer_id, router_ip,
-                )
-                result = {
-                    "success": False,
-                    "error": f"Router {router_ip} is known offline, will retry",
-                }
-                return await _persist_provisioning_result(
-                    result=result, verify_only=False,
-                    customer_id=customer_id, router_id=router_id,
-                    router_ip=router_ip, mac_address=mac_address,
-                    action=action, attempt_id=attempt_id,
-                    hotspot_payload=hotspot_payload,
+                    "[PROVISION] Router %s has a recent offline status; attempting direct "
+                    "delivery for paid customer %s anyway",
+                    router_ip,
+                    customer_id,
                 )
         except Exception:
             pass
@@ -865,7 +858,7 @@ async def provision_hotspot_customer(
 
     # Pull-channel fallback: the status looked online but the push failed (a flapping
     # router). Queue the render for the router to fetch on its next outbound check-in.
-    if pull_identity and pull_rsc and not result.get("success"):
+    if pull_identity and pull_rsc and not pull_handed_off and not result.get("success"):
         try:
             from app.services.pull_provisioning import handoff_to_pull_service
             handoff = await handoff_to_pull_service(pull_identity, pull_key, pull_rsc)

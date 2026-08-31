@@ -492,6 +492,32 @@ async def test_activate_pppoe_customer_tracks_failed_router_provision_for_retry(
     assert "remote-address" in attempt.last_error
 
 
+async def test_false_offline_status_does_not_suppress_pppoe_delivery(db, monkeypatch):
+    _, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+    router.last_status = False
+    router.last_checked_at = datetime.utcnow()
+    await db.commit()
+    calls = []
+
+    async def fake_provision(payload):
+        calls.append(payload)
+        return {"success": True, "profile": "pppoe_5M_5M"}
+
+    monkeypatch.setattr(pppoe_provisioning, "call_pppoe_provision", fake_provision)
+
+    result = await pppoe_provisioning.provision_pppoe_customer(
+        customer_id=customer.id,
+        router_id=router.id,
+        pppoe_payload={
+            "router_ip": router.ip_address,
+            "pppoe_username": customer.pppoe_username,
+        },
+    )
+
+    assert result["success"] is True
+    assert len(calls) == 1
+
+
 async def test_retry_pending_pppoe_provisioning_replays_active_customer_attempt(db, monkeypatch):
     reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
 

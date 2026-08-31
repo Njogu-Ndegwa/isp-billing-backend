@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import database
@@ -15,6 +15,14 @@ from app.services.router_status_alerts import (
 ROUTER_OFFLINE_SKIP_PERIOD = timedelta(minutes=30)
 ROUTER_STATUS_STALE_AFTER_SECONDS = 600
 ROUTER_AVAILABILITY_RETENTION_DAYS = 30
+ROUTER_OFFLINE_CONFIRMATION_WINDOW = timedelta(minutes=5)
+
+# These jobs only emit an availability row when their RouterOS connection
+# fails.  A successful run emits no matching positive row, so allowing one of
+# these failure-only samples to own the shared router summary creates a strong
+# false-offline bias.  Keep the sample for diagnostics/uptime analysis, but do
+# not let it suppress customer-facing work.
+ADVISORY_OFFLINE_SOURCES = frozenset({"expired_cleanup"})
 
 
 def router_recently_offline(
@@ -77,6 +85,8 @@ async def record_router_availability(
     is_online: bool,
     source: str,
     checked_at: Optional[datetime] = None,
+    *,
+    confirm_offline: bool = False,
 ) -> None:
     """Persist a single availability check and update the router summary columns.
 
@@ -103,20 +113,55 @@ async def record_router_availability(
         if not router:
             return
 
-        if is_online:
+        # Historical telemetry accepts every observation.  The shared summary
+        # is deliberately stricter: it must never move backwards in time, weak
+        # failure-only jobs cannot declare an outage, and an ordinary negative
+        # sample needs a second recent negative with no intervening success.
+        summary_is_current = (
+            router.last_checked_at is None or checked_at >= router.last_checked_at
+        )
+        update_summary = summary_is_current and is_online
+
+        if summary_is_current and not is_online and source not in ADVISORY_OFFLINE_SOURCES:
+            if confirm_offline:
+                update_summary = True
+            else:
+                confirmation_cutoff = checked_at - ROUTER_OFFLINE_CONFIRMATION_WINDOW
+                previous_signal = (
+                    await adb.execute(
+                        select(RouterAvailabilityCheck)
+                        .where(
+                            RouterAvailabilityCheck.router_id == router_id,
+                            RouterAvailabilityCheck.checked_at >= confirmation_cutoff,
+                            RouterAvailabilityCheck.checked_at <= checked_at,
+                            RouterAvailabilityCheck.source.notin_(ADVISORY_OFFLINE_SOURCES),
+                        )
+                        .order_by(
+                            RouterAvailabilityCheck.checked_at.desc(),
+                            RouterAvailabilityCheck.id.desc(),
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                update_summary = bool(previous_signal and not previous_signal.is_online)
+
+        if update_summary and is_online:
             # Capture the offline->online transition BEFORE overwriting the
             # summary columns; the message itself is sent after this commit.
             notify_transition = should_consider_recovery_notification(router, checked_at)
             if notify_transition:
                 offline_since = router.last_online_at
 
-        router.last_status = is_online
-        router.last_checked_at = checked_at
-        router.last_status_source = source
+        if update_summary:
+            router.last_status = is_online
+            router.last_checked_at = checked_at
+            router.last_status_source = source
+
         router.availability_checks = int(router.availability_checks or 0) + 1
         if is_online:
-            router.last_online_at = checked_at
             router.availability_successes = int(router.availability_successes or 0) + 1
+            if router.last_online_at is None or checked_at >= router.last_online_at:
+                router.last_online_at = checked_at
 
         adb.add(
             RouterAvailabilityCheck(

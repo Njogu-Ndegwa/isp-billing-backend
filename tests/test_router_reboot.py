@@ -84,6 +84,10 @@ async def test_reboot_router_runs_guarded_router_command(db, monkeypatch):
         },
     }]
 
+    await db.refresh(router)
+    assert router.last_status is False
+    assert router.last_status_source == "router_reboot"
+
 
 @pytest.mark.asyncio
 async def test_reboot_router_connect_failure_returns_503(db, monkeypatch):
