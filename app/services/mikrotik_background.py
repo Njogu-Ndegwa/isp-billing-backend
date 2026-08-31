@@ -1246,6 +1246,7 @@ async def cleanup_expired_users_background():
             router_pppoe_map = {}
             no_router_customers = []
             offline_skipped = []
+            agent_cleanup_items: dict[int, dict] = {}
             batch_deferred = []
             directly_deactivated_ids: set[int] = set()
             scheduled_router_cleanup_count = 0
@@ -1275,6 +1276,12 @@ async def cleanup_expired_users_background():
                         c.status = CustomerStatus.INACTIVE
                         directly_deactivated_ids.add(c.id)
                         continue
+                    agent_cleanup_items[c.id] = {
+                        "kind": "pppoe",
+                        "router_id": c.router.id,
+                        "customer_id": c.id,
+                        "username": c.pppoe_username,
+                    }
                     if _router_recently_offline(c.router, now):
                         offline_skipped.append(c.id)
                         continue
@@ -1302,6 +1309,15 @@ async def cleanup_expired_users_background():
                     c.status = CustomerStatus.INACTIVE
                     directly_deactivated_ids.add(c.id)
                     continue
+                if c.router:
+                    agent_cleanup_items[c.id] = {
+                        "kind": "hotspot",
+                        "router_id": c.router.id,
+                        "customer_id": c.id,
+                        "mac_address": c.mac_address,
+                        "username": normalize_mac_address(c.mac_address).replace(":", ""),
+                        "lb_enabled": bool(getattr(c.router, "lb_enabled", False)),
+                    }
                 if c.router and _router_recently_offline(c.router, now):
                     offline_skipped.append(c.id)
                     continue
@@ -1422,9 +1438,55 @@ async def cleanup_expired_users_background():
                 [r["id"] for r in pppoe_results["failed"]]
             )
 
+            # If direct cleanup could not reach/clean a router, leave the DB row
+            # ACTIVE until the outbound agent verifies removal and acknowledges
+            # it. Commands are generation-keyed, so a later renewal cancels an
+            # old same-router removal instead of taking paid access away.
+            agent_cleanup_ids = set(offline_skipped) | all_failed_ids
+            if agent_cleanup_ids:
+                from app.services.router_agent_commands import (
+                    queue_hotspot_remove_command,
+                    queue_pppoe_remove_command,
+                )
+
+                queued_agent_cleanups = 0
+                for customer_id in sorted(agent_cleanup_ids):
+                    item = agent_cleanup_items.get(customer_id)
+                    if not item:
+                        continue
+                    try:
+                        if item["kind"] == "pppoe":
+                            command_id = await queue_pppoe_remove_command(
+                                router_id=item["router_id"],
+                                customer_id=item["customer_id"],
+                                username=item["username"],
+                            )
+                        else:
+                            command_id = await queue_hotspot_remove_command(
+                                router_id=item["router_id"],
+                                customer_id=item["customer_id"],
+                                mac_address=item["mac_address"],
+                                username=item["username"],
+                                lb_enabled=item["lb_enabled"],
+                            )
+                        if command_id is not None:
+                            queued_agent_cleanups += 1
+                    except Exception as agent_cleanup_exc:
+                        logger.warning(
+                            "[CRON] Could not queue router-agent cleanup for customer %s: %s",
+                            customer_id,
+                            agent_cleanup_exc,
+                        )
+                if queued_agent_cleanups:
+                    logger.warning(
+                        "[CRON] Queued %d verified router-agent cleanup command(s)",
+                        queued_agent_cleanups,
+                    )
+
             now_after_cleanup = datetime.utcnow()
             post_cleanup_deactivated_count = 0
             skipped_repaid_count = 0
+            hotspot_renewal_repairs: list[tuple[int, int, dict]] = []
             newly_deactivated_ids = set(directly_deactivated_ids)
             for router_id in offline_router_ids:
                 try:
@@ -1450,6 +1512,26 @@ async def cleanup_expired_users_background():
                             "(expiry=%s > now=%s), skipping deactivation",
                             customer.id, customer.expiry, now_after_cleanup,
                         )
+                        if (
+                            customer.id not in pppoe_successful_ids
+                            and customer.router
+                            and customer.plan
+                            and customer.mac_address
+                        ):
+                            from app.services.hotspot_provisioning import build_hotspot_payload
+
+                            hotspot_renewal_repairs.append(
+                                (
+                                    customer.id,
+                                    customer.router.id,
+                                    build_hotspot_payload(
+                                        customer,
+                                        customer.plan,
+                                        customer.router,
+                                        f"CID:{customer.id}|expiry-race-repair",
+                                    ),
+                                )
+                            )
                         skipped_repaid_count += 1
                         continue
                     if customer.status != CustomerStatus.INACTIVE:
@@ -1465,6 +1547,40 @@ async def cleanup_expired_users_background():
                             ))
                         newly_deactivated_ids.add(customer.id)
             await db.commit()
+
+            # A payment can land after the last pre-cleanup DB recheck but
+            # before RouterOS removal completes. The row correctly stays ACTIVE,
+            # and this immediately restores the entitlement that was physically
+            # removed. The durable agent command remains available if the tunnel
+            # drops again during this repair.
+            if hotspot_renewal_repairs:
+                from app.services.hotspot_provisioning import provision_hotspot_customer
+
+                repair_results = await asyncio.gather(
+                    *[
+                        provision_hotspot_customer(
+                            customer_id=customer_id,
+                            router_id=router_id,
+                            hotspot_payload=payload,
+                            action="expiry_race_repair",
+                        )
+                        for customer_id, router_id, payload in hotspot_renewal_repairs
+                    ],
+                    return_exceptions=True,
+                )
+                failed_repairs = sum(
+                    1
+                    for result in repair_results
+                    if isinstance(result, Exception)
+                    or not (isinstance(result, dict) and result.get("success"))
+                )
+                if failed_repairs:
+                    logger.error(
+                        "[CRON] Immediate hotspot renewal repair failed for %d/%d customer(s); "
+                        "router-agent/direct retry remains queued",
+                        failed_repairs,
+                        len(hotspot_renewal_repairs),
+                    )
 
             # Expiry SMS is deliberately downstream of successful enforcement
             # and the INACTIVE commit. It uses its own short DB sessions and

@@ -27,6 +27,19 @@ async def _require_admin(token: str, db: AsyncSession) -> User:
     return user
 
 
+@router.get("/api/admin/router-agent/metrics")
+async def admin_router_agent_metrics(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Return process-local command-agent load and delivery latency counters."""
+
+    await _require_admin(token, db)
+    from app.api.router_agent_routes import router_agent_metrics_snapshot
+
+    return router_agent_metrics_snapshot()
+
+
 @router.get("/api/admin/db-pool")
 async def admin_db_pool_status(
     include_activity: bool = Query(

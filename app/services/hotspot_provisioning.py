@@ -10,7 +10,7 @@ from sqlalchemy import and_, or_, select, text
 
 from app.config import settings
 from app.db.database import async_session, db_pool_snapshot
-from app.services.router_availability import derive_router_status, record_router_availability
+from app.services.router_availability import record_router_availability
 from app.db.models import (
     ConnectionType,
     Customer,
@@ -27,6 +27,11 @@ from app.db.models import (
     RouterAuthMethod,
 )
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.provisioning_retry_policy import (
+    PAID_PROVISIONING_RETRY_MAX_ATTEMPTS,
+    retry_due_clause,
+    retryable_connectivity_error_clause,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +39,7 @@ HOTSPOT_PROVISIONING_TIMEOUT_SECONDS = 75
 HOTSPOT_RETRY_STALE_IN_PROGRESS_SECONDS = 90
 HOTSPOT_RETRY_BATCH_SIZE = 25
 HOTSPOT_RETRY_MAX_CONCURRENT_ROUTER_GROUPS = 4
-HOTSPOT_RETRY_MAX_ATTEMPTS = 5
+HOTSPOT_RETRY_MAX_ATTEMPTS = PAID_PROVISIONING_RETRY_MAX_ATTEMPTS
 HOTSPOT_RETRY_MAX_AGE = timedelta(hours=4)
 HOTSPOT_VERIFY_REFRESH_WINDOW = timedelta(minutes=15)
 HOTSPOT_RECENT_DELIVERY_WINDOW = timedelta(minutes=30)
@@ -778,73 +783,28 @@ async def provision_hotspot_customer(
                     attempt.updated_at = now
                 await db.commit()
 
-    # Pull-channel prep (opt-in routers only): render a fetchable provisioning script
-    # so a paid user can be delivered over the router's outbound check-in when we can't
-    # push over the tunnel. Rendering is CPU-only (safe in-session); the network handoff
-    # happens AFTER the session is released (Database Session Discipline).
-    pull_identity = None
-    pull_rsc = None
-    pull_key = None
-    pull_handed_off = False
+    # Create the durable command BEFORE network I/O. Direct tunnel push remains
+    # the immediate fast path; if it fails or this process dies mid-call, the
+    # outbound agent can still fetch the same idempotent entitlement.
+    agent_command_id = None
     if router_id and not verify_only:
-        offline = False
         try:
-            async with async_session() as db:
-                router_obj = await db.get(Router, router_id)
-                offline = bool(router_obj and derive_router_status(router_obj) == "offline")
-                if (router_obj and getattr(router_obj, "pull_channel_enabled", False)
-                        and router_obj.identity):
-                    try:
-                        import calendar
-                        from app.services.mikrotik_api import parse_speed_to_mikrotik
-                        from app.services.pull_provisioning import render_hotspot_provision_rsc
-                        # Bound the pull command to the customer's paid window so it can
-                        # never keep re-granting access after expiry (the free-internet
-                        # bug). Skip the handoff entirely for an already-expired customer.
-                        cust = await db.get(Customer, customer_id)
-                        cust_expiry = getattr(cust, "expiry", None)
-                        expires_ts = (calendar.timegm(cust_expiry.utctimetuple())
-                                      if cust_expiry else None)
-                        if cust_expiry is not None and cust_expiry <= now:
-                            logger.info(
-                                "[PROVISION] pull-channel skipped — customer %s already expired",
-                                customer_id,
-                            )
-                        else:
-                            pull_rsc = render_hotspot_provision_rsc(
-                                username=hotspot_payload.get("username"),
-                                password=hotspot_payload.get("password"),
-                                mac_address=hotspot_payload.get("mac_address"),
-                                rate_limit=parse_speed_to_mikrotik(hotspot_payload.get("bandwidth_limit")),
-                                time_limit=hotspot_payload.get("time_limit"),
-                                comment=hotspot_payload.get("comment", ""),
-                                expires_at=expires_ts,
-                            )
-                            pull_identity = router_obj.identity
-                            pull_key = hotspot_payload.get("username") or f"cust{customer_id}"
-                    except Exception as render_exc:
-                        logger.warning(
-                            "[PROVISION] pull-channel render skipped for customer %s: %s",
-                            customer_id, render_exc,
-                        )
-            # ---- network handoff OUTSIDE the DB session ----
-            if offline and pull_identity and pull_rsc:
-                from app.services.pull_provisioning import handoff_to_pull_service
-                handoff = await handoff_to_pull_service(pull_identity, pull_key, pull_rsc)
-                pull_handed_off = True
-                logger.info(
-                    "[PROVISION] pull-channel queued for offline router %s customer %s: %s",
-                    pull_identity, customer_id, handoff,
-                )
-            if offline:
-                logger.warning(
-                    "[PROVISION] Router %s has a recent offline status; attempting direct "
-                    "delivery for paid customer %s anyway",
-                    router_ip,
-                    customer_id,
-                )
-        except Exception:
-            pass
+            from app.services.router_agent_commands import queue_hotspot_provision_command
+
+            agent_command_id = await queue_hotspot_provision_command(
+                router_id=router_id,
+                customer_id=customer_id,
+                attempt_id=attempt_id,
+                hotspot_payload=hotspot_payload,
+            )
+        except Exception as command_exc:
+            # Agent fallback is defence-in-depth; never suppress the immediate
+            # paid delivery path because command rendering/queueing failed.
+            logger.warning(
+                "[PROVISION] Router-agent command skipped for customer %s: %s",
+                customer_id,
+                command_exc,
+            )
 
     try:
         result = await _run_mikrotik_operation(hotspot_payload, verify_only=verify_only)
@@ -856,29 +816,19 @@ async def provision_hotspot_customer(
     except Exception as exc:
         result = {"success": False, "error": str(exc)}
 
-    # Pull-channel fallback: the status looked online but the push failed (a flapping
-    # router). Queue the render for the router to fetch on its next outbound check-in.
-    if pull_identity and pull_rsc and not pull_handed_off and not result.get("success"):
+    # Whichever delivery path wins closes the same command. If the agent already
+    # acknowledged it, this is an idempotent no-op.
+    if agent_command_id is not None and result.get("success"):
         try:
-            from app.services.pull_provisioning import handoff_to_pull_service
-            handoff = await handoff_to_pull_service(pull_identity, pull_key, pull_rsc)
-            logger.info(
-                "[PROVISION] pull-channel queued after push failure for router %s customer %s: %s",
-                pull_identity, customer_id, handoff,
-            )
-        except Exception:
-            pass
+            from app.services.router_agent_commands import complete_command_from_push
 
-    # Delivered over the tunnel: clear any pending pull command so a later outbound
-    # fetch can't re-apply it. Belt-and-suspenders with the expiry bound — together
-    # they guarantee a command never re-grants access after the customer is served or
-    # their plan ends.
-    if pull_identity and pull_key and result.get("success"):
-        try:
-            from app.services.pull_provisioning import clear_pull_service
-            await clear_pull_service(pull_identity, pull_key)
-        except Exception:
-            pass
+            await complete_command_from_push(agent_command_id)
+        except Exception as command_exc:
+            logger.warning(
+                "[PROVISION] Could not close router-agent command %s after direct push: %s",
+                agent_command_id,
+                command_exc,
+            )
 
     try:
         return await _persist_provisioning_result(
@@ -956,9 +906,10 @@ async def retry_pending_hotspot_provisioning_background():
 
     Rules:
     - scheduled or stale in_progress older than 90s: full provisioning
-    - retry_pending while attempts < 5 and age < 4h: full provisioning
+    - retry_pending while attempts < 14 and age < 4h: backoff-spaced provisioning
+    - legacy failed connectivity attempts below the new limit: resume with backoff
     - router_updated with online_state != online within 15m: verify-only refresh
-    - after 5 attempts or 4h age: mark failed
+    - after 14 attempts or 4h age: mark failed
 
     Safety net:
     - recent completed DIRECT_API hotspot M-Pesa transactions with no attempt
@@ -1029,6 +980,22 @@ async def retry_pending_hotspot_provisioning_background():
                                 ProvisioningAttempt.provisioning_state == ProvisioningState.RETRY_PENDING,
                                 ProvisioningAttempt.attempt_count < HOTSPOT_RETRY_MAX_ATTEMPTS,
                                 ProvisioningAttempt.created_at > expiry_cutoff,
+                                retry_due_clause(
+                                    ProvisioningAttempt,
+                                    now,
+                                    max_attempts=HOTSPOT_RETRY_MAX_ATTEMPTS,
+                                ),
+                            ),
+                            and_(
+                                ProvisioningAttempt.provisioning_state == ProvisioningState.FAILED,
+                                ProvisioningAttempt.attempt_count < HOTSPOT_RETRY_MAX_ATTEMPTS,
+                                ProvisioningAttempt.created_at > expiry_cutoff,
+                                retryable_connectivity_error_clause(ProvisioningAttempt),
+                                retry_due_clause(
+                                    ProvisioningAttempt,
+                                    now,
+                                    max_attempts=HOTSPOT_RETRY_MAX_ATTEMPTS,
+                                ),
                             ),
                             and_(
                                 ProvisioningAttempt.provisioning_state == ProvisioningState.ROUTER_UPDATED,

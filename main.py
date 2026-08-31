@@ -56,6 +56,7 @@ from app.api.admin_metrics_routes import router as admin_metrics_router
 from app.api.lead_routes import router as lead_router
 from app.api.usage_routes import router as usage_router
 from app.api.usage_push_routes import router as usage_push_router
+from app.api.router_agent_routes import router as router_agent_router
 from app.api.access_credential_routes import router as access_credential_router
 from app.api.shop_routes import router as shop_router
 from app.api.portal_routes import router as portal_router
@@ -100,6 +101,7 @@ app.include_router(admin_metrics_router)
 app.include_router(lead_router)
 app.include_router(usage_router)
 app.include_router(usage_push_router)
+app.include_router(router_agent_router)
 app.include_router(access_credential_router)
 app.include_router(shop_router)
 app.include_router(portal_router)
@@ -319,7 +321,7 @@ async def run_radius_migrations():
             logger.info("Migration: provisioning_tokens table already exists, skipping")
 
         # --- Provisioning attempts table / provisioning_logs correlation ---
-        from app.db.models import ProvisioningAttempt
+        from app.db.models import ProvisioningAttempt, RouterCommand
         await conn.run_sync(
             lambda c: ProvisioningAttempt.__table__.create(c, checkfirst=True)
         )
@@ -338,6 +340,28 @@ async def run_radius_migrations():
         await conn.execute(sa_text(
             "CREATE INDEX IF NOT EXISTS idx_provisioning_attempts_external_reference "
             "ON provisioning_attempts(external_reference)"
+        ))
+
+        # --- Durable outbound router command agent ---
+        # The table is the source of truth; process-local pending caches are only
+        # an empty-poll optimisation and are rebuilt at startup.
+        await conn.run_sync(
+            lambda c: RouterCommand.__table__.create(c, checkfirst=True)
+        )
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_router_commands_router_state_available "
+            "ON router_commands(router_id, state, available_at)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS idx_router_commands_attempt "
+            "ON router_commands(provisioning_attempt_id)"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE routers "
+            "ADD COLUMN IF NOT EXISTS router_agent_enabled BOOLEAN NOT NULL DEFAULT FALSE, "
+            "ADD COLUMN IF NOT EXISTS agent_last_seen_at TIMESTAMP NULL, "
+            "ADD COLUMN IF NOT EXISTS agent_tunnel_state VARCHAR(20) NULL, "
+            "ADD COLUMN IF NOT EXISTS agent_version VARCHAR(20) NULL"
         ))
 
         result = await conn.execute(sa_text("""
@@ -2360,6 +2384,14 @@ async def startup_event():
         logger.info("RADIUS migrations completed successfully")
     except Exception as e:
         logger.error(f"RADIUS migration failed (non-fatal): {e}")
+
+    try:
+        from app.api.router_agent_routes import warm_router_agent_cache
+
+        await warm_router_agent_cache()
+        logger.info("Router-agent caches warmed successfully")
+    except Exception as e:
+        logger.error(f"Router-agent cache warm failed (non-fatal): {e}")
 
     try:
         await run_monitoring_migrations()

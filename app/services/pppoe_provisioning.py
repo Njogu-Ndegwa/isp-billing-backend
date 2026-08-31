@@ -24,6 +24,11 @@ from app.db.models import (
     RouterAuthMethod,
 )
 from app.services.mikrotik_api import MikroTikAPI
+from app.services.provisioning_retry_policy import (
+    PAID_PROVISIONING_RETRY_MAX_ATTEMPTS,
+    retry_due_clause,
+    retryable_connectivity_error_clause,
+)
 from app.config import settings
 from app.services.router_availability import record_router_availability
 
@@ -31,7 +36,7 @@ logger = logging.getLogger("pppoe_provisioning")
 
 PPPOE_RETRY_STALE_IN_PROGRESS_SECONDS = 90
 PPPOE_RETRY_BATCH_SIZE = 20
-PPPOE_RETRY_MAX_ATTEMPTS = 5
+PPPOE_RETRY_MAX_ATTEMPTS = PAID_PROVISIONING_RETRY_MAX_ATTEMPTS
 PPPOE_RETRY_MAX_AGE = timedelta(hours=4)
 PPPOE_RETRY_DB_BUSY_THRESHOLD_PERCENT = 60
 PPPOE_DEFAULT_LOCAL_ADDRESS = "192.168.89.1"
@@ -424,10 +429,40 @@ async def provision_pppoe_customer(
                 attempt.updated_at = now
                 await db.commit()
 
+    # Persist the agent fallback before RouterOS I/O, then attempt the tunnel
+    # immediately. Both transports close the same idempotent command.
+    agent_command_id = None
+    if router_id:
+        try:
+            from app.services.router_agent_commands import queue_pppoe_provision_command
+
+            agent_command_id = await queue_pppoe_provision_command(
+                router_id=router_id,
+                customer_id=customer_id,
+                attempt_id=attempt_id,
+                pppoe_payload=pppoe_payload,
+            )
+        except Exception as command_exc:
+            logger.warning(
+                "[PPPoE] Router-agent command skipped for customer %s: %s",
+                customer_id,
+                command_exc,
+            )
+
     # A persisted status is advisory telemetry, not permission to discard a
-    # paid activation.  Always make the bounded RouterOS attempt; otherwise one
-    # stale/false offline sample turns a successful payment into a real outage.
+    # paid activation. Always make the bounded RouterOS attempt.
     result = await call_pppoe_provision(pppoe_payload)
+    if agent_command_id is not None and result and result.get("success"):
+        try:
+            from app.services.router_agent_commands import complete_command_from_push
+
+            await complete_command_from_push(agent_command_id)
+        except Exception as command_exc:
+            logger.warning(
+                "[PPPoE] Could not close router-agent command %s after direct push: %s",
+                agent_command_id,
+                command_exc,
+            )
     return await _persist_pppoe_provisioning_result(
         result=result or {"success": False, "error": "PPPoE provisioning returned no result"},
         customer_id=customer_id,
@@ -445,7 +480,8 @@ async def retry_pending_pppoe_provisioning_background():
 
     This repairs the exact drift where a customer is ACTIVE in the DB but the
     MikroTik profile/secret creation failed during activation. It is bounded by
-    batch size, retry count, retry age, DB-pool pressure, and per-router grouping.
+    batch size, backoff-spaced retry count, retry age, DB-pool pressure, and
+    per-router grouping. Legacy five-attempt connectivity failures are resumed.
     """
     try:
         if _retry_db_pool_is_busy():
@@ -519,6 +555,22 @@ async def retry_pending_pppoe_provisioning_background():
                                 ProvisioningAttempt.provisioning_state == ProvisioningState.RETRY_PENDING,
                                 ProvisioningAttempt.attempt_count < PPPOE_RETRY_MAX_ATTEMPTS,
                                 ProvisioningAttempt.created_at > expiry_cutoff,
+                                retry_due_clause(
+                                    ProvisioningAttempt,
+                                    now,
+                                    max_attempts=PPPOE_RETRY_MAX_ATTEMPTS,
+                                ),
+                            ),
+                            and_(
+                                ProvisioningAttempt.provisioning_state == ProvisioningState.FAILED,
+                                ProvisioningAttempt.attempt_count < PPPOE_RETRY_MAX_ATTEMPTS,
+                                ProvisioningAttempt.created_at > expiry_cutoff,
+                                retryable_connectivity_error_clause(ProvisioningAttempt),
+                                retry_due_clause(
+                                    ProvisioningAttempt,
+                                    now,
+                                    max_attempts=PPPOE_RETRY_MAX_ATTEMPTS,
+                                ),
                             ),
                         ),
                     )

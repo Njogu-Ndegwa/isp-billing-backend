@@ -1,11 +1,8 @@
-"""Outbound pull-provisioning channel (opt-in per router).
+"""RouterOS-safe hotspot command rendering plus retired pull-service helpers.
 
-When a paid hotspot user cannot be pushed to a flaky/Starlink-fed router over the
-WireGuard tunnel, the app renders the provisioning as an idempotent RouterOS script
-and hands it to the secondary-server pull service. The router fetches and applies it
-on its next outbound check-in, so the customer gets online even while the tunnel is
-down. The queue + serving live on the secondary server; the old box only makes the
-brief outbound handoff here.
+The main app's durable ``router_commands`` outbox now uses the renderer below.
+The old secondary-server handoff functions remain only for rollback compatibility;
+the paid provisioning path no longer calls them.
 
 SECURITY: the rendered script is executed by the router, so every value that comes
 from customer data is either strictly whitelist-validated (username, MAC, rate,
@@ -61,6 +58,7 @@ def render_hotspot_provision_rsc(
     *, username: str, password: str, mac_address: str,
     rate_limit: str, time_limit: str, comment: str = "",
     expires_at: int | None = None,
+    lb_enabled: bool = False,
 ) -> str:
     """Render an idempotent RouterOS script that provisions one hotspot user exactly
     like ``MikroTikAPI.add_customer_bypass_mode`` (profile -> user -> bypassed
@@ -78,6 +76,18 @@ def render_hotspot_provision_rsc(
     profile = _require("plan_" + rate.replace("/", "_"), _PROFILE_RE, "profile")
     pw = _ros_quote(password)
     cm = _ros_quote(comment)
+    lb_timeout_seconds = 60
+    if lb_enabled:
+        total = 0
+        for amount, unit in re.findall(r"(\d+)([wdhms])", uptime.lower()):
+            total += int(amount) * {
+                "w": 604800,
+                "d": 86400,
+                "h": 3600,
+                "m": 60,
+                "s": 1,
+            }[unit]
+        lb_timeout_seconds = max(60, min(21_000_000, total or 60))
 
     header = []
     if expires_at is not None:
@@ -99,6 +109,62 @@ def render_hotspot_provision_rsc(
         (f':if ([:len [find mac-address="{mac}"]] = 0) do={{ add mac-address="{mac}" '
          f'type=bypassed comment="{cm}" }} else={{ set [find mac-address="{mac}"] '
          f'type=bypassed comment="{cm}" }}'),
+        # Capture the address before removing the unauthorized host entry, then
+        # force an immediate hotspot re-evaluation so a just-paid device does
+        # not remain trapped on the portal until it reconnects.
+        f':local bwClientIp ""',
+        f':local bwHost [/ip hotspot host find mac-address="{mac}"]',
+        ':if ([:len $bwHost] > 0) do={ :set bwClientIp [/ip hotspot host get [:pick $bwHost 0] address] }',
+        f':if ([:len $bwClientIp] = 0) do={{ :local bwLease [/ip dhcp-server lease find mac-address="{mac}"]; '
+        ':if ([:len $bwLease] > 0) do={ :set bwClientIp [/ip dhcp-server lease get [:pick $bwLease 0] active-address]; '
+        ':if ([:len $bwClientIp] = 0) do={ :set bwClientIp [/ip dhcp-server lease get [:pick $bwLease 0] address] } } }',
+        f':do {{ /ip hotspot active remove [find mac-address="{mac}"] }} on-error={{}}',
+        f':do {{ /ip hotspot host remove [find mac-address="{mac}"] }} on-error={{}}',
+        # Bypassed bindings do not reliably inherit hotspot profile limits.
+        # Match the direct path with a per-IP queue plus FastTrack exclusions.
+        f':do {{ /queue simple remove [find name="plan_{user}"] }} on-error={{}}',
+        ':if ([:len $bwClientIp] > 0) do={',
+        f'    /queue simple add name="plan_{user}" target=($bwClientIp . "/32") max-limit="{rate}" '
+        f'comment="MAC:{mac}|Plan rate limit"',
+        '    :local bwFastTrack [/ip firewall filter find chain=forward action=fasttrack-connection disabled=no]',
+        '    :if ([:len $bwFastTrack] > 0) do={',
+        '        :if ([:len [/ip firewall address-list find list="isp_queue_limited_clients" address=$bwClientIp]] = 0) do={',
+        '            /ip firewall address-list add list="isp_queue_limited_clients" address=$bwClientIp comment="Managed by ISP Billing queue sync"',
+        '        }',
+        '        :do { /ip firewall filter remove [find comment="ISP_BILLING_QUEUE_BYPASS_SRC"] } on-error={}',
+        '        :do { /ip firewall filter remove [find comment="ISP_BILLING_QUEUE_BYPASS_DST"] } on-error={}',
+        '        /ip firewall filter add chain=forward action=accept src-address-list="isp_queue_limited_clients" '
+        'comment="ISP_BILLING_QUEUE_BYPASS_SRC" place-before=[:pick $bwFastTrack 0]',
+        '        /ip firewall filter add chain=forward action=accept dst-address-list="isp_queue_limited_clients" '
+        'comment="ISP_BILLING_QUEUE_BYPASS_DST" place-before=[:pick $bwFastTrack 0]',
+        '    }',
+        *(
+            [
+                f'    :do {{ /ip firewall address-list remove [find list="LB_PAID" address=$bwClientIp] }} on-error={{}}',
+                f'    /ip firewall address-list add list="LB_PAID" address=$bwClientIp '
+                f'timeout={lb_timeout_seconds}s comment="PAID:{mac}"',
+            ]
+            if lb_enabled
+            else []
+        ),
+        '}',
+        ':foreach bwQueue in=[/queue simple find] do={',
+        '    :local bwQueueName [/queue simple get $bwQueue name]',
+        '    :if (([:pick $bwQueueName 0 3] = "hs-") or '
+        '(([:pick $bwQueueName 0 4] = "<hs-") and ([:pick $bwQueueName ([:len $bwQueueName] - 1) [:len $bwQueueName]] = ">"))) do={',
+        '        :do { /queue simple remove $bwQueue } on-error={}',
+        '    }',
+        '}',
+        f':if ([:len [/ip hotspot user find name="{user}"]] = 0) do={{ :error "hotspot user missing" }}',
+        f':if ([:len [/ip hotspot ip-binding find mac-address="{mac}" type=bypassed]] = 0) do={{ :error "bypass binding missing" }}',
+        f':if (([:len $bwClientIp] > 0) and ([:len [/queue simple find name="plan_{user}"]] = 0)) do={{ :error "rate queue missing" }}',
+        *(
+            [
+                f':if (([:len $bwClientIp] > 0) and ([:len [/ip firewall address-list find list="LB_PAID" address=$bwClientIp]] = 0)) do={{ :error "LB_PAID missing" }}',
+            ]
+            if lb_enabled
+            else []
+        ),
         "",
     ])
 
