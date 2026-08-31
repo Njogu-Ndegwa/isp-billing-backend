@@ -729,12 +729,22 @@ async def get_portal_data(
     Returns router info, plans, and ads in a single request,
     eliminating the waterfall of sequential API calls.
     """
-    from app.db.models import User, Ad, PortalSettings
+    from app.db.models import (
+        Ad,
+        PortalSettings,
+        ResellerPaymentMethod,
+        ResellerPaymentMethodType,
+        User,
+    )
     from app.api.portal_routes import _build_public_response
 
     stmt = (
-        select(Router, User)
+        select(Router, User, ResellerPaymentMethod.method_type)
         .join(User, Router.user_id == User.id)
+        .outerjoin(
+            ResellerPaymentMethod,
+            ResellerPaymentMethod.id == Router.payment_method_id,
+        )
         .where(func.lower(Router.identity) == identity.lower())
     )
     result = await db.execute(stmt)
@@ -743,7 +753,18 @@ async def get_portal_data(
     if not row:
         raise HTTPException(status_code=404, detail=f"Router with identity '{identity}' not found")
 
-    router_obj, reseller = row
+    router_obj, reseller, assigned_method_type = row
+    assigned_method_value = (
+        assigned_method_type.value
+        if hasattr(assigned_method_type, "value")
+        else assigned_method_type
+    )
+    gateway_by_method = {
+        ResellerPaymentMethodType.FAPSHI.value: "fapshi",
+        ResellerPaymentMethodType.ZENOPAY.value: "zenopay",
+        ResellerPaymentMethodType.MTN_MOMO.value: "mtn_momo",
+    }
+    collection_gateway = gateway_by_method.get(assigned_method_value, "mpesa")
 
     # Both views are scoped to this router: a plan tied to other routers must not
     # appear here, and must not drive this router's plan flags either.
@@ -789,6 +810,7 @@ async def get_portal_data(
             "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API',
             "business_name": reseller.business_name,
             "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
+            "payment_provider": collection_gateway,
             "support_phone": reseller.support_phone,
         },
         "plans": plans,

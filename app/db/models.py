@@ -926,6 +926,7 @@ class ResellerPaymentMethodType(str, enum.Enum):
     MPESA_PAYBILL_WITH_KEYS = "mpesa_paybill_with_keys"
     ZENOPAY = "zenopay"
     MTN_MOMO = "mtn_momo"
+    FAPSHI = "fapshi"
 
 
 class ZenoPayTransactionStatus(str, enum.Enum):
@@ -938,6 +939,14 @@ class MtnMomoTransactionStatus(str, enum.Enum):
     PENDING = "pending"
     SUCCESSFUL = "successful"
     FAILED = "failed"
+
+
+class FapshiTransactionStatus(str, enum.Enum):
+    CREATED = "created"
+    PENDING = "pending"
+    SUCCESSFUL = "successful"
+    FAILED = "failed"
+    EXPIRED = "expired"
 
 
 class ResellerPaymentMethod(Base):
@@ -981,6 +990,11 @@ class ResellerPaymentMethod(Base):
     mtn_target_environment = Column(String(50), nullable=True)  # sandbox | mtnuganda | mtnghana | ...
     mtn_base_url = Column(String(255), nullable=True)  # https://sandbox.momodeveloper.mtn.com or prod host
     mtn_currency = Column(String(10), nullable=True)   # EUR for sandbox, UGX/GHS/... for prod
+
+    # Fapshi (Cameroon Mobile Money / Orange Money)
+    fapshi_api_user = Column(String(100), nullable=True)
+    fapshi_api_key_encrypted = Column(String(500), nullable=True)
+    fapshi_environment = Column(String(20), nullable=True)  # sandbox | live
 
     # M-Pesa C2B Paybill registration. Populated by POST /api/payment-methods/{id}/register-c2b,
     # which calls Daraja's /mpesa/c2b/v1/registerurl with the reseller's own credentials.
@@ -1063,6 +1077,48 @@ class MtnMomoTransaction(Base):
 
     customer = relationship("Customer")
     reseller = relationship("User")
+
+
+class FapshiTransaction(Base):
+    """Tracks a Fapshi Direct Pay collection from initiation to provisioning."""
+    __tablename__ = "fapshi_transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Fapshi assigns trans_id after accepting Direct Pay. external_id is our
+    # pre-generated reconciliation key and exists before the provider call.
+    trans_id = Column(String(100), unique=True, nullable=True, index=True)
+    external_id = Column(String(100), unique=True, nullable=False, index=True)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True)
+    payment_method_id = Column(
+        Integer,
+        ForeignKey("reseller_payment_methods.id"),
+        nullable=False,
+        index=True,
+    )
+
+    amount = Column(DECIMAL(10, 2), nullable=False)
+    phone = Column(String(20), nullable=False)
+    medium = Column(String(50), nullable=True)
+    status = Column(
+        Enum(
+            FapshiTransactionStatus,
+            name="fapshitransactionstatus",
+            values_callable=lambda e: [x.value for x in e],
+        ),
+        nullable=False,
+        default=FapshiTransactionStatus.PENDING,
+    )
+    financial_transaction_id = Column(String(128), nullable=True)
+    failure_reason = Column(String(500), nullable=True)
+    environment = Column(String(20), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    confirmed_at = Column(DateTime, nullable=True)
+
+    customer = relationship("Customer")
+    reseller = relationship("User")
+    payment_method = relationship("ResellerPaymentMethod")
 
 
 class ResellerPayout(Base):

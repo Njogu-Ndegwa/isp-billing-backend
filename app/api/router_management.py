@@ -1768,6 +1768,16 @@ async def get_router_by_identity(
     router_obj, business_name = row
     await db.refresh(router_obj, ["assigned_payment_method"])
     pm = router_obj.assigned_payment_method
+    assigned_method_type = (
+        pm.method_type.value
+        if pm and hasattr(pm.method_type, "value")
+        else (pm.method_type if pm else None)
+    )
+    payment_provider = (
+        assigned_method_type
+        if assigned_method_type in {"fapshi", "zenopay", "mtn_momo"}
+        else "mpesa"
+    )
     return {
         "router_id": router_obj.id,
         "name": router_obj.name,
@@ -1776,6 +1786,7 @@ async def get_router_by_identity(
         "auth_method": getattr(router_obj, 'auth_method', 'DIRECT_API') or 'DIRECT_API',
         "business_name": business_name,
         "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
+        "payment_provider": payment_provider,
         "payment_method_id": router_obj.payment_method_id,
         "assigned_payment_method": {
             "id": pm.id,

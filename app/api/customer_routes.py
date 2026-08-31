@@ -16,7 +16,7 @@ from app.db.models import (
     UserBandwidthUsage, Voucher, CustomerUsagePeriod, UsageCapWatchState,
     ProvisioningAttempt, ProvisioningAttemptEntrypoint,
     ProvisioningAttemptSource, DevicePairing, ReconnectionAttempt,
-    ZenoPayTransaction, MtnMomoTransaction,
+    FapshiTransaction, ZenoPayTransaction, MtnMomoTransaction,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -511,6 +511,7 @@ async def delete_customer(
         await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id == customer_id))
         await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.customer_id == customer_id))
         await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id == customer_id))
+        await db.execute(delete(FapshiTransaction).where(FapshiTransaction.customer_id == customer_id))
 
         # Legacy table — NOT NULL column, table is deprecated, safe to delete
         await db.execute(delete(Payment).where(Payment.customer_id == customer_id))

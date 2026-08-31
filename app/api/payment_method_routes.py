@@ -41,7 +41,7 @@ class PaymentMethodCreate(BaseModel):
         ...,
         description=(
             "bank_account | mpesa_paybill | mpesa_till | mpesa_paybill_with_keys "
-            "| zenopay | mtn_momo"
+            "| zenopay | mtn_momo | fapshi"
         ),
     )
     label: str = Field(..., max_length=100, description="Display name for this method")
@@ -73,6 +73,11 @@ class PaymentMethodCreate(BaseModel):
     mtn_base_url: Optional[str] = None
     mtn_currency: Optional[str] = None  # EUR (sandbox) | UGX | GHS | ...
 
+    # Fapshi (Cameroon)
+    fapshi_api_user: Optional[str] = None
+    fapshi_api_key: Optional[str] = None
+    fapshi_environment: Optional[str] = "sandbox"  # sandbox | live
+
 
 class PaymentMethodUpdate(BaseModel):
     label: Optional[str] = None
@@ -94,6 +99,10 @@ class PaymentMethodUpdate(BaseModel):
     mtn_target_environment: Optional[str] = None
     mtn_base_url: Optional[str] = None
     mtn_currency: Optional[str] = None
+
+    fapshi_api_user: Optional[str] = None
+    fapshi_api_key: Optional[str] = None
+    fapshi_environment: Optional[str] = None
 
 
 class AssignPaymentMethodRequest(BaseModel):
@@ -190,6 +199,25 @@ def _validate_fields(method_type: ResellerPaymentMethodType, data: PaymentMethod
                 detail=f"Missing required fields for MTN MoMo: {', '.join(missing)}",
             )
 
+    elif method_type == ResellerPaymentMethodType.FAPSHI:
+        missing = []
+        if not data.fapshi_api_user:
+            missing.append("fapshi_api_user")
+        if not data.fapshi_api_key:
+            missing.append("fapshi_api_key")
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required fields for Fapshi: {', '.join(missing)}",
+            )
+        environment = (data.fapshi_environment or "sandbox").strip().lower()
+        if environment not in {"sandbox", "live"}:
+            raise HTTPException(
+                status_code=400,
+                detail="fapshi_environment must be 'sandbox' or 'live'",
+            )
+        data.fapshi_environment = environment
+
 
 def _serialize_payment_method(pm: ResellerPaymentMethod) -> dict:
     method_type = pm.method_type
@@ -253,6 +281,14 @@ def _serialize_payment_method(pm: ResellerPaymentMethod) -> dict:
         result["mtn_target_environment"] = pm.mtn_target_environment
         result["mtn_base_url"] = pm.mtn_base_url
         result["mtn_currency"] = pm.mtn_currency
+
+    elif method_type_value == ResellerPaymentMethodType.FAPSHI.value:
+        result["fapshi_api_user"] = pm.fapshi_api_user
+        result["fapshi_api_key"] = mask_credential(
+            decrypt_credential(pm.fapshi_api_key_encrypted)
+            if pm.fapshi_api_key_encrypted else None
+        )
+        result["fapshi_environment"] = pm.fapshi_environment or "sandbox"
 
     return result
 
@@ -320,6 +356,15 @@ async def create_payment_method(
                 else None)
         ),
         mtn_currency=request.mtn_currency,
+        fapshi_api_user=request.fapshi_api_user,
+        fapshi_api_key_encrypted=(
+            encrypt_credential(request.fapshi_api_key)
+            if request.fapshi_api_key else None
+        ),
+        fapshi_environment=(
+            (request.fapshi_environment or "sandbox").strip().lower()
+            if method_type == ResellerPaymentMethodType.FAPSHI else None
+        ),
     )
     db.add(pm)
     await db.commit()
@@ -427,6 +472,19 @@ async def update_payment_method(
         pm.mtn_base_url = request.mtn_base_url
     if request.mtn_currency is not None:
         pm.mtn_currency = request.mtn_currency
+
+    if request.fapshi_api_user is not None:
+        pm.fapshi_api_user = request.fapshi_api_user.strip()
+    if request.fapshi_api_key is not None:
+        pm.fapshi_api_key_encrypted = encrypt_credential(request.fapshi_api_key)
+    if request.fapshi_environment is not None:
+        environment = request.fapshi_environment.strip().lower()
+        if environment not in {"sandbox", "live"}:
+            raise HTTPException(
+                status_code=400,
+                detail="fapshi_environment must be 'sandbox' or 'live'",
+            )
+        pm.fapshi_environment = environment
 
     await db.commit()
     await db.refresh(pm)
@@ -541,6 +599,33 @@ async def test_payment_method(
             if "401" in error_msg or "Unauthorized" in error_msg:
                 return {"status": "failed", "message": "MTN MoMo credentials are invalid"}
             return {"status": "failed", "message": f"MTN MoMo credential test failed: {error_msg}"}
+
+    elif method_type == ResellerPaymentMethodType.FAPSHI:
+        from app.services.fapshi import FapshiAPIError, get_service_balance
+
+        try:
+            api_key = decrypt_credential(pm.fapshi_api_key_encrypted)
+            api_user = pm.fapshi_api_user
+            environment = pm.fapshi_environment or "sandbox"
+            # Release the request's DB connection before provider I/O.
+            await db.commit()
+            balance = await get_service_balance(
+                api_user=api_user,
+                api_key=api_key,
+                environment=environment,
+            )
+            currency = balance.get("currency") or "XAF"
+            service = balance.get("service") or "Fapshi service"
+            return {
+                "status": "success",
+                "message": f"Fapshi credentials are valid for {service} ({currency})",
+            }
+        except FapshiAPIError as e:
+            if e.status_code in {401, 403}:
+                return {"status": "failed", "message": "Fapshi credentials are invalid"}
+            return {"status": "failed", "message": f"Fapshi credential test failed: {e}"}
+        except Exception as e:
+            return {"status": "failed", "message": f"Fapshi credential test failed: {e}"}
 
     elif method_type in (
         ResellerPaymentMethodType.MPESA_PAYBILL,
