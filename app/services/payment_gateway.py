@@ -10,7 +10,7 @@ import base64
 import hashlib
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -22,6 +22,8 @@ from app.config import settings
 from app.db.models import (
     CollectionMode,
     Customer,
+    FapshiTransaction,
+    FapshiTransactionStatus,
     MpesaTransaction,
     MpesaTransactionStatus,
     MtnMomoTransaction,
@@ -160,6 +162,11 @@ async def initiate_customer_payment(
 
     if method_type == ResellerPaymentMethodType.MTN_MOMO:
         return await _initiate_mtn_momo(
+            db, payment_method, customer, phone, amount, reference, plan_name,
+        )
+
+    if method_type == ResellerPaymentMethodType.FAPSHI:
+        return await _initiate_fapshi(
             db, payment_method, customer, phone, amount, reference, plan_name,
         )
 
@@ -433,4 +440,121 @@ async def _initiate_mtn_momo(
         "collection_mode": CollectionMode.DIRECT,
         "reference_id": reference_id,
         "callback_url": callback_url,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fapshi (Cameroon Mobile Money / Orange Money)
+# ---------------------------------------------------------------------------
+
+async def _initiate_fapshi(
+    db: AsyncSession,
+    pm: ResellerPaymentMethod,
+    customer: Customer,
+    phone: str,
+    amount: float,
+    reference: str,
+    plan_name: str = "",
+) -> dict:
+    from app.services.fapshi import (
+        initiate_direct_payment,
+        normalize_cameroon_phone,
+        normalize_environment,
+        normalize_xaf_amount,
+    )
+
+    missing = []
+    if not pm.fapshi_api_user:
+        missing.append("fapshi_api_user")
+    if not pm.fapshi_api_key_encrypted:
+        missing.append("fapshi_api_key")
+    if missing:
+        raise ValueError(
+            f"Fapshi payment method is missing required fields: {', '.join(missing)}"
+        )
+
+    api_user = pm.fapshi_api_user
+    api_key = decrypt_credential(pm.fapshi_api_key_encrypted)
+    environment = normalize_environment(pm.fapshi_environment)
+    phone_local = normalize_cameroon_phone(phone)
+    amount_xaf = normalize_xaf_amount(amount)
+
+    # A double tap must not create a second phone prompt. Reuse a recent
+    # provider transaction for this customer, just like the M-Pesa guard.
+    recent_cutoff = datetime.utcnow() - timedelta(minutes=5)
+    existing = (
+        await db.execute(
+            select(FapshiTransaction)
+            .where(
+                FapshiTransaction.customer_id == customer.id,
+                FapshiTransaction.status.in_([
+                    FapshiTransactionStatus.CREATED,
+                    FapshiTransactionStatus.PENDING,
+                ]),
+                FapshiTransaction.created_at >= recent_cutoff,
+            )
+            .order_by(FapshiTransaction.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing:
+        if not existing.trans_id:
+            raise ValueError("A Fapshi payment is already being initiated. Please wait.")
+        return {
+            "gateway": "fapshi",
+            "collection_mode": CollectionMode.DIRECT,
+            "trans_id": existing.trans_id,
+            "external_id": existing.external_id,
+            "environment": existing.environment,
+            "reused": True,
+        }
+
+    external_id = f"BW-{uuid.uuid4().hex}"
+
+    # Persist first so a very fast webhook can correlate via externalId. This
+    # also releases the request's DB connection before the provider call.
+    txn = FapshiTransaction(
+        external_id=external_id,
+        reseller_id=pm.user_id,
+        customer_id=customer.id,
+        payment_method_id=pm.id,
+        amount=amount_xaf,
+        phone=phone_local,
+        status=FapshiTransactionStatus.PENDING,
+        environment=environment,
+    )
+    db.add(txn)
+    await db.commit()
+
+    try:
+        result = await initiate_direct_payment(
+            api_user=api_user,
+            api_key=api_key,
+            environment=environment,
+            amount=amount_xaf,
+            phone=phone_local,
+            name=customer.name,
+            user_id=f"customer-{customer.id}",
+            external_id=external_id,
+            message=(f"Internet package: {plan_name}" if plan_name else reference),
+        )
+    except Exception:
+        # No provider transaction was accepted. Remove the provisional local
+        # row; the caller restores the customer's pre-attempt state.
+        await db.delete(txn)
+        await db.commit()
+        raise
+
+    # Reload in case a sandbox/fast webhook already updated the row by
+    # externalId while Direct Pay was returning. Only attach the provider ID.
+    await db.refresh(txn)
+    txn.trans_id = result["transId"]
+    await db.commit()
+
+    return {
+        "gateway": "fapshi",
+        "collection_mode": CollectionMode.DIRECT,
+        "trans_id": result["transId"],
+        "external_id": external_id,
+        "environment": environment,
     }

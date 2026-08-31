@@ -46,6 +46,7 @@ from app.api.payment_method_routes import router as payment_method_router
 from app.api.c2b_routes import router as c2b_router
 from app.api.zenopay_routes import router as zenopay_router
 from app.api.mtn_momo_routes import router as mtn_momo_router
+from app.api.fapshi_routes import router as fapshi_router
 from app.api.admin_reseller_routes import router as admin_reseller_router
 from app.api.profile_routes import router as profile_router
 from app.api.b2b_routes import router as b2b_router
@@ -89,6 +90,7 @@ app.include_router(payment_method_router)
 app.include_router(c2b_router)
 app.include_router(zenopay_router)
 app.include_router(mtn_momo_router)
+app.include_router(fapshi_router)
 app.include_router(admin_reseller_router)
 app.include_router(profile_router)
 app.include_router(b2b_router)
@@ -643,10 +645,18 @@ async def run_payment_method_migrations():
             "EXCEPTION WHEN duplicate_object THEN NULL; "
             "END $$"
         ))
+        await conn.execute(sa_text(
+            "DO $$ BEGIN "
+            "CREATE TYPE fapshitransactionstatus AS ENUM "
+            "('created', 'pending', 'successful', 'failed', 'expired'); "
+            "EXCEPTION WHEN duplicate_object THEN NULL; "
+            "END $$"
+        ))
 
         # Create tables via ORM (checkfirst=True is safe to repeat)
         from app.db.models import (
-            ResellerPaymentMethod, ZenoPayTransaction, ResellerPayout,
+            FapshiTransaction, ResellerPaymentMethod, ZenoPayTransaction,
+            ResellerPayout,
         )
         await conn.run_sync(
             lambda c: ResellerPaymentMethod.__table__.create(c, checkfirst=True)
@@ -656,6 +666,9 @@ async def run_payment_method_migrations():
         )
         await conn.run_sync(
             lambda c: ResellerPayout.__table__.create(c, checkfirst=True)
+        )
+        await conn.run_sync(
+            lambda c: FapshiTransaction.__table__.create(c, checkfirst=True)
         )
 
         # Buy Goods till payouts (2026-07-21): the pre-existing enum type
@@ -668,6 +681,19 @@ async def run_payment_method_migrations():
         await conn.execute(sa_text(
             "ALTER TABLE reseller_payment_methods "
             "ADD COLUMN IF NOT EXISTS mpesa_till_number VARCHAR(20)"
+        ))
+
+        # Fapshi is an opt-in, per-reseller collection provider. Credentials
+        # stay encrypted on the payment method and routers choose it through
+        # the existing payment_method_id assignment.
+        await conn.execute(sa_text(
+            "ALTER TYPE resellerpaymentmethodtype ADD VALUE IF NOT EXISTS 'fapshi'"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE reseller_payment_methods "
+            "ADD COLUMN IF NOT EXISTS fapshi_api_user VARCHAR(100), "
+            "ADD COLUMN IF NOT EXISTS fapshi_api_key_encrypted VARCHAR(500), "
+            "ADD COLUMN IF NOT EXISTS fapshi_environment VARCHAR(20)"
         ))
 
         # Add payment_method_id FK to routers if missing

@@ -168,6 +168,43 @@ Authorization: Bearer <token>
 
 ---
 
+#### 1E. Create Fapshi Method (Cameroon)
+
+Fapshi collects MTN Mobile Money and Orange Money payments in XAF. Keep the method in `sandbox` until the captive portal has passed an end-to-end test.
+
+```json
+POST /api/payment-methods
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "method_type": "fapshi",
+  "label": "Cameroon Mobile Money",
+  "fapshi_api_user": "<api-user>",
+  "fapshi_api_key": "<api-key>",
+  "fapshi_environment": "sandbox"
+}
+```
+
+The response returns the API User and environment. The API Key is encrypted at rest and masked in API responses.
+
+```json
+{
+  "id": 5,
+  "user_id": 5,
+  "method_type": "fapshi",
+  "label": "Cameroon Mobile Money",
+  "is_active": true,
+  "fapshi_api_user": "<api-user>",
+  "fapshi_api_key": "****************************abcd",
+  "fapshi_environment": "sandbox"
+}
+```
+
+Fapshi requires whole-XAF amounts of at least 100. Cameroon numbers may be submitted as `654874452`, `237654874452`, or `+237654874452`; the provider request uses the local nine-digit form.
+
+---
+
 #### Create — Error Responses
 
 **`400` — Invalid method_type:**
@@ -212,6 +249,7 @@ Authorization: Bearer <token>
 | `mpesa_paybill` | `label`, `mpesa_paybill_number` |
 | `mpesa_paybill_with_keys` | `label`, `mpesa_shortcode`, `mpesa_passkey`, `mpesa_consumer_key`, `mpesa_consumer_secret` |
 | `zenopay` | `label`, `zenopay_api_key` |
+| `fapshi` | `label`, `fapshi_api_user`, `fapshi_api_key`, `fapshi_environment` (`sandbox` or `live`) |
 
 ---
 
@@ -417,6 +455,9 @@ Returns the full updated payment method:
 | `mpesa_consumer_key` | string | M-Pesa consumer key — re-encrypted on update |
 | `mpesa_consumer_secret` | string | M-Pesa consumer secret — re-encrypted on update |
 | `zenopay_api_key` | string | ZenoPay API key — re-encrypted on update |
+| `fapshi_api_user` | string | Fapshi API User |
+| `fapshi_api_key` | string | Fapshi API Key — re-encrypted on update |
+| `fapshi_environment` | string | `sandbox` or `live` |
 
 ---
 
@@ -507,6 +548,17 @@ No request body needed.
 }
 ```
 
+#### Response — Fapshi
+
+The credential test calls Fapshi's balance endpoint in the method's configured environment.
+
+```json
+{
+  "status": "success",
+  "message": "Fapshi credentials are valid"
+}
+```
+
 #### Response — Bank Account / Paybill without keys
 
 ```json
@@ -594,7 +646,7 @@ Authorization: Bearer <token>
 
 These endpoints are called by the **customer-facing frontend** (captive portal, mobile app) when a customer wants to pay for internet.
 
-The request bodies are **unchanged**. The only difference is the **response** may now include a `gateway` field that tells the frontend which polling endpoint to use.
+The request bodies are unchanged. Gateway-backed responses may also include `gateway` and provider transaction identifiers. The generic customer status endpoint remains the primary captive-portal polling contract.
 
 ---
 
@@ -676,6 +728,24 @@ Same response shape. The payment is initiated via ZenoPay instead of M-Pesa:
 ```
 
 Frontend polls: `GET /api/hotspot/payment-status/42` (same endpoint works — ZenoPay webhook updates the customer status just like M-Pesa callback does).
+
+#### Response — Router with Fapshi assigned
+
+The backend returns the normal customer fields plus provider identifiers. The captive portal still polls the generic customer status endpoint.
+
+```json
+{
+  "id": 42,
+  "customer_id": 42,
+  "status": "pending",
+  "gateway": "fapshi",
+  "trans_id": "FAPSHI-TRANSACTION-ID",
+  "external_id": "BW-HOTSPOT-42-EXAMPLE",
+  "message": "Payment request sent to phone"
+}
+```
+
+Frontend polls: `GET /api/hotspot/payment-status/42`. Each poll can reconcile a pending Fapshi transaction with the provider, so the captive portal does not depend on the webhook arriving first.
 
 > **Note:** The register-and-pay endpoint returns the same shape regardless of which gateway was used. The frontend doesn't need to know or care which gateway is behind it — it just polls payment-status as usual.
 
@@ -953,4 +1023,14 @@ ELSE:
    Poll GET /api/hotspot/payment-status/{customerId}    ← existing flow, no change
 ```
 
-The `POST /api/hotspot/register-and-pay` response is unchanged — always poll `GET /api/hotspot/payment-status/{customerId}` regardless of gateway.
+For `POST /api/hotspot/register-and-pay`, always poll `GET /api/hotspot/payment-status/{customerId}` regardless of gateway. Provider-specific fields are optional metadata.
+
+---
+
+## PART 4 — Fapshi deployment checklist
+
+1. Get both values from the Fapshi service dashboard: API User and API Key. An API User by itself cannot authenticate requests.
+2. Create the reseller's Fapshi method in `sandbox`, test the credentials, then assign it only to the Cameroon router(s). Routers without that assignment continue to use M-Pesa.
+3. Set the Fapshi webhook URL to `https://<billing-host>/api/fapshi/webhook`. The webhook handler rechecks the transaction through Fapshi before activating a customer.
+4. Test with a plan priced at a whole-XAF amount of at least 100 and a Cameroon mobile number. Confirm payment, customer activation, and router provisioning.
+5. Change the method to `live` after Fapshi has enabled Direct Pay for the live service. Repeat the test with the smallest valid plan before assigning more routers.

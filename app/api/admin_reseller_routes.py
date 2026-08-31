@@ -21,7 +21,7 @@ from app.db.models import (
     ZenoPayTransaction, DevicePairing, ReconnectionAttempt,
     ProvisioningAttempt, CustomerUsagePeriod, UsageCapWatchState,
     Lead, LeadActivity, LeadFollowUp, LeadSource,
-    MtnMomoTransaction, AccessCredential,
+    FapshiTransaction, MtnMomoTransaction, AccessCredential,
     PortalSettings, ShopProduct, ShopOrder, ShopOrderItem, ShopOrderTracking,
     SubscriptionShareCode, C2BTransaction, UnmatchedC2BPayment,
     SmsCreditAccount, SmsCreditTransaction, SmsCreditOrder, MessageTemplate,
@@ -172,6 +172,9 @@ def _serialize_payment_method_for_admin(pm: ResellerPaymentMethod) -> dict:
         result["mpesa_shortcode"] = pm.mpesa_shortcode
     elif method_type_value == ResellerPaymentMethodType.ZENOPAY.value:
         result["zenopay_account_id"] = pm.zenopay_account_id
+    elif method_type_value == ResellerPaymentMethodType.FAPSHI.value:
+        result["fapshi_api_user"] = pm.fapshi_api_user
+        result["fapshi_environment"] = pm.fapshi_environment or "sandbox"
 
     return result
 
@@ -1630,6 +1633,13 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         ))
     )).scalar() or 0
 
+    fapshi_transactions = (await db.execute(
+        select(func.count(FapshiTransaction.id)).where(or_(
+            FapshiTransaction.reseller_id == reseller_id,
+            FapshiTransaction.customer_id.in_(customer_ids_stmt),
+        ))
+    )).scalar() or 0
+
     # CRM / lead pipeline owned by this reseller
     leads_owned = (await db.execute(
         select(func.count(Lead.id)).where(Lead.user_id == reseller_id)
@@ -1751,6 +1761,7 @@ async def _reseller_deletion_summary(db: AsyncSession, reseller_id: int) -> dict
         "mpesa_transactions": mpesa_transactions,
         "zenopay_transactions": zenopay_transactions,
         "mtn_momo_transactions": mtn_momo_transactions,
+        "fapshi_transactions": fapshi_transactions,
         "provisioning_tokens": provisioning_tokens,
         "provisioning_logs": provisioning_logs_c + provisioning_logs_r,
         "provisioning_attempts": provisioning_attempts,
@@ -1955,6 +1966,8 @@ async def delete_reseller(
     )))
     await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.reseller_id == reseller_id))
     await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id.in_(customer_ids)))
+    await db.execute(delete(FapshiTransaction).where(FapshiTransaction.reseller_id == reseller_id))
+    await db.execute(delete(FapshiTransaction).where(FapshiTransaction.customer_id.in_(customer_ids)))
 
     # 4. Customer ratings
     await db.execute(delete(CustomerRating).where(CustomerRating.customer_id.in_(customer_ids)))

@@ -638,6 +638,10 @@ async def initiate_mpesa_payment_api(
                 resp["order_id"] = gw_result["order_id"]
             if gw_result.get("reference_id"):
                 resp["reference_id"] = gw_result["reference_id"]
+            if gw_result.get("trans_id"):
+                resp["trans_id"] = gw_result["trans_id"]
+            if gw_result.get("external_id"):
+                resp["external_id"] = gw_result["external_id"]
             return resp
 
         # --- Legacy path: use system M-Pesa credentials ---
@@ -901,6 +905,7 @@ async def register_hotspot_and_pay_api(
             db.add(customer)
             await db.flush()
         
+        gw_result = None
         if payment_method_enum == PaymentMethod.MOBILE_MONEY:
             reference = f"HOTSPOT-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
@@ -1019,8 +1024,9 @@ async def register_hotspot_and_pay_api(
                 await db.rollback()
                 logger.error(f"Cash payment processing failed for customer {customer.id}: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Payment processing failed: {str(e)}")
-        return {
+        response = {
             "id": customer.id,
+            "customer_id": customer.id,
             "name": customer.name,
             "phone": customer.phone,
             "mac_address": customer.mac_address,
@@ -1029,6 +1035,13 @@ async def register_hotspot_and_pay_api(
             "router_id": customer.router_id,
             "message": "STK Push sent to phone" if payment_method_enum == PaymentMethod.MOBILE_MONEY else "Payment recorded successfully"
         }
+        if payment_method_enum == PaymentMethod.MOBILE_MONEY:
+            response["gateway"] = gw_result.get("gateway") if gw_result else "mpesa"
+            if gw_result:
+                for key in ("checkout_request_id", "order_id", "reference_id", "trans_id", "external_id"):
+                    if gw_result.get(key):
+                        response[key] = gw_result[key]
+        return response
     except HTTPException:
         raise
     except Exception as e:
@@ -1058,7 +1071,9 @@ async def get_payment_status(
         # (no-op unless their txn is >25s old; runs AFTER this response).
         if customer.status == CustomerStatus.PENDING:
             from app.services.mpesa_transactions import kick_pending_payment_check
+            from app.api.fapshi_routes import kick_pending_fapshi_check
             background_tasks.add_task(kick_pending_payment_check, customerId)
+            background_tasks.add_task(kick_pending_fapshi_check, customerId)
 
         attempt = await get_recent_delivery_attempt_for_customer(db, customer.id)
         
