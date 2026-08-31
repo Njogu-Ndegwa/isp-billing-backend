@@ -213,6 +213,90 @@ async def test_successful_callback_completes_txn_and_provisions(
     assert payload_arg["mac_address"] == "AA:BB:CC:DD:EE:01"
 
 
+async def test_register_then_successful_callback_activates_and_provisions(
+    session_factory, client, patched_provisioning, provision_calls, monkeypatch
+):
+    """Full guest-payment story: registration -> STK -> callback -> MikroTik."""
+    from types import SimpleNamespace
+
+    from app.services import mpesa as mpesa_service
+
+    async with session_factory() as s:
+        reseller = await make_reseller(s)
+        plan = await make_plan(
+            s,
+            reseller,
+            duration_value=30,
+            duration_unit=DurationUnit.DAYS,
+            price=500,
+        )
+        router = await make_router(s, reseller)
+        plan_id = plan.id
+        router_id = router.id
+
+    checkout_id = "ws_CO_REGISTER_TO_PROVISION"
+
+    async def fake_stk(**_kwargs):
+        return SimpleNamespace(
+            checkout_request_id=checkout_id,
+            merchant_request_id="merchant-register-to-provision",
+        )
+
+    monkeypatch.setattr(mpesa_service, "initiate_stk_push", fake_stk)
+
+    register_response = await client.post(
+        "/api/hotspot/register-and-pay",
+        json={
+            "name": "Full Story Customer",
+            "phone": "254712345678",
+            "mac_address": "AA:BB:CC:DD:EE:77",
+            "plan_id": plan_id,
+            "router_id": router_id,
+            "payment_method": "mobile_money",
+        },
+    )
+    assert register_response.status_code == 200, register_response.text
+    customer_id = register_response.json()["id"]
+
+    async with session_factory() as s:
+        pending_customer = await s.get(Customer, customer_id)
+        assert pending_customer.status == CustomerStatus.PENDING
+        pending_txn = (
+            await s.execute(
+                select(MpesaTransaction).where(
+                    MpesaTransaction.checkout_request_id == checkout_id
+                )
+            )
+        ).scalar_one()
+        assert pending_txn.status == MpesaTransactionStatus.pending
+        assert pending_txn.customer_id == customer_id
+
+    callback_response = await client.post(
+        "/api/mpesa/callback",
+        json=_stk_callback_payload(checkout_id, amount=500.0),
+    )
+    assert callback_response.status_code == 200
+    assert callback_response.json()["ResultCode"] == 0
+
+    async with session_factory() as s:
+        activated_customer = await s.get(Customer, customer_id)
+        assert activated_customer.status == CustomerStatus.ACTIVE
+        assert activated_customer.expiry > datetime.utcnow() + timedelta(days=29, hours=23)
+        payments = (
+            await s.execute(
+                select(CustomerPayment).where(CustomerPayment.customer_id == customer_id)
+            )
+        ).scalars().all()
+        assert len(payments) == 1
+        assert payments[0].payment_reference == "RJ7T8K9MNP"
+
+    hotspot_calls = [call for call in provision_calls if call[0] == "hotspot"]
+    assert len(hotspot_calls) == 1
+    assert hotspot_calls[0][1][0] == customer_id
+    assert hotspot_calls[0][1][2]["mac_address"] == "AA:BB:CC:DD:EE:77"
+    assert hotspot_calls[0][1][3] == "hotspot_payment"
+
+
 async def test_failed_callback_marks_failed_and_no_provisioning(
     session_factory, client, patched_provisioning, provision_calls
 ):

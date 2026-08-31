@@ -59,6 +59,33 @@ class InitiateMpesaPaymentRequest(BaseModel):
     phone: str
 
 
+async def _restore_customer_after_failed_mobile_money(
+    customer_id: Optional[int],
+    original_state: Optional[dict],
+) -> None:
+    """Compensate customer changes committed before a failed provider call.
+
+    Existing customers regain their exact pre-attempt fields. A newly-created
+    customer remains inactive so the guest can retry against the same row and
+    the failed transaction retains a valid customer reference.
+    """
+    if not customer_id:
+        return
+
+    from app.db.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as fresh_db:
+        customer = await fresh_db.get(Customer, customer_id)
+        if not customer:
+            return
+        if original_state is None:
+            customer.status = CustomerStatus.INACTIVE
+        else:
+            for field, value in original_state.items():
+                setattr(customer, field, value)
+        await fresh_db.commit()
+
+
 def _router_auth_value(router: Optional[Router]) -> Optional[str]:
     auth_method = getattr(router, "auth_method", None)
     if auth_method is None:
@@ -618,7 +645,10 @@ async def initiate_mpesa_payment_api(
         if customer.user_id:
             owner_result = await db.execute(select(User.mpesa_shortcode).where(User.id == customer.user_id))
             owner_shortcode = owner_result.scalar_one_or_none()
-        
+
+        # All validation/snapshots are complete. Return this request's pooled
+        # connection before waiting on Safaricom.
+        await db.commit()
         try:
             stk_response = await initiate_stk_push(
                 phone_number=request.phone,
@@ -791,6 +821,16 @@ async def register_hotspot_and_pay_api(
         )
         customer_result = await db.execute(customer_stmt)
         existing_customer = customer_result.scalar_one_or_none()
+        original_customer_state = None
+        if existing_customer:
+            original_customer_state = {
+                "status": existing_customer.status,
+                "pending_update_data": existing_customer.pending_update_data,
+                "router_id": existing_customer.router_id,
+                "plan_id": existing_customer.plan_id,
+                "name": existing_customer.name,
+                "phone": existing_customer.phone,
+            }
 
         # DUPLICATE-PAYMENT GUARD: if this customer already has an in-flight
         # M-Pesa payment, don't charge them again — point the portal back at
@@ -892,6 +932,9 @@ async def register_hotspot_and_pay_api(
                 except Exception as e:
                     customer_id = getattr(customer, "id", None)
                     await db.rollback()
+                    await _restore_customer_after_failed_mobile_money(
+                        customer_id, original_customer_state
+                    )
                     logger.exception("Payment gateway failed for customer %s", customer_id)
                     raise HTTPException(
                         status_code=400,
@@ -899,6 +942,10 @@ async def register_hotspot_and_pay_api(
                     )
             else:
                 # --- Legacy path: use system M-Pesa credentials ---
+                # Persist the customer attempt, then release the connection
+                # before the external Daraja request. Failure compensation
+                # below restores existing customers or leaves new ones inactive.
+                await db.commit()
                 try:
                     stk_response = await initiate_stk_push(
                         phone_number=request.phone,
@@ -930,6 +977,9 @@ async def register_hotspot_and_pay_api(
                 except Exception as e:
                     customer_id = getattr(customer, "id", None)
                     await db.rollback()
+                    await _restore_customer_after_failed_mobile_money(
+                        customer_id, original_customer_state
+                    )
                     logger.exception("Payment initiation failed for customer %s", customer_id)
                     
                     try:

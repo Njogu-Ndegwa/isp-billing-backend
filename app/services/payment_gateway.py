@@ -186,6 +186,10 @@ async def _initiate_mpesa_with_reseller_keys(
     passkey = decrypt_credential(pm.mpesa_passkey_encrypted)
     shortcode = pm.mpesa_shortcode
 
+    # Release the caller's transaction before the external Daraja request.
+    # AsyncSession uses expire_on_commit=False, so the scalar snapshots above
+    # remain available while the pooled connection returns to the pool.
+    await db.commit()
     stk_response = await initiate_stk_push_direct(
         phone_number=phone,
         amount=amount,
@@ -234,6 +238,9 @@ async def _initiate_mpesa_system_collected(
 ) -> dict:
     from app.services.mpesa import initiate_stk_push_direct
 
+    # The caller may have loaded/updated the customer in this transaction.
+    # Persist that short DB unit first; never pin its connection across STK I/O.
+    await db.commit()
     stk_response = await initiate_stk_push_direct(
         phone_number=phone,
         amount=amount,
