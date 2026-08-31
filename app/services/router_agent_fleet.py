@@ -26,6 +26,11 @@ from app.services.router_agent_script import (
 )
 
 
+# RouterOS requires the ftp policy for scripts/schedulers that create, remove,
+# or import files. The agent fetches its response to a temporary .rsc file.
+AGENT_ROUTEROS_POLICY = "ftp,read,write,test,policy,sensitive"
+
+
 @dataclass(frozen=True)
 class RouterAgentCandidate:
     router_id: int
@@ -157,7 +162,7 @@ def install_router_agent_sync(
         script_params = {
             "name": SCRIPT_NAME,
             "source": source,
-            "policy": "read,write,test,policy,sensitive",
+            "policy": AGENT_ROUTEROS_POLICY,
             "comment": "Bitwave outbound command fallback v1",
         }
         if scripts:
@@ -186,7 +191,7 @@ def install_router_agent_sync(
             "interval": f"{random.randint(90, 150)}s",
             "start-time": "startup",
             "on-event": f"/system script run {SCRIPT_NAME}",
-            "policy": "read,write,test,policy,sensitive",
+            "policy": AGENT_ROUTEROS_POLICY,
             "comment": "Bitwave adaptive command polling",
             "disabled": "no",
         }
@@ -207,14 +212,14 @@ def install_router_agent_sync(
         verified_scripts = _rows(
             api.send_command_optimized(
                 "/system/script/print",
-                proplist=[".id", "name", "source"],
+                proplist=[".id", "name", "source", "policy"],
                 query=f"?name={SCRIPT_NAME}",
             )
         )
         verified_schedulers = _rows(
             api.send_command_optimized(
                 "/system/scheduler/print",
-                proplist=[".id", "name", "disabled", "interval", "on-event"],
+                proplist=[".id", "name", "disabled", "interval", "on-event", "policy"],
                 query=f"?name={SCHEDULER_NAME}",
             )
         )
@@ -228,13 +233,28 @@ def install_router_agent_sync(
             and verified_schedulers[0].get("disabled") != "true"
             and SCRIPT_NAME in (verified_schedulers[0].get("on-event") or "")
         )
-        if not source_ok or not scheduler_ok:
+        required_policies = set(AGENT_ROUTEROS_POLICY.split(","))
+        script_policy_ok = bool(
+            verified_scripts
+            and required_policies.issubset(
+                set((verified_scripts[0].get("policy") or "").split(","))
+            )
+        )
+        scheduler_policy_ok = bool(
+            verified_schedulers
+            and required_policies.issubset(
+                set((verified_schedulers[0].get("policy") or "").split(","))
+            )
+        )
+        if not source_ok or not scheduler_ok or not script_policy_ok or not scheduler_policy_ok:
             return {
                 "ok": False,
                 "router_id": candidate.router_id,
                 "error": "verification_failed",
                 "source_ok": source_ok,
                 "scheduler_ok": scheduler_ok,
+                "script_policy_ok": script_policy_ok,
+                "scheduler_policy_ok": scheduler_policy_ok,
             }
         return {
             "ok": True,

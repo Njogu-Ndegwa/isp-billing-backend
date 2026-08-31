@@ -2,6 +2,67 @@ from app.services import router_agent_fleet as fleet
 from tests.factories import make_reseller, make_router
 
 
+def test_agent_policy_can_create_and_import_command_files():
+    policies = set(fleet.AGENT_ROUTEROS_POLICY.split(","))
+
+    assert "ftp" in policies
+    assert {"read", "write", "test", "policy", "sensitive"}.issubset(policies)
+
+
+def test_installer_applies_and_verifies_file_policy_on_script_and_scheduler(monkeypatch):
+    class FakeAPI:
+        instances = []
+
+        def __init__(self, *_args, **_kwargs):
+            self.script = None
+            self.scheduler = None
+            self.__class__.instances.append(self)
+
+        def connect(self):
+            return True
+
+        def disconnect(self):
+            return None
+
+        def send_command_optimized(self, path, **_kwargs):
+            if path == "/system/script/print":
+                return {"success": True, "data": [self.script] if self.script else []}
+            if path == "/system/scheduler/print":
+                return {"success": True, "data": [self.scheduler] if self.scheduler else []}
+            raise AssertionError(path)
+
+        def send_command(self, path, params):
+            if path == "/system/script/add":
+                self.script = {".id": "*1", **params}
+            elif path == "/system/scheduler/add":
+                self.scheduler = {".id": "*2", **params}
+            else:
+                raise AssertionError(path)
+            return {"success": True, "data": []}
+
+    monkeypatch.setattr(fleet, "MikroTikAPI", FakeAPI)
+    candidate = fleet.RouterAgentCandidate(
+        router_id=1,
+        identity="Router-Policy-Test",
+        ip_address="10.0.0.2",
+        username="api",
+        password="secret",
+        port=8728,
+        tunnel_type="wireguard",
+        already_enabled=False,
+    )
+
+    result = fleet.install_router_agent_sync(
+        candidate,
+        endpoint_base_url="https://isp.bitwavetechnologies.net",
+    )
+
+    assert result["ok"] is True
+    api = FakeAPI.instances[0]
+    assert "ftp" in api.script["policy"].split(",")
+    assert "ftp" in api.scheduler["policy"].split(",")
+
+
 async def test_install_batches_advance_past_already_enabled_routers(db):
     reseller = await make_reseller(db)
     enabled = await make_router(
