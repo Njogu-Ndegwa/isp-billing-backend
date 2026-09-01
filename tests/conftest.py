@@ -213,3 +213,20 @@ async def db(session_factory) -> AsyncIterator[AsyncSession]:
 @pytest.fixture
 def now():
     return datetime.utcnow()
+
+
+@pytest.fixture(autouse=True)
+def reset_expiry_cleanup_router_memo():
+    """Clear the expired-cleanup unreachable-router memo between tests.
+
+    cleanup_expired_users_background remembers routers it could not reach in a
+    module-level dict that deliberately outlives a single run (that is the whole
+    point — it is what stops dead routers refilling the batch every 67s). Tests
+    reuse low router ids against a fresh database, so a router one test marked
+    unreachable would silently be skipped by the next one.
+    """
+    from app.services import mikrotik_background
+
+    mikrotik_background._expiry_cleanup_unreachable_routers.clear()
+    yield
+    mikrotik_background._expiry_cleanup_unreachable_routers.clear()
