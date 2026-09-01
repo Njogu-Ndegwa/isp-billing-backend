@@ -61,6 +61,11 @@ BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 60
 ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = ROUTER_OFFLINE_SKIP_PERIOD  # single source: see router_availability
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN = 60
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER = 15
+# An expiry SMS is only meaningful while the expiry is fresh. When cleanup has
+# been stalled, rows get deactivated days or weeks late, and a "your plan
+# expired" text long after the fact only confuses the customer and burns SMS
+# credits. Enforcement still happens; only the notification is suppressed.
+EXPIRY_NOTIFICATION_MAX_OVERDUE = timedelta(days=7)
 SAFETY_NET_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
 ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL = timedelta(minutes=5)
 BANDWIDTH_MAX_ROUTERS_PER_RUN = 8
@@ -120,6 +125,44 @@ def _router_recently_offline(
         and last_checked is not None
         and (now - last_checked) < threshold
     )
+
+
+# Routers whose RouterOS connection failed during expired-user cleanup.
+#
+# "expired_cleanup" is an ADVISORY availability source (see router_availability):
+# its failures deliberately no longer move the shared router summary, so this
+# failure-only job cannot declare a false outage and block paid access. Correct --
+# but that summary was also the ONLY signal this job used to skip unreachable
+# routers. Without it last_checked_at freezes, goes stale past the 30-minute
+# window, and every dead router is retried on every 67s run: it refills the
+# 60-slot batch, every attempt fails, the rows stay ACTIVE for retry, and no
+# customer anywhere ever expires (head-of-line block, incident 2026-09-01).
+#
+# Keep the skip signal here instead -- job-local, so it can never suppress
+# customer-facing provisioning the way the shared summary could.
+_expiry_cleanup_unreachable_routers: dict[int, datetime] = {}
+
+
+def _cleanup_router_unreachable(
+    router,
+    now: datetime,
+    threshold: timedelta = ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD,
+) -> bool:
+    failed_at = _expiry_cleanup_unreachable_routers.get(getattr(router, "id", None))
+    return failed_at is not None and (now - failed_at) < threshold
+
+
+def _record_cleanup_reachability(
+    unreachable_router_ids: set,
+    reachable_router_ids: set,
+    now: datetime,
+) -> None:
+    """Remember which routers this job could not reach, and forget the ones it
+    just reached so a recovered router is retried immediately."""
+    for router_id in unreachable_router_ids:
+        _expiry_cleanup_unreachable_routers[router_id] = now
+    for router_id in reachable_router_ids:
+        _expiry_cleanup_unreachable_routers.pop(router_id, None)
 
 
 def _background_db_pool_is_busy(job_name: str) -> bool:
@@ -1236,6 +1279,7 @@ async def cleanup_expired_users_background():
                 customer for customer in expired_customers
                 if customer.id in still_expired_ids
             ]
+            expiry_by_id = {c.id: c.expiry for c in expired_customers}
 
             await db.commit()
 
@@ -1282,7 +1326,9 @@ async def cleanup_expired_users_background():
                         "customer_id": c.id,
                         "username": c.pppoe_username,
                     }
-                    if _router_recently_offline(c.router, now):
+                    if _router_recently_offline(c.router, now) or _cleanup_router_unreachable(
+                        c.router, now
+                    ):
                         offline_skipped.append(c.id)
                         continue
                     router_key = f"{c.router.ip_address}:{c.router.port}"
@@ -1318,7 +1364,10 @@ async def cleanup_expired_users_background():
                         "username": normalize_mac_address(c.mac_address).replace(":", ""),
                         "lb_enabled": bool(getattr(c.router, "lb_enabled", False)),
                     }
-                if c.router and _router_recently_offline(c.router, now):
+                if c.router and (
+                    _router_recently_offline(c.router, now)
+                    or _cleanup_router_unreachable(c.router, now)
+                ):
                     offline_skipped.append(c.id)
                     continue
                 customer_data = {
@@ -1378,6 +1427,7 @@ async def cleanup_expired_users_background():
             # --- Hotspot cleanup (concurrent per-router) ---
             mikrotik_results = {"removed": [], "failed": [], "routers_connected": 0}
             offline_router_ids: set[int] = set()
+            connected_router_ids: set[int] = set()
             if router_customers_map:
                 async def _hotspot_task(rk, rd):
                     async with router_locks.acquire(rk):
@@ -1398,6 +1448,8 @@ async def cleanup_expired_users_background():
                     mikrotik_results["failed"].extend(outcome["failed"])
                     if outcome["connected"]:
                         mikrotik_results["routers_connected"] += 1
+                        if rd["router"].get("id"):
+                            connected_router_ids.add(rd["router"]["id"])
                     elif rd["router"].get("id"):
                         offline_router_ids.add(rd["router"]["id"])
 
@@ -1423,8 +1475,22 @@ async def cleanup_expired_users_background():
                     pppoe_results["failed"].extend(outcome["failed"])
                     if outcome["connected"]:
                         pppoe_results["routers_connected"] += 1
+                        if rd["router"].get("id"):
+                            connected_router_ids.add(rd["router"]["id"])
                     elif rd["router"].get("id"):
                         offline_router_ids.add(rd["router"]["id"])
+
+            _record_cleanup_reachability(
+                offline_router_ids, connected_router_ids, datetime.utcnow()
+            )
+            if offline_router_ids:
+                logger.warning(
+                    "[CRON] %d router(s) unreachable this run; skipping their expired "
+                    "customers for %s so reachable routers are not starved: %s",
+                    len(offline_router_ids),
+                    ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD,
+                    sorted(offline_router_ids),
+                )
 
             all_successful_ids = set(
                 [r["id"] for r in mikrotik_results["removed"]] +
@@ -1585,10 +1651,28 @@ async def cleanup_expired_users_background():
             # Expiry SMS is deliberately downstream of successful enforcement
             # and the INACTIVE commit. It uses its own short DB sessions and
             # dispatches provider I/O in background tasks.
-            if newly_deactivated_ids:
+            notify_ids = []
+            stale_notify_count = 0
+            for customer_id in sorted(newly_deactivated_ids):
+                expiry = expiry_by_id.get(customer_id)
+                if expiry is not None and (
+                    now_after_cleanup - expiry
+                ) > EXPIRY_NOTIFICATION_MAX_OVERDUE:
+                    stale_notify_count += 1
+                    continue
+                notify_ids.append(customer_id)
+            if stale_notify_count:
+                logger.warning(
+                    "[CRON] Suppressed expiry notification for %d customer(s) more than "
+                    "%s overdue (enforcement still applied)",
+                    stale_notify_count,
+                    EXPIRY_NOTIFICATION_MAX_OVERDUE,
+                )
+
+            if notify_ids:
                 try:
                     campaign_ids = await customer_expiry_notifications.queue_customer_expiry_notifications(
-                        sorted(newly_deactivated_ids),
+                        notify_ids,
                         session_factory=async_session,
                         now=now_after_cleanup,
                     )
