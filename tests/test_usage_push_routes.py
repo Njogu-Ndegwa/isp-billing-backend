@@ -20,6 +20,7 @@ Together those are what make a thousand routers pushing survivable when a single
 worker on a 1 GB box is receiving them.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
@@ -31,6 +32,7 @@ from sqlalchemy import select
 from app.api.usage_push_routes import router as usage_push_router
 from app.db.models import ConnectionType, CustomerStatus, CustomerUsagePeriod
 from app.services import usage_push
+from app.services.usage_push import IngestResult
 from app.services.usage_push_auth import derive_router_token
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
@@ -260,3 +262,54 @@ async def test_response_tells_the_router_when_to_come_back(db, client):
 
     assert resp.status_code == 200
     assert resp.json()["next_push_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_fleet_pushes_cannot_stampede_the_db_pool(db, client, monkeypatch):
+    """The pressure gauge is a snapshot; concurrency must also be bounded.
+
+    All requests below pass the healthy-pool check together.  Only the fixed
+    admission limit may enter ingest while the rest wait without a DB session.
+    """
+    reseller = await make_reseller(db)
+    identities = [f"Router-GATE-{index}" for index in range(6)]
+    for identity in identities:
+        await make_router(db, reseller, identity=identity)
+
+    import app.api.usage_push_routes as routes
+
+    entered_limit = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    peak = 0
+
+    async def blocked_ingest(*_args, **_kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        if active == routes.MAX_CONCURRENT_USAGE_INGESTS:
+            entered_limit.set()
+        try:
+            await release.wait()
+            return IngestResult()
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(routes, "ingest_usage_reports", blocked_ingest)
+
+    requests = [
+        asyncio.create_task(client.post(
+            "/api/router/usage-push",
+            json=_body(identity, []),
+            headers=_auth(identity),
+        ))
+        for identity in identities
+    ]
+
+    await asyncio.wait_for(entered_limit.wait(), timeout=2)
+    await asyncio.sleep(0.05)
+    assert peak == routes.MAX_CONCURRENT_USAGE_INGESTS
+
+    release.set()
+    responses = await asyncio.gather(*requests)
+    assert all(response.status_code == 200 for response in responses)
