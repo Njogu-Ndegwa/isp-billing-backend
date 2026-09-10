@@ -77,32 +77,19 @@ jobs:
           echo "Image digest:"
           docker inspect njogundegwa/isp-billing:latest --format='{{.Id}}'
           
-          echo "[5/7] Building FreeRADIUS image..."
-          if [ -d "radius" ]; then
-            docker build -t isp-billing-radius:latest ./radius/ || { echo "ERROR: FreeRADIUS build failed"; exit 1; }
-            echo "FreeRADIUS image built successfully"
-          else
-            echo "ERROR: radius/ directory not found"; exit 1
-          fi
-          
-          echo "[5.5/7] Building WireGuard Manager image..."
-          if [ -d "wg-manager" ]; then
-            docker build -t isp-billing-wg-manager:latest ./wg-manager/ || { echo "ERROR: WG Manager build failed"; exit 1; }
-            echo "WG Manager image built successfully"
-          else
-            echo "WARNING: wg-manager/ directory not found, skipping"
-          fi
-          
-          echo "[6/7] Restarting containers with Docker Hub image..."
-          docker compose down
+          # Production Postgres, RADIUS and WireGuard must stay up during an
+          # application deploy. `docker compose down` used to stop the entire
+          # billing stack and turned every backend release into a database and
+          # tunnel outage. Replace only the web container.
+          echo "[5/7] Replacing only the application container..."
           docker rmi isp-billing-web 2>/dev/null || true
           docker tag njogundegwa/isp-billing:latest isp-billing-web:latest
-          docker compose up -d --no-build --force-recreate || { echo "ERROR: Docker compose failed"; exit 1; }
+          docker compose up -d --no-build --force-recreate --no-deps web || { echo "ERROR: Application deploy failed"; exit 1; }
           
           echo "Verifying deployed image matches Docker Hub:"
           docker inspect isp_billing_app --format='{{.Image}}'
           
-          echo "[7/7] Cleaning up old images..."
+          echo "[6/7] Cleaning up old images..."
           docker image prune -f
           
           echo "=========================================="

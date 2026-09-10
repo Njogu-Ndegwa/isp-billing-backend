@@ -182,3 +182,33 @@ def test_outage_compensation_migration_runs_on_normal_startup():
         for node in startup_tries
         for handler in node.handlers
     ), "The outage migration must not be conditional on another migration failing"
+
+
+def test_mpesa_hot_path_index_is_concurrent_bounded_and_wired_to_startup():
+    """The production-sized M-Pesa table must never be locked during deploy.
+
+    It also runs on a 1 GB host, so the index build must explicitly cap its
+    memory and parallel worker count rather than inheriting future DB defaults.
+    """
+    source = migration_source()
+    normalized = " ".join(source.split()).lower()
+
+    assert "create index concurrently if not exists ix_mpesa_txn_customer_pending" in normalized
+    assert "on public.mpesa_transactions (customer_id, created_at desc)" in normalized
+    assert "where status = 'pending'" in normalized
+    assert "set maintenance_work_mem = '16mb'" in normalized
+    assert "set max_parallel_maintenance_workers = 0" in normalized
+    assert 'isolation_level="autocommit"' in normalized
+
+    tree = ast.parse(source)
+    startup = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "startup_event"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_hot_path_index_migrations"
+        for node in ast.walk(startup)
+    ), "The concurrent index migration is not wired into normal startup"

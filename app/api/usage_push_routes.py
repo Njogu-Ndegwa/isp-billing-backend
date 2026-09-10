@@ -24,6 +24,7 @@ the server and can be tuned without touching a thousand devices.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -63,13 +64,23 @@ POOL_PRESSURE_PERCENT = 60
 
 RETRY_AFTER_ON_PRESSURE = 90
 
+# The pool-pressure check is only a snapshot.  Without an admission gate, a
+# synchronized fleet can all observe (say) 40% usage and then enter DB work at
+# once, racing the 30-connection pool straight to 100%.  Keep router ingest to a
+# small, known share of the pool; queued requests hold no DB connection and the
+# reports are cumulative, so a delayed/retried report loses no usage.
+MAX_CONCURRENT_USAGE_INGESTS = 3
+_usage_ingest_gate = asyncio.Semaphore(MAX_CONCURRENT_USAGE_INGESTS)
+
 # identity -> monotonic timestamp of last accepted push.
 _last_push_at: dict[str, float] = {}
 
 
 def reset_rate_limiter() -> None:
     """Test hook — the limiter is process state, so tests must start clean."""
+    global _usage_ingest_gate
     _last_push_at.clear()
+    _usage_ingest_gate = asyncio.Semaphore(MAX_CONCURRENT_USAGE_INGESTS)
 
 
 def _pool_under_pressure() -> bool:
@@ -156,46 +167,61 @@ async def receive_usage_push(
             headers={"Retry-After": str(RETRY_AFTER_ON_PRESSURE)},
         )
 
-    async with async_session() as db:
-        router_row = (
-            await db.execute(
-                select(RouterModel).where(RouterModel.identity == identity)
+    async with _usage_ingest_gate:
+        # A request may have waited behind the gate. Re-check pressure before it
+        # becomes one of the admitted DB users instead of trusting the stale
+        # snapshot taken on arrival.
+        if _pool_under_pressure():
+            logger.warning(
+                "[USAGE-PUSH] Shedding queued push from %s: DB pool under pressure",
+                identity,
             )
-        ).scalar_one_or_none()
+            raise HTTPException(
+                status_code=503,
+                detail="Busy, retry later",
+                headers={"Retry-After": str(RETRY_AFTER_ON_PRESSURE)},
+            )
 
-    # A valid token for an identity with no router is still 401, not 404 — same
-    # reason as above, no enumeration.
-    if router_row is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        async with async_session() as db:
+            router_row = (
+                await db.execute(
+                    select(RouterModel).where(RouterModel.identity == identity)
+                )
+            ).scalar_one_or_none()
 
-    _last_push_at[identity] = now
+        # A valid token for an identity with no router is still 401, not 404 —
+        # same reason as above, no enumeration.
+        if router_row is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
-    metrics = None
-    if payload.router is not None:
-        metrics = RouterMetrics(
-            iface_rx_bytes=payload.router.iface_rx_bytes,
-            iface_tx_bytes=payload.router.iface_tx_bytes,
-            hotspot_active=payload.router.hotspot_active,
-            pppoe_active=payload.router.pppoe_active,
-            queue_count=payload.router.queue_count,
+        _last_push_at[identity] = now
+
+        metrics = None
+        if payload.router is not None:
+            metrics = RouterMetrics(
+                iface_rx_bytes=payload.router.iface_rx_bytes,
+                iface_tx_bytes=payload.router.iface_tx_bytes,
+                hotspot_active=payload.router.hotspot_active,
+                pppoe_active=payload.router.pppoe_active,
+                queue_count=payload.router.queue_count,
+            )
+
+        result = await ingest_usage_reports(
+            router_row.id,
+            [
+                UsageReport(
+                    queue_key=item.queue_key,
+                    upload_bytes=item.upload_bytes,
+                    download_bytes=item.download_bytes,
+                    final=item.final,
+                    queue_name=item.queue_name,
+                    target_ip=item.target_ip,
+                    max_limit=item.max_limit,
+                )
+                for item in payload.reports
+            ],
+            router_metrics=metrics,
         )
-
-    result = await ingest_usage_reports(
-        router_row.id,
-        [
-            UsageReport(
-                queue_key=item.queue_key,
-                upload_bytes=item.upload_bytes,
-                download_bytes=item.download_bytes,
-                final=item.final,
-                queue_name=item.queue_name,
-                target_ip=item.target_ip,
-                max_limit=item.max_limit,
-            )
-            for item in payload.reports
-        ],
-        router_metrics=metrics,
-    )
 
     if result.over_cap_customer_ids:
         # Enforcement does RouterOS I/O, so it must not run inside this request

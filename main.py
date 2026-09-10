@@ -2377,6 +2377,59 @@ async def run_feedback_migrations():
     logger.info("Migration: feedback board tables, enums, indexes ready")
 
 
+# ============================================================================
+# Hot-path performance indexes (Postgres only, concurrent + idempotent)
+# ============================================================================
+async def run_hot_path_index_migrations():
+    """Create large-table indexes without blocking production writes.
+
+    The customer portal polls payment status every few seconds.  Its pending
+    M-Pesa lookup filters by customer/status/time; without this partial index,
+    every poll scans the entire transaction table.  Production has enough rows
+    for those scans to evict Postgres' hot pages and push this 1 GB host into
+    active swap thrashing.
+
+    ``CREATE INDEX CONCURRENTLY`` must run outside a transaction.  Memory and
+    parallelism are deliberately capped for the small production host.  A
+    cancelled concurrent build can leave an invalid index behind, so the next
+    startup removes that invalid artifact before retrying.
+    """
+    if async_engine.dialect.name != "postgresql":
+        return
+
+    index_name = "ix_mpesa_txn_customer_pending"
+    async with async_engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(sa_text("SET maintenance_work_mem = '16MB'"))
+        await conn.execute(sa_text("SET max_parallel_maintenance_workers = 0"))
+        try:
+            result = await conn.execute(sa_text("""
+                SELECT indisvalid
+                FROM pg_index
+                WHERE indexrelid = to_regclass(
+                    'public.ix_mpesa_txn_customer_pending'
+                )
+            """))
+            is_valid = result.scalar_one_or_none()
+            if is_valid is False:
+                await conn.execute(sa_text(
+                    "DROP INDEX CONCURRENTLY IF EXISTS "
+                    "public.ix_mpesa_txn_customer_pending"
+                ))
+
+            await conn.execute(sa_text("""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    ix_mpesa_txn_customer_pending
+                ON public.mpesa_transactions (customer_id, created_at DESC)
+                WHERE status = 'pending'
+            """))
+        finally:
+            await conn.execute(sa_text("RESET max_parallel_maintenance_workers"))
+            await conn.execute(sa_text("RESET maintenance_work_mem"))
+
+    logger.info("Migration: %s is ready", index_name)
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -2566,6 +2619,12 @@ async def startup_event():
         logger.info("Feedback board migrations completed successfully")
     except Exception as e:
         logger.error(f"Feedback board migration failed (non-fatal): {e}")
+
+    try:
+        await run_hot_path_index_migrations()
+        logger.info("Hot-path index migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Hot-path index migration failed (non-fatal): {e}")
 
     scheduler.add_job(
         cleanup_expired_users_background,
