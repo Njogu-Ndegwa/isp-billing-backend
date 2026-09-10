@@ -2404,6 +2404,7 @@ async def run_hot_path_index_migrations():
     index_names = (
         "ix_mpesa_txn_customer_pending",
         "ix_mpesa_txn_status_created",
+        "ix_mpesa_txn_customer_created",
         "ix_customer_payments_customer_status",
     )
     async with async_engine.connect() as conn:
@@ -2450,6 +2451,26 @@ async def run_hot_path_index_migrations():
                 CREATE INDEX CONCURRENTLY IF NOT EXISTS
                     ix_mpesa_txn_status_created
                 ON public.mpesa_transactions (status, created_at ASC)
+            """))
+
+            result = await conn.execute(sa_text("""
+                SELECT indisvalid
+                FROM pg_index
+                WHERE indexrelid = to_regclass(
+                    'public.ix_mpesa_txn_customer_created'
+                )
+            """))
+            is_valid = result.scalar_one_or_none()
+            if is_valid is False:
+                await conn.execute(sa_text(
+                    "DROP INDEX CONCURRENTLY IF EXISTS "
+                    "public.ix_mpesa_txn_customer_created"
+                ))
+
+            await conn.execute(sa_text("""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    ix_mpesa_txn_customer_created
+                ON public.mpesa_transactions (customer_id, created_at DESC)
             """))
 
             result = await conn.execute(sa_text("""
