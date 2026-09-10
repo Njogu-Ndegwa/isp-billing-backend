@@ -197,6 +197,8 @@ def test_mpesa_hot_path_index_is_concurrent_bounded_and_wired_to_startup():
     assert "on public.mpesa_transactions (customer_id, created_at desc)" in normalized
     assert "create index concurrently if not exists ix_mpesa_txn_pending_created" in normalized
     assert "on public.mpesa_transactions (created_at asc)" in normalized
+    assert "create index concurrently if not exists ix_customer_payments_customer_status" in normalized
+    assert "on public.customer_payments (customer_id, status)" in normalized
     assert "where status = 'pending'" in normalized
     assert "set maintenance_work_mem = '16mb'" in normalized
     assert "set max_parallel_maintenance_workers = 0" in normalized

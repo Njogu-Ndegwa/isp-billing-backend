@@ -2386,9 +2386,10 @@ async def run_hot_path_index_migrations():
     The customer portal polls payment status every few seconds, while the
     reconciliation worker scans the global pending queue every 90 seconds.
     Separate partial indexes cover the customer-scoped and global time-ordered
-    lookups.  Without them, both paths scan the entire transaction table;
-    production has enough rows for those scans to evict Postgres' hot pages and
-    push this 1 GB host into active swap thrashing.
+    M-Pesa lookups.  Customer-list payment-history checks also need the missing
+    customer/status relationship index.  Without these indexes, the hot paths
+    scan the full payment tables; production has enough rows for those scans to
+    evict Postgres' hot pages and push this 1 GB host into active swap thrashing.
 
     ``CREATE INDEX CONCURRENTLY`` must run outside a transaction.  Memory and
     parallelism are deliberately capped for the small production host.  A
@@ -2401,6 +2402,7 @@ async def run_hot_path_index_migrations():
     index_names = (
         "ix_mpesa_txn_customer_pending",
         "ix_mpesa_txn_pending_created",
+        "ix_customer_payments_customer_status",
     )
     async with async_engine.connect() as conn:
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -2447,6 +2449,26 @@ async def run_hot_path_index_migrations():
                     ix_mpesa_txn_pending_created
                 ON public.mpesa_transactions (created_at ASC)
                 WHERE status = 'pending'
+            """))
+
+            result = await conn.execute(sa_text("""
+                SELECT indisvalid
+                FROM pg_index
+                WHERE indexrelid = to_regclass(
+                    'public.ix_customer_payments_customer_status'
+                )
+            """))
+            is_valid = result.scalar_one_or_none()
+            if is_valid is False:
+                await conn.execute(sa_text(
+                    "DROP INDEX CONCURRENTLY IF EXISTS "
+                    "public.ix_customer_payments_customer_status"
+                ))
+
+            await conn.execute(sa_text("""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    ix_customer_payments_customer_status
+                ON public.customer_payments (customer_id, status)
             """))
         finally:
             await conn.execute(sa_text("RESET max_parallel_maintenance_workers"))
