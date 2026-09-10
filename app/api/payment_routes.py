@@ -1166,14 +1166,12 @@ async def get_mpesa_transactions(
         if want_mpesa:
             mpesa_stmt = (
                 select(MpesaTransaction, Customer, Router, Plan)
-                .join(Customer, MpesaTransaction.customer_id == Customer.id, isouter=True)
+                .join(Customer, MpesaTransaction.customer_id == Customer.id)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
                 # Prefer the plan snapshotted on the transaction itself; legacy
                 # rows (plan_id NULL) fall back to the customer's current plan.
                 .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
-                .where(
-                    (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
-                )
+                .where(Customer.user_id == user.id)
             )
             if router_id:
                 mpesa_stmt = mpesa_stmt.where(Router.id == router_id)
@@ -1671,12 +1669,10 @@ async def get_mpesa_transactions_summary(
                     Router.id,
                     Plan.connection_type,
                 )
-                .join(Customer, MpesaTransaction.customer_id == Customer.id, isouter=True)
+                .join(Customer, MpesaTransaction.customer_id == Customer.id)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
                 .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
-                .where(
-                    (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
-                )
+                .where(Customer.user_id == user.id)
             )
             if router_id:
                 mpesa_stmt = mpesa_stmt.where(Router.id == router_id)
@@ -1848,13 +1844,13 @@ async def get_failed_mpesa_transactions(
 
         # Build query for failed + expired transactions
         stmt = select(MpesaTransaction, Customer, Router, Plan).join(
-            Customer, MpesaTransaction.customer_id == Customer.id, isouter=True
+            Customer, MpesaTransaction.customer_id == Customer.id
         ).join(
             Router, Customer.router_id == Router.id, isouter=True
         ).join(
             Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True
         ).where(
-            (Customer.user_id == user.id) | (MpesaTransaction.customer_id == None)
+            Customer.user_id == user.id
         ).where(
             MpesaTransaction.status.in_([MpesaTransactionStatus.failed, MpesaTransactionStatus.expired])
         )
