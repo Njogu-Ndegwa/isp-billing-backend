@@ -23,6 +23,7 @@ from email.mime.text import MIMEText
 import httpx
 
 from app.config import settings
+from app.core.runtime_mode import shadow_mode_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,9 @@ async def _send_via_resend(to: str, subject: str, html: str) -> bool:
 
 async def send_email(to: str, subject: str, html: str) -> bool:
     """Send one email. Returns True on acceptance by the transport."""
+    if shadow_mode_enabled():
+        logger.warning("Shadow mode blocked email delivery")
+        return False
     if not email_enabled():
         logger.warning(
             "Email sending disabled (no SMTP_HOST or RESEND_API_KEY); "

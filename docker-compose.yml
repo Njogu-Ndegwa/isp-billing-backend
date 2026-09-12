@@ -52,6 +52,7 @@ services:
       - isp-network
     environment:
       - DATABASE_URL=postgresql+asyncpg://isp_user:isp_secure_pass_2024@db:5432/isp_billing_db
+      - SHADOW_MODE=${SHADOW_MODE:-false}
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - ALGORITHM=HS256
       - ACCESS_TOKEN_EXPIRE_MINUTES=1440
@@ -110,6 +111,9 @@ services:
       - SMTP_USERNAME=${SMTP_USERNAME:-}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
       - SMTP_USE_SSL=${SMTP_USE_SSL:-false}
+      - PULL_SERVICE_URL=${PULL_SERVICE_URL:-}
+      - PULL_SERVICE_TOKEN=${PULL_SERVICE_TOKEN:-}
+      - PULL_HANDOFF_TIMEOUT=${PULL_HANDOFF_TIMEOUT:-8}
     volumes:
       - wg_sock:/var/run/wg-manager
     depends_on:
@@ -170,6 +174,7 @@ services:
       - WG_MANAGER_SECRET=${WG_MANAGER_SECRET:-change-me-wg-secret}
       - WG_INTERFACE=${WG_INTERFACE:-wg0}
       - L2TP_CHAP_SECRETS_PATH=/etc/ppp/chap-secrets
+      - SHADOW_MODE=${SHADOW_MODE:-false}
     volumes:
       - wg_sock:/var/run/wg-manager
       - /etc/ppp:/etc/ppp

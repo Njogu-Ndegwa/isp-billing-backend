@@ -10,6 +10,7 @@ from app.services.messaging.base import (
     ProviderSpec,
     SendResult,
 )
+from app.core.runtime_mode import require_external_side_effects_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class AfricasTalkingProvider(MessagingProvider):
     ) -> list[SendResult]:
         if not recipients:
             return []
+        require_external_side_effects_enabled("Africa's Talking SMS delivery")
         data = {
             "username": self.username,
             "to": ",".join(recipients),

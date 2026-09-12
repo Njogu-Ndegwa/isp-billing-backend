@@ -11,6 +11,7 @@ from app.services.messaging.base import (
     ProviderSpec,
     SendResult,
 )
+from app.core.runtime_mode import require_external_side_effects_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class TalksasaProvider(MessagingProvider):
     ) -> list[SendResult]:
         if not recipients:
             return []
+        require_external_side_effects_enabled("TalkSASA SMS delivery")
         if not self.api_token:
             return [
                 SendResult(

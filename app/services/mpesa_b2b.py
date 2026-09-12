@@ -17,6 +17,7 @@ from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.runtime_mode import require_external_side_effects_enabled
 from app.db.database import AsyncSessionLocal
 from app.db.models import (
     B2BTransaction,
@@ -300,6 +301,8 @@ async def initiate_b2b_payment(
     Raises PayoutInFlightError if another payout for this reseller is
     initiating or unresolved. Commits the caller's session.
     """
+    require_external_side_effects_enabled("M-Pesa B2B payout initiation")
+
     net_amount = int(amount - fee)
     if net_amount <= 0:
         raise ValueError(f"Net payout amount must be positive (amount={amount}, fee={fee})")
@@ -725,6 +728,8 @@ async def query_b2b_transaction_status(
     """Ask Safaricom what happened to a B2B transaction (async result via
     callback). Returns True if the query was accepted. No DB access here —
     callers must not hold a session across this network call."""
+    require_external_side_effects_enabled("M-Pesa B2B status query")
+
     if not (transaction_id or originator_conversation_id):
         logger.warning(
             "B2B status query for txn %s impossible: no receipt or originator id", txn_id
@@ -939,6 +944,8 @@ async def run_b2b_status_reconciliation():
     """Scheduled job: query Safaricom for every B2B transaction stuck without
     a verdict, so a lost callback can never leave sent money unrecorded
     (2026-07-18 incident: 15 lost callbacks → KES 12,713 double-paid)."""
+    require_external_side_effects_enabled("M-Pesa B2B status reconciliation")
+
     if not settings.MPESA_B2B_INITIATOR_NAME:
         return
 
@@ -1434,6 +1441,8 @@ async def execute_payout(
     Returns a PayoutLegResult per leg. A leg that fails does not stop the rest:
     one misconfigured till must not strand the other routers' money.
     """
+    require_external_side_effects_enabled("reseller payout execution")
+
     if payment_method is not None:
         if balance is None:
             balance = await get_unpaid_balance(db, reseller_id)
@@ -1552,6 +1561,8 @@ async def run_daily_payouts():
     Scheduled job: pay out all eligible resellers via B2B.
     Only runs for system-collected resellers (MPESA_PAYBILL, BANK_ACCOUNT).
     """
+    require_external_side_effects_enabled("daily reseller payout run")
+
     if not settings.MPESA_B2B_DAILY_PAYOUT_ENABLED:
         return
 

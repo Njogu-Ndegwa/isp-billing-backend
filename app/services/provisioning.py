@@ -20,6 +20,7 @@ from sqlalchemy import select, func
 from app.db.models import Router, ProvisioningToken, ProvisioningTokenStatus, User
 from app.db.database import AsyncSessionLocal
 from app.config import settings
+from app.core.runtime_mode import require_external_side_effects_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,7 @@ async def allocate_wireguard_ip(db: AsyncSession) -> str:
 
 async def register_wireguard_peer(public_key: str, ip: str):
     """Register a new WireGuard peer via the wg-manager sidecar."""
+    require_external_side_effects_enabled("primary WireGuard peer registration")
     async with _wg_client() as client:
         response = await client.post(
             "/add-peer",
@@ -242,6 +244,7 @@ async def register_wireguard_peer(public_key: str, ip: str):
 
 async def remove_wireguard_peer(public_key: str):
     """Remove a WireGuard peer via the wg-manager sidecar."""
+    require_external_side_effects_enabled("primary WireGuard peer removal")
     async with _wg_client() as client:
         response = await client.request(
             "DELETE",
@@ -270,6 +273,7 @@ async def get_server_wg_public_key() -> str:
 
 async def register_l2tp_peer(username: str, password: str, ip: str):
     """Register a new L2TP peer via the wg-manager sidecar (chap-secrets)."""
+    require_external_side_effects_enabled("primary L2TP peer registration")
     async with _wg_client() as client:
         response = await client.post(
             "/add-l2tp-peer",
@@ -282,6 +286,7 @@ async def register_l2tp_peer(username: str, password: str, ip: str):
 
 async def remove_l2tp_peer(username: str):
     """Remove an L2TP peer via the wg-manager sidecar."""
+    require_external_side_effects_enabled("primary L2TP peer removal")
     async with _wg_client() as client:
         response = await client.request(
             "DELETE",
