@@ -12,6 +12,8 @@ from typing import Optional
 
 import httpx
 
+from app.core.runtime_mode import require_external_side_effects_enabled
+
 logger = logging.getLogger(__name__)
 
 ZENOPAY_BASE_URL = "https://zenoapi.com/api"
@@ -32,6 +34,8 @@ async def initiate_zenopay_payment(
     The customer receives a push notification on their phone to authorize the
     payment. Results are delivered asynchronously via the webhook_url.
     """
+    require_external_side_effects_enabled("ZenoPay payment initiation")
+
     payload = {
         "order_id": order_id,
         "buyer_email": email,

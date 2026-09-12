@@ -1,5 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text as sa_text
 from app.db.database import get_db, async_engine, Base
 from app.services.plan_cache import warm_plan_cache
@@ -7,6 +8,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 import logging
+
+from app.core.runtime_mode import (
+    runtime_mode_name,
+    shadow_http_request_allowed,
+    shadow_mode_enabled,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +28,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def enforce_shadow_mode(request: Request, call_next):
+    if shadow_mode_enabled() and not shadow_http_request_allowed(
+        request.method, request.url.path
+    ):
+        logger.warning(
+            "Shadow mode blocked unsafe request: %s %s",
+            request.method,
+            request.url.path,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "This migration validation stack is read-only",
+                "code": "shadow_mode_blocked",
+            },
+            headers={"X-ISP-Runtime-Mode": "shadow"},
+        )
+
+    response = await call_next(request)
+    response.headers["X-ISP-Runtime-Mode"] = runtime_mode_name()
+    return response
 
 # --- Router registrations ---
 from app.api.radius_endpoints import router as radius_router
@@ -2501,6 +2532,17 @@ async def run_hot_path_index_migrations():
 
 @app.on_event("startup")
 async def startup_event():
+    if shadow_mode_enabled():
+        # Do this before the first startup migration.  A dark stack must be
+        # safe even if it is accidentally pointed at the production database.
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        scheduler.remove_all_jobs()
+        logger.warning(
+            "SHADOW_MODE active: startup migrations and every scheduler job are disabled"
+        )
+        return
+
     try:
         await run_radius_migrations()
         logger.info("RADIUS migrations completed successfully")
@@ -2927,7 +2969,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    scheduler.shutdown()
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
     logger.info("Background scheduler stopped")
 
 

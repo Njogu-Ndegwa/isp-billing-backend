@@ -724,7 +724,13 @@ async def get_dashboard_analytics(
 
 @router.get("/health")
 def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    from app.core.runtime_mode import runtime_mode_name
+
+    return {
+        "status": "healthy",
+        "runtime_mode": runtime_mode_name(),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 
 @router.get("/api/dashboard/revenue-over-time")

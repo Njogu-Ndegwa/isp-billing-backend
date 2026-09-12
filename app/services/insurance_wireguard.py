@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Set
 import httpx
 
 from app.config import settings
+from app.core.runtime_mode import require_external_side_effects_enabled
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.provisioning import generate_wireguard_keypair
 
@@ -28,7 +29,10 @@ def derive_insurance_ip(router_ip: str, target_subnet: str | None = None) -> str
             f"Router IP {router_ip} is outside {SOURCE_MGMT_SUBNET}; cannot derive insurance IP"
         )
 
-    target = ipaddress.IPv4Network(target_subnet or str(DEFAULT_INSURANCE_SUBNET))
+    configured = (getattr(settings, "INSURANCE_WG_SUBNET", "") or "").strip()
+    target = ipaddress.IPv4Network(
+        target_subnet or configured or str(DEFAULT_INSURANCE_SUBNET)
+    )
     if target.prefixlen != SOURCE_MGMT_SUBNET.prefixlen:
         raise InsuranceWireGuardError(
             f"Insurance subnet {target} must use /16 to preserve router host offsets"
@@ -375,6 +379,10 @@ async def insurance_manager_request(
     path: str,
     json: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    if method.upper() not in {"GET", "HEAD"}:
+        require_external_side_effects_enabled(
+            f"insurance manager {method.upper()} {path}"
+        )
     url = settings.INSURANCE_WG_MANAGER_URL.rstrip("/")
     if not url:
         raise InsuranceWireGuardError("INSURANCE_WG_MANAGER_URL is not configured")

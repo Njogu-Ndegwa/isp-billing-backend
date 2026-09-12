@@ -132,9 +132,12 @@ async def login_api(
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
-        user.last_login_at = datetime.utcnow()
-        db.add(user)
-        await db.flush()
+        from app.core.runtime_mode import shadow_mode_enabled
+
+        if not shadow_mode_enabled():
+            user.last_login_at = datetime.utcnow()
+            db.add(user)
+            await db.flush()
 
         token_data = {
             "sub": str(user.id),
@@ -158,8 +161,6 @@ async def login_api(
         except Exception as alert_err:
             logger.warning(f"Failed to get subscription alert for user {user.id}: {alert_err}")
 
-        await db.commit()
-
         response = {
             "access_token": access_token,
             "token_type": "bearer",
@@ -178,6 +179,13 @@ async def login_api(
 
         if subscription_alert:
             response["subscription_alert"] = subscription_alert
+
+        if shadow_mode_enabled():
+            # Build the response before rollback expires ORM attributes.
+            # Authentication stays useful, but no last_login_at write occurs.
+            await db.rollback()
+        else:
+            await db.commit()
 
         return response
     except HTTPException:

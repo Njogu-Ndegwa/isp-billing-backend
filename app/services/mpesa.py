@@ -7,6 +7,7 @@ import httpx
 from fastapi import HTTPException
 
 from app.config import settings
+from app.core.runtime_mode import require_external_side_effects_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ async def initiate_stk_push_direct(
     callback_url: Optional[str] = None,
     account_reference: Optional[str] = None,
 ) -> Optional[StkPushResponse]:
+    require_external_side_effects_enabled("M-Pesa STK push")
     try:
         access_token = await get_access_token(
             consumer_key=consumer_key,
@@ -127,6 +129,8 @@ async def initiate_stk_push_via_graphql_microservice(
     Calls the payment microservice GraphQL mutation and automatically falls back
     to the older/newer mutation names when needed.
     """
+
+    require_external_side_effects_enabled("M-Pesa GraphQL STK push")
 
     variables = {
         "merchantId": merchant_id,
@@ -251,6 +255,8 @@ async def initiate_stk_push(
     falls back to system default on failure.
     Accepts optional per-reseller credentials for direct collection.
     """
+    require_external_side_effects_enabled("M-Pesa STK push")
+
     if shortcode and shortcode != settings.MPESA_SHORTCODE:
         try:
             return await initiate_stk_push_direct(
@@ -282,6 +288,8 @@ async def query_stk_push_status(checkout_request_id: str, access_token: str | No
     Raises on network/auth errors so the caller can retry later.
     Pass *access_token* to reuse a token across a batch of queries.
     """
+    require_external_side_effects_enabled("M-Pesa STK status query")
+
     if access_token is None:
         access_token = await get_access_token()
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")

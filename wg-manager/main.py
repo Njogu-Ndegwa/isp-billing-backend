@@ -14,12 +14,23 @@ WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0")
 SERVER_PUBLIC_KEY_PATH = os.environ.get("WG_SERVER_PUBKEY_PATH", "/etc/wireguard/server_public.key")
 L2TP_CHAP_SECRETS_PATH = os.environ.get("L2TP_CHAP_SECRETS_PATH", "/etc/ppp/chap-secrets")
 L2TP_SERVER_NAME = "l2tp-server"
+SHADOW_MODE = os.environ.get("SHADOW_MODE", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 
 def verify_secret(x_api_key: str = Header(...)):
     if x_api_key != API_SECRET:
         raise HTTPException(status_code=403, detail="Invalid API key")
     return True
+
+
+def require_mutations_enabled():
+    if SHADOW_MODE:
+        raise HTTPException(
+            status_code=503,
+            detail="WireGuard/L2TP mutations are disabled in shadow mode",
+        )
 
 
 class AddPeerRequest(BaseModel):
@@ -44,6 +55,7 @@ class RemoveL2tpPeerRequest(BaseModel):
 @app.post("/add-l2tp-peer")
 def add_l2tp_peer(req: AddL2tpPeerRequest, _=Depends(verify_secret)):
     """Append a user line to /etc/ppp/chap-secrets for L2TP authentication."""
+    require_mutations_enabled()
     try:
         line = f'{req.username}    {L2TP_SERVER_NAME}    "{req.password}"    {req.ip}\n'
         existing = ""
@@ -69,6 +81,7 @@ def add_l2tp_peer(req: AddL2tpPeerRequest, _=Depends(verify_secret)):
 @app.delete("/remove-l2tp-peer")
 def remove_l2tp_peer(req: RemoveL2tpPeerRequest, _=Depends(verify_secret)):
     """Remove a user line from /etc/ppp/chap-secrets."""
+    require_mutations_enabled()
     try:
         if not os.path.exists(L2TP_CHAP_SECRETS_PATH):
             raise HTTPException(status_code=404, detail="chap-secrets file not found")
@@ -89,6 +102,7 @@ def remove_l2tp_peer(req: RemoveL2tpPeerRequest, _=Depends(verify_secret)):
 
 @app.post("/add-peer")
 def add_peer(req: AddPeerRequest, _=Depends(verify_secret)):
+    require_mutations_enabled()
     try:
         result = subprocess.run(
             ["wg", "set", WG_INTERFACE, "peer", req.public_key,
@@ -107,6 +121,7 @@ def add_peer(req: AddPeerRequest, _=Depends(verify_secret)):
 
 @app.delete("/remove-peer")
 def remove_peer(req: RemovePeerRequest, _=Depends(verify_secret)):
+    require_mutations_enabled()
     try:
         result = subprocess.run(
             ["wg", "set", WG_INTERFACE, "peer", req.public_key, "remove"],
@@ -185,10 +200,16 @@ def health():
         return {
             "status": "healthy" if result.returncode == 0 else "degraded",
             "interface": WG_INTERFACE,
-            "wg_available": result.returncode == 0
+            "wg_available": result.returncode == 0,
+            "runtime_mode": "shadow" if SHADOW_MODE else "active",
         }
     except Exception:
-        return {"status": "unhealthy", "interface": WG_INTERFACE, "wg_available": False}
+        return {
+            "status": "unhealthy",
+            "interface": WG_INTERFACE,
+            "wg_available": False,
+            "runtime_mode": "shadow" if SHADOW_MODE else "active",
+        }
 
 
 if __name__ == "__main__":

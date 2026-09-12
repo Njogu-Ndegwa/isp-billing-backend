@@ -26,6 +26,18 @@ engine_kwargs = {
     "future": True,
 }
 
+
+def connection_server_settings() -> dict[str, str]:
+    server_settings = {
+        "idle_in_transaction_session_timeout": str(settings.DB_IDLE_TX_TIMEOUT_MS),
+        "lock_timeout": str(settings.DB_LOCK_TIMEOUT_MS),
+    }
+    if settings.SHADOW_MODE:
+        # Database enforcement is the final backstop for a GET endpoint or
+        # newly-added code path that accidentally attempts a write.
+        server_settings["default_transaction_read_only"] = "on"
+    return server_settings
+
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["poolclass"] = NullPool
 else:
@@ -40,12 +52,7 @@ else:
         # waiters bail at DB_LOCK_TIMEOUT_MS, preventing the routers-row lock
         # convoy that drained the pool (incident 2026-06-05). Lives in code so it
         # survives DB volume recreation and never touches the shared RADIUS role.
-        connect_args={
-            "server_settings": {
-                "idle_in_transaction_session_timeout": str(settings.DB_IDLE_TX_TIMEOUT_MS),
-                "lock_timeout": str(settings.DB_LOCK_TIMEOUT_MS),
-            }
-        },
+        connect_args={"server_settings": connection_server_settings()},
     )
 
 async_engine = create_async_engine(DATABASE_URL, **engine_kwargs)

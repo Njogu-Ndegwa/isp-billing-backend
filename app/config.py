@@ -5,6 +5,12 @@ from dotenv import load_dotenv
 load_dotenv()  # Optional if you use a .env file
 
 class Settings(BaseSettings):
+    # A restored migration/DR stack must be safe to start alongside production.
+    # Shadow mode makes application DB connections read-only, skips startup
+    # migrations/schedulers, blocks unsafe HTTP methods, and guards outbound
+    # router/provider mutation boundaries.
+    SHADOW_MODE: bool = False
+
     # PostgreSQL connection - set via environment variable
     DATABASE_URL: str = "postgresql+asyncpg://isp_user:isp_secure_pass_2024@localhost:5434/isp_billing_db"
     DB_POOL_SIZE: int = 15
