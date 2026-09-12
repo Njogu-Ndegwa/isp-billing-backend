@@ -7,5 +7,6 @@ __pycache__/
 .venv/
 venv/
 
-# Environment files
-.env
+# Environment files (examples are safe; populated files are not)
+.env*
+!.env*.example

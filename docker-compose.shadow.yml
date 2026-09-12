@@ -1,0 +1,62 @@
+name: isp-billing-shadow
+
+x-shadow-logging: &shadow-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  shadow-db:
+    image: postgres:15-alpine
+    container_name: isp_billing_shadow_db
+    env_file:
+      - ${SHADOW_ENV_FILE:-.env.shadow}
+    volumes:
+      - shadow_postgres_data:/var/lib/postgresql/data
+    networks:
+      - shadow-internal
+    restart: "no"
+    logging: *shadow-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  shadow-web:
+    build: .
+    image: isp-billing-shadow:${SHADOW_IMAGE_TAG:-candidate}
+    container_name: isp_billing_shadow_app
+    env_file:
+      - ${SHADOW_ENV_FILE:-.env.shadow}
+    environment:
+      SHADOW_MODE: "true"
+      SMS_DISPATCH_ENABLED: "false"
+      MPESA_B2B_DAILY_PAYOUT_ENABLED: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+    ports:
+      - "127.0.0.1:${SHADOW_WEB_PORT:-18000}:8000"
+    depends_on:
+      shadow-db:
+        condition: service_healthy
+    networks:
+      - shadow-internal
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *shadow-logging
+
+volumes:
+  shadow_postgres_data:
+    name: isp_billing_shadow_postgres_data
+
+networks:
+  shadow-internal:
+    name: isp_billing_shadow_internal
+    internal: true
