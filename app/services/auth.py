@@ -11,6 +11,7 @@ from app.db.models import User, UserRole, SubscriptionStatus
 from app.db.database import get_db
 from app.config import settings
 from app.core.security import ALGORITHM
+from app.services import attribution
 import logging
 
 logger = logging.getLogger(__name__)
@@ -28,9 +29,11 @@ async def generate_unique_user_code(db: AsyncSession) -> int:
         if not result.scalar():
             return user_code
 
-async def create_user(db: AsyncSession, email: str, password: str, role: UserRole, organization_name: str, created_by: int = None, business_name: str = None, support_phone: str = None, mpesa_shortcode: str = None):
+async def create_user(db: AsyncSession, email: str, password: str, role: UserRole, organization_name: str, created_by: int = None, business_name: str = None, support_phone: str = None, mpesa_shortcode: str = None, acquisition_details: dict = None):
     hashed_password = await asyncio.to_thread(pwd_context.hash, password)
     user_code = await generate_unique_user_code(db)
+    # Already sanitized by app.services.attribution before it reaches here.
+    acq_source, acq_campaign = attribution.summarize(acquisition_details)
     user = User(
         user_code=user_code,
         email=email,
@@ -41,7 +44,10 @@ async def create_user(db: AsyncSession, email: str, password: str, role: UserRol
         support_phone=support_phone,
         mpesa_shortcode=mpesa_shortcode,
         created_by=created_by,
-        created_at=datetime.utcnow()
+        created_at=datetime.utcnow(),
+        acquisition_source=acq_source,
+        acquisition_campaign=acq_campaign,
+        acquisition_details=acquisition_details or None,
     )
     if role == UserRole.RESELLER:
         from app.services.subscription import TRIAL_DAYS
