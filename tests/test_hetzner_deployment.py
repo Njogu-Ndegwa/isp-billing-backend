@@ -26,6 +26,7 @@ def test_hetzner_compose_is_dark_and_does_not_replace_tunnel_manager():
     assert "wg-manager:" not in compose
     assert "no-new-privileges:true" in compose
     assert "read_only: true" in compose
+    assert "subnet: 172.20.0.0/16" in compose
 
 
 def test_hetzner_radius_uses_environment_secrets_and_target_subnet():

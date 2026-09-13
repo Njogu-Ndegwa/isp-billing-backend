@@ -106,3 +106,7 @@ networks:
   hetzner-private:
     name: isp_billing_hetzner_private
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
