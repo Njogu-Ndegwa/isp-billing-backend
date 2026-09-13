@@ -35,8 +35,6 @@ services:
       SMS_DISPATCH_ENABLED: "false"
       MPESA_B2B_DAILY_PAYOUT_ENABLED: "false"
       PYTHONDONTWRITEBYTECODE: "1"
-    ports:
-      - "127.0.0.1:${SHADOW_WEB_PORT:-18000}:8000"
     depends_on:
       shadow-db:
         condition: service_healthy
@@ -51,6 +49,12 @@ services:
     security_opt:
       - no-new-privileges:true
     logging: *shadow-logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
 
 volumes:
   shadow_postgres_data:
