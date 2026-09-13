@@ -280,15 +280,16 @@ def test_shadow_compose_is_isolated_and_excludes_active_control_plane():
     assert 'SHADOW_MODE: "true"' in compose
     assert 'SMS_DISPATCH_ENABLED: "false"' in compose
     assert 'MPESA_B2B_DAILY_PAYOUT_ENABLED: "false"' in compose
-    assert '"127.0.0.1:${SHADOW_WEB_PORT:-18000}:8000"' in compose
     assert "internal: true" in compose
     assert "read_only: true" in compose
     assert "no-new-privileges:true" in compose
+    assert "urllib.request.urlopen('http://127.0.0.1:8000/health'" in compose
     assert "freeradius:" not in compose
     assert "wg-manager:" not in compose
     assert "1812:1812" not in compose
     assert "1813:1813" not in compose
     assert "8729" not in compose
+    assert "SHADOW_WEB_PORT" not in compose
     assert "${SHADOW_ENV_FILE:-.env.shadow}" in compose
 
     gitignore = Path(".gitignore").read_text(encoding="utf-8")
