@@ -1,0 +1,108 @@
+name: isp-billing-hetzner
+
+x-hetzner-logging: &hetzner-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: isp_billing_hetzner_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - hetzner_postgres_data:/var/lib/postgresql/data
+    networks:
+      - hetzner-private
+    restart: unless-stopped
+    logging: *hetzner-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build: .
+    image: isp-billing-hetzner:${HETZNER_IMAGE_TAG:-candidate}
+    container_name: isp_billing_hetzner_app
+    env_file:
+      - ${HETZNER_ENV_FILE:-.env.hetzner}
+    environment:
+      SHADOW_MODE: "false"
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-false}
+      SMS_DISPATCH_ENABLED: ${SMS_DISPATCH_ENABLED:-false}
+      MPESA_B2B_DAILY_PAYOUT_ENABLED: ${MPESA_B2B_DAILY_PAYOUT_ENABLED:-false}
+      FEEDBACK_AI_ENABLED: ${FEEDBACK_AI_ENABLED:-false}
+      PYTHONDONTWRITEBYTECODE: "1"
+    ports:
+      - "127.0.0.1:${HETZNER_WEB_PORT:-8000}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - hetzner-private
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *hetzner-logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 120s
+
+  freeradius:
+    build:
+      context: ./radius
+      dockerfile: Dockerfile
+    image: isp-billing-radius-hetzner:${HETZNER_IMAGE_TAG:-candidate}
+    container_name: isp_billing_hetzner_radius
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      RADIUS_SHARED_SECRET: ${RADIUS_SHARED_SECRET:?set RADIUS_SHARED_SECRET}
+    ports:
+      - "10.251.0.1:1812:1812/udp"
+      - "10.251.0.1:1813:1813/udp"
+    volumes:
+      - ./radius/clients.hetzner.conf:/etc/freeradius/clients.conf:ro
+      - ./radius/mods-enabled/sql.hetzner:/etc/freeradius/mods-enabled/sql:ro
+      - ./radius/sites-enabled/default:/etc/freeradius/sites-enabled/default:ro
+      - ./radius/dictionary.mikrotik:/etc/freeradius/dictionary.mikrotik:ro
+      - ./radius/dictionary:/etc/freeradius/dictionary:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - hetzner-private
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *hetzner-logging
+
+volumes:
+  hetzner_postgres_data:
+    name: isp_billing_hetzner_postgres_data
+
+networks:
+  hetzner-private:
+    name: isp_billing_hetzner_private
+    driver: bridge

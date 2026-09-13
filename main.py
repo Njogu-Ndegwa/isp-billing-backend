@@ -2860,15 +2860,19 @@ async def startup_event():
         logger.error(f"Hot-path index migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
-    if not app_settings.RUN_SCHEDULER:
+    if not app_settings.RUN_SCHEDULER or not app_settings.SCHEDULER_ENABLED:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        scheduler.remove_all_jobs()
         logger.warning(
-            "Background scheduler disabled by RUN_SCHEDULER=false; "
-            "this instance will not run scheduled billing, reconciliation, or router jobs"
+            "Background scheduler disabled by RUN_SCHEDULER=false or "
+            "SCHEDULER_ENABLED=false; this instance will not run scheduled "
+            "billing, reconciliation, or router jobs"
         )
         async for db in get_db():
             await warm_plan_cache(db)
             break
-        logger.info("Plan cache warmed up")
+        logger.info("Plan cache warmed up with background scheduler disabled")
         return
 
     scheduler.add_job(
