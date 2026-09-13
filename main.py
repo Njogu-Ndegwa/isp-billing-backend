@@ -2270,6 +2270,31 @@ async def run_payment_port_attribution_migrations():
     logger.info("Payment port attribution migrations complete")
 
 
+async def run_signup_attribution_migrations():
+    """Add users.acquisition_source / acquisition_campaign / acquisition_details
+    so a reseller account records where it came from (TikTok ad, Google Search,
+    referral). Source and campaign are indexed because every acquisition report
+    groups by them; the JSON holds the click ids needed to upload offline
+    conversions back to Google and TikTok. All NULL for existing accounts.
+    Idempotent: ADD COLUMN IF NOT EXISTS + CREATE INDEX IF NOT EXISTS."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "ALTER TABLE users "
+            "ADD COLUMN IF NOT EXISTS acquisition_source VARCHAR(120) NULL, "
+            "ADD COLUMN IF NOT EXISTS acquisition_campaign VARCHAR(190) NULL, "
+            "ADD COLUMN IF NOT EXISTS acquisition_details JSON NULL"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_users_acquisition_source "
+            "ON users(acquisition_source)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_users_acquisition_campaign "
+            "ON users(acquisition_campaign)"
+        ))
+    logger.info("Signup attribution migrations complete")
+
+
 async def run_pull_channel_migrations():
     """Add routers.pull_channel_enabled (bool, default false) for the outbound
     pull-provisioning channel. Opt-in per router; the command queue itself lives on
@@ -2682,6 +2707,12 @@ async def startup_event():
         logger.info("Payment port attribution migrations completed successfully")
     except Exception as e:
         logger.error(f"Payment port attribution migration failed (non-fatal): {e}")
+
+    try:
+        await run_signup_attribution_migrations()
+        logger.info("Signup attribution migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Signup attribution migration failed (non-fatal): {e}")
 
     try:
         await run_feedback_migrations()

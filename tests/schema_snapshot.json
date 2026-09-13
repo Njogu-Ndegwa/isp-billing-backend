@@ -980,6 +980,9 @@
   "upload_bytes"
  ],
  "users": [
+  "acquisition_campaign",
+  "acquisition_details",
+  "acquisition_source",
   "business_name",
   "created_at",
   "created_by",

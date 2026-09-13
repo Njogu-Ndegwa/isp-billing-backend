@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from pydantic import BaseModel
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime, timedelta
 import asyncio
 import hashlib
@@ -13,6 +13,7 @@ from app.db.models import User, UserRole, PasswordResetToken
 from app.services.auth import create_user, authenticate_user, create_access_token, pwd_context
 from app.services.subscription import get_invoice_alert_for_user
 from app.services import email_service
+from app.services import attribution as attribution_service
 from app.config import settings
 import logging
 
@@ -29,6 +30,15 @@ class UserRegisterRequest(BaseModel):
     business_name: Optional[str] = None
     support_phone: Optional[str] = None
     mpesa_shortcode: Optional[str] = None
+    # Where the signup came from (utm_*, gclid, ttclid, referrer, landing_path,
+    # seen_at). Deliberately untyped: the marketing site must be able to add a
+    # new platform's click id without a coordinated backend release, and a
+    # signup must never fail over a field that only feeds a report. `Any`
+    # rather than `Dict[str, Any]` for that last reason: a frontend bug that
+    # sends a string here would otherwise 422 the whole registration. Anything
+    # that isn't a usable object is sanitized away to None instead. Values are
+    # length-capped by app.services.attribution before anything is stored.
+    attribution: Optional[Any] = None
 
 
 @router.post("/api/users/register")
@@ -49,11 +59,14 @@ async def register_user_api(
         if existing_result.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="User with this email already exists")
 
+        acquisition = attribution_service.sanitize_attribution(request.attribution)
+
         user = await create_user(
             db, request.email, request.password, role_enum, request.organization_name,
             business_name=request.business_name,
             support_phone=request.support_phone,
-            mpesa_shortcode=request.mpesa_shortcode
+            mpesa_shortcode=request.mpesa_shortcode,
+            acquisition_details=acquisition,
         )
 
         response_data = {
@@ -65,6 +78,7 @@ async def register_user_api(
             "business_name": getattr(user, 'business_name', None),
             "support_phone": getattr(user, 'support_phone', None),
             "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None),
+            "acquisition_source": getattr(user, 'acquisition_source', None),
             "created_at": user.created_at.isoformat()
         }
 
@@ -74,6 +88,7 @@ async def register_user_api(
                 await try_link_lead_on_registration(
                     db, user.id, request.email, request.support_phone,
                     request.organization_name,
+                    attribution=acquisition,
                 )
                 await db.commit()
             except Exception as link_err:

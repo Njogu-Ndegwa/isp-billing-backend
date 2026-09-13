@@ -139,6 +139,17 @@ class User(Base):
         server_default="trial"
     )
     subscription_expires_at = Column(DateTime, nullable=True)
+    # Where this account came from, captured on the visitor's FIRST landing by
+    # the marketing site and sent with the signup. Source and campaign are
+    # broken out as indexed columns so "signups by source" and revenue-by-
+    # channel reports never have to dig through JSON; the rest of the payload —
+    # click ids, referrer, landing path — stays in acquisition_details, and the
+    # click ids are what allow uploading offline conversions back to Google and
+    # TikTok so they optimise toward resellers who actually pay. NULL on every
+    # account created before this shipped and on every admin-created account.
+    acquisition_source = Column(String(120), nullable=True, index=True)
+    acquisition_campaign = Column(String(190), nullable=True, index=True)
+    acquisition_details = Column(JSON, nullable=True)
 
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
