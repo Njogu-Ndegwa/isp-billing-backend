@@ -2737,6 +2737,21 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Hot-path index migration failed (non-fatal): {e}")
 
+    from app.config import settings as app_settings
+    if not app_settings.SCHEDULER_ENABLED:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        scheduler.remove_all_jobs()
+        logger.warning(
+            "SCHEDULER_ENABLED=False: startup migrations completed, but every "
+            "background scheduler job remains disabled"
+        )
+        async for db in get_db():
+            await warm_plan_cache(db)
+            break
+        logger.info("Plan cache warmed up with background scheduler disabled")
+        return
+
     scheduler.add_job(
         cleanup_expired_users_background,
         trigger=IntervalTrigger(seconds=67),
@@ -2924,7 +2939,6 @@ async def startup_event():
         misfire_grace_time=900,
     )
 
-    from app.config import settings as app_settings
     if app_settings.MPESA_B2B_DAILY_PAYOUT_ENABLED:
         scheduler.add_job(
             run_daily_payouts,

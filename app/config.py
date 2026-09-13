@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     # migrations/schedulers, blocks unsafe HTTP methods, and guards outbound
     # router/provider mutation boundaries.
     SHADOW_MODE: bool = False
+    # Allow startup migrations while keeping a dark migration candidate from
+    # launching fleet scans, payment reconciliation, notifications, or other
+    # scheduled work. Production defaults to enabled; deployment candidates
+    # must opt out explicitly until traffic ownership is transferred.
+    SCHEDULER_ENABLED: bool = True
 
     # PostgreSQL connection - set via environment variable
     DATABASE_URL: str = "postgresql+asyncpg://isp_user:isp_secure_pass_2024@localhost:5434/isp_billing_db"
