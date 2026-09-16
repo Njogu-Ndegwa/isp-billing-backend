@@ -1152,6 +1152,15 @@ async def run_b2b_migrations():
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_b2b_conversation_id "
             "ON b2b_transactions(conversation_id) WHERE conversation_id IS NOT NULL"
         ))
+        # Safaricom may deliver the same result callback concurrently. The
+        # service row-locks the B2B transaction, and this partial unique index
+        # is the final backstop: one M-Pesa receipt can settle the reseller
+        # ledger only once. Manual/admin payout references are unaffected.
+        await conn.execute(sa_text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_reseller_payouts_mpesa_reference "
+            "ON reseller_payouts(reference) "
+            "WHERE payment_method = 'mpesa_b2b' AND reference IS NOT NULL"
+        ))
         logger.info("Migration: Ensured b2b_transactions table and indexes exist")
 
     async with async_engine.begin() as conn:

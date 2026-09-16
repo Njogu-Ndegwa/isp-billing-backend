@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint
+from sqlalchemy import Column, Integer, String, Text, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -1200,6 +1200,19 @@ class FapshiTransaction(Base):
 class ResellerPayout(Base):
     """Manual payout recorded by admin when system-collected funds are sent to a reseller."""
     __tablename__ = "reseller_payouts"
+    __table_args__ = (
+        Index(
+            "uq_reseller_payouts_mpesa_reference",
+            "reference",
+            unique=True,
+            postgresql_where=text(
+                "payment_method = 'mpesa_b2b' AND reference IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "payment_method = 'mpesa_b2b' AND reference IS NOT NULL"
+            ),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
