@@ -1054,9 +1054,16 @@ async def register_hotspot_and_pay_api(
 async def get_payment_status(
     customerId: int,
     background_tasks: BackgroundTasks,
+    mac: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get payment status for a customer"""
+    """Get payment status for a customer.
+
+    When ``mac`` matches the paying device and the plan covers more than one
+    device, the response also carries ``access_code``: the code the customer
+    enters on their other devices. Customer ids are sequential, so the code is
+    never returned without the matching device MAC.
+    """
     try:
         stmt = select(Customer).options(
             selectinload(Customer.plan)
@@ -1076,7 +1083,34 @@ async def get_payment_status(
             background_tasks.add_task(kick_pending_fapshi_check, customerId)
 
         attempt = await get_recent_delivery_attempt_for_customer(db, customer.id)
-        
+
+        from app.services.mikrotik_api import normalize_mac_address, validate_mac_address
+
+        access_code = None
+        max_devices = None
+        if (
+            mac
+            and customer.mac_address
+            and validate_mac_address(mac)
+            and normalize_mac_address(mac) == normalize_mac_address(customer.mac_address)
+            and customer.status == CustomerStatus.ACTIVE
+            and customer.subscription_owner_id is None
+            and customer.router_id
+            and customer.expiry
+            and customer.expiry > datetime.utcnow()
+        ):
+            from app.api.device_pairing import _format_share_code, get_or_create_access_code
+            from app.services.subscription_sharing import (
+                max_shared_users_for_plan,
+                sharing_enabled_for_plan,
+            )
+
+            if sharing_enabled_for_plan(customer.plan):
+                code_row = await get_or_create_access_code(db, customer)
+                access_code = _format_share_code(code_row.code)
+                max_devices = max_shared_users_for_plan(customer.plan)
+                await db.commit()
+
         return {
             "customer_id": customer.id,
             "status": customer.status.value,
@@ -1084,6 +1118,8 @@ async def get_payment_status(
             "plan_id": customer.plan_id,
             "plan_name": customer.plan.name if customer.plan else None,
             "delivery": serialize_delivery_attempt(attempt),
+            "access_code": access_code,
+            "max_devices": max_devices,
         }
     except HTTPException:
         raise

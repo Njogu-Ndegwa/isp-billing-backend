@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta
 from fastapi import HTTPException
@@ -149,6 +149,28 @@ async def record_customer_payment(
 
         logging.getLogger(__name__).error(
             f"[USAGE] on_renewal failed in reseller payment for customer {customer.id}: {renew_err}"
+        )
+
+    if customer.subscription_owner_id:
+        # A device that was sharing someone else's plan just paid for its own.
+        # Detach it, or the old owner's next renewal would overwrite this
+        # customer's expiry with theirs.
+        from app.db.models import DevicePairing
+
+        previous_owner_id = customer.subscription_owner_id
+        customer.subscription_owner_id = None
+        await db.execute(
+            update(DevicePairing)
+            .where(
+                DevicePairing.customer_id == customer.id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+            )
+            .values(is_active=False, subscription_owner_customer_id=None, is_subscription_share=False)
+        )
+        logger.info(
+            "[SUBSCRIPTION-SHARE] Customer %s paid for its own plan; detached from owner %s",
+            customer.id,
+            previous_owner_id,
         )
 
     if not customer.subscription_owner_id:

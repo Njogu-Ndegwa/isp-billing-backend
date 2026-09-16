@@ -52,6 +52,7 @@ from app.api.profile_routes import router as profile_router
 from app.api.b2b_routes import router as b2b_router
 from app.api.subscription_routes import router as subscription_router
 from app.api.device_pairing import router as device_pairing_router
+from app.api.access_code_routes import router as access_code_router
 from app.api.admin_metrics_routes import router as admin_metrics_router
 from app.api.lead_routes import router as lead_router
 from app.api.usage_routes import router as usage_router
@@ -97,6 +98,7 @@ app.include_router(profile_router)
 app.include_router(b2b_router)
 app.include_router(subscription_router)
 app.include_router(device_pairing_router)
+app.include_router(access_code_router)
 app.include_router(admin_metrics_router)
 app.include_router(lead_router)
 app.include_router(usage_router)
