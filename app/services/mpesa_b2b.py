@@ -473,8 +473,17 @@ async def _settle_completed_transaction(
 
     Shared by the Safaricom result callback and the transaction-status
     reconciliation path — the ledger must end up identical whichever way we
-    learn that the money moved.
+    learn that the money moved. Callers that can race must lock the transaction
+    row before checking its status; the unique M-Pesa reference index is the
+    final database backstop if a future caller forgets that rule.
     """
+    if txn.payout_id is not None:
+        logger.info(
+            "B2B transaction %s already has payout %s; skipping duplicate settlement",
+            txn.id, txn.payout_id,
+        )
+        return
+
     txn.status = B2BTransactionStatus.COMPLETED
     txn.completed_at = datetime.utcnow()
     if transaction_id:
@@ -540,16 +549,20 @@ async def process_b2b_result(db: AsyncSession, result_body: dict) -> Optional[B2
 
     txn = None
     if conversation_id:
-        stmt = select(B2BTransaction).where(
-            B2BTransaction.conversation_id == conversation_id
+        stmt = (
+            select(B2BTransaction)
+            .where(B2BTransaction.conversation_id == conversation_id)
+            .with_for_update()
         )
         row = await db.execute(stmt)
         txn = row.scalar_one_or_none()
 
     if not txn:
         if originator_id:
-            stmt2 = select(B2BTransaction).where(
-                B2BTransaction.originator_conversation_id == originator_id
+            stmt2 = (
+                select(B2BTransaction)
+                .where(B2BTransaction.originator_conversation_id == originator_id)
+                .with_for_update()
             )
             row2 = await db.execute(stmt2)
             txn = row2.scalar_one_or_none()
@@ -591,7 +604,7 @@ async def process_b2b_timeout(db: AsyncSession, body: dict) -> Optional[B2BTrans
     conversation_id = _provider_id_or_none(result.get("ConversationID"))
     originator_id = _provider_id_or_none(result.get("OriginatorConversationID"))
 
-    stmt = select(B2BTransaction)
+    stmt = select(B2BTransaction).with_for_update()
     if conversation_id:
         stmt = stmt.where(B2BTransaction.conversation_id == conversation_id)
     elif originator_id:
@@ -847,7 +860,13 @@ async def process_b2b_status_result(db: AsyncSession, body: dict) -> Optional[B2
         )
         return None
 
-    txn = await db.get(B2BTransaction, txn_id)
+    txn = (
+        await db.execute(
+            select(B2BTransaction)
+            .where(B2BTransaction.id == txn_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
     if not txn:
         return None
     if txn.status not in UNRESOLVED_STATUSES:

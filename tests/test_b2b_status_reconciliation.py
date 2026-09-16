@@ -12,11 +12,13 @@ KES 12,713. These tests pin the two defenses:
    failed → reseller stays owed; anything ambiguous → still blocked.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.db.models import (
     B2BTransaction,
@@ -25,6 +27,7 @@ from app.db.models import (
     ResellerTransactionCharge,
 )
 from tests.factories import make_reseller
+from tests.conftest import running_on_postgres
 from tests.test_b2b_payout_resilience import _patch_payout_env
 
 pytestmark = pytest.mark.asyncio
@@ -213,6 +216,130 @@ async def test_status_result_is_idempotent(engine, db, monkeypatch):
         select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
     )).scalars().all()
     assert len(payouts) == 1
+
+
+async def test_result_callback_is_idempotent(engine, db):
+    """A repeated normal result callback must create one payout and one fee."""
+    from app.services import mpesa_b2b as b2b
+
+    r1 = await make_reseller(db)
+    txn = await _make_txn(
+        db,
+        r1.id,
+        status=B2BTransactionStatus.PENDING,
+        conversation_id="AG_RESULT_DUP",
+        originator_id="orig-result-dup",
+        net=4993.0,
+        fee=42.0,
+    )
+    body = {
+        "Result": {
+            "ResultCode": "0",
+            "ResultDesc": "Completed",
+            "ConversationID": txn.conversation_id,
+            "OriginatorConversationID": txn.originator_conversation_id,
+            "TransactionID": "UI9TESTDUP",
+        }
+    }
+
+    await b2b.process_b2b_result(db, body)
+    await db.commit()
+    await b2b.process_b2b_result(db, body)
+    await db.commit()
+
+    payouts = (
+        await db.execute(
+            select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
+        )
+    ).scalars().all()
+    charges = (
+        await db.execute(
+            select(ResellerTransactionCharge).where(
+                ResellerTransactionCharge.reseller_id == r1.id
+            )
+        )
+    ).scalars().all()
+    assert len(payouts) == 1
+    assert len(charges) == 1
+
+
+@pytest.mark.skipif(
+    not running_on_postgres(),
+    reason="SELECT FOR UPDATE concurrency semantics require Postgres",
+)
+async def test_concurrent_result_callbacks_settle_once(
+    engine, db, session_factory
+):
+    """Two callbacks that arrive together serialize on the B2B transaction.
+
+    Regression for the 2026-09-09 SafoLink incident, where both sessions read
+    PENDING and inserted payout/fee rows about 30 ms apart.
+    """
+    from app.services import mpesa_b2b as b2b
+
+    r1 = await make_reseller(db)
+    txn = await _make_txn(
+        db,
+        r1.id,
+        status=B2BTransactionStatus.PENDING,
+        conversation_id="AG_RESULT_RACE",
+        originator_id="orig-result-race",
+        net=4993.0,
+        fee=42.0,
+    )
+    body = {
+        "Result": {
+            "ResultCode": "0",
+            "ResultDesc": "Completed",
+            "ConversationID": txn.conversation_id,
+            "OriginatorConversationID": txn.originator_conversation_id,
+            "TransactionID": "UI9TESTRACE",
+        }
+    }
+
+    async def deliver():
+        async with session_factory() as session:
+            await b2b.process_b2b_result(session, body)
+            await session.commit()
+
+    await asyncio.gather(deliver(), deliver())
+
+    payouts = (
+        await db.execute(
+            select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
+        )
+    ).scalars().all()
+    charges = (
+        await db.execute(
+            select(ResellerTransactionCharge).where(
+                ResellerTransactionCharge.reseller_id == r1.id
+            )
+        )
+    ).scalars().all()
+    assert len(payouts) == 1
+    assert len(charges) == 1
+
+
+async def test_mpesa_payout_reference_is_unique(engine, db):
+    """The DB is the last line of defense if callback locking regresses."""
+    r1 = await make_reseller(db)
+    db.add_all([
+        ResellerPayout(
+            reseller_id=r1.id,
+            amount=4993,
+            payment_method="mpesa_b2b",
+            reference="UI9UNIQUE",
+        ),
+        ResellerPayout(
+            reseller_id=r1.id,
+            amount=4993,
+            payment_method="mpesa_b2b",
+            reference="UI9UNIQUE",
+        ),
+    ])
+    with pytest.raises(IntegrityError):
+        await db.commit()
+    await db.rollback()
 
 
 async def test_status_result_failed_marks_failed_no_payout(engine, db, monkeypatch):

@@ -689,7 +689,13 @@ async def resolve_b2b_transaction(
     if outcome not in ("completed", "failed"):
         raise HTTPException(status_code=400, detail="outcome must be 'completed' or 'failed'")
 
-    txn = await db.get(B2BTransaction, txn_id)
+    txn = (
+        await db.execute(
+            select(B2BTransaction)
+            .where(B2BTransaction.id == txn_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
     if txn.status not in UNRESOLVED_STATUSES:
