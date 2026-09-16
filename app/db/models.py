@@ -1328,7 +1328,12 @@ class DevicePairing(Base):
 
 
 class SubscriptionShareCode(Base):
-    """One-time code used to add a device to a paid subscription."""
+    """Code that adds devices to a paid subscription.
+
+    ``status="access"`` rows are the multi-use access code shown to M-Pesa
+    payers: valid on every device up to the plan limit while the owner's plan
+    is active. ``active``/``redeemed``/``expired`` are legacy one-time codes.
+    """
     __tablename__ = "subscription_share_codes"
 
     id = Column(Integer, primary_key=True, autoincrement=True)

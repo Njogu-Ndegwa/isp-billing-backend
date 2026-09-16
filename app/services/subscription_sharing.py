@@ -144,10 +144,14 @@ async def sync_shared_subscription_devices_after_owner_renewal(
 ) -> list[dict]:
     """Extend active companion devices to the paying owner's new expiry.
 
+    Only as many devices as the (possibly new) plan allows come back, newest
+    first; the rest are released so a downgrade from a 5-device plan to a
+    2-device plan doesn't silently keep 4 extra devices online.
+
     Direct-API routers get a scheduled provisioning attempt. The scheduler or
     caller can deliver it after the current DB transaction is committed.
     """
-    if not owner_customer.expiry or not sharing_enabled_for_plan(plan):
+    if not owner_customer.expiry:
         return []
 
     rows = (
@@ -160,12 +164,26 @@ async def sync_shared_subscription_devices_after_owner_renewal(
                 DevicePairing.is_subscription_share == True,  # noqa: E712
                 DevicePairing.is_active == True,  # noqa: E712
             )
+            .order_by(DevicePairing.created_at.desc(), DevicePairing.id.desc())
         )
     ).all()
 
-    synced: list[dict] = []
+    limit = shared_device_limit_for_plan(plan)
     now = datetime.utcnow()
-    for pairing, shared_customer, router in rows:
+    for pairing, shared_customer, _router in rows[limit:]:
+        pairing.is_active = False
+        pairing.expires_at = now
+        shared_customer.subscription_owner_id = None
+        logger.info(
+            "[SUBSCRIPTION-SHARE] Released shared device %s (pairing %s): owner %s renewed onto a plan allowing %d extra device(s)",
+            shared_customer.id,
+            pairing.id,
+            owner_customer.id,
+            limit,
+        )
+
+    synced: list[dict] = []
+    for pairing, shared_customer, router in rows[:limit]:
         if not shared_customer.mac_address:
             continue
 

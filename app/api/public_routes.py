@@ -1118,7 +1118,7 @@ def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
         queues = api.send_command("/queue/simple/print")
         if queues.get("success") and queues.get("data"):
             for q in queues["data"]:
-                if q.get("name", "") == f"queue_{username}":
+                if q.get("name", "") in (f"queue_{username}", f"plan_{username}"):
                     api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
                     removed["queues"] += 1
 
@@ -1143,10 +1143,14 @@ async def reconnect_self_service(
     """
     Self-service reconnection for hotspot users whose session dropped.
 
-    Provide EITHER a phone number (for M-Pesa customers) OR a voucher code
-    (for voucher customers). The system looks up the active subscription and
-    re-provisions the user's current device on the router.
+    Provide EITHER a phone number (for M-Pesa customers) OR a code. The code
+    can be a voucher, the plan's access code, or the M-Pesa receipt; it goes
+    through the same path as ``/api/public/access-code/redeem``, so on a plan
+    that covers several devices it adds this device instead of moving the plan
+    away from another one.
     """
+    from app.services.code_attempt_limiter import check_code_attempts, record_code_failure
+
     phone_raw = (request.phone or "").strip()
     voucher_code = (request.voucher_code or "").strip()
 
@@ -1164,113 +1168,85 @@ async def reconnect_self_service(
         raise HTTPException(status_code=404, detail="Router not found")
 
     normalized_mac = normalize_mac_address(request.mac_address)
-    now = datetime.utcnow()
+    check_code_attempts(request.router_id, normalized_mac)
 
-    # Voucher code takes priority when both are provided
-    lookup_key = voucher_code if voucher_code else phone_raw
-
-    # --- Find the active customer ---
-    customer = None
-
+    # Code takes priority when both are provided
     if voucher_code:
-        # Voucher lookup: find the redeemed voucher → follow to customer.
-        # Accept both legacy "XXXX-XXXX" and new plain "XXXXXXXX" formats so
-        # customers with previously-printed vouchers still reconnect.
-        from app.services.voucher_service import voucher_lookup_candidates
-        code_candidates = voucher_lookup_candidates(voucher_code)
-        voucher_stmt = (
-            select(Voucher)
-            .where(Voucher.code.in_(code_candidates), Voucher.status == VoucherStatus.REDEEMED)
+        from app.api.access_code_routes import redeem_code_on_device
+
+        return await redeem_code_on_device(
+            db,
+            code=voucher_code,
+            router_obj=router_obj,
+            normalized_mac=normalized_mac,
+            background_tasks=background_tasks,
         )
-        voucher_result = await db.execute(voucher_stmt)
-        voucher_obj = voucher_result.scalar_one_or_none()
 
-        if not voucher_obj or not voucher_obj.redeemed_by:
-            db.add(ReconnectionAttempt(
-                phone=lookup_key, mac_address=normalized_mac,
-                router_id=request.router_id, success=False,
-                failure_reason="voucher_not_found",
-                created_at=datetime.utcnow(),
-            ))
-            await db.commit()
-            raise HTTPException(
-                status_code=404,
-                detail="No redeemed voucher found with this code",
-            )
+    if len(phone_raw) < 9:
+        raise HTTPException(status_code=400, detail="Please enter a valid phone number")
 
-        cust_stmt = (
-            select(Customer)
-            .options(selectinload(Customer.plan), selectinload(Customer.router))
-            .where(
-                Customer.id == voucher_obj.redeemed_by,
-                Customer.router_id == request.router_id,
-                Customer.status == CustomerStatus.ACTIVE,
-                Customer.expiry.isnot(None),
-                Customer.expiry > now,
-            )
+    # Only the paying customer's own row can be restored by phone. Devices
+    # sharing a plan carry the payer's phone too; matching them here let one
+    # reconnect silently steal another device's slot.
+    now = datetime.utcnow()
+    phone_variants = _build_phone_variants(phone_raw)
+    customer_stmt = (
+        select(Customer)
+        .options(selectinload(Customer.plan), selectinload(Customer.router))
+        .where(
+            Customer.phone.in_(phone_variants),
+            Customer.router_id == request.router_id,
+            Customer.subscription_owner_id.is_(None),
+            Customer.status == CustomerStatus.ACTIVE,
+            Customer.expiry.isnot(None),
+            Customer.expiry > now,
         )
-        cust_result = await db.execute(cust_stmt)
-        customer = cust_result.scalar_one_or_none()
+        .order_by(Customer.expiry.desc())
+        .limit(1)
+    )
+    customer = (await db.execute(customer_stmt)).scalar_one_or_none()
 
-        if not customer:
-            # Distinguish between wrong-router and expired for a clearer message
-            any_cust = (await db.execute(
-                select(Customer).where(Customer.id == voucher_obj.redeemed_by)
-            )).scalar_one_or_none()
-
-            if any_cust and any_cust.router_id != request.router_id:
-                reason = "voucher_wrong_router"
-                detail = "This voucher was redeemed on a different network"
-            elif any_cust and (any_cust.status != CustomerStatus.ACTIVE or not any_cust.expiry or any_cust.expiry <= now):
-                reason = "voucher_subscription_expired"
-                detail = "Your voucher subscription has expired"
-            else:
-                reason = "voucher_subscription_expired"
-                detail = "Your voucher subscription has expired"
-
-            db.add(ReconnectionAttempt(
-                phone=lookup_key, mac_address=normalized_mac,
-                router_id=request.router_id, success=False,
-                failure_reason=reason,
-                created_at=datetime.utcnow(),
-            ))
-            await db.commit()
-            raise HTTPException(status_code=404, detail=detail)
-
-    else:
-        # Phone number lookup
-        if len(phone_raw) < 9:
-            raise HTTPException(status_code=400, detail="Please enter a valid phone number")
-
-        phone_variants = _build_phone_variants(phone_raw)
-        customer_stmt = (
-            select(Customer)
-            .options(selectinload(Customer.plan), selectinload(Customer.router))
-            .where(
-                Customer.phone.in_(phone_variants),
-                Customer.router_id == request.router_id,
-                Customer.status == CustomerStatus.ACTIVE,
-                Customer.expiry.isnot(None),
-                Customer.expiry > now,
-            )
-            .order_by(Customer.expiry.desc())
-            .limit(1)
+    if not customer:
+        record_code_failure(request.router_id, normalized_mac)
+        db.add(ReconnectionAttempt(
+            phone=phone_raw, mac_address=normalized_mac,
+            router_id=request.router_id, success=False,
+            failure_reason="no_active_subscription",
+            created_at=datetime.utcnow(),
+        ))
+        await db.commit()
+        raise HTTPException(
+            status_code=404,
+            detail="No active subscription found for this phone number on this network",
         )
-        result = await db.execute(customer_stmt)
-        customer = result.scalar_one_or_none()
 
-        if not customer:
-            db.add(ReconnectionAttempt(
-                phone=lookup_key, mac_address=normalized_mac,
-                router_id=request.router_id, success=False,
-                failure_reason="no_active_subscription",
-                created_at=datetime.utcnow(),
-            ))
-            await db.commit()
-            raise HTTPException(
-                status_code=404,
-                detail="No active subscription found for this phone number on this network",
-            )
+    return await restore_customer_on_device(
+        db,
+        customer=customer,
+        router_obj=router_obj,
+        normalized_mac=normalized_mac,
+        lookup_key=phone_raw,
+        background_tasks=background_tasks,
+    )
+
+
+async def restore_customer_on_device(
+    db: AsyncSession,
+    *,
+    customer: Customer,
+    router_obj: Router,
+    normalized_mac: str,
+    lookup_key: str,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """Put a paying customer's plan on ``normalized_mac``.
+
+    If the customer's recorded device is a different MAC (new phone, or a
+    randomized MAC), the plan moves to this device and the old MAC is removed
+    from the router after the response is sent.
+    """
+    now = datetime.utcnow()
+    router_id = router_obj.id
 
     if not customer.plan:
         raise HTTPException(status_code=400, detail="Customer has no plan assigned")
@@ -1278,7 +1254,7 @@ async def reconnect_self_service(
     if customer.plan.connection_type != ConnectionType.HOTSPOT:
         db.add(ReconnectionAttempt(
             phone=lookup_key, mac_address=normalized_mac,
-            router_id=request.router_id, customer_id=customer.id,
+            router_id=router_id, customer_id=customer.id,
             success=False, failure_reason="not_hotspot",
             created_at=datetime.utcnow(),
         ))
@@ -1314,7 +1290,7 @@ async def reconnect_self_service(
         if conflicting and conflicting.status == CustomerStatus.ACTIVE and conflicting.expiry and conflicting.expiry > now:
             db.add(ReconnectionAttempt(
                 phone=lookup_key, mac_address=normalized_mac,
-                router_id=request.router_id, customer_id=customer.id,
+                router_id=router_id, customer_id=customer.id,
                 success=False, failure_reason="mac_conflict_active",
                 created_at=datetime.utcnow(),
             ))
@@ -1342,7 +1318,7 @@ async def reconnect_self_service(
     if use_radius:
         db.add(ReconnectionAttempt(
             phone=lookup_key, mac_address=normalized_mac,
-            router_id=request.router_id, customer_id=customer.id,
+            router_id=router_id, customer_id=customer.id,
             success=True, old_mac_address=old_mac if (mac_changed or mac_is_new) else None,
             created_at=datetime.utcnow(),
         ))
@@ -1370,13 +1346,12 @@ async def reconnect_self_service(
     customer_name = customer.name
     plan_name = customer.plan.name
     expiry_iso = customer.expiry.isoformat()
-    router_id_val = router_obj.id
     router_name = router_obj.name
 
     # Log the attempt and commit all DB changes (MAC update etc.) immediately
     db.add(ReconnectionAttempt(
         phone=lookup_key, mac_address=normalized_mac,
-        router_id=request.router_id, customer_id=customer_id,
+        router_id=router_id, customer_id=customer_id,
         success=True,
         old_mac_address=old_mac if (mac_changed or mac_is_new) else None,
         created_at=datetime.utcnow(),
@@ -1409,7 +1384,7 @@ async def reconnect_self_service(
         try:
             result = await provision_hotspot_customer(
                 customer_id=customer_id,
-                router_id=router_id_val,
+                router_id=router_id,
                 hotspot_payload=hotspot_payload,
                 action="self_service_reconnect",
             )

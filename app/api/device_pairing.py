@@ -15,7 +15,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select, text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -70,6 +70,20 @@ SHARE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 SHARE_CODE_ACTIVE = "active"
 SHARE_CODE_REDEEMED = "redeemed"
 SHARE_CODE_EXPIRED = "expired"
+# Multi-use code handed to the paying customer. It works on every device up to
+# the plan's device limit and stays valid for as long as the owner's plan does.
+SHARE_CODE_ACCESS = "access"
+
+
+class DeviceLimitReached(HTTPException):
+    """The subscription already has its full number of devices."""
+
+    def __init__(self, max_shared_users: int):
+        super().__init__(
+            status_code=409,
+            detail=f"This subscription already has the maximum {max_shared_users} total device(s)",
+        )
+        self.max_shared_users = max_shared_users
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +117,8 @@ class DeviceReconnectRequest(BaseModel):
 
 
 class ShareSubscriptionRequest(BaseModel):
-    owner_phone: str = Field(..., description="Phone number on the active paid subscription")
+    access_code: Optional[str] = Field(None, description="Access code or voucher of the paid plan")
+    owner_phone: Optional[str] = Field(None, description="Deprecated: no longer accepted as proof of ownership")
     router_id: int
     device_mac: str = Field(..., description="MAC address of the device to add")
     owner_mac: Optional[str] = Field(None, description="Optional current MAC of the paying customer")
@@ -114,7 +129,8 @@ class ShareSubscriptionRequest(BaseModel):
 
 
 class ShareSubscriptionCodeCreateRequest(BaseModel):
-    owner_phone: str = Field(..., description="Phone number on the active paid subscription")
+    access_code: Optional[str] = Field(None, description="Access code, voucher or M-Pesa receipt of the paid plan")
+    owner_phone: Optional[str] = Field(None, description="Deprecated: no longer accepted as proof of ownership")
     router_id: int
     owner_mac: Optional[str] = Field(None, description="Optional current MAC of the paying customer")
 
@@ -130,7 +146,8 @@ class ShareSubscriptionCodeRedeemRequest(BaseModel):
 
 
 class ShareSubscriptionDisconnectRequest(BaseModel):
-    owner_phone: str = Field(..., description="Phone number on the active paid subscription")
+    access_code: Optional[str] = Field(None, description="Access code or voucher of the paid plan")
+    owner_phone: Optional[str] = Field(None, description="Deprecated: no longer accepted as proof of ownership")
     router_id: int
     pairing_id: int = Field(..., description="Shared device pairing to disconnect")
 
@@ -504,59 +521,6 @@ async def _delete_radius_shared_device_entries(db: AsyncSession, mac_address: st
     }
 
 
-async def _find_share_owner_customer(
-    db: AsyncSession,
-    *,
-    router_id: int,
-    owner_phone: str,
-    owner_mac: Optional[str],
-) -> Customer:
-    if not owner_phone or len(owner_phone.strip()) < 10:
-        raise HTTPException(status_code=400, detail="Invalid owner phone number")
-
-    phone_variants = _build_phone_variants(owner_phone.strip())
-    now = datetime.utcnow()
-    stmt = (
-        select(Customer)
-        .options(selectinload(Customer.plan), selectinload(Customer.router))
-        .where(
-            Customer.router_id == router_id,
-            Customer.phone.in_(phone_variants),
-            Customer.subscription_owner_id.is_(None),
-            Customer.status == CustomerStatus.ACTIVE,
-            Customer.expiry.isnot(None),
-            Customer.expiry > now,
-        )
-        .order_by(Customer.expiry.desc(), Customer.id.desc())
-    )
-    if owner_mac:
-        normalized_owner_mac = _validate_device_mac(owner_mac)
-        if not normalized_owner_mac:
-            raise HTTPException(status_code=400, detail="Invalid owner MAC address format")
-        stmt = stmt.where(Customer.mac_address == normalized_owner_mac)
-
-    owners = list((await db.execute(stmt)).scalars().all())
-    hotspot_owners = [
-        owner for owner in owners
-        if owner.plan and owner.plan.connection_type == ConnectionType.HOTSPOT
-    ]
-
-    if not hotspot_owners:
-        raise HTTPException(
-            status_code=404,
-            detail="No active hotspot subscription found for this phone on this router",
-        )
-    if len(hotspot_owners) > 1 and not owner_mac:
-        shareable_owners = [
-            owner for owner in hotspot_owners
-            if sharing_enabled_for_plan(owner.plan)
-        ]
-        if shareable_owners:
-            return shareable_owners[0]
-
-    return hotspot_owners[0]
-
-
 async def _get_or_create_shared_customer(
     db: AsyncSession,
     *,
@@ -629,6 +593,12 @@ async def _share_subscription_for_owner(
         await _load_active_share_owner_stats(db, owner=owner, router_id=router_id)
     )
 
+    # Serialize concurrent adds for the same subscription so two devices
+    # redeeming at once cannot both pass the device-limit count below.
+    await db.execute(
+        select(Customer.id).where(Customer.id == owner.id).with_for_update()
+    )
+
     existing_pairing = (
         await db.execute(
             select(DevicePairing)
@@ -662,10 +632,7 @@ async def _share_subscription_for_owner(
         exclude_pairing_id=existing_pairing_id,
     )
     if active_shared_count >= max_companion_devices:
-        raise HTTPException(
-            status_code=409,
-            detail=f"This subscription already has the maximum {max_shared_users} total device(s)",
-        )
+        raise DeviceLimitReached(max_shared_users)
 
     shared_phone = (device_owner_phone or owner.phone or "").strip()
     shared_customer = await _get_or_create_shared_customer(
@@ -800,6 +767,435 @@ async def _share_subscription_for_owner(
 
 
 # ---------------------------------------------------------------------------
+# Access codes: one code per purchase, valid on every device up to the limit
+# ---------------------------------------------------------------------------
+
+ACCESS_CODE_FRESH_VOUCHER = "fresh_voucher"
+ACCESS_CODE_VOUCHER = "voucher"
+ACCESS_CODE_ACCESS = "access_code"
+ACCESS_CODE_ONE_TIME_SHARE = "one_time_share_code"
+ACCESS_CODE_MPESA_RECEIPT = "mpesa_receipt"
+
+
+class ResolvedAccessCode:
+    def __init__(
+        self,
+        kind: str,
+        *,
+        owner_customer_id: Optional[int] = None,
+        voucher: Optional[Voucher] = None,
+        share_code: Optional[SubscriptionShareCode] = None,
+        error: Optional[str] = None,
+    ):
+        self.kind = kind
+        self.owner_customer_id = owner_customer_id
+        self.voucher = voucher
+        self.share_code = share_code
+        self.error = error
+
+
+async def resolve_access_code(
+    db: AsyncSession,
+    *,
+    code: str,
+    router_id: int,
+) -> Optional[ResolvedAccessCode]:
+    """Work out what a code typed on the portal refers to.
+
+    Accepts a voucher (unused or already redeemed), a multi-use access code, a
+    legacy one-time share code, or the M-Pesa receipt of the payment. Returns
+    ``None`` when the code matches nothing, so the caller can count the miss.
+    """
+    from app.services.voucher_service import voucher_lookup_candidates
+
+    normalized = _normalize_share_code(code or "")
+    if len(normalized) < 4:
+        return None
+
+    if len(normalized) == SHARE_CODE_LENGTH:
+        share_code = (
+            await db.execute(
+                select(SubscriptionShareCode).where(
+                    SubscriptionShareCode.code == normalized,
+                    SubscriptionShareCode.router_id == router_id,
+                    SubscriptionShareCode.status.in_([SHARE_CODE_ACCESS, SHARE_CODE_ACTIVE]),
+                )
+            )
+        ).scalar_one_or_none()
+        if share_code:
+            kind = (
+                ACCESS_CODE_ACCESS
+                if share_code.status == SHARE_CODE_ACCESS
+                else ACCESS_CODE_ONE_TIME_SHARE
+            )
+            return ResolvedAccessCode(
+                kind,
+                owner_customer_id=share_code.owner_customer_id,
+                share_code=share_code,
+            )
+
+    voucher = (
+        await db.execute(
+            select(Voucher).where(Voucher.code.in_(voucher_lookup_candidates(code)))
+        )
+    ).scalar_one_or_none()
+    if voucher:
+        if voucher.router_id and voucher.router_id != router_id:
+            return ResolvedAccessCode(
+                ACCESS_CODE_VOUCHER,
+                voucher=voucher,
+                error="This voucher is not valid for this hotspot",
+            )
+        if voucher.status == VoucherStatus.AVAILABLE:
+            return ResolvedAccessCode(ACCESS_CODE_FRESH_VOUCHER, voucher=voucher)
+        if voucher.status == VoucherStatus.REDEEMED and voucher.redeemed_by:
+            return ResolvedAccessCode(
+                ACCESS_CODE_VOUCHER,
+                owner_customer_id=voucher.redeemed_by,
+                voucher=voucher,
+            )
+        status_messages = {
+            VoucherStatus.DISABLED: "Voucher has been disabled",
+            VoucherStatus.EXPIRED: "Voucher has expired",
+        }
+        return ResolvedAccessCode(
+            ACCESS_CODE_VOUCHER,
+            voucher=voucher,
+            error=status_messages.get(voucher.status, "Voucher is not available"),
+        )
+
+    receipt_customer_id = (
+        await db.execute(
+            select(MpesaTransaction.customer_id)
+            .where(
+                MpesaTransaction.mpesa_receipt_number == normalized,
+                MpesaTransaction.status == MpesaTransactionStatus.completed,
+                MpesaTransaction.customer_id.isnot(None),
+            )
+            .order_by(MpesaTransaction.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if receipt_customer_id:
+        return ResolvedAccessCode(
+            ACCESS_CODE_MPESA_RECEIPT,
+            owner_customer_id=receipt_customer_id,
+        )
+
+    return None
+
+
+async def load_access_code_owner(
+    db: AsyncSession,
+    *,
+    owner_customer_id: int,
+    router_id: int,
+) -> Customer:
+    """Load the paying customer behind a code, or raise if the plan is unusable."""
+    owner = (
+        await db.execute(
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(Customer.id == owner_customer_id)
+        )
+    ).scalar_one_or_none()
+    if not owner or owner.router_id != router_id:
+        raise HTTPException(status_code=400, detail="This code was used on a different network")
+    if owner.subscription_owner_id is not None:
+        raise HTTPException(status_code=400, detail="This code is no longer valid")
+    if (
+        owner.status != CustomerStatus.ACTIVE
+        or not owner.expiry
+        or owner.expiry <= datetime.utcnow()
+    ):
+        raise HTTPException(
+            status_code=410,
+            detail="The plan for this code has expired. Please buy a new plan.",
+        )
+    if not owner.plan or owner.plan.connection_type != ConnectionType.HOTSPOT:
+        raise HTTPException(status_code=400, detail="This code is not for a WiFi hotspot plan")
+    return owner
+
+
+async def get_or_create_access_code(db: AsyncSession, owner: Customer) -> SubscriptionShareCode:
+    """Return the owner's multi-use access code, creating it on first use.
+
+    The code's ``expires_at`` follows the owner's expiry so admin views stay
+    truthful; validity itself is always checked against the live owner row.
+    """
+    existing = (
+        await db.execute(
+            select(SubscriptionShareCode)
+            .where(
+                SubscriptionShareCode.owner_customer_id == owner.id,
+                SubscriptionShareCode.router_id == owner.router_id,
+                SubscriptionShareCode.status == SHARE_CODE_ACCESS,
+            )
+            .order_by(SubscriptionShareCode.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    now = datetime.utcnow()
+    if existing:
+        if owner.expiry and existing.expires_at != owner.expiry:
+            existing.expires_at = owner.expiry
+            existing.updated_at = now
+        return existing
+
+    access_code = SubscriptionShareCode(
+        code=await _generate_unique_share_code(db),
+        router_id=owner.router_id,
+        owner_customer_id=owner.id,
+        status=SHARE_CODE_ACCESS,
+        expires_at=owner.expiry or now,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(access_code)
+    await db.flush()
+    return access_code
+
+
+async def shareable_code_for_owner(
+    db: AsyncSession,
+    *,
+    owner: Customer,
+    resolved: ResolvedAccessCode,
+) -> str:
+    """The code the owner should hand to their other devices.
+
+    Voucher customers keep sharing their voucher. Everyone else gets the
+    generated access code — an M-Pesa receipt is payment data and should not
+    be passed around.
+    """
+    if resolved.kind == ACCESS_CODE_VOUCHER and resolved.voucher:
+        return resolved.voucher.code
+    access_code = await get_or_create_access_code(db, owner)
+    return _format_share_code(access_code.code)
+
+
+async def list_subscription_devices(
+    db: AsyncSession,
+    *,
+    owner: Customer,
+    current_mac: Optional[str] = None,
+) -> list[dict]:
+    """The owner's main device followed by its active shared devices."""
+    current = normalize_mac_address(current_mac) if current_mac else None
+    devices: list[dict] = []
+    if owner.mac_address:
+        owner_mac = normalize_mac_address(owner.mac_address)
+        devices.append(
+            {
+                "pairing_id": None,
+                "is_main_device": True,
+                "device_mac": owner_mac,
+                "device_name": "Main device",
+                "device_type": "other",
+                "is_this_device": owner_mac == current,
+                "added_at": None,
+            }
+        )
+
+    pairings = (
+        await db.execute(
+            select(DevicePairing)
+            .where(
+                DevicePairing.subscription_owner_customer_id == owner.id,
+                DevicePairing.router_id == owner.router_id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+                DevicePairing.is_active == True,  # noqa: E712
+            )
+            .order_by(DevicePairing.created_at.asc(), DevicePairing.id.asc())
+        )
+    ).scalars().all()
+    for pairing in pairings:
+        pairing_mac = normalize_mac_address(pairing.device_mac)
+        devices.append(
+            {
+                "pairing_id": pairing.id,
+                "is_main_device": False,
+                "device_mac": pairing_mac,
+                "device_name": pairing.device_name,
+                "device_type": _device_type_value(pairing.device_type),
+                "is_this_device": pairing_mac == current,
+                "added_at": pairing.created_at.isoformat() if pairing.created_at else None,
+            }
+        )
+    return devices
+
+
+def _router_cleanup_info(router_obj: Router) -> tuple[Optional[str], Optional[dict]]:
+    auth_method = getattr(router_obj, "auth_method", None)
+    auth_value = auth_method.value if hasattr(auth_method, "value") else auth_method
+    if auth_value == RouterAuthMethod.RADIUS.value:
+        return auth_value, None
+    return auth_value, {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+        "name": router_obj.name,
+    }
+
+
+async def disconnect_shared_pairing(
+    db: AsyncSession,
+    *,
+    owner: Customer,
+    router_id: int,
+    pairing_id: int,
+) -> dict:
+    """Free one shared-device slot and remove that device from the router."""
+    owner_id = owner.id
+    pairing = (
+        await db.execute(
+            select(DevicePairing)
+            .options(selectinload(DevicePairing.customer), selectinload(DevicePairing.router))
+            .where(
+                DevicePairing.id == pairing_id,
+                DevicePairing.router_id == router_id,
+                DevicePairing.subscription_owner_customer_id == owner_id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+                DevicePairing.is_active == True,  # noqa: E712
+            )
+        )
+    ).scalar_one_or_none()
+    if not pairing:
+        raise HTTPException(status_code=404, detail="Shared device not found for this subscription")
+    if not pairing.customer or not pairing.router:
+        raise HTTPException(status_code=400, detail="Shared device is missing customer or router details")
+
+    normalized_mac = _validate_device_mac(pairing.device_mac)
+    if not normalized_mac:
+        raise HTTPException(status_code=400, detail="Shared device has an invalid MAC address")
+
+    now = datetime.utcnow()
+    shared_customer = pairing.customer
+    shared_customer_id = shared_customer.id
+    pairing.is_active = False
+    pairing.expires_at = now
+    shared_customer.expiry = now
+    shared_customer.subscription_owner_id = None
+    auth_value, router_info = _router_cleanup_info(pairing.router)
+    await db.commit()
+
+    cleanup_result: dict = {"success": True, "skipped": True}
+    if auth_value == RouterAuthMethod.RADIUS.value:
+        cleanup_result = await _delete_radius_shared_device_entries(db, normalized_mac)
+    elif router_info:
+        cleanup_result = await asyncio.to_thread(
+            _remove_shared_device_from_direct_router_sync,
+            router_info,
+            normalized_mac,
+        )
+
+    cleanup_success = bool(cleanup_result.get("success"))
+    shared_customer = await db.get(Customer, shared_customer_id)
+    if shared_customer and cleanup_success:
+        shared_customer.status = CustomerStatus.INACTIVE
+        shared_customer.expiry = datetime.utcnow()
+
+    remaining_shared_devices = await active_shared_device_count(db, owner_id)
+    await db.commit()
+
+    return {
+        "success": True,
+        "pairing_id": pairing_id,
+        "customer_id": shared_customer_id,
+        "device_mac": normalized_mac,
+        "router_id": router_id,
+        "owner_customer_id": owner_id,
+        "active_shared_devices": remaining_shared_devices,
+        "cleanup_status": "removed" if cleanup_success else "pending",
+        "cleanup": cleanup_result,
+        "message": (
+            "Shared device disconnected."
+            if cleanup_success
+            else "Shared device slot freed. Router cleanup is still pending."
+        ),
+    }
+
+
+async def release_main_device(db: AsyncSession, *, owner: Customer) -> dict:
+    """Detach the owner's current device so the plan can move to another one.
+
+    Used when the owner's phone changed MAC (or they replaced it) and every
+    slot is taken. The next device that enters the code becomes the main device.
+    """
+    if not owner.mac_address:
+        return {"success": True, "cleanup_status": "skipped", "message": "No main device to remove."}
+
+    auth_value, router_info = _router_cleanup_info(owner.router)
+    if auth_value == RouterAuthMethod.RADIUS.value:
+        raise HTTPException(
+            status_code=400,
+            detail="The main device cannot be replaced on this network. Please contact your provider.",
+        )
+
+    old_mac = normalize_mac_address(owner.mac_address)
+    owner_id = owner.id
+    owner.mac_address = None
+    await db.commit()
+
+    cleanup_result: dict = {"success": True, "skipped": True}
+    if router_info:
+        cleanup_result = await asyncio.to_thread(
+            _remove_shared_device_from_direct_router_sync,
+            router_info,
+            old_mac,
+        )
+    cleanup_success = bool(cleanup_result.get("success"))
+    logger.info(
+        "[ACCESS-CODE] Released main device %s from customer %s (cleanup=%s)",
+        old_mac,
+        owner_id,
+        cleanup_success,
+    )
+    return {
+        "success": True,
+        "owner_customer_id": owner_id,
+        "device_mac": old_mac,
+        "cleanup_status": "removed" if cleanup_success else "pending",
+        "cleanup": cleanup_result,
+        "message": "Main device removed. Enter your code on the new device to connect it.",
+    }
+
+
+async def _owner_from_access_code_or_401(
+    db: AsyncSession,
+    *,
+    access_code: Optional[str],
+    router_id: int,
+    device_key: Optional[str],
+) -> tuple[Customer, ResolvedAccessCode]:
+    """Authorize a subscription-management request by its access code."""
+    from app.services.code_attempt_limiter import check_code_attempts, record_code_failure
+
+    if not access_code or not access_code.strip():
+        raise HTTPException(
+            status_code=401,
+            detail="Enter the access code or voucher for this plan to manage its devices.",
+        )
+    check_code_attempts(router_id, device_key)
+    resolved = await resolve_access_code(db, code=access_code, router_id=router_id)
+    if (
+        not resolved
+        or resolved.error
+        or resolved.kind in (ACCESS_CODE_FRESH_VOUCHER, ACCESS_CODE_ONE_TIME_SHARE)
+        or not resolved.owner_customer_id
+    ):
+        record_code_failure(router_id, device_key)
+        raise HTTPException(status_code=401, detail="That code is not valid for an active plan on this network.")
+    owner = await load_access_code_owner(
+        db,
+        owner_customer_id=resolved.owner_customer_id,
+        router_id=router_id,
+    )
+    return owner, resolved
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -809,11 +1205,13 @@ async def share_subscription_with_device(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Add a companion device under an existing paid hotspot subscription.
+    Add a companion device (e.g. a TV typed in by MAC) under a paid hotspot plan.
 
     The plan's ``max_shared_users`` is the total-device allowance, including
     the owner's paid device. A value of 1 keeps sharing disabled; values above
-    1 allow ``max_shared_users - 1`` shared devices.
+    1 allow ``max_shared_users - 1`` shared devices. The caller must prove they
+    hold the plan with its access code or voucher; a phone number alone is
+    not enough.
     """
     try:
         normalized_mac = _validate_device_mac(request.device_mac)
@@ -821,11 +1219,11 @@ async def share_subscription_with_device(
             raise HTTPException(status_code=400, detail="Invalid MAC address format. Expected format: AA:BB:CC:DD:EE:FF")
 
         device_type = _parse_device_type(request.device_type)
-        owner = await _find_share_owner_customer(
+        owner, _resolved = await _owner_from_access_code_or_401(
             db,
+            access_code=request.access_code,
             router_id=request.router_id,
-            owner_phone=request.owner_phone,
-            owner_mac=request.owner_mac,
+            device_key=request.owner_mac or normalized_mac,
         )
         return await _share_subscription_for_owner(
             db,
@@ -834,7 +1232,7 @@ async def share_subscription_with_device(
             normalized_mac=normalized_mac,
             device_type=device_type,
             device_name=request.device_name,
-            device_owner_phone=request.device_owner_phone or request.owner_phone,
+            device_owner_phone=request.device_owner_phone,
             device_owner_name=request.device_owner_name,
         )
 
@@ -851,63 +1249,32 @@ async def create_share_subscription_code(
     request: ShareSubscriptionCodeCreateRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Generate a one-time code for the paying customer to share their subscription."""
+    """Return the code the paying customer should enter on their other devices."""
     try:
-        owner = await _find_share_owner_customer(
+        owner, resolved = await _owner_from_access_code_or_401(
             db,
+            access_code=request.access_code,
             router_id=request.router_id,
-            owner_phone=request.owner_phone,
-            owner_mac=request.owner_mac,
+            device_key=request.owner_mac,
         )
-        _plan, _router_obj, max_shared_users, max_companion_devices, active_shared_count = (
+        _plan, _router_obj, _max_shared_users, max_companion_devices, active_shared_count = (
             await _load_active_share_owner_stats(db, owner=owner, router_id=request.router_id)
         )
-        if active_shared_count >= max_companion_devices:
-            raise HTTPException(
-                status_code=409,
-                detail=f"This subscription already has the maximum {max_shared_users} total device(s)",
-            )
-
-        now = datetime.utcnow()
-        existing_code = (
-            await db.execute(
-                select(SubscriptionShareCode)
-                .where(
-                    SubscriptionShareCode.router_id == request.router_id,
-                    SubscriptionShareCode.owner_customer_id == owner.id,
-                    SubscriptionShareCode.status == SHARE_CODE_ACTIVE,
-                    SubscriptionShareCode.expires_at > now,
-                )
-                .order_by(SubscriptionShareCode.expires_at.desc(), SubscriptionShareCode.id.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if existing_code:
-            return _serialize_share_code(
-                existing_code,
-                active_shared_devices=active_shared_count,
-                max_companion_devices=max_companion_devices,
-            )
-
-        code = await _generate_unique_share_code(db)
-        share_code = SubscriptionShareCode(
-            code=code,
-            router_id=request.router_id,
-            owner_customer_id=owner.id,
-            status=SHARE_CODE_ACTIVE,
-            expires_at=now + timedelta(minutes=SHARE_CODE_TTL_MINUTES),
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(share_code)
+        code = await shareable_code_for_owner(db, owner=owner, resolved=resolved)
         await db.commit()
-        await db.refresh(share_code)
-
-        return _serialize_share_code(
-            share_code,
-            active_shared_devices=active_shared_count,
-            max_companion_devices=max_companion_devices,
-        )
+        return {
+            "success": True,
+            "code": code,
+            "raw_code": _normalize_share_code(code),
+            "status": SHARE_CODE_ACCESS,
+            "router_id": request.router_id,
+            "owner_customer_id": owner.id,
+            "expires_at": owner.expiry.isoformat() if owner.expiry else None,
+            "active_shared_devices": active_shared_count,
+            "max_companion_devices": max_companion_devices,
+            "available_shared_devices": max(0, max_companion_devices - active_shared_count),
+            "message": "Enter this code on your other devices.",
+        }
 
     except HTTPException:
         raise
@@ -922,7 +1289,13 @@ async def redeem_share_subscription_code(
     request: ShareSubscriptionCodeRedeemRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Redeem a one-time share code from the device that should get access."""
+    """Redeem a share code from the device that should get access.
+
+    Kept for portals that predate ``/api/public/access-code/redeem``. Legacy
+    one-time codes are marked used; multi-use access codes are not.
+    """
+    from app.services.code_attempt_limiter import check_code_attempts, record_code_failure
+
     try:
         normalized_mac = _validate_device_mac(request.device_mac)
         if not normalized_mac:
@@ -932,6 +1305,7 @@ async def redeem_share_subscription_code(
         if len(normalized_code) < 4:
             raise HTTPException(status_code=400, detail="Share code is required")
 
+        check_code_attempts(request.router_id, normalized_mac)
         share_code = (
             await db.execute(
                 select(SubscriptionShareCode)
@@ -947,14 +1321,16 @@ async def redeem_share_subscription_code(
             )
         ).scalar_one_or_none()
         if not share_code:
+            record_code_failure(request.router_id, normalized_mac)
             raise HTTPException(status_code=404, detail="Share code not found")
 
         now = datetime.utcnow()
+        is_access_code = share_code.status == SHARE_CODE_ACCESS
         if share_code.status == SHARE_CODE_REDEEMED:
             raise HTTPException(status_code=409, detail="This share code has already been used")
-        if share_code.status != SHARE_CODE_ACTIVE:
+        if share_code.status not in (SHARE_CODE_ACTIVE, SHARE_CODE_ACCESS):
             raise HTTPException(status_code=400, detail="This share code is no longer active")
-        if share_code.expires_at <= now:
+        if not is_access_code and share_code.expires_at <= now:
             share_code.status = SHARE_CODE_EXPIRED
             share_code.updated_at = now
             await db.commit()
@@ -975,9 +1351,9 @@ async def redeem_share_subscription_code(
             normalized_mac=normalized_mac,
             device_type=device_type,
             device_name=request.device_name,
-            device_owner_phone=request.device_owner_phone or owner.phone,
+            device_owner_phone=request.device_owner_phone,
             device_owner_name=request.device_owner_name,
-            share_code=share_code,
+            share_code=None if is_access_code else share_code,
         )
 
     except HTTPException:
@@ -994,7 +1370,11 @@ async def get_share_subscription_owner_status(
     phone: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Check owner subscription sharing status and attached shared devices."""
+    """Whether a phone has a shareable plan here.
+
+    Deliberately reveals no devices, MACs or codes: a phone number is not proof
+    of ownership. The device list lives behind ``/api/public/access-code/devices``.
+    """
     try:
         router_obj = (await db.execute(select(Router).where(Router.id == router_id))).scalar_one_or_none()
         if not router_obj:
@@ -1032,73 +1412,22 @@ async def get_share_subscription_owner_status(
         if not owner:
             return {
                 "router_id": router_id,
-                "phone": phone,
                 "has_active_subscription": False,
                 "sharing_enabled": False,
-                "devices": [],
-                "count": 0,
                 "message": "No active hotspot subscription found for this phone on this router.",
             }
 
         plan = owner.plan
-        max_shared_users = max_shared_users_for_plan(plan)
-        max_companion_devices = shared_device_limit_for_plan(plan)
-        pairings = (
-            await db.execute(
-                select(DevicePairing, Customer)
-                .join(Customer, DevicePairing.customer_id == Customer.id)
-                .where(
-                    DevicePairing.subscription_owner_customer_id == owner.id,
-                    DevicePairing.router_id == router_id,
-                    DevicePairing.is_subscription_share == True,  # noqa: E712
-                    DevicePairing.is_active == True,  # noqa: E712
-                )
-                .order_by(DevicePairing.created_at.desc())
-            )
-        ).all()
-
-        devices = []
-        for pairing, shared_customer in pairings:
-            attempt = await get_recent_delivery_attempt_for_customer(db, shared_customer.id)
-            devices.append(
-                {
-                    **_serialize_pairing(pairing),
-                    "customer": {
-                        "id": shared_customer.id,
-                        "name": shared_customer.name,
-                        "phone": shared_customer.phone,
-                        "status": shared_customer.status.value,
-                        "expiry": shared_customer.expiry.isoformat() if shared_customer.expiry else None,
-                    },
-                    "delivery": serialize_delivery_attempt(attempt),
-                }
-            )
-
-        active_shared_devices = len(devices)
+        sharing_enabled = sharing_enabled_for_plan(plan)
         return {
             "router_id": router_id,
-            "phone": phone,
             "has_active_subscription": True,
-            "sharing_enabled": sharing_enabled_for_plan(plan),
-            "owner_customer_id": owner.id,
-            "owner_device_mac": owner.mac_address,
-            "owner_expiry": owner.expiry.isoformat() if owner.expiry else None,
-            "plan": {
-                "id": plan.id if plan else None,
-                "name": plan.name if plan else None,
-                "max_shared_users": max_shared_users,
-            },
-            "max_shared_users": max_shared_users,
-            "max_companion_devices": max_companion_devices,
-            "active_shared_devices": active_shared_devices,
-            "available_shared_devices": max(0, max_companion_devices - active_shared_devices),
-            "devices": devices,
-            "count": active_shared_devices,
+            "sharing_enabled": sharing_enabled,
+            "max_shared_users": max_shared_users_for_plan(plan),
+            "requires_access_code": True,
             "message": (
-                "Subscription can share another device."
-                if sharing_enabled_for_plan(plan) and active_shared_devices < max_companion_devices
-                else "This subscription has reached its sharing limit."
-                if sharing_enabled_for_plan(plan)
+                "Enter your access code or voucher to manage devices on this plan."
+                if sharing_enabled
                 else "This subscription plan does not allow sharing."
             ),
         }
@@ -1116,100 +1445,19 @@ async def disconnect_shared_subscription_device(
     db: AsyncSession = Depends(get_db),
 ):
     """Disconnect an active shared device and free one subscription slot."""
-    cleanup_result: dict = {"success": True, "skipped": True}
-    owner_id: int | None = None
-    shared_customer_id: int | None = None
-    normalized_mac: str | None = None
-    auth_value: str | None = None
-    router_info: dict | None = None
-
     try:
-        owner = await _find_share_owner_customer(
+        owner, _resolved = await _owner_from_access_code_or_401(
             db,
+            access_code=request.access_code,
             router_id=request.router_id,
-            owner_phone=request.owner_phone,
-            owner_mac=None,
+            device_key=None,
         )
-        owner_id = owner.id
-
-        pairing = (
-            await db.execute(
-                select(DevicePairing)
-                .options(selectinload(DevicePairing.customer), selectinload(DevicePairing.router))
-                .where(
-                    DevicePairing.id == request.pairing_id,
-                    DevicePairing.router_id == request.router_id,
-                    DevicePairing.subscription_owner_customer_id == owner.id,
-                    DevicePairing.is_subscription_share == True,  # noqa: E712
-                    DevicePairing.is_active == True,  # noqa: E712
-                )
-            )
-        ).scalar_one_or_none()
-        if not pairing:
-            raise HTTPException(status_code=404, detail="Shared device not found for this subscription")
-        if not pairing.customer or not pairing.router:
-            raise HTTPException(status_code=400, detail="Shared device is missing customer or router details")
-
-        normalized_mac = _validate_device_mac(pairing.device_mac)
-        if not normalized_mac:
-            raise HTTPException(status_code=400, detail="Shared device has an invalid MAC address")
-
-        now = datetime.utcnow()
-        shared_customer = pairing.customer
-        router_obj = pairing.router
-        shared_customer_id = shared_customer.id
-        pairing.is_active = False
-        pairing.expires_at = now
-        shared_customer.expiry = now
-        shared_customer.subscription_owner_id = None
-
-        auth_method = getattr(router_obj, "auth_method", None)
-        auth_value = auth_method.value if hasattr(auth_method, "value") else auth_method
-        if auth_value != RouterAuthMethod.RADIUS.value:
-            router_info = {
-                "ip": router_obj.ip_address,
-                "username": router_obj.username,
-                "password": router_obj.password,
-                "port": router_obj.port,
-                "name": router_obj.name,
-            }
-
-        await db.commit()
-
-        if auth_value == RouterAuthMethod.RADIUS.value:
-            cleanup_result = await _delete_radius_shared_device_entries(db, normalized_mac)
-        elif router_info:
-            cleanup_result = await asyncio.to_thread(
-                _remove_shared_device_from_direct_router_sync,
-                router_info,
-                normalized_mac,
-            )
-
-        cleanup_success = bool(cleanup_result.get("success"))
-        shared_customer = await db.get(Customer, shared_customer_id)
-        if shared_customer and cleanup_success:
-            shared_customer.status = CustomerStatus.INACTIVE
-            shared_customer.expiry = datetime.utcnow()
-
-        remaining_shared_devices = await active_shared_device_count(db, owner_id)
-        await db.commit()
-
-        return {
-            "success": True,
-            "pairing_id": request.pairing_id,
-            "customer_id": shared_customer_id,
-            "device_mac": normalized_mac,
-            "router_id": request.router_id,
-            "owner_customer_id": owner_id,
-            "active_shared_devices": remaining_shared_devices,
-            "cleanup_status": "removed" if cleanup_success else "pending",
-            "cleanup": cleanup_result,
-            "message": (
-                "Shared device disconnected."
-                if cleanup_success
-                else "Shared device slot freed. Router cleanup is still pending."
-            ),
-        }
+        return await disconnect_shared_pairing(
+            db,
+            owner=owner,
+            router_id=request.router_id,
+            pairing_id=request.pairing_id,
+        )
 
     except HTTPException:
         raise
@@ -1659,27 +1907,17 @@ async def list_paired_devices(
         if not router_obj:
             raise HTTPException(status_code=404, detail="Router not found")
 
-        owner_ids_for_phone = (
-            select(Customer.id)
-            .where(
-                Customer.phone == phone,
-                Customer.router_id == router_id,
-                Customer.subscription_owner_id.is_(None),
-            )
-        )
-
-        # Get pairings where either the device customer or subscription owner
-        # matches the requested phone.
+        # Separately paid devices only. Devices sharing a plan are listed behind
+        # the plan's access code (/api/public/access-code/devices), because a
+        # phone number is not proof of owning that plan.
         result = await db.execute(
             select(DevicePairing)
             .join(Customer, DevicePairing.customer_id == Customer.id)
             .where(
-                or_(
-                    Customer.phone == phone,
-                    DevicePairing.subscription_owner_customer_id.in_(owner_ids_for_phone),
-                ),
+                Customer.phone == phone,
                 DevicePairing.router_id == router_id,
                 DevicePairing.is_active == True,
+                DevicePairing.is_subscription_share == False,  # noqa: E712
             )
             .order_by(DevicePairing.created_at.desc())
         )
@@ -1701,19 +1939,40 @@ async def list_paired_devices(
 @router.delete("/api/public/device/unpair/{pairing_id}")
 async def unpair_device(
     pairing_id: int,
+    router_id: Optional[int] = None,
+    owner_phone: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Deactivate a paired device. Marks pairing as inactive and removes
+    Deactivate a separately paid device. Marks pairing as inactive and removes
     the hotspot user + ip-binding from MikroTik.
+
+    The caller must name the router and the phone the device was paired with,
+    so pairing ids cannot simply be enumerated. Devices sharing a plan are
+    removed with ``/api/public/access-code/disconnect`` instead.
     """
     try:
+        if router_id is None or not owner_phone:
+            raise HTTPException(status_code=400, detail="router_id and owner_phone are required")
+
         pairing = (await db.execute(
-            select(DevicePairing).where(DevicePairing.id == pairing_id)
+            select(DevicePairing)
+            .options(selectinload(DevicePairing.customer))
+            .where(DevicePairing.id == pairing_id, DevicePairing.router_id == router_id)
         )).scalar_one_or_none()
 
-        if not pairing:
+        phone_variants = set(_build_phone_variants(owner_phone.strip()))
+        if (
+            not pairing
+            or not pairing.customer
+            or (pairing.customer.phone or "") not in phone_variants
+        ):
             raise HTTPException(status_code=404, detail="Pairing not found")
+        if pairing.is_subscription_share:
+            raise HTTPException(
+                status_code=400,
+                detail="This device shares a plan. Remove it with the plan's access code.",
+            )
 
         if not pairing.is_active:
             return {"success": True, "message": "Device is already unpaired"}
