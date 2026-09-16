@@ -1692,16 +1692,19 @@ async def pair_device_with_voucher(
             raise HTTPException(status_code=400, detail="Invalid MAC address format. Expected format: AA:BB:CC:DD:EE:FF")
         device_type = _parse_device_type(request.device_type)
 
+        from app.services.code_attempt_limiter import check_code_attempts, record_code_failure
         from app.services.voucher_service import voucher_lookup_candidates
         candidates = voucher_lookup_candidates(request.voucher_code)
         if not candidates:
             raise HTTPException(status_code=400, detail="Voucher code is required")
+        check_code_attempts(request.router_id, normalized_mac)
         result = await db.execute(
             select(Voucher).options(selectinload(Voucher.plan)).where(Voucher.code.in_(candidates))
         )
         voucher = result.scalar_one_or_none()
 
         if not voucher:
+            record_code_failure(request.router_id, normalized_mac)
             raise HTTPException(status_code=404, detail="Voucher code not found")
         code = voucher.code
         if voucher.status != VoucherStatus.AVAILABLE:
