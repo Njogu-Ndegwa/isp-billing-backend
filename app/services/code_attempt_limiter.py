@@ -16,7 +16,10 @@ from fastapi import HTTPException
 
 WINDOW_SECONDS = 600
 MAX_FAILURES_PER_DEVICE = 8
-MAX_FAILURES_PER_ROUTER = 60
+# The router-wide ceiling blocks every customer on that router, so it must sit
+# well above what a busy hotspot's honest typos produce; it only exists to cap
+# guessing that rotates device identifiers.
+MAX_FAILURES_PER_ROUTER = 300
 _MAX_TRACKED_KEYS = 20000
 
 _failures: dict[tuple, deque] = {}
@@ -38,10 +41,22 @@ def _evict_stale(now: float) -> None:
         _recent(key, now)
 
 
+def _keys(router_id: int, device_key: str | None) -> list[tuple]:
+    # Requests without a device identifier (e.g. the share page opened outside
+    # the hotspot) only count router-wide; pooling them under one empty device
+    # key would let a few wrong codes lock out every such visitor.
+    keys = [("router", router_id)]
+    if device_key:
+        keys.append(("device", router_id, device_key.upper()))
+    return keys
+
+
 def check_code_attempts(router_id: int, device_key: str | None) -> None:
     """Raise 429 when this device or router has too many recent failures."""
     now = time.monotonic()
-    device_failures = len(_recent(("device", router_id, (device_key or "").upper()), now))
+    device_failures = (
+        len(_recent(("device", router_id, device_key.upper()), now)) if device_key else 0
+    )
     router_failures = len(_recent(("router", router_id), now))
     if device_failures >= MAX_FAILURES_PER_DEVICE or router_failures >= MAX_FAILURES_PER_ROUTER:
         raise HTTPException(
@@ -54,7 +69,7 @@ def record_code_failure(router_id: int, device_key: str | None) -> None:
     now = time.monotonic()
     if len(_failures) > _MAX_TRACKED_KEYS:
         _evict_stale(now)
-    for key in (("device", router_id, (device_key or "").upper()), ("router", router_id)):
+    for key in _keys(router_id, device_key):
         _failures.setdefault(key, deque()).append(now)
 
 

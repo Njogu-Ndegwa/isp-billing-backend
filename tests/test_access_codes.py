@@ -544,3 +544,19 @@ async def test_unpair_requires_matching_phone_and_skips_shared_devices(db):
     assert exc.value.status_code == 400
     await db.refresh(shared_pairing)
     assert shared_pairing.is_active is True
+
+
+async def test_failures_without_a_device_do_not_share_a_bucket(db):
+    from app.services import code_attempt_limiter as limiter
+
+    for _ in range(MAX_FAILURES_PER_DEVICE + 2):
+        limiter.record_code_failure(1, None)
+    limiter.check_code_attempts(1, None)
+    limiter.check_code_attempts(1, PHONE_2)
+
+    for _ in range(limiter.MAX_FAILURES_PER_ROUTER):
+        limiter.record_code_failure(1, None)
+    with pytest.raises(HTTPException) as exc:
+        limiter.check_code_attempts(1, PHONE_2)
+    assert exc.value.status_code == 429
+    limiter.check_code_attempts(2, PHONE_2)
