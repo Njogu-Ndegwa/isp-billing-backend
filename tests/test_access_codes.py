@@ -544,3 +544,75 @@ async def test_unpair_requires_matching_phone_and_skips_shared_devices(db):
     assert exc.value.status_code == 400
     await db.refresh(shared_pairing)
     assert shared_pairing.is_active is True
+
+
+async def test_failures_without_a_device_do_not_share_a_bucket(db):
+    from app.services import code_attempt_limiter as limiter
+
+    for _ in range(MAX_FAILURES_PER_DEVICE + 2):
+        limiter.record_code_failure(1, None)
+    limiter.check_code_attempts(1, None)
+    limiter.check_code_attempts(1, PHONE_2)
+
+    for _ in range(limiter.MAX_FAILURES_PER_ROUTER):
+        limiter.record_code_failure(1, None)
+    with pytest.raises(HTTPException) as exc:
+        limiter.check_code_attempts(1, PHONE_2)
+    assert exc.value.status_code == 429
+    limiter.check_code_attempts(2, PHONE_2)
+
+
+async def test_legacy_voucher_endpoints_are_throttled(db):
+    reseller, plan, router = await _setup(db)
+
+    for _ in range(MAX_FAILURES_PER_DEVICE):
+        with pytest.raises(HTTPException) as exc:
+            await public_routes.redeem_voucher_public(
+                {"code": "11112222", "mac_address": PHONE_2, "router_id": router.id}, db
+            )
+        assert exc.value.status_code == 400
+    with pytest.raises(HTTPException) as exc:
+        await public_routes.redeem_voucher_public(
+            {"code": "11112222", "mac_address": PHONE_2, "router_id": router.id}, db
+        )
+    assert exc.value.status_code == 429
+
+    for _ in range(MAX_FAILURES_PER_DEVICE):
+        with pytest.raises(HTTPException) as exc:
+            await device_pairing.pair_device_with_voucher(
+                device_pairing.DevicePairVoucherRequest(
+                    device_mac=PHONE_3, voucher_code="11112222", router_id=router.id
+                ),
+                db,
+            )
+        assert exc.value.status_code == 404
+    with pytest.raises(HTTPException) as exc:
+        await device_pairing.pair_device_with_voucher(
+            device_pairing.DevicePairVoucherRequest(
+                device_mac=PHONE_3, voucher_code="11112222", router_id=router.id
+            ),
+            db,
+        )
+    assert exc.value.status_code == 429
+
+
+async def test_legacy_voucher_verify_is_throttled(db):
+    from app.services import code_attempt_limiter as limiter
+
+    for _ in range(limiter.MAX_FAILURES_PER_ROUTER):
+        with pytest.raises(HTTPException) as exc:
+            await public_routes.verify_voucher_public("11112222", 0, db)
+        assert exc.value.status_code == 400
+    with pytest.raises(HTTPException) as exc:
+        await public_routes.verify_voucher_public("11112222", 0, db)
+    assert exc.value.status_code == 429
+
+
+async def test_legacy_voucher_redeem_still_works(db, stub_provisioning):
+    reseller, plan, router = await _setup(db)
+    await _voucher(db, reseller, plan, router)
+    result = await public_routes.redeem_voucher_public(
+        {"code": "48392910", "mac_address": OWNER_MAC, "router_id": router.id}, db
+    )
+    await stub_provisioning.drain()
+    assert result["success"] is True

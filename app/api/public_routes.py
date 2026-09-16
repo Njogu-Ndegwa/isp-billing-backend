@@ -895,10 +895,16 @@ async def redeem_voucher_public(
     if not validate_mac_address(mac_address):
         raise HTTPException(status_code=400, detail="Invalid MAC address format")
 
+    from app.services.code_attempt_limiter import check_code_attempts, record_code_failure
     from app.services.voucher_service import redeem_voucher
+
+    normalized_mac = normalize_mac_address(mac_address)
+    check_code_attempts(rid, normalized_mac)
     result = await redeem_voucher(db, code, mac_address, rid)
 
     if not result.get("success"):
+        if result.get("error") == "Voucher code not found":
+            record_code_failure(rid, normalized_mac)
         raise HTTPException(status_code=400, detail=result.get("error", "Redemption failed"))
 
     return result
@@ -1044,16 +1050,25 @@ async def access_credential_login_public(
 @router.get("/api/public/voucher/verify/{code}")
 async def verify_voucher_public(
     code: str,
+    router_id: int = 0,
     db: AsyncSession = Depends(get_db),
 ):
     """
     Check if a voucher code is valid without redeeming it.
     Returns plan details so the customer knows what they're getting.
+
+    Throttled like every other public code lookup. Current portals no longer
+    call this; callers without ``router_id`` share one bucket.
     """
+    from app.services.code_attempt_limiter import check_code_attempts, record_code_failure
     from app.services.voucher_service import verify_voucher
+
+    check_code_attempts(router_id, None)
     result = await verify_voucher(db, code)
 
     if not result.get("valid"):
+        if result.get("error") == "Voucher code not found":
+            record_code_failure(router_id, None)
         raise HTTPException(status_code=400, detail=result.get("error", "Invalid voucher"))
 
     return result
