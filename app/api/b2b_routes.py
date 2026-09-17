@@ -58,6 +58,11 @@ MIN_WITHDRAWAL_KES = 2
 # with our credentials. Admin/scheduled payouts are not throttled.
 WITHDRAWAL_COOLDOWN = timedelta(minutes=10)
 
+# A manual "failed" verdict releases the same balance for payment again. Do
+# not permit that while a delayed Safaricom result callback may still arrive;
+# reconciliation gets the first 48 hours to obtain a provider verdict.
+MANUAL_FAILURE_MIN_AGE = timedelta(hours=48)
+
 
 async def _withdrawal_cooldown_remaining(db: AsyncSession, reseller_id: int) -> int:
     """Seconds until this reseller may attempt another self-withdrawal (0 = now)."""
@@ -716,6 +721,16 @@ async def resolve_b2b_transaction(
         txn.result_desc = f"Manually resolved as completed by admin {admin.id}: {note}"[:500]
         await _settle_completed_transaction(db, txn, receipt)
     else:
+        created_at = txn.created_at or datetime.utcnow()
+        if created_at > datetime.utcnow() - MANUAL_FAILURE_MIN_AGE:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A payment cannot be manually marked failed during its first "
+                    "48 hours; wait for Safaricom callback/status reconciliation "
+                    "or mark it completed with the verified statement receipt"
+                ),
+            )
         txn.status = B2BTransactionStatus.FAILED
         txn.result_code = txn.result_code or "MANUAL"
         txn.result_desc = f"Manually resolved as failed by admin {admin.id}: {note}"[:500]

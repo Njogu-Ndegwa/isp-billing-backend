@@ -578,6 +578,38 @@ async def test_admin_resolve_failed_unblocks_without_payout(engine, db, monkeypa
     assert not await b2b.has_unresolved_b2b(db, r1.id)
 
 
+async def test_admin_cannot_fail_fresh_transaction_while_callback_may_arrive(
+    engine, db, monkeypatch
+):
+    """A fresh manual failure could race a real success and enable overpayment."""
+    from app.api import b2b_routes as routes
+
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    reseller = await make_reseller(db)
+    fresh = await _make_txn(
+        db,
+        reseller.id,
+        age=timedelta(minutes=10),
+        conversation_id="AG_fresh_manual_failure_guard",
+        status=B2BTransactionStatus.PENDING,
+    )
+    _login_as(monkeypatch, routes, admin)
+
+    with pytest.raises(HTTPException) as exc:
+        await routes.resolve_b2b_transaction(
+            fresh.id,
+            routes.ResolveB2BRequest(
+                outcome="failed", note="Could not find it yet"
+            ),
+            db=db,
+            token="t",
+        )
+
+    assert exc.value.status_code == 409
+    await db.refresh(fresh)
+    assert fresh.status == B2BTransactionStatus.PENDING
+
+
 async def test_admin_resolve_guards(engine, db, monkeypatch):
     from app.api import b2b_routes as routes
 

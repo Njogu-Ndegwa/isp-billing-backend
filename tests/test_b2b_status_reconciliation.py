@@ -26,7 +26,7 @@ from app.db.models import (
     ResellerPayout,
     ResellerTransactionCharge,
 )
-from tests.factories import make_reseller
+from tests.factories import make_reseller, make_router
 from tests.conftest import running_on_postgres
 from tests.test_b2b_payout_resilience import _patch_payout_env
 
@@ -35,7 +35,7 @@ pytestmark = pytest.mark.asyncio
 
 async def _make_txn(db, reseller_id, *, status, age=timedelta(hours=30),
                     triggered_by="scheduled", conversation_id=None,
-                    originator_id=None, net=95.0, fee=5.0):
+                    originator_id=None, net=95.0, fee=5.0, router_id=None):
     txn = B2BTransaction(
         reseller_id=reseller_id,
         conversation_id=conversation_id,
@@ -48,6 +48,7 @@ async def _make_txn(db, reseller_id, *, status, age=timedelta(hours=30),
         account_reference="acc-1",
         status=status,
         triggered_by=triggered_by,
+        router_id=router_id,
         created_at=datetime.utcnow() - age,
     )
     db.add(txn)
@@ -71,6 +72,18 @@ def _status_result_body(conversation_id, *, result_code="0", status_text="Comple
                     {"Key": "ReceiptNo", "Value": receipt},
                 ]
             },
+        }
+    }
+
+
+def _result_body(txn, *, result_code="0", receipt="UGITESTRCPT"):
+    return {
+        "Result": {
+            "ResultCode": result_code,
+            "ResultDesc": "Completed" if result_code == "0" else "Failed",
+            "ConversationID": txn.conversation_id,
+            "OriginatorConversationID": txn.originator_conversation_id,
+            "TransactionID": receipt,
         }
     }
 
@@ -263,6 +276,73 @@ async def test_result_callback_is_idempotent(engine, db):
     assert len(charges) == 1
 
 
+async def test_result_success_after_timeout_settles_immediately(engine, db):
+    """TIMEOUT is unresolved; a later definitive success must create the ledger."""
+    from app.services import mpesa_b2b as b2b
+
+    reseller = await make_reseller(db)
+    txn = await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.TIMEOUT,
+        conversation_id="AG_TIMEOUT_THEN_SUCCESS",
+        originator_id="orig-timeout-success",
+        net=4993.0,
+        fee=42.0,
+    )
+
+    settled = await b2b.process_b2b_result(
+        db, _result_body(txn, receipt="UI9TIMEOUTSUCCESS")
+    )
+    await db.commit()
+
+    assert settled.status == B2BTransactionStatus.COMPLETED
+    assert settled.transaction_id == "UI9TIMEOUTSUCCESS"
+    payouts = (
+        await db.execute(
+            select(ResellerPayout).where(ResellerPayout.reseller_id == reseller.id)
+        )
+    ).scalars().all()
+    charges = (
+        await db.execute(
+            select(ResellerTransactionCharge).where(
+                ResellerTransactionCharge.reseller_id == reseller.id
+            )
+        )
+    ).scalars().all()
+    assert len(payouts) == 1
+    assert len(charges) == 1
+    assert not await b2b.has_unresolved_b2b(db, reseller.id)
+
+
+async def test_result_failure_after_timeout_releases_balance(engine, db):
+    """A definitive failure after TIMEOUT must unblock without a fake payout."""
+    from app.services import mpesa_b2b as b2b
+
+    reseller = await make_reseller(db)
+    txn = await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.TIMEOUT,
+        conversation_id="AG_TIMEOUT_THEN_FAILURE",
+        originator_id="orig-timeout-failure",
+    )
+
+    settled = await b2b.process_b2b_result(
+        db, _result_body(txn, result_code="2001", receipt=None)
+    )
+    await db.commit()
+
+    assert settled.status == B2BTransactionStatus.FAILED
+    payouts = (
+        await db.execute(
+            select(ResellerPayout).where(ResellerPayout.reseller_id == reseller.id)
+        )
+    ).scalars().all()
+    assert payouts == []
+    assert not await b2b.has_unresolved_b2b(db, reseller.id)
+
+
 @pytest.mark.skipif(
     not running_on_postgres(),
     reason="SELECT FOR UPDATE concurrency semantics require Postgres",
@@ -320,6 +400,76 @@ async def test_concurrent_result_callbacks_settle_once(
     assert len(charges) == 1
 
 
+@pytest.mark.skipif(
+    not running_on_postgres(),
+    reason="SELECT FOR UPDATE concurrency semantics require Postgres",
+)
+async def test_timeout_commit_before_result_still_accepts_definitive_success(
+    engine, db, session_factory
+):
+    """Force timeout to own the row lock first, then deliver the real result."""
+    from app.services import mpesa_b2b as b2b
+
+    reseller = await make_reseller(db)
+    txn = await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.PENDING,
+        conversation_id="AG_TIMEOUT_RESULT_RACE",
+        originator_id="orig-timeout-result-race",
+        net=4993.0,
+        fee=42.0,
+    )
+    timeout_body = {
+        "Result": {
+            "ConversationID": txn.conversation_id,
+            "OriginatorConversationID": txn.originator_conversation_id,
+            "ResultDesc": "Queue timeout",
+        }
+    }
+    result_body = _result_body(txn, receipt="UI9TIMEOUTRACE")
+    timeout_has_lock = asyncio.Event()
+    allow_timeout_commit = asyncio.Event()
+
+    async def deliver_timeout():
+        async with session_factory() as session:
+            await b2b.process_b2b_timeout(session, timeout_body)
+            timeout_has_lock.set()
+            await allow_timeout_commit.wait()
+            await session.commit()
+
+    async def deliver_result():
+        await timeout_has_lock.wait()
+        async with session_factory() as session:
+            await b2b.process_b2b_result(session, result_body)
+            await session.commit()
+
+    timeout_task = asyncio.create_task(deliver_timeout())
+    await timeout_has_lock.wait()
+    result_task = asyncio.create_task(deliver_result())
+    await asyncio.sleep(0.05)
+    allow_timeout_commit.set()
+    await asyncio.gather(timeout_task, result_task)
+
+    await db.refresh(txn)
+    assert txn.status == B2BTransactionStatus.COMPLETED
+    assert txn.transaction_id == "UI9TIMEOUTRACE"
+    payouts = (
+        await db.execute(
+            select(ResellerPayout).where(ResellerPayout.reseller_id == reseller.id)
+        )
+    ).scalars().all()
+    charges = (
+        await db.execute(
+            select(ResellerTransactionCharge).where(
+                ResellerTransactionCharge.reseller_id == reseller.id
+            )
+        )
+    ).scalars().all()
+    assert len(payouts) == 1
+    assert len(charges) == 1
+
+
 async def test_mpesa_payout_reference_is_unique(engine, db):
     """The DB is the last line of defense if callback locking regresses."""
     r1 = await make_reseller(db)
@@ -367,9 +517,10 @@ async def test_status_result_failed_marks_failed_no_payout(engine, db, monkeypat
     assert not await b2b.has_unresolved_b2b(db, r1.id)
 
 
-async def test_status_result_2033_fresh_marks_failed(engine, db, monkeypatch):
-    """Code 2033 (no record at Safaricom) on a FRESH transaction is a
-    definitive 'never processed' — mark failed so the reseller stays owed."""
+async def test_status_result_2033_fresh_stays_blocked_and_accepts_late_success(
+    engine, db, monkeypatch
+):
+    """Fresh 2033 can be provider lag; it must not release money for re-pay."""
     from app.services import mpesa_b2b as b2b
 
     r1 = await make_reseller(db)
@@ -383,12 +534,26 @@ async def test_status_result_2033_fresh_marks_failed(engine, db, monkeypatch):
     )
     await db.commit()
 
-    assert settled.status == B2BTransactionStatus.FAILED
+    assert settled.status == B2BTransactionStatus.PENDING
+    assert not (settled.result_desc or "").startswith(b2b.MANUAL_REVIEW_MARKER)
     payouts = (await db.execute(
         select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
     )).scalars().all()
     assert payouts == []
-    assert not await b2b.has_unresolved_b2b(db, r1.id)
+    assert await b2b.has_unresolved_b2b(db, r1.id)
+
+    # A real result may arrive after the status index said "not found".
+    await b2b.process_b2b_result(
+        db, _result_body(txn, receipt="UI9LATEAFTER2033")
+    )
+    await db.commit()
+    await db.refresh(txn)
+    assert txn.status == B2BTransactionStatus.COMPLETED
+    payouts = (await db.execute(
+        select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
+    )).scalars().all()
+    assert len(payouts) == 1
+    assert payouts[0].reference == "UI9LATEAFTER2033"
 
 
 async def test_status_result_2033_stale_stays_blocked(engine, db, monkeypatch):
@@ -415,17 +580,16 @@ async def test_status_result_2033_stale_stays_blocked(engine, db, monkeypatch):
     assert (txn.result_desc or "").startswith(b2b.MANUAL_REVIEW_MARKER)
 
 
-async def test_status_result_2033_stale_with_history_auto_fails(engine, db, monkeypatch):
-    """Corroborating-evidence rule: a stale 2033 zombie whose reseller has had
-    later payouts complete and reconcile is treated as never-processed —
-    auto-failed, reseller stays owed and unblocked. (An actively-transacting
-    reseller must not be deadlocked by ancient uncertainty.)"""
+async def test_status_result_2033_stale_with_history_still_requires_statement(
+    engine, db, monkeypatch
+):
+    """Later payouts are not proof that an old ambiguous transfer failed."""
     from app.services import mpesa_b2b as b2b
 
     r1 = await make_reseller(db)
     txn = await _make_txn(db, r1.id, status=B2BTransactionStatus.PENDING,
                           age=timedelta(days=39), conversation_id="AG_zombie_hist")
-    # Two later reconciled balance payouts = the corroboration threshold.
+    # Even two later reconciled payouts cannot prove this transfer failed.
     await _make_txn(db, r1.id, status=B2BTransactionStatus.COMPLETED,
                     age=timedelta(days=20), conversation_id="AG_later_1")
     await _make_txn(db, r1.id, status=B2BTransactionStatus.COMPLETED,
@@ -439,20 +603,173 @@ async def test_status_result_2033_stale_with_history_auto_fails(engine, db, monk
     await db.commit()
 
     await db.refresh(txn)
-    assert txn.status == B2BTransactionStatus.FAILED
-    assert "Auto-failed stale unresolved payout" in (txn.result_desc or "")
+    assert txn.status == B2BTransactionStatus.PENDING
+    assert (txn.result_desc or "").startswith(b2b.MANUAL_REVIEW_MARKER)
     payouts = (await db.execute(
         select(ResellerPayout).where(ResellerPayout.reseller_id == r1.id)
     )).scalars().all()
     assert payouts == []  # failed = no ledger rows; the reseller stays owed
-    assert not await b2b.has_unresolved_b2b(db, r1.id)
+    assert await b2b.has_unresolved_b2b(db, r1.id)
 
 
-async def test_reconciliation_sweep_unsticks_flagged_zombies_with_history(
+async def test_status_result_2033_router_zombie_ignores_other_router_history(
+    engine, db, monkeypatch
+):
+    """Router B payouts cannot prove that a stale router A transfer failed."""
+    from app.services import mpesa_b2b as b2b
+
+    reseller = await make_reseller(db)
+    router_a = await make_router(db, reseller, name="Site A")
+    router_b = await make_router(db, reseller, name="Site B")
+    zombie = await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.PENDING,
+        age=timedelta(days=39),
+        conversation_id="AG_ROUTER_ZOMBIE",
+        router_id=router_a.id,
+    )
+    await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.COMPLETED,
+        age=timedelta(days=10),
+        conversation_id="AG_OTHER_ROUTER_1",
+        router_id=router_b.id,
+    )
+    await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.COMPLETED,
+        age=timedelta(days=2),
+        conversation_id="AG_OTHER_ROUTER_2",
+        router_id=router_b.id,
+    )
+
+    b2b._status_query_map.clear()
+    b2b._status_query_map["QCONV-ROUTER-ZOMBIE"] = zombie.id
+    await b2b.process_b2b_status_result(
+        db,
+        _status_result_body(
+            "QCONV-ROUTER-ZOMBIE", result_code="2033", status_text=""
+        ),
+    )
+    await db.commit()
+
+    await db.refresh(zombie)
+    assert zombie.status == B2BTransactionStatus.PENDING
+    assert (zombie.result_desc or "").startswith(b2b.MANUAL_REVIEW_MARKER)
+    assert await b2b.has_unresolved_b2b(db, reseller.id, router_id=router_a.id)
+
+
+async def test_status_result_2033_router_zombie_ignores_same_router_history(
+    engine, db, monkeypatch
+):
+    """Same-router history is still not a provider or statement verdict."""
+    from app.services import mpesa_b2b as b2b
+
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller, name="Site A")
+    zombie = await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.PENDING,
+        age=timedelta(days=39),
+        conversation_id="AG_SAME_ROUTER_ZOMBIE",
+        router_id=router.id,
+    )
+    await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.COMPLETED,
+        age=timedelta(days=10),
+        conversation_id="AG_SAME_ROUTER_1",
+        router_id=router.id,
+    )
+    await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.COMPLETED,
+        age=timedelta(days=2),
+        conversation_id="AG_SAME_ROUTER_2",
+        router_id=router.id,
+    )
+
+    b2b._status_query_map.clear()
+    b2b._status_query_map["QCONV-SAME-ROUTER"] = zombie.id
+    await b2b.process_b2b_status_result(
+        db,
+        _status_result_body(
+            "QCONV-SAME-ROUTER", result_code="2033", status_text=""
+        ),
+    )
+    await db.commit()
+
+    await db.refresh(zombie)
+    assert zombie.status == B2BTransactionStatus.PENDING
+    assert (zombie.result_desc or "").startswith(b2b.MANUAL_REVIEW_MARKER)
+    assert await b2b.has_unresolved_b2b(db, reseller.id, router_id=router.id)
+
+
+async def test_status_result_2033_deleted_router_never_uses_null_bucket_history(
+    engine, db, monkeypatch
+):
+    """ON DELETE SET NULL must not turn unrelated history into failure proof."""
+    from app.services import mpesa_b2b as b2b
+
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller, name="Deleted Site")
+    zombie = await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.PENDING,
+        age=timedelta(days=39),
+        conversation_id="AG_DELETED_ROUTER_ZOMBIE",
+        router_id=router.id,
+    )
+    await db.delete(router)
+    # Production Postgres applies the FK's ON DELETE SET NULL. The local
+    # SQLite harness does not enforce foreign keys, so mirror that transition.
+    zombie.router_id = None
+    await db.commit()
+    await db.refresh(zombie)
+    assert zombie.router_id is None
+
+    await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.COMPLETED,
+        age=timedelta(days=10),
+        conversation_id="AG_NULL_BUCKET_1",
+    )
+    await _make_txn(
+        db,
+        reseller.id,
+        status=B2BTransactionStatus.COMPLETED,
+        age=timedelta(days=2),
+        conversation_id="AG_NULL_BUCKET_2",
+    )
+
+    b2b._status_query_map.clear()
+    b2b._status_query_map["QCONV-DELETED-ROUTER"] = zombie.id
+    await b2b.process_b2b_status_result(
+        db,
+        _status_result_body(
+            "QCONV-DELETED-ROUTER", result_code="2033", status_text=""
+        ),
+    )
+    await db.commit()
+
+    await db.refresh(zombie)
+    assert zombie.status == B2BTransactionStatus.PENDING
+    assert (zombie.result_desc or "").startswith(b2b.MANUAL_REVIEW_MARKER)
+    assert await b2b.has_unresolved_b2b(db, reseller.id)
+
+
+async def test_reconciliation_sweep_never_auto_releases_flagged_zombies(
     engine, db, session_factory, monkeypatch
 ):
-    """Rows already flagged for manual review get retro-resolved by the same
-    evidence rule on the next tick — no new Safaricom call needed."""
+    """Manual-review rows stay blocked regardless of later ledger history."""
     from app.services import mpesa_b2b as b2b
 
     r1 = await make_reseller(db)
@@ -480,10 +797,11 @@ async def test_reconciliation_sweep_unsticks_flagged_zombies_with_history(
 
     await db.refresh(flagged)
     await db.refresh(stuck)
-    assert flagged.status == B2BTransactionStatus.FAILED
-    assert not await b2b.has_unresolved_b2b(db, r1.id)
+    assert flagged.status == B2BTransactionStatus.PENDING
+    assert await b2b.has_unresolved_b2b(db, r1.id)
     assert stuck.status == B2BTransactionStatus.PENDING
     assert await b2b.has_unresolved_b2b(db, r2.id)
+    b2b.query_b2b_transaction_status.assert_not_awaited()
 
 
 async def test_status_result_ambiguous_leaves_txn_blocked(engine, db, monkeypatch):
