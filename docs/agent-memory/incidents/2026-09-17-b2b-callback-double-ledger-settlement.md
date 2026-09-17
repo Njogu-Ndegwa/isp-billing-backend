@@ -30,6 +30,15 @@ rows, and the later commit merely overwrote `b2b_transactions.payout_id` and
 
 - Lock B2B transaction rows with `SELECT ... FOR UPDATE` in the normal result,
   timeout, status-reconciliation, and manual-resolution paths.
+- Treat both `pending` and `timeout` as unresolved when the definitive normal
+  result arrives, so a timeout/result race cannot delay or strand settlement.
+- Never treat a Safaricom 2033 "not found" response or later payout history as
+  proof that money did not move. Retry for 48 hours, then keep the balance
+  blocked until an admin verifies the M-Pesa statement; router deletion can
+  erase bucket identity, so historical ledger activity is unsafe evidence.
+- Prevent admins from marking a transaction failed during its first 48 hours,
+  when a legitimate delayed success callback may still arrive; verified manual
+  completion remains available with the real statement receipt.
 - Skip settlement defensively when a transaction already links to a payout.
 - Add a partial unique index on `reseller_payouts.reference` for M-Pesa B2B
   payouts so one Safaricom receipt cannot settle the ledger twice.
@@ -41,6 +50,13 @@ rows, and the later commit merely overwrote `b2b_transactions.payout_id` and
 - Sequential duplicate callback test creates one payout and one fee.
 - PostgreSQL concurrency test delivers two callbacks simultaneously and asserts
   one payout and one fee.
+- Timeout-first tests prove a later definitive success settles exactly once and
+  a later definitive failure releases the balance without a payout.
+- Fresh and stale 2033 tests prove "not found" never releases the balance,
+  including after router deletion, while a later definitive success still
+  settles normally.
+- Manual failure tests prove fresh unresolved payments cannot be released for
+  repayment while a real callback may still arrive.
 - Database uniqueness test rejects duplicate M-Pesa payout references.
 - Production audit must show one payout row, one fee row, and a zero balance for
   the affected reseller after repair.
