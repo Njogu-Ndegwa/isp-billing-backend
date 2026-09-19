@@ -625,6 +625,13 @@ async def record_subscription_payment(
     return payment
 
 
+def format_money(amount: float, currency: str | None) -> str:
+    """'KES 1,500' / 'USD 10.00' / 'XAF 159,140' for user-facing messages."""
+    code = (currency or BASE_CURRENCY).upper()
+    decimals = 2 if code in ("USD", "EUR") else 0
+    return f"{code} {amount:,.{decimals}f}"
+
+
 async def get_invoice_alert_for_user(db: AsyncSession, user_id: int) -> dict | None:
     """
     Returns a subscription alert dict for injection into login/dashboard responses.
@@ -650,16 +657,17 @@ async def get_invoice_alert_for_user(db: AsyncSession, user_id: int) -> dict | N
     elif pending_invoice:
         enriched = enrich_invoice(pending_invoice, inv_paid)
         remaining = enriched["balance_remaining"]
+        money = lambda amount: format_money(amount, enriched["currency"])  # noqa: E731
         if enriched["is_overdue"]:
-            message = f"Your {enriched['period_label']} invoice of KES {enriched['final_charge']:,.0f} is overdue."
+            message = f"Your {enriched['period_label']} invoice of {money(enriched['final_charge'])} is overdue."
             if inv_paid > 0:
-                message += f" KES {inv_paid:,.0f} paid, KES {remaining:,.0f} remaining."
+                message += f" {money(inv_paid)} paid, {money(remaining)} remaining."
             else:
                 message += " Please pay to avoid suspension."
         elif enriched["is_due_soon"]:
-            message = f"Your {enriched['period_label']} invoice of KES {enriched['final_charge']:,.0f} is due in {enriched['days_until_due']} day{'s' if enriched['days_until_due'] != 1 else ''}."
+            message = f"Your {enriched['period_label']} invoice of {money(enriched['final_charge'])} is due in {enriched['days_until_due']} day{'s' if enriched['days_until_due'] != 1 else ''}."
             if inv_paid > 0:
-                message += f" KES {inv_paid:,.0f} paid, KES {remaining:,.0f} remaining."
+                message += f" {money(inv_paid)} paid, {money(remaining)} remaining."
         else:
             return None
     elif status_val == "trial":
