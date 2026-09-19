@@ -29,7 +29,7 @@ from app.services.subscription import (
 )
 from app.services.markets import (
     MARKETS, get_market, market_summary, PAY_CARD,
-    REPORTING_CURRENCY, kes_per_unit, to_kes, sql_kes_by_currency,
+    REPORTING_CURRENCY, kes_per_unit, to_kes, sql_kes_by_currency, kes_rates,
 )
 from app.services.mpesa import initiate_stk_push_direct
 from app.services.mpesa_b2b import (
@@ -631,7 +631,7 @@ def _admin_invoice(invoice: SubscriptionInvoice, amount_paid: float = 0.0) -> di
 
 def _fx_meta() -> dict:
     """Admin totals are in KES; usd_rate (KES per USD) lets the UI show USD."""
-    return {"reporting_currency": REPORTING_CURRENCY, "usd_rate": kes_per_unit("USD")}
+    return {"reporting_currency": REPORTING_CURRENCY, "usd_rate": kes_per_unit("USD"), "kes_rates": kes_rates()}
 
 
 def _enum_value(value):

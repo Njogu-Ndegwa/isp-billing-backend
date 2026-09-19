@@ -29,6 +29,7 @@ from app.services.markets import (
     kes_per_unit,
     sql_kes_by_currency,
     sql_kes_by_market,
+    kes_rates,
 )
 from app.core.cache import cache
 
@@ -62,7 +63,7 @@ def _charge_kes():
 def _fx_meta() -> dict[str, Any]:
     """Top-level fields on every admin money response: totals are in KES, and
     ``usd_rate`` (KES per USD) lets the frontend offer a USD view by dividing."""
-    return {"reporting_currency": REPORTING_CURRENCY, "usd_rate": kes_per_unit("USD")}
+    return {"reporting_currency": REPORTING_CURRENCY, "usd_rate": kes_per_unit("USD"), "kes_rates": kes_rates()}
 
 
 def _cp_select(*cols):

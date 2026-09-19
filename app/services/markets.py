@@ -200,3 +200,10 @@ def sql_kes_by_market(amount_col, market_code_col):
         for m in MARKETS.values() if m.currency != REPORTING_CURRENCY
     ]
     return case(*whens, else_=amount_col)
+
+
+def kes_rates() -> dict[str, float]:
+    """KES per 1 unit of every currency in use, for frontends that total rows
+    in different currencies (e.g. the admin resellers list)."""
+    currencies = {REPORTING_CURRENCY, "USD"} | {m.currency for m in MARKETS.values()}
+    return {code: kes_per_unit(code) for code in sorted(currencies)}

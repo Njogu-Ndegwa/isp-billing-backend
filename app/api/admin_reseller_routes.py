@@ -38,7 +38,7 @@ from app.config import settings
 from app.services.app_settings import get_setting, set_setting
 from app.services.voucher_service import COMPENSATION_DAILY_LIMIT_KEY
 from app.services.markets import (
-    REPORTING_CURRENCY, get_market, kes_per_unit, sql_kes_by_market, to_kes,
+    REPORTING_CURRENCY, get_market, kes_per_unit, sql_kes_by_market, to_kes, kes_rates,
 )
 
 import logging
@@ -416,6 +416,9 @@ async def list_resellers(
         "total": len(items),
         "filters_applied": {"sort_by": sort_by, "sort_order": sort_order, "filter": filter, "search": search},
         "resellers": items,
+        # Rows are in each reseller's own currency; KES per unit to total them.
+        "kes_rates": kes_rates(),
+        "usd_rate": kes_per_unit("USD"),
     }
 
 
@@ -601,6 +604,7 @@ async def reseller_stats(
         "currency": REPORTING_CURRENCY,
         "reporting_currency": REPORTING_CURRENCY,
         "usd_rate": kes_per_unit("USD"),
+        "kes_rates": kes_rates(),
         "revenue_over_time": revenue_over_time,
         "signups_over_time": signups_over_time,
         "totals": {
@@ -1390,6 +1394,7 @@ async def admin_dashboard(
         # USD view: divide any KES figure by usd_rate (KES per USD).
         "reporting_currency": REPORTING_CURRENCY,
         "usd_rate": kes_per_unit("USD"),
+        "kes_rates": kes_rates(),
         "resellers": {
             "total": total_resellers,
             # Login recency — a usage signal, not a subscription state. Keep it
