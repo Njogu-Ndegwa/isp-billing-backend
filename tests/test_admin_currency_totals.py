@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 import app.api.admin_reseller_routes as arr
+import app.api.dashboard_routes as dr
 import app.api.subscription_routes as sr
 from app.db.database import get_db
 from app.db.models import (
@@ -85,6 +86,7 @@ async def client(session_factory):
     application = FastAPI()
     application.include_router(sr.router)
     application.include_router(arr.router)
+    application.include_router(dr.router)
 
     async def _override_get_db():
         async with session_factory() as s:
@@ -106,6 +108,7 @@ def _auth_as(monkeypatch, user):
         return user
     monkeypatch.setattr(sr, "get_current_user", _fake)
     monkeypatch.setattr(arr, "get_current_user", _fake)
+    monkeypatch.setattr(dr, "get_current_user", _fake)
 
 
 # ---------------------------------------------------------------------------
@@ -306,3 +309,36 @@ async def test_admin_totals_carry_reporting_currency_and_usd_rate(db, client, mo
     for body in (revenue, dashboard, mrr):
         assert body["reporting_currency"] == "KES"
         assert body["usd_rate"] == USD_TO_KES
+
+
+# ---------------------------------------------------------------------------
+# Shared dashboard charts: admins see every reseller, so they convert to KES
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_admin_daily_transactions_and_revenue_series_are_in_kes(db, client, monkeypatch):
+    ke = await make_reseller(db)
+    cm = await make_reseller(db, market_code="CM")
+    await _customer_payment(db, ke, 1_000)
+    await _customer_payment(db, cm, 5_710)
+    expected = round(1_000 + 5_710 * XAF_TO_KES, 2)
+
+    _auth_as(monkeypatch, await make_admin(db))
+    daily = (await client.get("/api/dashboard/transactions-daily?period=7d")).json()
+    assert daily["currency"] == "KES"
+    assert daily["totals"]["revenue"] == pytest.approx(expected, abs=0.02)
+
+    series = (await client.get("/api/dashboard/revenue-over-time?period=7d")).json()
+    assert series["currency"] == "KES"
+    assert sum(p.get("revenue", 0) for p in series["data"]) == pytest.approx(expected, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_reseller_daily_transactions_stay_in_their_currency(db, client, monkeypatch):
+    cm = await make_reseller(db, market_code="CM")
+    await _customer_payment(db, cm, 5_710)
+
+    _auth_as(monkeypatch, cm)
+    daily = (await client.get("/api/dashboard/transactions-daily?period=7d")).json()
+    assert daily["currency"] == "XAF"
+    assert daily["totals"]["revenue"] == 5_710
