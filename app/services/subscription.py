@@ -547,6 +547,8 @@ def enrich_invoice(invoice: SubscriptionInvoice, amount_paid: float = 0.0) -> di
         "gross_charge": invoice.gross_charge,
         "final_charge": invoice.final_charge,
         "currency": getattr(invoice, "currency", None) or BASE_CURRENCY,
+        # Rates, local revenue and FX rate the charge was computed with.
+        "pricing_rule": getattr(invoice, "pricing_rule", None),
         "amount_paid": round(amount_paid, 2),
         "balance_remaining": round(balance_remaining, 2),
         "status": status_val,

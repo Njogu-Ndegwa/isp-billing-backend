@@ -375,6 +375,9 @@ async def test_admin_sets_market_and_reprices(db, client, monkeypatch):
     assert resp.json()["before"] == {"final_charge": 4774.2, "currency": "KES"}
     assert resp.json()["invoice"]["final_charge"] == 10.0
     assert resp.json()["invoice"]["currency"] == "USD"
+    # The UI shows the local revenue and FX rate from the invoice's pricing rule.
+    assert resp.json()["invoice"]["pricing_rule"]["minimum"] == 10.0
+    assert resp.json()["invoice"]["pricing_rule"]["revenue_currency"] == "XAF"
 
     bad = await client.patch(f"/api/admin/subscriptions/{reseller.id}", json={"market_code": "XX"})
     assert bad.status_code == 400
