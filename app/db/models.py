@@ -139,6 +139,16 @@ class User(Base):
         server_default="trial"
     )
     subscription_expires_at = Column(DateTime, nullable=True)
+    # Country market (app/services/markets.py): fixes the reseller's operating
+    # currency (plan prices, customer payments, revenue), how the platform
+    # bills them and how they pay, plus language/timezone defaults. Plain
+    # string, not a Postgres enum, so adding a market never needs ALTER TYPE.
+    market_code = Column(String(2), nullable=False, default="KE", server_default="KE")
+    # Per-reseller price in the market's subscription currency: replaces the
+    # flat fee (flat markets) or the minimum charge (usage markets).
+    subscription_price_override = Column(Float, nullable=True)
+    # UI/SMS language; NULL means the market default.
+    preferred_language = Column(String(10), nullable=True)
     # Where this account came from, captured on the visitor's FIRST landing by
     # the marketing site and sent with the signup. Source and campaign are
     # broken out as indexed columns so "signups by source" and revenue-by-
@@ -382,6 +392,11 @@ class SubscriptionInvoice(Base):
     pppoe_charge = Column(Float, nullable=False, default=0)
     gross_charge = Column(Float, nullable=False, default=0)
     final_charge = Column(Float, nullable=False, default=0)
+    # Currency of every money column on this invoice (and of its payments).
+    currency = Column(String(3), nullable=False, default="KES", server_default="KES")
+    # Copy of the pricing rule the charge was computed with, so a later price
+    # or market change never rewrites what an old invoice meant.
+    pricing_rule = Column(JSON, nullable=True)
     status = Column(
         Enum(InvoiceStatus, name="invoicestatus",
              values_callable=lambda e: [x.value for x in e]),
@@ -404,6 +419,13 @@ class SubscriptionPayment(Base):
     payment_reference = Column(String(255), nullable=True)
     mpesa_checkout_request_id = Column(String(255), nullable=True, unique=True, index=True)
     phone_number = Column(String(20), nullable=True)
+    currency = Column(String(3), nullable=False, default="KES", server_default="KES")
+    # Card payments (payment_method='card'): the PayAfrica reference (PAF-...)
+    # returned when the Paystack checkout was created, and the hosted
+    # checkout link handed to the reseller. payment_reference holds our own
+    # external reference (SUBCARD-...) until the payment is confirmed.
+    provider_reference = Column(String(120), nullable=True, unique=True, index=True)
+    checkout_url = Column(String(500), nullable=True)
     status = Column(
         Enum(SubscriptionPaymentStatus, name="subscriptionpaymentstatus",
              values_callable=lambda e: [x.value for x in e]),

@@ -24,6 +24,13 @@ from app.db.models import (
     GrowthTarget,
 )
 from app.services.app_settings import get_setting, set_setting
+from app.services.markets import (
+    REPORTING_CURRENCY,
+    kes_per_unit,
+    sql_kes_by_currency,
+    sql_kes_by_market,
+    kes_rates,
+)
 from app.core.cache import cache
 
 import logging
@@ -34,6 +41,39 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Platform-wide money is reported in KES. Subscription payments carry their own
+# currency (KES over M-Pesa, USD by card); customer payments are in the owning
+# reseller's market currency, so those queries join User on reseller_id.
+def _sub_kes():
+    """SubscriptionPayment.amount converted to KES."""
+    return sql_kes_by_currency(SubscriptionPayment.amount, SubscriptionPayment.currency)
+
+
+def _cp_kes():
+    """CustomerPayment.amount converted to KES (needs User joined on reseller_id)."""
+    return sql_kes_by_market(CustomerPayment.amount, User.market_code)
+
+
+def _charge_kes():
+    """ResellerTransactionCharge.amount (reseller's currency) in KES."""
+    return sql_kes_by_market(ResellerTransactionCharge.amount, User.market_code)
+
+
+def _fx_meta() -> dict[str, Any]:
+    """Top-level fields on every admin money response: totals are in KES, and
+    ``usd_rate`` (KES per USD) lets the frontend offer a USD view by dividing."""
+    return {"reporting_currency": REPORTING_CURRENCY, "usd_rate": kes_per_unit("USD"), "kes_rates": kes_rates()}
+
+
+def _cp_select(*cols):
+    """select() over customer_payments with the owning reseller outer-joined."""
+    return (
+        select(*cols)
+        .select_from(CustomerPayment)
+        .outerjoin(User, User.id == CustomerPayment.reseller_id)
+    )
+
 
 def _period_range(period: str) -> tuple[datetime, datetime, datetime, datetime]:
     """Return (cur_start, cur_end, prev_start, prev_end) for a named period."""
@@ -272,7 +312,7 @@ async def compute_mrr(db: AsyncSession) -> dict[str, Any]:
 
     async def _period_mrr(start: datetime, end: datetime) -> float:
         val = (await db.execute(
-            select(func.coalesce(func.sum(SubscriptionPayment.amount), 0))
+            select(func.coalesce(func.sum(_sub_kes()), 0))
             .where(
                 SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
                 SubscriptionPayment.created_at >= start,
@@ -308,7 +348,7 @@ async def compute_mrr(db: AsyncSession) -> dict[str, Any]:
         if not user_ids:
             return 0.0
         val = (await db.execute(
-            select(func.coalesce(func.sum(SubscriptionPayment.amount), 0))
+            select(func.coalesce(func.sum(_sub_kes()), 0))
             .where(
                 SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
                 SubscriptionPayment.created_at >= start,
@@ -339,7 +379,7 @@ async def compute_mrr(db: AsyncSession) -> dict[str, Any]:
         select(
             User.subscription_status,
             func.count(User.id).label("cnt"),
-            func.coalesce(func.sum(SubscriptionPayment.amount), 0).label("rev"),
+            func.coalesce(func.sum(_sub_kes()), 0).label("rev"),
         )
         .outerjoin(
             SubscriptionPayment,
@@ -371,7 +411,8 @@ async def compute_mrr(db: AsyncSession) -> dict[str, Any]:
         "current_mrr": round(current, 2),
         "previous_period_mrr": round(previous, 2),
         "change_percent": _pct_change(current, previous),
-        "currency": "KES",
+        "currency": REPORTING_CURRENCY,
+        **_fx_meta(),
         "breakdown": {
             "new_mrr": round(new_mrr, 2),
             "churned_mrr": round(churned_mrr, 2),
@@ -581,14 +622,14 @@ async def compute_dashboard_v2_extras(db: AsyncSession) -> dict[str, Any]:
     )
 
     cur_revenue = float((await db.execute(
-        select(func.coalesce(func.sum(CustomerPayment.amount), 0))
+        _cp_select(func.coalesce(func.sum(_cp_kes()), 0))
         .where(
             CustomerPayment.created_at >= month_start,
             CustomerPayment.counts_as_revenue == True,
         )
     )).scalar())
     prev_revenue = float((await db.execute(
-        select(func.coalesce(func.sum(CustomerPayment.amount), 0))
+        _cp_select(func.coalesce(func.sum(_cp_kes()), 0))
         .where(
             CustomerPayment.created_at >= rev_prev_start,
             CustomerPayment.created_at < rev_prev_end,
@@ -708,7 +749,7 @@ async def compute_subscription_revenue_history(
         rows = (await db.execute(
             select(
                 func.date(SubscriptionPayment.created_at).label("d"),
-                func.coalesce(func.sum(SubscriptionPayment.amount), 0).label("rev"),
+                func.coalesce(func.sum(_sub_kes()), 0).label("rev"),
             )
             .where(
                 SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
@@ -751,6 +792,8 @@ async def compute_subscription_revenue_history(
         "period": period,
         **_window_meta(period, offset, cur_start, cur_end),
         "granularity": granularity,
+        "currency": REPORTING_CURRENCY,
+        **_fx_meta(),
         "total_revenue": total_revenue,
         "previous_total_revenue": previous_total_revenue,
         "change_percent": _pct_change(total_revenue, previous_total_revenue),
@@ -777,7 +820,7 @@ async def compute_arpu(db: AsyncSession) -> dict[str, Any]:
 
     async def _subscription_revenue(start: datetime, end: datetime) -> float:
         return float((await db.execute(
-            select(func.coalesce(func.sum(SubscriptionPayment.amount), 0))
+            select(func.coalesce(func.sum(_sub_kes()), 0))
             .where(
                 SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
                 SubscriptionPayment.created_at >= start,
@@ -787,7 +830,9 @@ async def compute_arpu(db: AsyncSession) -> dict[str, Any]:
 
     async def _charge_revenue(start: datetime, end: datetime) -> float:
         return float((await db.execute(
-            select(func.coalesce(func.sum(ResellerTransactionCharge.amount), 0))
+            select(func.coalesce(func.sum(_charge_kes()), 0))
+            .select_from(ResellerTransactionCharge)
+            .outerjoin(User, User.id == ResellerTransactionCharge.reseller_id)
             .where(
                 ResellerTransactionCharge.created_at >= start,
                 ResellerTransactionCharge.created_at < end,
@@ -816,7 +861,8 @@ async def compute_arpu(db: AsyncSession) -> dict[str, Any]:
         "current_arpu": cur_arpu,
         "previous_period_arpu": prev_arpu,
         "change_percent": _pct_change(cur_arpu, prev_arpu),
-        "currency": "KES",
+        "currency": REPORTING_CURRENCY,
+        **_fx_meta(),
         # Kept for API compatibility; now means "resellers with a paid, live
         # subscription" rather than a status snapshot that included trials.
         "active_resellers": paying_now,
@@ -1018,7 +1064,7 @@ async def compute_revenue_concentration(db: AsyncSession) -> dict[str, Any]:
         select(
             CustomerPayment.reseller_id,
             User.organization_name,
-            func.coalesce(func.sum(CustomerPayment.amount), 0).label("rev"),
+            func.coalesce(func.sum(_cp_kes()), 0).label("rev"),
         )
         .join(User, User.id == CustomerPayment.reseller_id)
         .where(
@@ -1026,7 +1072,7 @@ async def compute_revenue_concentration(db: AsyncSession) -> dict[str, Any]:
             CustomerPayment.counts_as_revenue == True,
         )
         .group_by(CustomerPayment.reseller_id, User.organization_name)
-        .order_by(func.sum(CustomerPayment.amount).desc())
+        .order_by(func.sum(_cp_kes()).desc())
     )).all()
 
     total_revenue = sum(float(r.rev) for r in rows)
@@ -1060,6 +1106,8 @@ async def compute_revenue_concentration(db: AsyncSession) -> dict[str, Any]:
     return {
         "top_5_share_percent": top5_share,
         "top_10_share_percent": top10_share,
+        "currency": REPORTING_CURRENCY,
+        **_fx_meta(),
         "total_revenue": round(total_revenue, 2),
         "total_resellers_with_revenue": total_with_rev,
         "top_contributors": top_contributors[:10],
@@ -1080,7 +1128,7 @@ async def compute_smart_alerts(db: AsyncSession) -> dict[str, Any]:
     alerts: list[dict] = []
 
     month_revenue = float((await db.execute(
-        select(func.coalesce(func.sum(CustomerPayment.amount), 0))
+        _cp_select(func.coalesce(func.sum(_cp_kes()), 0))
         .where(
             CustomerPayment.created_at >= month_start,
             CustomerPayment.counts_as_revenue == True,
@@ -1221,12 +1269,12 @@ async def compute_revenue_forecast(
     # so free vouchers don't inflate the projection. Days that had only comp
     # payments are kept as real zero-revenue points via case().
     rows = (await db.execute(
-        select(
+        _cp_select(
             func.date(CustomerPayment.created_at).label("d"),
             func.coalesce(
                 func.sum(
                     case(
-                        (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
+                        (CustomerPayment.counts_as_revenue == True, _cp_kes()),
                         else_=0,
                     )
                 ),
@@ -1241,6 +1289,8 @@ async def compute_revenue_forecast(
     if not rows:
         return {
             "forecast": [],
+            "currency": REPORTING_CURRENCY,
+            **_fx_meta(),
             "projected_period_end_total": 0,
             "growth_rate_percent": 0,
             "confidence": "low",
@@ -1289,6 +1339,8 @@ async def compute_revenue_forecast(
 
     return {
         "forecast": forecast,
+        "currency": REPORTING_CURRENCY,
+        **_fx_meta(),
         "projected_period_end_total": round(total_projected, 2),
         "growth_rate_percent": growth_rate,
         "confidence": confidence,
@@ -1337,6 +1389,7 @@ async def get_growth_targets(db: AsyncSession) -> dict[str, Any]:
     )
 
     return {
+        **_fx_meta(),
         "targets": result_targets,
         "updated_at": latest_update.isoformat(),
     }
@@ -1395,7 +1448,7 @@ async def _compute_target_current(db: AsyncSession, target_id: str) -> float:
 
     if target_id == "mrr_target":
         val = (await db.execute(
-            select(func.coalesce(func.sum(SubscriptionPayment.amount), 0))
+            select(func.coalesce(func.sum(_sub_kes()), 0))
             .where(
                 SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
                 SubscriptionPayment.created_at >= month_start,
@@ -1616,7 +1669,7 @@ async def _earnings_daily(
     hotspot = func.coalesce(SubscriptionInvoice.hotspot_charge, 0.0)
     pppoe = func.coalesce(SubscriptionInvoice.pppoe_charge, 0.0)
     charged = hotspot + pppoe
-    amount = SubscriptionPayment.amount
+    amount = _sub_kes()
 
     saas_stmt = (
         select(
@@ -1654,9 +1707,9 @@ async def _earnings_daily(
 
     if own_ids:
         reseller_rows = (await db.execute(
-            select(
+            _cp_select(
                 func.date(CustomerPayment.created_at).label("d"),
-                func.coalesce(func.sum(CustomerPayment.amount), 0).label("rev"),
+                func.coalesce(func.sum(_cp_kes()), 0).label("rev"),
             )
             .where(
                 CustomerPayment.reseller_id.in_(own_ids),
@@ -1716,7 +1769,7 @@ def _earnings_series(
 
 async def _earnings_all_time(db: AsyncSession, own_ids: list[int]) -> dict[str, float]:
     system_stmt = select(
-        func.coalesce(func.sum(SubscriptionPayment.amount), 0)
+        func.coalesce(func.sum(_sub_kes()), 0)
     ).where(SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED)
     if own_ids:
         system_stmt = system_stmt.where(SubscriptionPayment.user_id.notin_(own_ids))
@@ -1725,7 +1778,7 @@ async def _earnings_all_time(db: AsyncSession, own_ids: list[int]) -> dict[str, 
     reseller = 0.0
     if own_ids:
         reseller = float((await db.execute(
-            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+            _cp_select(func.coalesce(func.sum(_cp_kes()), 0)).where(
                 CustomerPayment.reseller_id.in_(own_ids),
                 CustomerPayment.counts_as_revenue == True,  # noqa: E712
             )
@@ -1807,6 +1860,8 @@ async def compute_earnings(db: AsyncSession, period: str = "month") -> dict[str,
         "start_date": cur_start.isoformat(),
         "end_date": (cur_end - timedelta(days=1)).isoformat(),
         "comparison_label": _EARNINGS_COMPARISON_LABEL[period],
+        "currency": REPORTING_CURRENCY,
+        **_fx_meta(),
         "streams": streams,
         "totals": {**current_totals, **current_groups},
         "previous_totals": {**previous_totals, **previous_groups},

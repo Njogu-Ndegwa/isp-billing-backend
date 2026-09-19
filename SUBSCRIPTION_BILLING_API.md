@@ -540,13 +540,66 @@ Manually trigger pre-expiry invoice generation for resellers expiring within 5 d
 
 ---
 
-## Billing Formula Reference
+## Markets, currencies and card payments
+
+Every reseller belongs to a market (`users.market_code`, default `KE`), defined in
+`app/services/markets.py`. The market fixes:
+
+| Market | Operating currency | Invoiced in | Formula | Pays with |
+|---|---|---|---|---|
+| KE Kenya | KES | KES | 3% hotspot + KES 25/PPPoE user, min KES 500 | M-Pesa |
+| CM Cameroon | XAF | USD (1 USD = 571 XAF) | 3% hotspot + USD 0.20/PPPoE user, min USD 10 | card |
+| UG Uganda | UGX | USD (1 USD = 3,818 UGX) | same as Cameroon | card |
+| TZ Tanzania | TZS | USD (1 USD = 2,649 TZS) | same as Cameroon | card |
+
+International hotspot revenue is converted to USD at the market's fixed
+`usd_rate` (set in `app/services/markets.py`, update by hand when rates drift).
+The USD 10 minimum applies until 3% of revenue passes about USD 333. Each
+invoice's `pricing_rule` records `hotspot_revenue_local`, `revenue_currency`
+and the `fx_rate` used.
+
+The operating currency is the currency of the reseller's plan prices, customer
+payments and hotspot revenue. Invoices and subscription payments carry their own
+`currency`, and each invoice stores the `pricing_rule` it was computed with.
+`GET /api/subscription` returns a `market` object (currency, language, timezone,
+`subscription_currency`, `subscription_payment_methods`) for the frontend, plus
+`total_paid_by_currency`.
+
+`POST /api/subscription/pay` (M-Pesa) only accepts KES invoices.
+
+### POST `/api/subscription/pay-card`
+
+Body: `{"invoice_id": 597}`. Creates a Paystack checkout through PayAfrica for the
+invoice's full balance (USD or KES) and returns `payment_url`, `payment_id`,
+`amount`, `currency`, `reference` (ours, `SUBCARD-...`) and `provider_reference`
+(PayAfrica, `PAF-...`). The payment stays `pending`: PayAfrica has no status
+lookup or signed webhook yet, so an admin confirms it.
+
+### POST `/api/admin/subscriptions/payments/{payment_id}/confirm-card`
+
+Body: `{"receipt": "optional Paystack receipt"}`. Marks a pending card payment
+completed and activates the reseller for a month when the invoice is fully paid.
+Card payments settle at PayAfrica, so they never count toward the M-Pesa
+"send to bank" totals.
+
+### PATCH `/api/admin/subscriptions/{reseller_id}` (market fields)
+
+`market_code` (`KE`/`CM`/`UG`/`TZ`), `price_override` (in the subscription
+currency: replaces the minimum charge),
+`clear_price_override: true`, `preferred_language` (one of the market's languages).
+
+### POST `/api/admin/subscriptions/{reseller_id}/reprice/{invoice_id}`
+
+Recomputes a pending/overdue invoice with no completed payments using the
+reseller's current market. Use after moving a reseller to the right market.
+
+## Billing Formula Reference (Kenya)
 
 ```
 hotspot_charge  = hotspot_revenue * 3%
 pppoe_charge    = active_pppoe_users * KES 25
 gross_charge    = hotspot_charge + pppoe_charge
-final_charge    = max(gross_charge, KES 500)
+final_charge    = max(gross_charge, KES 500)   # price_override replaces the 500
 ```
 
 ## Invoice Status Values

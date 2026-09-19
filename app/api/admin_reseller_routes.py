@@ -37,6 +37,9 @@ from app.services.mpesa_b2b import (
 from app.config import settings
 from app.services.app_settings import get_setting, set_setting
 from app.services.voucher_service import COMPENSATION_DAILY_LIMIT_KEY
+from app.services.markets import (
+    REPORTING_CURRENCY, get_market, kes_per_unit, sql_kes_by_market, to_kes, kes_rates,
+)
 
 import logging
 
@@ -47,6 +50,28 @@ router = APIRouter(tags=["admin-resellers"])
 # Only mobile_money payments flow through the admin's M-Pesa shortcode.
 # Cash and voucher payments are collected directly by the reseller.
 MPESA_FILTER = CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY
+
+
+# Currency handling: a reseller's customer revenue, payouts and transaction
+# charges are all in their market currency. Per-reseller responses stay in that
+# currency and carry a `currency` field; totals across resellers are converted
+# to KES (REPORTING_CURRENCY) at the fixed market rates.
+def _reseller_currency(user: User) -> str:
+    return get_market(getattr(user, "market_code", None)).currency
+
+
+def _cp_kes():
+    """CustomerPayment.amount in KES; needs User joined on reseller_id."""
+    return sql_kes_by_market(CustomerPayment.amount, User.market_code)
+
+
+def _cp_kes_select(*cols):
+    """select() over customer_payments with the owning reseller outer-joined."""
+    return (
+        select(*cols)
+        .select_from(CustomerPayment)
+        .outerjoin(User, User.id == CustomerPayment.reseller_id)
+    )
 
 
 class AdminPasswordResetRequest(BaseModel):
@@ -338,6 +363,9 @@ async def list_resellers(
             "business_name": r.business_name,
             "support_phone": r.support_phone,
             "mpesa_shortcode": r.mpesa_shortcode,
+            "market_code": r.market_code,
+            # Money on this row is in the reseller's market currency.
+            "currency": _reseller_currency(r),
             "subscription_status": sub_status_val,
             "subscription_expires_at": r.subscription_expires_at.isoformat() if r.subscription_expires_at else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
@@ -370,13 +398,14 @@ async def list_resellers(
         items.append(item)
 
     # Sort
+    # Rows can be in different currencies, so money sorts compare KES values.
     sort_key_map = {
-        "revenue": lambda x: x["total_revenue"],
-        "mpesa_revenue": lambda x: x["mpesa_revenue"],
+        "revenue": lambda x: to_kes(x["total_revenue"], x["currency"]),
+        "mpesa_revenue": lambda x: to_kes(x["mpesa_revenue"], x["currency"]),
         "customers": lambda x: x["active_customers"],
         "created_at": lambda x: x["created_at"] or "",
         "last_login": lambda x: x["last_login_at"] or "",
-        "unpaid_balance": lambda x: x["unpaid_balance"],
+        "unpaid_balance": lambda x: to_kes(x["unpaid_balance"], x["currency"]),
         "router_count": lambda x: x["router_count"],
         "subscription_expires_at": lambda x: x["subscription_expires_at"] or "",
     }
@@ -387,6 +416,9 @@ async def list_resellers(
         "total": len(items),
         "filters_applied": {"sort_by": sort_by, "sort_order": sort_order, "filter": filter, "search": search},
         "resellers": items,
+        # Rows are in each reseller's own currency; KES per unit to total them.
+        "kes_rates": kes_rates(),
+        "usd_rate": kes_per_unit("USD"),
     }
 
 
@@ -487,14 +519,15 @@ async def reseller_stats(
 
     buckets = _make_buckets(trunc_unit, start, end)
 
+    # Across all resellers, so every market's revenue is converted to KES.
     rev_stmt = (
-        select(
+        _cp_kes_select(
             func.date_trunc(trunc_unit, CustomerPayment.created_at).label("bucket"),
             func.coalesce(
                 func.sum(
                     case(
                         (CustomerPayment.counts_as_revenue == True,
-                         CustomerPayment.amount),
+                         _cp_kes()),
                         else_=0,
                     )
                 ),
@@ -504,7 +537,7 @@ async def reseller_stats(
                 func.sum(
                     case(
                         (CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY,
-                         CustomerPayment.amount),
+                         _cp_kes()),
                         else_=0,
                     )
                 ),
@@ -568,6 +601,10 @@ async def reseller_stats(
         "window_end": end.isoformat(),
         "window_label": window_label,
         "max_offset": 0 if period == "all" else 36,
+        "currency": REPORTING_CURRENCY,
+        "reporting_currency": REPORTING_CURRENCY,
+        "usd_rate": kes_per_unit("USD"),
+        "kes_rates": kes_rates(),
         "revenue_over_time": revenue_over_time,
         "signups_over_time": signups_over_time,
         "totals": {
@@ -801,6 +838,9 @@ async def get_reseller_detail(
         "subscription_expires_at": r.subscription_expires_at.isoformat() if r.subscription_expires_at else None,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "last_login_at": r.last_login_at.isoformat() if r.last_login_at else None,
+        "market_code": r.market_code,
+        # Every amount in this response is in the reseller's market currency.
+        "currency": _reseller_currency(r),
         "revenue": revenue,
         "customers": {
             "active": status_counts.get("active", 0),
@@ -843,7 +883,7 @@ async def get_reseller_payments(
     token: str = Depends(verify_token),
 ):
     await _require_admin(token, db)
-    await _get_reseller_or_404(db, reseller_id)
+    reseller = await _get_reseller_or_404(db, reseller_id)
 
     base_filter = [CustomerPayment.reseller_id == reseller_id]
 
@@ -918,6 +958,7 @@ async def get_reseller_payments(
 
     return {
         "reseller_id": reseller_id,
+        "currency": _reseller_currency(reseller),
         "page": page,
         "per_page": per_page,
         "total_count": total_count,
@@ -986,7 +1027,7 @@ async def get_reseller_routers(
       ?start_date=...&end_date=...
     """
     await _require_admin(token, db)
-    await _get_reseller_or_404(db, reseller_id)
+    reseller = await _get_reseller_or_404(db, reseller_id)
 
     if sort_by and sort_by not in ROUTER_SORT_FIELDS:
         raise HTTPException(
@@ -1157,6 +1198,7 @@ async def get_reseller_routers(
 
     return {
         "reseller_id": reseller_id,
+        "currency": _reseller_currency(reseller),
         "summary": summary,
         "filters_applied": {"sort_by": sort_by, "sort_order": sort_order, "filter": filter, "search": search},
         "routers": items,
@@ -1192,26 +1234,28 @@ async def admin_dashboard(
     )).scalar() or 0
 
     # Revenue across all resellers (excluding compensation vouchers)
+    # Every money figure on this dashboard spans resellers in different markets,
+    # so it is converted to KES.
     async def _total_revenue_since(since: datetime) -> dict:
         f = [CustomerPayment.created_at >= since]
         total = float((await db.execute(
-            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+            _cp_kes_select(func.coalesce(func.sum(_cp_kes()), 0)).where(
                 *f, CustomerPayment.counts_as_revenue == True
             )
         )).scalar())
         # MPESA_FILTER (payment_method==MOBILE_MONEY) already excludes CASH comp payments
         mpesa = float((await db.execute(
-            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*f, MPESA_FILTER)
+            _cp_kes_select(func.coalesce(func.sum(_cp_kes()), 0)).where(*f, MPESA_FILTER)
         )).scalar())
         return {"total": total, "mpesa": mpesa}
 
     all_time_revenue = float((await db.execute(
-        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+        _cp_kes_select(func.coalesce(func.sum(_cp_kes()), 0)).where(
             CustomerPayment.counts_as_revenue == True
         )
     )).scalar())
     all_time_mpesa_revenue = float((await db.execute(
-        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(MPESA_FILTER)
+        _cp_kes_select(func.coalesce(func.sum(_cp_kes()), 0)).where(MPESA_FILTER)
     )).scalar())
 
     # Customer counts
@@ -1232,7 +1276,7 @@ async def admin_dashboard(
             User.id,
             User.email,
             User.organization_name,
-            func.coalesce(func.sum(CustomerPayment.amount), 0).label("month_revenue"),
+            func.coalesce(func.sum(_cp_kes()), 0).label("month_revenue"),
         )
         .join(CustomerPayment, CustomerPayment.reseller_id == User.id)
         .where(
@@ -1241,7 +1285,7 @@ async def admin_dashboard(
             CustomerPayment.counts_as_revenue == True,
         )
         .group_by(User.id, User.email, User.organization_name)
-        .order_by(func.sum(CustomerPayment.amount).desc())
+        .order_by(func.sum(_cp_kes()).desc())
         .limit(10)
     )
     top_result = await db.execute(top_stmt)
@@ -1257,11 +1301,19 @@ async def admin_dashboard(
 
     # Payout totals
     total_payouts = float((await db.execute(
-        select(func.coalesce(func.sum(ResellerPayout.amount), 0))
+        select(func.coalesce(func.sum(
+            sql_kes_by_market(ResellerPayout.amount, User.market_code)
+        ), 0))
+        .select_from(ResellerPayout)
+        .outerjoin(User, User.id == ResellerPayout.reseller_id)
     )).scalar())
 
     total_charges = float((await db.execute(
-        select(func.coalesce(func.sum(ResellerTransactionCharge.amount), 0))
+        select(func.coalesce(func.sum(
+            sql_kes_by_market(ResellerTransactionCharge.amount, User.market_code)
+        ), 0))
+        .select_from(ResellerTransactionCharge)
+        .outerjoin(User, User.id == ResellerTransactionCharge.reseller_id)
     )).scalar())
 
     total_unpaid = round(all_time_mpesa_revenue - total_payouts - total_charges, 2)
@@ -1337,6 +1389,12 @@ async def admin_dashboard(
     v2_extras = await compute_dashboard_v2_extras(db)
 
     return {
+        # All money below is in KES, converted from each reseller's currency.
+        "currency": REPORTING_CURRENCY,
+        # USD view: divide any KES figure by usd_rate (KES per USD).
+        "reporting_currency": REPORTING_CURRENCY,
+        "usd_rate": kes_per_unit("USD"),
+        "kes_rates": kes_rates(),
         "resellers": {
             "total": total_resellers,
             # Login recency — a usage signal, not a subscription state. Keep it
@@ -1479,7 +1537,7 @@ async def get_payout_history(
     token: str = Depends(verify_token),
 ):
     await _require_admin(token, db)
-    await _get_reseller_or_404(db, reseller_id)
+    reseller = await _get_reseller_or_404(db, reseller_id)
 
     filters = [ResellerPayout.reseller_id == reseller_id]
     if start_date:
@@ -1530,6 +1588,7 @@ async def get_payout_history(
 
     return {
         "reseller_id": reseller_id,
+        "currency": _reseller_currency(reseller),
         "page": page,
         "per_page": per_page,
         "total_count": total_count,
@@ -2208,7 +2267,7 @@ async def get_transaction_charges(
 ):
     """List all transaction charges for a reseller (paginated)."""
     await _require_admin(token, db)
-    await _get_reseller_or_404(db, reseller_id)
+    reseller = await _get_reseller_or_404(db, reseller_id)
 
     filters = [ResellerTransactionCharge.reseller_id == reseller_id]
     if start_date:
@@ -2249,6 +2308,7 @@ async def get_transaction_charges(
 
     return {
         "reseller_id": reseller_id,
+        "currency": _reseller_currency(reseller),
         "page": page,
         "per_page": per_page,
         "total_count": total_count,

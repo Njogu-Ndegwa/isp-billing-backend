@@ -37,9 +37,17 @@ def enforce_active_subscription(user: User):
         )
 
 
-HOTSPOT_RATE = 0.03          # 3% of hotspot revenue
-PPPOE_PER_USER = 25.0        # 25 KES per PPPoE user per month
-MINIMUM_CHARGE = 500.0        # 500 KES minimum monthly charge
+from app.services.markets import (
+    DEFAULT_MARKET, MARKETS, PRICING_FLAT, get_market, market_summary,
+    reseller_market, reseller_pricing,
+)
+
+# Kenya's usage rule, kept as module constants for existing callers/tests.
+_KE_PRICING = MARKETS[DEFAULT_MARKET].pricing
+HOTSPOT_RATE = _KE_PRICING.hotspot_rate        # 3% of hotspot revenue
+PPPOE_PER_USER = _KE_PRICING.per_pppoe_user    # 25 KES per PPPoE user per month
+MINIMUM_CHARGE = _KE_PRICING.minimum           # 500 KES minimum monthly charge
+BASE_CURRENCY = _KE_PRICING.currency
 TRIAL_DAYS = 7
 GRACE_PERIOD_DAYS = 5
 DUE_SOON_THRESHOLD_DAYS = 5
@@ -79,8 +87,31 @@ async def calculate_reseller_charges(
     Calculate subscription charges for a reseller based on their usage
     during the given billing period.
     Returns a breakdown dict with all charge components.
+
+    The pricing rule comes from the reseller's market (plus any per-reseller
+    override). Hotspot revenue is collected in the market's currency; when the
+    invoice is in another currency (international resellers are invoiced in
+    USD) it is converted at the market's fixed rate. All money fields on the
+    result are in the invoice currency; the local revenue and the rate used
+    are recorded in ``pricing_rule``.
     """
-    hotspot_revenue = float((await db.execute(
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    market = reseller_market(user) if user else get_market(None)
+    rule = reseller_pricing(user) if user else market.pricing
+    if rule.kind == PRICING_FLAT:
+        amount = round(float(rule.flat_amount), 2)
+        return {
+            "hotspot_revenue": 0.0,
+            "hotspot_charge": 0.0,
+            "pppoe_user_count": 0,
+            "pppoe_charge": 0.0,
+            "gross_charge": amount,
+            "final_charge": amount,
+            "currency": rule.currency,
+            "pricing_rule": rule.as_dict(),
+        }
+
+    hotspot_revenue_local = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0))
         .join(Customer, CustomerPayment.customer_id == Customer.id)
         .join(Plan, Customer.plan_id == Plan.id)
@@ -106,10 +137,12 @@ async def calculate_reseller_charges(
         )
     )).scalar() or 0
 
-    hotspot_charge = round(hotspot_revenue * HOTSPOT_RATE, 2)
-    pppoe_charge = round(pppoe_user_count * PPPOE_PER_USER, 2)
+    fx_rate = market.fx_rate_to(rule.currency)
+    hotspot_revenue = round(hotspot_revenue_local / fx_rate, 2)
+    hotspot_charge = round(hotspot_revenue * rule.hotspot_rate, 2)
+    pppoe_charge = round(pppoe_user_count * rule.per_pppoe_user, 2)
     gross_charge = round(hotspot_charge + pppoe_charge, 2)
-    final_charge = max(gross_charge, MINIMUM_CHARGE)
+    final_charge = max(gross_charge, rule.minimum)
 
     return {
         "hotspot_revenue": hotspot_revenue,
@@ -118,6 +151,13 @@ async def calculate_reseller_charges(
         "pppoe_charge": pppoe_charge,
         "gross_charge": gross_charge,
         "final_charge": final_charge,
+        "currency": rule.currency,
+        "pricing_rule": {
+            **rule.as_dict(),
+            "revenue_currency": market.currency,
+            "hotspot_revenue_local": hotspot_revenue_local,
+            "fx_rate": fx_rate,
+        },
     }
 
 
@@ -149,6 +189,8 @@ async def generate_invoice_for_reseller(
         pppoe_charge=charges["pppoe_charge"],
         gross_charge=charges["gross_charge"],
         final_charge=charges["final_charge"],
+        currency=charges["currency"],
+        pricing_rule=charges["pricing_rule"],
         status=InvoiceStatus.PENDING,
         due_date=due_date,
     )
@@ -413,12 +455,17 @@ async def get_subscription_summary(db: AsyncSession, user_id: int) -> dict:
 
     pending_invoice = await get_pending_invoice(db, user_id)
 
-    total_paid = float((await db.execute(
-        select(func.coalesce(func.sum(SubscriptionPayment.amount), 0)).where(
+    paid_rows = (await db.execute(
+        select(SubscriptionPayment.currency, func.coalesce(func.sum(SubscriptionPayment.amount), 0))
+        .where(
             SubscriptionPayment.user_id == user_id,
             SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
         )
-    )).scalar())
+        .group_by(SubscriptionPayment.currency)
+    )).all()
+    total_paid_by_currency = {(cur or BASE_CURRENCY): float(total) for cur, total in paid_rows}
+    market = market_summary(user)
+    total_paid = total_paid_by_currency.get(market["subscription_currency"], 0.0)
 
     invoice_count = (await db.execute(
         select(func.count(SubscriptionInvoice.id)).where(
@@ -432,7 +479,11 @@ async def get_subscription_summary(db: AsyncSession, user_id: int) -> dict:
         "trial_ends_at": sub.trial_ends_at.isoformat() if sub and sub.trial_ends_at else None,
         "current_period_start": sub.current_period_start.isoformat() if sub and sub.current_period_start else None,
         "current_period_end": sub.current_period_end.isoformat() if sub and sub.current_period_end else None,
+        # total_paid is in the current subscription currency; a reseller who
+        # changed market keeps older payments under their own currency.
         "total_paid": total_paid,
+        "total_paid_by_currency": total_paid_by_currency,
+        "market": market,
         "invoice_count": invoice_count,
         "pending_invoice": (
             enrich_invoice(pending_invoice, await get_invoice_amount_paid(db, pending_invoice.id))
@@ -495,6 +546,9 @@ def enrich_invoice(invoice: SubscriptionInvoice, amount_paid: float = 0.0) -> di
         "pppoe_charge": invoice.pppoe_charge,
         "gross_charge": invoice.gross_charge,
         "final_charge": invoice.final_charge,
+        "currency": getattr(invoice, "currency", None) or BASE_CURRENCY,
+        # Rates, local revenue and FX rate the charge was computed with.
+        "pricing_rule": getattr(invoice, "pricing_rule", None),
         "amount_paid": round(amount_paid, 2),
         "balance_remaining": round(balance_remaining, 2),
         "status": status_val,
@@ -506,6 +560,31 @@ def enrich_invoice(invoice: SubscriptionInvoice, amount_paid: float = 0.0) -> di
         "human_message": human_message,
         "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
     }
+
+
+async def reprice_unpaid_invoice(db: AsyncSession, invoice: SubscriptionInvoice) -> SubscriptionInvoice:
+    """Recompute an unpaid invoice with the reseller's CURRENT pricing rule.
+
+    For fixing invoices issued under the wrong market (e.g. XAF revenue billed
+    as KES). Refuses once any payment has completed against the invoice,
+    because that payment was made in the old currency.
+    """
+    status_val = invoice.status.value if hasattr(invoice.status, "value") else invoice.status
+    if status_val not in ("pending", "overdue"):
+        raise ValueError("Only pending or overdue invoices can be repriced")
+    if await get_invoice_amount_paid(db, invoice.id) > 0:
+        raise ValueError("Invoice already has completed payments; waive it instead")
+
+    charges = await calculate_reseller_charges(
+        db, invoice.user_id, invoice.period_start, invoice.period_end
+    )
+    for field in (
+        "hotspot_revenue", "hotspot_charge", "pppoe_user_count", "pppoe_charge",
+        "gross_charge", "final_charge", "currency", "pricing_rule",
+    ):
+        setattr(invoice, field, charges[field])
+    await db.flush()
+    return invoice
 
 
 async def record_subscription_payment(
@@ -980,6 +1059,8 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
                 pppoe_charge=charges["pppoe_charge"],
                 gross_charge=charges["gross_charge"],
                 final_charge=charges["final_charge"],
+                currency=charges["currency"],
+                pricing_rule=charges["pricing_rule"],
                 status=InvoiceStatus.PENDING,
                 due_date=expires,
             )
@@ -1104,6 +1185,8 @@ async def generate_catchup_invoices(db: AsyncSession) -> dict:
                 pppoe_charge=charges["pppoe_charge"],
                 gross_charge=charges["gross_charge"],
                 final_charge=charges["final_charge"],
+                currency=charges["currency"],
+                pricing_rule=charges["pricing_rule"],
                 status=InvoiceStatus.PENDING,
                 due_date=expires,
             )

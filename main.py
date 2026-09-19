@@ -2306,6 +2306,40 @@ async def run_signup_attribution_migrations():
     logger.info("Signup attribution migrations complete")
 
 
+async def run_international_subscription_migrations():
+    """Country markets + multi-currency subscriptions paid by card.
+
+    users: market_code (default 'KE'), subscription_price_override,
+    preferred_language. subscription_invoices: currency, pricing_rule.
+    subscription_payments: currency, provider_reference (unique),
+    checkout_url. Defaults keep every existing reseller on Kenya/KES/M-Pesa;
+    an admin moves international resellers to their market.
+    Idempotent: ADD COLUMN IF NOT EXISTS + CREATE UNIQUE INDEX IF NOT EXISTS."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "ALTER TABLE users "
+            "ADD COLUMN IF NOT EXISTS market_code VARCHAR(2) NOT NULL DEFAULT 'KE', "
+            "ADD COLUMN IF NOT EXISTS subscription_price_override DOUBLE PRECISION NULL, "
+            "ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(10) NULL"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE subscription_invoices "
+            "ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'KES', "
+            "ADD COLUMN IF NOT EXISTS pricing_rule JSON NULL"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE subscription_payments "
+            "ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'KES', "
+            "ADD COLUMN IF NOT EXISTS provider_reference VARCHAR(120) NULL, "
+            "ADD COLUMN IF NOT EXISTS checkout_url VARCHAR(500) NULL"
+        ))
+        await conn.execute(sa_text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_subscription_payments_provider_reference "
+            "ON subscription_payments(provider_reference)"
+        ))
+    logger.info("International subscription migrations complete")
+
+
 async def run_pull_channel_migrations():
     """Add routers.pull_channel_enabled (bool, default false) for the outbound
     pull-provisioning channel. Opt-in per router; the command queue itself lives on
@@ -2724,6 +2758,11 @@ async def startup_event():
         logger.info("Signup attribution migrations completed successfully")
     except Exception as e:
         logger.error(f"Signup attribution migration failed (non-fatal): {e}")
+
+    try:
+        await run_international_subscription_migrations()
+    except Exception as e:
+        logger.error(f"International subscription migration failed (non-fatal): {e}")
 
     try:
         await run_feedback_migrations()

@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import secrets
 
+from app.services.markets import market_summary
 from app.db.database import get_db
 from app.db.models import User, UserRole, PasswordResetToken
 from app.services.auth import create_user, authenticate_user, create_access_token, pwd_context
@@ -188,6 +189,8 @@ async def login_api(
                 "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None),
                 "subscription_status": sub_status,
                 "subscription_expires_at": user.subscription_expires_at.isoformat() if getattr(user, 'subscription_expires_at', None) else None,
+                "preferred_language": getattr(user, 'preferred_language', None),
+                "market": market_summary(user),
             },
         }
 

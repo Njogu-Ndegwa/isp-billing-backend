@@ -5,6 +5,7 @@ from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional
 from datetime import datetime
 
+from app.services.markets import market_summary, reseller_market
 from app.db.database import get_db
 from app.db.models import User
 from app.services.auth import verify_token, get_current_user, pwd_context
@@ -39,6 +40,9 @@ class ProfileUpdateRequest(BaseModel):
     support_phone: Optional[str] = None
     mpesa_shortcode: Optional[str] = None
     email: Optional[str] = None
+    # UI language; must be one of the reseller's market languages. "" resets
+    # to the market default.
+    preferred_language: Optional[str] = None
 
     @field_validator("support_phone")
     @classmethod
@@ -89,6 +93,9 @@ def _user_to_profile(user: User) -> dict:
         "mpesa_shortcode": user.mpesa_shortcode,
         "created_at": user.created_at.isoformat() if user.created_at else None,
         "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "preferred_language": user.preferred_language,
+        # Currency, language and subscription terms the dashboard renders with.
+        "market": market_summary(user),
     }
 
 
@@ -138,6 +145,15 @@ async def update_profile(
         user.support_phone = request.support_phone
     if request.mpesa_shortcode is not None:
         user.mpesa_shortcode = request.mpesa_shortcode
+    if request.preferred_language is not None:
+        lang = request.preferred_language.strip().lower() or None
+        languages = reseller_market(user).languages
+        if lang and lang not in languages:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"preferred_language must be one of: {', '.join(languages)}",
+            )
+        user.preferred_language = lang
 
     await db.commit()
     await db.refresh(user)

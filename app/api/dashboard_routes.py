@@ -12,9 +12,10 @@ from app.db.models import (
     MpesaTransaction, MpesaTransactionStatus,
     ResellerPayout, ResellerTransactionCharge, PaymentMethod,
     ResellerFinancials,
-    ShopOrder, ShopOrderPaymentStatus, UserRole,
+    ShopOrder, ShopOrderPaymentStatus, UserRole, User,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services.markets import REPORTING_CURRENCY, reseller_market, sql_kes_by_market
 from app.services.subscription import get_invoice_alert_for_user
 from app.services.router_helpers import get_router_by_id
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, validate_mac_address
@@ -337,6 +338,7 @@ async def get_dashboard_overview(
             logger.warning(f"Shop summary skipped (non-fatal): {shop_err}")
 
         return {
+            "currency": reseller_market(user).currency,
             "router_id": router_id,
             "router_name": router_name,
             "revenue": {
@@ -679,6 +681,7 @@ async def get_dashboard_analytics(
             router_name = router_obj.name if router_obj else None
         
         return {
+            "currency": reseller_market(user).currency,
             "router_id": router_id,
             "router_name": router_name,
             "extractedAt": now.isoformat(),
@@ -781,22 +784,28 @@ async def get_revenue_over_time(
         ]
         if user.role != UserRole.ADMIN:
             base_where.append(CustomerPayment.reseller_id == user_id)
+        # Admins see every reseller's payments, each in its own market
+        # currency: convert to KES so the platform series adds up.
+        is_admin = user.role == UserRole.ADMIN
+        amount_col = (
+            sql_kes_by_market(CustomerPayment.amount, User.market_code).label("amount")
+            if is_admin else CustomerPayment.amount
+        )
+        payments_q = select(
+            amount_col,
+            CustomerPayment.created_at,
+            CustomerPayment.counts_as_revenue,
+        )
+        if is_admin:
+            payments_q = payments_q.join(User, CustomerPayment.reseller_id == User.id)
         if router_id:
             payments_q = (
-                select(
-                    CustomerPayment.amount,
-                    CustomerPayment.created_at,
-                    CustomerPayment.counts_as_revenue,
-                )
+                payments_q
                 .join(Customer, CustomerPayment.customer_id == Customer.id)
                 .where(*base_where, Customer.router_id == router_id)
             )
         else:
-            payments_q = select(
-                CustomerPayment.amount,
-                CustomerPayment.created_at,
-                CustomerPayment.counts_as_revenue,
-            ).where(*base_where)
+            payments_q = payments_q.where(*base_where)
 
         rows = (await db.execute(payments_q)).all()
 
@@ -861,6 +870,7 @@ async def get_revenue_over_time(
         avg_per_period = round(total_revenue / len(non_zero), 2) if non_zero else 0.0
 
         return {
+            "currency": REPORTING_CURRENCY if is_admin else reseller_market(user).currency,
             "period": period_label,
             "group_by": group_by,
             "start_date": range_start.strftime("%Y-%m-%d"),
@@ -956,6 +966,13 @@ async def get_daily_transaction_counts(
         if by_port and not router_id:
             raise HTTPException(status_code=400, detail="by_port requires router_id")
 
+        # Admins see every reseller's payments, each in its own market
+        # currency: convert to KES so the platform totals add up.
+        is_admin = user.role == UserRole.ADMIN
+        amount_expr = (
+            sql_kes_by_market(CustomerPayment.amount, User.market_code)
+            if is_admin else CustomerPayment.amount
+        )
         day_bucket = func.date(CustomerPayment.created_at).label("day")
         select_columns = [
             day_bucket,
@@ -963,7 +980,7 @@ async def get_daily_transaction_counts(
             func.coalesce(
                 func.sum(
                     case(
-                        (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
+                        (CustomerPayment.counts_as_revenue == True, amount_expr),
                         else_=0,
                     )
                 ),
@@ -982,6 +999,8 @@ async def get_daily_transaction_counts(
             .order_by(day_bucket)
         )
 
+        if is_admin:
+            stmt = stmt.join(User, CustomerPayment.reseller_id == User.id)
         if router_id:
             stmt = stmt.join(Customer, CustomerPayment.customer_id == Customer.id).where(Customer.router_id == router_id)
 
@@ -1039,6 +1058,7 @@ async def get_daily_transaction_counts(
         total_days = len(data)
 
         return {
+            "currency": REPORTING_CURRENCY if is_admin else reseller_market(user).currency,
             "period": period_label,
             "start_date": range_start.strftime("%Y-%m-%d"),
             "end_date": final_day.strftime("%Y-%m-%d"),
@@ -1166,6 +1186,7 @@ async def get_daily_revenue_metrics(
             router_name = router_obj.name if router_obj else None
         
         return {
+            "currency": reseller_market(user).currency,
             "router_id": router_id,
             "router_name": router_name,
             "date": day_start.strftime("%Y-%m-%d"),
@@ -1341,6 +1362,7 @@ async def get_dashboard_stats(
             router_name = router_obj.name if router_obj else None
         
         return {
+            "currency": reseller_market(user).currency,
             "router_id": router_id,
             "router_name": router_name,
             "period_days": period,
@@ -1499,6 +1521,7 @@ async def get_reseller_account_statement(
     )).scalar())
 
     return {
+        "currency": reseller_market(user).currency,
         "balance": {
             "total_system_collected": all_time_mpesa,
             "total_paid_to_you": total_paid,
