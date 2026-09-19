@@ -22,9 +22,12 @@ from app.services.subscription import (
     generate_invoice_for_reseller, record_subscription_payment,
     get_invoice_alert_for_user,
     verify_subscription_payments_for_reseller,
+    _complete_subscription_payment,
     cap_invoice_period_start,
     TRIAL_DAYS, GRACE_PERIOD_DAYS, PRE_EXPIRY_DAYS,
+    BASE_CURRENCY, reprice_unpaid_invoice,
 )
+from app.services.markets import MARKETS, get_market, market_summary, PAY_CARD
 from app.services.mpesa import initiate_stk_push_direct
 from app.services.mpesa_b2b import (
     SUBSCRIPTION_OWNER_TRIGGER,
@@ -33,6 +36,10 @@ from app.services.mpesa_b2b import (
     initiate_b2b_payment,
 )
 from app.config import settings
+
+import secrets
+
+import httpx
 
 import logging
 
@@ -162,6 +169,8 @@ async def get_invoice_detail(
             "amount": p.amount,
             "payment_method": p.payment_method,
             "payment_reference": p.payment_reference,
+            "currency": p.currency,
+            "checkout_url": p.checkout_url,
             "phone_number": p.phone_number,
             "status": p.status.value if hasattr(p.status, 'value') else p.status,
             "created_at": p.created_at.isoformat() if p.created_at else None,
@@ -252,6 +261,8 @@ async def request_my_invoice(
         pppoe_charge=charges["pppoe_charge"],
         gross_charge=charges["gross_charge"],
         final_charge=charges["final_charge"],
+        currency=charges["currency"],
+        pricing_rule=charges["pricing_rule"],
         status=InvoiceStatus.PENDING,
         due_date=expires,
     )
@@ -298,6 +309,13 @@ async def pay_subscription(
 
     if balance <= 0:
         raise HTTPException(status_code=400, detail="Invoice is already fully paid")
+
+    invoice_currency = (invoice.currency or BASE_CURRENCY).upper()
+    if invoice_currency != BASE_CURRENCY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This invoice is in {invoice_currency}; M-Pesa can only pay KES invoices. Pay by card instead.",
+        )
 
     amount = request.amount if request.amount else balance
     if amount < 1:
@@ -355,6 +373,102 @@ async def pay_subscription(
         "already_paid": round(already_paid, 2),
         "balance_after_this": round(max(balance - amount, 0), 2),
         "phone_number": phone,
+    }
+
+
+class SubscriptionCardPayRequest(BaseModel):
+    invoice_id: int
+
+
+@router.post("/api/subscription/pay-card")
+async def pay_subscription_by_card(
+    request: SubscriptionCardPayRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Create a card checkout (PayAfrica/Paystack) for the invoice's full balance.
+
+    Returns the hosted checkout link. The payment stays pending until an admin
+    confirms it: PayAfrica gives us no way to verify the payment, and the
+    browser redirect after checkout proves nothing.
+    """
+    from app.services.payafrica import (
+        SUPPORTED_CURRENCIES, PayAfricaAPIError, initialize_card_checkout,
+    )
+
+    user = await get_current_user(token, db)
+    if user.role != UserRole.RESELLER:
+        raise HTTPException(status_code=403, detail="Only resellers can pay subscriptions")
+
+    invoice = (await db.execute(
+        select(SubscriptionInvoice).where(
+            SubscriptionInvoice.id == request.invoice_id,
+            SubscriptionInvoice.user_id == user.id,
+        )
+    )).scalar_one_or_none()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if invoice.status in (InvoiceStatus.PAID, InvoiceStatus.WAIVED):
+        raise HTTPException(status_code=400, detail="Invoice is already paid or waived")
+
+    currency = (invoice.currency or BASE_CURRENCY).upper()
+    if currency not in SUPPORTED_CURRENCIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Card payments are not available for {currency} invoices",
+        )
+    balance = round(invoice.final_charge - await get_invoice_amount_paid(db, invoice.id), 2)
+    if balance <= 0:
+        raise HTTPException(status_code=400, detail="Invoice is already fully paid")
+
+    pending_payment = SubscriptionPayment(
+        invoice_id=invoice.id,
+        user_id=user.id,
+        amount=balance,
+        currency=currency,
+        payment_method=PAY_CARD,
+        status=SubscriptionPaymentStatus.PENDING,
+    )
+    db.add(pending_payment)
+    await db.flush()
+    payment_id = pending_payment.id
+    reference = f"SUBCARD-{payment_id}-{secrets.token_hex(4)}"
+    pending_payment.payment_reference = reference
+    customer_email = user.email
+    invoice_id = invoice.id
+    # Release the pooled connection before calling the provider.
+    await db.commit()
+
+    callback_url = settings.FRONTEND_BASE_URL.rstrip("/") + "/settings/subscription?card=returned"
+    try:
+        checkout = await initialize_card_checkout(
+            amount=balance,
+            currency=currency,
+            customer_email=customer_email,
+            reference=reference,
+            callback_url=callback_url,
+        )
+    except (PayAfricaAPIError, ValueError, httpx.HTTPError) as e:
+        failed = await db.get(SubscriptionPayment, payment_id)
+        failed.status = SubscriptionPaymentStatus.FAILED
+        await db.commit()
+        logger.error(f"[SUBSCRIPTION] Card checkout failed for reseller {user.id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Card checkout failed: {e}")
+
+    payment = await db.get(SubscriptionPayment, payment_id)
+    payment.provider_reference = checkout["reference"]
+    payment.checkout_url = checkout["payment_url"][:500]
+    await db.commit()
+
+    return {
+        "message": "Open the checkout link to pay by card. Your subscription is activated once the payment is confirmed.",
+        "payment_id": payment_id,
+        "invoice_id": invoice_id,
+        "amount": balance,
+        "currency": currency,
+        "payment_url": checkout["payment_url"],
+        "reference": reference,
+        "provider_reference": checkout["reference"],
     }
 
 
@@ -483,6 +597,8 @@ async def list_my_payments(
                 "amount": p.amount,
                 "payment_method": p.payment_method,
                 "payment_reference": p.payment_reference,
+                "currency": p.currency,
+                "checkout_url": p.checkout_url,
                 "phone_number": p.phone_number,
                 "status": p.status.value if hasattr(p.status, 'value') else p.status,
                 "created_at": p.created_at.isoformat() if p.created_at else None,
@@ -590,10 +706,17 @@ async def _subscription_owner_transfer_totals(db: AsyncSession) -> dict:
     }
 
 
+# Only M-Pesa subscription payments land in the platform shortcode and can be
+# forwarded by B2B. Card payments settle at PayAfrica, so they must never make
+# shortcode money look "available to send".
+_IN_MPESA_SHORTCODE = SubscriptionPayment.payment_method == "mpesa"
+
+
 async def _subscription_collection_summary(db: AsyncSession) -> dict:
     total_collected = float((await db.execute(
         select(func.coalesce(func.sum(SubscriptionPayment.amount), 0)).where(
             SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+            _IN_MPESA_SHORTCODE,
         )
     )).scalar() or 0)
     transfers = await _subscription_owner_transfer_totals(db)
@@ -622,7 +745,10 @@ async def _subscription_payment_send_allocations(db: AsyncSession) -> dict[int, 
 
     payments = (await db.execute(
         select(SubscriptionPayment)
-        .where(SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED)
+        .where(
+            SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+            _IN_MPESA_SHORTCODE,
+        )
         .order_by(SubscriptionPayment.created_at.asc(), SubscriptionPayment.id.asc())
     )).scalars().all()
 
@@ -771,11 +897,12 @@ async def admin_list_subscription_payments(
     items = []
     for payment, reseller in rows:
         status_value = _enum_value(payment.status)
+        forwardable = status_value == "completed" and payment.payment_method == "mpesa"
         allocation = allocations.get(payment.id, {
-            "send_status": "not_applicable" if status_value != "completed" else "unsent",
+            "send_status": "unsent" if forwardable else "not_applicable",
             "sent_amount": 0.0,
             "pending_send_amount": 0.0,
-            "unsent_amount": float(payment.amount or 0) if status_value == "completed" else 0.0,
+            "unsent_amount": float(payment.amount or 0) if forwardable else 0.0,
         })
         if send_status and allocation["send_status"] != send_status:
             continue
@@ -788,6 +915,8 @@ async def admin_list_subscription_payments(
             "amount": payment.amount,
             "payment_method": payment.payment_method,
             "payment_reference": payment.payment_reference,
+            "currency": payment.currency,
+            "provider_reference": payment.provider_reference,
             "mpesa_checkout_request_id": payment.mpesa_checkout_request_id,
             "phone_number": payment.phone_number,
             "status": status_value,
@@ -1002,6 +1131,7 @@ async def admin_list_subscriptions(
             "business_name": r.business_name,
             "subscription_status": sub_status_val,
             "subscription_expires_at": r.subscription_expires_at.isoformat() if r.subscription_expires_at else None,
+            "market_code": r.market_code,
             "total_paid": total_paid,
             "outstanding": outstanding,
             "pending_invoice": enrich_invoice(pending_inv, inv_paid) if pending_inv else None,
@@ -1170,6 +1300,9 @@ async def admin_get_subscription_detail(
             "email": user.email,
             "organization_name": user.organization_name,
             "business_name": user.business_name,
+            "market_code": user.market_code,
+            "price_override": user.subscription_price_override,
+            "preferred_language": user.preferred_language,
         },
         "subscription": summary,
         "invoices": [
@@ -1183,6 +1316,8 @@ async def admin_get_subscription_detail(
                 "amount": p.amount,
                 "payment_method": p.payment_method,
                 "payment_reference": p.payment_reference,
+                "currency": p.currency,
+                "checkout_url": p.checkout_url,
                 "phone_number": p.phone_number,
                 "status": p.status.value if hasattr(p.status, 'value') else p.status,
                 "created_at": p.created_at.isoformat() if p.created_at else None,
@@ -1196,6 +1331,39 @@ class AdminSubscriptionPatch(BaseModel):
     subscription_status: Optional[str] = None
     subscription_expires_at: Optional[str] = None
     adjust_days: Optional[int] = None
+    # Country market (KE, CM, UG, TZ): sets currency, pricing, payment methods.
+    market_code: Optional[str] = None
+    # Price in the market's subscription currency (flat fee, or the minimum
+    # for usage markets). Send clear_price_override=true to remove it.
+    price_override: Optional[float] = None
+    clear_price_override: bool = False
+    preferred_language: Optional[str] = None
+
+
+def _apply_market_settings(user: User, body: AdminSubscriptionPatch) -> None:
+    if body.market_code is not None:
+        code = body.market_code.strip().upper()
+        if code not in MARKETS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"market_code must be one of: {', '.join(sorted(MARKETS))}",
+            )
+        user.market_code = code
+    if body.clear_price_override:
+        user.subscription_price_override = None
+    elif body.price_override is not None:
+        if body.price_override <= 0:
+            raise HTTPException(status_code=400, detail="price_override must be greater than zero")
+        user.subscription_price_override = round(float(body.price_override), 2)
+    if body.preferred_language is not None:
+        lang = body.preferred_language.strip().lower() or None
+        market = get_market(user.market_code)
+        if lang and lang not in market.languages:
+            raise HTTPException(
+                status_code=400,
+                detail=f"preferred_language must be one of: {', '.join(market.languages)}",
+            )
+        user.preferred_language = lang
 
 
 @router.patch("/api/admin/subscriptions/{reseller_id}")
@@ -1242,6 +1410,8 @@ async def admin_edit_subscription(
             sub.current_period_end = new_expiry
             sub.updated_at = datetime.utcnow()
 
+    _apply_market_settings(user, body)
+
     if body.adjust_days is not None:
         base = user.subscription_expires_at or datetime.utcnow()
         new_expiry = base + timedelta(days=body.adjust_days)
@@ -1265,7 +1435,82 @@ async def admin_edit_subscription(
         "subscription_status": sub_status.value if hasattr(sub_status, 'value') else sub_status,
         "subscription_expires_at": expires_at.isoformat() if expires_at else None,
         "days_remaining": days_remaining,
+        "market": market_summary(user),
+        "price_override": user.subscription_price_override,
     }
+
+
+class ConfirmCardPaymentRequest(BaseModel):
+    # Paystack/PayAfrica receipt shown in their dashboard, for the audit trail.
+    receipt: Optional[str] = None
+
+
+@router.post("/api/admin/subscriptions/payments/{payment_id}/confirm-card")
+async def admin_confirm_card_payment(
+    payment_id: int,
+    body: ConfirmCardPaymentRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Confirm a pending card payment after checking it in PayAfrica.
+
+    Marks it completed and, when the invoice is fully paid, activates the
+    reseller for one month (same path as M-Pesa reconciliation).
+    """
+    await _require_admin(token, db)
+    payment = await db.get(SubscriptionPayment, payment_id)
+    if not payment or payment.payment_method != PAY_CARD:
+        raise HTTPException(status_code=404, detail="Card payment not found")
+    if _enum_value(payment.status) != "pending":
+        raise HTTPException(status_code=400, detail=f"Payment is already {_enum_value(payment.status)}")
+    if body.receipt:
+        payment.payment_reference = body.receipt.strip()[:255]
+    await db.commit()
+
+    completed = await _complete_subscription_payment(payment_id)
+    if not completed:
+        raise HTTPException(status_code=409, detail="Payment was already processed")
+
+    user = (await db.execute(select(User).where(User.id == payment.user_id))).scalar_one()
+    await db.refresh(user)
+    return {
+        "message": "Card payment confirmed",
+        "payment_id": payment_id,
+        "reseller_id": user.id,
+        "subscription_status": _enum_value(user.subscription_status),
+        "subscription_expires_at": user.subscription_expires_at.isoformat() if user.subscription_expires_at else None,
+    }
+
+
+@router.post("/api/admin/subscriptions/{reseller_id}/reprice/{invoice_id}")
+async def admin_reprice_invoice(
+    reseller_id: int,
+    invoice_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Recompute an unpaid invoice with the reseller's current market pricing.
+
+    Use after moving a reseller to the right market when an invoice was issued
+    under the wrong one (e.g. XAF revenue billed as KES).
+    """
+    await _require_admin(token, db)
+    invoice = (await db.execute(
+        select(SubscriptionInvoice).where(
+            SubscriptionInvoice.id == invoice_id,
+            SubscriptionInvoice.user_id == reseller_id,
+        )
+    )).scalar_one_or_none()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    before = {"final_charge": invoice.final_charge, "currency": invoice.currency}
+    try:
+        await reprice_unpaid_invoice(db, invoice)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await db.commit()
+    await db.refresh(invoice)
+    return {"before": before, "invoice": enrich_invoice(invoice, 0.0)}
 
 
 @router.post("/api/admin/subscriptions/{reseller_id}/activate")
