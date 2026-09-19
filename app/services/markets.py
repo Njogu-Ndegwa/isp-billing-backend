@@ -83,9 +83,9 @@ _INTERNATIONAL_PRICING = PricingRule(
 )
 
 MARKETS: dict[str, Market] = {
-    "KE": Market("KE", "Kenya", "KES", "en", ("en", "sw"), "Africa/Nairobi", "254",
-                 _KENYA_PRICING, (PAY_MPESA,)),
     # usd_rate values: open.er-api.com mid-market rates on 2026-09-19.
+    "KE": Market("KE", "Kenya", "KES", "en", ("en", "sw"), "Africa/Nairobi", "254",
+                 _KENYA_PRICING, (PAY_MPESA,), usd_rate=129.5),
     "CM": Market("CM", "Cameroon", "XAF", "fr", ("fr", "en"), "Africa/Douala", "237",
                  _INTERNATIONAL_PRICING, (PAY_CARD,), usd_rate=571.0),
     "UG": Market("UG", "Uganda", "UGX", "en", ("en",), "Africa/Kampala", "256",
@@ -140,3 +140,63 @@ def market_summary(user) -> dict:
         "fx_rate": market.fx_rate_to(pricing.currency),
         "subscription_payment_methods": list(market.subscription_payment_methods),
     }
+
+
+# ---------------------------------------------------------------------------
+# Converting to KES for platform-wide totals
+# ---------------------------------------------------------------------------
+# Admin dashboards add up money across resellers. Each reseller's customer
+# revenue is in their market currency and subscription payments carry their
+# own currency, so totals convert everything to KES with the same fixed rates
+# used for invoicing.
+
+REPORTING_CURRENCY = "KES"
+
+
+def kes_per_unit(currency: str | None) -> float:
+    """KES value of 1 unit of ``currency`` at the fixed market rates."""
+    code = (currency or REPORTING_CURRENCY).upper()
+    kes_per_usd = MARKETS[DEFAULT_MARKET].usd_rate
+    if code == REPORTING_CURRENCY:
+        return 1.0
+    if code == "USD":
+        return kes_per_usd
+    for market in MARKETS.values():
+        if market.currency == code and market.usd_rate:
+            return kes_per_usd / market.usd_rate
+    raise ValueError(f"No KES rate for {code}")
+
+
+def to_kes(amount: float | None, currency: str | None) -> float:
+    return round(float(amount or 0) * kes_per_unit(currency), 2)
+
+
+def sql_kes_by_currency(amount_col, currency_col):
+    """SQL: ``amount_col`` in KES, reading the currency from ``currency_col``.
+
+    For tables that store a currency (subscription_invoices,
+    subscription_payments). Unknown/NULL currencies count as KES.
+    """
+    from sqlalchemy import case
+
+    currencies = {"USD"} | {m.currency for m in MARKETS.values()}
+    whens = [
+        (currency_col == code, amount_col * kes_per_unit(code))
+        for code in sorted(currencies) if code != REPORTING_CURRENCY
+    ]
+    return case(*whens, else_=amount_col)
+
+
+def sql_kes_by_market(amount_col, market_code_col):
+    """SQL: ``amount_col`` in KES for money in a reseller's market currency.
+
+    For customer payments / plan prices, whose currency is the owning
+    reseller's market (join users and pass ``User.market_code``).
+    """
+    from sqlalchemy import case
+
+    whens = [
+        (market_code_col == m.code, amount_col * kes_per_unit(m.currency))
+        for m in MARKETS.values() if m.currency != REPORTING_CURRENCY
+    ]
+    return case(*whens, else_=amount_col)
