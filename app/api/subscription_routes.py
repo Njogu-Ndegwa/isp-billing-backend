@@ -44,6 +44,7 @@ import secrets
 
 import httpx
 
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -473,6 +474,85 @@ async def pay_subscription_by_card(
         "reference": reference,
         "provider_reference": checkout["reference"],
     }
+
+
+@router.post("/api/subscription/pay-card/verify")
+async def verify_my_card_payments(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Called when the reseller returns from checkout: checks their pending
+    card payments with Paystack and activates immediately if paid. Without
+    PAYSTACK_SECRET_KEY it reports ``auto_verify: false`` (admin confirms)."""
+    from app.services import paystack
+    from app.services.card_payments import reconcile_card_payment
+
+    user = await get_current_user(token, db)
+    if user.role != UserRole.RESELLER:
+        raise HTTPException(status_code=403, detail="Only resellers have subscriptions")
+    user_id = user.id
+    pending_ids = (await db.execute(
+        select(SubscriptionPayment.id)
+        .where(
+            SubscriptionPayment.user_id == user_id,
+            SubscriptionPayment.payment_method == PAY_CARD,
+            SubscriptionPayment.status == SubscriptionPaymentStatus.PENDING,
+        )
+        .order_by(SubscriptionPayment.created_at.desc())
+        .limit(3)
+    )).scalars().all()
+    # Release the connection before calling Paystack.
+    await db.commit()
+
+    if not paystack.is_configured():
+        return {"auto_verify": False, "results": {}, "activated": False}
+
+    results = {}
+    for payment_id in pending_ids:
+        try:
+            results[payment_id] = await reconcile_card_payment(payment_id)
+        except Exception as e:
+            logger.warning(f"[CARD] verify failed for payment {payment_id}: {e}")
+            results[payment_id] = "error"
+
+    refreshed = (await db.execute(select(User).where(User.id == user_id))).scalar_one()
+    await db.refresh(refreshed)
+    return {
+        "auto_verify": True,
+        "results": results,
+        "activated": any(r == "completed" for r in results.values()),
+        "subscription_status": _enum_value(refreshed.subscription_status),
+        "subscription_expires_at": refreshed.subscription_expires_at.isoformat() if refreshed.subscription_expires_at else None,
+    }
+
+
+@router.post("/api/paystack/webhook")
+async def paystack_webhook(request: Request):
+    """Signed Paystack webhook (for when the Paystack account's webhook URL
+    points here). The event is only a hint: the payment is re-verified with
+    Paystack's API before anything is activated."""
+    from app.services import paystack
+    from app.services.card_payments import find_pending_card_payment_ids, reconcile_card_payment
+
+    raw = await request.body()
+    if not paystack.valid_webhook_signature(raw, request.headers.get("x-paystack-signature")):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        event = json.loads(raw or b"{}")
+    except ValueError:
+        return {"ok": True}
+    if event.get("event") != "charge.success":
+        return {"ok": True}
+    data = event.get("data") or {}
+    references = {str(v) for v in (data.get("reference"), (data.get("metadata") or {}).get("reference")) if v}
+    for ref in references:
+        for payment_id in await find_pending_card_payment_ids(ref):
+            try:
+                outcome = await reconcile_card_payment(payment_id)
+                logger.info(f"[CARD] Webhook {ref}: payment {payment_id} -> {outcome}")
+            except Exception as e:
+                logger.warning(f"[CARD] Webhook reconcile failed for payment {payment_id}: {e}")
+    return {"ok": True}
 
 
 @router.post("/api/subscription/mpesa/callback")
@@ -1480,6 +1560,23 @@ async def admin_edit_subscription(
 class ConfirmCardPaymentRequest(BaseModel):
     # Paystack/PayAfrica receipt shown in their dashboard, for the audit trail.
     receipt: Optional[str] = None
+
+
+@router.post("/api/admin/subscriptions/payments/{payment_id}/verify-card")
+async def admin_verify_card_payment(
+    payment_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Ask Paystack about one card payment now (completes it if paid)."""
+    from app.services.card_payments import reconcile_card_payment
+
+    await _require_admin(token, db)
+    await db.commit()
+    outcome = await reconcile_card_payment(payment_id)
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail="Card payment not found")
+    return {"payment_id": payment_id, "outcome": outcome}
 
 
 @router.post("/api/admin/subscriptions/payments/{payment_id}/confirm-card")

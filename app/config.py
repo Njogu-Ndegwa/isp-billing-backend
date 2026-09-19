@@ -137,6 +137,11 @@ class Settings(BaseSettings):
 
     # Card payments for subscriptions (PayAfrica -> Paystack hosted checkout).
     PAYAFRICA_BASE_URL: str = "https://api.payafrica.org"
+    # Secret key of the Paystack account behind those checkouts. When set,
+    # card payments are verified with Paystack and activate automatically;
+    # when empty, an admin confirms them. Server env only, never commit.
+    PAYSTACK_SECRET_KEY: str = ""
+    PAYSTACK_BASE_URL: str = "https://api.paystack.co"
 
     # Just-in-time RouterOS operator access. This is the source allowed to
     # reach WinBox/SSH/WebFig when an admin opens remote access for a router.

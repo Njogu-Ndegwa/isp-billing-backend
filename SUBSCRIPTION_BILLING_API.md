@@ -575,6 +575,30 @@ invoice's full balance (USD or KES) and returns `payment_url`, `payment_id`,
 (PayAfrica, `PAF-...`). The payment stays `pending`: PayAfrica has no status
 lookup or signed webhook yet, so an admin confirms it.
 
+### Automatic card confirmation (Paystack)
+
+With `PAYSTACK_SECRET_KEY` set in the server `.env` (the secret key of the
+Paystack account behind the PayAfrica checkouts), card payments confirm
+themselves. A payment completes only when Paystack reports `success` for the
+exact amount (minor units) and currency; anything else stays pending for an admin.
+
+- `POST /api/subscription/pay-card/verify`: reseller, called on return from
+  checkout. Checks their pending card payments now. Returns `auto_verify`
+  (false = no key, admin confirms), `activated`, `subscription_status`,
+  `subscription_expires_at`.
+- `POST /api/paystack/webhook`: optional, for when the Paystack account's
+  webhook URL points here. Requires a valid `x-paystack-signature` (HMAC-SHA512
+  of the body with the secret key); the payment is re-verified via Paystack's
+  API before anything is activated.
+- `POST /api/admin/subscriptions/payments/{payment_id}/verify-card`: admin,
+  ask Paystack about one payment now. Returns `outcome`.
+- Background job every 3 minutes checks pending card payments (catches payers
+  who closed the tab). Unpaid checkouts are marked failed after 48 hours; the
+  invoice stays payable.
+
+Each payment activates at most once (row lock + pending check), whichever
+trigger fires first. Without the key nothing changes: admins confirm manually.
+
 ### POST `/api/admin/subscriptions/payments/{payment_id}/confirm-card`
 
 Body: `{"receipt": "optional Paystack receipt"}`. Marks a pending card payment
