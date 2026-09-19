@@ -1,10 +1,11 @@
 """Country markets and multi-currency reseller subscriptions.
 
 Pins:
-  * the market registry is internally consistent (usage rules bill in the
-    market's own currency, every market has a way to pay)
-  * Kenya's usage formula is unchanged; other markets pay a flat USD fee no
-    matter how much local-currency (e.g. XAF) revenue they collect
+  * the market registry is internally consistent (every market can convert
+    its revenue into its invoice currency, every market has a way to pay)
+  * Kenya's usage formula is unchanged; international markets pay the same
+    formula in USD (3% of hotspot revenue converted at the market's fixed
+    rate + USD 0.20 per PPPoE user, minimum USD 10)
   * the per-reseller price override
   * repricing an invoice issued under the wrong market (prod invoice #597:
     XAF revenue billed as KES 4,774.20)
@@ -27,6 +28,7 @@ from app.db.database import get_db
 from app.db.models import (
     ConnectionType,
     CustomerPayment,
+    CustomerStatus,
     InvoiceStatus,
     PaymentMethod,
     PaymentStatus,
@@ -94,8 +96,8 @@ def test_every_market_is_consistent():
         assert market.default_language in market.languages
         assert market.subscription_payment_methods, code
         if market.pricing.kind == PRICING_USAGE:
-            # Revenue is summed in the market currency, so the charge must be too.
-            assert market.pricing.currency == market.currency, code
+            # Revenue is summed in the market currency and must be convertible.
+            assert market.fx_rate_to(market.pricing.currency) > 0, code
 
 
 def test_unknown_market_falls_back_to_kenya():
@@ -121,21 +123,59 @@ async def test_kenya_reseller_keeps_usage_formula(db):
 
 
 @pytest.mark.asyncio
-async def test_cameroon_reseller_pays_flat_usd_regardless_of_xaf_revenue(db):
+async def test_cameroon_reseller_below_threshold_pays_usd_minimum(db):
     reseller = await make_reseller(db, market_code="CM")
     await _hotspot_revenue(db, reseller, 159_140)  # XAF, as on prod invoice #597
 
     charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
 
+    rate = MARKETS["CM"].usd_rate
     assert charges["currency"] == "USD"
+    assert charges["hotspot_revenue"] == round(159_140 / rate, 2)
+    assert charges["hotspot_charge"] == round(charges["hotspot_revenue"] * 0.03, 2)
+    assert charges["hotspot_charge"] < 10.0
     assert charges["final_charge"] == 10.0
-    assert charges["hotspot_revenue"] == 0.0
-    assert charges["hotspot_charge"] == 0.0
+    assert charges["pricing_rule"]["hotspot_revenue_local"] == 159_140
+    assert charges["pricing_rule"]["revenue_currency"] == "XAF"
+    assert charges["pricing_rule"]["fx_rate"] == rate
 
 
 @pytest.mark.asyncio
-async def test_price_override_replaces_flat_fee_or_kenyan_minimum(db):
-    intl = await make_reseller(db, market_code="UG", subscription_price_override=15.0)
+async def test_cameroon_reseller_above_threshold_pays_three_percent_in_usd(db):
+    reseller = await make_reseller(db, market_code="CM")
+    rate = MARKETS["CM"].usd_rate
+    await _hotspot_revenue(db, reseller, 500 * rate)  # USD 500 of XAF revenue
+
+    charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
+
+    assert charges["hotspot_revenue"] == 500.0
+    assert charges["hotspot_charge"] == 15.0
+    assert charges["final_charge"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_international_pppoe_users_cost_twenty_cents(db):
+    reseller = await make_reseller(db, market_code="UG")
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    for _ in range(60):
+        await make_customer(
+            db, reseller, plan, status=CustomerStatus.ACTIVE,
+            expiry=PERIOD_END + timedelta(days=10),
+        )
+    rate = MARKETS["UG"].usd_rate
+    await _hotspot_revenue(db, reseller, 100 * rate)  # USD 100 -> USD 3
+
+    charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
+
+    assert charges["pppoe_user_count"] == 60
+    assert charges["pppoe_charge"] == 12.0
+    assert charges["gross_charge"] == 15.0
+    assert charges["final_charge"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_price_override_replaces_the_minimum_charge(db):
+    intl = await make_reseller(db, market_code="UG", subscription_price_override=15.0)  # minimum $15
     kenyan = await make_reseller(db, subscription_price_override=300.0)
 
     assert (await calculate_reseller_charges(db, intl.id, PERIOD_START, PERIOD_END))["final_charge"] == 15.0
@@ -154,7 +194,7 @@ async def test_reprice_fixes_invoice_issued_under_wrong_market(db):
 
     assert invoice.final_charge == 10.0
     assert invoice.currency == "USD"
-    assert invoice.pricing_rule["flat_amount"] == 10.0
+    assert invoice.pricing_rule["minimum"] == 10.0
 
 
 @pytest.mark.asyncio

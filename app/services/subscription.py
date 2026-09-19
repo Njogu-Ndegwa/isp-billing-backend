@@ -39,7 +39,7 @@ def enforce_active_subscription(user: User):
 
 from app.services.markets import (
     DEFAULT_MARKET, MARKETS, PRICING_FLAT, get_market, market_summary,
-    reseller_pricing,
+    reseller_market, reseller_pricing,
 )
 
 # Kenya's usage rule, kept as module constants for existing callers/tests.
@@ -89,13 +89,15 @@ async def calculate_reseller_charges(
     Returns a breakdown dict with all charge components.
 
     The pricing rule comes from the reseller's market (plus any per-reseller
-    override). Flat markets are charged a fixed fee in the rule's currency;
-    usage components stay zero there because hotspot revenue is in the local
-    currency, not the invoice currency. Usage rules are always expressed in
-    the market's own currency, so revenue and charge share one currency.
+    override). Hotspot revenue is collected in the market's currency; when the
+    invoice is in another currency (international resellers are invoiced in
+    USD) it is converted at the market's fixed rate. All money fields on the
+    result are in the invoice currency; the local revenue and the rate used
+    are recorded in ``pricing_rule``.
     """
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    rule = reseller_pricing(user) if user else get_market(None).pricing
+    market = reseller_market(user) if user else get_market(None)
+    rule = reseller_pricing(user) if user else market.pricing
     if rule.kind == PRICING_FLAT:
         amount = round(float(rule.flat_amount), 2)
         return {
@@ -109,7 +111,7 @@ async def calculate_reseller_charges(
             "pricing_rule": rule.as_dict(),
         }
 
-    hotspot_revenue = float((await db.execute(
+    hotspot_revenue_local = float((await db.execute(
         select(func.coalesce(func.sum(CustomerPayment.amount), 0))
         .join(Customer, CustomerPayment.customer_id == Customer.id)
         .join(Plan, Customer.plan_id == Plan.id)
@@ -135,6 +137,8 @@ async def calculate_reseller_charges(
         )
     )).scalar() or 0
 
+    fx_rate = market.fx_rate_to(rule.currency)
+    hotspot_revenue = round(hotspot_revenue_local / fx_rate, 2)
     hotspot_charge = round(hotspot_revenue * rule.hotspot_rate, 2)
     pppoe_charge = round(pppoe_user_count * rule.per_pppoe_user, 2)
     gross_charge = round(hotspot_charge + pppoe_charge, 2)
@@ -148,7 +152,12 @@ async def calculate_reseller_charges(
         "gross_charge": gross_charge,
         "final_charge": final_charge,
         "currency": rule.currency,
-        "pricing_rule": rule.as_dict(),
+        "pricing_rule": {
+            **rule.as_dict(),
+            "revenue_currency": market.currency,
+            "hotspot_revenue_local": hotspot_revenue_local,
+            "fx_rate": fx_rate,
+        },
     }
 
 

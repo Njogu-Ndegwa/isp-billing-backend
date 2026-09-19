@@ -6,7 +6,8 @@ The market is the single source of truth for:
 * the reseller's operating currency: plan prices, customer payments and
   hotspot revenue are all in this currency;
 * how the platform bills the reseller (the subscription pricing rule) and in
-  which currency;
+  which currency, plus the fixed exchange rate used when the invoice currency
+  differs from the operating currency;
 * which methods the reseller can use to pay that subscription;
 * defaults for language and timezone.
 
@@ -51,26 +52,46 @@ class Market:
     phone_prefix: str
     pricing: PricingRule
     subscription_payment_methods: tuple[str, ...]
+    # Units of the operating currency per 1 USD. Fixed on purpose (no live
+    # feed billing depends on); update by hand when rates drift. Each invoice
+    # stores the rate it used.
+    usd_rate: float | None = None
+
+    def fx_rate_to(self, invoice_currency: str) -> float:
+        """Local units per 1 unit of the invoice currency."""
+        if invoice_currency == self.currency:
+            return 1.0
+        if invoice_currency == "USD" and self.usd_rate:
+            return self.usd_rate
+        raise ValueError(
+            f"No exchange rate from {self.currency} to {invoice_currency} for market {self.code}"
+        )
 
 
-# Kenya keeps the long-standing usage formula paid over M-Pesa. Other markets
-# pay a flat USD fee by card: their hotspot revenue is in another currency, so
-# a KES percentage/minimum means nothing there.
+# Everyone pays the same shape of formula: 3% of hotspot revenue plus a
+# per-PPPoE-user fee, with a monthly minimum. Kenya pays it in KES over
+# M-Pesa. International resellers pay it in USD by card: their local-currency
+# revenue is converted at the market's fixed usd_rate, so the $10 minimum
+# applies until 3% of revenue passes about $333.
 _KENYA_PRICING = PricingRule(
     kind=PRICING_USAGE, currency="KES",
     hotspot_rate=0.03, per_pppoe_user=25.0, minimum=500.0,
 )
-_INTERNATIONAL_PRICING = PricingRule(kind=PRICING_FLAT, currency="USD", flat_amount=10.0)
+_INTERNATIONAL_PRICING = PricingRule(
+    kind=PRICING_USAGE, currency="USD",
+    hotspot_rate=0.03, per_pppoe_user=0.20, minimum=10.0,
+)
 
 MARKETS: dict[str, Market] = {
     "KE": Market("KE", "Kenya", "KES", "en", ("en", "sw"), "Africa/Nairobi", "254",
                  _KENYA_PRICING, (PAY_MPESA,)),
+    # usd_rate values: open.er-api.com mid-market rates on 2026-09-19.
     "CM": Market("CM", "Cameroon", "XAF", "fr", ("fr", "en"), "Africa/Douala", "237",
-                 _INTERNATIONAL_PRICING, (PAY_CARD,)),
+                 _INTERNATIONAL_PRICING, (PAY_CARD,), usd_rate=571.0),
     "UG": Market("UG", "Uganda", "UGX", "en", ("en",), "Africa/Kampala", "256",
-                 _INTERNATIONAL_PRICING, (PAY_CARD,)),
+                 _INTERNATIONAL_PRICING, (PAY_CARD,), usd_rate=3818.0),
     "TZ": Market("TZ", "Tanzania", "TZS", "sw", ("sw", "en"), "Africa/Dar_es_Salaam", "255",
-                 _INTERNATIONAL_PRICING, (PAY_CARD,)),
+                 _INTERNATIONAL_PRICING, (PAY_CARD,), usd_rate=2649.0),
 }
 
 
@@ -116,5 +137,6 @@ def market_summary(user) -> dict:
         "timezone": market.timezone,
         "subscription_currency": pricing.currency,
         "subscription_pricing": pricing.as_dict(),
+        "fx_rate": market.fx_rate_to(pricing.currency),
         "subscription_payment_methods": list(market.subscription_payment_methods),
     }

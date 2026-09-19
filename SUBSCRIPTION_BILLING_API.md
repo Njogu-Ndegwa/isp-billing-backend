@@ -545,12 +545,18 @@ Manually trigger pre-expiry invoice generation for resellers expiring within 5 d
 Every reseller belongs to a market (`users.market_code`, default `KE`), defined in
 `app/services/markets.py`. The market fixes:
 
-| Market | Operating currency | Subscription | Pays with |
-|---|---|---|---|
-| KE Kenya | KES | usage formula below, in KES | M-Pesa |
-| CM Cameroon | XAF | flat USD 10 / month | card |
-| UG Uganda | UGX | flat USD 10 / month | card |
-| TZ Tanzania | TZS | flat USD 10 / month | card |
+| Market | Operating currency | Invoiced in | Formula | Pays with |
+|---|---|---|---|---|
+| KE Kenya | KES | KES | 3% hotspot + KES 25/PPPoE user, min KES 500 | M-Pesa |
+| CM Cameroon | XAF | USD (1 USD = 571 XAF) | 3% hotspot + USD 0.20/PPPoE user, min USD 10 | card |
+| UG Uganda | UGX | USD (1 USD = 3,818 UGX) | same as Cameroon | card |
+| TZ Tanzania | TZS | USD (1 USD = 2,649 TZS) | same as Cameroon | card |
+
+International hotspot revenue is converted to USD at the market's fixed
+`usd_rate` (set in `app/services/markets.py`, update by hand when rates drift).
+The USD 10 minimum applies until 3% of revenue passes about USD 333. Each
+invoice's `pricing_rule` records `hotspot_revenue_local`, `revenue_currency`
+and the `fx_rate` used.
 
 The operating currency is the currency of the reseller's plan prices, customer
 payments and hotspot revenue. Invoices and subscription payments carry their own
@@ -579,7 +585,7 @@ Card payments settle at PayAfrica, so they never count toward the M-Pesa
 ### PATCH `/api/admin/subscriptions/{reseller_id}` (market fields)
 
 `market_code` (`KE`/`CM`/`UG`/`TZ`), `price_override` (in the subscription
-currency: replaces the flat fee, or the minimum for Kenya),
+currency: replaces the minimum charge),
 `clear_price_override: true`, `preferred_language` (one of the market's languages).
 
 ### POST `/api/admin/subscriptions/{reseller_id}/reprice/{invoice_id}`
