@@ -107,3 +107,49 @@ async def initialize_card_checkout(
         reference, data["reference"],
     )
     return data
+
+
+# PayAfrica only accepts callback_url on origins it has allow-listed. Until
+# ours is added, fall back so the payment itself still goes through; the
+# payer then lands on PayAfrica's page instead of ours after paying.
+PAYAFRICA_OWN_CALLBACK = "https://payafrica.org/payments"
+
+
+def _is_untrusted_callback(error: "PayAfricaAPIError") -> bool:
+    text = str(error).lower()
+    return error.status_code == 422 and "callback" in text and "trust" in text
+
+
+async def initialize_card_checkout_with_fallback(
+    *,
+    amount: Any,
+    currency: str,
+    customer_email: str,
+    reference: str,
+    callback_url: str | None,
+) -> tuple[dict, str | None]:
+    """Create the checkout, retrying without our callback if PayAfrica
+    rejects its origin. Returns (checkout, callback_url_actually_used)."""
+    candidates: list[str | None] = [callback_url, None, PAYAFRICA_OWN_CALLBACK]
+    last_error: PayAfricaAPIError | None = None
+    for candidate in dict.fromkeys(candidates):  # de-duplicate, keep order
+        try:
+            checkout = await initialize_card_checkout(
+                amount=amount,
+                currency=currency,
+                customer_email=customer_email,
+                reference=reference,
+                callback_url=candidate,
+            )
+            if candidate != callback_url:
+                logger.warning(
+                    "PayAfrica rejected callback origin %r; checkout %s created with callback %r",
+                    callback_url, reference, candidate,
+                )
+            return checkout, candidate
+        except PayAfricaAPIError as exc:
+            if not _is_untrusted_callback(exc):
+                raise
+            last_error = exc
+    assert last_error is not None
+    raise last_error
