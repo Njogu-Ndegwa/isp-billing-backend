@@ -27,7 +27,10 @@ from app.services.subscription import (
     TRIAL_DAYS, GRACE_PERIOD_DAYS, PRE_EXPIRY_DAYS,
     BASE_CURRENCY, reprice_unpaid_invoice,
 )
-from app.services.markets import MARKETS, get_market, market_summary, PAY_CARD
+from app.services.markets import (
+    MARKETS, get_market, market_summary, PAY_CARD,
+    REPORTING_CURRENCY, kes_per_unit, to_kes, sql_kes_by_currency,
+)
 from app.services.mpesa import initiate_stk_push_direct
 from app.services.mpesa_b2b import (
     SUBSCRIPTION_OWNER_TRIGGER,
@@ -619,6 +622,18 @@ async def _require_admin(token: str, db: AsyncSession) -> User:
     return user
 
 
+def _admin_invoice(invoice: SubscriptionInvoice, amount_paid: float = 0.0) -> dict:
+    """enrich_invoice plus the KES value of the charge, for admin views."""
+    data = enrich_invoice(invoice, amount_paid)
+    data["final_charge_kes"] = to_kes(invoice.final_charge, invoice.currency)
+    return data
+
+
+def _fx_meta() -> dict:
+    """Admin totals are in KES; usd_rate (KES per USD) lets the UI show USD."""
+    return {"reporting_currency": REPORTING_CURRENCY, "usd_rate": kes_per_unit("USD")}
+
+
 def _enum_value(value):
     return value.value if hasattr(value, "value") else value
 
@@ -916,6 +931,7 @@ async def admin_list_subscription_payments(
             "payment_method": payment.payment_method,
             "payment_reference": payment.payment_reference,
             "currency": payment.currency,
+            "amount_kes": to_kes(payment.amount, payment.currency),
             "provider_reference": payment.provider_reference,
             "mpesa_checkout_request_id": payment.mpesa_checkout_request_id,
             "phone_number": payment.phone_number,
@@ -1110,16 +1126,28 @@ async def admin_list_subscriptions(
 
     items = []
     for r in resellers:
+        # Money on each row is in the reseller's subscription currency (KES for
+        # Kenya, USD for card-paying markets); `currency` labels it. Payments
+        # made in another currency (e.g. before a market change) are converted
+        # through KES at the fixed market rates.
+        currency = market_summary(r)["subscription_currency"]
         pending_inv = await get_pending_invoice(db, r.id)
         total_paid = float((await db.execute(
-            select(func.coalesce(func.sum(SubscriptionPayment.amount), 0)).where(
+            select(func.coalesce(func.sum(
+                sql_kes_by_currency(SubscriptionPayment.amount, SubscriptionPayment.currency)
+            ), 0)).where(
                 SubscriptionPayment.user_id == r.id,
                 SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
             )
         )).scalar())
+        if currency != REPORTING_CURRENCY:
+            total_paid = round(total_paid / kes_per_unit(currency), 2)
 
         inv_paid = await get_invoice_amount_paid(db, pending_inv.id) if pending_inv else 0.0
         outstanding = round(pending_inv.final_charge - inv_paid, 2) if pending_inv else 0.0
+        inv_currency = ((pending_inv.currency if pending_inv else None) or currency).upper()
+        if pending_inv and inv_currency != currency:
+            outstanding = round(to_kes(outstanding, inv_currency) / kes_per_unit(currency), 2)
 
         sub_status = r.subscription_status
         sub_status_val = sub_status.value if hasattr(sub_status, 'value') else sub_status
@@ -1134,14 +1162,16 @@ async def admin_list_subscriptions(
             "market_code": r.market_code,
             "total_paid": total_paid,
             "outstanding": outstanding,
-            "pending_invoice": enrich_invoice(pending_inv, inv_paid) if pending_inv else None,
+            "currency": currency,
+            "pending_invoice": _admin_invoice(pending_inv, inv_paid) if pending_inv else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "last_login_at": r.last_login_at.isoformat() if r.last_login_at else None,
         })
 
     sort_key_map = {
         "expires_at": lambda x: x["subscription_expires_at"] or "",
-        "revenue": lambda x: x["total_paid"],
+        # Rows are in different currencies: rank by KES value.
+        "revenue": lambda x: to_kes(x["total_paid"], x["currency"]),
         "created_at": lambda x: x["created_at"] or "",
     }
     if sort_by and sort_by in sort_key_map:
@@ -1161,21 +1191,25 @@ async def admin_subscription_revenue(
     now = datetime.utcnow()
     month_start = datetime(now.year, now.month, 1)
 
+    # Platform-wide totals: every currency converted to KES.
+    paid_kes = sql_kes_by_currency(SubscriptionPayment.amount, SubscriptionPayment.currency)
     total_collected = float((await db.execute(
-        select(func.coalesce(func.sum(SubscriptionPayment.amount), 0)).where(
+        select(func.coalesce(func.sum(paid_kes), 0)).where(
             SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
         )
     )).scalar())
 
     this_month_collected = float((await db.execute(
-        select(func.coalesce(func.sum(SubscriptionPayment.amount), 0)).where(
+        select(func.coalesce(func.sum(paid_kes), 0)).where(
             SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
             SubscriptionPayment.created_at >= month_start,
         )
     )).scalar())
 
     total_outstanding = float((await db.execute(
-        select(func.coalesce(func.sum(SubscriptionInvoice.final_charge), 0)).where(
+        select(func.coalesce(func.sum(
+            sql_kes_by_currency(SubscriptionInvoice.final_charge, SubscriptionInvoice.currency)
+        ), 0)).where(
             SubscriptionInvoice.status.in_([InvoiceStatus.PENDING, InvoiceStatus.OVERDUE]),
         )
     )).scalar())
@@ -1215,6 +1249,8 @@ async def admin_subscription_revenue(
         "total_collected": total_collected,
         "this_month_collected": this_month_collected,
         "total_outstanding": total_outstanding,
+        "currency": REPORTING_CURRENCY,
+        **_fx_meta(),
         "total_invoices": total_invoices,
         "overdue_invoices": overdue_count,
         "resellers": {
@@ -1306,7 +1342,7 @@ async def admin_get_subscription_detail(
         },
         "subscription": summary,
         "invoices": [
-            enrich_invoice(inv, await get_invoice_amount_paid(db, inv.id))
+            _admin_invoice(inv, await get_invoice_amount_paid(db, inv.id))
             for inv in invoices
         ],
         "payments": [
@@ -1317,6 +1353,7 @@ async def admin_get_subscription_detail(
                 "payment_method": p.payment_method,
                 "payment_reference": p.payment_reference,
                 "currency": p.currency,
+                "amount_kes": to_kes(p.amount, p.currency),
                 "checkout_url": p.checkout_url,
                 "phone_number": p.phone_number,
                 "status": p.status.value if hasattr(p.status, 'value') else p.status,
@@ -1510,7 +1547,7 @@ async def admin_reprice_invoice(
         raise HTTPException(status_code=400, detail=str(e))
     await db.commit()
     await db.refresh(invoice)
-    return {"before": before, "invoice": enrich_invoice(invoice, 0.0)}
+    return {"before": before, "invoice": _admin_invoice(invoice, 0.0)}
 
 
 @router.post("/api/admin/subscriptions/{reseller_id}/activate")

@@ -15,6 +15,7 @@ from app.db.models import (
     ShopOrder, ShopOrderPaymentStatus, UserRole,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services.markets import reseller_market
 from app.services.subscription import get_invoice_alert_for_user
 from app.services.router_helpers import get_router_by_id
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, validate_mac_address
@@ -337,6 +338,7 @@ async def get_dashboard_overview(
             logger.warning(f"Shop summary skipped (non-fatal): {shop_err}")
 
         return {
+            "currency": reseller_market(user).currency,
             "router_id": router_id,
             "router_name": router_name,
             "revenue": {
@@ -679,6 +681,7 @@ async def get_dashboard_analytics(
             router_name = router_obj.name if router_obj else None
         
         return {
+            "currency": reseller_market(user).currency,
             "router_id": router_id,
             "router_name": router_name,
             "extractedAt": now.isoformat(),
@@ -861,6 +864,7 @@ async def get_revenue_over_time(
         avg_per_period = round(total_revenue / len(non_zero), 2) if non_zero else 0.0
 
         return {
+            "currency": reseller_market(user).currency,
             "period": period_label,
             "group_by": group_by,
             "start_date": range_start.strftime("%Y-%m-%d"),
@@ -1039,6 +1043,7 @@ async def get_daily_transaction_counts(
         total_days = len(data)
 
         return {
+            "currency": reseller_market(user).currency,
             "period": period_label,
             "start_date": range_start.strftime("%Y-%m-%d"),
             "end_date": final_day.strftime("%Y-%m-%d"),
@@ -1166,6 +1171,7 @@ async def get_daily_revenue_metrics(
             router_name = router_obj.name if router_obj else None
         
         return {
+            "currency": reseller_market(user).currency,
             "router_id": router_id,
             "router_name": router_name,
             "date": day_start.strftime("%Y-%m-%d"),
@@ -1341,6 +1347,7 @@ async def get_dashboard_stats(
             router_name = router_obj.name if router_obj else None
         
         return {
+            "currency": reseller_market(user).currency,
             "router_id": router_id,
             "router_name": router_name,
             "period_days": period,
@@ -1499,6 +1506,7 @@ async def get_reseller_account_statement(
     )).scalar())
 
     return {
+        "currency": reseller_market(user).currency,
         "balance": {
             "total_system_collected": all_time_mpesa,
             "total_paid_to_you": total_paid,
