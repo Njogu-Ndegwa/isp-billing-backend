@@ -26,6 +26,18 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["public"])
 
+# Reconnects for one customer must be serialized.  Production currently runs a
+# single web worker; the database compare-and-swap below is the cross-process
+# backstop if that ever changes.
+_reconnect_locks: dict[int, asyncio.Lock] = {}
+
+
+def _reconnect_lock(customer_id: int) -> asyncio.Lock:
+    lock = _reconnect_locks.get(customer_id)
+    if lock is None:
+        lock = _reconnect_locks[customer_id] = asyncio.Lock()
+    return lock
+
 
 # ---------------------------------------------------------------------------
 # Private sync helpers (run in thread pool to avoid blocking the event loop)
@@ -1102,7 +1114,7 @@ def _build_phone_variants(phone: str) -> list[str]:
 
 
 def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
-    """Remove hotspot user, binding, queue, and DHCP lease for the old MAC."""
+    """Revoke the old device and prove that it no longer has hotspot access."""
     normalized = normalize_mac_address(old_mac)
     username = normalized.replace(":", "")
     api = MikroTikAPI(
@@ -1113,40 +1125,234 @@ def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
     if not api.connect():
         return {"error": "Failed to connect to router for cleanup"}
     try:
-        removed = {"user": False, "bindings": 0, "queues": 0, "sessions": 0}
+        removed = {
+            "bindings": 0, "sessions": 0, "hosts": 0,
+            "users": 0, "queues": 0, "leases": 0, "lb_paid": 0,
+        }
+        command_errors: list[str] = []
 
-        users = api.send_command("/ip/hotspot/user/print")
-        if users.get("success") and users.get("data"):
-            for u in users["data"]:
-                if u.get("name", "").upper() == username.upper():
-                    api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
-                    removed["user"] = True
-                    break
+        def _print(path: str) -> list[dict] | None:
+            result = api.send_command(f"{path}/print")
+            if not result.get("success"):
+                command_errors.append(f"{path}/print: {result.get('error', 'failed')}")
+                return None
+            return result.get("data") or []
 
-        bindings = api.send_command("/ip/hotspot/ip-binding/print")
-        if bindings.get("success") and bindings.get("data"):
-            for b in bindings["data"]:
-                if normalize_mac_address(b.get("mac-address", "")) == normalized:
-                    api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
-                    removed["bindings"] += 1
+        def _remove(path: str, rows: list[dict] | None, matches, key: str) -> None:
+            if rows is None:
+                return
+            for row in rows:
+                if not matches(row):
+                    continue
+                result = api.send_command(f"{path}/remove", {"numbers": row.get(".id")})
+                if result.get("success"):
+                    removed[key] += 1
+                else:
+                    command_errors.append(
+                        f"{path}/remove: {result.get('error', 'failed')}"
+                    )
 
-        queues = api.send_command("/queue/simple/print")
-        if queues.get("success") and queues.get("data"):
-            for q in queues["data"]:
-                if q.get("name", "") in (f"queue_{username}", f"plan_{username}"):
-                    api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
-                    removed["queues"] += 1
+        hosts = _print("/ip/hotspot/host")
+        client_ips = {
+            str(row.get("address"))
+            for row in (hosts or [])
+            if row.get("address")
+            and normalize_mac_address(row.get("mac-address", "")) == normalized
+        }
 
-        active = api.send_command("/ip/hotspot/active/print")
-        if active.get("success") and active.get("data"):
-            for s in active["data"]:
-                if s.get("user", "").upper() == username.upper():
-                    api.send_command("/ip/hotspot/active/remove", {"numbers": s[".id"]})
-                    removed["sessions"] += 1
+        # Authorization-bearing state goes first.  Host and lease removal then
+        # makes the old device pass through the captive portal again.
+        _remove(
+            "/ip/hotspot/ip-binding", _print("/ip/hotspot/ip-binding"),
+            lambda row: normalize_mac_address(row.get("mac-address", "")) == normalized,
+            "bindings",
+        )
+        _remove(
+            "/ip/hotspot/active", _print("/ip/hotspot/active"),
+            lambda row: (
+                normalize_mac_address(row.get("mac-address", "")) == normalized
+                or str(row.get("user", "")).upper() == username.upper()
+            ),
+            "sessions",
+        )
+        _remove(
+            "/ip/hotspot/host", hosts,
+            lambda row: normalize_mac_address(row.get("mac-address", "")) == normalized,
+            "hosts",
+        )
+        _remove(
+            "/ip/hotspot/user", _print("/ip/hotspot/user"),
+            lambda row: str(row.get("name", "")).upper() == username.upper(),
+            "users",
+        )
+        _remove(
+            "/queue/simple", _print("/queue/simple"),
+            lambda row: row.get("name") in {f"queue_{username}", f"plan_{username}"},
+            "queues",
+        )
+        _remove(
+            "/ip/dhcp-server/lease", _print("/ip/dhcp-server/lease"),
+            lambda row: normalize_mac_address(row.get("mac-address", "")) == normalized,
+            "leases",
+        )
 
+        if router_info.get("lb_enabled") and client_ips:
+            lb_rows = _print("/ip/firewall/address-list")
+            _remove(
+                "/ip/firewall/address-list", lb_rows,
+                lambda row: (
+                    row.get("list") == "LB_PAID"
+                    and (
+                        row.get("address") in client_ips
+                        or f"PAID:{normalized}" in str(row.get("comment", "")).upper()
+                    )
+                ),
+                "lb_paid",
+            )
+
+        remaining: dict[str, int] = {}
+
+        def _verify(path: str, key: str, matches) -> None:
+            rows = _print(path)
+            if rows is None:
+                remaining[key] = -1
+                return
+            count = sum(1 for row in rows if matches(row))
+            if count:
+                remaining[key] = count
+
+        _verify(
+            "/ip/hotspot/ip-binding", "bindings",
+            lambda row: normalize_mac_address(row.get("mac-address", "")) == normalized,
+        )
+        _verify(
+            "/ip/hotspot/active", "sessions",
+            lambda row: (
+                normalize_mac_address(row.get("mac-address", "")) == normalized
+                or str(row.get("user", "")).upper() == username.upper()
+            ),
+        )
+        _verify(
+            "/ip/hotspot/user", "users",
+            lambda row: str(row.get("name", "")).upper() == username.upper(),
+        )
+        _verify(
+            "/queue/simple", "queues",
+            lambda row: row.get("name") in {f"queue_{username}", f"plan_{username}"},
+        )
+
+        # A connected phone immediately creates a new host row.  It is safe
+        # only when RouterOS explicitly says it is neither authorized nor
+        # bypassed; an absent flag is treated as unverifiable and fails closed.
+        def _host_still_authorized(row: dict) -> bool:
+            if normalize_mac_address(row.get("mac-address", "")) != normalized:
+                return False
+            authorized = str(row.get("authorized", "")).lower()
+            bypassed = str(row.get("bypassed", "")).lower()
+            return not (authorized in {"false", "no"} and bypassed in {"false", "no"})
+
+        _verify("/ip/hotspot/host", "authorized_hosts", _host_still_authorized)
+
+        if router_info.get("lb_enabled") and client_ips:
+            _verify(
+                "/ip/firewall/address-list", "lb_paid",
+                lambda row: (
+                    row.get("list") == "LB_PAID"
+                    and (
+                        row.get("address") in client_ips
+                        or f"PAID:{normalized}" in str(row.get("comment", "")).upper()
+                    )
+                ),
+            )
+
+        if remaining or command_errors:
+            return {
+                "error": "Old device revocation could not be verified",
+                "remaining": remaining,
+                "command_errors": command_errors,
+                "removed": removed,
+            }
         return {"success": True, "removed": removed}
     finally:
         api.disconnect()
+
+
+async def _cleanup_old_mac_with_retry(router_info: dict, old_mac: str) -> dict:
+    """Two bounded attempts; enough for a transient RouterOS miss, not a load spike."""
+    result: dict = {"error": "cleanup_not_attempted"}
+    for attempt in range(2):
+        try:
+            result = await asyncio.to_thread(
+                _cleanup_old_mac_from_router_sync, router_info, old_mac
+            )
+        except Exception as exc:
+            result = {"error": f"cleanup_crashed: {exc}"}
+            logger.warning(
+                "[RECONNECT] Old MAC cleanup attempt %s crashed: %s",
+                attempt + 1, exc,
+            )
+        if result.get("success"):
+            return result
+        if attempt == 0:
+            await asyncio.sleep(0.5)
+    return result
+
+
+async def _provision_reconnected_mac_if_current(
+    *,
+    customer_id: int,
+    router_id: int,
+    target_mac: str,
+    hotspot_payload: dict,
+    customer_name: str,
+    router_name: str,
+) -> None:
+    """Provision only if this MAC is still the customer's current device."""
+    from app.db import database as database_module
+    from app.services.hotspot_provisioning import provision_hotspot_customer
+
+    async with _reconnect_lock(customer_id):
+        async with database_module.async_session() as verify_db:
+            current = await verify_db.get(Customer, customer_id)
+            still_current = bool(
+                current
+                and current.router_id == router_id
+                and current.status == CustomerStatus.ACTIVE
+                and current.expiry
+                and current.expiry > datetime.utcnow()
+                and normalize_mac_address(current.mac_address or "") == target_mac
+            )
+            await verify_db.rollback()
+
+        if not still_current:
+            logger.info(
+                "[RECONNECT] Skipping stale provisioning for customer %s MAC %s",
+                customer_id, target_mac,
+            )
+            return
+
+        try:
+            result = await provision_hotspot_customer(
+                customer_id=customer_id,
+                router_id=router_id,
+                hotspot_payload=hotspot_payload,
+                action="self_service_reconnect",
+            )
+            if result.get("success"):
+                logger.info(
+                    "[RECONNECT] Customer %s (%s) provisioned on router %s",
+                    customer_id, customer_name, router_name,
+                )
+            else:
+                logger.error(
+                    "[RECONNECT] Background provisioning failed for customer %s: %s",
+                    customer_id, result.get("provisioning_error"),
+                )
+        except Exception as exc:
+            logger.error(
+                "[RECONNECT] Background provisioning error for customer %s: %s",
+                customer_id, exc,
+            )
 
 
 @router.post("/api/public/reconnect")
@@ -1257,57 +1463,92 @@ async def restore_customer_on_device(
     """Put a paying customer's plan on ``normalized_mac``.
 
     If the customer's recorded device is a different MAC (new phone, or a
-    randomized MAC), the plan moves to this device and the old MAC is removed
-    from the router after the response is sent.
+    randomized MAC), direct-API routers revoke and verify the old device before
+    the database moves the entitlement to the new one.
     """
-    now = datetime.utcnow()
+    customer_id = customer.id
     router_id = router_obj.id
 
-    if not customer.plan:
-        raise HTTPException(status_code=400, detail="Customer has no plan assigned")
+    # The lookup above opened a read transaction.  Release it before waiting
+    # for the per-customer lock or talking to RouterOS.
+    await db.commit()
 
-    if customer.plan.connection_type != ConnectionType.HOTSPOT:
-        db.add(ReconnectionAttempt(
-            phone=lookup_key, mac_address=normalized_mac,
-            router_id=router_id, customer_id=customer.id,
-            success=False, failure_reason="not_hotspot",
-            created_at=datetime.utcnow(),
-        ))
-        await db.commit()
-        raise HTTPException(
-            status_code=400,
-            detail="Reconnection is only available for WiFi/hotspot connections. "
-                   "PPPoE connections reconnect automatically.",
+    async with _reconnect_lock(customer_id):
+        current_stmt = (
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(Customer.id == customer_id)
+            .with_for_update()
         )
+        customer = (await db.execute(current_stmt)).scalar_one_or_none()
+        if not customer or customer.router_id != router_id:
+            await db.rollback()
+            raise HTTPException(status_code=404, detail="Active subscription not found")
 
-    old_mac = normalize_mac_address(customer.mac_address) if customer.mac_address else None
-    mac_changed = old_mac is not None and old_mac != normalized_mac
-    mac_is_new = old_mac is None
+        now = datetime.utcnow()
+        if (
+            customer.status != CustomerStatus.ACTIVE
+            or not customer.expiry
+            or customer.expiry <= now
+        ):
+            await db.rollback()
+            raise HTTPException(status_code=404, detail="Active subscription not found")
+        if not customer.plan:
+            await db.rollback()
+            raise HTTPException(status_code=400, detail="Customer has no plan assigned")
 
-    router_info = {
-        "ip": router_obj.ip_address,
-        "username": router_obj.username,
-        "password": router_obj.password,
-        "port": router_obj.port,
-        "name": router_obj.name,
-    }
-
-    # --- If MAC changed or was never set, update it in the DB ---
-    if mac_changed or mac_is_new:
-        conflict_stmt = select(Customer).where(
-            Customer.mac_address == normalized_mac,
-            Customer.user_id == router_obj.user_id,
-            Customer.id != customer.id,
-        )
-        conflict_result = await db.execute(conflict_stmt)
-        conflicting = conflict_result.scalar_one_or_none()
-
-        if conflicting and conflicting.status == CustomerStatus.ACTIVE and conflicting.expiry and conflicting.expiry > now:
+        if customer.plan.connection_type != ConnectionType.HOTSPOT:
             db.add(ReconnectionAttempt(
                 phone=lookup_key, mac_address=normalized_mac,
                 router_id=router_id, customer_id=customer.id,
+                success=False, failure_reason="not_hotspot",
+                created_at=now,
+            ))
+            await db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail="Reconnection is only available for WiFi/hotspot connections. "
+                       "PPPoE connections reconnect automatically.",
+            )
+
+        current_router = customer.router or router_obj
+        old_mac = normalize_mac_address(customer.mac_address) if customer.mac_address else None
+        mac_changed = old_mac is not None and old_mac != normalized_mac
+        mac_is_new = old_mac is None
+        auth_method = getattr(current_router, "auth_method", None)
+        use_radius = auth_method == RouterAuthMethod.RADIUS if auth_method else False
+
+        router_info = {
+            "ip": current_router.ip_address,
+            "username": current_router.username,
+            "password": current_router.password,
+            "port": current_router.port,
+            "name": current_router.name,
+            "lb_enabled": bool(getattr(current_router, "lb_enabled", False)),
+        }
+
+        async def _find_conflict() -> Customer | None:
+            result = await db.execute(
+                select(Customer).where(
+                    Customer.mac_address == normalized_mac,
+                    Customer.user_id == current_router.user_id,
+                    Customer.id != customer_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+        conflicting = await _find_conflict() if (mac_changed or mac_is_new) else None
+        if (
+            conflicting
+            and conflicting.status == CustomerStatus.ACTIVE
+            and conflicting.expiry
+            and conflicting.expiry > now
+        ):
+            db.add(ReconnectionAttempt(
+                phone=lookup_key, mac_address=normalized_mac,
+                router_id=router_id, customer_id=customer_id,
                 success=False, failure_reason="mac_conflict_active",
-                created_at=datetime.utcnow(),
+                created_at=now,
             ))
             await db.commit()
             raise HTTPException(
@@ -1315,121 +1556,117 @@ async def restore_customer_on_device(
                 detail="This device is currently registered to another active account",
             )
 
-        if conflicting:
-            conflicting.mac_address = None
+        if mac_changed and not use_radius:
+            # Keep the database pointing at the old device while revocation is
+            # attempted.  No pooled DB connection is held during router I/O.
+            await db.commit()
+            cleanup_result = await _cleanup_old_mac_with_retry(router_info, old_mac)
+            if not cleanup_result.get("success"):
+                logger.error(
+                    "[RECONNECT] Refusing customer %s move %s -> %s; cleanup failed: %s",
+                    customer_id, old_mac, normalized_mac, cleanup_result,
+                )
+                db.add(ReconnectionAttempt(
+                    phone=lookup_key, mac_address=normalized_mac,
+                    router_id=router_id, customer_id=customer_id,
+                    success=False, failure_reason="old_mac_cleanup_unverified",
+                    old_mac_address=old_mac, created_at=datetime.utcnow(),
+                ))
+                await db.commit()
+                raise HTTPException(
+                    status_code=503,
+                    detail="We could not safely move your active session. Please try again shortly.",
+                )
+
+            # Cross-worker compare-and-swap: another process may have moved the
+            # customer while this worker was talking to RouterOS.
+            customer = (await db.execute(current_stmt)).scalar_one_or_none()
+            actual_mac = (
+                normalize_mac_address(customer.mac_address)
+                if customer and customer.mac_address else None
+            )
+            if not customer or actual_mac != old_mac:
+                db.add(ReconnectionAttempt(
+                    phone=lookup_key, mac_address=normalized_mac,
+                    router_id=router_id, customer_id=customer_id,
+                    success=False, failure_reason="concurrent_device_move",
+                    old_mac_address=old_mac, created_at=datetime.utcnow(),
+                ))
+                await db.commit()
+                raise HTTPException(
+                    status_code=409,
+                    detail="This subscription was moved by another request. Please try again.",
+                )
+            current_router = customer.router or current_router
+            conflicting = await _find_conflict()
+
+        if mac_changed or mac_is_new:
+            if conflicting:
+                conflicting.mac_address = None
+                await db.flush()
+            customer.mac_address = normalized_mac
             await db.flush()
+            logger.info(
+                "[RECONNECT] Customer %s MAC updated: %s → %s",
+                customer_id, old_mac or "(none)", normalized_mac,
+            )
 
-        customer.mac_address = normalized_mac
-        await db.flush()
-        logger.info(
-            "[RECONNECT] Customer %s MAC updated: %s → %s",
-            customer.id, old_mac or "(none)", normalized_mac,
-        )
+        customer_name = customer.name
+        plan_name = customer.plan.name
+        expiry = customer.expiry
+        expiry_iso = expiry.isoformat()
+        router_name = current_router.name
 
-    # --- Provision (or re-provision) the current MAC on the router ---
-    auth_method = getattr(router_obj, "auth_method", None)
-    use_radius = auth_method == RouterAuthMethod.RADIUS if auth_method else False
-
-    if use_radius:
         db.add(ReconnectionAttempt(
             phone=lookup_key, mac_address=normalized_mac,
-            router_id=router_id, customer_id=customer.id,
-            success=True, old_mac_address=old_mac if (mac_changed or mac_is_new) else None,
+            router_id=router_id, customer_id=customer_id,
+            success=True,
+            old_mac_address=old_mac if (mac_changed or mac_is_new) else None,
             created_at=datetime.utcnow(),
         ))
+
+        if use_radius:
+            await db.commit()
+            remaining = expiry - now
+            return {
+                "success": True,
+                "message": "Your session has been restored. You should be connected shortly.",
+                "customer_name": customer_name,
+                "plan_name": plan_name,
+                "expires_at": expiry_iso,
+                "remaining_hours": round(remaining.total_seconds() / 3600, 1),
+            }
+
+        from app.services.hotspot_provisioning import build_hotspot_payload
+
+        hotspot_payload = build_hotspot_payload(
+            customer, customer.plan, current_router,
+            comment=f"Self-service reconnect for {customer_name} ({lookup_key})",
+        )
         await db.commit()
 
-        remaining = customer.expiry - now
+        # Response delivery comes first so kicking the captive-portal host for
+        # the new MAC cannot swallow the success response.
+        background_tasks.add_task(
+            _provision_reconnected_mac_if_current,
+            customer_id=customer_id,
+            router_id=router_id,
+            target_mac=normalized_mac,
+            hotspot_payload=hotspot_payload,
+            customer_name=customer_name,
+            router_name=router_name,
+        )
+
+        remaining = expiry - now
         return {
             "success": True,
-            "message": "Your session has been restored. You should be connected shortly.",
-            "customer_name": customer.name,
-            "plan_name": customer.plan.name,
-            "expires_at": customer.expiry.isoformat(),
+            "message": "You're back online! Your session has been restored.",
+            "customer_name": customer_name,
+            "plan_name": plan_name,
+            "expires_at": expiry_iso,
             "remaining_hours": round(remaining.total_seconds() / 3600, 1),
+            "mac_changed": mac_changed,
         }
-
-    from app.services.hotspot_provisioning import build_hotspot_payload, provision_hotspot_customer
-
-    hotspot_payload = build_hotspot_payload(
-        customer, customer.plan, router_obj,
-        comment=f"Self-service reconnect for {customer.name} ({lookup_key})",
-    )
-
-    # Capture values before the DB session closes
-    customer_id = customer.id
-    customer_name = customer.name
-    plan_name = customer.plan.name
-    expiry_iso = customer.expiry.isoformat()
-    router_name = router_obj.name
-
-    # Log the attempt and commit all DB changes (MAC update etc.) immediately
-    db.add(ReconnectionAttempt(
-        phone=lookup_key, mac_address=normalized_mac,
-        router_id=router_id, customer_id=customer_id,
-        success=True,
-        old_mac_address=old_mac if (mac_changed or mac_is_new) else None,
-        created_at=datetime.utcnow(),
-    ))
-    await db.commit()
-
-    # Fire provisioning in background — respond to user instantly
-    if mac_changed:
-        async def _background_cleanup_old_mac():
-            try:
-                cleanup_result = await asyncio.to_thread(
-                    _cleanup_old_mac_from_router_sync,
-                    router_info,
-                    old_mac,
-                )
-                if cleanup_result.get("error"):
-                    logger.warning(
-                        "[RECONNECT] Old MAC cleanup failed for customer %s: %s",
-                        customer_id,
-                        cleanup_result["error"],
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "[RECONNECT] Old MAC cleanup crashed for customer %s: %s",
-                    customer_id,
-                    exc,
-                )
-
-    async def _background_provision():
-        try:
-            result = await provision_hotspot_customer(
-                customer_id=customer_id,
-                router_id=router_id,
-                hotspot_payload=hotspot_payload,
-                action="self_service_reconnect",
-            )
-            if result.get("success"):
-                logger.info(
-                    "[RECONNECT] Customer %s (%s) provisioned on router %s",
-                    customer_id, customer_name, router_name,
-                )
-            else:
-                logger.error(
-                    "[RECONNECT] Background provisioning failed for customer %s: %s",
-                    customer_id, result.get("provisioning_error"),
-                )
-        except Exception as exc:
-            logger.error("[RECONNECT] Background provisioning error for customer %s: %s", customer_id, exc)
-
-    background_tasks.add_task(_background_provision)
-    if mac_changed:
-        background_tasks.add_task(_background_cleanup_old_mac)
-
-    remaining = customer.expiry - now
-    return {
-        "success": True,
-        "message": "You're back online! Your session has been restored.",
-        "customer_name": customer_name,
-        "plan_name": plan_name,
-        "expires_at": expiry_iso,
-        "remaining_hours": round(remaining.total_seconds() / 3600, 1),
-        "mac_changed": mac_changed,
-    }
 
 
 @router.get("/api/public/plans/{router_id}")

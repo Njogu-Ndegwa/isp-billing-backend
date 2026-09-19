@@ -56,6 +56,9 @@ def stub_provisioning(monkeypatch):
         calls.append((args, kwargs))
         return {"success": True}
 
+    async def fake_old_mac_cleanup(*_args, **_kwargs):
+        return {"success": True}
+
     original_create_task = asyncio.create_task
 
     def tracking_create_task(coro, *args, **kwargs):
@@ -66,6 +69,7 @@ def stub_provisioning(monkeypatch):
     for module in (device_pairing, voucher_service):
         monkeypatch.setattr(module, "log_provisioning_event", fake_log)
         monkeypatch.setattr(module, "provision_hotspot_customer", fake_provision)
+    monkeypatch.setattr(public_routes, "_cleanup_old_mac_with_retry", fake_old_mac_cleanup)
     monkeypatch.setattr(asyncio, "create_task", tracking_create_task)
 
     class Stub:
@@ -390,7 +394,11 @@ async def test_managing_devices_needs_a_valid_code(db):
         assert exc.value.status_code == 401
 
 
-async def test_phone_reconnect_never_takes_over_a_shared_device(db, stub_provisioning):
+async def test_phone_reconnect_never_takes_over_a_shared_device(db, stub_provisioning, monkeypatch):
+    async def cleanup_ok(*_args, **_kwargs):
+        return {"success": True}
+
+    monkeypatch.setattr(public_routes, "_cleanup_old_mac_with_retry", cleanup_ok)
     reseller, plan, router = await _setup(db, max_shared_users=2)
     owner = await _active_owner(db, reseller, plan, router)
     shared = await make_customer(

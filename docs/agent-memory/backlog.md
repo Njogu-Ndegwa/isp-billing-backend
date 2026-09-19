@@ -4,6 +4,13 @@ Project-level items that should survive across agent sessions.
 
 ## Reliability And Architecture
 
+### Historical Reconnect Router-State Cleanup
+
+- Status: planned
+- Problem: before the 2026-09-19 fail-closed reconnect fix, failed old-MAC cleanup left stale hotspot users, queues, hosts, or leases on affected routers. A 48-hour audit found 21 customers with explicit cleanup connection failures; reachable-router checks found no second bypass binding at audit time, but five of six still-active samples retained stale non-authorizing artifacts.
+- Why it matters: stale users and queues confuse diagnosis and could become authorization-bearing again if another repair path recreates matching state.
+- Proposed next step: from an operator workstation, run a rate-limited per-router audit against historical reconnect moves, re-check the customer's current DB MAC immediately before each removal, and delete only old-MAC artifacts. Do not fan out from the 1 GB production server.
+
 ### M-Pesa Callback Handler Atomic Completion Claim
 
 - Status: planned
