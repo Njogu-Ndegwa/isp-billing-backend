@@ -845,8 +845,13 @@ async def _complete_subscription_payment(payment_id: int):
     from app.db.database import async_session
 
     async with async_session() as db:
+        # Row lock: a Paystack webhook and the card reconciler may complete the
+        # same payment concurrently; the second waits here, then sees it's no
+        # longer pending, so a payment can never activate twice.
         payment = (await db.execute(
-            select(SubscriptionPayment).where(SubscriptionPayment.id == payment_id)
+            select(SubscriptionPayment)
+            .where(SubscriptionPayment.id == payment_id)
+            .with_for_update()
         )).scalar_one_or_none()
 
         if not payment or payment.status != SubscriptionPaymentStatus.PENDING:

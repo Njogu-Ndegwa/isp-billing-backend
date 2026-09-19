@@ -136,6 +136,7 @@ from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning
 from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
 from app.services.subscription import reconcile_pending_subscription_payments
+from app.services.card_payments import reconcile_pending_card_payments
 from app.services.mpesa_b2b import run_daily_payouts
 
 scheduler = AsyncIOScheduler()
@@ -2879,6 +2880,17 @@ async def startup_event():
         trigger=IntervalTrigger(seconds=90),
         id='reconcile_pending_subscription_payments',
         name='Reconcile pending subscription payments via STK Query',
+        replace_existing=True,
+        max_instances=1
+    )
+    # Card subscription payments: verified with Paystack when
+    # PAYSTACK_SECRET_KEY is set (no-op otherwise). Sequential, short DB
+    # sessions, never held across the Paystack call.
+    scheduler.add_job(
+        reconcile_pending_card_payments,
+        trigger=IntervalTrigger(minutes=3),
+        id='reconcile_pending_card_payments',
+        name='Verify pending card subscription payments with Paystack',
         replace_existing=True,
         max_instances=1
     )
