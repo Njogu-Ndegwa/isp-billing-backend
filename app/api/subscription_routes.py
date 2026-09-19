@@ -396,7 +396,7 @@ async def pay_subscription_by_card(
     browser redirect after checkout proves nothing.
     """
     from app.services.payafrica import (
-        SUPPORTED_CURRENCIES, PayAfricaAPIError, initialize_card_checkout,
+        SUPPORTED_CURRENCIES, PayAfricaAPIError, initialize_card_checkout_with_fallback,
     )
 
     user = await get_current_user(token, db)
@@ -444,7 +444,7 @@ async def pay_subscription_by_card(
 
     callback_url = settings.FRONTEND_BASE_URL.rstrip("/") + "/settings/subscription?card=returned"
     try:
-        checkout = await initialize_card_checkout(
+        checkout, used_callback = await initialize_card_checkout_with_fallback(
             amount=balance,
             currency=currency,
             customer_email=customer_email,
@@ -470,6 +470,9 @@ async def pay_subscription_by_card(
         "amount": balance,
         "currency": currency,
         "payment_url": checkout["payment_url"],
+        # False when PayAfrica wouldn't redirect back to us: the payer ends on
+        # PayAfrica's page and the payment is confirmed in the background.
+        "returns_to_dashboard": used_callback == callback_url,
         "reference": reference,
         "provider_reference": checkout["reference"],
     }
