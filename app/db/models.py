@@ -1760,6 +1760,13 @@ class PortalSettings(Base):
     # Comma-separated plan IDs to pin at top, e.g. "3,7"
     featured_plan_ids = Column(String(200), nullable=True)
     show_plan_speed = Column(Boolean, nullable=False, default=True, server_default="true")
+    # How the captive portal orders the packages it lists.
+    # default        - merchandised: bestseller/popular pinned, then price high->low (legacy)
+    # price_asc      - cheapest package first  ("smallest to largest")
+    # price_desc     - most expensive first, no pinning
+    # duration_asc   - shortest package first
+    # duration_desc  - longest package first
+    plan_sort_order = Column(String(20), nullable=False, default="default", server_default="default")
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

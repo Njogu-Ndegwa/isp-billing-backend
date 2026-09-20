@@ -14,7 +14,11 @@ from app.db.models import (
 )
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
-from app.services.plan_cache import get_plans_cached, select_portal_plans
+from app.services.plan_cache import (
+    get_plans_cached,
+    select_portal_plans,
+    sort_portal_plans,
+)
 from app.config import settings
 
 import logging
@@ -812,6 +816,15 @@ async def get_portal_data(
     ) if any(p.get("plan_type") == "regular" for p in all_plans_for_flags) else False
 
     portal_settings = portal_settings_result.scalar_one_or_none()
+
+    # Order the packages the way this reseller asked for. The portal applies the
+    # same order client-side; sorting here as well means any client that renders
+    # the array as-is (admin portal preview, an older cached script.js) still
+    # shows the reseller's chosen order.
+    plans = sort_portal_plans(
+        plans,
+        getattr(portal_settings, "plan_sort_order", None),
+    )
 
     return {
         "router": {
@@ -1690,9 +1703,18 @@ async def get_public_plans(
     all_plans = await get_plans_cached(
         db, router_obj.user_id, connection_type, include_hidden=True, router_id=router_obj.id
     )
-    return select_portal_plans(
+    plans = select_portal_plans(
         visible_plans, all_plans, bool(getattr(router_obj, "emergency_active", False))
     )
+
+    from app.db.models import PortalSettings
+
+    sort_order_result = await db.execute(
+        select(PortalSettings.plan_sort_order).where(
+            PortalSettings.user_id == router_obj.user_id
+        )
+    )
+    return sort_portal_plans(plans, sort_order_result.scalar_one_or_none())
 
 
 @router.get("/api/public/ads")

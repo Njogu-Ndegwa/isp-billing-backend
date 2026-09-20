@@ -121,6 +121,96 @@ def select_portal_plans(
     return [p for p in visible_plans if p.get("plan_type") != "emergency"]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Portal package ordering
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Values accepted by portal_settings.plan_sort_order. "default" is the legacy
+# merchandised order the portal has always used (featured/bestseller pinned,
+# then price high->low) and stays the default so nobody's portal re-orders
+# itself on deploy.
+VALID_PLAN_SORT_ORDERS = {
+    "default",
+    "price_asc",
+    "price_desc",
+    "duration_asc",
+    "duration_desc",
+}
+
+DEFAULT_PLAN_SORT_ORDER = "default"
+
+# Minutes per duration unit, for comparing "1 day" against "3 hours".
+_DURATION_UNIT_MINUTES = {
+    "MINUTES": 1,
+    "HOURS": 60,
+    "DAYS": 60 * 24,
+    "WEEKS": 60 * 24 * 7,
+    "MONTHS": 60 * 24 * 30,
+}
+
+
+def plan_duration_minutes(plan: Dict) -> float:
+    """Duration of a serialized plan in minutes, for ordering.
+
+    Unknown units fall back to 1 minute per unit rather than raising: a plan
+    with a strange unit should land somewhere sane, not break the portal.
+    """
+    try:
+        value = float(plan.get("duration_value") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    unit = str(plan.get("duration_unit") or "").upper()
+    return value * _DURATION_UNIT_MINUTES.get(unit, 1)
+
+
+# Special offers lead, then emergency plans, then everything else — the same
+# grouping the portal client applies in transformPlansData().
+_PLAN_TYPE_RANK = {"special_offer": 0, "emergency": 1}
+
+
+def _plan_type_rank(plan: Dict) -> int:
+    return _PLAN_TYPE_RANK.get(plan.get("plan_type") or "regular", 2)
+
+
+def _plan_price(plan: Dict) -> float:
+    try:
+        return float(plan.get("price") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def sort_portal_plans(plans: List[Dict], sort_order: Optional[str]) -> List[Dict]:
+    """Order the packages a captive portal lists, per the reseller's setting.
+
+    Returns a new list; the input is never mutated (it may be a cached object).
+    "default" is returned untouched so the portal keeps applying its own
+    merchandised order (featured pin, bestseller, popular, price high->low).
+
+    Ties break on plan id so the order is stable across requests — two packages
+    at the same price must not swap places between page loads.
+    """
+    order = (sort_order or DEFAULT_PLAN_SORT_ORDER).strip().lower()
+    if order not in VALID_PLAN_SORT_ORDERS or order == DEFAULT_PLAN_SORT_ORDER:
+        return list(plans)
+
+    key, reverse = {
+        "price_asc": (_plan_price, False),
+        "price_desc": (_plan_price, True),
+        "duration_asc": (plan_duration_minutes, False),
+        "duration_desc": (plan_duration_minutes, True),
+    }[order]
+
+    # id ascending on a tie in both directions: sort by id first, then by the
+    # real key with a stable sort, so reverse=True doesn't flip the tiebreak.
+    by_id = sorted(plans, key=lambda p: int(p.get("id") or 0))
+    ordered = sorted(by_id, key=key, reverse=reverse)
+
+    # Special offers and emergency plans lead, whatever the chosen order. The
+    # portal renders them as their own group under a notice card, so a payload
+    # that interleaves them would disagree with the page the customer sees.
+    return sorted(ordered, key=_plan_type_rank)
+
+
 def _serialize_plan(plan: Plan) -> Dict:
     """Convert Plan model to dict"""
     return {
