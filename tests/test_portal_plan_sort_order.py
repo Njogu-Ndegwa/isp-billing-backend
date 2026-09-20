@@ -19,7 +19,7 @@ pinned, then price high->low). A deploy must not re-order anybody's portal.
 import pytest  # noqa: F401  (pytest.ini asyncio_mode=auto)
 
 from app.api.public_routes import get_portal_data, get_public_plans
-from app.db.models import DurationUnit, PortalSettings
+from app.db.models import DurationUnit, PlanType, PortalSettings
 from app.services.plan_cache import (
     DEFAULT_PLAN_SORT_ORDER,
     VALID_PLAN_SORT_ORDERS,
@@ -143,6 +143,50 @@ def test_default_is_a_valid_choice():
 
 
 # ---------------------------------------------------------------------------
+# The invariant that matters most: sorting must never LOSE a package.
+#
+# An empty portal is a router that cannot take money. Re-ordering is cosmetic;
+# dropping a plan is an outage, so every order is checked against the input set.
+# ---------------------------------------------------------------------------
+
+def test_no_sort_order_ever_adds_drops_or_duplicates_a_package():
+    plans = [
+        _p(1, 100, 1, "DAYS"),
+        _p(2, 20, 3, "HOURS"),
+        _p(3, 50, 1, "WEEKS"),
+        _p(4, 20, 30, "MINUTES"),
+    ]
+    expected = sorted(p["id"] for p in plans)
+    for order in VALID_PLAN_SORT_ORDERS:
+        got = sort_portal_plans(plans, order)
+        assert sorted(p["id"] for p in got) == expected, order
+        assert len(got) == len(plans), order
+
+
+def test_a_plan_missing_price_or_duration_is_kept_not_dropped():
+    """Bad data must sort somewhere sane, never vanish from the grid."""
+    plans = [_p(1, 100), {"id": 2}, {"id": 3, "price": None, "duration_value": None}]
+    for order in VALID_PLAN_SORT_ORDERS:
+        assert sorted(p["id"] for p in sort_portal_plans(plans, order)) == [1, 2, 3], order
+
+
+def test_sorting_an_empty_list_stays_empty_instead_of_raising():
+    for order in VALID_PLAN_SORT_ORDERS:
+        assert sort_portal_plans([], order) == []
+
+
+def test_special_offers_lead_whatever_the_chosen_order():
+    """The portal renders them as their own group, so the payload must agree."""
+    plans = [
+        {**_p(1, 500), "plan_type": "regular"},
+        {**_p(2, 10), "plan_type": "special_offer"},
+        {**_p(3, 20), "plan_type": "regular"},
+    ]
+    assert [p["id"] for p in sort_portal_plans(plans, "price_desc")] == [2, 1, 3]
+    assert [p["id"] for p in sort_portal_plans(plans, "price_asc")] == [2, 3, 1]
+
+
+# ---------------------------------------------------------------------------
 # What the customer actually sees
 # ---------------------------------------------------------------------------
 
@@ -223,3 +267,58 @@ async def test_one_resellers_order_does_not_leak_into_anothers_portal(db):
     assert prices(asc_plans) == [10, 200]
     assert plain_settings["plan_sort_order"] == DEFAULT_PLAN_SORT_ORDER
     assert prices(client_order(plain_plans, DEFAULT_PLAN_SORT_ORDER)) == [200, 10]
+
+
+async def test_emergency_mode_still_renders_its_plans_under_a_custom_sort(db):
+    """The regression this contract file exists for, re-checked with sorting on.
+
+    Emergency plans are conventionally left is_hidden; the portal drops hidden
+    plans client-side. Sorting must not reintroduce an empty portal on exactly
+    the router having an outage.
+    """
+    reseller = await make_reseller(db)
+    site = await make_router(db, reseller, identity="sort-emergency", emergency_active=True)
+    await set_sort_order(db, reseller, "price_asc")
+    await make_plan(db, reseller, name="Daily", price=100, duration_value=1)
+    await make_plan(db, reseller, name="Rescue Big", price=30, duration_value=1,
+                    plan_type=PlanType.EMERGENCY, is_hidden=True)
+    await make_plan(db, reseller, name="Rescue Small", price=10, duration_value=1,
+                    plan_type=PlanType.EMERGENCY, is_hidden=True)
+
+    plans, _ = await portal_plans(db, site)
+    rendered = [p for p in plans if not p["is_hidden"]]
+
+    assert len(rendered) == 2, "emergency portal must not render empty"
+    assert prices(rendered) == [10, 30]
+
+
+async def test_a_sorted_portal_never_comes_back_empty(db):
+    """Whatever the setting, a router with sellable plans must list them."""
+    for order in sorted(VALID_PLAN_SORT_ORDERS):
+        reseller = await make_reseller(db)
+        site = await make_router(db, reseller, identity=f"nonempty-{order}")
+        await set_sort_order(db, reseller, order)
+        await make_plan(db, reseller, name="A", price=50, duration_value=1)
+        await make_plan(db, reseller, name="B", price=150, duration_value=7)
+
+        plans, _ = await portal_plans(db, site)
+
+        assert len(plans) == 2, f"{order} rendered {len(plans)} plans"
+
+
+async def test_a_legacy_row_with_a_null_sort_order_behaves_as_default(db):
+    """Belt and braces: the migration backfills 'default', but a NULL must be safe."""
+    reseller = await make_reseller(db)
+    site = await make_router(db, reseller, identity="sort-null")
+    settings = PortalSettings(user_id=reseller.id)
+    settings.plan_sort_order = None
+    db.add(settings)
+    await db.commit()
+    await make_plan(db, reseller, name="Weekly", price=200, duration_value=7)
+    await make_plan(db, reseller, name="Hourly", price=10, duration_value=1,
+                    duration_unit=DurationUnit.HOURS)
+
+    plans, portal_settings = await portal_plans(db, site)
+
+    assert portal_settings["plan_sort_order"] == DEFAULT_PLAN_SORT_ORDER
+    assert len(plans) == 2

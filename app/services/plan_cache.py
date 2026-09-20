@@ -163,6 +163,15 @@ def plan_duration_minutes(plan: Dict) -> float:
     return value * _DURATION_UNIT_MINUTES.get(unit, 1)
 
 
+# Special offers lead, then emergency plans, then everything else — the same
+# grouping the portal client applies in transformPlansData().
+_PLAN_TYPE_RANK = {"special_offer": 0, "emergency": 1}
+
+
+def _plan_type_rank(plan: Dict) -> int:
+    return _PLAN_TYPE_RANK.get(plan.get("plan_type") or "regular", 2)
+
+
 def _plan_price(plan: Dict) -> float:
     try:
         return float(plan.get("price") or 0)
@@ -194,7 +203,12 @@ def sort_portal_plans(plans: List[Dict], sort_order: Optional[str]) -> List[Dict
     # id ascending on a tie in both directions: sort by id first, then by the
     # real key with a stable sort, so reverse=True doesn't flip the tiebreak.
     by_id = sorted(plans, key=lambda p: int(p.get("id") or 0))
-    return sorted(by_id, key=key, reverse=reverse)
+    ordered = sorted(by_id, key=key, reverse=reverse)
+
+    # Special offers and emergency plans lead, whatever the chosen order. The
+    # portal renders them as their own group under a notice card, so a payload
+    # that interleaves them would disagree with the page the customer sees.
+    return sorted(ordered, key=_plan_type_rank)
 
 
 def _serialize_plan(plan: Plan) -> Dict:
