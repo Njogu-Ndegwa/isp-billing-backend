@@ -137,6 +137,9 @@ class Settings(BaseSettings):
 
     # Card payments for subscriptions (PayAfrica -> Paystack hosted checkout).
     PAYAFRICA_BASE_URL: str = "https://api.payafrica.org"
+    # Public base URL PayAfrica calls when a card payment succeeds. Must be a
+    # destination PayAfrica has registered; empty disables sending webhook_url.
+    PAYAFRICA_WEBHOOK_BASE_URL: str = "https://isp.bitwavetechnologies.net"
 
     # Just-in-time RouterOS operator access. This is the source allowed to
     # reach WinBox/SSH/WebFig when an admin opens remote access for a router.
