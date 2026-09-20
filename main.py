@@ -63,6 +63,7 @@ from app.api.shop_routes import router as shop_router
 from app.api.portal_routes import router as portal_router
 from app.api.messaging_routes import router as messaging_router
 from app.api.admin_messaging_routes import router as admin_messaging_router
+from app.api.messaging_provider_routes import router as messaging_provider_router
 from app.api.feedback_routes import router as feedback_router
 from app.api.admin_feedback_routes import router as admin_feedback_router
 from app.api.agent_board_routes import router as agent_board_router
@@ -109,6 +110,7 @@ app.include_router(shop_router)
 app.include_router(portal_router)
 app.include_router(messaging_router)
 app.include_router(admin_messaging_router)
+app.include_router(messaging_provider_router)
 app.include_router(feedback_router)
 app.include_router(admin_feedback_router)
 app.include_router(agent_board_router)
@@ -2084,13 +2086,17 @@ async def run_messaging_migrations():
         tables = await conn.run_sync(existing_tables)
 
         from app.db.models import (
+            MessagingProviderAccount,
             MessagingSettings, SmsCreditAccount, SmsCreditTransaction,
             CustomerExpirySmsSettings, SmsCreditOrder, MessageTemplate, SmsCampaign, SmsMessage,
             ResellerInboxMessage,
         )
         # Explicit startup create_all target: customer_expiry_sms_settings.
+        # messaging_provider_accounts must precede sms_messages: the latter
+        # carries a FK to it.
         targets = [
-            MessagingSettings, SmsCreditAccount, CustomerExpirySmsSettings, SmsCreditTransaction,
+            MessagingSettings, MessagingProviderAccount, SmsCreditAccount,
+            CustomerExpirySmsSettings, SmsCreditTransaction,
             SmsCreditOrder, MessageTemplate, SmsCampaign, SmsMessage,
             ResellerInboxMessage,
         ]
@@ -2129,6 +2135,28 @@ async def run_messaging_migrations():
         await conn.execute(text(
             "ALTER TABLE sms_messages "
             "ADD COLUMN IF NOT EXISTS category VARCHAR(40) NULL"
+        ))
+        # --- Per-tenant gateway accounts -------------------------------
+        # A reseller on their own SMS gateway gets a row in
+        # messaging_provider_accounts; user_id NULL is the platform default.
+        await conn.execute(text(
+            "ALTER TABLE sms_messages ADD COLUMN IF NOT EXISTS "
+            "provider_account_id INTEGER NULL "
+            "REFERENCES messaging_provider_accounts(id)"
+        ))
+        # Exactly one default per owner. Two partial indexes, because NULL
+        # user_id never collides in a plain unique constraint.
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_messaging_provider_default_per_user "
+            "ON messaging_provider_accounts(user_id) "
+            "WHERE is_default AND user_id IS NOT NULL"
+        ))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_messaging_provider_default_platform "
+            "ON messaging_provider_accounts((1)) "
+            "WHERE is_default AND user_id IS NULL"
         ))
         await conn.execute(text(
             "INSERT INTO messaging_settings (id, price_per_sms_kes, provider) "

@@ -57,6 +57,7 @@ from app.db.models import (
     User,
 )
 from app.services import sms_credits, sms_dispatch
+from app.services.messaging import accounts as provider_accounts
 from app.services.messaging import count_segments, resolve_sender_id
 from app.services.reseller_welcome import _resolve_sender_admin_id
 
@@ -192,7 +193,10 @@ async def _queue_alert_sms(db, owner: User, router: Router,
     )
     db.add(row)
     await db.flush()
-    return row.id, resolve_sender_id(settings_row.sender_id if settings_row else None)
+    sender_id = await provider_accounts.resolve_sender_id_for(
+        db, owner.id, settings_row.sender_id if settings_row else None
+    )
+    return row.id, sender_id
 
 
 async def _create_alert_messages(
@@ -228,8 +232,19 @@ async def deliver_alert_sms(sms_id: int, provider_sender_id: Optional[str]) -> N
     The dispatcher manages its own short sessions, so no DB connection is held
     across the provider call. Never raises.
     """
+    # The alert is billed to the router's owner, so it goes out on that
+    # reseller's own gateway when they have one configured.
+    owner_user_id = None
     try:
-        await sms_dispatch.dispatch_admin_sms_messages([sms_id], provider_sender_id)
+        async with database.async_session() as db:
+            row = await db.get(SmsMessage, sms_id)
+            owner_user_id = row.user_id if row is not None else None
+    except Exception:
+        logger.exception("Could not read owner for alert sms %s", sms_id)
+    try:
+        await sms_dispatch.dispatch_admin_sms_messages(
+            [sms_id], provider_sender_id, owner_user_id=owner_user_id
+        )
     except Exception:
         logger.exception("Alert SMS dispatch crashed for sms %s", sms_id)
     try:

@@ -4,7 +4,12 @@ import logging
 
 import httpx
 
-from app.services.messaging.base import MessagingProvider, SendResult
+from app.services.messaging.base import (
+    MessagingProvider,
+    ProviderField,
+    ProviderSpec,
+    SendResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,3 +65,20 @@ class AfricasTalkingProvider(MessagingProvider):
                                   status="no_response", error="no_response")
                        for n in recipients]
         return results
+
+
+SPEC = ProviderSpec(
+    name="africastalking",
+    label="Africa's Talking",
+    factory=AfricasTalkingProvider,
+    sender_id_hint="Registered alphanumeric sender ID, or blank for the shared pool",
+    docs_url="https://developers.africastalking.com/docs/sms/overview",
+    countries=["KE", "UG", "TZ", "RW", "NG", "MW"],
+    fields=[
+        ProviderField("username", "Username", required=True,
+                      help="'sandbox' for the test environment."),
+        ProviderField("api_key", "API key", secret=True, required=True),
+        ProviderField("base_url", "API base URL", required=True,
+                      default="https://api.africastalking.com"),
+    ],
+)

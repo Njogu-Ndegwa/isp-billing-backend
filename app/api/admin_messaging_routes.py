@@ -10,12 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.db.models import (
-    User, UserRole, MessagingSettings, SmsCreditOrder, SmsCreditTransaction,
-    ResellerInboxMessage, SmsMessage, SmsMessageKind, SmsMessageStatus,
+    User, UserRole, MessagingProviderAccount, MessagingSettings, SmsCreditOrder,
+    SmsCreditTransaction, ResellerInboxMessage, SmsMessage, SmsMessageKind,
+    SmsMessageStatus,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import sms_credits, sms_dispatch
-from app.services.messaging import count_segments, resolve_sender_id
+from app.services.messaging import accounts as provider_accounts
+from app.services.messaging import count_segments, registry, resolve_sender_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin-messaging"])
@@ -207,8 +209,9 @@ async def send_inbox(req: InboxSendIn, background: BackgroundTasks,
     # Resolve sender the same way the reseller send path does; SMS_SENDER_ID is
     # an operational override for provider migrations.
     settings_row = await db.get(MessagingSettings, 1)
-    sender_id = resolve_sender_id(
-        settings_row.sender_id if settings_row and settings_row.sender_id else None
+    sender_id = await provider_accounts.resolve_sender_id_for(
+        db, None,
+        settings_row.sender_id if settings_row and settings_row.sender_id else None,
     )
     await db.flush()
     sms_message_ids = [row.id for row in sms_rows]
