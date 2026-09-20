@@ -1913,6 +1913,12 @@ class MessagingSettings(Base):
     sender_id = Column(String(20), nullable=True)
     provider = Column(String(50), nullable=False, default="talksasa", server_default="talksasa")
     enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Whether resellers may configure their own SMS gateway from their portal.
+    # Off by default: a reseller on their own gateway is still charged portal
+    # SMS credits, so opening self-service is a commercial decision, not a
+    # technical one. Admins can always configure a gateway on their behalf.
+    allow_reseller_gateways = Column(Boolean, nullable=False, default=False,
+                                     server_default="false")
     message_retention_days = Column(Integer, nullable=False, default=60, server_default="60")
     bundles = Column(JSON, nullable=True)
     welcome_enabled = Column(Boolean, nullable=False, default=True, server_default="true")

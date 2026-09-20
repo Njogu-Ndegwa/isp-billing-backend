@@ -35,6 +35,7 @@ class SettingsIn(BaseModel):
     min_purchase_credits: Optional[int] = None
     sender_id: Optional[str] = None
     enabled: Optional[bool] = None
+    allow_reseller_gateways: Optional[bool] = None
     message_retention_days: Optional[int] = None
     bundles: Optional[list] = None
     welcome_enabled: Optional[bool] = None
@@ -59,6 +60,7 @@ async def get_settings(db: AsyncSession = Depends(get_db),
         "min_purchase_credits": s.min_purchase_credits,
         "sender_id": s.sender_id,
         "enabled": s.enabled,
+        "allow_reseller_gateways": s.allow_reseller_gateways,
         "message_retention_days": s.message_retention_days,
         "bundles": s.bundles or [],
         "welcome_enabled": cfg["enabled"],
@@ -84,6 +86,8 @@ async def update_settings(body: SettingsIn, db: AsyncSession = Depends(get_db),
         s.sender_id = body.sender_id or None
     if body.enabled is not None:
         s.enabled = body.enabled
+    if body.allow_reseller_gateways is not None:
+        s.allow_reseller_gateways = body.allow_reseller_gateways
     if body.message_retention_days is not None:
         s.message_retention_days = body.message_retention_days
     if body.bundles is not None:

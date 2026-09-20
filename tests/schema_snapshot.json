@@ -405,6 +405,7 @@
   "user_id"
  ],
  "messaging_settings": [
+  "allow_reseller_gateways",
   "bundles",
   "created_at",
   "enabled",

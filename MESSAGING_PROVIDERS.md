@@ -98,7 +98,13 @@ its own sender ID and is never overridden by it.
 
 ## Configuring a reseller's gateway
 
-All admin-only, under `/api/admin/messaging`:
+Two ways in: an admin sets it up for a reseller, or the reseller sets it up
+themselves from their own portal. Self-service is **off by default** — see
+[Who may add a gateway](#who-may-add-a-gateway).
+
+### Admin — any account, including the platform's own
+
+Under `/api/admin/messaging`:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -138,6 +144,56 @@ portal credits. Its outcome is stored on the row (`last_test_ok`,
 
 Omit `user_id` to configure the platform-wide account instead. Exactly one
 account per owner can be the default, enforced by two partial unique indexes.
+
+### Reseller — their own accounts only
+
+Under `/api/messaging`, same shapes minus `user_id` (the caller is always the
+owner):
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/providers` | providers they can choose from + whether self-service is on |
+| GET | `/provider-accounts` | their own gateways, and which one their sends use now |
+| POST | `/provider-accounts` | add one |
+| PUT | `/provider-accounts/{id}` | update one |
+| DELETE | `/provider-accounts/{id}` | deactivate one |
+| POST | `/provider-accounts/{id}/test` | test send |
+
+`GET /provider-accounts` also returns an `effective` block — the gateway,
+sender ID and source their messages actually go out on right now. A reseller
+who has configured nothing sees `source: "platform"` or `"env"`, which is how
+the portal can say "you are on the platform gateway" without guessing.
+
+Every reseller handler pins `user_id` to the caller and refuses any row it
+does not own. A request for another tenant's account id returns **404, not
+403**, so account ids cannot be probed. The platform account is invisible and
+uneditable from this path.
+
+Reads work even with self-service off, so a reseller can always see the
+gateway an admin configured for them. Only writes are gated.
+
+Deactivating their own gateway is safe: the next send falls back to the
+platform gateway, so a reseller can never lock themselves out of sending.
+
+### Who may add a gateway
+
+`MessagingSettings.allow_reseller_gateways` (admin settings endpoint,
+`allow_reseller_gateways`) controls reseller self-service. It defaults to
+**false**, and writes return 403 until an admin turns it on.
+
+It defaults off because of an open commercial question, not a technical one:
+
+> **A reseller sending on their own gateway is still charged portal SMS
+> credits.** Credits are reserved at queue time regardless of which gateway
+> carries the message. So a reseller who brings their own vendor currently
+> pays twice — their vendor, and the platform.
+
+That may be exactly right (the platform's margin is on the software, not the
+SMS) or exactly wrong (the credit price is priced as resale of platform SMS).
+It is a pricing decision, so this change does not touch billing. Whichever way
+it goes, the lever is in `app/api/messaging_routes.py` where `try_deduct`
+reserves credits — resolution already knows whether the sending account is the
+reseller's own (`resolved.source == "reseller"`).
 
 ### Credentials
 
@@ -197,9 +253,8 @@ reseller switches vendors.
 
 ## Not built yet
 
-* Reseller self-service. Today an admin configures a reseller's gateway for
-  them, which keeps credential handling on one path. Reseller-facing CRUD
-  would reuse `accounts.py` unchanged.
+* A decision on whether own-gateway sends should still cost portal credits —
+  see [Who may add a gateway](#who-may-add-a-gateway).
 * Delivery-report webhooks per provider. `SmsMessageStatus.DELIVERED` exists
   but nothing sets it; a `ProviderSpec` hook for inbound DLRs is the natural
   place.

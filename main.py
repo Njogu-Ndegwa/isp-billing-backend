@@ -2136,6 +2136,10 @@ async def run_messaging_migrations():
             "ALTER TABLE sms_messages "
             "ADD COLUMN IF NOT EXISTS category VARCHAR(40) NULL"
         ))
+        await conn.execute(text(
+            "ALTER TABLE messaging_settings ADD COLUMN IF NOT EXISTS "
+            "allow_reseller_gateways BOOLEAN NOT NULL DEFAULT false"
+        ))
         # --- Per-tenant gateway accounts -------------------------------
         # A reseller on their own SMS gateway gets a row in
         # messaging_provider_accounts; user_id NULL is the platform default.
