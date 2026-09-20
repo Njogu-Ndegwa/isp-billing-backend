@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.api import customer_routes
-from app.db.models import CustomerStatus
+from app.db.models import CustomerStatus, RouterAvailabilityCheck
 from app.services import mikrotik_background
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
@@ -70,6 +70,118 @@ async def test_cleanup_keeps_expired_customer_active_when_router_cleanup_fails(
 
     assert customer.status == CustomerStatus.ACTIVE
     assert cleanup_calls == [[customer.id]]
+
+
+async def test_cleanup_restores_recent_unreachable_router_backoff_after_restart(
+    db,
+    session_factory,
+    monkeypatch,
+):
+    _patch_cleanup_side_effects(monkeypatch, session_factory)
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    router = await make_router(db, reseller)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() - timedelta(minutes=10),
+        mac_address="BE:96:9D:22:1B:46",
+    )
+    failed_at = datetime.utcnow() - timedelta(minutes=5)
+    db.add(
+        RouterAvailabilityCheck(
+            router_id=router.id,
+            checked_at=failed_at,
+            is_online=False,
+            source="expired_cleanup",
+        )
+    )
+    await db.commit()
+
+    cleanup_calls = []
+
+    def fake_router_cleanup(_router_info, customers_data):
+        cleanup_calls.append([c["id"] for c in customers_data])
+        return {"removed": [], "failed": [], "connected": True}
+
+    monkeypatch.setattr(
+        mikrotik_background,
+        "_cleanup_single_router_hotspot_sync",
+        fake_router_cleanup,
+    )
+
+    await mikrotik_background.cleanup_expired_users_background()
+    await db.refresh(customer)
+
+    assert customer.status == CustomerStatus.ACTIVE
+    assert cleanup_calls == []
+    assert mikrotik_background._expiry_cleanup_unreachable_routers[router.id] == failed_at
+
+
+async def test_cleanup_does_not_restore_backoff_after_newer_online_sample(
+    db,
+    session_factory,
+    monkeypatch,
+):
+    _patch_cleanup_side_effects(monkeypatch, session_factory)
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    router = await make_router(db, reseller)
+    customer = await make_customer(
+        db,
+        reseller,
+        plan,
+        router,
+        status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() - timedelta(minutes=10),
+        mac_address="BE:96:9D:22:1B:47",
+    )
+    now = datetime.utcnow()
+    db.add_all(
+        [
+            RouterAvailabilityCheck(
+                router_id=router.id,
+                checked_at=now - timedelta(minutes=5),
+                is_online=False,
+                source="expired_cleanup",
+            ),
+            RouterAvailabilityCheck(
+                router_id=router.id,
+                checked_at=now - timedelta(minutes=1),
+                is_online=True,
+                source="bandwidth_snapshot",
+            ),
+        ]
+    )
+    await db.commit()
+
+    cleanup_calls = []
+
+    def fake_router_cleanup(_router_info, customers_data):
+        cleanup_calls.append([c["id"] for c in customers_data])
+        return {
+            "removed": [{"id": c["id"], "details": {}} for c in customers_data],
+            "failed": [],
+            "connected": True,
+        }
+
+    monkeypatch.setattr(
+        mikrotik_background,
+        "_cleanup_single_router_hotspot_sync",
+        fake_router_cleanup,
+    )
+
+    await mikrotik_background.cleanup_expired_users_background()
+    await db.refresh(customer)
+
+    assert customer.status == CustomerStatus.INACTIVE
+    assert cleanup_calls == [[customer.id]]
+    assert router.id not in mikrotik_background._expiry_cleanup_unreachable_routers
 
 
 async def test_cleanup_marks_customer_inactive_after_router_cleanup_succeeds(
