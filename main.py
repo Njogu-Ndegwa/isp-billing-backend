@@ -1799,6 +1799,15 @@ async def run_portal_settings_migrations():
             EXCEPTION WHEN duplicate_column THEN NULL;
             END $$
         """))
+        # Portal package ordering. Existing rows keep the legacy merchandised
+        # order ('default') so no reseller's portal re-orders itself on deploy.
+        await conn.execute(sa_text("""
+            DO $$ BEGIN
+                ALTER TABLE portal_settings
+                    ADD COLUMN plan_sort_order VARCHAR(20) NOT NULL DEFAULT 'default';
+            EXCEPTION WHEN duplicate_column THEN NULL;
+            END $$
+        """))
     logger.info("Portal settings table ready")
 
 

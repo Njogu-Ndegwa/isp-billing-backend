@@ -65,13 +65,15 @@ Returns the reseller's current settings, plus lists of all valid values for each
     "portal_language": "en",
     "plans_section_title": null,
     "featured_plan_ids": null,
+    "plan_sort_order": "default",
     "created_at": "2026-05-05T17:00:00",
     "updated_at": "2026-05-05T17:00:00"
   },
   "available_themes": ["emerald_green", "midnight_purple", "ocean_blue", "rose_gold", "slate_gray", "sunset_orange"],
   "available_header_styles": ["compact", "hero", "minimal", "standard"],
   "available_languages": ["en", "fr", "sw"],
-  "available_announcement_types": ["info", "success", "warning"]
+  "available_announcement_types": ["info", "success", "warning"],
+  "available_plan_sort_orders": ["default", "duration_asc", "duration_desc", "price_asc", "price_desc"]
 }
 ```
 
@@ -190,6 +192,7 @@ Wipes all customizations and recreates the row with system defaults. Useful as a
 | `portal_language` | string | `en` | Portal language: `en`, `sw` (Swahili), `fr`. |
 | `plans_section_title` | string | null | Heading above the plans grid. Defaults to "Choose Your Plan". |
 | `featured_plan_ids` | string | null | Comma-separated plan IDs to pin at the top, e.g. `"3,7"`. |
+| `plan_sort_order` | string | `default` | Order the portal lists packages in. See [Plan Sort Orders](#plan-sort-orders). |
 
 ---
 
@@ -205,6 +208,31 @@ Wipes all customizations and recreates the row with system defaults. Useful as a
 | `midnight_purple` | Dark purple — bold, premium |
 | `rose_gold` | Pink / rose — friendly, approachable |
 | `slate_gray` | Neutral gray — minimal, clean |
+
+### Plan Sort Orders
+
+Controls the order the captive portal lists hotspot packages in. Applied by the
+API (`GET /api/public/portal/{identity}` and `GET /api/public/plans/{router_id}`
+return the plans already ordered) and again by the portal client, which re-sorts
+after its own filtering.
+
+| Value | Description |
+|---|---|
+| `default` | Legacy merchandised order: bestseller and best-value plans pinned, then price high → low. What every reseller had before this setting existed. |
+| `price_asc` | Cheapest package first — "smallest package to the largest". |
+| `price_desc` | Most expensive first, with no bestseller pinning. |
+| `duration_asc` | Shortest package first. Compared in real time, so 180 minutes sorts below 1 day. |
+| `duration_desc` | Longest package first. |
+
+Two things sit outside the chosen order, by design:
+
+- **Special offers and emergency plans always lead** the grid — they are rendered
+  under their own notice card.
+- **`featured_plan_ids` still pins** those plans to the top. It is an explicit
+  per-plan choice; clear it if you want a strict price or duration order.
+
+An unrecognised value is treated as `default` rather than rejected at render
+time, so a bad cached value can never leave a portal with no packages on it.
 
 ### Header Styles
 

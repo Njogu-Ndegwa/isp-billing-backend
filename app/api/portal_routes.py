@@ -10,6 +10,7 @@ from app.db.models import PortalSettings, Router, User
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.router_helpers import get_router_by_id
+from app.services.plan_cache import DEFAULT_PLAN_SORT_ORDER, VALID_PLAN_SORT_ORDERS
 
 import logging
 
@@ -34,6 +35,9 @@ VALID_THEMES = {
 VALID_HEADER_STYLES = {"standard", "minimal", "hero", "compact"}
 VALID_LANGUAGES = {"en", "sw", "fr"}
 VALID_ANNOUNCEMENT_TYPES = {"info", "warning", "success"}
+
+# VALID_PLAN_SORT_ORDERS is imported from app.services.plan_cache — the public
+# portal endpoint sorts with the same table, so there is one source of truth.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +79,7 @@ class PortalSettingsUpdate(BaseModel):
     plans_section_title: Optional[str] = None
     featured_plan_ids: Optional[str] = None
     show_plan_speed: Optional[bool] = None
+    plan_sort_order: Optional[str] = None
 
     @field_validator("color_theme")
     @classmethod
@@ -102,6 +107,13 @@ class PortalSettingsUpdate(BaseModel):
     def validate_announcement_type(cls, v):
         if v is not None and v not in VALID_ANNOUNCEMENT_TYPES:
             raise ValueError(f"announcement_type must be one of: {', '.join(sorted(VALID_ANNOUNCEMENT_TYPES))}")
+        return v
+
+    @field_validator("plan_sort_order")
+    @classmethod
+    def validate_plan_sort_order(cls, v):
+        if v is not None and v not in VALID_PLAN_SORT_ORDERS:
+            raise ValueError(f"plan_sort_order must be one of: {', '.join(sorted(VALID_PLAN_SORT_ORDERS))}")
         return v
 
 
@@ -147,6 +159,7 @@ def _settings_to_dict(s: PortalSettings) -> dict:
         "plans_section_title": s.plans_section_title,
         "featured_plan_ids": s.featured_plan_ids,
         "show_plan_speed": s.show_plan_speed,
+        "plan_sort_order": s.plan_sort_order or DEFAULT_PLAN_SORT_ORDER,
         # Timestamps
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
@@ -188,6 +201,7 @@ async def get_portal_settings(
         "available_header_styles": sorted(VALID_HEADER_STYLES),
         "available_languages": sorted(VALID_LANGUAGES),
         "available_announcement_types": sorted(VALID_ANNOUNCEMENT_TYPES),
+        "available_plan_sort_orders": sorted(VALID_PLAN_SORT_ORDERS),
     }
 
 
@@ -214,7 +228,7 @@ async def update_portal_settings(
         "show_social_links", "facebook_url", "whatsapp_group_url",
         "instagram_url", "show_announcement", "announcement_type",
         "announcement_text", "portal_language", "plans_section_title",
-        "featured_plan_ids", "show_plan_speed",
+        "featured_plan_ids", "show_plan_speed", "plan_sort_order",
     ]
 
     changed = []
@@ -350,6 +364,7 @@ def _build_public_response(settings: Optional[PortalSettings], reseller: Optiona
             "plans_section_title": None,
             "featured_plan_ids": None,
             "show_plan_speed": True,
+            "plan_sort_order": DEFAULT_PLAN_SORT_ORDER,
         }
 
     return {
@@ -377,4 +392,5 @@ def _build_public_response(settings: Optional[PortalSettings], reseller: Optiona
         "plans_section_title": settings.plans_section_title,
         "featured_plan_ids": settings.featured_plan_ids,
         "show_plan_speed": settings.show_plan_speed,
+        "plan_sort_order": settings.plan_sort_order or DEFAULT_PLAN_SORT_ORDER,
     }
