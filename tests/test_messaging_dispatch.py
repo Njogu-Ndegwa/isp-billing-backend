@@ -7,8 +7,24 @@ from app.db.models import (
     SmsMessage, SmsMessageStatus, SmsMessageKind,
 )
 from app.services import sms_dispatch, sms_credits
+from app.services.messaging.accounts import ResolvedProvider
 from app.services.messaging.base import SendResult
 from tests.factories import make_reseller, make_plan, make_customer, make_sms_account
+
+
+def _use_provider(monkeypatch, provider, *, sender_id="BRAND", account_id=None,
+                  source="env"):
+    """Pin dispatch to one provider, bypassing account resolution."""
+    async def _resolve(db, user_id, *, configured_sender_id=None):
+        return ResolvedProvider(
+            provider=provider,
+            sender_id=configured_sender_id or sender_id,
+            account_id=account_id,
+            source=source,
+        )
+
+    monkeypatch.setattr(sms_dispatch.provider_accounts, "resolve", _resolve)
+
 
 
 @pytest.mark.asyncio
@@ -90,7 +106,7 @@ async def test_dispatch_marks_sent_and_refunds_failures(db, session_factory, mon
                            status="Failed", error="Failed"),
             ]
 
-    monkeypatch.setattr(sms_dispatch, "get_provider", lambda: _FakeProvider())
+    _use_provider(monkeypatch, _FakeProvider())
     monkeypatch.setattr(sms_dispatch, "async_session", session_factory)
 
     await sms_dispatch.dispatch_campaign(camp_id)
@@ -130,7 +146,7 @@ async def test_dispatch_all_success_marks_completed(db, session_factory, monkeyp
             return [SendResult(recipient="254700000001", success=True,
                                provider_message_id="X1", status="Success")]
 
-    monkeypatch.setattr(sms_dispatch, "get_provider", lambda: _FakeProvider())
+    _use_provider(monkeypatch, _FakeProvider())
     monkeypatch.setattr(sms_dispatch, "async_session", session_factory)
     await sms_dispatch.dispatch_campaign(camp_id)
 
@@ -190,7 +206,7 @@ async def test_dispatch_sends_each_personalized_message_body(
                 )
             ]
 
-    monkeypatch.setattr(sms_dispatch, "get_provider", lambda: _FakeProvider())
+    _use_provider(monkeypatch, _FakeProvider())
     monkeypatch.setattr(sms_dispatch, "async_session", session_factory)
 
     await sms_dispatch.dispatch_campaign(camp_id)
@@ -235,7 +251,7 @@ async def test_dispatch_admin_sms_messages_updates_per_recipient_status(
                            status="Rejected", error="Rejected"),
             ]
 
-    monkeypatch.setattr(sms_dispatch, "get_provider", lambda: _FakeProvider())
+    _use_provider(monkeypatch, _FakeProvider())
     monkeypatch.setattr(sms_dispatch, "async_session", session_factory)
 
     await sms_dispatch.dispatch_admin_sms_messages(ids, "BRAND")

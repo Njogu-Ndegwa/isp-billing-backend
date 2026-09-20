@@ -389,7 +389,23 @@
   "updated_at",
   "user_id"
  ],
+ "messaging_provider_accounts": [
+  "created_at",
+  "credentials",
+  "id",
+  "is_active",
+  "is_default",
+  "label",
+  "last_test_at",
+  "last_test_error",
+  "last_test_ok",
+  "provider",
+  "sender_id",
+  "updated_at",
+  "user_id"
+ ],
  "messaging_settings": [
+  "allow_reseller_gateways",
   "bundles",
   "created_at",
   "enabled",
@@ -875,6 +891,7 @@
   "id",
   "kind",
   "provider",
+  "provider_account_id",
   "provider_message_id",
   "recipient_phone",
   "segments",

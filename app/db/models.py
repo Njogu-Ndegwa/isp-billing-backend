@@ -1913,12 +1913,55 @@ class MessagingSettings(Base):
     sender_id = Column(String(20), nullable=True)
     provider = Column(String(50), nullable=False, default="talksasa", server_default="talksasa")
     enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Whether resellers may configure their own SMS gateway from their portal.
+    # Off by default: a reseller on their own gateway is still charged portal
+    # SMS credits, so opening self-service is a commercial decision, not a
+    # technical one. Admins can always configure a gateway on their behalf.
+    allow_reseller_gateways = Column(Boolean, nullable=False, default=False,
+                                     server_default="false")
     message_retention_days = Column(Integer, nullable=False, default=60, server_default="60")
     bundles = Column(JSON, nullable=True)
     welcome_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     welcome_subject = Column(String(200), nullable=True)
     welcome_message_body = Column(String(2000), nullable=True)
     welcome_support_phone = Column(String(20), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MessagingProviderAccount(Base):
+    """An SMS gateway account, owned by one reseller or by the platform.
+
+    Resellers increasingly bring their own gateway — a different vendor from
+    the platform default, on their own contract and sender ID. One row is one
+    set of gateway credentials.
+
+    user_id NULL marks a platform-wide account: the fallback used by any
+    reseller who has not configured their own. Exactly one account per owner
+    may be the default, enforced by two partial unique indexes (see the
+    startup migration in main.py) because NULL user_id does not collide in a
+    plain unique constraint.
+
+    `credentials` is a JSON object keyed by the provider's declared
+    ProviderField keys. Fields the provider marks `secret=True` are stored
+    Fernet-encrypted and never returned in plaintext by the API. Keeping
+    credentials in JSON rather than one column per vendor is deliberate: it is
+    what lets a new provider ship as a single module with no migration.
+    """
+
+    __tablename__ = "messaging_provider_accounts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    provider = Column(String(50), nullable=False)
+    label = Column(String(100), nullable=False)
+    sender_id = Column(String(20), nullable=True)
+    credentials = Column(JSON, nullable=False, default=dict)
+    is_default = Column(Boolean, nullable=False, default=True, server_default="true")
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    last_test_at = Column(DateTime, nullable=True)
+    last_test_ok = Column(Boolean, nullable=True)
+    last_test_error = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -2027,6 +2070,12 @@ class SmsMessage(Base):
     kind = Column(Enum(SmsMessageKind, name="smsmessagekind",
                        values_callable=lambda e: [x.value for x in e]), nullable=False)
     provider = Column(String(50), nullable=True)
+    # Which gateway account actually carried this message. Kept alongside
+    # `provider` so a reseller's billing dispute can be traced to one set of
+    # credentials even after they switch vendors.
+    provider_account_id = Column(
+        Integer, ForeignKey("messaging_provider_accounts.id"), nullable=True
+    )
     provider_message_id = Column(String(128), nullable=True)
     status = Column(Enum(SmsMessageStatus, name="smsmessagestatus",
                          values_callable=lambda e: [x.value for x in e]),

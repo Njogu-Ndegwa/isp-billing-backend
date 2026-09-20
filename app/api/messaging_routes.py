@@ -19,6 +19,7 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import customer_expiry_notifications, sms_credits, sms_dispatch
+from app.services.messaging import accounts as provider_accounts
 from app.services.messaging import count_segments, resolve_sender_id
 from app.services.mpesa import initiate_stk_push_direct
 
@@ -330,7 +331,12 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
             "shortfall": total - acct.balance,
         })
 
-    sender_id = resolve_sender_id(s.sender_id)
+    # Stamp the sender ID of the gateway that will actually carry this
+    # campaign — a reseller on their own gateway has their own approved
+    # sender ID, and the platform's would be rejected by it.
+    sender_id = await provider_accounts.resolve_sender_id_for(
+        db, user.id, s.sender_id
+    )
     camp = SmsCampaign(user_id=user.id, body=req.body, recipient_count=len(recips),
                        segments_per_message=segments, total_credits=total,
                        sender_id=sender_id, status=SmsCampaignStatus.QUEUED)

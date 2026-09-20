@@ -21,7 +21,7 @@ from app.db.models import (
     MessagingSettings,
 )
 from app.services import sms_credits
-from app.services.messaging import default_sender_id, get_provider
+from app.services.messaging import accounts as provider_accounts
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,22 @@ async def dispatch_campaign(campaign_id: int) -> None:
             .where(SmsMessage.campaign_id == campaign_id,
                    SmsMessage.status == SmsMessageStatus.QUEUED)
         )).all()
-        sender_id = camp.sender_id or default_sender_id()
         user_id = camp.user_id
+        # Resolve the reseller's gateway here, while a session is already
+        # open: resolution is DB + CPU only, so nothing is held across the
+        # provider calls below.
+        resolved = None
+        resolve_error = None
+        try:
+            resolved = await provider_accounts.resolve(
+                db, user_id, configured_sender_id=camp.sender_id
+            )
+        except Exception as exc:
+            resolve_error = str(exc)[:255]
+            logger.error(
+                "SMS campaign %s has no usable provider: %s", campaign_id, exc
+            )
+        sender_id = camp.sender_id or (resolved.sender_id if resolved else "")
         await db.commit()
     # --- DB session closed; no connection held from here ---
 
@@ -98,7 +112,20 @@ async def dispatch_campaign(campaign_id: int) -> None:
         await _finalize(campaign_id)
         return
 
-    provider = get_provider()
+    if resolved is None:
+        # No gateway is configured or its credentials will not load. Fail the
+        # messages and refund rather than leaving the campaign stuck SENDING.
+        await _fail_all(campaign_id, user_id,
+                        resolve_error or "no_provider_configured")
+        await _finalize(campaign_id)
+        return
+
+    provider = resolved.provider
+    account_id = resolved.account_id
+    logger.info(
+        "SMS campaign %s dispatching via provider=%s source=%s account=%s",
+        campaign_id, provider.name, resolved.source, account_id,
+    )
     chunk_size = settings.SMS_DISPATCH_CHUNK_SIZE
 
     messages_by_body: dict[str, list] = {}
@@ -131,10 +158,13 @@ async def dispatch_campaign(campaign_id: int) -> None:
                         row.status = SmsMessageStatus.SENT
                         row.provider_message_id = res.provider_message_id
                         row.provider = provider.name
+                        row.provider_account_id = account_id
                         row.error = None
                         sent_count += 1
                     else:
                         row.status = SmsMessageStatus.FAILED
+                        row.provider = provider.name
+                        row.provider_account_id = account_id
                         row.error = (res.error if res else "no_response")[:255]
                         failed_credits += row.credits_charged
                         failed_count += 1
@@ -159,6 +189,28 @@ async def dispatch_campaign(campaign_id: int) -> None:
                 # --- DB session closed ---
 
     await _finalize(campaign_id)
+
+
+async def _fail_all(campaign_id: int, user_id: int, error: str) -> None:
+    """Fail every queued message of a campaign and refund its credits."""
+    async with async_session() as db:
+        rows = (await db.execute(
+            select(SmsMessage).where(SmsMessage.campaign_id == campaign_id,
+                                     SmsMessage.status == SmsMessageStatus.QUEUED)
+        )).scalars().all()
+        refund = 0
+        for row in rows:
+            row.status = SmsMessageStatus.FAILED
+            row.error = error[:255]
+            refund += row.credits_charged
+        if refund:
+            await sms_credits.refund(db, user_id, refund,
+                                     reference=f"campaign:{campaign_id}",
+                                     note="no usable SMS provider")
+            camp = await db.get(SmsCampaign, campaign_id)
+            if camp is not None:
+                camp.refunded_credits += refund
+        await db.commit()
 
 
 async def _finalize(campaign_id: int) -> None:
@@ -189,12 +241,21 @@ async def _finalize(campaign_id: int) -> None:
         )
 
 
-async def dispatch_admin_sms_messages(message_ids: list[int], sender_id: str) -> None:
+async def dispatch_admin_sms_messages(
+    message_ids: list[int],
+    sender_id: str,
+    owner_user_id: int | None = None,
+) -> None:
     """Send queued admin->reseller SMS rows and persist provider outcomes.
 
     The rows are created and committed by the request handler first. This worker
     owns its own short DB sessions and never holds a DB connection while calling
     the SMS provider.
+
+    `owner_user_id` names the reseller whose gateway and credits this send
+    belongs to — used for sends billed to a reseller, such as router status
+    alerts. Leave it None for platform-originated sends (admin broadcasts,
+    reseller welcome messages), which go out on the platform gateway.
     """
     if not message_ids:
         return
@@ -212,13 +273,34 @@ async def dispatch_admin_sms_messages(message_ids: list[int], sender_id: str) ->
                 SmsMessage.status == SmsMessageStatus.QUEUED,
             )
         )).all()
+        resolved = None
+        resolve_error = None
+        try:
+            resolved = await provider_accounts.resolve(
+                db, owner_user_id, configured_sender_id=sender_id
+            )
+        except Exception as exc:
+            resolve_error = str(exc)[:255]
+            logger.error("Admin SMS dispatch has no usable provider: %s", exc)
         await db.commit()
     # --- DB session closed; provider I/O starts below ---
 
     if not rows:
         return
 
-    provider = get_provider()
+    if resolved is None:
+        async with async_session() as db:
+            for row_id in [r.id for r in rows]:
+                row = await db.get(SmsMessage, row_id)
+                if row is not None and row.status == SmsMessageStatus.QUEUED:
+                    row.status = SmsMessageStatus.FAILED
+                    row.error = (resolve_error or "no_provider_configured")[:255]
+            await db.commit()
+        return
+
+    provider = resolved.provider
+    account_id = resolved.account_id
+    sender_id = sender_id or resolved.sender_id
     chunk_size = settings.SMS_DISPATCH_CHUNK_SIZE
     total_sent = 0
     total_failed = 0
@@ -256,11 +338,13 @@ async def dispatch_admin_sms_messages(message_ids: list[int], sender_id: str) ->
                         row.status = SmsMessageStatus.SENT
                         row.provider_message_id = res.provider_message_id
                         row.provider = provider.name
+                        row.provider_account_id = account_id
                         row.error = None
                         sent_count += 1
                     else:
                         row.status = SmsMessageStatus.FAILED
                         row.provider = provider.name
+                        row.provider_account_id = account_id
                         row.error = ((res.error if res else provider_error) or "no_response")[:255]
                         failed_count += 1
                 await db.commit()

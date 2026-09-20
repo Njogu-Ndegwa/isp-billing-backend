@@ -5,7 +5,12 @@ from typing import Any
 
 import httpx
 
-from app.services.messaging.base import MessagingProvider, SendResult
+from app.services.messaging.base import (
+    MessagingProvider,
+    ProviderField,
+    ProviderSpec,
+    SendResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -285,3 +290,18 @@ class TalksasaProvider(MessagingProvider):
         if len(digits) == 9 and digits[0] in {"1", "7"}:
             return "254" + digits
         return digits
+
+
+SPEC = ProviderSpec(
+    name="talksasa",
+    label="TalkSASA",
+    factory=TalksasaProvider,
+    sender_id_hint="Approved alphanumeric sender ID, e.g. TALKSASA",
+    docs_url="https://bulksms.talksasa.com/developers",
+    countries=["KE"],
+    fields=[
+        ProviderField("api_token", "API token", secret=True, required=True),
+        ProviderField("base_url", "API base URL", required=True,
+                      default="https://bulksms.talksasa.com/api/v3"),
+    ],
+)

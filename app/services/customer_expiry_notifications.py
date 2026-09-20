@@ -33,6 +33,7 @@ from app.db.models import (
     User,
 )
 from app.services import sms_credits, sms_dispatch
+from app.services.messaging import accounts as provider_accounts
 from app.services.messaging import count_segments, resolve_sender_id
 
 logger = logging.getLogger(__name__)
@@ -131,8 +132,8 @@ async def _create_campaign(
     message_segments = [count_segments(recipient[3]) for recipient in recipients]
     segments = max(message_segments)
     total_credits = sum(message_segments)
-    sender_id = resolve_sender_id(
-        settings_row.sender_id if settings_row else None
+    sender_id = await provider_accounts.resolve_sender_id_for(
+        db, reseller_id, settings_row.sender_id if settings_row else None
     )
 
     campaign = SmsCampaign(
