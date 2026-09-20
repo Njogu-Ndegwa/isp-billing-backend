@@ -44,6 +44,7 @@ import secrets
 
 import httpx
 
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -398,6 +399,7 @@ async def pay_subscription_by_card(
     from app.services.payafrica import (
         SUPPORTED_CURRENCIES, PayAfricaAPIError, initialize_card_checkout_with_fallback,
     )
+    from app.services.payafrica_webhook import webhook_url_for
 
     user = await get_current_user(token, db)
     if user.role != UserRole.RESELLER:
@@ -443,13 +445,17 @@ async def pay_subscription_by_card(
     await db.commit()
 
     callback_url = settings.FRONTEND_BASE_URL.rstrip("/") + "/settings/subscription?card=returned"
+    # PayAfrica calls this when the payment succeeds (like the M-Pesa
+    # callback). It is dropped automatically if PayAfrica hasn't registered it.
+    webhook_url = webhook_url_for(payment_id)
     try:
-        checkout, used_callback = await initialize_card_checkout_with_fallback(
+        checkout, used_callback, used_webhook = await initialize_card_checkout_with_fallback(
             amount=balance,
             currency=currency,
             customer_email=customer_email,
             reference=reference,
             callback_url=callback_url,
+            webhook_url=webhook_url,
         )
     except (PayAfricaAPIError, ValueError, httpx.HTTPError) as e:
         failed = await db.get(SubscriptionPayment, payment_id)
@@ -473,9 +479,100 @@ async def pay_subscription_by_card(
         # False when PayAfrica wouldn't redirect back to us: the payer ends on
         # PayAfrica's page and the payment is confirmed in the background.
         "returns_to_dashboard": used_callback == callback_url,
+        # True when PayAfrica accepted our webhook: the payment then confirms
+        # itself instead of waiting for an admin.
+        "auto_confirm": bool(used_webhook),
         "reference": reference,
         "provider_reference": checkout["reference"],
     }
+
+
+@router.post("/api/payafrica/webhook/{payment_id}/{token}")
+async def payafrica_card_webhook(
+    payment_id: int,
+    token: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """PayAfrica's notification that a card payment succeeded.
+
+    The token in the path proves the caller got the URL from us via PayAfrica.
+    Nothing is activated unless the payment is still pending and the payload's
+    amount and currency match; with a Paystack key configured the payment is
+    verified against Paystack as well.
+    """
+    from app.services.payafrica_webhook import (
+        amount_matches, extract_outcome, safe_headers, valid_token,
+    )
+
+    raw = await request.body()
+    if not valid_token(payment_id, token):
+        logger.warning("[PAYAFRICA-WEBHOOK] Bad token for payment %s", payment_id)
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        payload = {}
+    # The payload format is not documented yet: log it (it carries no secrets)
+    # so the real shape is visible after the first live payment.
+    logger.info(
+        "[PAYAFRICA-WEBHOOK] payment=%s headers=%s body=%s",
+        payment_id, safe_headers(request.headers), (raw or b"")[:2000].decode("utf-8", "replace"),
+    )
+
+    payment = await db.get(SubscriptionPayment, payment_id)
+    if not payment or payment.payment_method != PAY_CARD:
+        raise HTTPException(status_code=404, detail="Card payment not found")
+    status_value = _enum_value(payment.status)
+    amount = float(payment.amount)
+    currency = (payment.currency or BASE_CURRENCY).upper()
+    # Release the connection before completing the payment (own session).
+    await db.commit()
+
+    if status_value != "pending":
+        logger.info("[PAYAFRICA-WEBHOOK] Payment %s already %s", payment_id, status_value)
+        return {"ok": True, "status": status_value}
+
+    outcome = extract_outcome(payload)
+    if outcome != "success":
+        logger.info("[PAYAFRICA-WEBHOOK] Payment %s: outcome=%s, nothing to do", payment_id, outcome)
+        return {"ok": True, "status": outcome}
+
+    if not amount_matches(payload, amount, currency):
+        logger.error(
+            "[PAYAFRICA-WEBHOOK] Payment %s: amount/currency mismatch, expected %s %s",
+            payment_id, amount, currency,
+        )
+        return {"ok": True, "status": "mismatch"}
+
+    from app.services.subscription import _complete_subscription_payment
+
+    try:  # Paystack verification ships separately; use it when present.
+        from app.services import paystack
+        from app.services.card_payments import reconcile_card_payment
+    except ImportError:
+        paystack = None  # type: ignore[assignment]
+
+    if paystack is not None and paystack.is_configured():
+        # Prefer Paystack's own answer when we can ask it.
+        result = await reconcile_card_payment(payment_id)
+        logger.info("[PAYAFRICA-WEBHOOK] Payment %s verified with Paystack: %s", payment_id, result)
+        return {"ok": True, "status": result}
+
+    completed = await _complete_subscription_payment(payment_id)
+    logger.info("[PAYAFRICA-WEBHOOK] Payment %s completed=%s", payment_id, completed)
+    return {"ok": True, "status": "completed" if completed else "already_processed"}
+
+
+@router.get("/api/payafrica/webhook/{payment_id}/{token}")
+async def payafrica_card_webhook_probe(payment_id: int, token: str):
+    """Reachability check for PayAfrica (and for us) — changes nothing."""
+    from app.services.payafrica_webhook import valid_token
+
+    if not valid_token(payment_id, token):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return {"ok": True, "payment_id": payment_id, "expects": "POST"}
 
 
 @router.post("/api/subscription/mpesa/callback")

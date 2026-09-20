@@ -66,6 +66,7 @@ async def initialize_card_checkout(
     customer_email: str,
     reference: str,
     callback_url: str | None = None,
+    webhook_url: str | None = None,
 ) -> dict:
     """Create a Paystack checkout; returns ``payment_url`` and PayAfrica's ``reference``."""
     currency = (currency or "").upper()
@@ -80,6 +81,11 @@ async def initialize_card_checkout(
     }
     if callback_url:
         payload["callback_url"] = callback_url
+    # Server-to-server notification when the payment succeeds. PayAfrica only
+    # accepts destinations it has registered, so callers must be ready for a
+    # rejection (see initialize_card_checkout_with_fallback).
+    if webhook_url:
+        payload["webhook_url"] = webhook_url
 
     base_url = settings.PAYAFRICA_BASE_URL.rstrip("/")
     async with httpx.AsyncClient(timeout=PAYAFRICA_TIMEOUT) as client:
@@ -115,9 +121,23 @@ async def initialize_card_checkout(
 PAYAFRICA_OWN_CALLBACK = "https://payafrica.org/payments"
 
 
+def _rejects_field(error: "PayAfricaAPIError", field: str) -> bool:
+    """True when PayAfrica refused this optional field, for any reason.
+
+    Seen in the wild: "callback_url origin is not trusted by PayAfrica",
+    "webhook_url must be a registered HTTPS PayAfrica relay destination", and
+    pydantic's "URL host invalid". Any of them means: drop the field and keep
+    the payment going.
+    """
+    return error.status_code == 422 and field in str(error).lower()
+
+
 def _is_untrusted_callback(error: "PayAfricaAPIError") -> bool:
-    text = str(error).lower()
-    return error.status_code == 422 and "callback" in text and "trust" in text
+    return _rejects_field(error, "callback_url")
+
+
+def _is_unregistered_webhook(error: "PayAfricaAPIError") -> bool:
+    return _rejects_field(error, "webhook_url")
 
 
 async def initialize_card_checkout_with_fallback(
@@ -127,12 +147,23 @@ async def initialize_card_checkout_with_fallback(
     customer_email: str,
     reference: str,
     callback_url: str | None,
-) -> tuple[dict, str | None]:
-    """Create the checkout, retrying without our callback if PayAfrica
-    rejects its origin. Returns (checkout, callback_url_actually_used)."""
-    candidates: list[str | None] = [callback_url, None, PAYAFRICA_OWN_CALLBACK]
+    webhook_url: str | None = None,
+) -> tuple[dict, str | None, str | None]:
+    """Create the checkout, dropping whichever of callback_url / webhook_url
+    PayAfrica refuses, so an unregistered URL never blocks the payment.
+
+    Returns (checkout, callback_url_used, webhook_url_used).
+    """
+    callbacks: list[str | None] = list(dict.fromkeys([callback_url, None, PAYAFRICA_OWN_CALLBACK]))
+    callback_index = 0
+    webhook = webhook_url
     last_error: PayAfricaAPIError | None = None
-    for candidate in dict.fromkeys(candidates):  # de-duplicate, keep order
+
+    # At most one drop per field, so this terminates.
+    for _ in range(len(callbacks) + 1):
+        if callback_index >= len(callbacks):
+            break
+        candidate = callbacks[callback_index]
         try:
             checkout = await initialize_card_checkout(
                 amount=amount,
@@ -140,16 +171,26 @@ async def initialize_card_checkout_with_fallback(
                 customer_email=customer_email,
                 reference=reference,
                 callback_url=candidate,
+                webhook_url=webhook,
             )
             if candidate != callback_url:
                 logger.warning(
                     "PayAfrica rejected callback origin %r; checkout %s created with callback %r",
                     callback_url, reference, candidate,
                 )
-            return checkout, candidate
+            return checkout, candidate, webhook
         except PayAfricaAPIError as exc:
-            if not _is_untrusted_callback(exc):
-                raise
             last_error = exc
+            if webhook and _is_unregistered_webhook(exc):
+                logger.warning(
+                    "PayAfrica has not registered webhook %r; checkout %s continues without it",
+                    webhook, reference,
+                )
+                webhook = None
+                continue
+            if _is_untrusted_callback(exc):
+                callback_index += 1
+                continue
+            raise
     assert last_error is not None
     raise last_error
