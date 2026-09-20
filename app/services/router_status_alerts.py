@@ -172,7 +172,12 @@ async def _queue_alert_sms(db, owner: User, router: Router,
     if settings_row is not None and not settings_row.enabled:
         return None, None
     segments = count_segments(sms_body)
-    if not await sms_credits.try_deduct(
+    # The alert is billed to the router's owner, so it follows their gateway:
+    # on their own gateway they pay their vendor and owe no portal credits,
+    # which also means a zero balance can no longer suppress their alerts.
+    bills_credits = await provider_accounts.bills_platform_credits(db, owner.id)
+    credits_charged = segments if bills_credits else 0
+    if bills_credits and not await sms_credits.try_deduct(
             db, owner.id, segments,
             reference=f"router_alert:{router.id}",
             note=f"Status alert SMS for router '{router.name}'"):
@@ -186,7 +191,7 @@ async def _queue_alert_sms(db, owner: User, router: Router,
         recipient_phone=phone,
         body=sms_body,
         segments=segments,
-        credits_charged=segments,
+        credits_charged=credits_charged,
         kind=SmsMessageKind.ADMIN_TO_RESELLER,
         category=ALERT_SMS_CATEGORY,
         status=SmsMessageStatus.QUEUED,

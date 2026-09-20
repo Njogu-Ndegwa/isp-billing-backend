@@ -131,7 +131,12 @@ async def _create_campaign(
     """Persist one credit-backed campaign. Caller owns the session."""
     message_segments = [count_segments(recipient[3]) for recipient in recipients]
     segments = max(message_segments)
-    total_credits = sum(message_segments)
+    # Segments are a property of the message; credits are what we bill for it.
+    # A reseller on their own gateway pays their vendor, so the credit cost is
+    # zero while the segment counts stay accurate.
+    bills_credits = await provider_accounts.bills_platform_credits(db, reseller_id)
+    message_credits = message_segments if bills_credits else [0] * len(message_segments)
+    total_credits = sum(message_credits)
     sender_id = await provider_accounts.resolve_sender_id_for(
         db, reseller_id, settings_row.sender_id if settings_row else None
     )
@@ -148,7 +153,7 @@ async def _create_campaign(
     db.add(campaign)
     await db.flush()
 
-    if not await sms_credits.try_deduct(
+    if bills_credits and not await sms_credits.try_deduct(
         db,
         reseller_id,
         total_credits,
@@ -163,8 +168,8 @@ async def _create_campaign(
         )
         return None
 
-    for (customer_id, phone, category, message_body), segments_for_message in zip(
-        recipients, message_segments
+    for (customer_id, phone, category, message_body), segments_for_message, credits_for_message in zip(
+        recipients, message_segments, message_credits
     ):
         db.add(
             SmsMessage(
@@ -174,7 +179,7 @@ async def _create_campaign(
                 recipient_phone=phone,
                 body=message_body,
                 segments=segments_for_message,
-                credits_charged=segments_for_message,
+                credits_charged=credits_for_message,
                 kind=SmsMessageKind.RESELLER_TO_CUSTOMER,
                 status=SmsMessageStatus.QUEUED,
                 category=category,
