@@ -228,5 +228,7 @@ def reset_expiry_cleanup_router_memo():
     from app.services import mikrotik_background
 
     mikrotik_background._expiry_cleanup_unreachable_routers.clear()
+    mikrotik_background._expiry_cleanup_backoff_hydrated = False
     yield
     mikrotik_background._expiry_cleanup_unreachable_routers.clear()
+    mikrotik_background._expiry_cleanup_backoff_hydrated = False

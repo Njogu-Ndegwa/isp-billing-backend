@@ -12,7 +12,7 @@ remove_user_from_mikrotik function used by multiple router files.
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, func, or_
+from sqlalchemy import and_, case, select, delete, func, or_
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
 from app.db.database import async_session, db_pool_snapshot
@@ -33,6 +33,7 @@ from app.db.models import (
     CustomerPayment,
     PaymentStatus,
     ProvisioningLog,
+    RouterAvailabilityCheck,
 )
 from app.services.mikrotik_api import (
     MikroTikAPI,
@@ -141,6 +142,69 @@ def _router_recently_offline(
 # Keep the skip signal here instead -- job-local, so it can never suppress
 # customer-facing provisioning the way the shared summary could.
 _expiry_cleanup_unreachable_routers: dict[int, datetime] = {}
+_expiry_cleanup_backoff_hydrated = False
+
+
+async def _hydrate_expiry_cleanup_unreachable_routers(db, now: datetime) -> None:
+    """Restore the cleanup-only router backoff after an app restart.
+
+    ``expired_cleanup`` failures intentionally do not update the shared router
+    status, because this failure-only job would otherwise suppress paid access.
+    The worker therefore keeps its own backoff map.  Rebuilding that map from
+    recent availability samples prevents every deploy from immediately
+    retrying the entire known-dead fleet.  A newer positive sample from any
+    source wins, so a router that recovered before the restart is not skipped.
+    """
+    global _expiry_cleanup_backoff_hydrated
+    if _expiry_cleanup_backoff_hydrated:
+        return
+
+    cutoff = now - ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD
+    last_failed = func.max(
+        case(
+            (
+                and_(
+                    RouterAvailabilityCheck.source == "expired_cleanup",
+                    RouterAvailabilityCheck.is_online.is_(False),
+                ),
+                RouterAvailabilityCheck.checked_at,
+            ),
+            else_=None,
+        )
+    ).label("last_failed")
+    last_online = func.max(
+        case(
+            (RouterAvailabilityCheck.is_online.is_(True), RouterAvailabilityCheck.checked_at),
+            else_=None,
+        )
+    ).label("last_online")
+
+    rows = (
+        await db.execute(
+            select(
+                RouterAvailabilityCheck.router_id,
+                last_failed,
+                last_online,
+            )
+            .where(RouterAvailabilityCheck.checked_at >= cutoff)
+            .group_by(RouterAvailabilityCheck.router_id)
+        )
+    ).all()
+    restored = 0
+    for router_id, failed_at, online_at in rows:
+        if failed_at is None or (online_at is not None and online_at >= failed_at):
+            continue
+        previous = _expiry_cleanup_unreachable_routers.get(router_id)
+        if previous is None or failed_at > previous:
+            _expiry_cleanup_unreachable_routers[router_id] = failed_at
+            restored += 1
+
+    _expiry_cleanup_backoff_hydrated = True
+    if restored:
+        logger.info(
+            "[CRON] Restored cleanup backoff for %d recently-unreachable router(s)",
+            restored,
+        )
 
 
 def _cleanup_router_unreachable(
@@ -1227,6 +1291,7 @@ async def cleanup_expired_users_background():
     try:
         async with async_session() as db:
             now = datetime.utcnow()
+            await _hydrate_expiry_cleanup_unreachable_routers(db, now)
             from sqlalchemy import or_
 
             stmt = select(Customer).options(
@@ -1402,7 +1467,7 @@ async def cleanup_expired_users_background():
             if offline_skipped:
                 logger.warning(
                     "[CRON] Skipping %d customer(s) on recently-offline routers: %s",
-                    len(offline_skipped), offline_skipped,
+                    len(offline_skipped), offline_skipped[:50],
                 )
 
             if batch_deferred:
@@ -1694,7 +1759,11 @@ async def cleanup_expired_users_background():
                 )
 
             if all_failed_ids:
-                logger.warning(f"[CRON] {len(all_failed_ids)} customers kept ACTIVE for retry: {list(all_failed_ids)}")
+                logger.warning(
+                    "[CRON] %d customers kept ACTIVE for retry: %s",
+                    len(all_failed_ids),
+                    list(all_failed_ids)[:50],
+                )
 
             duration = (datetime.utcnow() - start_time).total_seconds()
             removed_total = len(mikrotik_results["removed"]) + len(pppoe_results["removed"])
