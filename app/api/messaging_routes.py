@@ -51,6 +51,10 @@ async def get_credits(db: AsyncSession = Depends(get_db),
     user = await _require_reseller(token, db)
     acct = await sms_credits.get_or_create_account(db, user.id)
     s = await _get_settings(db)
+    # Which gateway this reseller sends on, and therefore whether portal
+    # credits apply at all. Without this the Credits screen would quote a
+    # price per SMS to someone who is not being charged per SMS.
+    gateway = await provider_accounts.gateway_summary(db, user.id)
     return {
         "balance": acct.balance,
         "total_purchased": acct.total_purchased,
@@ -59,6 +63,8 @@ async def get_credits(db: AsyncSession = Depends(get_db),
         "min_purchase_credits": s.min_purchase_credits,
         "bundles": s.bundles or [],
         "enabled": s.enabled,
+        "gateway": gateway,
+        "bills_platform_credits": gateway["bills_platform_credits"],
     }
 
 
@@ -322,14 +328,20 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
         raise HTTPException(status_code=400, detail="No recipients matched")
 
     segments = count_segments(req.body)
-    total = segments * len(recips)
-    acct = await sms_credits.get_or_create_account(db, user.id)
-    if acct.balance < total:
-        raise HTTPException(status_code=400, detail={
-            "message": "Insufficient SMS credits",
-            "required": total, "balance": acct.balance,
-            "shortfall": total - acct.balance,
-        })
+    # Portal credits are resale of the platform's own SMS. A reseller on their
+    # own gateway already pays their vendor for this message, so it costs them
+    # nothing here and the balance gate does not apply.
+    bills_credits = await provider_accounts.bills_platform_credits(db, user.id)
+    per_message_credits = segments if bills_credits else 0
+    total = per_message_credits * len(recips)
+    if bills_credits:
+        acct = await sms_credits.get_or_create_account(db, user.id)
+        if acct.balance < total:
+            raise HTTPException(status_code=400, detail={
+                "message": "Insufficient SMS credits",
+                "required": total, "balance": acct.balance,
+                "shortfall": total - acct.balance,
+            })
 
     # Stamp the sender ID of the gateway that will actually carry this
     # campaign — a reseller on their own gateway has their own approved
@@ -342,16 +354,18 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
                        sender_id=sender_id, status=SmsCampaignStatus.QUEUED)
     db.add(camp)
     await db.flush()
-    # Reserve credits with the campaign id as the ledger reference, so the
-    # send_debit and any later refunds share one reference for clean auditing.
-    ok = await sms_credits.try_deduct(db, user.id, total,
-                                      reference=f"campaign:{camp.id}")
-    if not ok:
-        raise HTTPException(status_code=400, detail="Insufficient SMS credits")
+    if bills_credits:
+        # Reserve credits with the campaign id as the ledger reference, so the
+        # send_debit and any later refunds share one reference for clean auditing.
+        ok = await sms_credits.try_deduct(db, user.id, total,
+                                          reference=f"campaign:{camp.id}")
+        if not ok:
+            raise HTTPException(status_code=400, detail="Insufficient SMS credits")
     for r in recips:
         db.add(SmsMessage(campaign_id=camp.id, user_id=user.id,
                           customer_id=r["customer_id"], recipient_phone=r["phone"],
-                          body=req.body, segments=segments, credits_charged=segments,
+                          body=req.body, segments=segments,
+                          credits_charged=per_message_credits,
                           kind=SmsMessageKind.RESELLER_TO_CUSTOMER,
                           status=SmsMessageStatus.QUEUED))
     await db.commit()

@@ -242,6 +242,50 @@ async def resolve(
     )
 
 
+async def bills_platform_credits(db: AsyncSession, user_id: Optional[int]) -> bool:
+    """Whether a send for `user_id` should consume portal SMS credits.
+
+    Portal credits are resale of the platform's own SMS. A reseller sending
+    through their own gateway already pays their vendor directly, so charging
+    portal credits too would bill the same message twice.
+
+    Decided at queue time, alongside the sender ID, so what a reseller is
+    quoted before sending is what they are charged for.
+    """
+    account = await _pick(db, user_id) if user_id is not None else None
+    return account is None
+
+
+async def gateway_summary(db: AsyncSession, user_id: Optional[int]) -> dict:
+    """Which gateway this owner sends on — for the credits and compose screens.
+
+    Never raises: a broken provider config must not take down the credits
+    endpoint. It reports what is configured, not whether it can connect.
+    """
+    account = await _pick(db, user_id) if user_id is not None else None
+    if account is None:
+        return {
+            "source": "platform",
+            "provider": None,
+            "provider_label": None,
+            "sender_id": None,
+            "account_id": None,
+            "bills_platform_credits": True,
+        }
+    try:
+        label = registry.get_spec(account.provider).label
+    except ValueError:
+        label = account.provider
+    return {
+        "source": "reseller",
+        "provider": account.provider,
+        "provider_label": label,
+        "sender_id": account.sender_id,
+        "account_id": account.id,
+        "bills_platform_credits": False,
+    }
+
+
 async def resolve_sender_id_for(
     db: AsyncSession,
     user_id: Optional[int],
