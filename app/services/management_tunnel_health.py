@@ -4,6 +4,7 @@ Manager calls are deliberately separate from database work. Callers must finish
 and commit their short DB section before awaiting either network request.
 """
 
+from collections import defaultdict
 from datetime import datetime, timezone
 import ipaddress
 
@@ -11,6 +12,7 @@ import httpx
 
 from app.config import settings
 from app.services.provisioning import _wg_client
+from app.services.router_availability import summarize_router_flaps
 
 
 def classify_primary_tunnel(ip_address: str | None) -> str | None:
@@ -42,6 +44,57 @@ def fleet_counts(rows) -> dict:
         if last_status:
             counts[tunnel]["online_routers"] += 1
     return counts
+
+
+def build_fleet_flap_history(
+    routers: list[dict],
+    checks,
+    *,
+    hours: int = 24,
+    now: datetime | None = None,
+) -> dict:
+    """Summarize management-path transitions for the admin tunnel dashboard."""
+    now = now or datetime.utcnow()
+    checks_by_router = defaultdict(list)
+    for check in checks:
+        router_id = check.get("router_id") if isinstance(check, dict) else check.router_id
+        checks_by_router[router_id].append(check)
+
+    rows = []
+    for router in routers:
+        summary = summarize_router_flaps(checks_by_router.get(router["id"], []), now=now)
+        tunnel_type = classify_primary_tunnel(router.get("ip_address"))
+        if not tunnel_type:
+            continue
+        rows.append({
+            "router_id": router["id"],
+            "router_name": router.get("name"),
+            "identity": router.get("identity"),
+            "ip_address": router.get("ip_address"),
+            "tunnel_type": tunnel_type,
+            "current_status": summary["status"],
+            "sample_count": summary["sample_count"],
+            "transition_count": summary["transition_count"],
+            "outage_count": summary["outage_count"],
+            "is_flapping": summary["is_flapping"],
+            "last_transition_at": summary["last_transition_at"],
+        })
+
+    affected = sorted(
+        (row for row in rows if row["is_flapping"]),
+        key=lambda row: (
+            -row["transition_count"],
+            -row["outage_count"],
+            row["router_name"] or row["identity"] or "",
+        ),
+    )
+    return {
+        "window_hours": hours,
+        "monitored_routers": sum(1 for row in rows if row["sample_count"]),
+        "affected_count": len(affected),
+        "total_transitions": sum(row["transition_count"] for row in rows),
+        "routers": affected[:25],
+    }
 
 
 async def fetch_manager_health(timeout: float = 6.0) -> dict:
@@ -177,16 +230,31 @@ def build_management_tunnel_health(
     *,
     insurance_manager: dict | None = None,
     insurance_error: str | None = None,
+    flap_history: dict | None = None,
 ) -> dict:
     generated_at = datetime.now(timezone.utc).isoformat()
     primary, primary_issues = _primary_plane(manager, fleet, error)
     insurance, insurance_issues = _insurance_plane(insurance_manager, insurance_error)
-    issues = primary_issues + insurance_issues
+    flap_history = flap_history or {
+        "window_hours": 24,
+        "monitored_routers": 0,
+        "affected_count": 0,
+        "total_transitions": 0,
+        "routers": [],
+    }
+    flap_issues = []
+    if flap_history.get("affected_count"):
+        flap_issues.append(
+            f"{flap_history['affected_count']} router(s) are repeatedly losing and recovering their management tunnel."
+        )
+    issues = primary_issues + insurance_issues + flap_issues
     if primary_issues and not insurance_issues:
         summary = (
             f"{' '.join(primary_issues)} Hetzner emergency tunnels are operational, "
             "but application failover is manual."
         )
+        if flap_issues:
+            summary = f"{summary} {' '.join(flap_issues)}"
     elif issues:
         summary = " ".join(issues)
     else:
@@ -203,6 +271,7 @@ def build_management_tunnel_health(
         "services": primary["services"],
         "primary": primary,
         "insurance": insurance,
+        "flapping": flap_history,
         "automatic_failover_enabled": False,
     }
 

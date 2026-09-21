@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Iterable, Optional
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +23,111 @@ ROUTER_OFFLINE_CONFIRMATION_WINDOW = timedelta(minutes=5)
 # false-offline bias.  Keep the sample for diagnostics/uptime analysis, but do
 # not let it suppress customer-facing work.
 ADVISORY_OFFLINE_SOURCES = frozenset({"expired_cleanup"})
+
+
+def _check_value(check: Any, field: str) -> Any:
+    if isinstance(check, dict):
+        return check.get(field)
+    return getattr(check, field, None)
+
+
+def summarize_router_flaps(
+    checks: Iterable[Any],
+    *,
+    now: Optional[datetime] = None,
+    confirmation_window: timedelta = ROUTER_OFFLINE_CONFIRMATION_WINDOW,
+) -> Dict[str, Any]:
+    """Turn raw reachability samples into debounced state transitions.
+
+    A single failed connection is not an outage: the production summary already
+    requires two negative samples within five minutes, so the history view uses
+    the same rule.  One successful sample immediately confirms recovery.
+    """
+    now = now or datetime.utcnow()
+    ordered = sorted(
+        (
+            check
+            for check in checks
+            if _check_value(check, "checked_at") is not None
+            and _check_value(check, "source") not in ADVISORY_OFFLINE_SOURCES
+        ),
+        key=lambda check: _check_value(check, "checked_at"),
+    )
+
+    state: Optional[bool] = None
+    pending_offline_at: Optional[datetime] = None
+    transitions = []
+    outages = []
+    outage_started_at: Optional[datetime] = None
+
+    for check in ordered:
+        checked_at = _check_value(check, "checked_at")
+        is_online = bool(_check_value(check, "is_online"))
+        source = str(_check_value(check, "source") or "unknown")
+
+        if is_online:
+            pending_offline_at = None
+            if state is False:
+                transitions.append({
+                    "at": checked_at.isoformat(),
+                    "from": "offline",
+                    "to": "online",
+                    "source": source,
+                })
+                started = outage_started_at or checked_at
+                outages.append({
+                    "started_at": started.isoformat(),
+                    "ended_at": checked_at.isoformat(),
+                    "duration_seconds": max(0, round((checked_at - started).total_seconds())),
+                })
+                outage_started_at = None
+            state = True
+            continue
+
+        if state is False:
+            continue
+
+        if (
+            pending_offline_at is None
+            or checked_at - pending_offline_at > confirmation_window
+        ):
+            pending_offline_at = checked_at
+            continue
+
+        # A second recent negative confirms the management path is unavailable.
+        previous_state = state
+        state = False
+        outage_started_at = checked_at
+        pending_offline_at = None
+        if previous_state is True:
+            transitions.append({
+                "at": checked_at.isoformat(),
+                "from": "online",
+                "to": "offline",
+                "source": source,
+            })
+
+    if state is False and outage_started_at is not None:
+        outages.append({
+            "started_at": outage_started_at.isoformat(),
+            "ended_at": None,
+            "duration_seconds": max(0, round((now - outage_started_at).total_seconds())),
+        })
+
+    outage_transitions = sum(1 for item in transitions if item["to"] == "offline")
+    recovery_transitions = sum(1 for item in transitions if item["to"] == "online")
+    transition_count = len(transitions)
+    return {
+        "status": "online" if state is True else "offline" if state is False else "unknown",
+        "sample_count": len(ordered),
+        "transition_count": transition_count,
+        "outage_count": outage_transitions,
+        "recovery_count": recovery_transitions,
+        "is_flapping": transition_count >= 4 or outage_transitions >= 2,
+        "last_transition_at": transitions[-1]["at"] if transitions else None,
+        "transitions": transitions[-20:],
+        "outages": outages[-20:],
+    }
 
 
 def router_recently_offline(

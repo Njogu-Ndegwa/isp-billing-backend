@@ -31,7 +31,11 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
-from app.services.router_availability import build_router_status, record_router_availability
+from app.services.router_availability import (
+    build_router_status,
+    record_router_availability,
+    summarize_router_flaps,
+)
 from app.services.provisioning import provision_base_url_for_vpn
 from app.services.router_helpers import connect_to_router
 from app.services.router_remote_access import (
@@ -1647,12 +1651,15 @@ async def get_router_uptime(
             RouterAvailabilityCheck.router_id == router_id,
             RouterAvailabilityCheck.checked_at >= since,
         )
-        .order_by(RouterAvailabilityCheck.checked_at.desc())
-        .limit(recent_checks)
+        .order_by(
+            RouterAvailabilityCheck.checked_at,
+            RouterAvailabilityCheck.id,
+        )
     )
     checks_result = await db.execute(checks_stmt)
     checks = checks_result.scalars().all()
 
+    flap_summary = summarize_router_flaps(checks, now=now)
     overall_total = int(router_obj.availability_checks or 0)
     overall_online = int(router_obj.availability_successes or 0)
 
@@ -1676,13 +1683,17 @@ async def get_router_uptime(
             "online_checks": int(window_online or 0),
             "uptime_percentage": round((window_online / window_total) * 100, 2) if window_total else None,
         },
+        "flapping": {
+            **flap_summary,
+            "window_hours": hours,
+        },
         "recent_checks": [
             {
                 "checked_at": check.checked_at.isoformat(),
                 "is_online": check.is_online,
                 "source": check.source,
             }
-            for check in checks
+            for check in checks[-recent_checks:][::-1]
         ],
     }
 
