@@ -3,8 +3,10 @@ from pydantic import BaseModel
 import subprocess
 import os
 import logging
+import re
 import shlex
 import time
+from collections import Counter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +19,12 @@ SERVER_PUBLIC_KEY_PATH = os.environ.get("WG_SERVER_PUBKEY_PATH", "/etc/wireguard
 L2TP_CHAP_SECRETS_PATH = os.environ.get("L2TP_CHAP_SECRETS_PATH", "/etc/ppp/chap-secrets")
 L2TP_SERVER_NAME = "l2tp-server"
 WG_RECENT_HANDSHAKE_SECONDS = int(os.environ.get("WG_RECENT_HANDSHAKE_SECONDS", "180"))
+
+IPSEC_CONNMARK_RULE_RE = re.compile(
+    r"^-A PREROUTING -s (?P<src>\S+) -d (?P<dst>\S+) -p udp .*?"
+    r"--sport (?P<sport>\d+) --dport (?P<dport>\d+) .*?"
+    r"--set-xmark 0x[0-9a-f]+/0xffffffff$"
+)
 
 
 def _listening_udp_ports(paths=None):
@@ -147,6 +155,65 @@ def _l2tp_health():
         "ipsec_ports": ipsec_ports,
         "configured_peers": configured_peers,
         "active_sessions": _active_ppp_sessions(),
+    }
+
+
+def _ipsec_connmark_health():
+    """Detect the duplicate NAT-T mark rules that can black-hole live CHILD_SAs.
+
+    The connmark plugin prepends a rule for every CHILD_SA. More than one rule
+    for the exact public source tuple is dangerous because a later stale MARK
+    rule can overwrite the live mark. This is read-only and intentionally lives
+    in the NET_ADMIN manager container rather than the web process.
+    """
+    try:
+        result = subprocess.run(
+            ["iptables-legacy", "-t", "mangle", "-S", "PREROUTING"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return {
+            "available": False,
+            "healthy": None,
+            "error": "iptables_legacy_not_found",
+            "duplicate_tuple_count": 0,
+            "superseded_rule_count": 0,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "available": False,
+            "healthy": None,
+            "error": "iptables_audit_timeout",
+            "duplicate_tuple_count": 0,
+            "superseded_rule_count": 0,
+        }
+
+    if result.returncode != 0:
+        return {
+            "available": False,
+            "healthy": None,
+            "error": "iptables_audit_failed",
+            "duplicate_tuple_count": 0,
+            "superseded_rule_count": 0,
+        }
+
+    tuples = Counter()
+    for line in result.stdout.splitlines():
+        match = IPSEC_CONNMARK_RULE_RE.match(line.strip())
+        if not match:
+            continue
+        values = match.groupdict()
+        tuples[(values["src"], values["dst"], values["sport"], values["dport"])] += 1
+
+    duplicate_counts = [count for count in tuples.values() if count > 1]
+    return {
+        "available": True,
+        "healthy": not duplicate_counts,
+        "duplicate_tuple_count": len(duplicate_counts),
+        "superseded_rule_count": sum(count - 1 for count in duplicate_counts),
+        "inspected_rule_count": sum(tuples.values()),
     }
 
 
@@ -313,7 +380,12 @@ def server_info(_=Depends(verify_secret)):
 def health():
     wireguard = _wireguard_health()
     l2tp = _l2tp_health()
-    healthy = wireguard["available"] and (not l2tp["required"] or l2tp["available"])
+    ipsec_connmark = _ipsec_connmark_health()
+    healthy = (
+        wireguard["available"]
+        and (not l2tp["required"] or l2tp["available"])
+        and ipsec_connmark.get("healthy") is not False
+    )
     return {
         # Keep the original top-level keys for backward compatibility.
         "status": "healthy" if healthy else "unhealthy",
@@ -321,6 +393,7 @@ def health():
         "wg_available": wireguard["available"],
         "wireguard": wireguard,
         "l2tp": l2tp,
+        "ipsec_connmark": ipsec_connmark,
     }
 
 

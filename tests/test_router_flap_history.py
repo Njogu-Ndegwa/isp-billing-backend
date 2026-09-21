@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta
 
-from app.services.management_tunnel_health import build_fleet_flap_history
+from app.services.management_tunnel_health import (
+    build_fleet_flap_history,
+    build_fleet_tunnel_status,
+)
 from app.services.router_availability import summarize_router_flaps
 
 
@@ -25,6 +28,19 @@ def test_single_failed_probe_does_not_create_a_flap():
     assert summary["transition_count"] == 0
     assert summary["outage_count"] == 0
     assert summary["is_flapping"] is False
+
+
+def test_latest_single_failure_is_an_early_warning_not_an_outage():
+    start = datetime(2026, 9, 21, 9, 0)
+    summary = summarize_router_flaps([
+        _check(start, True),
+        _check(start + timedelta(minutes=1), False),
+    ])
+
+    assert summary["status"] == "online"
+    assert summary["pending_outage"] is True
+    assert summary["last_sample_online"] is False
+    assert summary["transition_count"] == 0
 
 
 def test_repeated_confirmed_outages_are_classified_as_flapping():
@@ -73,3 +89,62 @@ def test_fleet_summary_only_lists_repeated_flappers():
     assert result["total_transitions"] == 4
     assert result["routers"][0]["router_id"] == 1
     assert result["routers"][0]["tunnel_type"] == "l2tp"
+
+
+def test_fleet_status_exposes_online_down_watch_and_unknown_routers():
+    now = datetime(2026, 9, 21, 9, 10)
+    routers = [
+        {
+            "id": 1,
+            "name": "Healthy",
+            "identity": "Router-1",
+            "ip_address": "10.0.0.1",
+            "last_status": True,
+            "last_checked_at": now - timedelta(minutes=1),
+            "last_status_source": "bandwidth_snapshot",
+        },
+        {
+            "id": 2,
+            "name": "Early warning",
+            "identity": "Router-2",
+            "ip_address": "10.0.100.2",
+            "last_status": True,
+            "last_checked_at": now - timedelta(minutes=2),
+            "last_status_source": "bandwidth_snapshot",
+        },
+        {
+            "id": 3,
+            "name": "Down",
+            "identity": "Router-3",
+            "ip_address": "10.0.100.3",
+            "last_status": False,
+            "last_checked_at": now - timedelta(minutes=1),
+            "last_status_source": "router_connect",
+        },
+        {
+            "id": 4,
+            "name": "Stale",
+            "identity": "Router-4",
+            "ip_address": "10.0.0.4",
+            "last_status": True,
+            "last_checked_at": now - timedelta(minutes=30),
+            "last_status_source": "bandwidth_snapshot",
+        },
+    ]
+    checks = [
+        _check(now - timedelta(minutes=1), True, router_id=1),
+        _check(now - timedelta(minutes=3), True, router_id=2),
+        _check(now - timedelta(seconds=30), False, router_id=2),
+        _check(now - timedelta(minutes=3), True, router_id=3),
+        _check(now - timedelta(minutes=2), False, router_id=3),
+        _check(now - timedelta(minutes=1), False, router_id=3),
+    ]
+
+    result = build_fleet_tunnel_status(routers, checks, now=now)
+
+    assert result["online_count"] == 1
+    assert result["watch_count"] == 1
+    assert result["offline_count"] == 1
+    assert result["unknown_count"] == 1
+    assert result["attention_count"] == 3
+    assert [row["state"] for row in result["routers"]] == ["offline", "watch", "unknown"]

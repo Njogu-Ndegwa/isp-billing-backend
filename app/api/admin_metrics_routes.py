@@ -20,6 +20,7 @@ from app.services import admin_metrics as svc
 from app.services.management_tunnel_health import (
     build_management_tunnel_health,
     build_fleet_flap_history,
+    build_fleet_tunnel_status,
     fetch_insurance_manager_health,
     fetch_manager_health,
     fleet_counts,
@@ -183,6 +184,8 @@ async def admin_management_tunnel_status(
                 Router.identity,
                 Router.ip_address,
                 Router.last_status,
+                Router.last_checked_at,
+                Router.last_status_source,
             )
         )
     ).all()
@@ -217,6 +220,21 @@ async def admin_management_tunnel_status(
         ],
         availability_rows,
     )
+    fleet_status = build_fleet_tunnel_status(
+        [
+            {
+                "id": row.id,
+                "name": row.name,
+                "identity": row.identity,
+                "ip_address": row.ip_address,
+                "last_status": row.last_status,
+                "last_checked_at": row.last_checked_at,
+                "last_status_source": row.last_status_source,
+            }
+            for row in router_rows
+        ],
+        availability_rows,
+    )
 
     # Release the DB transaction before the external manager call. A tunnel
     # outage must never pin a pooled DB connection while this request times out.
@@ -246,6 +264,7 @@ async def admin_management_tunnel_status(
         ),
         insurance_error=insurance_error,
         flap_history=flap_history,
+        fleet_status=fleet_status,
     )
 
 

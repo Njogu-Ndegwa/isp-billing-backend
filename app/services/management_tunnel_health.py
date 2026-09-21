@@ -12,7 +12,10 @@ import httpx
 
 from app.config import settings
 from app.services.provisioning import _wg_client
-from app.services.router_availability import summarize_router_flaps
+from app.services.router_availability import (
+    ROUTER_STATUS_STALE_AFTER_SECONDS,
+    summarize_router_flaps,
+)
 
 
 def classify_primary_tunnel(ip_address: str | None) -> str | None:
@@ -97,6 +100,94 @@ def build_fleet_flap_history(
     }
 
 
+def build_fleet_tunnel_status(
+    routers: list[dict],
+    checks,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Build a current, cached per-router tunnel state and early-warning queue."""
+    now = now or datetime.utcnow()
+    checks_by_router = defaultdict(list)
+    for check in checks:
+        router_id = check.get("router_id") if isinstance(check, dict) else check.router_id
+        checks_by_router[router_id].append(check)
+
+    counts = {"online": 0, "watch": 0, "offline": 0, "unknown": 0}
+    rows = []
+    for router in routers:
+        tunnel_type = classify_primary_tunnel(router.get("ip_address"))
+        if not tunnel_type:
+            continue
+
+        summary = summarize_router_flaps(checks_by_router.get(router["id"], []), now=now)
+        last_checked_at = router.get("last_checked_at")
+        age_seconds = (
+            max(0, round((now - last_checked_at).total_seconds()))
+            if last_checked_at
+            else None
+        )
+        status_is_fresh = (
+            age_seconds is not None and age_seconds <= ROUTER_STATUS_STALE_AFTER_SECONDS
+        )
+        last_status = router.get("last_status")
+
+        if status_is_fresh and last_status is False:
+            state = "offline"
+            reason = "Two recent probes confirmed the management tunnel is down."
+        elif status_is_fresh and last_status is True and summary["pending_outage"]:
+            state = "watch"
+            reason = "The latest probe failed; waiting for a second failure before declaring an outage."
+        elif status_is_fresh and last_status is True and summary["is_flapping"]:
+            state = "watch"
+            reason = "Repeated outage and recovery cycles were detected in the last 24 hours."
+        elif status_is_fresh and last_status is True:
+            state = "online"
+            reason = "The latest confirmed management-tunnel probe succeeded."
+        else:
+            state = "unknown"
+            reason = "There is no reachability sample newer than 10 minutes."
+
+        counts[state] += 1
+        rows.append({
+            "router_id": router["id"],
+            "router_name": router.get("name"),
+            "identity": router.get("identity"),
+            "ip_address": router.get("ip_address"),
+            "tunnel_type": tunnel_type,
+            "state": state,
+            "reason": reason,
+            "last_checked_at": last_checked_at.isoformat() if last_checked_at else None,
+            "status_age_seconds": age_seconds,
+            "status_source": router.get("last_status_source"),
+            "pending_outage": summary["pending_outage"],
+            "is_flapping": summary["is_flapping"],
+            "transition_count": summary["transition_count"],
+            "outage_count": summary["outage_count"],
+            "last_transition_at": summary["last_transition_at"],
+        })
+
+    priority = {"offline": 0, "watch": 1, "unknown": 2, "online": 3}
+    attention = sorted(
+        (row for row in rows if row["state"] != "online"),
+        key=lambda row: (
+            priority[row["state"]],
+            -row["transition_count"],
+            row["router_name"] or row["identity"] or "",
+        ),
+    )
+    return {
+        "stale_after_seconds": ROUTER_STATUS_STALE_AFTER_SECONDS,
+        "total_routers": len(rows),
+        "online_count": counts["online"],
+        "watch_count": counts["watch"],
+        "offline_count": counts["offline"],
+        "unknown_count": counts["unknown"],
+        "attention_count": len(attention),
+        "routers": attention[:50],
+    }
+
+
 async def fetch_manager_health(timeout: float = 6.0) -> dict:
     async with _wg_client(timeout=timeout) as client:
         response = await client.get(
@@ -145,6 +236,7 @@ def _primary_plane(
 
     wireguard = dict(manager.get("wireguard") or {})
     l2tp = dict(manager.get("l2tp") or {})
+    ipsec_connmark = dict(manager.get("ipsec_connmark") or {})
     wireguard.update(fleet["wireguard"])
     l2tp.update(fleet["l2tp"])
 
@@ -157,12 +249,18 @@ def _primary_plane(
         issues.append(
             f"Primary L2TP/IPsec is unavailable; {l2tp['registered_routers']} registered routers may be unreachable."
         )
+    if ipsec_connmark.get("healthy") is False:
+        issues.append(
+            f"IPsec early warning: {ipsec_connmark.get('duplicate_tuple_count', 0)} duplicate NAT-T tuple(s) "
+            f"contain {ipsec_connmark.get('superseded_rule_count', 0)} superseded connmark rule(s)."
+        )
     summary = "Primary AWS management tunnels are operational." if not issues else " ".join(issues)
     return {
         "manager_reachable": True,
         "overall_status": "critical" if issues else "healthy",
         "summary": summary,
         "services": {"wireguard": wireguard, "l2tp": l2tp},
+        "ipsec_connmark": ipsec_connmark,
     }, issues
 
 
@@ -231,6 +329,7 @@ def build_management_tunnel_health(
     insurance_manager: dict | None = None,
     insurance_error: str | None = None,
     flap_history: dict | None = None,
+    fleet_status: dict | None = None,
 ) -> dict:
     generated_at = datetime.now(timezone.utc).isoformat()
     primary, primary_issues = _primary_plane(manager, fleet, error)
@@ -240,6 +339,16 @@ def build_management_tunnel_health(
         "monitored_routers": 0,
         "affected_count": 0,
         "total_transitions": 0,
+        "routers": [],
+    }
+    fleet_status = fleet_status or {
+        "stale_after_seconds": ROUTER_STATUS_STALE_AFTER_SECONDS,
+        "total_routers": 0,
+        "online_count": 0,
+        "watch_count": 0,
+        "offline_count": 0,
+        "unknown_count": 0,
+        "attention_count": 0,
         "routers": [],
     }
     flap_issues = []
@@ -271,6 +380,7 @@ def build_management_tunnel_health(
         "services": primary["services"],
         "primary": primary,
         "insurance": insurance,
+        "fleet_status": fleet_status,
         "flapping": flap_history,
         "automatic_failover_enabled": False,
     }
