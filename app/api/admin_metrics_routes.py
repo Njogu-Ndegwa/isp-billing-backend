@@ -5,7 +5,7 @@ All routes require admin role (same auth as /api/admin/* endpoints).
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -14,11 +14,12 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import db_pool_snapshot, get_db
-from app.db.models import Router, User, UserRole
+from app.db.models import Router, RouterAvailabilityCheck, User, UserRole
 from app.services.auth import verify_token, get_current_user
 from app.services import admin_metrics as svc
 from app.services.management_tunnel_health import (
     build_management_tunnel_health,
+    build_fleet_flap_history,
     fetch_insurance_manager_health,
     fetch_manager_health,
     fleet_counts,
@@ -175,9 +176,47 @@ async def admin_management_tunnel_status(
     """Return platform-level WireGuard and L2TP/IPsec health for superadmins."""
     await _require_admin(token, db)
     router_rows = (
-        await db.execute(select(Router.ip_address, Router.last_status))
+        await db.execute(
+            select(
+                Router.id,
+                Router.name,
+                Router.identity,
+                Router.ip_address,
+                Router.last_status,
+            )
+        )
     ).all()
-    fleet = fleet_counts(router_rows)
+    fleet = fleet_counts((row.ip_address, row.last_status) for row in router_rows)
+    router_ids = [row.id for row in router_rows]
+    since = datetime.utcnow() - timedelta(hours=24)
+    availability_rows = []
+    if router_ids:
+        availability_rows = (
+            await db.execute(
+                select(RouterAvailabilityCheck)
+                .where(
+                    RouterAvailabilityCheck.router_id.in_(router_ids),
+                    RouterAvailabilityCheck.checked_at >= since,
+                )
+                .order_by(
+                    RouterAvailabilityCheck.router_id,
+                    RouterAvailabilityCheck.checked_at,
+                    RouterAvailabilityCheck.id,
+                )
+            )
+        ).scalars().all()
+    flap_history = build_fleet_flap_history(
+        [
+            {
+                "id": row.id,
+                "name": row.name,
+                "identity": row.identity,
+                "ip_address": row.ip_address,
+            }
+            for row in router_rows
+        ],
+        availability_rows,
+    )
 
     # Release the DB transaction before the external manager call. A tunnel
     # outage must never pin a pooled DB connection while this request times out.
@@ -206,6 +245,7 @@ async def admin_management_tunnel_status(
             None if isinstance(insurance_result, Exception) else insurance_result
         ),
         insurance_error=insurance_error,
+        flap_history=flap_history,
     )
 
 

@@ -1,4 +1,5 @@
 import importlib.util
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from httpx import ASGITransport, AsyncClient
 import app.api.admin_metrics_routes as routes_module
 from app.api.admin_metrics_routes import router as admin_metrics_router
 from app.db.database import get_db
+from app.db.models import RouterAvailabilityCheck
 from app.services.auth import verify_token
 from app.services.management_tunnel_health import (
     build_management_tunnel_health,
@@ -149,7 +151,18 @@ async def test_admin_endpoint_combines_manager_and_router_counts(db, client, mon
     admin = await make_admin(db)
     reseller = await make_reseller(db)
     await make_router(db, reseller, ip_address="10.0.0.25", last_status=True)
-    await make_router(db, reseller, ip_address="10.0.100.9", last_status=False)
+    l2tp_router = await make_router(db, reseller, ip_address="10.0.100.9", last_status=False)
+    started = datetime.utcnow() - timedelta(minutes=10)
+    db.add_all([
+        RouterAvailabilityCheck(router_id=l2tp_router.id, checked_at=started, is_online=True, source="test"),
+        RouterAvailabilityCheck(router_id=l2tp_router.id, checked_at=started + timedelta(minutes=1), is_online=False, source="test"),
+        RouterAvailabilityCheck(router_id=l2tp_router.id, checked_at=started + timedelta(minutes=2), is_online=False, source="test"),
+        RouterAvailabilityCheck(router_id=l2tp_router.id, checked_at=started + timedelta(minutes=3), is_online=True, source="test"),
+        RouterAvailabilityCheck(router_id=l2tp_router.id, checked_at=started + timedelta(minutes=4), is_online=False, source="test"),
+        RouterAvailabilityCheck(router_id=l2tp_router.id, checked_at=started + timedelta(minutes=5), is_online=False, source="test"),
+        RouterAvailabilityCheck(router_id=l2tp_router.id, checked_at=started + timedelta(minutes=6), is_online=True, source="test"),
+    ])
+    await db.commit()
 
     async def fake_current_user(token, session):
         return admin
@@ -183,10 +196,13 @@ async def test_admin_endpoint_combines_manager_and_router_counts(db, client, mon
     response = await client.get("/api/admin/management-tunnels")
     assert response.status_code == 200
     payload = response.json()
-    assert payload["overall_status"] == "healthy"
+    assert payload["overall_status"] == "critical"
     assert payload["services"]["wireguard"]["registered_routers"] == 1
     assert payload["services"]["wireguard"]["online_routers"] == 1
     assert payload["services"]["l2tp"]["registered_routers"] == 1
     assert payload["services"]["l2tp"]["online_routers"] == 0
     assert payload["insurance"]["services"]["l2tp"]["online_routers"] == 16
+    assert payload["flapping"]["affected_count"] == 1
+    assert payload["flapping"]["routers"][0]["router_id"] == l2tp_router.id
+    assert "repeatedly losing and recovering" in payload["summary"]
     assert payload["automatic_failover_enabled"] is False
