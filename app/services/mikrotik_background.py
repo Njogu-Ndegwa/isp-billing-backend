@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 SAFETY_NET_BYPASS_GRACE_PERIOD = timedelta(minutes=5)
 BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 60
 ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = ROUTER_OFFLINE_SKIP_PERIOD  # single source: see router_availability
-ROUTER_LONG_OFFLINE_CLEANUP_QUARANTINE = timedelta(days=7)
+ROUTER_LONG_OFFLINE_CLEANUP_QUARANTINE = timedelta(days=3)
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN = 60
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER = 15
 # An expiry SMS is only meaningful while the expiry is fresh. When cleanup has

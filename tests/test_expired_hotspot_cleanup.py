@@ -199,7 +199,7 @@ async def test_cleanup_quarantines_long_offline_router_until_it_recovers(
         reseller,
         last_status=False,
         last_checked_at=now - timedelta(minutes=1),
-        last_online_at=now - timedelta(days=8),
+        last_online_at=now - timedelta(days=4),
     )
     online_router = await make_router(
         db,
