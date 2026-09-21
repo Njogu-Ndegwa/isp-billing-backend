@@ -43,6 +43,10 @@ their old rules did not collide.  Routers whose NAT preserved/reused source port
 - Disabled the enabled-but-dead `l2tp-aws2` profile pointing to retired endpoint
   `35.170.199.141` on seven reachable routers.  Primary AWS and current Hetzner
   profiles were left enabled.
+- Router-0767 (the separately scheduled QUBIT #2 check) was not affected by the
+  L2TP connmark bug.  Its primary and Hetzner WireGuard peers were healthy; its
+  zero-RX `wg-aws2` peer to `35.170.199.141` was disabled to stop handshake-log
+  noise.
 - Added debounced flap/outage interpretation to the existing 30-day router
   availability store and exposed fleet and per-router history in the admin UI.
 
