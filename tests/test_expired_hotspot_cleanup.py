@@ -184,6 +184,87 @@ async def test_cleanup_does_not_restore_backoff_after_newer_online_sample(
     assert router.id not in mikrotik_background._expiry_cleanup_unreachable_routers
 
 
+async def test_cleanup_quarantines_long_offline_router_until_it_recovers(
+    db,
+    session_factory,
+    monkeypatch,
+):
+    _patch_cleanup_side_effects(monkeypatch, session_factory)
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    now = datetime.utcnow()
+    offline_router = await make_router(
+        db,
+        reseller,
+        last_status=False,
+        last_checked_at=now - timedelta(minutes=1),
+        last_online_at=now - timedelta(days=4),
+    )
+    online_router = await make_router(
+        db,
+        reseller,
+        ip_address="10.0.0.3",
+        last_status=True,
+        last_checked_at=now - timedelta(minutes=1),
+        last_online_at=now - timedelta(minutes=1),
+    )
+    quarantined = await make_customer(
+        db,
+        reseller,
+        plan,
+        offline_router,
+        status=CustomerStatus.ACTIVE,
+        expiry=now - timedelta(days=2),
+        mac_address="BE:96:9D:22:1B:48",
+    )
+    current = await make_customer(
+        db,
+        reseller,
+        plan,
+        online_router,
+        status=CustomerStatus.ACTIVE,
+        expiry=now - timedelta(minutes=5),
+        mac_address="BE:96:9D:22:1B:49",
+    )
+
+    cleanup_calls = []
+
+    def fake_router_cleanup(router_info, customers_data):
+        cleanup_calls.append((router_info["id"], [c["id"] for c in customers_data]))
+        return {
+            "removed": [{"id": c["id"], "details": {}} for c in customers_data],
+            "failed": [],
+            "connected": True,
+        }
+
+    monkeypatch.setattr(
+        mikrotik_background,
+        "_cleanup_single_router_hotspot_sync",
+        fake_router_cleanup,
+    )
+
+    await mikrotik_background.cleanup_expired_users_background()
+    await db.refresh(quarantined)
+    await db.refresh(current)
+
+    assert cleanup_calls == [(online_router.id, [current.id])]
+    assert quarantined.status == CustomerStatus.ACTIVE
+    assert current.status == CustomerStatus.INACTIVE
+
+    offline_router.last_status = True
+    offline_router.last_checked_at = datetime.utcnow()
+    offline_router.last_online_at = datetime.utcnow()
+    await db.commit()
+    cleanup_calls.clear()
+
+    await mikrotik_background.cleanup_expired_users_background()
+    await db.refresh(quarantined)
+
+    assert cleanup_calls == [(offline_router.id, [quarantined.id])]
+    assert quarantined.status == CustomerStatus.INACTIVE
+
+
 async def test_cleanup_marks_customer_inactive_after_router_cleanup_succeeds(
     db,
     session_factory,

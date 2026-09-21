@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 SAFETY_NET_BYPASS_GRACE_PERIOD = timedelta(minutes=5)
 BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 60
 ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = ROUTER_OFFLINE_SKIP_PERIOD  # single source: see router_availability
+ROUTER_LONG_OFFLINE_CLEANUP_QUARANTINE = timedelta(days=3)
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN = 60
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER = 15
 # An expiry SMS is only meaningful while the expiry is fresh. When cleanup has
@@ -126,6 +127,28 @@ def _router_recently_offline(
         and last_checked is not None
         and (now - last_checked) < threshold
     )
+
+
+def _router_long_offline(
+    router,
+    now: datetime,
+    threshold: timedelta = ROUTER_LONG_OFFLINE_CLEANUP_QUARANTINE,
+) -> bool:
+    """Return whether a persistently offline router should leave the hot queue.
+
+    ``last_checked_at`` advances on every health check and therefore cannot tell
+    us how long an outage has lasted. ``last_online_at`` is the durable last
+    successful signal; routers that have never been online use ``created_at`` as
+    the start of the observation window. A recovered router has ``last_status``
+    set to true and automatically becomes eligible again on the next run.
+    """
+    if getattr(router, "last_status", None) is not False:
+        return False
+    offline_reference = (
+        getattr(router, "last_online_at", None)
+        or getattr(router, "created_at", None)
+    )
+    return offline_reference is not None and (now - offline_reference) >= threshold
 
 
 # Routers whose RouterOS connection failed during expired-user cleanup.
@@ -1355,6 +1378,7 @@ async def cleanup_expired_users_background():
             router_pppoe_map = {}
             no_router_customers = []
             offline_skipped = []
+            long_offline_quarantined = []
             agent_cleanup_items: dict[int, dict] = {}
             batch_deferred = []
             directly_deactivated_ids: set[int] = set()
@@ -1384,6 +1408,9 @@ async def cleanup_expired_users_background():
                     if not c.router:
                         c.status = CustomerStatus.INACTIVE
                         directly_deactivated_ids.add(c.id)
+                        continue
+                    if _router_long_offline(c.router, now):
+                        long_offline_quarantined.append(c.id)
                         continue
                     agent_cleanup_items[c.id] = {
                         "kind": "pppoe",
@@ -1419,6 +1446,9 @@ async def cleanup_expired_users_background():
                 if c.router and getattr(c.router, 'auth_method', None) == 'RADIUS':
                     c.status = CustomerStatus.INACTIVE
                     directly_deactivated_ids.add(c.id)
+                    continue
+                if c.router and _router_long_offline(c.router, now):
+                    long_offline_quarantined.append(c.id)
                     continue
                 if c.router:
                     agent_cleanup_items[c.id] = {
@@ -1468,6 +1498,15 @@ async def cleanup_expired_users_background():
                 logger.warning(
                     "[CRON] Skipping %d customer(s) on recently-offline routers: %s",
                     len(offline_skipped), offline_skipped[:50],
+                )
+
+            if long_offline_quarantined:
+                logger.warning(
+                    "[CRON] Quarantined %d expired customer(s) on routers offline for at least %s; "
+                    "rows remain ACTIVE and automatically re-enter cleanup after the router reports online: %s",
+                    len(long_offline_quarantined),
+                    ROUTER_LONG_OFFLINE_CLEANUP_QUARANTINE,
+                    long_offline_quarantined[:50],
                 )
 
             if batch_deferred:
