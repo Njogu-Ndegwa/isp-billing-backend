@@ -3,10 +3,9 @@ from pydantic import BaseModel
 import subprocess
 import os
 import logging
-import re
 import shlex
+import socket
 import time
-from collections import Counter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,15 +19,9 @@ L2TP_CHAP_SECRETS_PATH = os.environ.get("L2TP_CHAP_SECRETS_PATH", "/etc/ppp/chap
 L2TP_SERVER_NAME = "l2tp-server"
 WG_RECENT_HANDSHAKE_SECONDS = int(os.environ.get("WG_RECENT_HANDSHAKE_SECONDS", "180"))
 
-IPSEC_CONNMARK_RULE_RE = re.compile(
-    r"^-A PREROUTING -s (?P<src>\S+) -d (?P<dst>\S+) -p udp .*?"
-    r"--sport (?P<sport>\d+) --dport (?P<dport>\d+) .*?"
-    r"--set-xmark 0x[0-9a-f]+/0xffffffff$"
-)
-
 
 def _listening_udp_ports(paths=None):
-    """Return UDP ports bound in this network namespace from procfs."""
+    """Return UDP ports bound in this host-network container's namespace."""
     paths = paths or ("/proc/net/udp", "/proc/net/udp6")
     ports = set()
     for path in paths:
@@ -87,17 +80,9 @@ def _wireguard_health():
             timeout=5,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return {
-            "available": False,
-            "interface": WG_INTERFACE,
-            "listening_port": None,
-            "configured_peers": 0,
-            "recent_handshakes": 0,
-            "stale_handshakes": 0,
-            "never_handshaken": 0,
-        }
+        result = None
 
-    if result.returncode != 0:
+    if result is None or result.returncode != 0:
         return {
             "available": False,
             "interface": WG_INTERFACE,
@@ -119,14 +104,13 @@ def _wireguard_health():
         except (IndexError, ValueError):
             handshakes.append(0)
 
-    recent = sum(1 for handshake in handshakes if 0 < now - handshake <= WG_RECENT_HANDSHAKE_SECONDS)
-    stale = sum(1 for handshake in handshakes if handshake > 0 and now - handshake > WG_RECENT_HANDSHAKE_SECONDS)
-    never = sum(1 for handshake in handshakes if handshake <= 0)
+    recent = sum(1 for value in handshakes if 0 < now - value <= WG_RECENT_HANDSHAKE_SECONDS)
+    stale = sum(1 for value in handshakes if value > 0 and now - value > WG_RECENT_HANDSHAKE_SECONDS)
+    never = sum(1 for value in handshakes if value <= 0)
     try:
         listening_port = int(interface_fields[2])
     except (IndexError, ValueError):
         listening_port = None
-
     return {
         "available": True,
         "interface": WG_INTERFACE,
@@ -142,78 +126,19 @@ def _wireguard_health():
 def _l2tp_health():
     ports = _listening_udp_ports()
     configured_peers = _configured_l2tp_peers()
-    l2tp_listener = 1701 in ports
+    listener_available = 1701 in ports
     ipsec_ports = {port: port in ports for port in (500, 4500)}
     ipsec_available = all(ipsec_ports.values())
     required = configured_peers > 0
     return {
-        "available": l2tp_listener and ipsec_available,
+        "available": listener_available and ipsec_available,
         "required": required,
-        "listener_available": l2tp_listener,
+        "listener_available": listener_available,
         "ipsec_available": ipsec_available,
         "listening_port": 1701,
         "ipsec_ports": ipsec_ports,
         "configured_peers": configured_peers,
         "active_sessions": _active_ppp_sessions(),
-    }
-
-
-def _ipsec_connmark_health():
-    """Detect the duplicate NAT-T mark rules that can black-hole live CHILD_SAs.
-
-    The connmark plugin prepends a rule for every CHILD_SA. More than one rule
-    for the exact public source tuple is dangerous because a later stale MARK
-    rule can overwrite the live mark. This is read-only and intentionally lives
-    in the NET_ADMIN manager container rather than the web process.
-    """
-    try:
-        result = subprocess.run(
-            ["iptables-legacy", "-t", "mangle", "-S", "PREROUTING"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except FileNotFoundError:
-        return {
-            "available": False,
-            "healthy": None,
-            "error": "iptables_legacy_not_found",
-            "duplicate_tuple_count": 0,
-            "superseded_rule_count": 0,
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "available": False,
-            "healthy": None,
-            "error": "iptables_audit_timeout",
-            "duplicate_tuple_count": 0,
-            "superseded_rule_count": 0,
-        }
-
-    if result.returncode != 0:
-        return {
-            "available": False,
-            "healthy": None,
-            "error": "iptables_audit_failed",
-            "duplicate_tuple_count": 0,
-            "superseded_rule_count": 0,
-        }
-
-    tuples = Counter()
-    for line in result.stdout.splitlines():
-        match = IPSEC_CONNMARK_RULE_RE.match(line.strip())
-        if not match:
-            continue
-        values = match.groupdict()
-        tuples[(values["src"], values["dst"], values["sport"], values["dport"])] += 1
-
-    duplicate_counts = [count for count in tuples.values() if count > 1]
-    return {
-        "available": True,
-        "healthy": not duplicate_counts,
-        "duplicate_tuple_count": len(duplicate_counts),
-        "superseded_rule_count": sum(count - 1 for count in duplicate_counts),
-        "inspected_rule_count": sum(tuples.values()),
     }
 
 
@@ -240,6 +165,13 @@ class AddL2tpPeerRequest(BaseModel):
 
 class RemoveL2tpPeerRequest(BaseModel):
     username: str
+
+
+class TestRouterRequest(BaseModel):
+    ip: str
+    port: int = 8728
+    timeout: int = 5
+    ping_count: int = 3
 
 
 @app.post("/add-l2tp-peer")
@@ -346,6 +278,38 @@ def list_peers(_=Depends(verify_secret)):
         raise HTTPException(status_code=500, detail="wg command timed out")
 
 
+@app.post("/test-router")
+def test_router(req: TestRouterRequest, _=Depends(verify_secret)):
+    """Verify that this server can reach a router through the insurance VPN."""
+    ping_count = max(1, min(req.ping_count, 5))
+    timeout = max(1, min(req.timeout, 15))
+
+    ping_result = subprocess.run(
+        ["ping", "-c", str(ping_count), "-W", str(timeout), req.ip],
+        capture_output=True,
+        text=True,
+        timeout=(ping_count * timeout) + 3,
+    )
+
+    tcp_success = False
+    tcp_error = None
+    try:
+        with socket.create_connection((req.ip, req.port), timeout=timeout):
+            tcp_success = True
+    except OSError as exc:
+        tcp_error = str(exc)
+
+    return {
+        "ip": req.ip,
+        "port": req.port,
+        "ping_success": ping_result.returncode == 0,
+        "ping_stdout": ping_result.stdout[-2000:],
+        "ping_stderr": ping_result.stderr[-1000:],
+        "tcp_success": tcp_success,
+        "tcp_error": tcp_error,
+    }
+
+
 @app.get("/server-info")
 def server_info(_=Depends(verify_secret)):
     """Return the server's WireGuard public key."""
@@ -380,20 +344,13 @@ def server_info(_=Depends(verify_secret)):
 def health():
     wireguard = _wireguard_health()
     l2tp = _l2tp_health()
-    ipsec_connmark = _ipsec_connmark_health()
-    healthy = (
-        wireguard["available"]
-        and (not l2tp["required"] or l2tp["available"])
-        and ipsec_connmark.get("healthy") is not False
-    )
+    healthy = wireguard["available"] and (not l2tp["required"] or l2tp["available"])
     return {
-        # Keep the original top-level keys for backward compatibility.
         "status": "healthy" if healthy else "unhealthy",
         "interface": WG_INTERFACE,
         "wg_available": wireguard["available"],
         "wireguard": wireguard,
         "l2tp": l2tp,
-        "ipsec_connmark": ipsec_connmark,
     }
 
 

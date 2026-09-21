@@ -11,6 +11,17 @@ Project-level items that should survive across agent sessions.
 - Why it matters: stale users and queues confuse diagnosis and could become authorization-bearing again if another repair path recreates matching state.
 - Proposed next step: from an operator workstation, run a rate-limited per-router audit against historical reconnect moves, re-check the customer's current DB MAC immediately before each removal, and delete only old-MAC artifacts. Do not fan out from the 1 GB production server.
 
+### Shared Management Tunnel Health And Recovery
+
+- Status: started
+- Problem: the 2026-08-28 unattended-upgrade restart cascade left `xl2tpd` failed while customer routers retained WAN internet, silently removing the application's management path to RouterOS v6 devices.
+- Why it matters: L2TP and WireGuard are fleet-wide dependencies. A single listener failure can make dozens of otherwise-online routers unreachable without any customer-facing internet symptom.
+- Done so far: restored L2TP, added combined primary AWS plus Hetzner emergency WireGuard/L2TP health, an admin API and frontend incident panel, focused tests, and a systemd recovery drop-in under `ops/systemd/`. The panel explicitly labels Hetzner as manual rescue because no automatic application fallback exists. See `incidents/2026-08-28-xl2tpd-maintenance-restart-failure.md`.
+- The 2026-09-21 follow-up adds cached per-router up/watch/down/unknown state,
+  24-hour flap history, and a direct duplicate-IPsec-connmark early warning for
+  the stale-SA failure signature.
+- Proposed next step: install the drop-in and deploy the application/manager changes; then connect the health endpoint to an out-of-band notification channel. Design automatic Hetzner fallback through the planned central router I/O gateway, with per-router control-ready verification—not just tunnel-up state.
+
 ### M-Pesa Callback Handler Atomic Completion Claim
 
 - Status: planned
