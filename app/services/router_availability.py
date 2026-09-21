@@ -117,9 +117,19 @@ def summarize_router_flaps(
     outage_transitions = sum(1 for item in transitions if item["to"] == "offline")
     recovery_transitions = sum(1 for item in transitions if item["to"] == "online")
     transition_count = len(transitions)
+    last_sample = ordered[-1] if ordered else None
+    last_sample_at = _check_value(last_sample, "checked_at") if last_sample else None
     return {
         "status": "online" if state is True else "offline" if state is False else "unknown",
         "sample_count": len(ordered),
+        "last_sample_at": last_sample_at.isoformat() if last_sample_at else None,
+        "last_sample_online": (
+            bool(_check_value(last_sample, "is_online")) if last_sample else None
+        ),
+        "pending_outage": pending_offline_at is not None,
+        "pending_outage_since": (
+            pending_offline_at.isoformat() if pending_offline_at else None
+        ),
         "transition_count": transition_count,
         "outage_count": outage_transitions,
         "recovery_count": recovery_transitions,

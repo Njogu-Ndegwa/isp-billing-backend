@@ -49,6 +49,12 @@ their old rules did not collide.  Routers whose NAT preserved/reused source port
   noise.
 - Added debounced flap/outage interpretation to the existing 30-day router
   availability store and exposed fleet and per-router history in the admin UI.
+- Added a read-only connmark collision audit to the primary tunnel manager. The
+  admin dashboard now raises an early warning as soon as duplicate NAT-T tuples
+  appear, before operators have to infer the problem from router reconnects.
+- Added a cached fleet state view that separates confirmed online, first-failure
+  watch, confirmed offline, and stale/unknown routers without fan-out calls from
+  the dashboard request.
 
 ## Verification
 
@@ -64,8 +70,8 @@ their old rules did not collide.  Routers whose NAT preserved/reused source port
 
 - Deploy the backend before the frontend so the UI receives the new `flapping`
   response fields.
-- Add an operator alert based on repeated debounced transitions, not a single
-  failed probe.
+- Connect the dashboard's connmark and repeated-flap warning to an out-of-band
+  operator notification channel after the dashboard rollout is stable.
 - Retry the exact retired-profile cleanup when unreachable Router-0826 returns.
 - Diagnose Router-1153's reboot/power fault locally; it is independent of the
   IPsec mark collision.

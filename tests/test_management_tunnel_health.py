@@ -98,6 +98,30 @@ def test_wg_manager_counts_only_l2tp_chap_peers(tmp_path):
     assert module._configured_l2tp_peers(str(secrets)) == 2
 
 
+def test_wg_manager_detects_duplicate_ipsec_connmark_tuples(monkeypatch):
+    module = _load_wg_manager_module()
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = (
+            "-A PREROUTING -s 197.248.1.2/32 -d 54.91.202.229/32 -p udp -m udp "
+            "--sport 4500 --dport 4500 -j MARK --set-xmark 0x2/0xffffffff\n"
+            "-A PREROUTING -s 197.248.1.2/32 -d 54.91.202.229/32 -p udp -m udp "
+            "--sport 4500 --dport 4500 -j MARK --set-xmark 0x1/0xffffffff\n"
+            "-A PREROUTING -s 102.220.2.3/32 -d 54.91.202.229/32 -p udp -m udp "
+            "--sport 51000 --dport 4500 -j MARK --set-xmark 0x3/0xffffffff\n"
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: Result())
+    result = module._ipsec_connmark_health()
+
+    assert result["available"] is True
+    assert result["healthy"] is False
+    assert result["duplicate_tuple_count"] == 1
+    assert result["superseded_rule_count"] == 1
+
+
 def test_manager_health_is_unhealthy_when_l2tp_is_down(monkeypatch):
     module = _load_wg_manager_module()
     monkeypatch.setattr(module, "_wireguard_health", lambda: {"available": True})
@@ -146,12 +170,51 @@ def test_combined_health_names_l2tp_blast_radius():
     assert result["automatic_failover_enabled"] is False
 
 
+def test_combined_health_raises_early_warning_for_duplicate_connmarks():
+    fleet = {
+        "wireguard": {"registered_routers": 100, "online_routers": 90},
+        "l2tp": {"registered_routers": 59, "online_routers": 55},
+    }
+    manager = {
+        "wireguard": {"available": True},
+        "l2tp": {"required": True, "available": True, "active_sessions": 55},
+        "ipsec_connmark": {
+            "available": True,
+            "healthy": False,
+            "duplicate_tuple_count": 2,
+            "superseded_rule_count": 7,
+        },
+    }
+
+    result = build_management_tunnel_health(
+        manager,
+        fleet,
+        insurance_manager=_healthy_insurance_manager(),
+    )
+
+    assert result["overall_status"] == "critical"
+    assert "IPsec early warning" in result["summary"]
+    assert result["primary"]["ipsec_connmark"]["superseded_rule_count"] == 7
+
+
 @pytest.mark.asyncio
 async def test_admin_endpoint_combines_manager_and_router_counts(db, client, monkeypatch):
     admin = await make_admin(db)
     reseller = await make_reseller(db)
-    await make_router(db, reseller, ip_address="10.0.0.25", last_status=True)
-    l2tp_router = await make_router(db, reseller, ip_address="10.0.100.9", last_status=False)
+    await make_router(
+        db,
+        reseller,
+        ip_address="10.0.0.25",
+        last_status=True,
+        last_checked_at=datetime.utcnow(),
+    )
+    l2tp_router = await make_router(
+        db,
+        reseller,
+        ip_address="10.0.100.9",
+        last_status=False,
+        last_checked_at=datetime.utcnow(),
+    )
     started = datetime.utcnow() - timedelta(minutes=10)
     db.add_all([
         RouterAvailabilityCheck(router_id=l2tp_router.id, checked_at=started, is_online=True, source="test"),
@@ -204,5 +267,8 @@ async def test_admin_endpoint_combines_manager_and_router_counts(db, client, mon
     assert payload["insurance"]["services"]["l2tp"]["online_routers"] == 16
     assert payload["flapping"]["affected_count"] == 1
     assert payload["flapping"]["routers"][0]["router_id"] == l2tp_router.id
+    assert payload["fleet_status"]["online_count"] == 1
+    assert payload["fleet_status"]["offline_count"] == 1
+    assert payload["fleet_status"]["routers"][0]["router_id"] == l2tp_router.id
     assert "repeatedly losing and recovering" in payload["summary"]
     assert payload["automatic_failover_enabled"] is False
