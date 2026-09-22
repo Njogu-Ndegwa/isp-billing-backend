@@ -98,6 +98,16 @@
   "surface",
   "updated_at"
  ],
+ "app_instance_heartbeats": [
+  "app_version",
+  "db_identity",
+  "hostname",
+  "instance_id",
+  "last_seen_at",
+  "runtime_mode",
+  "scheduler_enabled",
+  "started_at"
+ ],
  "app_settings": [
   "key",
   "updated_at",
@@ -459,6 +469,13 @@
   "status",
   "target_environment",
   "updated_at"
+ ],
+ "ops_health_snapshots": [
+  "generated_at",
+  "id",
+  "metrics",
+  "overall_status",
+  "payload"
  ],
  "outage_compensation_items": [
   "compensation_id",

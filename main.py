@@ -2642,6 +2642,43 @@ async def run_hot_path_index_migrations():
     logger.info("Migration: hot-path indexes are ready: %s", ", ".join(index_names))
 
 
+async def run_ops_health_migrations():
+    """Operations health monitor (app/services/ops_health.py).
+
+    Two NEW tables via the checkfirst create_all pattern: ops_health_snapshots
+    and app_instance_heartbeats. Plus one relaxation on an existing table:
+    provisioning_logs.customer_id becomes nullable so the safety net can log a
+    per-router "safety_net_binding_removed" row that has no customer (the
+    removed bindings are, by definition, MACs no customer owns). DROP NOT NULL
+    is idempotent by nature. Safe to run on every startup.
+    """
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+
+        from app.db.models import AppInstanceHeartbeat, OpsHealthSnapshot
+        # Explicit startup create_all targets: ops_health_snapshots,
+        # app_instance_heartbeats.
+        targets = [OpsHealthSnapshot, AppInstanceHeartbeat]
+        to_create = [m.__table__ for m in targets if m.__tablename__ not in tables]
+        if to_create:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
+            logger.info(
+                "Ops health migration: created %s",
+                ", ".join(t.name for t in to_create),
+            )
+
+        await conn.execute(sa_text(
+            "ALTER TABLE provisioning_logs ALTER COLUMN customer_id DROP NOT NULL"
+        ))
+
+    logger.info("Ops health migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     if shadow_mode_enabled():
@@ -2859,6 +2896,12 @@ async def startup_event():
         logger.info("Hot-path index migrations completed successfully")
     except Exception as e:
         logger.error(f"Hot-path index migration failed (non-fatal): {e}")
+
+    try:
+        await run_ops_health_migrations()
+        logger.info("Ops health migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Ops health migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
     if not scheduler_enabled():
@@ -3090,7 +3133,40 @@ async def startup_event():
         )
         logger.info("B2B status reconciliation scheduled every 10 minutes")
 
+    # --- Operations health monitor -------------------------------------------
+    # DB-only job: heartbeat -> (skip if pool busy) -> compute sections ->
+    # evaluate rules -> deliver alerts -> store snapshot -> prune 7d. It does no
+    # network I/O (the optional critical SMS is queued and dispatched after its
+    # session closes). Only ONE active writer should ever run this job; the
+    # app_instance_heartbeats table is what detects when that is violated
+    # (control_plane.multiple_writers -- the 2026-09-22 fenced-AWS incident).
+    async def _ops_health_snapshot_background():
+        from app.services.ops_health import run_cycle
+        try:
+            await run_cycle()
+        except Exception as e:
+            logger.error(f"[OPS-HEALTH] Snapshot cycle failed: {e}")
+
+    scheduler.add_job(
+        _ops_health_snapshot_background,
+        trigger=IntervalTrigger(seconds=60),
+        id='ops_health_snapshot',
+        name='Operations health snapshot + alerting',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
+    )
+
+    # In-process job registry (app/services/job_registry.py): records
+    # started/finished/error/missed/max-instances per job for the ops-health
+    # "jobs" section. Listener must be attached before start() to see the
+    # first submissions.
+    from app.services import job_registry
+    job_registry.install(scheduler)
+
     scheduler.start()
+    job_registry.sync_jobs(scheduler)
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "
         "cap sampler every 19s, queue repair every 313s, hotspot provisioning retry every 97s, "

@@ -507,7 +507,10 @@ class Router(Base):
 class ProvisioningLog(Base):
     __tablename__ = "provisioning_logs"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    # Nullable since the ops-health monitor (2026-09): the safety net logs one
+    # "safety_net_binding_removed" row per router with no customer. Startup
+    # migration: run_ops_health_migrations() in main.py (DROP NOT NULL).
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
     attempt_id = Column(Integer, ForeignKey("provisioning_attempts.id"), nullable=True)
     mac_address = Column(String(50), nullable=True)
@@ -2391,3 +2394,43 @@ class OutageCompensationItem(Base):
     reprovision_state = Column(String(32), nullable=True, index=True)
     reprovision_error = Column(String(500), nullable=True)
     reprovision_attempted_at = Column(DateTime, nullable=True)
+
+
+# ========================================
+# OPERATIONS HEALTH MONITOR
+# ========================================
+
+class OpsHealthSnapshot(Base):
+    """One evaluated operations-health snapshot (app/services/ops_health.py).
+
+    ``payload`` carries the full ``sections`` + ``alerts`` object served by
+    ``GET /api/admin/ops-health``; ``metrics`` is the small flat subset used for
+    sparklines and 7-day baselines so history/baseline reads never have to load
+    the full payload. Rows are pruned to 7 days by the snapshot job.
+    """
+    __tablename__ = "ops_health_snapshots"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    generated_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    overall_status = Column(String(16), nullable=False, default="unknown")
+    payload = Column(JSON, nullable=False)
+    metrics = Column(JSON, nullable=True)
+
+
+class AppInstanceHeartbeat(Base):
+    """Liveness row per running app process.
+
+    Exactly one instance should ever be an active scheduler writer. The
+    2026-09-22 incident (fenced AWS app restarted by CI, its scheduler running
+    against a stale database) is detected by counting rows with
+    ``runtime_mode == "active"`` and ``scheduler_enabled`` seen in the last 3
+    minutes, and by any two rows disagreeing on ``db_identity``.
+    """
+    __tablename__ = "app_instance_heartbeats"
+    instance_id = Column(String(128), primary_key=True)
+    hostname = Column(String(255), nullable=True)
+    runtime_mode = Column(String(16), nullable=False, default="unknown")
+    scheduler_enabled = Column(Boolean, nullable=False, default=False)
+    db_identity = Column(String(64), nullable=True)
+    app_version = Column(String(64), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    last_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)

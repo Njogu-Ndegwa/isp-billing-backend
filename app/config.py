@@ -162,6 +162,14 @@ class Settings(BaseSettings):
     ROUTER_WEBFIG_SESSION_MINUTES: int = 120
     ROUTER_WEBFIG_PROXY_TIMEOUT_SECONDS: int = 20
 
+    # --- Operations health monitor (app/services/ops_health.py) ------------
+    # Optional JSON written by ops/native-router-route-sync.py on the tunnel
+    # host: {"checked_at": iso, "native": n, "transit_fallback": n, "unrouted": n}.
+    # Empty = the control-path tile reports available=false.
+    OPS_ROUTE_STATE_FILE: str = ""
+    # Critical-only SMS destination for ops alerts. Empty = inbox alerts only.
+    OPS_ALERT_SMS_PHONE: str = ""
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

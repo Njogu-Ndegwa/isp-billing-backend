@@ -873,6 +873,7 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
         async def _find_candidates_task(r):
             rk = f"{r.ip_address}:{r.port}"
             ri = {
+                "id": r.id,
                 "ip": r.ip_address, "username": r.username,
                 "password": r.password, "port": r.port, "name": r.name,
             }
@@ -936,14 +937,42 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
             *[_remove_task(group) for group in candidate_groups],
             return_exceptions=True,
         )
+        removed_per_router: dict[int, int] = {}
         for i, outcome in enumerate(removal_outcomes):
             if isinstance(outcome, Exception):
                 logger.error(f"[SAFETY-NET] Error removing bindings on router {candidate_groups[i]['router_info']['name']}: {outcome}")
             else:
                 total_removed += outcome
+                router_id = candidate_groups[i]["router_info"].get("id")
+                if outcome and router_id is not None:
+                    removed_per_router[router_id] = removed_per_router.get(router_id, 0) + int(outcome)
+        if removed_per_router:
+            await _record_safety_net_removals(removed_per_router)
     except Exception as e:
         logger.error(f"[SAFETY-NET] Cleanup failed: {e}")
     return total_removed
+
+
+async def _record_safety_net_removals(removed_per_router: dict[int, int]) -> None:
+    """One ``safety_net_binding_removed`` provisioning_logs row per router.
+
+    The ops-health monitor sums the ``count=N`` values to spot a spike (the
+    2026-09-22 stale-database incident deleted 1,062 paid bindings in 90 min).
+    Own short session, after all router I/O; never fatal to the cleanup.
+    """
+    try:
+        async with async_session() as log_db:
+            for router_id, count in removed_per_router.items():
+                log_db.add(ProvisioningLog(
+                    customer_id=None,
+                    router_id=router_id,
+                    action="safety_net_binding_removed",
+                    status="success",
+                    details=f"count={count}",
+                ))
+            await log_db.commit()
+    except Exception as log_err:
+        logger.warning("[SAFETY-NET] Could not record binding removals: %s", log_err)
 
 
 def _cleanup_single_router_pppoe_sync(router_info: dict, customers_data: list) -> dict:
@@ -1714,6 +1743,18 @@ async def cleanup_expired_users_background():
                                 action="pppoe_deactivation",
                                 status="success",
                                 details="Expiry cleanup confirmed session and secret absent",
+                            ))
+                        else:
+                            # Confirmed RouterOS removal only (all_successful_ids);
+                            # quarantined/deferred/failed rows never reach here.
+                            # Feeds the ops-health expiry removal-latency p95.
+                            db.add(ProvisioningLog(
+                                customer_id=customer.id,
+                                router_id=customer.router_id,
+                                mac_address=customer.mac_address,
+                                action="hotspot_deactivation",
+                                status="success",
+                                details="Expiry cleanup removed hotspot access",
                             ))
                         newly_deactivated_ids.add(customer.id)
             await db.commit()
