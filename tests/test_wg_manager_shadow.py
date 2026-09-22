@@ -34,10 +34,16 @@ def test_wg_manager_shadow_mode_blocks_peer_mutations(monkeypatch):
 def test_wg_manager_health_reports_shadow_mode(monkeypatch):
     module = load_wg_manager_module()
     monkeypatch.setattr(module, "SHADOW_MODE", True)
-
-    class Result:
-        returncode = 0
-
-    monkeypatch.setattr(module.subprocess, "run", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr(module, "_wireguard_health", lambda: {"available": True})
+    monkeypatch.setattr(
+        module,
+        "_l2tp_health",
+        lambda: {"required": False, "available": False},
+    )
+    monkeypatch.setattr(
+        module,
+        "_ipsec_connmark_health",
+        lambda: {"healthy": True},
+    )
 
     assert module.health()["runtime_mode"] == "shadow"

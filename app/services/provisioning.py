@@ -562,9 +562,9 @@ def _rsc_backup_l2tp(token: ProvisioningToken) -> str:
 # ---- STEP 3B: BACKUP L2TP/IPsec VPN (new server insurance tunnel) ----
 
 :do {{
-    /interface l2tp-client add name={interface_name} connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=no allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Insurance tunnel to new AWS"
+    /interface l2tp-client add name={interface_name} connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=yes allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Standby management tunnel - enable only during failover"
 }} on-error={{
-    /interface l2tp-client set [find where name={interface_name}] connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=no allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Insurance tunnel to new AWS"
+    /interface l2tp-client set [find where name={interface_name}] connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=yes allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Standby management tunnel - enable only during failover"
 }}
 
 :do {{
@@ -575,7 +575,7 @@ def _rsc_backup_l2tp(token: ProvisioningToken) -> str:
     :log warning "Provisioning: RouterOS rejected backup L2TP use-ipsec/ipsec-secret settings"
 }}
 
-:log info "Provisioning: backup L2TP/IPsec tunnel configured"
+:log info "Provisioning: backup L2TP/IPsec tunnel staged disabled for single-active failover"
 :delay 15s"""
 
 

@@ -1330,7 +1330,7 @@ async def get_routers(
             if backup_ip_error:
                 backup_status = "invalid_ip"
                 backup_source = "derived_ip"
-            elif batch_status in {"verified", "partial"}:
+            elif batch_status in {"verified", "partial", "standby"}:
                 backup_status = batch_status
             elif backup_ip and backup_ip in manager_backup_ips:
                 backup_status = "registered"
@@ -1505,7 +1505,14 @@ async def configure_router_insurance_wireguard(
                 router_config["router_public_key"],
                 backup_ip,
             )
-        verify_result = await verify_insurance_router(backup_ip, port=router_obj.port)
+        if tunnel_type == "l2tp":
+            verify_result = {
+                "mode": "configured_standby",
+                "active": False,
+                "reason": "L2TP backup is intentionally disabled for single-active failover",
+            }
+        else:
+            verify_result = await verify_insurance_router(backup_ip, port=router_obj.port)
     except InsuranceWireGuardError as exc:
         logger.error(
             "Insurance tunnel setup failed for router %s (%s): %s",

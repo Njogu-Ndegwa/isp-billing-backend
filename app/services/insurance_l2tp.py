@@ -26,11 +26,11 @@ def build_l2tp_plan(router_ip: str, backup_ip: str) -> List[str]:
         "Confirm RouterOS version needs the L2TP/IPsec insurance tunnel",
         f"Register L2TP credentials on new server as {backup_ip}",
         f"Ensure {settings.INSURANCE_L2TP_INTERFACE} exists on RouterOS",
-        f"Ensure {settings.INSURANCE_L2TP_INTERFACE} connects to {settings.INSURANCE_SERVER_PUBLIC_IP}",
+        f"Stage {settings.INSURANCE_L2TP_INTERFACE} disabled for controlled failover to {settings.INSURANCE_SERVER_PUBLIC_IP}",
         f"Ensure MikroTik API accepts {settings.INSURANCE_SERVER_VPN_IP}/32",
         "Ensure firewall allows backup API source before input drops",
         f"Ensure hotspot walled garden includes {settings.INSURANCE_SERVER_PUBLIC_IP}/32",
-        "Ask new server to verify ping and TCP 8728 over the backup tunnel",
+        "Record the backup as configured standby; do not verify it as active",
     ]
 
 
@@ -74,11 +74,14 @@ def _ensure_l2tp_client(
         "connect-to": settings.INSURANCE_SERVER_PUBLIC_IP,
         "user": username,
         "password": password,
-        "disabled": "no",
+        # Two simultaneous IKEv1/L2TP clients can leave stale connmark rules
+        # after CHILD_SA rekeys, especially when several routers share NAT.
+        # Keep the backup cold until a controlled, single-active promotion.
+        "disabled": "yes",
         "allow": "mschap2,mschap1",
         "add-default-route": "no",
         "use-peer-dns": "no",
-        "comment": "Insurance tunnel to new AWS",
+        "comment": "Standby management tunnel - enable only during failover",
     }
 
     if existing:
@@ -141,6 +144,8 @@ def configure_router_backup_l2tp(
         "l2tp_username": username,
         "actions": actions,
         "backup_ip": backup_ip,
+        "standby_mode": "single_active",
+        "standby_disabled": True,
     }
 
 

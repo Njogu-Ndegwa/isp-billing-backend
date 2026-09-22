@@ -11,6 +11,7 @@ import logging
 
 from app.core.runtime_mode import (
     runtime_mode_name,
+    scheduler_enabled,
     shadow_http_request_allowed,
     shadow_mode_enabled,
 )
@@ -2860,7 +2861,7 @@ async def startup_event():
         logger.error(f"Hot-path index migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
-    if not app_settings.RUN_SCHEDULER or not app_settings.SCHEDULER_ENABLED:
+    if not scheduler_enabled():
         if scheduler.running:
             scheduler.shutdown(wait=False)
         scheduler.remove_all_jobs()

@@ -71,7 +71,7 @@ def test_migration_environment_is_passed_through_compose():
 
     assert "RUN_SCHEDULER=${RUN_SCHEDULER:-true}" in compose
     assert "SERVER_PUBLIC_IP=${SERVER_PUBLIC_IP:-54.91.202.229}" in compose
-    assert "PULL_SERVICE_URL=${PULL_SERVICE_URL:-http://35.170.199.141:8443}" in compose
+    assert "PULL_SERVICE_URL=${PULL_SERVICE_URL:-}" in compose
 
 
 def test_radius_accepts_primary_and_hetzner_tunnel_subnets():

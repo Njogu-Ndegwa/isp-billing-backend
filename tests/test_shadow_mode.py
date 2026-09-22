@@ -274,6 +274,22 @@ def test_compose_wires_shadow_and_pull_configuration():
     assert "35.170.199.141:8443" not in compose
 
 
+def test_runtime_mode_distinguishes_shadow_standby_and_active(monkeypatch):
+    from app.core.runtime_mode import runtime_mode_name
+
+    monkeypatch.setattr(settings, "SHADOW_MODE", True)
+    monkeypatch.setattr(settings, "RUN_SCHEDULER", False)
+    monkeypatch.setattr(settings, "SCHEDULER_ENABLED", False)
+    assert runtime_mode_name() == "shadow"
+
+    monkeypatch.setattr(settings, "SHADOW_MODE", False)
+    assert runtime_mode_name() == "standby"
+
+    monkeypatch.setattr(settings, "RUN_SCHEDULER", True)
+    monkeypatch.setattr(settings, "SCHEDULER_ENABLED", True)
+    assert runtime_mode_name() == "active"
+
+
 def test_shadow_compose_is_isolated_and_excludes_active_control_plane():
     compose = Path("docker-compose.shadow.yml").read_text(encoding="utf-8")
 

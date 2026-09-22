@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 
 from app.services import insurance_tunnel_batch as batch
 from app.services.insurance_tunnel_batch import (
@@ -197,5 +198,69 @@ def test_verify_candidate_retries_until_backup_reachability_passes(monkeypatch):
 
     monkeypatch.setattr(batch, "verify_insurance_router", fake_verify)
     monkeypatch.setattr(batch.asyncio, "sleep", no_sleep)
+
+    asyncio.run(run())
+
+
+def test_l2tp_batch_stages_disabled_standby_without_active_verification(monkeypatch):
+    candidate = replace(
+        make_candidate(83, token_vpn_type="l2tp"),
+        l2tp_username="l2tp-Router-0083",
+        l2tp_password="secret",
+    )
+    verify_calls = []
+
+    async def fake_register(username, password, backup_ip):
+        assert (username, password, backup_ip) == (
+            "l2tp-Router-0083",
+            "secret",
+            candidate.backup_ip,
+        )
+        return {"status": "registered"}
+
+    async def fake_run_router_op(_router, _operation, **_kwargs):
+        return batch.RouterOpResult(
+            status=batch.RouterOpStatus.OK,
+            value={
+                "actions": ["Created l2tp-aws2"],
+                "standby_mode": "single_active",
+                "standby_disabled": True,
+            },
+        )
+
+    async def fail_if_verified(*_args, **_kwargs):
+        verify_calls.append(True)
+        raise AssertionError("disabled L2TP standby must not be verified as active")
+
+    async def run():
+        async with batch._jobs_lock:
+            batch._jobs.clear()
+            batch._active_job_id = None
+            batch._jobs["job"] = {
+                "job_id": "job",
+                "status": "running",
+                "created_at": "2026-09-22T00:00:00Z",
+                "updated_at": "2026-09-22T00:00:00Z",
+                "items": [batch._item_from_candidate(candidate)],
+            }
+
+        try:
+            await batch._process_l2tp_candidate("job", candidate)
+            item = (await batch.get_insurance_tunnel_batch("job"))["items"][0]
+        finally:
+            async with batch._jobs_lock:
+                batch._jobs.clear()
+                batch._active_job_id = None
+
+        assert item["status"] == "standby"
+        assert item["verification"]["mode"] == "configured_standby"
+        assert item["verification"]["active"] is False
+        assert item["verification_attempts"] == []
+        assert item["error"] is None
+        assert verify_calls == []
+
+    monkeypatch.setattr(batch, "register_insurance_l2tp_peer", fake_register)
+    monkeypatch.setattr(batch, "run_router_op", fake_run_router_op)
+    monkeypatch.setattr(batch, "verify_insurance_router", fail_if_verified)
 
     asyncio.run(run())

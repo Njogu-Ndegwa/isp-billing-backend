@@ -31,8 +31,17 @@ def shadow_mode_enabled() -> bool:
     return bool(getattr(settings, "SHADOW_MODE", False))
 
 
+def scheduler_enabled() -> bool:
+    """Honor the current kill switch and the legacy Hetzner candidate alias."""
+    return bool(getattr(settings, "RUN_SCHEDULER", True)) and bool(
+        getattr(settings, "SCHEDULER_ENABLED", True)
+    )
+
+
 def runtime_mode_name() -> str:
-    return "shadow" if shadow_mode_enabled() else "active"
+    if shadow_mode_enabled():
+        return "shadow"
+    return "active" if scheduler_enabled() else "standby"
 
 
 def shadow_http_request_allowed(method: str, path: str) -> bool:

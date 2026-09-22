@@ -33,7 +33,10 @@ services:
     env_file:
       - ${HETZNER_ENV_FILE:-.env.hetzner}
     environment:
-      SHADOW_MODE: "false"
+      # Fail closed. Promotion must explicitly set SHADOW_MODE=false and enable
+      # both scheduler switches after the old primary has been fenced.
+      SHADOW_MODE: ${SHADOW_MODE:-true}
+      RUN_SCHEDULER: ${RUN_SCHEDULER:-false}
       SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-false}
       SMS_DISPATCH_ENABLED: ${SMS_DISPATCH_ENABLED:-false}
       MPESA_B2B_DAILY_PAYOUT_ENABLED: ${MPESA_B2B_DAILY_PAYOUT_ENABLED:-false}
@@ -65,6 +68,7 @@ services:
       start_period: 120s
 
   freeradius:
+    profiles: ["active"]
     build:
       context: ./radius
       dockerfile: Dockerfile

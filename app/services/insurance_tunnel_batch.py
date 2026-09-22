@@ -282,6 +282,7 @@ def _blank_counts() -> Dict[str, int]:
     return {
         "queued": 0,
         "running": 0,
+        "standby": 0,
         "verified": 0,
         "partial": 0,
         "failed": 0,
@@ -787,7 +788,27 @@ async def _process_l2tp_candidate(job_id: str, candidate: InsuranceTunnelCandida
     )
     if not config_result.is_ok:
         raise InsuranceWireGuardError(_gateway_error(config_result))
-    await _verify_candidate(job_id, candidate, manager_result, config_result.value)
+    logger.info(
+        "Insurance L2TP standby staged disabled for router %s (%s -> %s)",
+        candidate.router.id,
+        candidate.router.ip_address,
+        candidate.backup_ip,
+    )
+    await _update_item(
+        job_id,
+        candidate.router.id,
+        status="standby",
+        manager=manager_result,
+        router_actions=config_result.value.get("actions", []),
+        verification={
+            "mode": "configured_standby",
+            "active": False,
+            "reason": "L2TP backup is intentionally disabled for single-active failover",
+        },
+        verification_attempts=[],
+        finished_at=_now_iso(),
+        error=None,
+    )
 
 
 async def _process_wireguard_candidate(
