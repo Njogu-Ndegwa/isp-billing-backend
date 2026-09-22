@@ -294,6 +294,77 @@ async def test_provisioning_section_counts_backlog_and_latency(db, now):
     assert call["p95"] == pytest.approx(9.55)
 
 
+def test_tunnel_type_follows_management_ip_ranges():
+    assert ops_health.tunnel_type_for_ip("10.0.0.244") == "wireguard"
+    assert ops_health.tunnel_type_for_ip("10.0.99.7") == "wireguard"
+    assert ops_health.tunnel_type_for_ip("10.0.100.12") == "l2tp"
+    assert ops_health.tunnel_type_for_ip("10.251.3.9") == "wg2_insurance"
+    assert ops_health.tunnel_type_for_ip("10.250.0.44") == "aws_insurance"
+    assert ops_health.tunnel_type_for_ip("192.168.88.1") == "other"
+    assert ops_health.tunnel_type_for_ip(None) == "other"
+    assert ops_health.tunnel_type_for_ip("not-an-ip") == "other"
+
+
+@pytest.mark.asyncio
+async def test_provisioning_section_splits_latency_and_backlog_by_tunnel(db, now):
+    """L2TP routers slow while WireGuard stays flat: the split must show it and
+    every problematic router must carry its tunnel."""
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    wg = await make_router(db, reseller, ip_address="10.0.0.5", name="WG-A")
+    l2 = await make_router(db, reseller, ip_address="10.0.100.9", name="L2TP-B")
+    l2_backlog = await make_router(db, reseller, ip_address="10.0.101.3", name="L2TP-C")
+    recent = now - timedelta(minutes=5)
+
+    for secs in (1.0, 1.5, 2.0):
+        c = await make_customer(db, reseller, plan, wg)
+        db.add(_attempt(c, wg, state=ProvisioningState.ROUTER_UPDATED, created=recent,
+                        attempted=recent, updated=recent + timedelta(seconds=secs)))
+    for secs in (30.0, 40.0, 45.0, 50.0, 70.0):   # >= 5 samples: enough to alert
+        c = await make_customer(db, reseller, plan, l2)
+        db.add(_attempt(c, l2, state=ProvisioningState.ROUTER_UPDATED, created=recent,
+                        attempted=recent, updated=recent + timedelta(seconds=secs)))
+    for _ in range(4):
+        c = await make_customer(db, reseller, plan, l2_backlog)
+        db.add(_attempt(c, l2_backlog, state=ProvisioningState.RETRY_PENDING,
+                        created=recent, attempted=recent, error="timeout"))
+    c = await make_customer(db, reseller, plan, wg)
+    db.add(_attempt(c, wg, state=ProvisioningState.RETRY_PENDING, created=recent, attempted=recent))
+    await db.commit()
+
+    section = await ops_health.build_provisioning_section(now)
+    by_tunnel = section["latency"]["by_tunnel"]
+    assert list(by_tunnel) == ["wireguard", "l2tp"]
+    assert by_tunnel["wireguard"]["router_call"]["p95"] == pytest.approx(1.95)
+    assert by_tunnel["wireguard"]["routers"] == 1
+    assert by_tunnel["l2tp"]["router_call"]["p95"] == pytest.approx(66.0)
+    assert by_tunnel["l2tp"]["router_call"]["samples"] == 5
+    assert by_tunnel["l2tp"]["routers"] == 2
+    assert section["backlog_by_tunnel"] == {
+        "wireguard": {"routers": 1, "pending": 1, "routers_with_backlog": 0},
+        "l2tp": {"routers": 1, "pending": 4, "routers_with_backlog": 1},
+    }
+    top = section["top_routers"][0]
+    assert top["router_name"] == "L2TP-C" and top["tunnel"] == "l2tp"
+    assert section["top_routers"][1]["tunnel"] == "wireguard"
+
+    # The per-tunnel p95s are stored flat so the 7-day baseline can be per tunnel.
+    metrics = ops_health.metrics_from_sections({"provisioning": section})
+    assert metrics["provisioning_p95_router_call__l2tp"] == pytest.approx(66.0)
+    assert metrics["provisioning_samples_router_call__wireguard"] == 3
+
+    # And the alert names the tunnel (L2TP p95 is over the 60 s floor).
+    alerts = rules.evaluate({"provisioning": section,
+                             "control_plane": {"active_writers": 1,
+                                               "minutes_since_writer_heartbeat": 0.5}})
+    keys = {a["key"]: a for a in alerts}
+    assert keys["provisioning.tunnel_latency_l2tp"]["severity"] == "critical"
+    assert "L2TP/IPsec" in keys["provisioning.tunnel_latency_l2tp"]["title"]
+    assert "2 routers use this tunnel" in keys["provisioning.tunnel_latency_l2tp"]["message"]
+    assert "provisioning.tunnel_latency_wireguard" not in keys
+    assert rules.section_status("provisioning", section, alerts) == "critical"
+
+
 @pytest.mark.asyncio
 async def test_expiry_section_splits_hot_from_quarantined_and_measures_removal(db, now):
     reseller = await make_reseller(db)
@@ -326,6 +397,11 @@ async def test_expiry_section_splits_hot_from_quarantined_and_measures_removal(d
     assert section["removal_latency"]["samples"] == 1
     assert section["removal_latency"]["p95"] == pytest.approx(300)
     assert hot_old.expiry < now
+    # Factory routers sit on 10.0.0.2 (WireGuard); quarantined ones are excluded.
+    assert section["hot_by_tunnel"] == {"wireguard": {"routers": 1, "customers": 2}}
+    assert section["removal_latency_by_tunnel"]["wireguard"]["p95"] == pytest.approx(300)
+    metrics = ops_health.metrics_from_sections({"expiry": section})
+    assert metrics["expiry_samples_removal__wireguard"] == 1
 
 
 @pytest.mark.asyncio

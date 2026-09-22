@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ from app.db.models import (
 from app.core.runtime_mode import runtime_mode_name, scheduler_enabled
 from app.services import job_registry
 from app.services import ops_health_rules as rules
+from app.services.management_tunnel_health import classify_primary_tunnel
 from app.services.router_availability import ROUTER_STATUS_STALE_AFTER_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -179,6 +181,45 @@ def read_route_state_file(path: str) -> dict:
         return unavailable
 
 
+# Display order for per-tunnel breakdowns. Primary planes first, then the
+# insurance planes, then anything the classifier cannot place.
+TUNNEL_TYPES = ("wireguard", "l2tp", "wg2_insurance", "aws_insurance", "other")
+
+
+def tunnel_type_for_ip(ip_address: Optional[str]) -> str:
+    """Which management tunnel a router is reached over, from its stored IP.
+
+    Primary planes follow ``management_tunnel_health.classify_primary_tunnel``
+    (10.0.0-99.x WireGuard, 10.0.100-199.x L2TP/IPsec). The Hetzner wg2
+    insurance plane is 10.251/16 and the retired-AWS one 10.250/16.
+    """
+    primary = classify_primary_tunnel(ip_address)
+    if primary:
+        return primary
+    try:
+        octets = str(ipaddress.ip_address(ip_address or "")).split(".")
+    except ValueError:
+        return "other"
+    if octets[:2] == ["10", "251"]:
+        return "wg2_insurance"
+    if octets[:2] == ["10", "250"]:
+        return "aws_insurance"
+    return "other"
+
+
+def _by_tunnel_latency(samples_by_tunnel: dict[str, list[float]],
+                       baselines_by_tunnel: dict[str, tuple[Optional[float], int]]) -> dict:
+    """{tunnel: latency_block} for every tunnel that has samples or a known
+    baseline, in TUNNEL_TYPES order."""
+    out: dict[str, dict] = {}
+    for tunnel in TUNNEL_TYPES:
+        if tunnel not in samples_by_tunnel and tunnel not in baselines_by_tunnel:
+            continue
+        base = baselines_by_tunnel.get(tunnel) or (None, 0)
+        out[tunnel] = latency_block(samples_by_tunnel.get(tunnel, []), base[0], base[1])
+    return out
+
+
 def _parse_count(details: Optional[str]) -> int:
     if not details:
         return 0
@@ -258,12 +299,13 @@ async def build_provisioning_section(now: datetime, baselines: Optional[dict] = 
             key=lambda r: (-r[1], r[0]),
         )
         top_ids = [rid for rid, _ in pending_by_router[:10]]
-        names: dict[int, str] = {}
+        # id -> (name, tunnel type) for the whole fleet: the per-tunnel split
+        # needs every router an attempt touched, not just the top ten.
+        router_rows = (await db.execute(select(Router.id, Router.name, Router.ip_address))).all()
+        names: dict[int, str] = {rid: name for rid, name, _ in router_rows}
+        tunnel_of: dict[int, str] = {rid: tunnel_type_for_ip(ip) for rid, _, ip in router_rows}
         errors: dict[int, str] = {}
         if top_ids:
-            names = dict((await db.execute(
-                select(Router.id, Router.name).where(Router.id.in_(top_ids))
-            )).all())
             err_rows = (await db.execute(
                 select(ProvisioningAttempt.router_id, ProvisioningAttempt.last_error)
                 .where(ProvisioningAttempt.router_id.in_(top_ids),
@@ -277,7 +319,7 @@ async def build_provisioning_section(now: datetime, baselines: Optional[dict] = 
                     errors[rid] = str(err)[:120]
         lat_rows = (await db.execute(
             select(ProvisioningAttempt.created_at, ProvisioningAttempt.last_attempt_at,
-                   ProvisioningAttempt.router_updated_at)
+                   ProvisioningAttempt.router_updated_at, ProvisioningAttempt.router_id)
             .where(ProvisioningAttempt.router_updated_at >= window_start)
             .order_by(ProvisioningAttempt.router_updated_at.desc())
             .limit(ROW_FETCH_LIMIT)
@@ -290,7 +332,7 @@ async def build_provisioning_section(now: datetime, baselines: Optional[dict] = 
         if snap_e2e is None or snap_call is None:
             raw_baseline_rows = (await db.execute(
                 select(ProvisioningAttempt.created_at, ProvisioningAttempt.last_attempt_at,
-                       ProvisioningAttempt.router_updated_at)
+                       ProvisioningAttempt.router_updated_at, ProvisioningAttempt.router_id)
                 .where(ProvisioningAttempt.router_updated_at >= now - BASELINE_WINDOW,
                        ProvisioningAttempt.router_updated_at < window_start)
                 .order_by(ProvisioningAttempt.router_updated_at.desc())
@@ -306,21 +348,74 @@ async def build_provisioning_section(now: datetime, baselines: Optional[dict] = 
     success_ratio = round(counts["router_updated"] / settled, 3) if settled else None
 
     def _split(rows):
+        """Fleet lists plus per-tunnel lists for both latencies."""
         e2e, call = [], []
-        for created, attempted, updated in rows:
+        e2e_t: dict[str, list[float]] = defaultdict(list)
+        call_t: dict[str, list[float]] = defaultdict(list)
+        for created, attempted, updated, router_id in rows:
+            tunnel = tunnel_of.get(router_id, "other")
             v = _seconds(updated, created)
             if v is not None and v >= 0:
                 e2e.append(v)
+                e2e_t[tunnel].append(v)
             v = _seconds(updated, attempted)
             if v is not None and v >= 0:
                 call.append(v)
-        return e2e, call
+                call_t[tunnel].append(v)
+        return e2e, call, e2e_t, call_t
 
-    e2e, call = _split(lat_rows)
+    e2e, call, e2e_by_tunnel, call_by_tunnel = _split(lat_rows)
+
+    # Baselines: fleet + per tunnel, from stored snapshots when there are
+    # enough, else from the raw 7-day rows fetched above.
+    base_e2e_t: dict[str, tuple[Optional[float], int]] = {}
+    base_call_t: dict[str, tuple[Optional[float], int]] = {}
     if snap_e2e is None or snap_call is None:
-        base_e2e, base_call = _split(raw_baseline_rows)
+        base_e2e, base_call, raw_e2e_t, raw_call_t = _split(raw_baseline_rows)
         snap_e2e = snap_e2e or (percentile(base_e2e, 95), len(base_e2e))
         snap_call = snap_call or (percentile(base_call, 95), len(base_call))
+        for tunnel, values in raw_e2e_t.items():
+            base_e2e_t[tunnel] = (percentile(values, 95), len(values))
+        for tunnel, values in raw_call_t.items():
+            base_call_t[tunnel] = (percentile(values, 95), len(values))
+    else:
+        for tunnel in TUNNEL_TYPES:
+            e2e_b = _baseline_from_snapshots(
+                baselines or {}, f"provisioning_p95_end_to_end__{tunnel}",
+                f"provisioning_samples_end_to_end__{tunnel}")
+            call_b = _baseline_from_snapshots(
+                baselines or {}, f"provisioning_p95_router_call__{tunnel}",
+                f"provisioning_samples_router_call__{tunnel}")
+            if e2e_b and e2e_b[1]:
+                base_e2e_t[tunnel] = e2e_b
+            if call_b and call_b[1]:
+                base_call_t[tunnel] = call_b
+
+    # Backlog split by tunnel so a problem plane is obvious at a glance.
+    backlog_by_tunnel: dict[str, dict] = {}
+    for rid, n in pending_by_router:
+        tunnel = tunnel_of.get(rid, "other")
+        entry = backlog_by_tunnel.setdefault(tunnel, {"routers": 0, "pending": 0,
+                                                       "routers_with_backlog": 0})
+        entry["routers"] += 1
+        entry["pending"] += int(n)
+        if n >= 3:
+            entry["routers_with_backlog"] += 1
+    backlog_by_tunnel = {t: backlog_by_tunnel[t] for t in TUNNEL_TYPES if t in backlog_by_tunnel}
+
+    e2e_blocks = _by_tunnel_latency(e2e_by_tunnel, base_e2e_t)
+    call_blocks = _by_tunnel_latency(call_by_tunnel, base_call_t)
+    routers_per_tunnel: dict[str, int] = defaultdict(int)
+    for tunnel in tunnel_of.values():
+        routers_per_tunnel[tunnel] += 1
+    by_tunnel = {
+        tunnel: {
+            "end_to_end": e2e_blocks.get(tunnel),
+            "router_call": call_blocks.get(tunnel),
+            "routers": routers_per_tunnel.get(tunnel, 0),
+        }
+        for tunnel in TUNNEL_TYPES if tunnel in e2e_blocks or tunnel in call_blocks
+    }
 
     return {
         "status": "unknown",
@@ -329,14 +424,16 @@ async def build_provisioning_section(now: datetime, baselines: Optional[dict] = 
         "success_ratio": success_ratio,
         "success_ratio_samples": settled,
         "routers_with_backlog": sum(1 for _, n in pending_by_router if n >= 3),
+        "backlog_by_tunnel": backlog_by_tunnel,
         "top_routers": [
             {"router_id": rid, "router_name": names.get(rid), "pending": int(n),
-             "last_error": errors.get(rid)}
+             "last_error": errors.get(rid), "tunnel": tunnel_of.get(rid, "other")}
             for rid, n in pending_by_router[:10]
         ],
         "latency": {
             "end_to_end": latency_block(e2e, snap_e2e[0], snap_e2e[1]),
             "router_call": latency_block(call, snap_call[0], snap_call[1]),
+            "by_tunnel": by_tunnel,
         },
     }
 
@@ -410,7 +507,8 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
     window_start = now - WINDOW
     async with database.async_session() as db:
         router_rows = (await db.execute(
-            select(Router.id, Router.last_status, Router.last_online_at, Router.created_at)
+            select(Router.id, Router.last_status, Router.last_online_at, Router.created_at,
+                   Router.ip_address)
         )).all()
         group_rows = (await db.execute(
             select(Customer.router_id, func.count(), func.min(Customer.expiry))
@@ -421,7 +519,7 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
             .group_by(Customer.router_id)
         )).all()
         removal_rows = (await db.execute(
-            select(ProvisioningLog.log_date, Customer.expiry)
+            select(ProvisioningLog.log_date, Customer.expiry, Customer.router_id)
             .join(Customer, Customer.id == ProvisioningLog.customer_id)
             .where(ProvisioningLog.action.in_(DEACTIVATION_ACTIONS),
                    ProvisioningLog.status == "success",
@@ -434,7 +532,7 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
         raw_rows = []
         if snap is None:
             raw_rows = (await db.execute(
-                select(ProvisioningLog.log_date, Customer.expiry)
+                select(ProvisioningLog.log_date, Customer.expiry, Customer.router_id)
                 .join(Customer, Customer.id == ProvisioningLog.customer_id)
                 .where(ProvisioningLog.action.in_(DEACTIVATION_ACTIONS),
                        ProvisioningLog.status == "success",
@@ -445,12 +543,14 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
             )).all()
         await db.commit()
 
+    tunnel_of = {rid: tunnel_type_for_ip(ip) for rid, _, _, _, ip in router_rows}
     quarantined_routers = {
-        rid for rid, last_status, last_online, created in router_rows
+        rid for rid, last_status, last_online, created, _ in router_rows
         if is_router_quarantined(last_status, last_online, created, now)
     }
     total = hot = quarantined = 0
     oldest_hot: Optional[datetime] = None
+    hot_by_tunnel: dict[str, dict] = {}
     for router_id, n, oldest in group_rows:
         n = int(n)
         total += n
@@ -458,21 +558,37 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
             quarantined += n
             continue
         hot += n
+        entry = hot_by_tunnel.setdefault(tunnel_of.get(router_id, "other"),
+                                         {"routers": 0, "customers": 0})
+        entry["routers"] += 1
+        entry["customers"] += n
         if oldest is not None and (oldest_hot is None or oldest < oldest_hot):
             oldest_hot = oldest
+    hot_by_tunnel = {t: hot_by_tunnel[t] for t in TUNNEL_TYPES if t in hot_by_tunnel}
 
     def _latencies(rows):
         out = []
-        for log_date, expiry in rows:
+        by_tunnel: dict[str, list[float]] = defaultdict(list)
+        for log_date, expiry, router_id in rows:
             v = _seconds(log_date, expiry)
             if v is not None and v >= 0:
                 out.append(v)
-        return out
+                by_tunnel[tunnel_of.get(router_id, "other")].append(v)
+        return out, by_tunnel
 
-    samples = _latencies(removal_rows)
+    samples, samples_by_tunnel = _latencies(removal_rows)
+    base_by_tunnel: dict[str, tuple[Optional[float], int]] = {}
     if snap is None:
-        base = _latencies(raw_rows)
+        base, raw_by_tunnel = _latencies(raw_rows)
         snap = (percentile(base, 95), len(base))
+        for tunnel, values in raw_by_tunnel.items():
+            base_by_tunnel[tunnel] = (percentile(values, 95), len(values))
+    else:
+        for tunnel in TUNNEL_TYPES:
+            b = _baseline_from_snapshots(baselines or {}, f"expiry_p95_removal__{tunnel}",
+                                         f"expiry_samples_removal__{tunnel}")
+            if b and b[1]:
+                base_by_tunnel[tunnel] = b
 
     job = job_registry.get(CLEANUP_JOB_ID, now) or {}
     since_finish = job.get("seconds_since_finish")
@@ -481,10 +597,12 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
         "expired_active_total": total,
         "expired_active_hot": hot,
         "expired_active_quarantined": quarantined,
+        "hot_by_tunnel": hot_by_tunnel,
         "oldest_hot_expired_minutes": (
             round(_seconds(now, oldest_hot) / 60, 1) if oldest_hot else None
         ),
         "removal_latency": latency_block(samples, snap[0], snap[1]),
+        "removal_latency_by_tunnel": _by_tunnel_latency(samples_by_tunnel, base_by_tunnel),
         "cleanup_job": {
             "last_finished_at": job.get("last_finished_at"),
             "last_duration_seconds": job.get("last_duration_seconds"),
@@ -658,7 +776,18 @@ def metrics_from_sections(sections: dict) -> dict:
     sn = sections.get("safety_net") or {}
     cp = sections.get("control_plane") or {}
     lat = prov.get("latency") or {}
+    metrics: dict[str, Any] = {}
+    # Per-tunnel p95/sample pairs feed the per-tunnel 7-day baselines.
+    for tunnel, block in (lat.get("by_tunnel") or {}).items():
+        for kind in ("end_to_end", "router_call"):
+            sub = (block or {}).get(kind) or {}
+            metrics[f"provisioning_p95_{kind}__{tunnel}"] = sub.get("p95")
+            metrics[f"provisioning_samples_{kind}__{tunnel}"] = sub.get("samples", 0)
+    for tunnel, block in (exp.get("removal_latency_by_tunnel") or {}).items():
+        metrics[f"expiry_p95_removal__{tunnel}"] = (block or {}).get("p95")
+        metrics[f"expiry_samples_removal__{tunnel}"] = (block or {}).get("samples", 0)
     return {
+        **metrics,
         "provisioning_retry_pending": (prov.get("counts") or {}).get("retry_pending", 0),
         "provisioning_p95_end_to_end": (lat.get("end_to_end") or {}).get("p95"),
         "provisioning_samples_end_to_end": (lat.get("end_to_end") or {}).get("samples", 0),

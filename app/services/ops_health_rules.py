@@ -76,6 +76,14 @@ JOBS_STALE_MIN_MINUTES = 5
 
 LOCAL_UTC_OFFSET_HOURS = 3   # EAT; mirrors settings.LOCAL_UTC_OFFSET_HOURS
 
+TUNNEL_LABELS = {
+    "wireguard": "WireGuard",
+    "l2tp": "L2TP/IPsec",
+    "wg2_insurance": "wg2 insurance",
+    "aws_insurance": "AWS insurance",
+    "other": "unclassified tunnel",
+}
+
 SEVERITY_ORDER = {"critical": 3, "warning": 2, "watch": 1, "healthy": 0, "unknown": -1}
 STATUS_ORDER = {"critical": 4, "warning": 3, "watch": 2, "unknown": 1, "healthy": 0}
 
@@ -198,6 +206,22 @@ def evaluate(sections: dict, now: Optional[datetime] = None) -> list[dict]:
     )
     if a:
         alerts.append(a)
+    # Router-call latency per management tunnel: the "us or them" signal. One
+    # plane drifting while the other stays flat points at that tunnel host
+    # (strongSwan for L2TP, wg for WireGuard), not at the sites.
+    for tunnel, block in ((prov.get("latency") or {}).get("by_tunnel") or {}).items():
+        a = _latency_ratio_alert(
+            f"provisioning.tunnel_latency_{tunnel}",
+            f"Router-call latency p95 on {TUNNEL_LABELS.get(tunnel, tunnel)}",
+            (block or {}).get("router_call"),
+            PROVISIONING_LATENCY_RATIO_WARN, PROVISIONING_LATENCY_RATIO_CRIT,
+            min_samples=PROVISIONING_LATENCY_MIN_SAMPLES,
+            p95_crit_seconds=PROVISIONING_LATENCY_P95_CRIT_SECONDS,
+        )
+        if a:
+            a["message"] += (f" {int((block or {}).get('routers') or 0)} routers use this "
+                             f"tunnel; compare the other tunnels before blaming the sites.")
+            alerts.append(a)
 
     # payments ----------------------------------------------------------------
     pay = s.get("payments") or {}
