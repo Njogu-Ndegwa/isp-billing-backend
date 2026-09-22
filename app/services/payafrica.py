@@ -4,11 +4,10 @@
 to PayAfrica and returns the link the payer opens. Amounts are in MAJOR units
 (``10`` with ``USD`` shows "Pay USD 10" on the checkout page).
 
-PayAfrica does not yet expose a status lookup or a signed webhook for these
-checkouts, so nothing here can prove a payment succeeded. Card payments are
-confirmed by an admin (``POST /api/admin/subscriptions/payments/{id}/confirm-card``)
-and never from the browser redirect back to ``callback_url``, which anyone
-can forge.
+PayAfrica can notify the tokenized per-payment webhook after checkout. Card
+payments are completed from that server-to-server notification, with the admin
+confirmation endpoint as a fallback, and never from the browser redirect back
+to ``callback_url`` (which anyone can forge).
 
 Docs: https://api.payafrica.org/docs
 """

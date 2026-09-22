@@ -392,8 +392,8 @@ async def pay_subscription_by_card(
 ):
     """Create a card checkout (PayAfrica/Paystack) for the invoice's full balance.
 
-    Returns the hosted checkout link. The payment stays pending until an admin
-    confirms it: PayAfrica gives us no way to verify the payment, and the
+    Returns the hosted checkout link. The payment stays pending until PayAfrica
+    calls the tokenized server-to-server webhook or an admin confirms it; the
     browser redirect after checkout proves nothing.
     """
     from app.services.payafrica import (

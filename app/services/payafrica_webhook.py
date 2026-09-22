@@ -28,7 +28,10 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-_SUCCESS_VALUES = {"success", "successful", "completed", "complete", "paid", "payment.completed", "charge.success"}
+_SUCCESS_VALUES = {
+    "success", "successful", "completed", "complete", "paid",
+    "payment.completed", "payment.succeeded", "charge.success",
+}
 _FAILURE_VALUES = {"failed", "failure", "reversed", "cancelled", "canceled", "payment.failed"}
 
 
@@ -93,14 +96,32 @@ def amount_matches(payload: Any, expected_amount: float, expected_currency: str)
     accepted. A currency in the payload must match; a missing one is allowed
     because the payment id already pins the checkout.
     """
-    raw = _first(payload, ("amount", "amount_paid", "value", "requested_amount"))
-    if raw is None:
-        return False
-    try:
-        amount = float(str(raw).replace(",", ""))
-    except (TypeError, ValueError):
-        return False
-    if abs(amount - expected_amount) > 0.01 and abs(amount - expected_amount * 100) > 0.01:
+    # The live PayAfrica relay uses ``amount_subunits`` (1000 for USD 10).
+    # Keep it distinct from the older/undocumented amount fields so a value of
+    # 10 subunits can never be mistaken for USD 10.
+    raw_subunits = _first(payload, ("amount_subunits",))
+    if raw_subunits is not None:
+        try:
+            amount_subunits = float(str(raw_subunits).replace(",", ""))
+        except (TypeError, ValueError):
+            return False
+        amount_ok = abs(amount_subunits - expected_amount * 100) <= 0.01
+    else:
+        raw = _first(payload, ("amount", "amount_paid", "value", "requested_amount"))
+        if raw is None:
+            return False
+        try:
+            amount = float(str(raw).replace(",", ""))
+        except (TypeError, ValueError):
+            return False
+        # Older relay payloads have used both major and minor units under the
+        # generic ``amount`` key, so retain support for both there.
+        amount_ok = (
+            abs(amount - expected_amount) <= 0.01
+            or abs(amount - expected_amount * 100) <= 0.01
+        )
+
+    if not amount_ok:
         return False
 
     currency = _first(payload, ("currency", "currency_code"))
