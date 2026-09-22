@@ -225,10 +225,12 @@ async def test_subscription_revenue_sums_usd_card_payment_in_kes(db, client, mon
     }
 
     mrr = await compute_mrr(db)
-    assert mrr["current_mrr"] == pytest.approx(1795.0, abs=0.01)
+    assert mrr["current_mrr"] == pytest.approx(500 + 1256.15, abs=0.01)
+    assert mrr["basis"] == "net_subscription_revenue"
+    assert mrr["card_processing_fee_rate"] == 0.03
 
     history = await compute_subscription_revenue_history(db, period="30d")
-    assert history["total_revenue"] == pytest.approx(1795.0, abs=0.01)
+    assert history["total_revenue"] == pytest.approx(500 + 1256.15, abs=0.01)
 
 
 @pytest.mark.asyncio

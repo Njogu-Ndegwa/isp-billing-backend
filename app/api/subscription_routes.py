@@ -29,6 +29,7 @@ from app.services.subscription import (
 )
 from app.services.markets import (
     MARKETS, get_market, market_summary, PAY_CARD,
+    PAYSTACK_PROCESSING_FEE_RATE,
     REPORTING_CURRENCY, kes_per_unit, to_kes, sql_kes_by_currency, kes_rates,
 )
 from app.services.mpesa import initiate_stk_push_direct
@@ -55,13 +56,6 @@ OWNER_DESTINATION_TYPES = [
     ResellerPaymentMethodType.BANK_ACCOUNT,
     ResellerPaymentMethodType.MPESA_PAYBILL,
 ]
-
-# Until PayAfrica exposes an actual settlement/fee report, account for card
-# receipts using the operator-approved assumption that Paystack retains 3%.
-# MRR and gross subscription revenue remain the full amount paid; only the
-# separate card settlement view is net of this fee.
-PAYSTACK_PROCESSING_FEE_RATE = 0.03
-
 
 # ============================================================
 # Reseller-facing endpoints
