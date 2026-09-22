@@ -25,6 +25,8 @@ from app.db.models import (
 )
 from app.services.app_settings import get_setting, set_setting
 from app.services.markets import (
+    PAY_CARD,
+    PAYSTACK_PROCESSING_FEE_RATE,
     REPORTING_CURRENCY,
     kes_per_unit,
     sql_kes_by_currency,
@@ -46,8 +48,17 @@ logger = logging.getLogger(__name__)
 # currency (KES over M-Pesa, USD by card); customer payments are in the owning
 # reseller's market currency, so those queries join User on reseller_id.
 def _sub_kes():
-    """SubscriptionPayment.amount converted to KES."""
-    return sql_kes_by_currency(SubscriptionPayment.amount, SubscriptionPayment.currency)
+    """Net subscription revenue in KES, after assumed card processing fees."""
+    gross_kes = sql_kes_by_currency(
+        SubscriptionPayment.amount, SubscriptionPayment.currency
+    )
+    return case(
+        (
+            SubscriptionPayment.payment_method == PAY_CARD,
+            gross_kes * (1 - PAYSTACK_PROCESSING_FEE_RATE),
+        ),
+        else_=gross_kes,
+    )
 
 
 def _cp_kes():
@@ -412,6 +423,8 @@ async def compute_mrr(db: AsyncSession) -> dict[str, Any]:
         "previous_period_mrr": round(previous, 2),
         "change_percent": _pct_change(current, previous),
         "currency": REPORTING_CURRENCY,
+        "basis": "net_subscription_revenue",
+        "card_processing_fee_rate": PAYSTACK_PROCESSING_FEE_RATE,
         **_fx_meta(),
         "breakdown": {
             "new_mrr": round(new_mrr, 2),

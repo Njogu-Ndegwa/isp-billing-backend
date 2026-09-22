@@ -24,6 +24,9 @@ PRICING_FLAT = "flat"
 
 PAY_MPESA = "mpesa"
 PAY_CARD = "card"
+# Operator-approved accounting assumption until provider settlement reports
+# expose the actual fee per transaction.
+PAYSTACK_PROCESSING_FEE_RATE = 0.03
 
 DEFAULT_MARKET = "KE"
 

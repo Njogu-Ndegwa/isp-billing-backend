@@ -92,6 +92,7 @@ async def _state(session_factory, reseller_id, invoice_id, payment_id):
 @pytest.mark.parametrize("payload,expected", [
     ({"status": "success"}, "success"),
     ({"event": "payment.completed"}, "success"),
+    ({"event": "payment.succeeded"}, "success"),
     ({"data": {"status": "successful"}}, "success"),
     ({"status": "failed"}, "failed"),
     ({"event": "payment.failed"}, "failed"),
@@ -105,6 +106,8 @@ def test_extract_outcome(payload, expected):
 @pytest.mark.parametrize("payload,ok", [
     ({"amount": 10, "currency": "USD"}, True),
     ({"amount": 1000, "currency": "USD"}, True),      # minor units
+    ({"amount_subunits": 1000, "currency": "USD"}, True),
+    ({"amount_subunits": 10, "currency": "USD"}, False),
     ({"data": {"amount": "10.00", "currency": "usd"}}, True),
     ({"amount": 10}, True),                            # currency omitted
     ({"amount": 9, "currency": "USD"}, False),
@@ -149,6 +152,32 @@ async def test_valid_webhook_activates(db, client, session_factory):
     assert again.json()["status"] == "completed"  # already completed, reported as-is
     user2, _, _ = await _state(session_factory, reseller.id, invoice.id, payment.id)
     assert user2.subscription_expires_at == user.subscription_expires_at
+
+
+@pytest.mark.asyncio
+async def test_live_payafrica_payload_shape_activates(db, client, session_factory):
+    """Regression for the first live callback received on 2026-09-22."""
+    reseller, invoice, payment = await _pending_card_payment(db)
+    payload = {
+        "amount_subunits": 1000,
+        "currency": "USD",
+        "event": "payment.succeeded",
+        "external_reference": payment.payment_reference,
+        "paid_at": "2026-09-22T14:29:30.622494Z",
+        "reference": payment.provider_reference,
+    }
+
+    resp = await client.post(
+        f"/api/payafrica/webhook/{payment.id}/{webhook_token(payment.id)}",
+        json=payload,
+        headers={"x-payafrica-signature": "provider-signature"},
+    )
+
+    assert resp.status_code == 200 and resp.json()["status"] == "completed"
+    user, inv, pay = await _state(session_factory, reseller.id, invoice.id, payment.id)
+    assert pay.status == SubscriptionPaymentStatus.COMPLETED
+    assert inv.status == InvoiceStatus.PAID
+    assert user.subscription_status == SubscriptionStatus.ACTIVE
 
 
 @pytest.mark.asyncio
