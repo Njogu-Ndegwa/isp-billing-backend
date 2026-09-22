@@ -1,0 +1,7 @@
+isp_billing_app | njogundegwa/isp-billing:latest | 0.0.0.0:8000->8000/tcp, [::]:8000->8000/tcp
+isp_billing_radius | isp-billing-radius:latest | 0.0.0.0:1812-1813->1812-1813/udp, [::]:1812-1813->1812-1813/udp
+isp_billing_postgres | postgres:15-alpine | 0.0.0.0:5434->5432/tcp, [::]:5434->5432/tcp
+isp_wg_manager | isp-billing-wg-manager | 
+
+# wg0 peers (private key stripped)
+515

@@ -3,6 +3,10 @@ from pydantic import BaseModel
 import subprocess
 import os
 import logging
+import re
+import shlex
+import time
+from collections import Counter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,12 +18,220 @@ WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0")
 SERVER_PUBLIC_KEY_PATH = os.environ.get("WG_SERVER_PUBKEY_PATH", "/etc/wireguard/server_public.key")
 L2TP_CHAP_SECRETS_PATH = os.environ.get("L2TP_CHAP_SECRETS_PATH", "/etc/ppp/chap-secrets")
 L2TP_SERVER_NAME = "l2tp-server"
+WG_RECENT_HANDSHAKE_SECONDS = int(os.environ.get("WG_RECENT_HANDSHAKE_SECONDS", "180"))
+
+IPSEC_CONNMARK_RULE_RE = re.compile(
+    r"^-A PREROUTING -s (?P<src>\S+) -d (?P<dst>\S+) -p udp .*?"
+    r"--sport (?P<sport>\d+) --dport (?P<dport>\d+) .*?"
+    r"--set-xmark 0x[0-9a-f]+/0xffffffff$"
+)
+
+
+def _listening_udp_ports(paths=None):
+    """Return UDP ports bound in this network namespace from procfs."""
+    paths = paths or ("/proc/net/udp", "/proc/net/udp6")
+    ports = set()
+    for path in paths:
+        try:
+            with open(path) as proc_file:
+                next(proc_file, None)
+                for line in proc_file:
+                    fields = line.split()
+                    if len(fields) < 2 or ":" not in fields[1]:
+                        continue
+                    try:
+                        ports.add(int(fields[1].rsplit(":", 1)[1], 16))
+                    except ValueError:
+                        continue
+        except OSError:
+            continue
+    return ports
+
+
+def _configured_l2tp_peers(path=L2TP_CHAP_SECRETS_PATH):
+    usernames = set()
+    try:
+        with open(path) as secrets_file:
+            for line in secrets_file:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                try:
+                    fields = shlex.split(stripped)
+                except ValueError:
+                    continue
+                if len(fields) < 2 or fields[1] not in {L2TP_SERVER_NAME, "*"}:
+                    continue
+                usernames.add(fields[0])
+    except OSError:
+        return 0
+    return len(usernames)
+
+
+def _active_ppp_sessions(path="/sys/class/net"):
+    try:
+        return sum(
+            1 for name in os.listdir(path)
+            if name.startswith("ppp") and name[3:].isdigit()
+        )
+    except OSError:
+        return 0
+
+
+def _wireguard_health():
+    try:
+        result = subprocess.run(
+            ["wg", "show", WG_INTERFACE, "dump"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {
+            "available": False,
+            "interface": WG_INTERFACE,
+            "listening_port": None,
+            "configured_peers": 0,
+            "recent_handshakes": 0,
+            "stale_handshakes": 0,
+            "never_handshaken": 0,
+        }
+
+    if result.returncode != 0:
+        return {
+            "available": False,
+            "interface": WG_INTERFACE,
+            "listening_port": None,
+            "configured_peers": 0,
+            "recent_handshakes": 0,
+            "stale_handshakes": 0,
+            "never_handshaken": 0,
+        }
+
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    interface_fields = lines[0].split("\t") if lines else []
+    peers = [line.split("\t") for line in lines[1:]]
+    now = int(time.time())
+    handshakes = []
+    for peer in peers:
+        try:
+            handshakes.append(int(peer[4]))
+        except (IndexError, ValueError):
+            handshakes.append(0)
+
+    recent = sum(1 for handshake in handshakes if 0 < now - handshake <= WG_RECENT_HANDSHAKE_SECONDS)
+    stale = sum(1 for handshake in handshakes if handshake > 0 and now - handshake > WG_RECENT_HANDSHAKE_SECONDS)
+    never = sum(1 for handshake in handshakes if handshake <= 0)
+    try:
+        listening_port = int(interface_fields[2])
+    except (IndexError, ValueError):
+        listening_port = None
+
+    return {
+        "available": True,
+        "interface": WG_INTERFACE,
+        "listening_port": listening_port,
+        "configured_peers": len(peers),
+        "recent_handshakes": recent,
+        "stale_handshakes": stale,
+        "never_handshaken": never,
+        "recent_window_seconds": WG_RECENT_HANDSHAKE_SECONDS,
+    }
+
+
+def _l2tp_health():
+    ports = _listening_udp_ports()
+    configured_peers = _configured_l2tp_peers()
+    l2tp_listener = 1701 in ports
+    ipsec_ports = {port: port in ports for port in (500, 4500)}
+    ipsec_available = all(ipsec_ports.values())
+    required = configured_peers > 0
+    return {
+        "available": l2tp_listener and ipsec_available,
+        "required": required,
+        "listener_available": l2tp_listener,
+        "ipsec_available": ipsec_available,
+        "listening_port": 1701,
+        "ipsec_ports": ipsec_ports,
+        "configured_peers": configured_peers,
+        "active_sessions": _active_ppp_sessions(),
+    }
+
+
+def _ipsec_connmark_health():
+    """Detect the duplicate NAT-T mark rules that can black-hole live CHILD_SAs.
+
+    The connmark plugin prepends a rule for every CHILD_SA. More than one rule
+    for the exact public source tuple is dangerous because a later stale MARK
+    rule can overwrite the live mark. This is read-only and intentionally lives
+    in the NET_ADMIN manager container rather than the web process.
+    """
+    try:
+        result = subprocess.run(
+            ["iptables-legacy", "-t", "mangle", "-S", "PREROUTING"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return {
+            "available": False,
+            "healthy": None,
+            "error": "iptables_legacy_not_found",
+            "duplicate_tuple_count": 0,
+            "superseded_rule_count": 0,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "available": False,
+            "healthy": None,
+            "error": "iptables_audit_timeout",
+            "duplicate_tuple_count": 0,
+            "superseded_rule_count": 0,
+        }
+
+    if result.returncode != 0:
+        return {
+            "available": False,
+            "healthy": None,
+            "error": "iptables_audit_failed",
+            "duplicate_tuple_count": 0,
+            "superseded_rule_count": 0,
+        }
+
+    tuples = Counter()
+    for line in result.stdout.splitlines():
+        match = IPSEC_CONNMARK_RULE_RE.match(line.strip())
+        if not match:
+            continue
+        values = match.groupdict()
+        tuples[(values["src"], values["dst"], values["sport"], values["dport"])] += 1
+
+    duplicate_counts = [count for count in tuples.values() if count > 1]
+    return {
+        "available": True,
+        "healthy": not duplicate_counts,
+        "duplicate_tuple_count": len(duplicate_counts),
+        "superseded_rule_count": sum(count - 1 for count in duplicate_counts),
+        "inspected_rule_count": sum(tuples.values()),
+    }
+SHADOW_MODE = os.environ.get("SHADOW_MODE", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 
 def verify_secret(x_api_key: str = Header(...)):
     if x_api_key != API_SECRET:
         raise HTTPException(status_code=403, detail="Invalid API key")
     return True
+
+
+def require_mutations_enabled():
+    if SHADOW_MODE:
+        raise HTTPException(
+            status_code=503,
+            detail="WireGuard/L2TP mutations are disabled in shadow mode",
+        )
 
 
 class AddPeerRequest(BaseModel):
@@ -44,6 +256,7 @@ class RemoveL2tpPeerRequest(BaseModel):
 @app.post("/add-l2tp-peer")
 def add_l2tp_peer(req: AddL2tpPeerRequest, _=Depends(verify_secret)):
     """Append a user line to /etc/ppp/chap-secrets for L2TP authentication."""
+    require_mutations_enabled()
     try:
         line = f'{req.username}    {L2TP_SERVER_NAME}    "{req.password}"    {req.ip}\n'
         existing = ""
@@ -69,6 +282,7 @@ def add_l2tp_peer(req: AddL2tpPeerRequest, _=Depends(verify_secret)):
 @app.delete("/remove-l2tp-peer")
 def remove_l2tp_peer(req: RemoveL2tpPeerRequest, _=Depends(verify_secret)):
     """Remove a user line from /etc/ppp/chap-secrets."""
+    require_mutations_enabled()
     try:
         if not os.path.exists(L2TP_CHAP_SECRETS_PATH):
             raise HTTPException(status_code=404, detail="chap-secrets file not found")
@@ -89,6 +303,7 @@ def remove_l2tp_peer(req: RemoveL2tpPeerRequest, _=Depends(verify_secret)):
 
 @app.post("/add-peer")
 def add_peer(req: AddPeerRequest, _=Depends(verify_secret)):
+    require_mutations_enabled()
     try:
         result = subprocess.run(
             ["wg", "set", WG_INTERFACE, "peer", req.public_key,
@@ -107,6 +322,7 @@ def add_peer(req: AddPeerRequest, _=Depends(verify_secret)):
 
 @app.delete("/remove-peer")
 def remove_peer(req: RemovePeerRequest, _=Depends(verify_secret)):
+    require_mutations_enabled()
     try:
         result = subprocess.run(
             ["wg", "set", WG_INTERFACE, "peer", req.public_key, "remove"],
@@ -177,18 +393,24 @@ def server_info(_=Depends(verify_secret)):
 
 @app.get("/health")
 def health():
-    try:
-        result = subprocess.run(
-            ["wg", "show", WG_INTERFACE],
-            capture_output=True, text=True, timeout=5
-        )
-        return {
-            "status": "healthy" if result.returncode == 0 else "degraded",
-            "interface": WG_INTERFACE,
-            "wg_available": result.returncode == 0
-        }
-    except Exception:
-        return {"status": "unhealthy", "interface": WG_INTERFACE, "wg_available": False}
+    wireguard = _wireguard_health()
+    l2tp = _l2tp_health()
+    ipsec_connmark = _ipsec_connmark_health()
+    healthy = (
+        wireguard["available"]
+        and (not l2tp["required"] or l2tp["available"])
+        and ipsec_connmark.get("healthy") is not False
+    )
+    return {
+        # Keep the original top-level keys for backward compatibility.
+        "status": "healthy" if healthy else "unhealthy",
+        "interface": WG_INTERFACE,
+        "wg_available": wireguard["available"],
+        "wireguard": wireguard,
+        "l2tp": l2tp,
+        "ipsec_connmark": ipsec_connmark,
+        "runtime_mode": "shadow" if SHADOW_MODE else "active",
+    }
 
 
 if __name__ == "__main__":

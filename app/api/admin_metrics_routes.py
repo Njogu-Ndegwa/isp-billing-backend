@@ -4,18 +4,28 @@ Admin dashboard metrics endpoints.
 All routes require admin role (same auth as /api/admin/* endpoints).
 """
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import db_pool_snapshot, get_db
-from app.db.models import User, UserRole
+from app.db.models import Router, RouterAvailabilityCheck, User, UserRole
 from app.services.auth import verify_token, get_current_user
 from app.services import admin_metrics as svc
+from app.services.management_tunnel_health import (
+    build_management_tunnel_health,
+    build_fleet_flap_history,
+    build_fleet_tunnel_status,
+    fetch_insurance_manager_health,
+    fetch_manager_health,
+    fleet_counts,
+    manager_error_code,
+)
 
 router = APIRouter(tags=["admin-metrics"])
 
@@ -157,6 +167,105 @@ async def admin_db_pool_status(
         "postgres_activity": activity,
         "long_running_connections": long_running,
     }
+
+
+@router.get("/api/admin/management-tunnels")
+async def admin_management_tunnel_status(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Return platform-level WireGuard and L2TP/IPsec health for superadmins."""
+    await _require_admin(token, db)
+    router_rows = (
+        await db.execute(
+            select(
+                Router.id,
+                Router.name,
+                Router.identity,
+                Router.ip_address,
+                Router.last_status,
+                Router.last_checked_at,
+                Router.last_status_source,
+            )
+        )
+    ).all()
+    fleet = fleet_counts((row.ip_address, row.last_status) for row in router_rows)
+    router_ids = [row.id for row in router_rows]
+    since = datetime.utcnow() - timedelta(hours=24)
+    availability_rows = []
+    if router_ids:
+        availability_rows = (
+            await db.execute(
+                select(RouterAvailabilityCheck)
+                .where(
+                    RouterAvailabilityCheck.router_id.in_(router_ids),
+                    RouterAvailabilityCheck.checked_at >= since,
+                )
+                .order_by(
+                    RouterAvailabilityCheck.router_id,
+                    RouterAvailabilityCheck.checked_at,
+                    RouterAvailabilityCheck.id,
+                )
+            )
+        ).scalars().all()
+    flap_history = build_fleet_flap_history(
+        [
+            {
+                "id": row.id,
+                "name": row.name,
+                "identity": row.identity,
+                "ip_address": row.ip_address,
+            }
+            for row in router_rows
+        ],
+        availability_rows,
+    )
+    fleet_status = build_fleet_tunnel_status(
+        [
+            {
+                "id": row.id,
+                "name": row.name,
+                "identity": row.identity,
+                "ip_address": row.ip_address,
+                "last_status": row.last_status,
+                "last_checked_at": row.last_checked_at,
+                "last_status_source": row.last_status_source,
+            }
+            for row in router_rows
+        ],
+        availability_rows,
+    )
+
+    # Release the DB transaction before the external manager call. A tunnel
+    # outage must never pin a pooled DB connection while this request times out.
+    await db.commit()
+
+    primary_result, insurance_result = await asyncio.gather(
+        fetch_manager_health(),
+        fetch_insurance_manager_health(),
+        return_exceptions=True,
+    )
+    primary_error = (
+        manager_error_code(primary_result)
+        if isinstance(primary_result, Exception)
+        else None
+    )
+    insurance_error = (
+        manager_error_code(insurance_result)
+        if isinstance(insurance_result, Exception)
+        else None
+    )
+    return build_management_tunnel_health(
+        None if isinstance(primary_result, Exception) else primary_result,
+        fleet,
+        error=primary_error,
+        insurance_manager=(
+            None if isinstance(insurance_result, Exception) else insurance_result
+        ),
+        insurance_error=insurance_error,
+        flap_history=flap_history,
+        fleet_status=fleet_status,
+    )
 
 
 # ---------------------------------------------------------------------------

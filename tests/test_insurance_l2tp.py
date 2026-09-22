@@ -61,7 +61,11 @@ def test_insurance_l2tp_accepts_routeros_v6_without_wireguard_commands():
     assert result["routeros_version"] == "6.49.10"
     assert result["l2tp_username"] == "l2tp-Router-0001"
     assert "Confirmed RouterOS 6.49.10 needs L2TP/IPsec insurance tunnel" in result["actions"]
-    assert any(command == "/interface/l2tp-client/add" for command, _ in api.calls)
+    add_calls = [args for command, args in api.calls if command == "/interface/l2tp-client/add"]
+    assert add_calls
+    assert add_calls[0]["disabled"] == "yes"
+    assert result["standby_mode"] == "single_active"
+    assert result["standby_disabled"] is True
     assert not any("wireguard" in command for command, _ in api.calls)
 
 

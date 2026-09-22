@@ -10,6 +10,8 @@ from datetime import datetime
 import json  # Ensure you import json for serializing logs
 from urllib.parse import urlsplit
 
+from app.core.runtime_mode import shadow_routeros_command_blocked
+
 # Initialize logger
 logger = logging.getLogger("mikrotik_api")
 logger.setLevel(logging.WARNING)  # Reduce noise, only warnings/errors
@@ -405,6 +407,12 @@ class MikroTikAPI:
             return False
 
     def send_command(self, command: str, arguments: Dict[str, str] = None) -> Dict[str, Any]:
+        if shadow_routeros_command_blocked(command):
+            logger.warning("Shadow mode blocked RouterOS command: %s", command)
+            return {
+                "error": "shadow_mode_blocked",
+                "message": "RouterOS mutations are disabled in shadow mode",
+            }
         if not self.connected:
             return {"error": "Not connected"}
         
@@ -469,6 +477,13 @@ class MikroTikAPI:
         the full command sentence has been sent, a closed socket is treated as a
         successful command dispatch.
         """
+        if shadow_routeros_command_blocked("/system/reboot"):
+            logger.warning("Shadow mode blocked RouterOS reboot")
+            return {
+                "error": "shadow_mode_blocked",
+                "message": "RouterOS mutations are disabled in shadow mode",
+                "command_sent": False,
+            }
         if not self.connected:
             return {"error": "Not connected"}
 
@@ -551,6 +566,12 @@ class MikroTikAPI:
             api.send_command_optimized("/ip/arp/print", 
                 proplist=[".id", "mac-address", "address", "interface"])
         """
+        if shadow_routeros_command_blocked(command):
+            logger.warning("Shadow mode blocked RouterOS command: %s", command)
+            return {
+                "error": "shadow_mode_blocked",
+                "message": "RouterOS mutations are disabled in shadow mode",
+            }
         if not self.connected:
             return {"error": "Not connected"}
         

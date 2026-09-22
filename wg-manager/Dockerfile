@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends wireguard-tools && \
+    apt-get install -y --no-install-recommends iptables wireguard-tools && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

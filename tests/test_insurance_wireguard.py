@@ -4,6 +4,7 @@ from app.services.insurance_wireguard import (
     InsuranceWireGuardError,
     backup_ips_from_manager_peers,
     configure_router_backup_wireguard,
+    derive_insurance_ip,
     parse_routeros_major_version,
 )
 
@@ -66,6 +67,30 @@ def test_parse_routeros_major_version():
     assert parse_routeros_major_version("7.19.6 (stable)") == 7
     assert parse_routeros_major_version("6.49.10") == 6
     assert parse_routeros_major_version("") is None
+
+
+def test_derive_insurance_ip_uses_configured_subnet(monkeypatch):
+    from app.services import insurance_wireguard
+
+    monkeypatch.setattr(
+        insurance_wireguard.settings,
+        "INSURANCE_WG_SUBNET",
+        "10.251.0.0/16",
+    )
+
+    assert derive_insurance_ip("10.0.42.17") == "10.251.42.17"
+
+
+def test_explicit_insurance_subnet_overrides_configured_subnet(monkeypatch):
+    from app.services import insurance_wireguard
+
+    monkeypatch.setattr(
+        insurance_wireguard.settings,
+        "INSURANCE_WG_SUBNET",
+        "10.251.0.0/16",
+    )
+
+    assert derive_insurance_ip("10.0.42.17", "10.252.0.0/16") == "10.252.42.17"
 
 
 def test_backup_ips_from_manager_peers_extracts_router_backup_addresses():

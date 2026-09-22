@@ -26,6 +26,8 @@ from typing import Optional, Tuple
 
 import httpx
 
+from app.core.runtime_mode import require_external_side_effects_enabled
+
 logger = logging.getLogger(__name__)
 
 # In-process cache of access tokens, keyed by (api_user, base_url).
@@ -180,6 +182,8 @@ async def initiate_request_to_pay(
     The caller is responsible for persisting a ``MtnMomoTransaction`` with the
     supplied ``reference_id`` in PENDING state before (or after) this call.
     """
+    require_external_side_effects_enabled("MTN MoMo RequestToPay initiation")
+
     access_token = await get_access_token(
         api_user=api_user,
         api_key=api_key,

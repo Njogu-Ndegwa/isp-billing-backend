@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import logging
 
 from app.config import settings
+from app.core.runtime_mode import require_external_side_effects_enabled
 from app.db.database import get_db
 from app.db.models import (
     C2BTransaction,
@@ -367,6 +368,7 @@ async def _call_daraja_registerurl(
     """Call Safaricom Daraja /mpesa/c2b/v2/registerurl. Returns Safaricom's
     response verbatim so the caller can show ResponseDescription / errors
     back to the operator."""
+    require_external_side_effects_enabled("M-Pesa C2B callback registration")
     access_token = await get_access_token(
         consumer_key=consumer_key, consumer_secret=consumer_secret
     )

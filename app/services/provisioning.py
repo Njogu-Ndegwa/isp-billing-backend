@@ -20,6 +20,7 @@ from sqlalchemy import select, func
 from app.db.models import Router, ProvisioningToken, ProvisioningTokenStatus, User
 from app.db.database import AsyncSessionLocal
 from app.config import settings
+from app.core.runtime_mode import require_external_side_effects_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,7 @@ async def allocate_wireguard_ip(db: AsyncSession) -> str:
 
 async def register_wireguard_peer(public_key: str, ip: str):
     """Register a new WireGuard peer via the wg-manager sidecar."""
+    require_external_side_effects_enabled("primary WireGuard peer registration")
     async with _wg_client() as client:
         response = await client.post(
             "/add-peer",
@@ -242,6 +244,7 @@ async def register_wireguard_peer(public_key: str, ip: str):
 
 async def remove_wireguard_peer(public_key: str):
     """Remove a WireGuard peer via the wg-manager sidecar."""
+    require_external_side_effects_enabled("primary WireGuard peer removal")
     async with _wg_client() as client:
         response = await client.request(
             "DELETE",
@@ -270,6 +273,7 @@ async def get_server_wg_public_key() -> str:
 
 async def register_l2tp_peer(username: str, password: str, ip: str):
     """Register a new L2TP peer via the wg-manager sidecar (chap-secrets)."""
+    require_external_side_effects_enabled("primary L2TP peer registration")
     async with _wg_client() as client:
         response = await client.post(
             "/add-l2tp-peer",
@@ -282,6 +286,7 @@ async def register_l2tp_peer(username: str, password: str, ip: str):
 
 async def remove_l2tp_peer(username: str):
     """Remove an L2TP peer via the wg-manager sidecar."""
+    require_external_side_effects_enabled("primary L2TP peer removal")
     async with _wg_client() as client:
         response = await client.request(
             "DELETE",
@@ -557,9 +562,9 @@ def _rsc_backup_l2tp(token: ProvisioningToken) -> str:
 # ---- STEP 3B: BACKUP L2TP/IPsec VPN (new server insurance tunnel) ----
 
 :do {{
-    /interface l2tp-client add name={interface_name} connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=no allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Insurance tunnel to new AWS"
+    /interface l2tp-client add name={interface_name} connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=yes allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Standby management tunnel - enable only during failover"
 }} on-error={{
-    /interface l2tp-client set [find where name={interface_name}] connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=no allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Insurance tunnel to new AWS"
+    /interface l2tp-client set [find where name={interface_name}] connect-to={settings.INSURANCE_SERVER_PUBLIC_IP} user="{token.l2tp_username}" password="{token.l2tp_password}" disabled=yes allow=mschap2,mschap1 add-default-route=no use-peer-dns=no comment="Standby management tunnel - enable only during failover"
 }}
 
 :do {{
@@ -570,7 +575,7 @@ def _rsc_backup_l2tp(token: ProvisioningToken) -> str:
     :log warning "Provisioning: RouterOS rejected backup L2TP use-ipsec/ipsec-secret settings"
 }}
 
-:log info "Provisioning: backup L2TP/IPsec tunnel configured"
+:log info "Provisioning: backup L2TP/IPsec tunnel staged disabled for single-active failover"
 :delay 15s"""
 
 

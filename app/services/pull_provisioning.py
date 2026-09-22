@@ -17,8 +17,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# --- config (env, with safe defaults matching the current POC service) ---
-PULL_SERVICE_URL = os.environ.get("PULL_SERVICE_URL", "http://35.170.199.141:8443").rstrip("/")
+# --- retired rollback-channel config (fail closed when no endpoint is set) ---
+PULL_SERVICE_URL = os.environ.get("PULL_SERVICE_URL", "").rstrip("/")
 PULL_SERVICE_TOKEN = os.environ.get("PULL_SERVICE_TOKEN", "")
 PULL_HANDOFF_TIMEOUT = float(os.environ.get("PULL_HANDOFF_TIMEOUT", "8"))
 
@@ -184,6 +184,12 @@ async def handoff_to_pull_service(identity: str, key: str, rsc: str) -> dict:
     it under `key` (one slot per user, no overwrite). Must be called with NO DB session
     held (network I/O). Never raises on transport error — the app's retry tries again."""
     import httpx
+    from app.core.runtime_mode import shadow_mode_enabled
+
+    if shadow_mode_enabled():
+        return {"ok": False, "error": "shadow_mode_blocked"}
+    if not PULL_SERVICE_URL:
+        return {"ok": False, "error": "pull_service_not_configured"}
     ident = _require(identity, _KEY_RE, "identity")
     url = f"{PULL_SERVICE_URL}/pull/set/{ident}/{_safe_key(key)}"
     try:
@@ -204,6 +210,12 @@ async def handoff_to_pull_service(identity: str, key: str, rsc: str) -> dict:
 async def clear_pull_service(identity: str, key: str) -> dict:
     """Tell the pull service one user's command has been applied; stop serving it."""
     import httpx
+    from app.core.runtime_mode import shadow_mode_enabled
+
+    if shadow_mode_enabled():
+        return {"ok": False, "error": "shadow_mode_blocked"}
+    if not PULL_SERVICE_URL:
+        return {"ok": False, "error": "pull_service_not_configured"}
     ident = _require(identity, _KEY_RE, "identity")
     url = f"{PULL_SERVICE_URL}/pull/clear/{ident}/{_safe_key(key)}"
     try:

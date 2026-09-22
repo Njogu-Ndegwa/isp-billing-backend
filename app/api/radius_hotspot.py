@@ -40,6 +40,7 @@ from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, Field
 
 from app.db.database import get_db
+from app.core.runtime_mode import require_external_side_effects_enabled
 from app.db.models import (
     CollectionMode, Customer, Plan, Router, CustomerStatus,
     MpesaTransaction, MpesaTransactionStatus,
@@ -804,6 +805,7 @@ async def _initiate_radius_stk_push(
     existing mpesa.py initiate_stk_push function. It uses the same
     M-Pesa credentials but points the callback to /api/radius/mpesa/callback.
     """
+    require_external_side_effects_enabled("RADIUS M-Pesa STK push")
     import httpx
 
     # Get access token (same credentials as existing)

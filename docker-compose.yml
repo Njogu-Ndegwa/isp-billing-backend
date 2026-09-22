@@ -52,6 +52,7 @@ services:
       - isp-network
     environment:
       - DATABASE_URL=postgresql+asyncpg://isp_user:isp_secure_pass_2024@db:5432/isp_billing_db
+      - SHADOW_MODE=${SHADOW_MODE:-false}
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - ALGORITHM=HS256
       - ACCESS_TOKEN_EXPIRE_MINUTES=1440
@@ -72,11 +73,14 @@ services:
       - MPESA_B2B_RESULT_URL=${MPESA_B2B_RESULT_URL:-}
       - MPESA_B2B_TIMEOUT_URL=${MPESA_B2B_TIMEOUT_URL:-}
       - MPESA_B2B_DAILY_PAYOUT_ENABLED=${MPESA_B2B_DAILY_PAYOUT_ENABLED:-true}
-      - SERVER_PUBLIC_IP=54.91.202.229
+      - RUN_SCHEDULER=${RUN_SCHEDULER:-true}
+      - SERVER_PUBLIC_IP=${SERVER_PUBLIC_IP:-54.91.202.229}
       - WG_MANAGER_URL=${WG_MANAGER_URL:-http://host.docker.internal:8729}
       - WG_MANAGER_SECRET=${WG_MANAGER_SECRET:-change-me-wg-secret}
       - PROVISION_BASE_URL=${PROVISION_BASE_URL:-https://isp.bitwavetechnologies.net}
+      - PROVISION_LEGACY_BASE_URL=${PROVISION_LEGACY_BASE_URL:-}
       - L2TP_IPSEC_PSK=${L2TP_IPSEC_PSK:-BitwaveL2TP2026!Secure}
+      - PULL_SERVICE_URL=${PULL_SERVICE_URL:-}
       - INSURANCE_WG_MANAGER_URL=${INSURANCE_WG_MANAGER_URL:-}
       - INSURANCE_WG_MANAGER_SECRET=${INSURANCE_WG_MANAGER_SECRET:-}
       - INSURANCE_SERVER_PUBLIC_IP=${INSURANCE_SERVER_PUBLIC_IP:-}
@@ -107,6 +111,9 @@ services:
       - SMTP_USERNAME=${SMTP_USERNAME:-}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
       - SMTP_USE_SSL=${SMTP_USE_SSL:-false}
+      - PULL_SERVICE_URL=${PULL_SERVICE_URL:-}
+      - PULL_SERVICE_TOKEN=${PULL_SERVICE_TOKEN:-}
+      - PULL_HANDOFF_TIMEOUT=${PULL_HANDOFF_TIMEOUT:-8}
     volumes:
       - wg_sock:/var/run/wg-manager
     depends_on:
@@ -167,6 +174,7 @@ services:
       - WG_MANAGER_SECRET=${WG_MANAGER_SECRET:-change-me-wg-secret}
       - WG_INTERFACE=${WG_INTERFACE:-wg0}
       - L2TP_CHAP_SECRETS_PATH=/etc/ppp/chap-secrets
+      - SHADOW_MODE=${SHADOW_MODE:-false}
     volumes:
       - wg_sock:/var/run/wg-manager
       - /etc/ppp:/etc/ppp

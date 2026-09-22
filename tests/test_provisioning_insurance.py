@@ -71,6 +71,9 @@ def test_l2tp_provisioning_script_configures_backup_tunnel(monkeypatch):
     assert "STEP 3B: BACKUP L2TP/IPsec VPN" in script
     assert "l2tp-client add name=l2tp-aws2 connect-to=35.170.199.141" in script
     assert 'user="l2tp-Router-0001" password="L2tpPassword123"' in script
+    assert "l2tp-client add name=l2tp-aws2 connect-to=35.170.199.141" in script
+    assert "l2tp-aws2 connect-to=35.170.199.141" in script
+    assert "disabled=yes allow=mschap2,mschap1 add-default-route=no" in script
     assert "add-default-route=no use-peer-dns=no" in script
     assert "ipsec-secret=insurance-psk" in script
 

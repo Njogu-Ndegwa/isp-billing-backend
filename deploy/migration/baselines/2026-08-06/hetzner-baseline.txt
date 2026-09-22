@@ -1,0 +1,45 @@
+deploy-dispatcher-1 | deploy-dispatcher | 0.0.0.0:8080->8080/tcp
+factory-app-device-portal | node:20-bookworm-slim | 0.0.0.0:8090->3000/tcp
+isp-admin | isp-admin:6caf815 | 127.0.0.1:3001->3000/tcp
+deploy-db-1 | postgres:16-alpine | 5432/tcp
+
+## Caddyfile
+# Bitwave frontend origins on Hetzner (egress-nbg1).
+#
+# Parallel deployment alongside Vercel. Ports 8081/8082 are the pre-DNS test
+# endpoints; the portal-hz./admin-hz. hostname blocks (80/443) get added once
+# Cloudflare DNS points here and an Origin CA cert is installed.
+#
+# Do not add anything that touches iptables FORWARD/NAT - the wg-egress
+# WireGuard role and the software factory (8080/8090) share this box.
+{
+}
+
+# ---- captive portal (static) ----
+:8081 {
+	root * /srv/portal/current
+	header X-Served-By "hetzner"
+	encode gzip
+	file_server
+}
+
+# ---- admin dashboard (Next.js) ----
+:8082 {
+	header X-Served-By "hetzner"
+	encode gzip
+	reverse_proxy 127.0.0.1:3001
+}
+
+## iptables FORWARD/NAT (wg-egress - DO NOT TOUCH baseline)
+-P FORWARD ACCEPT
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-FORWARD
+-A FORWARD -i wg-egress -o eth0 -p tcp -m multiport --dports 25,465,587,22,23,445,3389,5900 -j DROP
+-A FORWARD -i wg-egress -j ACCEPT
+-A FORWARD -o wg-egress -j ACCEPT
+-P POSTROUTING ACCEPT
+-A POSTROUTING -s 172.18.0.0/16 ! -o br-601d6b64843c -j MASQUERADE
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+-A POSTROUTING -s 10.61.0.0/24 -o eth0 -j MASQUERADE
+## disk
+/dev/sda1        38G  8.4G   28G  24% /

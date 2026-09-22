@@ -1,0 +1,56 @@
+# wg1 peer count: 236
+# wg1 iface: wg1              UNKNOWN        10.250.0.1/16 
+# chap-secrets entries: 77
+# ppp sessions live: 12
+
+## xl2tpd.conf
+[global]
+ipsec saref = no
+force userspace = yes
+
+[lns default]
+ip range = 10.250.0.100-10.250.199.255
+local ip = 10.250.0.1
+require authentication = yes
+name = l2tp-server
+pppoptfile = /etc/ppp/options.xl2tpd
+length bit = yes
+
+## options.xl2tpd
+require-mschap-v2
+ms-dns 8.8.8.8
+ms-dns 8.8.4.4
+noccp
+mtu 1280
+mru 1280
+nodefaultroute
+lock
+proxyarp
+
+## ipsec.conf
+config setup
+    charondebug="ike 2, knl 1, cfg 1, net 1"
+    uniqueids=no
+
+conn l2tp-vpn
+    keyexchange=ikev1
+    type=transport
+    authby=secret
+    rekey=no
+    keyingtries=3
+    dpddelay=30
+    dpdtimeout=120
+    dpdaction=clear
+    left=%defaultroute
+    leftprotoport=17/1701
+    right=%any
+    rightprotoport=17/%any
+    ike=aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!
+    esp=aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!
+    mark=%unique
+    auto=add
+
+## sysctls
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0

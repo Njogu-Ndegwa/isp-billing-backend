@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from app.core.runtime_mode import require_external_side_effects_enabled
+
 logger = logging.getLogger(__name__)
 
 FAPSHI_BASE_URLS = {
@@ -111,6 +113,7 @@ async def initiate_direct_payment(
     message: str | None = None,
 ) -> dict:
     """Send a Direct Pay prompt and return Fapshi's accepted transaction."""
+    require_external_side_effects_enabled("Fapshi Direct Pay initiation")
     env = normalize_environment(environment)
     payload = {
         "amount": normalize_xaf_amount(amount),
