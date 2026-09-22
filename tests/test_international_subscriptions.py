@@ -341,19 +341,33 @@ async def test_failed_checkout_marks_payment_failed(db, client, monkeypatch, ses
 async def test_card_money_is_never_forwardable_by_b2b(db):
     kenyan = await make_reseller(db)
     intl = await make_reseller(db, market_code="CM")
-    db.add_all([
-        SubscriptionPayment(user_id=kenyan.id, amount=500.0, payment_method="mpesa",
-                            status=SubscriptionPaymentStatus.COMPLETED),
-        SubscriptionPayment(user_id=intl.id, amount=10.0, currency="USD", payment_method=PAY_CARD,
-                            status=SubscriptionPaymentStatus.COMPLETED),
-    ])
+    mpesa_payment = SubscriptionPayment(
+        user_id=kenyan.id, amount=500.0, payment_method="mpesa",
+        status=SubscriptionPaymentStatus.COMPLETED,
+    )
+    card_payment = SubscriptionPayment(
+        user_id=intl.id, amount=10.0, currency="USD", payment_method=PAY_CARD,
+        status=SubscriptionPaymentStatus.COMPLETED,
+    )
+    db.add_all([mpesa_payment, card_payment])
     await db.commit()
 
     summary = await sr._subscription_collection_summary(db)
     allocations = await sr._subscription_payment_send_allocations(db)
 
     assert summary["total_collected"] == 500.0
-    assert len(allocations) == 1
+    assert summary["paybill_collected"] == 500.0
+    assert summary["card_settlement"] == {
+        "fee_rate": 0.03,
+        "fee_assumed": True,
+        "currency": "KES",
+        "payment_count": 1,
+        "gross_collected": 1295.0,
+        "processing_fees": 38.85,
+        "net_settlement": 1256.15,
+    }
+    assert set(allocations) == {mpesa_payment.id}
+    assert card_payment.id not in allocations
 
 
 @pytest.mark.asyncio

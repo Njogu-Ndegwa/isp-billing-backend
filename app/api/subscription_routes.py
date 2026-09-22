@@ -56,6 +56,12 @@ OWNER_DESTINATION_TYPES = [
     ResellerPaymentMethodType.MPESA_PAYBILL,
 ]
 
+# Until PayAfrica exposes an actual settlement/fee report, account for card
+# receipts using the operator-approved assumption that Paystack retains 3%.
+# MRR and gross subscription revenue remain the full amount paid; only the
+# separate card settlement view is net of this fee.
+PAYSTACK_PROCESSING_FEE_RATE = 0.03
+
 
 # ============================================================
 # Reseller-facing endpoints
@@ -827,6 +833,43 @@ async def _subscription_owner_transfer_totals(db: AsyncSession) -> dict:
 _IN_MPESA_SHORTCODE = SubscriptionPayment.payment_method == "mpesa"
 
 
+def _paystack_settlement_from_gross(gross_kes: float, payment_count: int) -> dict:
+    gross = round(float(gross_kes or 0), 2)
+    fee = round(gross * PAYSTACK_PROCESSING_FEE_RATE, 2)
+    return {
+        "fee_rate": PAYSTACK_PROCESSING_FEE_RATE,
+        "fee_assumed": True,
+        "currency": REPORTING_CURRENCY,
+        "payment_count": int(payment_count or 0),
+        "gross_collected": gross,
+        "processing_fees": fee,
+        "net_settlement": round(gross - fee, 2),
+    }
+
+
+async def _paystack_card_settlement(
+    db: AsyncSession,
+    *,
+    created_at_from: datetime | None = None,
+) -> dict:
+    filters = [
+        SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+        SubscriptionPayment.payment_method == PAY_CARD,
+    ]
+    if created_at_from is not None:
+        filters.append(SubscriptionPayment.created_at >= created_at_from)
+
+    row = (await db.execute(
+        select(
+            func.coalesce(func.sum(
+                sql_kes_by_currency(SubscriptionPayment.amount, SubscriptionPayment.currency)
+            ), 0),
+            func.count(SubscriptionPayment.id),
+        ).where(*filters)
+    )).one()
+    return _paystack_settlement_from_gross(float(row[0] or 0), int(row[1] or 0))
+
+
 async def _subscription_collection_summary(db: AsyncSession) -> dict:
     total_collected = float((await db.execute(
         select(func.coalesce(func.sum(SubscriptionPayment.amount), 0)).where(
@@ -842,7 +885,9 @@ async def _subscription_collection_summary(db: AsyncSession) -> dict:
     if available < 0:
         available = 0.0
     fee_preview = _calculate_owner_b2b_fee(available)
+    card_settlement = await _paystack_card_settlement(db)
     return {
+        "paybill_collected": round(total_collected, 2),
         "total_collected": round(total_collected, 2),
         "completed_sent": transfers["completed_gross"],
         "pending_send": transfers["pending_gross"],
@@ -850,6 +895,7 @@ async def _subscription_collection_summary(db: AsyncSession) -> dict:
         "completed_fees": transfers["completed_fees"],
         "available_to_send": available,
         "fee_preview": fee_preview,
+        "card_settlement": card_settlement,
     }
 
 
@@ -1013,6 +1059,16 @@ async def admin_list_subscription_payments(
     for payment, reseller in rows:
         status_value = _enum_value(payment.status)
         forwardable = status_value == "completed" and payment.payment_method == "mpesa"
+        card_completed = status_value == "completed" and payment.payment_method == PAY_CARD
+        processing_fee = (
+            round(float(payment.amount or 0) * PAYSTACK_PROCESSING_FEE_RATE, 2)
+            if card_completed else 0.0
+        )
+        amount_kes = to_kes(payment.amount, payment.currency)
+        processing_fee_kes = (
+            round(amount_kes * PAYSTACK_PROCESSING_FEE_RATE, 2)
+            if card_completed else 0.0
+        )
         allocation = allocations.get(payment.id, {
             "send_status": "unsent" if forwardable else "not_applicable",
             "sent_amount": 0.0,
@@ -1031,7 +1087,12 @@ async def admin_list_subscription_payments(
             "payment_method": payment.payment_method,
             "payment_reference": payment.payment_reference,
             "currency": payment.currency,
-            "amount_kes": to_kes(payment.amount, payment.currency),
+            "amount_kes": amount_kes,
+            "processing_fee_rate": PAYSTACK_PROCESSING_FEE_RATE if card_completed else 0.0,
+            "processing_fee": processing_fee,
+            "net_settlement": round(float(payment.amount or 0) - processing_fee, 2),
+            "processing_fee_kes": processing_fee_kes,
+            "net_settlement_kes": round(amount_kes - processing_fee_kes, 2),
             "provider_reference": payment.provider_reference,
             "mpesa_checkout_request_id": payment.mpesa_checkout_request_id,
             "phone_number": payment.phone_number,
@@ -1306,6 +1367,9 @@ async def admin_subscription_revenue(
         )
     )).scalar())
 
+    paystack_all_time = await _paystack_card_settlement(db)
+    paystack_this_month = await _paystack_card_settlement(db, created_at_from=month_start)
+
     total_outstanding = float((await db.execute(
         select(func.coalesce(func.sum(
             sql_kes_by_currency(SubscriptionInvoice.final_charge, SubscriptionInvoice.currency)
@@ -1348,6 +1412,10 @@ async def admin_subscription_revenue(
     return {
         "total_collected": total_collected,
         "this_month_collected": this_month_collected,
+        "paystack": {
+            **paystack_all_time,
+            "this_month": paystack_this_month,
+        },
         "total_outstanding": total_outstanding,
         "currency": REPORTING_CURRENCY,
         **_fx_meta(),

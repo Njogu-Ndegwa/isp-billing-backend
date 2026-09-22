@@ -205,6 +205,24 @@ async def test_subscription_revenue_sums_usd_card_payment_in_kes(db, client, mon
     assert body["currency"] == "KES"
     assert body["total_collected"] == pytest.approx(500 + 1295, abs=0.01)
     assert body["this_month_collected"] == pytest.approx(500 + 1295, abs=0.01)
+    assert body["paystack"] == {
+        "fee_rate": 0.03,
+        "fee_assumed": True,
+        "currency": "KES",
+        "payment_count": 1,
+        "gross_collected": 1295.0,
+        "processing_fees": 38.85,
+        "net_settlement": 1256.15,
+        "this_month": {
+            "fee_rate": 0.03,
+            "fee_assumed": True,
+            "currency": "KES",
+            "payment_count": 1,
+            "gross_collected": 1295.0,
+            "processing_fees": 38.85,
+            "net_settlement": 1256.15,
+        },
+    }
 
     mrr = await compute_mrr(db)
     assert mrr["current_mrr"] == pytest.approx(1795.0, abs=0.01)
