@@ -3,7 +3,10 @@
 
 Runs FROM the local workstation and reaches production exactly the way the
 `accessing-production-server` skill prescribes: key-based, non-interactive SSH
-to dennis@54.91.202.229, then `docker exec` into the postgres container. The
+to root@91.98.238.12 (Hetzner, production since 2026-09-22), then `docker exec`
+into the postgres container `isp_billing_hetzner_db`. The DB user/name are
+read from that container's own POSTGRES_USER/POSTGRES_DB environment (set
+from .env.hetzner), so nothing is hard-coded here. The
 SQL is piped over stdin (`psql -f -`) so no quotes are hand-nested through
 ssh -> sh -> docker (the skill's documented pattern).
 
@@ -12,15 +15,16 @@ READ-ONLY BY CONSTRUCTION — three independent layers:
      a single SELECT/WITH statement (no semicolons, no write keywords).
   2. Every session starts with `SET default_transaction_read_only = on;` so
      even a slipped write would be refused by Postgres itself.
-  3. `SET statement_timeout = '5s';` — the prod box has ~1 GB RAM; anything
-     slower than 5s is aborted server-side rather than hammered.
+  3. `SET statement_timeout = '5s';` — this is the live production database;
+     anything slower than 5s is aborted server-side rather than hammered.
 
 Output convention for the CLI tools: compact JSON on stdout, diagnostics on
 stderr, exit 0 on success / 1 on failure.
 
-CONNECTION BUDGET — IMPORTANT: prod port 22 is UFW rate-limited (server
-hardening 2026-07-21: 6+ new connections in ~30s from one IP = temporary
-block, observed live while building these tools). Every tool therefore batches
+CONNECTION BUDGET — IMPORTANT: prod port 22 is rate-limited (the old AWS box
+had UFW LIMIT — 6+ new connections in ~30s from one IP = temporary block,
+observed live while building these tools; the Hetzner box runs fail2ban, which
+bans the same pattern for longer). Every tool therefore batches
 ALL of its statements into ONE ssh connection via run_batch(). Never call
 run_sql() in a loop; if you get "Connection timed out" right after successful
 calls, you are rate-limited — wait 60s, do not retry in a loop.
@@ -33,12 +37,14 @@ import subprocess
 import sys
 import time
 
-SSH_HOST = "dennis@54.91.202.229"
+SSH_HOST = "root@91.98.238.12"
 # -q suppresses SET echoes, -A -t gives bare output, ON_ERROR_STOP makes psql
-# exit non-zero on SQL errors, -f - reads the SQL from stdin.
+# exit non-zero on SQL errors, -f - reads the SQL from stdin. The single quotes
+# survive the remote login shell, so $POSTGRES_USER/$POSTGRES_DB are expanded by
+# the sh INSIDE the container (where compose injects them from .env.hetzner).
 REMOTE_PSQL = (
-    "docker exec -i isp_billing_postgres "
-    "psql -U isp_user -d isp_billing_db -v ON_ERROR_STOP=1 -qAt -f -"
+    "docker exec -i isp_billing_hetzner_db "
+    "sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -qAt -f -'"
 )
 SSH_CMD = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST, REMOTE_PSQL]
 
@@ -117,7 +123,7 @@ def run_batch(queries, timeout: int = 60):
     if proc.returncode != 0:
         err = (proc.stderr or "").strip()[:500]
         if "Connection timed out" in err or "Connection refused" in err:
-            err += " | likely the UFW port-22 rate limit -- wait 60s, do not retry in a loop"
+            err += " | likely the port-22 rate limit (fail2ban) -- wait 60s, do not retry in a loop"
         raise ProdQueryError(f"batch({tags}): remote query failed (rc={proc.returncode}): {err}")
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
     if len(lines) != len(queries):

@@ -100,11 +100,12 @@ auto-send (L3) to Dennis — and M-Pesa/config categories never promote past L2.
 Five CLI tools in `tools/` answer reseller questions with REAL production data
 instead of guesses. All are strictly read-only (SELECT-only by construction,
 `default_transaction_read_only=on`, 5s statement timeout), reach prod over the
-`accessing-production-server` SSH pattern (`ssh dennis@54.91.202.229` →
-`docker exec -i isp_billing_postgres psql ... -f -` with SQL piped via stdin),
+`accessing-production-server` SSH pattern (`ssh root@91.98.238.12` →
+`docker exec -i isp_billing_hetzner_db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" ... -f -'`
+with SQL piped via stdin),
 print compact JSON on stdout / diagnostics on stderr, exit 0/1. Run them from
 this skill's `tools/` directory. If a call errors or takes >5s, note it and
-move on — never hammer the 1GB prod box.
+move on — never hammer the prod box.
 
 - `lookup_account.py` — identity resolution ("Ebu ntumie email I check"):
   `python tools/lookup_account.py --phone 0712345678` (or `--email x@y.com`,
