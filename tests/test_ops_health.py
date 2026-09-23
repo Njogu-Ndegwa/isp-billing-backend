@@ -384,9 +384,15 @@ async def test_expiry_section_splits_hot_from_quarantined_and_measures_removal(d
     # A suspended reseller's router looks online but is cut off at the platform
     # level: its 16-day-old expiries must not masquerade as the oldest hot one
     # (the first live alert on 2026-09-23 did exactly that).
+    # It has also gone silent and failed cleanup, which alone would quarantine
+    # it; the suspended owner is the reason reported (2026-09-23: 601 such
+    # customers briefly showed as quarantined instead).
     suspended = await make_reseller(db, subscription_status=SubscriptionStatus.SUSPENDED)
-    cut_off = await make_router(db, suspended, last_status=True, last_checked_at=now,
-                                last_online_at=now)
+    cut_off = await make_router(db, suspended, last_status=True,
+                                last_checked_at=now - timedelta(days=16),
+                                last_online_at=now - timedelta(days=16))
+    db.add(RouterAvailabilityCheck(router_id=cut_off.id, checked_at=now - timedelta(hours=1),
+                                   is_online=False, source="expired_cleanup"))
     for _ in range(2):
         await make_customer(db, suspended, plan, cut_off, status=CustomerStatus.ACTIVE,
                             expiry=now - timedelta(days=16))
