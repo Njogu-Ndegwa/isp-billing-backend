@@ -86,8 +86,16 @@ jobs:
           echo "[3/7] Fetching origin/main..."
           git config --global --add safe.directory /opt/isp-billing-shadow/repo
           git fetch origin main || { echo "ERROR: Git fetch failed"; exit 1; }
-          git reset --hard origin/main || { echo "ERROR: Git reset failed"; exit 1; }
+          # Reset to FETCH_HEAD, never to origin/main: a single-branch clone
+          # (the Hetzner checkout only tracked a codex/* branch) leaves the
+          # origin/main remote-tracking ref frozen, and on 2026-09-23 two
+          # "successful" deploys silently re-deployed the previous commit.
+          git reset --hard FETCH_HEAD || { echo "ERROR: Git reset failed"; exit 1; }
           echo "Deploying commit: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+          if [ "$(git rev-parse HEAD)" != "${{ github.sha }}" ]; then
+            echo "ERROR: checkout is at $(git rev-parse --short HEAD) but this run is for ${{ github.sha }}"
+            exit 1
+          fi
 
           echo "[4/7] Disk and memory headroom..."
           df -h / | tail -1
