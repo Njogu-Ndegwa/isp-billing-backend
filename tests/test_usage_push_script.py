@@ -51,6 +51,18 @@ def test_script_skips_queues_that_are_not_ours():
     assert "<pppoe-" in script
 
 
+def test_hotspot_count_includes_bypassed_hosts():
+    """Paid customers ride a bypassed ip-binding and never show in
+    /ip hotspot active — counting that table read 0 on a router with paying
+    customers online. Must match the poller: authorized + bypassed hosts."""
+    script = render_usage_push_script(
+        identity="Router-0721", endpoint_url=URL, include_router_metrics=True
+    )
+    assert "/ip hotspot host find where bypassed" in script
+    assert "/ip hotspot host find where authorized" in script
+    assert "/ip hotspot active find" not in script
+
+
 def test_logout_hook_marks_reports_final():
     script = render_usage_push_script(identity="Router-0721", endpoint_url=URL)
     assert '\\"final\\":true' in script

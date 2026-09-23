@@ -76,13 +76,20 @@ def render_usage_push_script(
     # Read-only lookups, guarded so a router missing the hotspot/ppp package or
     # an ether1 by that name skips metrics instead of losing the whole push.
     # ``:set first false`` marks the batch as worth sending even with no queues.
+    #
+    # Hotspot users are counted from ``/ip hotspot host`` (authorized + bypassed),
+    # the same figure the background poller persists. Paid customers get in via
+    # a ``bypassed`` ip-binding and never appear in ``/ip hotspot active``, so
+    # counting that table reported 0 on a router with live paying customers
+    # (router 10, 2026-09-23: 0 active, 4 bypassed hosts online).
     metrics_block = ""
     if include_router_metrics:
         metrics_block = (
             '    :do {\n'
             '        :local rxb [/interface get [find name="ether1"] rx-byte]\n'
             '        :local txb [/interface get [find name="ether1"] tx-byte]\n'
-            '        :local hs [:len [/ip hotspot active find]]\n'
+            '        :local hs ([:len [/ip hotspot host find where authorized]]'
+            ' + [:len [/ip hotspot host find where bypassed]])\n'
             '        :local pp [:len [/ppp active find]]\n'
             '        :set body ($body . ",\\"router\\":{\\"iface_rx_bytes\\":" . $rxb'
             ' . ",\\"iface_tx_bytes\\":" . $txb . ",\\"hotspot_active\\":" . $hs'
