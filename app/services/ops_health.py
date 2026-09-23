@@ -44,6 +44,7 @@ from app.db.models import (
     ResellerInboxMessage,
     Router,
     RouterAvailabilityCheck,
+    SubscriptionStatus,
     User,
     UserRole,
 )
@@ -131,6 +132,18 @@ def _seconds(later: Optional[datetime], earlier: Optional[datetime]) -> Optional
     if later is None or earlier is None:
         return None
     return (later - earlier).total_seconds()
+
+
+CUT_OFF_OWNER_STATUSES = (SubscriptionStatus.SUSPENDED, SubscriptionStatus.INACTIVE)
+
+
+def is_owner_cut_off(owner_status) -> bool:
+    """A suspended or inactive reseller's routers serve 503 at the platform
+    level, so nothing on them is a live backlog."""
+    if owner_status is None:
+        return False
+    value = owner_status.value if hasattr(owner_status, "value") else str(owner_status)
+    return value in {s.value for s in CUT_OFF_OWNER_STATUSES}
 
 
 def is_router_quarantined(last_status, last_online_at, created_at, now: datetime) -> bool:
@@ -508,7 +521,8 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
     async with database.async_session() as db:
         router_rows = (await db.execute(
             select(Router.id, Router.last_status, Router.last_online_at, Router.created_at,
-                   Router.ip_address)
+                   Router.ip_address, User.subscription_status)
+            .outerjoin(User, User.id == Router.user_id)
         )).all()
         group_rows = (await db.execute(
             select(Customer.router_id, func.count(), func.min(Customer.expiry))
@@ -543,12 +557,20 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
             )).all()
         await db.commit()
 
-    tunnel_of = {rid: tunnel_type_for_ip(ip) for rid, _, _, _, ip in router_rows}
+    tunnel_of = {rid: tunnel_type_for_ip(ip) for rid, _, _, _, ip, _ in router_rows}
     quarantined_routers = {
-        rid for rid, last_status, last_online, created, _ in router_rows
+        rid for rid, last_status, last_online, created, _, _ in router_rows
         if is_router_quarantined(last_status, last_online, created, now)
     }
-    total = hot = quarantined = 0
+    # Routers of suspended/inactive resellers are cut off at the platform level
+    # (their customers cannot be online), so their expired customers are not a
+    # backlog the cleanup can drain. First live alert (2026-09-23) was 12
+    # customers on 4 such routers, 16 days old, hiding the real 4-day backlog.
+    suspended_owner_routers = {
+        rid for rid, _, _, _, _, owner_status in router_rows
+        if is_owner_cut_off(owner_status)
+    }
+    total = hot = quarantined = suspended_owner = 0
     oldest_hot: Optional[datetime] = None
     hot_by_tunnel: dict[str, dict] = {}
     for router_id, n, oldest in group_rows:
@@ -556,6 +578,9 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
         total += n
         if router_id in quarantined_routers:
             quarantined += n
+            continue
+        if router_id in suspended_owner_routers:
+            suspended_owner += n
             continue
         hot += n
         entry = hot_by_tunnel.setdefault(tunnel_of.get(router_id, "other"),
@@ -597,6 +622,7 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
         "expired_active_total": total,
         "expired_active_hot": hot,
         "expired_active_quarantined": quarantined,
+        "expired_active_suspended_owner": suspended_owner,
         "hot_by_tunnel": hot_by_tunnel,
         "oldest_hot_expired_minutes": (
             round(_seconds(now, oldest_hot) / 60, 1) if oldest_hot else None

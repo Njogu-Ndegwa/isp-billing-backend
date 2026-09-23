@@ -37,6 +37,7 @@ from app.db.models import (
     ProvisioningState,
     ResellerInboxMessage,
     RouterAvailabilityCheck,
+    SubscriptionStatus,
 )
 from app.services import job_registry, ops_health
 from app.services import ops_health_rules as rules
@@ -380,6 +381,15 @@ async def test_expiry_section_splits_hot_from_quarantined_and_measures_removal(d
     for _ in range(3):
         await make_customer(db, reseller, plan, dead, status=CustomerStatus.ACTIVE,
                             expiry=now - timedelta(days=2))
+    # A suspended reseller's router looks online but is cut off at the platform
+    # level: its 16-day-old expiries must not masquerade as the oldest hot one
+    # (the first live alert on 2026-09-23 did exactly that).
+    suspended = await make_reseller(db, subscription_status=SubscriptionStatus.SUSPENDED)
+    cut_off = await make_router(db, suspended, last_status=True, last_checked_at=now,
+                                last_online_at=now)
+    for _ in range(2):
+        await make_customer(db, suspended, plan, cut_off, status=CustomerStatus.ACTIVE,
+                            expiry=now - timedelta(days=16))
     # Already removed: does not count as a backlog, but feeds removal latency.
     removed = await make_customer(db, reseller, plan, online, status=CustomerStatus.INACTIVE,
                                   expiry=now - timedelta(minutes=30))
@@ -390,9 +400,10 @@ async def test_expiry_section_splits_hot_from_quarantined_and_measures_removal(d
     await db.commit()
 
     section = await ops_health.build_expiry_section(now)
-    assert section["expired_active_total"] == 5
+    assert section["expired_active_total"] == 7
     assert section["expired_active_hot"] == 2
     assert section["expired_active_quarantined"] == 3
+    assert section["expired_active_suspended_owner"] == 2
     assert section["oldest_hot_expired_minutes"] == pytest.approx(41, abs=0.1)
     assert section["removal_latency"]["samples"] == 1
     assert section["removal_latency"]["p95"] == pytest.approx(300)
