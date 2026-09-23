@@ -601,11 +601,13 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
     for router_id, n, oldest in group_rows:
         n = int(n)
         total += n
-        if router_id in quarantined_routers:
-            quarantined += n
-            continue
+        # Owner first: a suspended reseller's routers usually go silent too, and
+        # "reseller suspended" is the more useful reason than "quarantined".
         if router_id in suspended_owner_routers:
             suspended_owner += n
+            continue
+        if router_id in quarantined_routers:
+            quarantined += n
             continue
         hot += n
         entry = hot_by_tunnel.setdefault(tunnel_of.get(router_id, "other"),
