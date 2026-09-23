@@ -580,10 +580,13 @@ async def test_second_active_writer_alerts_admins_once_per_dedupe_window(db, now
 
 
 @pytest.mark.asyncio
-async def test_deploy_handover_is_not_a_second_writer(db, now):
+async def test_deploy_handover_is_not_a_second_writer(db, monkeypatch, now):
     """The outgoing container of a deploy still has a heartbeat inside the live
     window but has not written one since the new process started: superseded,
     not concurrent. Fired a false critical after every deploy on 2026-09-23."""
+    # Pin "our" process start so the test does not depend on how long the
+    # pytest worker has been alive (a fresh CI worker starts < 70 s before this).
+    monkeypatch.setattr(ops_health, "_PROCESS_STARTED_AT", now - timedelta(seconds=30))
     await make_admin(db)
     db.add(AppInstanceHeartbeat(
         instance_id="old-container-aaaa", hostname="4110e55ae77d", runtime_mode="active",
