@@ -506,6 +506,14 @@ class Router(Base):
     # router has produced that day. Capped at MAX_STATUS_ALERTS_PER_ROUTER_PER_DAY.
     status_alerts_day = Column(String(10), nullable=True)
     status_alerts_sent_today = Column(Integer, nullable=False, default=0, server_default="0")
+    # Overload alerts (router_overload_alerts): one per level per local day.
+    overload_warning_notified_at = Column(DateTime, nullable=True)
+    overload_critical_notified_at = Column(DateTime, nullable=True)
+    # SNMP CPU monitoring: set by scripts/router_snmp_rollout.py once SNMP is
+    # enabled and verified on the router; the poller only reads enrolled routers.
+    snmp_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    cpu_load = Column(Integer, nullable=True)
+    cpu_checked_at = Column(DateTime, nullable=True)
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 

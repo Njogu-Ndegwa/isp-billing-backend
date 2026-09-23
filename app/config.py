@@ -122,6 +122,13 @@ class Settings(BaseSettings):
     TALKSASA_BASE_URL: str = "https://bulksms.talksasa.com/api/v3"
     SMS_DISPATCH_CHUNK_SIZE: int = 100
     SMS_DISPATCH_ENABLED: bool = True
+    # Router overload alerts to resellers (app/services/router_overload_alerts.py).
+    # Payment-failure signal needs no router access and is on by default; the
+    # SNMP CPU poll stays off until routers are enrolled with
+    # scripts/router_snmp_rollout.py and a community is configured.
+    ROUTER_OVERLOAD_ALERTS_ENABLED: bool = True
+    ROUTER_SNMP_POLL_ENABLED: bool = False
+    ROUTER_SNMP_COMMUNITY: str = ""
 
     # --- Feedback board (Ideas + Bugs) / AI triage -----------------------
     # ANTHROPIC_API_KEY lives in the server .env only — never committed.

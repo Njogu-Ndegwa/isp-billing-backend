@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import json
 import re
@@ -33,6 +34,12 @@ from app.config import settings
 from app.services.router_availability import record_router_availability
 
 logger = logging.getLogger("pppoe_provisioning")
+
+# PPPoE provisioning runs in its own small pool, like hotspot provisioning
+# (_hotspot_provision_pool). The shared default executor has only
+# min(32, cpu+4) = 6 workers on the 2-vCPU prod box and is also used by
+# background jobs; a slow router there must not delay a paid PPPoE customer.
+_pppoe_provision_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pppoe-provision")
 
 PPPOE_RETRY_STALE_IN_PROGRESS_SECONDS = 90
 PPPOE_RETRY_BATCH_SIZE = 20
@@ -280,7 +287,8 @@ async def call_pppoe_provision(payload: dict):
     Same pattern as call_mikrotik_bypass -- never blocks the event loop.
     """
     try:
-        result = await asyncio.to_thread(_provision_pppoe_sync, payload)
+        result = await asyncio.get_running_loop().run_in_executor(
+            _pppoe_provision_pool, _provision_pppoe_sync, payload)
         if result and result.get("error"):
             logger.error(f"[PPPoE] Provision failed: {result['error']}")
         return result
@@ -294,7 +302,8 @@ async def call_pppoe_remove(payload: dict):
     Async wrapper that runs PPPoE removal in a thread pool.
     """
     try:
-        result = await asyncio.to_thread(_remove_pppoe_sync, payload)
+        result = await asyncio.get_running_loop().run_in_executor(
+            _pppoe_provision_pool, _remove_pppoe_sync, payload)
         if result and result.get("error"):
             logger.error(f"[PPPoE] Remove failed: {result['error']}")
         return result
