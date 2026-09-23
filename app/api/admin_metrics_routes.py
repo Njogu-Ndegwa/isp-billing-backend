@@ -304,6 +304,29 @@ async def admin_ops_health(
     }
 
 
+@router.get("/api/admin/ops-health/window")
+async def admin_ops_health_window(
+    start: datetime = Query(..., description="ISO 8601 UTC start of the slice"),
+    end: Optional[datetime] = Query(None, description="ISO 8601 UTC end (default: now)"),
+    router_id: Optional[int] = Query(None, ge=1),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Live look-back report for an arbitrary time slice, optionally one router.
+
+    Computed from provisioning_attempts / provisioning_logs / mpesa_transactions
+    for that slice only (max 14 days), so incident days elsewhere in history do
+    not pollute it. Payments are fleet-wide and omitted when a router is chosen.
+    """
+    await _require_admin(token, db)
+    await db.commit()
+    from app.services.ops_health_window import build_window_report
+
+    start = start.replace(tzinfo=None) if start.tzinfo else start
+    end_value = end.replace(tzinfo=None) if (end and end.tzinfo) else (end or datetime.utcnow())
+    return await build_window_report(start, end_value, router_id=router_id)
+
+
 @router.get("/api/admin/ops-health/history")
 async def admin_ops_health_history(
     hours: int = Query(24, ge=1, le=ops_health.HISTORY_MAX_HOURS),
