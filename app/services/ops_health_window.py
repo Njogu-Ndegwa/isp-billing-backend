@@ -37,6 +37,7 @@ from app.services.ops_health import (
     _seconds,
     is_owner_cut_off,
     is_router_quarantined,
+    load_cleanup_failures_since_online,
     percentile,
     tunnel_type_for_ip,
 )
@@ -159,7 +160,8 @@ def classify_unenforced(router_state, now: datetime) -> str:
     if is_owner_cut_off(router_state.get("owner_status")):
         return "owner_suspended"
     if is_router_quarantined(router_state.get("last_status"), router_state.get("last_online_at"),
-                             router_state.get("created_at"), now):
+                             router_state.get("created_at"), now,
+                             router_state.get("last_cleanup_failure_at")):
         return "router_offline_3d_plus"
     if router_state.get("last_status") is False:
         return "router_offline"
@@ -323,11 +325,13 @@ async def build_window_report(start: datetime, end: datetime,
                    User.email, User.organization_name)
             .outerjoin(User, User.id == Router.user_id)
         )).all()
+        cleanup_failures = await load_cleanup_failures_since_online(db, datetime.utcnow())
         names = {r[0]: r[1] for r in router_rows}
         tunnel_of = {r[0]: tunnel_type_for_ip(r[2]) for r in router_rows}
         router_state = {
             r[0]: {"last_status": r[3], "last_online_at": r[4], "last_checked_at": r[5],
-                   "created_at": r[6], "router_agent_enabled": bool(r[7]), "owner_status": r[8]}
+                   "created_at": r[6], "router_agent_enabled": bool(r[7]), "owner_status": r[8],
+                   "last_cleanup_failure_at": cleanup_failures.get(r[0])}
             for r in router_rows
         }
 
