@@ -117,51 +117,86 @@ def _router_error_is_duplicate(error: str) -> bool:
 # ============================================================================
 # CIRCUIT BREAKER: Track failed routers to avoid repeated blocking timeouts
 # Only triggers on CONNECTION failures, not read timeouts during operations
+#
+# Lanes (2026-09-23). One shared breaker let background jobs (queue repair,
+# usage sampling, port attribution...) trip the breaker on a router whose
+# uplink is congested at evening peak, which then blocked paid customers'
+# provisioning on that router: 48 payment attempts skipped in 4 h on the
+# worst routers. Each connection now declares a lane:
+#   * LANE_PAYMENT    - delivering access a customer just paid for. Only its
+#                       own failures can open its breaker.
+#   * LANE_DEFAULT    - everything else (admin actions, expiry cleanup, FUP):
+#                       unchanged behaviour, except background failures no
+#                       longer count against it.
+#   * LANE_BACKGROUND - optional fleet jobs. Opens on any lane's breaker, and
+#                       also stands down for PAYMENT_PRIORITY_WINDOW after any
+#                       payment-lane failure, leaving the struggling link to
+#                       the payment retries.
+# A successful connection in any lane proves reachability and clears all.
 # ============================================================================
+LANE_PAYMENT = "payment"
+LANE_DEFAULT = "default"
+LANE_BACKGROUND = "background"
+_LANES = (LANE_PAYMENT, LANE_DEFAULT, LANE_BACKGROUND)
 _router_failures: Dict[str, Dict[str, Any]] = {}
 CIRCUIT_BREAKER_THRESHOLD = 3  # Number of connection failures before circuit opens
 CIRCUIT_BREAKER_RESET_TIME = 60  # Seconds to wait before retrying failed router
+PAYMENT_PRIORITY_WINDOW = 120  # Background jobs yield this long after a payment-lane failure
 
-def _get_router_key(host: str, port: int) -> str:
-    """Generate unique key for a router"""
-    return f"{host}:{port}"
+def _get_router_key(host: str, port: int, lane: str = LANE_DEFAULT) -> str:
+    """Generate unique key for a router in one breaker lane"""
+    return f"{lane}|{host}:{port}"
 
-def _is_circuit_open(host: str, port: int) -> bool:
-    """Check if circuit breaker is open (router should be skipped)"""
-    key = _get_router_key(host, port)
-    if key not in _router_failures:
+def _lane_open(host: str, port: int, lane: str) -> bool:
+    key = _get_router_key(host, port, lane)
+    failure_info = _router_failures.get(key)
+    if failure_info is None:
         return False
-    
-    failure_info = _router_failures[key]
     # Check if enough time has passed to retry
     if time.time() - failure_info["last_failure"] > CIRCUIT_BREAKER_RESET_TIME:
         # Reset the circuit breaker - allow retry
-        del _router_failures[key]
-        logger.info(f"Circuit breaker reset for {host}:{port} - allowing retry")
+        _router_failures.pop(key, None)
+        logger.info(f"Circuit breaker reset for {host}:{port} ({lane}) - allowing retry")
         return False
-    
     # Circuit is open if we've exceeded threshold
     return failure_info["count"] >= CIRCUIT_BREAKER_THRESHOLD
 
-def _record_failure(host: str, port: int):
+def _recent_payment_failure(host: str, port: int) -> bool:
+    info = _router_failures.get(_get_router_key(host, port, LANE_PAYMENT))
+    return bool(info) and (time.time() - info["last_failure"]) < PAYMENT_PRIORITY_WINDOW
+
+def _is_circuit_open(host: str, port: int, lane: str = LANE_DEFAULT) -> bool:
+    """Check if circuit breaker is open for this lane (router should be skipped)"""
+    if lane == LANE_PAYMENT:
+        return _lane_open(host, port, LANE_PAYMENT)
+    if lane == LANE_BACKGROUND:
+        return (
+            any(_lane_open(host, port, l) for l in _LANES)
+            or _recent_payment_failure(host, port)
+        )
+    return _lane_open(host, port, LANE_PAYMENT) or _lane_open(host, port, LANE_DEFAULT)
+
+def _record_failure(host: str, port: int, lane: str = LANE_DEFAULT):
     """Record a connection failure for circuit breaker"""
-    key = _get_router_key(host, port)
+    key = _get_router_key(host, port, lane)
     if key not in _router_failures:
         _router_failures[key] = {"count": 0, "last_failure": 0}
-    
+
     _router_failures[key]["count"] += 1
     _router_failures[key]["last_failure"] = time.time()
-    
+
     count = _router_failures[key]["count"]
     if count >= CIRCUIT_BREAKER_THRESHOLD:
-        logger.warning(f"Circuit breaker OPEN for {host}:{port} - will skip for {CIRCUIT_BREAKER_RESET_TIME}s")
+        logger.warning(f"Circuit breaker OPEN for {host}:{port} ({lane}) - will skip for {CIRCUIT_BREAKER_RESET_TIME}s")
 
-def _record_success(host: str, port: int):
-    """Record a successful connection - reset circuit breaker"""
-    key = _get_router_key(host, port)
-    if key in _router_failures:
-        del _router_failures[key]
-        logger.info(f"Circuit breaker cleared for {host}:{port} after successful connection")
+def _record_success(host: str, port: int, lane: str = LANE_DEFAULT):
+    """Record a successful connection - reachability proven, reset every lane"""
+    cleared = False
+    for l in _LANES:
+        if _router_failures.pop(_get_router_key(host, port, l), None) is not None:
+            cleared = True
+    if cleared:
+        logger.info(f"Circuit breaker cleared for {host}:{port} after successful connection ({lane})")
 
 # Helper functions to validate and normalize MAC addresses
 def validate_mac_address(mac: str) -> bool:
@@ -175,8 +210,8 @@ def normalize_mac_address(mac: str) -> str:
     return ':'.join(clean_mac[i:i+2] for i in range(0, 12, 2))
 
 class MikroTikAPI:
-    def __init__(self, host: str, username: str, password: str, port: int = 8728, 
-                 timeout: int = 15, connect_timeout: int = 5):
+    def __init__(self, host: str, username: str, password: str, port: int = 8728,
+                 timeout: int = 15, connect_timeout: int = 5, lane: str = LANE_DEFAULT):
         """
         Initialize MikroTik API connection.
         
@@ -194,6 +229,8 @@ class MikroTikAPI:
         self.port = port
         self.timeout = timeout
         self.connect_timeout = connect_timeout
+        # Circuit-breaker lane; see LANE_* above.
+        self.lane = lane if lane in _LANES else LANE_DEFAULT
         self.sock = None
         self.connected = False
         # Set on every connect() failure so callers can surface a useful reason
@@ -210,8 +247,8 @@ class MikroTikAPI:
         self.last_connect_error = None
 
         # Check circuit breaker first - avoid blocking on known-bad routers
-        if _is_circuit_open(self.host, self.port):
-            logger.warning(f"Circuit breaker OPEN - skipping connection to {self.host}:{self.port}")
+        if _is_circuit_open(self.host, self.port, self.lane):
+            logger.warning(f"Circuit breaker OPEN - skipping connection to {self.host}:{self.port} ({self.lane})")
             self.last_connect_error = (
                 f"Circuit breaker open for {self.host}:{self.port} after repeated failures "
                 f"(retrying in up to {CIRCUIT_BREAKER_RESET_TIME}s)"
@@ -227,10 +264,10 @@ class MikroTikAPI:
             self.sock.settimeout(self.timeout)
             
             if self.login():
-                _record_success(self.host, self.port)
+                _record_success(self.host, self.port, self.lane)
                 return True
             else:
-                _record_failure(self.host, self.port)
+                _record_failure(self.host, self.port, self.lane)
                 # login() already set last_connect_error with a precise reason
                 if not self.last_connect_error:
                     self.last_connect_error = (
@@ -245,7 +282,7 @@ class MikroTikAPI:
             )
             logger.error(msg)
             self.last_connect_error = msg
-            _record_failure(self.host, self.port)
+            _record_failure(self.host, self.port, self.lane)
             self._cleanup_socket()
             return False
         except ConnectionRefusedError:
@@ -255,21 +292,21 @@ class MikroTikAPI:
             )
             logger.error(msg)
             self.last_connect_error = msg
-            _record_failure(self.host, self.port)
+            _record_failure(self.host, self.port, self.lane)
             self._cleanup_socket()
             return False
         except OSError as e:
             msg = f"Network error connecting to {self.host}:{self.port}: {e}"
             logger.error(msg)
             self.last_connect_error = msg
-            _record_failure(self.host, self.port)
+            _record_failure(self.host, self.port, self.lane)
             self._cleanup_socket()
             return False
         except Exception as e:
             msg = f"Connection failed to {self.host}:{self.port}: {e}"
             logger.error(msg)
             self.last_connect_error = msg
-            _record_failure(self.host, self.port)
+            _record_failure(self.host, self.port, self.lane)
             self._cleanup_socket()
             return False
     

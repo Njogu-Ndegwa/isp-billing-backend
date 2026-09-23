@@ -35,7 +35,7 @@ _router_cursor = 0
 
 def _seed_router_lb_paid_sync(router_info: dict, active_customers: list) -> dict:
     """Connect and seed LB_PAID for one router. Runs in a worker thread."""
-    from app.services.mikrotik_api import MikroTikAPI
+    from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI
     from app.services.mikrotik_lb import lb_seed_paid
 
     api = MikroTikAPI(
@@ -45,6 +45,7 @@ def _seed_router_lb_paid_sync(router_info: dict, active_customers: list) -> dict
         router_info["port"],
         timeout=30,
         connect_timeout=5,
+        lane=LANE_BACKGROUND,
     )
     if not api.connect():
         return {"error": "connect_failed", "detail": api.last_connect_error}

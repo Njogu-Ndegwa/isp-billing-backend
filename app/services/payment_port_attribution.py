@@ -34,7 +34,7 @@ from sqlalchemy import select
 
 from app.db.database import async_session, db_pool_snapshot
 from app.db.models import Customer, CustomerPayment, Router
-from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI, normalize_mac_address
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,7 @@ def _fetch_mac_port_map_sync(router_info: dict) -> dict:
         router_info["port"],
         timeout=10,
         connect_timeout=4,
+        lane=LANE_BACKGROUND,
     )
     if not api.connect():
         return {"error": api.last_connect_error or "connect_failed"}

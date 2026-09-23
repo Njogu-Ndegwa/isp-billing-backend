@@ -39,7 +39,7 @@ from app.db.models import (
     UsageCapWatchState,
 )
 from app.services.fup import evaluate_and_enforce
-from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI, normalize_mac_address
 from app.services.usage_counters import parse_queue_bytes, record_queue_usage_sample
 
 logger = logging.getLogger(__name__)
@@ -290,6 +290,7 @@ def _fetch_queue_usage_for_router_sync(router_info: dict[str, Any]) -> dict[str,
         router_info["port"],
         timeout=10,
         connect_timeout=4,
+        lane=LANE_BACKGROUND,
     )
     if not api.connect():
         return {"error": api.last_connect_error or "connect_failed"}
