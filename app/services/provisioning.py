@@ -808,31 +808,22 @@ def _rsc_identity_and_user(token: ProvisioningToken) -> str:
 :log info "Provisioning: Identity set to {token.identity}, API user created" """
 
 
-def _rsc_router_command_agent(token: ProvisioningToken) -> str:
-    """Install the stable outbound fallback on every newly-provisioned router."""
+def _rsc_remove_router_command_agent() -> str:
+    """New routers no longer get the outbound command agent.
 
-    from app.services.router_agent_script import (
-        SCRIPT_NAME,
-        SCHEDULER_NAME,
-        render_router_agent_source,
-    )
+    Its script fails on every run on RouterOS 7.19+ (it sat dead on 55 routers
+    for a week, 2026-09-23), and nothing depends on it: cleanup and
+    provisioning reach routers over the API. A router being re-provisioned
+    drops any copy an earlier provisioning installed.
+    """
 
-    source = render_router_agent_source(
-        identity=token.identity,
-        endpoint_base_url=settings.PROVISION_BASE_URL,
-        tunnel_type=token.vpn_type,
-        management_probe_ip="10.0.0.1",
-        check_certificate=token.vpn_type != "l2tp",
-    )
+    from app.services.router_agent_script import SCRIPT_NAME, SCHEDULER_NAME
+
     return f"""
-# ---- STEP 9: OUTBOUND COMMAND FALLBACK ----
+# ---- STEP 9: REMOVE LEGACY OUTBOUND COMMAND AGENT ----
 
 :do {{ /system scheduler remove [find name="{SCHEDULER_NAME}"] }} on-error={{}}
 :do {{ /system script remove [find name="{SCRIPT_NAME}"] }} on-error={{}}
-/system script add name="{SCRIPT_NAME}" policy=read,write,test,policy,sensitive comment="Bitwave outbound command fallback v1" source={{
-{source}
-}}
-/system scheduler add name="{SCHEDULER_NAME}" interval=2m start-time=startup on-event="/system script run {SCRIPT_NAME}" policy=read,write,test,policy,sensitive comment="Bitwave adaptive command polling"
 """
 
 
@@ -882,7 +873,7 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     parts.append(_rsc_walled_garden(token))
     parts.append(_rsc_api_access())
     parts.append(_rsc_identity_and_user(token))
-    parts.append(_rsc_router_command_agent(token))
+    parts.append(_rsc_remove_router_command_agent())
     parts.append(_rsc_notify_and_reboot(token))
 
     return "\n".join(parts)
@@ -1103,9 +1094,8 @@ async def complete_provisioning(
         password=token.router_admin_password,
         port=8728,
         payment_methods=token.payment_methods,
-        # The generated RouterOS script installed the agent. The global app
-        # setting remains the fleetwide kill switch.
-        router_agent_enabled=True,
+        # The generated RouterOS script no longer installs the outbound agent.
+        router_agent_enabled=False,
     )
     db.add(router_obj)
     await db.flush()

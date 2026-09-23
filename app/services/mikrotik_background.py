@@ -12,7 +12,7 @@ remove_user_from_mikrotik function used by multiple router files.
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import and_, case, select, delete, func, or_
+from sqlalchemy import and_, case, select, delete, func, or_, update
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
 from app.db.database import async_session, db_pool_snapshot
@@ -64,6 +64,10 @@ ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = ROUTER_OFFLINE_SKIP_PERIOD  # single source
 ROUTER_LONG_OFFLINE_CLEANUP_QUARANTINE = timedelta(days=3)
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN = 60
 EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER = 15
+# The outbound agent polls every 2 minutes. One that has not checked in for
+# 15 is not going to execute a queued removal (on RouterOS 7.19+ the script
+# fails on every run), so cleanup does not queue work for it.
+ROUTER_AGENT_ALIVE_WINDOW = timedelta(minutes=15)
 # An expiry SMS is only meaningful while the expiry is fresh. When cleanup has
 # been stalled, rows get deactivated days or weeks late, and a "your plan
 # expired" text long after the fact only confuses the customer and burns SMS
@@ -142,14 +146,29 @@ def _router_long_offline(
     successful signal; routers that have never been online use ``created_at`` as
     the start of the observation window. A recovered router has ``last_status``
     set to true and automatically becomes eligible again on the next run.
+
+    Silence counts too. The shared summary needs two failures within five
+    minutes to flip to offline, and the only jobs that still probe a dead
+    router do so far less often than that, so a router that just stops
+    answering keeps ``last_status = true`` forever and used to be retried every
+    30 minutes indefinitely. Such a router is quarantined once this job has
+    itself failed to reach it since its last online signal: cleanup's own
+    evidence, so a stalled telemetry job can never quarantine a router cleanup
+    can still reach. Any later online signal moves ``last_online_at`` past the
+    failure and releases it.
+
+    Mirrored for the dashboard by ``ops_health.is_router_quarantined``.
     """
-    if getattr(router, "last_status", None) is not False:
-        return False
     offline_reference = (
         getattr(router, "last_online_at", None)
         or getattr(router, "created_at", None)
     )
-    return offline_reference is not None and (now - offline_reference) >= threshold
+    if offline_reference is None or (now - offline_reference) < threshold:
+        return False
+    if getattr(router, "last_status", None) is False:
+        return True
+    failed_at = _expiry_cleanup_unreachable_routers.get(getattr(router, "id", None))
+    return failed_at is not None and failed_at > offline_reference
 
 
 # Routers whose RouterOS connection failed during expired-user cleanup.
@@ -236,8 +255,33 @@ def _cleanup_router_unreachable(
     now: datetime,
     threshold: timedelta = ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD,
 ) -> bool:
-    failed_at = _expiry_cleanup_unreachable_routers.get(getattr(router, "id", None))
-    return failed_at is not None and (now - failed_at) < threshold
+    """True while this job's own back-off for the router is still running.
+
+    Any online signal newer than the failure (a payment provisioned, a usage
+    push, a bandwidth sample) ends the back-off at once. Otherwise a dark site
+    that comes back keeps serving its expired customers for up to 30 minutes
+    while cleanup waits out a failure the router has already recovered from.
+    """
+    router_id = getattr(router, "id", None)
+    failed_at = _expiry_cleanup_unreachable_routers.get(router_id)
+    if failed_at is None:
+        return False
+    last_online_at = getattr(router, "last_online_at", None)
+    if last_online_at is not None and last_online_at > failed_at:
+        _expiry_cleanup_unreachable_routers.pop(router_id, None)
+        return False
+    return (now - failed_at) < threshold
+
+
+def _router_agent_alive(router, now: datetime) -> bool:
+    """True when the router's outbound agent has checked in recently enough to
+    execute a queued removal."""
+    last_seen = getattr(router, "agent_last_seen_at", None)
+    return (
+        bool(getattr(router, "router_agent_enabled", False))
+        and last_seen is not None
+        and (now - last_seen) <= ROUTER_AGENT_ALIVE_WINDOW
+    )
 
 
 def _record_cleanup_reachability(
@@ -1334,6 +1378,42 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
         inactive_pppoe_reconcile_running = False
 
 
+async def _deactivate_expired_identityless_customers(db: AsyncSession, now: datetime) -> list[int]:
+    """Mark expired ACTIVE customers with no MAC and no PPPoE username INACTIVE.
+
+    The router cleanup below can only select rows it has a device identity for,
+    so these were never deactivated. They come from self-service reconnect: when
+    a device's MAC moves to another customer row, the old row keeps ACTIVE with
+    its MAC cleared. There is nothing on a router to remove for them (the old
+    binding follows the MAC, and the safety net drops unowned bindings), so the
+    status change is DB-only.
+    """
+    ids = (
+        await db.execute(
+            select(Customer.id).where(
+                Customer.status == CustomerStatus.ACTIVE,
+                Customer.expiry.isnot(None),
+                Customer.expiry <= now,
+                Customer.mac_address.is_(None),
+                Customer.pppoe_username.is_(None),
+            )
+        )
+    ).scalars().all()
+    if ids:
+        await db.execute(
+            update(Customer)
+            .where(Customer.id.in_(ids), Customer.status == CustomerStatus.ACTIVE)
+            .values(status=CustomerStatus.INACTIVE)
+        )
+        logger.warning(
+            "[CRON] Deactivated %d expired customer(s) with no MAC or PPPoE username: %s",
+            len(ids),
+            ids[:50],
+        )
+    await db.commit()
+    return list(ids)
+
+
 async def cleanup_expired_users_background():
     global cleanup_running, _last_safety_net_cleanup_at, _last_access_credential_reaper_at
     if cleanup_running:
@@ -1347,6 +1427,7 @@ async def cleanup_expired_users_background():
         async with async_session() as db:
             now = datetime.utcnow()
             await _hydrate_expiry_cleanup_unreachable_routers(db, now)
+            await _deactivate_expired_identityless_customers(db, now)
             from sqlalchemy import or_
 
             stmt = select(Customer).options(
@@ -1430,6 +1511,19 @@ async def cleanup_expired_users_background():
                 per_router_cleanup_counts[router_key] = current_router_count + 1
                 return True
 
+            # Whether to try a router is decided by this job's own back-off
+            # alone. The shared summary also flips offline on other jobs'
+            # failures, and a router whose payment provisioning fails every
+            # minute (router 371, 2026-09-23) kept that summary "recently
+            # offline" indefinitely, so its expired customers were never
+            # retried. The summary still orders the batch: customers on routers
+            # it believes are down go last, so they cannot take the slots of
+            # routers that are known to be up.
+            expired_customers = sorted(
+                expired_customers,
+                key=lambda c: bool(c.router and _router_recently_offline(c.router, now)),
+            )
+
             for c in expired_customers:
                 is_pppoe = c.pppoe_username and (
                     not c.mac_address
@@ -1444,15 +1538,14 @@ async def cleanup_expired_users_background():
                     if _router_long_offline(c.router, now):
                         long_offline_quarantined.append(c.id)
                         continue
-                    agent_cleanup_items[c.id] = {
-                        "kind": "pppoe",
-                        "router_id": c.router.id,
-                        "customer_id": c.id,
-                        "username": c.pppoe_username,
-                    }
-                    if _router_recently_offline(c.router, now) or _cleanup_router_unreachable(
-                        c.router, now
-                    ):
+                    if _router_agent_alive(c.router, now):
+                        agent_cleanup_items[c.id] = {
+                            "kind": "pppoe",
+                            "router_id": c.router.id,
+                            "customer_id": c.id,
+                            "username": c.pppoe_username,
+                        }
+                    if _cleanup_router_unreachable(c.router, now):
                         offline_skipped.append(c.id)
                         continue
                     router_key = f"{c.router.ip_address}:{c.router.port}"
@@ -1482,7 +1575,7 @@ async def cleanup_expired_users_background():
                 if c.router and _router_long_offline(c.router, now):
                     long_offline_quarantined.append(c.id)
                     continue
-                if c.router:
+                if c.router and _router_agent_alive(c.router, now):
                     agent_cleanup_items[c.id] = {
                         "kind": "hotspot",
                         "router_id": c.router.id,
@@ -1491,10 +1584,7 @@ async def cleanup_expired_users_background():
                         "username": normalize_mac_address(c.mac_address).replace(":", ""),
                         "lb_enabled": bool(getattr(c.router, "lb_enabled", False)),
                     }
-                if c.router and (
-                    _router_recently_offline(c.router, now)
-                    or _cleanup_router_unreachable(c.router, now)
-                ):
+                if c.router and _cleanup_router_unreachable(c.router, now):
                     offline_skipped.append(c.id)
                     continue
                 customer_data = {
@@ -1528,8 +1618,9 @@ async def cleanup_expired_users_background():
 
             if offline_skipped:
                 logger.warning(
-                    "[CRON] Skipping %d customer(s) on recently-offline routers: %s",
-                    len(offline_skipped), offline_skipped[:50],
+                    "[CRON] Skipping %d customer(s) on routers cleanup could not reach "
+                    "in the last %s: %s",
+                    len(offline_skipped), ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD, offline_skipped[:50],
                 )
 
             if long_offline_quarantined:

@@ -146,13 +146,36 @@ def is_owner_cut_off(owner_status) -> bool:
     return value in {s.value for s in CUT_OFF_OWNER_STATUSES}
 
 
-def is_router_quarantined(last_status, last_online_at, created_at, now: datetime) -> bool:
-    """Same rule as ``mikrotik_background._router_long_offline``: offline AND the
-    last successful online signal (or creation, if never online) is >= 3 days old."""
-    if last_status is not False:
-        return False
+def is_router_quarantined(last_status, last_online_at, created_at, now: datetime,
+                          last_cleanup_failure_at: Optional[datetime] = None) -> bool:
+    """Same rule as ``mikrotik_background._router_long_offline``: the last
+    successful online signal (or creation, if never online) is >= 3 days old,
+    AND either the router is marked offline or expiry cleanup has itself failed
+    to reach it since that signal (a silent router keeps a stale
+    ``last_status = true``). Cleanup keeps that evidence in memory; here it
+    comes from its ``expired_cleanup`` availability rows."""
     reference = last_online_at or created_at
-    return reference is not None and (now - reference) >= EXPIRY_QUARANTINE_AFTER
+    if reference is None or (now - reference) < EXPIRY_QUARANTINE_AFTER:
+        return False
+    if last_status is False:
+        return True
+    return last_cleanup_failure_at is not None and last_cleanup_failure_at > reference
+
+
+async def load_cleanup_failures_since_online(db, now: datetime) -> dict[int, datetime]:
+    """Latest ``expired_cleanup`` failure per router that happened after the
+    router's last online signal, for routers silent long enough to quarantine."""
+    reference = func.coalesce(Router.last_online_at, Router.created_at)
+    rows = (await db.execute(
+        select(RouterAvailabilityCheck.router_id, func.max(RouterAvailabilityCheck.checked_at))
+        .join(Router, Router.id == RouterAvailabilityCheck.router_id)
+        .where(RouterAvailabilityCheck.source == "expired_cleanup",
+               RouterAvailabilityCheck.is_online.is_(False),
+               reference <= now - EXPIRY_QUARANTINE_AFTER,
+               RouterAvailabilityCheck.checked_at > reference)
+        .group_by(RouterAvailabilityCheck.router_id)
+    )).all()
+    return {router_id: failed_at for router_id, failed_at in rows}
 
 
 def sample_history_points(rows: list[tuple[datetime, dict]], bucket: timedelta = HISTORY_BUCKET) -> list[dict]:
@@ -524,6 +547,7 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
                    Router.ip_address, User.subscription_status)
             .outerjoin(User, User.id == Router.user_id)
         )).all()
+        cleanup_failures = await load_cleanup_failures_since_online(db, now)
         group_rows = (await db.execute(
             select(Customer.router_id, func.count(), func.min(Customer.expiry))
             .where(Customer.status == CustomerStatus.ACTIVE,
@@ -560,7 +584,8 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
     tunnel_of = {rid: tunnel_type_for_ip(ip) for rid, _, _, _, ip, _ in router_rows}
     quarantined_routers = {
         rid for rid, last_status, last_online, created, _, _ in router_rows
-        if is_router_quarantined(last_status, last_online, created, now)
+        if is_router_quarantined(last_status, last_online, created, now,
+                                 cleanup_failures.get(rid))
     }
     # Routers of suspended/inactive resellers are cut off at the platform level
     # (their customers cannot be online), so their expired customers are not a
