@@ -165,6 +165,7 @@ from app.services.usage_cap_sampler import sample_capped_usage_background
 from app.services.mikrotik_lb_background import reconcile_lb_paid_background
 from app.services.payment_port_attribution import attribute_recent_payment_ports_background
 from app.services.router_status_alerts import scan_and_notify_offline_routers
+from app.services.router_overload_alerts import poll_router_cpu, scan_payment_overload
 from app.services.customer_expiry_notifications import scan_customer_expiry_reminders
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_background
@@ -2490,6 +2491,22 @@ async def run_router_status_alert_migrations():
     logger.info("Router status-alert migrations complete")
 
 
+async def run_router_overload_alert_migrations():
+    """Columns for router overload alerts and SNMP CPU monitoring. All nullable
+    or defaulted, so existing rows keep today's behaviour (no router is SNMP
+    enrolled until the rollout script verifies it). Idempotent."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS overload_warning_notified_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS overload_critical_notified_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS snmp_enabled BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS cpu_load INTEGER NULL,
+            ADD COLUMN IF NOT EXISTS cpu_checked_at TIMESTAMP NULL
+        """))
+    logger.info("Router overload-alert migrations complete")
+
+
 async def run_feedback_migrations():
     """Create feedback board (Ideas + Bugs) enums, tables, indexes. Idempotent."""
     from sqlalchemy import text, inspect
@@ -2871,6 +2888,7 @@ async def startup_event():
 
     try:
         await run_router_status_alert_migrations()
+        await run_router_overload_alert_migrations()
         logger.info("Router status-alert migrations completed successfully")
     except Exception as e:
         logger.error(f"Router status-alert migration failed (non-fatal): {e}")
@@ -2974,6 +2992,24 @@ async def startup_event():
         name='Send opt-in router offline alerts (DB-only, debounced)',
         replace_existing=True,
         max_instances=1
+    )
+    scheduler.add_job(
+        scan_payment_overload,
+        trigger=IntervalTrigger(seconds=307),
+        id='router_overload_alerts',
+        name='Alert resellers when payments fail on a reachable (overloaded) router',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        poll_router_cpu,
+        trigger=IntervalTrigger(seconds=301),
+        id='router_cpu_snmp_poll',
+        name='Poll enrolled routers CPU over SNMP (event loop, no threads)',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         scan_customer_expiry_reminders,
