@@ -292,14 +292,35 @@ def build_timeline(start: datetime, end: datetime, attempt_rows: list[tuple],
     return {"bucket_seconds": size, "points": points}
 
 
+async def resolve_owner(db, owner: str) -> Optional[dict[str, Any]]:
+    """Turn an ``owner`` query value (reseller email, case-insensitive, or a
+    numeric user id) into ``{"user_id", "email", "organization_name"}``."""
+    text = (owner or "").strip()
+    if not text:
+        return None
+    q = select(User.id, User.email, User.organization_name, User.subscription_status)
+    q = q.where(User.id == int(text)) if text.isdigit() else q.where(func.lower(User.email) == text.lower())
+    row = (await db.execute(q)).first()
+    if row is None:
+        return None
+    status = row[3]
+    return {"user_id": row[0], "email": row[1], "organization_name": row[2],
+            "subscription_status": status.value if hasattr(status, "value") else status}
+
+
 async def build_window_report(start: datetime, end: datetime,
-                              router_id: Optional[int] = None) -> dict[str, Any]:
+                              router_id: Optional[int] = None,
+                              owner_id: Optional[int] = None) -> dict[str, Any]:
+    """``router_id`` narrows to one router; ``owner_id`` to every router of one
+    reseller (the primary way to answer "how is this reseller doing"). When both
+    are given the router must belong to the owner, otherwise the scope is empty."""
     start, end = clamp_window(start, end)
     async with database.async_session() as db:
         router_rows = (await db.execute(
             select(Router.id, Router.name, Router.ip_address, Router.last_status,
                    Router.last_online_at, Router.last_checked_at, Router.created_at,
-                   Router.router_agent_enabled, User.subscription_status)
+                   Router.router_agent_enabled, User.subscription_status, Router.user_id,
+                   User.email, User.organization_name)
             .outerjoin(User, User.id == Router.user_id)
         )).all()
         names = {r[0]: r[1] for r in router_rows}
@@ -310,6 +331,33 @@ async def build_window_report(start: datetime, end: datetime,
             for r in router_rows
         }
 
+        owner: Optional[dict[str, Any]] = None
+        scope_ids: Optional[set[int]] = None
+        if owner_id is not None:
+            owned = [r for r in router_rows if r[9] == owner_id]
+            scope_ids = {r[0] for r in owned}
+            owner_row = await resolve_owner(db, str(owner_id))
+            owner = {
+                **(owner_row or {"user_id": owner_id, "email": None,
+                                 "organization_name": None, "subscription_status": None}),
+                "routers": [
+                    {"router_id": r[0], "router_name": r[1], "tunnel": tunnel_type_for_ip(r[2]),
+                     "last_status": r[3], "last_online_at": _iso(r[4]),
+                     "last_checked_at": _iso(r[5]), "router_agent_enabled": bool(r[7])}
+                    for r in sorted(owned, key=lambda r: (r[1] or "", r[0]))
+                ],
+                "routers_total": len(owned),
+            }
+        if router_id is not None:
+            scope_ids = {router_id} if scope_ids is None else (scope_ids & {router_id})
+
+        def _scoped(q, column):
+            if scope_ids is None:
+                return q
+            if not scope_ids:
+                return q.where(column.is_(None))  # empty scope: no rows
+            return q.where(column.in_(sorted(scope_ids)))
+
         attempt_q = (
             select(ProvisioningAttempt.router_id, ProvisioningAttempt.provisioning_state,
                    ProvisioningAttempt.created_at, ProvisioningAttempt.last_attempt_at,
@@ -319,9 +367,7 @@ async def build_window_report(start: datetime, end: datetime,
             .order_by(ProvisioningAttempt.created_at.desc())
             .limit(ROW_LIMIT)
         )
-        if router_id is not None:
-            attempt_q = attempt_q.where(ProvisioningAttempt.router_id == router_id)
-        attempt_rows = (await db.execute(attempt_q)).all()
+        attempt_rows = (await db.execute(_scoped(attempt_q, ProvisioningAttempt.router_id))).all()
 
         removal_q = (
             select(ProvisioningLog.log_date, Customer.expiry, Customer.router_id)
@@ -332,9 +378,7 @@ async def build_window_report(start: datetime, end: datetime,
             .order_by(ProvisioningLog.log_date.desc())
             .limit(ROW_LIMIT)
         )
-        if router_id is not None:
-            removal_q = removal_q.where(Customer.router_id == router_id)
-        removal_rows = (await db.execute(removal_q)).all()
+        removal_rows = (await db.execute(_scoped(removal_q, Customer.router_id))).all()
 
         # Enforcement: customers whose (current) expiry fell inside the slice.
         # Renewed customers carry a later expiry and are therefore not counted;
@@ -356,24 +400,31 @@ async def build_window_report(start: datetime, end: datetime,
             .order_by(Customer.expiry.asc())
             .limit(ROW_LIMIT)
         )
-        if router_id is not None:
-            exp_q = exp_q.where(Customer.router_id == router_id)
-        expiry_rows = (await db.execute(exp_q)).all()
+        expiry_rows = (await db.execute(_scoped(exp_q, Customer.router_id))).all()
 
+        # Payments: fleet-wide when unscoped; for a reseller (or one router)
+        # the transactions of customers on the scoped routers.
         payments: Optional[dict] = None
-        if router_id is None:
-            status_rows = (await db.execute(
+        if scope_ids is None or scope_ids:
+            status_q = (
                 select(MpesaTransaction.status, func.count())
                 .where(MpesaTransaction.created_at >= start, MpesaTransaction.created_at < end)
                 .group_by(MpesaTransaction.status)
-            )).all()
-            pay_rows = (await db.execute(
+            )
+            pay_q = (
                 select(MpesaTransaction.created_at, MpesaTransaction.updated_at)
                 .where(MpesaTransaction.created_at >= start, MpesaTransaction.created_at < end,
                        MpesaTransaction.status == MpesaTransactionStatus.completed)
                 .order_by(MpesaTransaction.created_at.desc())
                 .limit(ROW_LIMIT)
-            )).all()
+            )
+            if scope_ids is not None:
+                status_q = _scoped(status_q.join(Customer, Customer.id == MpesaTransaction.customer_id),
+                                   Customer.router_id)
+                pay_q = _scoped(pay_q.join(Customer, Customer.id == MpesaTransaction.customer_id),
+                                Customer.router_id)
+            status_rows = (await db.execute(status_q)).all()
+            pay_rows = (await db.execute(pay_q)).all()
             by_status: dict[str, int] = defaultdict(int)
             for status, n in status_rows:
                 by_status[status.value if hasattr(status, "value") else str(status)] += int(n)
@@ -406,6 +457,7 @@ async def build_window_report(start: datetime, end: datetime,
              "tunnel": tunnel_of.get(router_id, "other")}
             if router_id is not None else None
         ),
+        "owner": owner,
         "provisioning": summarize_attempts(attempt_rows, tunnel_of, names),
         "expiry": {
             "enforcement": summarize_enforcement(expiry_rows, router_state, tunnel_of, names, datetime.utcnow()),
