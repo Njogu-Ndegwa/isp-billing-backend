@@ -17,6 +17,7 @@ from app.db.database import db_pool_snapshot, get_db
 from app.db.models import Router, RouterAvailabilityCheck, User, UserRole
 from app.services.auth import verify_token, get_current_user
 from app.services import admin_metrics as svc
+from app.services import ops_health
 from app.services.management_tunnel_health import (
     build_management_tunnel_health,
     build_fleet_flap_history,
@@ -266,6 +267,52 @@ async def admin_management_tunnel_status(
         flap_history=flap_history,
         fleet_status=fleet_status,
     )
+
+
+# ---------------------------------------------------------------------------
+# Operations health (read-only: serves the latest stored snapshot, never computes)
+# ---------------------------------------------------------------------------
+
+@router.get("/api/admin/ops-health")
+async def admin_ops_health(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Latest ops-health snapshot + 24h sparkline history. Contract: ops-health spec."""
+    await _require_admin(token, db)
+    await db.commit()
+    now = datetime.utcnow()
+    latest = await ops_health.load_latest_snapshot()
+    points = await ops_health.load_history_points(now, 24)
+    if latest is None:
+        return {
+            "generated_at": None,
+            "snapshot_age_seconds": None,
+            "overall_status": "unknown",
+            "alerts": [],
+            "sections": {},
+            "history": {"points": points},
+        }
+    age = max(0, int((now - latest["generated_at"]).total_seconds()))
+    return {
+        "generated_at": ops_health._iso(latest["generated_at"]),
+        "snapshot_age_seconds": age,
+        "overall_status": latest["overall_status"],
+        "alerts": latest["alerts"],
+        "sections": latest["sections"],
+        "history": {"points": points},
+    }
+
+
+@router.get("/api/admin/ops-health/history")
+async def admin_ops_health_history(
+    hours: int = Query(24, ge=1, le=ops_health.HISTORY_MAX_HOURS),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    await _require_admin(token, db)
+    await db.commit()
+    return {"points": await ops_health.load_history_points(datetime.utcnow(), hours)}
 
 
 # ---------------------------------------------------------------------------
