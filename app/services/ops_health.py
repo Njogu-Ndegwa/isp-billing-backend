@@ -666,7 +666,7 @@ def count_recent_drops(checks: Iterable[tuple[int, datetime, bool]], now: dateti
 async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None) -> dict:
     async with database.async_session() as db:
         router_rows = (await db.execute(
-            select(Router.last_status, Router.last_checked_at)
+            select(Router.last_status, Router.last_checked_at, Router.ip_address)
         )).all()
         check_rows = (await db.execute(
             select(RouterAvailabilityCheck.router_id, RouterAvailabilityCheck.checked_at,
@@ -678,19 +678,27 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
         await db.commit()
 
     online = offline = stale = 0
+    by_tunnel: dict[str, dict] = {}
     stale_after = timedelta(seconds=ROUTER_STATUS_STALE_AFTER_SECONDS)
-    for last_status, last_checked in router_rows:
+    for last_status, last_checked, ip in router_rows:
+        bucket = by_tunnel.setdefault(tunnel_type_for_ip(ip),
+                                      {"online": 0, "offline": 0, "stale": 0, "total": 0})
+        bucket["total"] += 1
         if last_checked is None or (now - last_checked) > stale_after:
             stale += 1
+            bucket["stale"] += 1
         elif last_status:
             online += 1
+            bucket["online"] += 1
         else:
             offline += 1
+            bucket["offline"] += 1
     drops = count_recent_drops(check_rows, now)
     return {
         "status": "unknown",
         "counts": {"online": online, "offline": offline, "stale": stale,
                    "total": len(router_rows)},
+        "by_tunnel": {t: by_tunnel[t] for t in TUNNEL_TYPES if t in by_tunnel},
         "recent_drops_10m": drops,
         "platform_event": drops >= rules.TUNNELS_PLATFORM_EVENT_WARN,
         "control_path": read_route_state_file(getattr(settings, "OPS_ROUTE_STATE_FILE", "")),

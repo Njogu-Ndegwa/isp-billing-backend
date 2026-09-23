@@ -462,6 +462,8 @@ async def test_tunnels_section_counts_fleet_drops(db, now):
 
     section = await ops_health.build_tunnels_section(now)
     assert section["counts"] == {"online": 3, "offline": 0, "stale": 1, "total": 4}
+    # Factory routers all sit on 10.0.0.2 -> one WireGuard bucket.
+    assert section["by_tunnel"] == {"wireguard": {"online": 3, "offline": 0, "stale": 1, "total": 4}}
     assert section["recent_drops_10m"] == 2
     assert section["platform_event"] is False
     assert section["control_path"]["available"] is False

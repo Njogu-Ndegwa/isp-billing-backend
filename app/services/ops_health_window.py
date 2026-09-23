@@ -231,6 +231,67 @@ def summarize_enforcement(rows, router_state, tunnel_of, names, now: datetime) -
     }
 
 
+def bucket_seconds_for(start: datetime, end: datetime) -> int:
+    """15-minute buckets up to 6 h, hourly up to 3 days, daily beyond."""
+    hours = (end - start).total_seconds() / 3600
+    if hours <= 6:
+        return 900
+    if hours <= 72:
+        return 3600
+    return 86400
+
+
+def build_timeline(start: datetime, end: datetime, attempt_rows: list[tuple],
+                   expiry_rows: list[tuple]) -> dict:
+    """Per-bucket delivered / not delivered payments, e2e p95, expired vs removed.
+
+    Attempts bucket on created_at (when the customer paid); expiries on expiry.
+    """
+    size = bucket_seconds_for(start, end)
+    n = max(1, int(((end - start).total_seconds() + size - 1) // size))
+    buckets = [
+        {"t": _iso(start + timedelta(seconds=i * size)), "delivered": 0, "not_delivered": 0,
+         "pending": 0, "e2e": [], "expired": 0, "removed": 0}
+        for i in range(n)
+    ]
+
+    def idx(ts: Optional[datetime]) -> Optional[int]:
+        if ts is None:
+            return None
+        i = int((ts - start).total_seconds() // size)
+        return i if 0 <= i < n else None
+
+    for _rid, state, created, _attempted, updated, _tries, _err in attempt_rows:
+        i = idx(created)
+        if i is None:
+            continue
+        key = state.value if hasattr(state, "value") else str(state)
+        b = buckets[i]
+        if key == "router_updated":
+            b["delivered"] += 1
+            v = _seconds(updated, created)
+            if v is not None and v >= 0:
+                b["e2e"].append(v)
+        elif key in ("retry_pending", "failed"):
+            b["not_delivered"] += 1
+        else:
+            b["pending"] += 1
+    for _cid, _rid, expiry, status, removed_at in expiry_rows:
+        i = idx(expiry)
+        if i is None:
+            continue
+        status_value = status.value if hasattr(status, "value") else str(status)
+        buckets[i]["expired"] += 1
+        if removed_at is not None or status_value != CustomerStatus.ACTIVE.value:
+            buckets[i]["removed"] += 1
+    points = []
+    for b in buckets:
+        e2e = b.pop("e2e")
+        b["e2e_p95"] = percentile(e2e, 95)
+        points.append(b)
+    return {"bucket_seconds": size, "points": points}
+
+
 async def build_window_report(start: datetime, end: datetime,
                               router_id: Optional[int] = None) -> dict[str, Any]:
     start, end = clamp_window(start, end)
@@ -355,5 +416,6 @@ async def build_window_report(start: datetime, end: datetime,
             },
         },
         "payments": payments,
+        "timeline": build_timeline(start, end, attempt_rows, expiry_rows),
         "truncated": max(len(attempt_rows), len(removal_rows), len(expiry_rows)) >= ROW_LIMIT,
     }

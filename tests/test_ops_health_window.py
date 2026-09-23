@@ -142,6 +142,15 @@ async def test_window_report_isolates_the_slice_and_ranks_routers(db, now):
     assert report["payments"]["callback_latency"]["p95"] == pytest.approx(28.2)
     assert report["window"]["hours"] == 3
     assert report["truncated"] is False
+    # Timeline: a 3 h slice -> 15-minute buckets; everything landed in the first hour.
+    tl = report["timeline"]
+    assert tl["bucket_seconds"] == 900 and len(tl["points"]) == 12
+    assert [p["delivered"] for p in tl["points"][:3]] == [3, 2, 0]
+    assert tl["points"][2]["not_delivered"] == 2
+    assert tl["points"][0]["e2e_p95"] == pytest.approx(6.9)
+    assert (tl["points"][2]["expired"], tl["points"][2]["removed"]) == (1, 1)
+    assert window.bucket_seconds_for(now - timedelta(hours=30), now) == 3600
+    assert window.bucket_seconds_for(now - timedelta(days=10), now) == 86400
 
     # Single-router view: only that router, payments omitted, router echoed back.
     single = await window.build_window_report(t0, t1, router_id=l2.id)
