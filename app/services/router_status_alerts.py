@@ -27,6 +27,18 @@ latency there. The offline scan sheds load when the DB pool is under pressure,
 per the background-work guardrails.
 
 Noise control:
+- Daily budget per router (2026-09-24, after flapping routers sent one reseller
+  52 messages in a day): at most ``MAX_STATUS_ALERTS_PER_ROUTER_PER_DAY`` (3)
+  messages per router per local day. The first outage gets "went offline", its
+  recovery gets "back online", and any further outage that day gets ONE
+  "unstable connection" message that uses up the rest of the day's budget, so a
+  flapping router can never produce more than 3 messages a day. The budget is
+  claimed with a compare-and-swap UPDATE, so concurrent writers cannot overspend.
+- "Back online" is only sent for an outage we actually announced (a first-ever
+  online is the one exception) — no orphan recovery messages.
+- Per-reseller SMS cap: at most ``MAX_STATUS_ALERT_SMS_PER_OWNER_PER_DAY`` status
+  SMS per reseller per local day across all their routers; beyond that the
+  alert is inbox-only.
 - ``MIN_OUTAGE_FOR_ALERTS``: outages shorter than this produce no message in
   either direction.
 - ``MAX_OUTAGE_AGE_FOR_ALERTS``: "went offline" is only announced while the
@@ -44,9 +56,10 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app.config import settings
+from app.core.local_time import local_midnight_utc, local_now
 from app.db import database
 from app.db.database import db_pool_snapshot
 from app.db.models import (
@@ -77,6 +90,61 @@ MAX_OUTAGE_AGE_FOR_ALERTS = timedelta(hours=48)
 # offline routers are still re-probed at least every ~30 min by background jobs,
 # so a fresh outage always has a recent failed check.
 OFFLINE_STATUS_FRESH_WINDOW = timedelta(minutes=90)
+MAX_STATUS_ALERTS_PER_ROUTER_PER_DAY = 3
+MAX_STATUS_ALERT_SMS_PER_OWNER_PER_DAY = 4
+
+KIND_OFFLINE = "offline"
+KIND_UNSTABLE = "unstable"
+KIND_RECOVERY = "recovery"
+
+
+def _local_day(now: datetime) -> str:
+    return local_now(now).strftime("%Y-%m-%d")
+
+
+def _announced_outage(router: Router) -> bool:
+    """True when the current outage's "went offline" message was sent."""
+    off = getattr(router, "offline_notified_at", None)
+    on = getattr(router, "online_notified_at", None)
+    return off is not None and (on is None or off > on)
+
+
+def decide_daily_kind(router: Router, requested: str, now: datetime,
+                      first_ever_online: bool = False) -> Optional[tuple[str, int]]:
+    """Apply the per-router daily budget. Returns (kind, new_count) or None.
+
+    Pure function over the row's current budget; the caller persists it with a
+    compare-and-swap on (status_alerts_day, status_alerts_sent_today).
+    """
+    today = _local_day(now)
+    used = (router.status_alerts_sent_today or 0) if router.status_alerts_day == today else 0
+    if used >= MAX_STATUS_ALERTS_PER_ROUTER_PER_DAY:
+        return None
+    if requested == KIND_OFFLINE:
+        if used == 0:
+            return KIND_OFFLINE, 1
+        # Second outage today: one "unstable" message, then silence until tomorrow.
+        return KIND_UNSTABLE, MAX_STATUS_ALERTS_PER_ROUTER_PER_DAY
+    # Recovery: only for an announced outage, or a router's first-ever online
+    # (the caller knows that from the pre-transition row: offline_since is None).
+    if not (_announced_outage(router) or first_ever_online):
+        return None
+    return KIND_RECOVERY, used + 1
+
+
+async def _spend_daily_budget(db, router: Router, new_count: int, now: datetime) -> bool:
+    """Compare-and-swap the router's daily budget. Caller commits/rolls back."""
+    prev_day = router.status_alerts_day
+    prev_count = router.status_alerts_sent_today or 0
+    day_match = (Router.status_alerts_day.is_(None) if prev_day is None
+                 else Router.status_alerts_day == prev_day)
+    result = await db.execute(
+        update(Router)
+        .where(Router.id == router.id, day_match,
+               func.coalesce(Router.status_alerts_sent_today, 0) == prev_count)
+        .values(status_alerts_day=_local_day(now), status_alerts_sent_today=new_count)
+    )
+    return result.rowcount == 1
 
 
 def _db_pool_too_busy() -> bool:
@@ -155,6 +223,17 @@ def render_offline_notification(name: str, offline_since: datetime,
     return subject, body + _OPT_OUT_HINT
 
 
+def render_unstable_notification(name: str) -> tuple[str, str]:
+    """Return (subject, body) for the once-a-day "unstable connection" message."""
+    subject = f"Router connection unstable: {name}"
+    body = (
+        f"Your router '{name}' has gone offline again today. The connection looks "
+        "unstable; please check the router's power and internet link. We won't send "
+        "more offline/online alerts for this router until tomorrow."
+    )
+    return subject, body + _OPT_OUT_HINT
+
+
 async def _queue_alert_sms(db, owner: User, router: Router,
                            sms_body: str) -> tuple[Optional[int], Optional[str]]:
     """Charge the owner's credits and add the QUEUED SMS row. Caller commits.
@@ -170,6 +249,17 @@ async def _queue_alert_sms(db, owner: User, router: Router,
         return None, None
     settings_row = await db.get(MessagingSettings, 1)
     if settings_row is not None and not settings_row.enabled:
+        return None, None
+    sent_today = (await db.execute(
+        select(func.count(SmsMessage.id)).where(
+            SmsMessage.user_id == owner.id,
+            SmsMessage.category == ALERT_SMS_CATEGORY,
+            SmsMessage.created_at >= local_midnight_utc(),
+        )
+    )).scalar() or 0
+    if sent_today >= MAX_STATUS_ALERT_SMS_PER_OWNER_PER_DAY:
+        logger.info("Router %s alert SMS skipped: owner %s reached the daily SMS cap",
+                    router.id, owner.id)
         return None, None
     segments = count_segments(sms_body)
     # The alert is billed to the router's owner, so it follows their gateway:
@@ -300,6 +390,20 @@ async def send_router_recovery_notification(
     now = now or datetime.utcnow()
     try:
         async with database.async_session() as db:
+            # Daily budget + "only after an announced outage", decided on the
+            # row as it was BEFORE this recovery's cooldown claim.
+            before = await db.get(Router, router_id)
+            if before is None:
+                return False
+            decision = decide_daily_kind(before, KIND_RECOVERY, now,
+                                         first_ever_online=offline_since is None)
+            if decision is None:
+                await db.rollback()
+                return False
+            _, new_count = decision
+            if not await _spend_daily_budget(db, before, new_count, now):
+                await db.rollback()
+                return False
             # Atomic cooldown claim: only one concurrent writer per cooldown
             # window gets rowcount 1; everyone else skips without a message.
             claim = await db.execute(
@@ -382,9 +486,19 @@ async def send_router_offline_notification(
             if not router or router.last_online_at is None:
                 await db.rollback()
                 return False
-            subject, body = render_offline_notification(
-                router.name, router.last_online_at, now
-            )
+            await db.refresh(router)
+            decision = decide_daily_kind(router, KIND_OFFLINE, now)
+            if decision is None or not await _spend_daily_budget(db, router, decision[1], now):
+                # Budget spent for today: stay silent (the stamp is rolled back
+                # too, so the outage is announced tomorrow if it is still going).
+                await db.rollback()
+                return False
+            if decision[0] == KIND_UNSTABLE:
+                subject, body = render_unstable_notification(router.name)
+            else:
+                subject, body = render_offline_notification(
+                    router.name, router.last_online_at, now
+                )
             created, sms_id, provider_sender = await _create_alert_messages(
                 db, router, subject, body)
             if not created:

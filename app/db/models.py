@@ -501,6 +501,11 @@ class Router(Base):
     status_alerts_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     online_notified_at = Column(DateTime, nullable=True)
     offline_notified_at = Column(DateTime, nullable=True)
+    # Anti-spam daily budget for status alerts (router_status_alerts): local
+    # (EAT) day 'YYYY-MM-DD' and how many offline/online/unstable messages this
+    # router has produced that day. Capped at MAX_STATUS_ALERTS_PER_ROUTER_PER_DAY.
+    status_alerts_day = Column(String(10), nullable=True)
+    status_alerts_sent_today = Column(Integer, nullable=False, default=0, server_default="0")
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 
