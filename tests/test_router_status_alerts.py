@@ -57,6 +57,15 @@ async def _setup_offline_router(db, *, alerts=True, offline_for=timedelta(hours=
     return admin, reseller, router
 
 
+async def _announce(db, router_id):
+    """Mark the current outage as announced ("went offline" was sent). Under the
+    anti-spam rule a "back online" message is only sent for an announced outage."""
+    r = await db.get(Router, router_id)
+    await db.refresh(r)
+    r.offline_notified_at = datetime.utcnow() - timedelta(minutes=1)
+    await db.commit()
+
+
 async def _inbox_messages(db, recipient_id):
     result = await db.execute(
         select(ResellerInboxMessage).where(
@@ -71,6 +80,7 @@ async def _inbox_messages(db, recipient_id):
 async def test_offline_to_online_transition_sends_recovery_message(db):
     _, reseller, router = await _setup_offline_router(db)
 
+    await _announce(db, router.id)
     await record_router_availability(db, router.id, True, "test")
 
     messages = await _inbox_messages(db, reseller.id)
@@ -124,6 +134,7 @@ async def test_online_to_online_does_not_notify(db):
 async def test_recovery_cooldown_blocks_repeat_notification(db):
     _, reseller, router = await _setup_offline_router(db)
 
+    await _announce(db, router.id)
     await record_router_availability(db, router.id, True, "test")
     assert len(await _inbox_messages(db, reseller.id)) == 1
 
@@ -148,6 +159,7 @@ async def test_recovery_cooldown_blocks_repeat_notification(db):
     aged.online_notified_at = datetime.utcnow() - (NOTIFY_COOLDOWN + timedelta(minutes=1))
     await db.commit()
 
+    await _announce(db, router.id)
     await record_router_availability(db, router.id, True, "test")
     assert len(await _inbox_messages(db, reseller.id)) == 2
 
@@ -336,6 +348,7 @@ async def test_recovery_alert_queues_charged_sms(db, monkeypatch):
     calls = _capture_sms_spawn(monkeypatch)
     _, reseller, router = await _setup_sms_reseller(db)
 
+    await _announce(db, router.id)
     await record_router_availability(db, router.id, True, "test")
 
     messages = await _inbox_messages(db, reseller.id)
@@ -377,6 +390,7 @@ async def test_alert_degrades_to_inbox_only_without_credits(db, monkeypatch):
     calls = _capture_sms_spawn(monkeypatch)
     _, reseller, router = await _setup_sms_reseller(db, credits=0)
 
+    await _announce(db, router.id)
     await record_router_availability(db, router.id, True, "test")
 
     messages = await _inbox_messages(db, reseller.id)
@@ -390,6 +404,7 @@ async def test_alert_skips_sms_without_phone(db, monkeypatch):
     calls = _capture_sms_spawn(monkeypatch)
     _, reseller, router = await _setup_sms_reseller(db, phone=None)
 
+    await _announce(db, router.id)
     await record_router_availability(db, router.id, True, "test")
 
     messages = await _inbox_messages(db, reseller.id)

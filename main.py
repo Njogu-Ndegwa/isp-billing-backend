@@ -2464,6 +2464,13 @@ async def run_router_status_alert_migrations():
             ADD COLUMN IF NOT EXISTS online_notified_at TIMESTAMP NULL,
             ADD COLUMN IF NOT EXISTS offline_notified_at TIMESTAMP NULL
         """))
+        # Anti-spam daily budget (2026-09-24): flapping routers sent up to 52
+        # offline/online messages a day to one reseller.
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS status_alerts_day VARCHAR(10) NULL,
+            ADD COLUMN IF NOT EXISTS status_alerts_sent_today INTEGER NOT NULL DEFAULT 0
+        """))
         result = await conn.execute(sa_text("""
             SELECT column_default FROM information_schema.columns
             WHERE table_name = 'routers' AND column_name = 'status_alerts_enabled'

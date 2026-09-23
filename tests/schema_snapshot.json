@@ -799,7 +799,9 @@
   "radius_nas_identifier",
   "radius_secret",
   "router_agent_enabled",
+  "status_alerts_day",
   "status_alerts_enabled",
+  "status_alerts_sent_today",
   "user_id",
   "username"
  ],
