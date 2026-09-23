@@ -722,8 +722,23 @@ async def build_control_plane_section(now: datetime, baselines: Optional[dict] =
         "started_at": _iso(row.started_at),
         "last_seen_at": _iso(row.last_seen_at),
     } for row in live]
-    writers = sum(1 for i in instances if i["runtime_mode"] == "active" and i["scheduler_enabled"])
-    identities = {i["db_identity"] for i in instances if i["db_identity"]}
+    # A deploy recreates the container: the old process's heartbeat row stays
+    # inside the 3-minute live window while the new process is already
+    # running, which looked like two writers after every deploy on
+    # 2026-09-23. An instance that has NOT heartbeated since the newest
+    # instance started is superseded, not concurrent; a genuine second writer
+    # keeps heartbeating and is counted again within a minute.
+    newest_started = max((r.started_at for r in live if r.started_at), default=None)
+    superseded_ids = {
+        r.instance_id for r in live
+        if newest_started is not None and r.started_at != newest_started
+        and r.last_seen_at is not None and r.last_seen_at < newest_started
+    }
+    for inst in instances:
+        inst["superseded"] = inst["instance_id"] in superseded_ids
+    concurrent = [i for i in instances if not i["superseded"]]
+    writers = sum(1 for i in concurrent if i["runtime_mode"] == "active" and i["scheduler_enabled"])
+    identities = {i["db_identity"] for i in concurrent if i["db_identity"]}
     since_writer = _seconds(now, last_writer)
     return {
         "status": "unknown",
@@ -945,6 +960,24 @@ async def write_heartbeat(now: Optional[datetime] = None) -> dict:
                 setattr(row, key, value)
         await db.commit()
     return {"instance_id": _INSTANCE_ID, **fields}
+
+
+async def retire_heartbeat() -> bool:
+    """Delete this process's heartbeat row on graceful shutdown (best effort).
+
+    Called from the FastAPI shutdown hook so a deploy's outgoing container
+    never lingers as a "live" instance. Returns True if a row was removed.
+    """
+    try:
+        async with database.async_session() as db:
+            result = await db.execute(delete(AppInstanceHeartbeat).where(
+                AppInstanceHeartbeat.instance_id == _INSTANCE_ID
+            ))
+            await db.commit()
+            return bool(result.rowcount)
+    except Exception:  # noqa: BLE001 - shutdown must never fail on this
+        logger.warning("[OPS-HEALTH] could not retire heartbeat %s", _INSTANCE_ID)
+        return False
 
 
 # ---------------------------------------------------------------------------

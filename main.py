@@ -3188,6 +3188,13 @@ async def shutdown_event():
         logger.info("Background scheduler stopped")
     else:
         logger.info("Background scheduler was not running")
+    # Drop this process's ops-health heartbeat so the outgoing container of a
+    # deploy is not counted as a second active writer for the next 3 minutes.
+    try:
+        from app.services.ops_health import retire_heartbeat
+        await retire_heartbeat()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[OPS-HEALTH] heartbeat retirement skipped: {e}")
 
 
 if __name__ == "__main__":

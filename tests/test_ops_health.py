@@ -535,7 +535,7 @@ async def test_second_active_writer_alerts_admins_once_per_dedupe_window(db, now
     rogue = AppInstanceHeartbeat(
         instance_id="aws-stale-1234", hostname="ip-172-31-0-1", runtime_mode="active",
         scheduler_enabled=True, db_identity="1188", app_version="old",
-        started_at=now - timedelta(hours=2), last_seen_at=now - timedelta(seconds=30),
+        started_at=now - timedelta(hours=2), last_seen_at=now,   # heartbeating NOW = concurrent
     )
     db.add(rogue)
     await db.commit()
@@ -577,6 +577,49 @@ async def test_second_active_writer_alerts_admins_once_per_dedupe_window(db, now
     # Once the rogue instance stops heartbeating the alert clears on its own.
     cleared = await ops_health.run_cycle(now + timedelta(minutes=40))
     assert cleared["overall_status"] == "healthy" and cleared["alerts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_deploy_handover_is_not_a_second_writer(db, now):
+    """The outgoing container of a deploy still has a heartbeat inside the live
+    window but has not written one since the new process started: superseded,
+    not concurrent. Fired a false critical after every deploy on 2026-09-23."""
+    await make_admin(db)
+    db.add(AppInstanceHeartbeat(
+        instance_id="old-container-aaaa", hostname="4110e55ae77d", runtime_mode="active",
+        scheduler_enabled=True, db_identity="7566", app_version="prev",
+        started_at=now - timedelta(hours=3), last_seen_at=now - timedelta(seconds=70),
+    ))
+    await db.commit()
+    # Our own heartbeat: started when this test process started (before `now`),
+    # written at `now` -> the newest instance.
+    result = await ops_health.run_cycle(now)
+    assert result["delivered"] == 0
+    snap = await ops_health.load_latest_snapshot()
+    cp = snap["sections"]["control_plane"]
+    assert cp["active_writers"] == 1
+    assert cp["db_identity_mismatch"] is False
+    by_id = {i["instance_id"]: i for i in cp["instances"]}
+    assert by_id["old-container-aaaa"]["superseded"] is True
+    assert [k for k in snap["alerts"] if k["key"].startswith("control_plane")] == []
+
+    # ...but if that "old" instance keeps heartbeating after we started, it is
+    # a real second writer and the alert fires on the next cycle.
+    row = await db.get(AppInstanceHeartbeat, "old-container-aaaa")
+    row.last_seen_at = now + timedelta(minutes=1)
+    await db.commit()
+    result = await ops_health.run_cycle(now + timedelta(minutes=1))
+    assert result["overall_status"] == "critical" and result["delivered"] == 1
+    snap = await ops_health.load_latest_snapshot()
+    assert snap["sections"]["control_plane"]["active_writers"] == 2
+
+
+@pytest.mark.asyncio
+async def test_retire_heartbeat_removes_own_row(db):
+    await ops_health.write_heartbeat()
+    assert await ops_health.retire_heartbeat() is True
+    assert (await db.execute(select(AppInstanceHeartbeat))).scalars().all() == []
+    assert await ops_health.retire_heartbeat() is False
 
 
 @pytest.mark.asyncio
