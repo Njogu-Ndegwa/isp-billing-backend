@@ -152,13 +152,13 @@ async def test_window_report_isolates_the_slice_and_ranks_routers(db, now):
     assert window.bucket_seconds_for(now - timedelta(hours=30), now) == 3600
     assert window.bucket_seconds_for(now - timedelta(days=10), now) == 86400
 
-    # Single-router view: only that router, payments omitted, router echoed back.
+    # Single-router view: only that router, router echoed back, payments scoped.
     single = await window.build_window_report(t0, t1, router_id=l2.id)
     assert single["router"] == {"router_id": l2.id, "router_name": "L2TP slow", "tunnel": "l2tp"}
     assert single["provisioning"]["counts"]["router_updated"] == 2
     assert single["provisioning"]["counts"]["retry_pending"] == 2
     assert list(single["provisioning"]["by_tunnel"]) == ["l2tp"]
-    assert single["payments"] is None
+    assert single["payments"]["counts"]["created"] == 0  # scoped to that router's customers
     assert single["expiry"]["removals"] == 0
 
 
@@ -232,3 +232,94 @@ async def test_enforcement_percentage_and_drilldown_by_reason(db, now):
 
     single = (await window.build_window_report(t0, t1, router_id=dead.id))["expiry"]["enforcement"]
     assert (single["expired"], single["pct_removed"]) == (2, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_owner_scope_covers_every_router_of_one_reseller(db, now):
+    """`owner_id` is the primary way in: every router of that reseller, nothing
+    of anyone else's, payments scoped to their customers, and a router list
+    that includes routers with no activity in the slice."""
+    opic = await make_reseller(db, email="OPIC@Example.com")
+    other = await make_reseller(db, email="other@example.com")
+    plan = await make_plan(db, opic)
+    plan_o = await make_plan(db, other)
+    a = await make_router(db, opic, ip_address="10.0.0.31", name="OPIC #1")
+    b = await make_router(db, opic, ip_address="10.0.100.31", name="OPIC #2")
+    idle = await make_router(db, opic, ip_address="10.0.0.32", name="OPIC #3 idle")
+    foreign = await make_router(db, other, ip_address="10.0.0.33", name="Other #1")
+    t0 = now - timedelta(hours=4)
+    t1 = now - timedelta(hours=1)
+
+    ca = await make_customer(db, opic, plan, a)
+    cb = await make_customer(db, opic, plan, b)
+    cf = await make_customer(db, other, plan_o, foreign)
+    db.add(_attempt(ca, a, state=ProvisioningState.ROUTER_UPDATED, created=t0 + timedelta(minutes=5),
+                    updated=t0 + timedelta(minutes=5, seconds=4)))
+    db.add(_attempt(cb, b, state=ProvisioningState.RETRY_PENDING, created=t0 + timedelta(minutes=6),
+                    tries=4, error="Failed to connect"))
+    db.add(_attempt(cf, foreign, state=ProvisioningState.ROUTER_UPDATED, created=t0 + timedelta(minutes=7),
+                    updated=t0 + timedelta(minutes=7, seconds=2)))
+    for cust, status in ((ca, MpesaTransactionStatus.completed), (cf, MpesaTransactionStatus.completed),
+                         (cb, MpesaTransactionStatus.failed)):
+        db.add(MpesaTransaction(checkout_request_id=f"ck-{cust.id}", phone_number="254700000000",
+                                amount=50, reference="x", status=status, customer_id=cust.id,
+                                created_at=t0 + timedelta(minutes=8), updated_at=t0 + timedelta(minutes=8, seconds=3)))
+    # One OPIC plan expired inside the slice and was never removed (router b is
+    # marked online, so it shows as "online, not removed").
+    b.last_status = True
+    b.last_checked_at = now
+    cb.status = CustomerStatus.ACTIVE
+    cb.expiry = t0 + timedelta(minutes=30)
+    await db.commit()
+
+    report = await window.build_window_report(t0, t1, owner_id=opic.id)
+    assert report["owner"]["user_id"] == opic.id
+    assert report["owner"]["email"] == "OPIC@Example.com"
+    assert [r["router_name"] for r in report["owner"]["routers"]] == ["OPIC #1", "OPIC #2", "OPIC #3 idle"]
+    assert report["owner"]["routers_total"] == 3
+    assert report["router"] is None
+    counts = report["provisioning"]["counts"]
+    assert counts["router_updated"] == 1 and counts["retry_pending"] == 1
+    assert {r["router_name"] for r in report["provisioning"]["routers"]} == {"OPIC #1", "OPIC #2"}
+    assert report["payments"]["counts"] == {"created": 2, "completed": 1, "failed": 1, "pending": 0}
+    enf = report["expiry"]["enforcement"]
+    assert (enf["expired"], enf["still_active"]) == (1, 1)
+    assert enf["routers"][0]["router_name"] == "OPIC #2"
+
+    # Owner + router narrows within the owner; a foreign router yields an empty scope.
+    one = await window.build_window_report(t0, t1, owner_id=opic.id, router_id=a.id)
+    assert one["provisioning"]["counts"]["router_updated"] == 1
+    assert one["provisioning"]["counts"].get("retry_pending", 0) == 0
+    assert one["payments"]["counts"]["created"] == 1
+    empty = await window.build_window_report(t0, t1, owner_id=opic.id, router_id=foreign.id)
+    assert empty["provisioning"]["counts"] == {} or sum(empty["provisioning"]["counts"].values()) == 0
+    assert empty["payments"] is None
+
+    # Unscoped still sees everything (regression guard for the refactor).
+    fleet = await window.build_window_report(t0, t1)
+    assert fleet["owner"] is None
+    assert fleet["provisioning"]["counts"]["router_updated"] == 2
+    assert fleet["payments"]["counts"]["created"] == 3
+
+
+@pytest.mark.asyncio
+async def test_window_endpoint_resolves_owner_by_email_or_id(db, client, monkeypatch, now):
+    _auth_as(monkeypatch, await make_admin(db))
+    opic = await make_reseller(db, email="opic@example.com")
+    await make_router(db, opic, ip_address="10.0.0.41", name="OPIC #1")
+    await db.commit()
+    base = {"start": (now - timedelta(hours=2)).isoformat(), "end": now.isoformat()}
+
+    r = await client.get("/api/admin/ops-health/window", params={**base, "owner": "  Opic@Example.COM "})
+    assert r.status_code == 200
+    assert r.json()["owner"]["user_id"] == opic.id
+    assert r.json()["owner"]["routers"][0]["router_name"] == "OPIC #1"
+
+    r = await client.get("/api/admin/ops-health/window", params={**base, "owner": str(opic.id)})
+    assert r.status_code == 200 and r.json()["owner"]["email"] == "opic@example.com"
+
+    r = await client.get("/api/admin/ops-health/window", params={**base, "owner": "nobody@example.com"})
+    assert r.status_code == 404 and "nobody@example.com" in r.json()["detail"]
+
+    r = await client.get("/api/admin/ops-health/window", params={**base, "owner": ""})
+    assert r.status_code == 200 and r.json()["owner"] is None
