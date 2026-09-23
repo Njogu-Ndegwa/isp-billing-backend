@@ -115,9 +115,23 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
 
 ## Server Access And Deploys
 
-- SSH access to production (key-based, non-interactive for agents), the backend
-  deploy runbook, and the one-time procedure to grant the same capability on any
-  new server: [`docs/agent-memory/server-access.md`](docs/agent-memory/server-access.md).
+- Production is the Hetzner box since 2026-09-22: `ssh -o BatchMode=yes root@91.98.238.12`,
+  repo at `/opt/isp-billing-shadow/repo`, containers `isp_billing_hetzner_app` /
+  `isp_billing_hetzner_db` / `isp_billing_hetzner_radius`, image built on the host with
+  `docker compose --env-file .env.hetzner -f docker-compose.hetzner.yml`. CI
+  (`.github/workflows/deploy.yml`) deploys every push to `main` there and refuses a host
+  whose `.env.hetzner` says `SHADOW_MODE=true`.
+- The old AWS box (`dennis@54.91.202.229`) is a FENCED standby: its Postgres, RADIUS and
+  wg-manager keep running because its tunnels still carry transit for routers without a
+  native Hetzner path, but **`isp_billing_app` there must stay STOPPED**. On 2026-09-22 the
+  old CI step restarted it and its stale scheduler deleted 1,062 paid-client router bindings.
+  Never start it — by hand or from CI.
+- Routers keep their stored `10.0.X.Y` address; the Hetzner host routes each one natively
+  via wg2 (`10.251.0.0/16`) once `ops/native-router-route-sync.py` (30 s timer) has verified
+  it, else via `wg-aws-transit`. Scripts never choose a path.
+- SSH access details (key-based, non-interactive for agents), the backend
+  deploy runbook, the AWS standby facts, and the one-time procedure to grant the same
+  capability on any new server: [`docs/agent-memory/server-access.md`](docs/agent-memory/server-access.md).
 - Claude Code skill **`accessing-production-server`** (`.claude/skills/`) packages this for
   agents: how to connect and run commands/scripts inside the prod containers safely (read-only
   first, never restart). Auto-discovered — describe a prod task and it triggers, or run
@@ -178,11 +192,15 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   timestamps unreliable until SNTP syncs after reboot. Server-side gotcha: stale `ppp<N>` iface
   may show `10.0.100.x` via `ip -br addr` even when router is unreachable — confirm with live ping.
 
-- **Insurance tunnel rescue** — when a router's primary L2TP/WG path is dead, reach it via the
-  new AWS server: `ssh -o BatchMode=yes dennis@35.170.199.141` (passwordless sudo granted
-  2026-07-19; `dennis ALL=(ALL) NOPASSWD:ALL` in `/etc/sudoers.d/99-dennis-nopasswd`), then
-  connect to `10.250.0.x` or `10.250.100.x`. NOTE: no `librouteros`/`routeros_api` on that box —
-  use a raw stdlib RouterOS API client piped over ssh. Proved in anger on Router-0715 (2026-07-10).
+- **Insurance tunnel rescue** — when a router's AWS-side L2TP/WG path is dead, reach it over
+  the Hetzner wg2 plane from the production box: `ssh -o BatchMode=yes root@91.98.238.12`, then
+  connect to `10.251.0.x` (WireGuard peers) or `10.251.100.x` (native L2TP). Manager API is
+  `:8730`; always pass `INSURANCE_WG_SUBNET` to `derive_insurance_ip` (code still defaults to
+  `10.250`). The old AWS Elastic-IP insurance box `35.170.199.141` (`10.250.0.0/16`) is retired
+  as of 2026-09-22 — do not ssh there. The raw-stdlib RouterOS client trick (no
+  `librouteros` on the host) still applies outside the app container; inside
+  `isp_billing_hetzner_app` use the app's own `MikroTikAPI`. Proved in anger on Router-0715
+  (2026-07-10, AWS era).
 
 - **Router logs are EAT (UTC+3); server/DB is UTC.** When correlating MikroTik `/log print`
   timestamps against app logs, DB records, or customer expiry fields, subtract 3 hours from the
@@ -190,10 +208,12 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   in incident timelines.
 
 - **SIMSEAS #4 (router 110) has a live egress tunnel as of 2026-07-19.** A `wg-egress` WireGuard
-  interface (`10.60.0.2/24` → AWS `35.170.199.141:51822`) is routing ALL customer traffic through
-  AWS Virginia to test Starlink congestion bypass. Off-peak this adds ~270ms latency (10× worse).
-  Failover to direct Starlink in ~3s. Production plan: move egress to Hetzner `91.98.238.12`
-  (see `project-simseas-starlink-egress` memory). Don't remove this tunnel without checking with Dennis.
+  interface (`10.60.0.2/24` → AWS `35.170.199.141:51822`) was routing ALL customer traffic through
+  AWS Virginia to test Starlink congestion bypass. Off-peak this added ~270ms latency (10× worse).
+  Failover to direct Starlink in ~3s. Production plan was to move egress to Hetzner `91.98.238.12`
+  (see `project-simseas-starlink-egress` memory); that AWS box is retired as of 2026-09-22, so
+  check the router's live `wg-egress` peer endpoint before relying on this note. Don't remove
+  the tunnel without checking with Dennis.
 
 ## Feedback Board (Ideas + Bugs)
 
@@ -214,7 +234,13 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
 
 ## AWS Migration / Insurance Tunnel Handoff
 
-The migration strategy is deliberately staged. The first milestone is not to move
+**Status 2026-09-22: the cutover is done.** Hetzner `91.98.238.12` is the primary (app,
+DB, RADIUS, wg2 insurance/native plane on `10.251.0.0/16`); AWS `54.91.202.229` is the
+fenced standby whose app stays stopped; the AWS Elastic-IP insurance box `35.170.199.141`
+is retired. The phases below are kept as the record of how we got here; see
+`docs/agent-memory/server-access.md` for the live facts.
+
+The migration strategy was deliberately staged. The first milestone is not to move
 traffic or users; it is to make every reachable, eligible router reachable from
 the new AWS server through a secondary management tunnel while the old production
 server remains the primary control plane. Only after this safety layer exists
@@ -240,13 +266,15 @@ should the platform/database/application cutover be attempted.
 
 ### Current Server/Tunnel Facts
 
-- Old server remains the current production app path.
-- New AWS Elastic IP is `35.170.199.141`.
-- Backup management network is `10.250.0.0/16`; new server side is `10.250.0.1`.
-- New server WireGuard insurance interface is `wg1`, listening on UDP `51821`,
-  used by RouterOS v7 routers.
-- New server also has strongSwan/xl2tpd prepared for RouterOS v6 L2TP/IPsec
-  insurance tunnels.
+- Hetzner `91.98.238.12` is the production app path (since 2026-09-22).
+- AWS `54.91.202.229` is the fenced standby: Postgres/RADIUS/wg-manager up, app
+  stopped; its `10.0.0.0/16` WireGuard and L2TP tunnels still carry transit for
+  routers that have no native Hetzner path.
+- The AWS Elastic-IP insurance box `35.170.199.141` (`10.250.0.0/16`, `wg1`, UDP
+  `51821`) is retired.
+- The live insurance/native plane is Hetzner `wg2`: `10.251.0.0/16`, server side
+  `10.251.0.1`, UDP `51823`, manager API `:8730`, RouterOS v7 routers; strongSwan/
+  xl2tpd on the same host serves RouterOS v6 L2TP/IPsec (`10.251.100.x`).
 - Do not commit manager API keys, L2TP PSKs, private keys, or router credentials.
   Keep those in server env files and GitHub secrets only.
 

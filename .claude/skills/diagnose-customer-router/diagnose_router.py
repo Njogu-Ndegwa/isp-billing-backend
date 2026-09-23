@@ -2,14 +2,14 @@
 """
 Read-only captive-portal / hotspot diagnostic for an already-provisioned router.
 
-Runs INSIDE the isp_billing_app container on the production server, reusing the
+Runs INSIDE the isp_billing_hetzner_app container on the production server, reusing the
 app's own RouterOS API client. It NEVER writes to the router. It reads the
 router's credentials in one short DB section, releases the session, then does
 all RouterOS I/O (see AGENTS.md "Database Session Discipline").
 
 Usage (from your workstation):
-    ssh -o BatchMode=yes dennis@54.91.202.229 \
-        "docker exec -e ROUTER_ID=<id> -i isp_billing_app python -" < diagnose_router.py
+    ssh -o BatchMode=yes root@91.98.238.12 \
+        "docker exec -e ROUTER_ID=<id> -i isp_billing_hetzner_app python -" < diagnose_router.py
 
 Env:
     ROUTER_ID    (required) numeric routers.id of the router to diagnose

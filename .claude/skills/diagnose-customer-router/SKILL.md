@@ -5,7 +5,7 @@ description: >
   "connected, no internet", captive portal / hotspot login page not appearing, clients
   not redirected, no WiFi sign-in, or the router shows online but customers can't get on —
   and you have the router's numeric ID (or its 10.0.0.x management-tunnel IP). For routers
-  already in the ISP billing system and reachable over the production WireGuard tunnel.
+  already in the ISP billing system and reachable over the production management tunnels.
 ---
 
 # Diagnose Customer Router
@@ -17,7 +17,7 @@ it **read-only** through the production server, comparing against a known-good r
 matching the result against a catalog of proven failure modes.
 
 **Core principle: diagnose read-only first; propose fixes and get explicit approval before
-ANY write. This is a 1 GB-RAM production box — never restart anything.**
+ANY write. This is the production box — never restart anything.**
 
 ## When to use
 - Customer router is online but clients get "no internet" / no captive portal / no redirect.
@@ -35,19 +35,21 @@ Not for: provisioning a brand-new router, or routers not yet in the system.
    RouterOS I/O. Never hold a DB session across network calls (see AGENTS.md).
 4. **Never serve hotspot files from a foreign/leftover directory** (e.g. `flash/billing` = a
    previous provider's files). Only use a known-good Bitwave router as the template.
-5. **Mind the 1 GB RAM.** One short-lived `docker exec python` at a time; the script is light.
+5. **Mind memory.** `free -h` first; one short-lived `docker exec python` at a time; the script is light.
 
 ## Step 0 — Connect (routers are reachable ONLY through the prod server)
 
 **REQUIRED SUB-SKILL:** use `accessing-production-server` to connect and for the safety rules.
-In short: customer routers live on the WireGuard `10.0.0.x` network and are reachable **only**
-*through* the `isp_billing_app` container on `ssh dennis@54.91.202.229` — never directly from
-your workstation. Read-only by default; never restart; mind the ~1 GB RAM.
+In short: customer routers are stored as `10.0.0.x` addresses and are reachable **only**
+*through* the `isp_billing_hetzner_app` container on `ssh root@91.98.238.12` — never directly
+from your workstation. The host routes each `10.0.X.Y` natively via the Hetzner wg2 peer or
+falls back to AWS transit (slower; expect longer RouterOS calls). Read-only by default; never
+restart; check `free -h` before heavy work.
 
 Quick reachability check:
 ```bash
-ssh -o BatchMode=yes dennis@54.91.202.229 \
-  "docker exec isp_billing_app python -c \"import socket;s=socket.socket();s.settimeout(4);s.connect(('10.0.0.78',8728));print('router API reachable')\""
+ssh -o BatchMode=yes root@91.98.238.12 \
+  "docker exec isp_billing_hetzner_app python -c \"import socket;s=socket.socket();s.settimeout(4);s.connect(('10.0.0.78',8728));print('router API reachable')\""
 ```
 
 ## Step 1 — Run the read-only diagnostic
@@ -57,8 +59,8 @@ folder; `cd` there or use its absolute path) into the app container. You only ne
 numeric **id**; the script resolves its `10.0.0.x` IP from the DB:
 
 ```bash
-ssh -o BatchMode=yes dennis@54.91.202.229 \
-  "docker exec -e ROUTER_ID=<id> -i isp_billing_app python -" \
+ssh -o BatchMode=yes root@91.98.238.12 \
+  "docker exec -e ROUTER_ID=<id> -i isp_billing_hetzner_app python -" \
   < diagnose_router.py
 ```
 

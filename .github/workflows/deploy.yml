@@ -12,7 +12,7 @@ on:
     #
     # Anything that CAN reach the container is deliberately absent from this
     # list and still deploys: app/**, main.py, scripts/**, requirements*.txt,
-    # Dockerfile, docker-compose.yml, and this workflow itself.
+    # Dockerfile, docker-compose*.yml, and this workflow itself.
     # Tests still run on everything — tests.yml has no path filter.
     paths-ignore:
       - '.claude/**'
@@ -25,6 +25,14 @@ env:
   IMAGE_NAME: njogundegwa/isp-billing
 
 jobs:
+  # Production is the Hetzner box (91.98.238.12) since 2026-09-22. The AWS box
+  # (54.91.202.229) is a FENCED standby: its Postgres/RADIUS/wg-manager keep
+  # running for router transit, but its app container `isp_billing_app` must
+  # stay STOPPED. On 2026-09-22 15:55 UTC the old "Deploy to AWS EC2" step ran
+  # `docker compose down && up -d --force-recreate` there on the PR #66 merge;
+  # the revived AWS scheduler ran against the stale AWS DB and its safety-net
+  # deleted 1,062 paid-client router bindings in 90 minutes. CI must never
+  # start the AWS app again — this job only touches the Hetzner `web` service.
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
@@ -37,84 +45,89 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Kept for the AWS standby re-seed path. Nothing below deploys this
+      # image: the Hetzner host builds its own from the repo checkout.
       - name: Build and push Docker image
         run: |
           docker build --no-cache -t ${{ env.IMAGE_NAME }}:latest .
           docker push ${{ env.IMAGE_NAME }}:latest
 
-      - name: Deploy to AWS EC2
-        # Key-only auth: the server dropped password SSH in the 2026-07-21
-        # hardening. SERVER_SSH_KEY is a dedicated deploy key whose public half
-        # lives in the server user's authorized_keys.
+      - name: Deploy to Hetzner
+        # Key-only auth. HETZNER_SSH_KEY is a dedicated deploy key whose public
+        # half lives in root's authorized_keys on the Hetzner box.
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.HETZNER_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${{ secrets.HETZNER_SSH_USER }}@${{ secrets.HETZNER_HOST }} << 'ENDSSH'
           set -e
-          
+
           echo "=========================================="
-          echo "Starting deployment at $(date)"
+          echo "Starting Hetzner deployment at $(date -u)"
           echo "=========================================="
-          
-          echo "[1/7] Navigating to project directory..."
-          cd ~/apps/isp-billing || { echo "ERROR: Directory not found"; exit 1; }
+
+          echo "[1/7] Entering the production checkout..."
+          cd /opt/isp-billing-shadow/repo || { echo "ERROR: /opt/isp-billing-shadow/repo not found"; exit 1; }
           echo "Current directory: $(pwd)"
-          
-          echo "[2/7] Pulling latest code from GitHub..."
-          git config --global --add safe.directory ~/apps/isp-billing
+
+          echo "[2/7] Refusing to deploy onto a shadow stack..."
+          if [ ! -f .env.hetzner ]; then
+            echo "ERROR: .env.hetzner missing — cannot tell whether this stack is live"; exit 1
+          fi
+          if grep -Eq '^[[:space:]]*SHADOW_MODE[[:space:]]*=[[:space:]]*true' .env.hetzner; then
+            echo "ERROR: .env.hetzner has SHADOW_MODE=true. This host is a SHADOW stack, not"
+            echo "       production. CI never deploys the live pipeline onto a shadow stack."
+            echo "       Promote the host first (deploy/migration/promote-hetzner.sh), then re-run."
+            exit 1
+          fi
+          echo "SHADOW_MODE is not true — live stack confirmed"
+
+          echo "[3/7] Fetching origin/main..."
+          git config --global --add safe.directory /opt/isp-billing-shadow/repo
           git fetch origin main || { echo "ERROR: Git fetch failed"; exit 1; }
           git reset --hard origin/main || { echo "ERROR: Git reset failed"; exit 1; }
-          echo "Git pull successful"
-          
-          echo "[3/7] Checking disk space..."
+          echo "Deploying commit: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+
+          echo "[4/7] Disk and memory headroom..."
           df -h / | tail -1
-          
-          echo "[4/7] Pulling latest Docker image from Docker Hub..."
-          docker pull njogundegwa/isp-billing:latest || { echo "ERROR: Docker pull failed"; exit 1; }
-          echo "Image pulled successfully"
-          echo "Image digest:"
-          docker inspect njogundegwa/isp-billing:latest --format='{{.Id}}'
-          
-          echo "[5/7] Building FreeRADIUS image..."
-          if [ -d "radius" ]; then
-            docker build -t isp-billing-radius:latest ./radius/ || { echo "ERROR: FreeRADIUS build failed"; exit 1; }
-            echo "FreeRADIUS image built successfully"
-          else
-            echo "ERROR: radius/ directory not found"; exit 1
+          free -h | head -2
+
+          echo "[5/7] Building the web image on the host..."
+          docker compose --env-file .env.hetzner -f docker-compose.hetzner.yml build web \
+            || { echo "ERROR: web image build failed"; exit 1; }
+
+          echo "[6/7] Recreating ONLY the web service (db/radius untouched, no compose down)..."
+          docker compose --env-file .env.hetzner -f docker-compose.hetzner.yml up -d --no-deps web \
+            || { echo "ERROR: web service start failed"; exit 1; }
+
+          echo "[7/7] Post-deploy checks..."
+          docker ps --filter name=isp_billing_hetzner_app --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+
+          echo "Waiting up to 90s for /health inside the container..."
+          healthy=0
+          for i in $(seq 1 18); do
+            if docker exec isp_billing_hetzner_app python -c "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/health',timeout=5).read()[:200])" 2>/dev/null; then
+              healthy=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$healthy" -ne 1 ]; then
+            echo "ERROR: isp_billing_hetzner_app never answered /health within 90s"
+            docker logs --since 3m isp_billing_hetzner_app 2>&1 | tail -40 || true
+            exit 1
           fi
-          
-          echo "[5.5/7] Building WireGuard Manager image..."
-          if [ -d "wg-manager" ]; then
-            docker build -t isp-billing-wg-manager:latest ./wg-manager/ || { echo "ERROR: WG Manager build failed"; exit 1; }
-            echo "WG Manager image built successfully"
-          else
-            echo "WARNING: wg-manager/ directory not found, skipping"
-          fi
-          
-          echo "[6/7] Restarting containers with Docker Hub image..."
-          docker compose down
-          docker rmi isp-billing-web 2>/dev/null || true
-          docker tag njogundegwa/isp-billing:latest isp-billing-web:latest
-          docker compose up -d --no-build --force-recreate || { echo "ERROR: Docker compose failed"; exit 1; }
-          
-          echo "Verifying deployed image matches Docker Hub:"
-          docker inspect isp_billing_app --format='{{.Image}}'
-          
-          echo "[7/7] Cleaning up old images..."
-          docker image prune -f
-          
+          echo "/health OK after ~$((i * 5))s"
+
+          echo "Startup / error lines from the last 3 minutes:"
+          docker logs --since 3m isp_billing_hetzner_app 2>&1 \
+            | grep -E "Application startup complete|ERROR|Traceback" | tail -20 || true
+
+          echo "Pruning dangling images..."
+          docker image prune -f >/dev/null 2>&1 || true
+
           echo "=========================================="
-          echo "Deployment complete at $(date)"
+          echo "Hetzner deployment complete at $(date -u)"
           echo "=========================================="
-          
-          echo "Container status:"
-          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "isp|radius|NAMES"
-          
-          echo "Recent app logs:"
-          docker logs isp_billing_app --tail 10 2>&1 || true
-          
-          echo "FreeRADIUS status:"
-          docker logs isp_billing_radius --tail 5 2>&1 || true
           ENDSSH
