@@ -23,7 +23,7 @@ from app.db.models import (
     Router,
     RouterAuthMethod,
 )
-from app.services.mikrotik_api import MikroTikAPI
+from app.services.mikrotik_api import LANE_PAYMENT, MikroTikAPI
 from app.services.provisioning_retry_policy import (
     PAID_PROVISIONING_RETRY_MAX_ATTEMPTS,
     retry_due_clause,
@@ -128,6 +128,7 @@ def _provision_pppoe_sync(payload: dict) -> dict:
     api = MikroTikAPI(
         router_ip, router_username, router_password, router_port,
         timeout=15, connect_timeout=5,
+        lane=LANE_PAYMENT,
     )
 
     if not api.connect():

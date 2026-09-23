@@ -36,6 +36,7 @@ from app.db.models import (
     RouterAvailabilityCheck,
 )
 from app.services.mikrotik_api import (
+    LANE_BACKGROUND,
     MikroTikAPI,
     is_hotspot_parent_queue_name,
     normalize_mac_address,
@@ -788,7 +789,8 @@ def _find_router_binding_cleanup_candidates_sync(router_info: dict, active_macs:
     candidates: set[str] = set()
     api = MikroTikAPI(
         router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
-        timeout=15, connect_timeout=5
+        timeout=15, connect_timeout=5,
+        lane=LANE_BACKGROUND,
     )
     if not api.connect():
         return set()
@@ -817,7 +819,8 @@ def _remove_router_bindings_sync(router_info: dict, orphan_macs: set[str]) -> in
 
     api = MikroTikAPI(
         router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
-        timeout=15, connect_timeout=5
+        timeout=15, connect_timeout=5,
+        lane=LANE_BACKGROUND,
     )
     if not api.connect():
         return 0
@@ -1918,6 +1921,7 @@ def _scan_router_idle_credentials_sync(
         router_info["ip"], router_info["username"],
         router_info["password"], router_info["port"],
         timeout=15, connect_timeout=5,
+        lane=LANE_BACKGROUND,
     )
     if not api.connect():
         logger.warning(f"[REAPER] Could not connect to {router_info.get('name')}, skipping")
@@ -2189,7 +2193,7 @@ def _sync_single_router_queues_sync(router_info: dict, customers_data: list) -> 
 
     api = None
     try:
-        api = MikroTikAPI(router_info["ip"], router_info["username"], router_info["password"], router_info["port"], timeout=30, connect_timeout=5)
+        api = MikroTikAPI(router_info["ip"], router_info["username"], router_info["password"], router_info["port"], timeout=30, connect_timeout=5, lane=LANE_BACKGROUND)
         if not api.connect():
             logger.error(f"[SYNC] Failed to connect to {router_name} ({router_ip})")
             results["errors"] = len(customers_data)
@@ -2808,7 +2812,8 @@ def _bandwidth_reconnect(api, router_info: dict) -> bool:
 def _fetch_bandwidth_data_sync_for_router(router_info: dict):
     api = MikroTikAPI(
         router_info["ip_address"], router_info["username"], router_info["password"], router_info["port"],
-        timeout=15, connect_timeout=5
+        timeout=15, connect_timeout=5,
+        lane=LANE_BACKGROUND,
     )
     if not api.connect():
         logger.warning(f"[BANDWIDTH] Failed to connect to router ID {router_info['id']} at {router_info['ip_address']}")
@@ -2895,7 +2900,8 @@ def _fetch_bandwidth_data_sync_for_router(router_info: dict):
 def _fetch_bandwidth_data_sync():
     api = MikroTikAPI(
         settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT,
-        timeout=15, connect_timeout=5
+        timeout=15, connect_timeout=5,
+        lane=LANE_BACKGROUND,
     )
     if not api.connect():
         return None
