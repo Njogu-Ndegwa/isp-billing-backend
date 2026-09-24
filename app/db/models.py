@@ -714,6 +714,29 @@ class BandwidthSnapshot(Base):
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+class RouterHealth(Base):
+    """Latest health reading per router (app/services/router_health.py).
+
+    Written by the push agent (every ~2 min) and the SNMP pilot poller; read by
+    the dashboard CPU dial and the CPU overload alerts. Kept off the hot
+    ``routers`` row on purpose.
+    """
+    __tablename__ = "router_health"
+
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="CASCADE"), primary_key=True)
+    source = Column(String(10), nullable=False)
+    sampled_at = Column(DateTime, nullable=False)
+    cpu_load = Column(Integer, nullable=True)
+    memory_free_bytes = Column(BigInteger, nullable=True)
+    memory_total_bytes = Column(BigInteger, nullable=True)
+    storage_free_bytes = Column(BigInteger, nullable=True)
+    storage_total_bytes = Column(BigInteger, nullable=True)
+    uptime_seconds = Column(BigInteger, nullable=True)
+    routeros_version = Column(String(40), nullable=True)
+    board_name = Column(String(60), nullable=True)
+    wan_link_downs = Column(BigInteger, nullable=True)
+
+
 class RouterUsageBucket(Base):
     """Per-router 5-minute ledger of bytes credited to customers.
 

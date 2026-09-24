@@ -743,6 +743,20 @@
   "state",
   "updated_at"
  ],
+ "router_health": [
+  "board_name",
+  "cpu_load",
+  "memory_free_bytes",
+  "memory_total_bytes",
+  "router_id",
+  "routeros_version",
+  "sampled_at",
+  "source",
+  "storage_free_bytes",
+  "storage_total_bytes",
+  "uptime_seconds",
+  "wan_link_downs"
+ ],
  "router_log_entries": [
   "created_at",
   "id",

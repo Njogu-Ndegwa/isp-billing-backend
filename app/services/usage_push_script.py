@@ -83,17 +83,37 @@ def render_usage_push_script(
     # counting that table reported 0 on a router with live paying customers
     # (router 10, 2026-09-23: 0 active, 4 bypassed hosts online).
     metrics_block = ""
+    health_prelude = ""
     if include_router_metrics:
+        # Health is read FIRST, before the queue walk below, so the script's own
+        # work does not inflate the CPU figure it reports. Every read is a local
+        # /system resource value (RouterOS 6 and 7 alike), no network, no login.
+        health_prelude = (
+            '    :local hcpu [/system resource get cpu-load]\n'
+            '    :local hfm [/system resource get free-memory]\n'
+            '    :local htm [/system resource get total-memory]\n'
+            '    :local hfh [/system resource get free-hdd-space]\n'
+            '    :local hth [/system resource get total-hdd-space]\n'
+            '    :local hup [/system resource get uptime]\n'
+            '    :local hver [/system resource get version]\n'
+            '    :local hbrd [/system resource get board-name]\n'
+        )
         metrics_block = (
             '    :do {\n'
             '        :local rxb [/interface get [find name="ether1"] rx-byte]\n'
             '        :local txb [/interface get [find name="ether1"] tx-byte]\n'
+            '        :local lnd [/interface get [find name="ether1"] link-downs]\n'
             '        :local hs ([:len [/ip hotspot host find where authorized]]'
             ' + [:len [/ip hotspot host find where bypassed]])\n'
             '        :local pp [:len [/ppp active find]]\n'
             '        :set body ($body . ",\\"router\\":{\\"iface_rx_bytes\\":" . $rxb'
             ' . ",\\"iface_tx_bytes\\":" . $txb . ",\\"hotspot_active\\":" . $hs'
-            ' . ",\\"pppoe_active\\":" . $pp . ",\\"queue_count\\":" . $qcount . "}")\n'
+            ' . ",\\"pppoe_active\\":" . $pp . ",\\"queue_count\\":" . $qcount'
+            ' . ",\\"cpu_load\\":" . $hcpu . ",\\"free_memory\\":" . $hfm'
+            ' . ",\\"total_memory\\":" . $htm . ",\\"free_hdd\\":" . $hfh'
+            ' . ",\\"total_hdd\\":" . $hth . ",\\"wan_link_downs\\":" . $lnd'
+            ' . ",\\"uptime\\":\\"" . $hup . "\\",\\"version\\":\\"" . $hver'
+            ' . "\\",\\"board\\":\\"" . $hbrd . "\\"}")\n'
             '        :set first false\n'
             '    } on-error={ :log info "usage-push: metrics skipped" }\n'
         )
@@ -114,7 +134,7 @@ def render_usage_push_script(
     :local url "{endpoint_url}"
     :local tok "{token}"
     :local ident "{identity}"
-    :local body "{{\\"identity\\":\\"$ident\\",\\"reports\\":["
+{health_prelude}    :local body "{{\\"identity\\":\\"$ident\\",\\"reports\\":["
     :local first true
     :local qcount 0
     :foreach q in=[/queue simple find] do={{
