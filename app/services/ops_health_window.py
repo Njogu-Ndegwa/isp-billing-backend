@@ -38,8 +38,9 @@ from app.services.ops_health import (
     is_owner_cut_off,
     is_router_quarantined,
     load_cleanup_failures_since_online,
+    load_management_tunnel_overrides,
     percentile,
-    tunnel_type_for_ip,
+    tunnel_type_for_router,
 )
 
 MAX_WINDOW = timedelta(days=14)
@@ -326,8 +327,9 @@ async def build_window_report(start: datetime, end: datetime,
             .outerjoin(User, User.id == Router.user_id)
         )).all()
         cleanup_failures = await load_cleanup_failures_since_online(db, datetime.utcnow())
+        overrides = await load_management_tunnel_overrides(db)
         names = {r[0]: r[1] for r in router_rows}
-        tunnel_of = {r[0]: tunnel_type_for_ip(r[2]) for r in router_rows}
+        tunnel_of = {r[0]: tunnel_type_for_router(r[2], overrides.get(r[0])) for r in router_rows}
         router_state = {
             r[0]: {"last_status": r[3], "last_online_at": r[4], "last_checked_at": r[5],
                    "created_at": r[6], "router_agent_enabled": bool(r[7]), "owner_status": r[8],
@@ -345,7 +347,7 @@ async def build_window_report(start: datetime, end: datetime,
                 **(owner_row or {"user_id": owner_id, "email": None,
                                  "organization_name": None, "subscription_status": None}),
                 "routers": [
-                    {"router_id": r[0], "router_name": r[1], "tunnel": tunnel_type_for_ip(r[2]),
+                    {"router_id": r[0], "router_name": r[1], "tunnel": tunnel_of.get(r[0], "other"),
                      "last_status": r[3], "last_online_at": _iso(r[4]),
                      "last_checked_at": _iso(r[5]), "router_agent_enabled": bool(r[7])}
                     for r in sorted(owned, key=lambda r: (r[1] or "", r[0]))

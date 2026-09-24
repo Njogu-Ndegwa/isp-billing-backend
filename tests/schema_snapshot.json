@@ -788,6 +788,7 @@
   "lb_applied_at",
   "lb_config",
   "lb_enabled",
+  "management_tunnel",
   "name",
   "offline_notified_at",
   "online_notified_at",

@@ -219,7 +219,9 @@ def read_route_state_file(path: str) -> dict:
 
 # Display order for per-tunnel breakdowns. Primary planes first, then the
 # insurance planes, then anything the classifier cannot place.
-TUNNEL_TYPES = ("wireguard", "l2tp", "wg2_insurance", "aws_insurance", "other")
+TUNNEL_TYPES = ("wireguard", "l2tp", "sstp", "wg2_insurance", "aws_insurance", "other")
+# Values of routers.management_tunnel that override the ip_address range.
+MANAGEMENT_TUNNEL_OVERRIDES = frozenset({"sstp"})
 
 
 def tunnel_type_for_ip(ip_address: Optional[str]) -> str:
@@ -241,6 +243,24 @@ def tunnel_type_for_ip(ip_address: Optional[str]) -> str:
     if octets[:2] == ["10", "250"]:
         return "aws_insurance"
     return "other"
+
+
+def tunnel_type_for_router(ip_address: Optional[str], management_tunnel: Optional[str] = None) -> str:
+    """Like ``tunnel_type_for_ip``, but a router moved onto another management
+    tunnel (routers.management_tunnel, e.g. SSTP) keeps its original address
+    range, so the explicit flag wins."""
+    if management_tunnel in MANAGEMENT_TUNNEL_OVERRIDES:
+        return management_tunnel
+    return tunnel_type_for_ip(ip_address)
+
+
+async def load_management_tunnel_overrides(db) -> dict[int, str]:
+    """{router_id: management_tunnel} for the few routers that set it."""
+    rows = (await db.execute(
+        select(Router.id, Router.management_tunnel)
+        .where(Router.management_tunnel.isnot(None))
+    )).all()
+    return {rid: tunnel for rid, tunnel in rows}
 
 
 def _by_tunnel_latency(samples_by_tunnel: dict[str, list[float]],
@@ -338,8 +358,11 @@ async def build_provisioning_section(now: datetime, baselines: Optional[dict] = 
         # id -> (name, tunnel type) for the whole fleet: the per-tunnel split
         # needs every router an attempt touched, not just the top ten.
         router_rows = (await db.execute(select(Router.id, Router.name, Router.ip_address))).all()
+        overrides = await load_management_tunnel_overrides(db)
         names: dict[int, str] = {rid: name for rid, name, _ in router_rows}
-        tunnel_of: dict[int, str] = {rid: tunnel_type_for_ip(ip) for rid, _, ip in router_rows}
+        tunnel_of: dict[int, str] = {
+            rid: tunnel_type_for_router(ip, overrides.get(rid)) for rid, _, ip in router_rows
+        }
         errors: dict[int, str] = {}
         if top_ids:
             err_rows = (await db.execute(
@@ -548,6 +571,7 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
             .outerjoin(User, User.id == Router.user_id)
         )).all()
         cleanup_failures = await load_cleanup_failures_since_online(db, now)
+        overrides = await load_management_tunnel_overrides(db)
         group_rows = (await db.execute(
             select(Customer.router_id, func.count(), func.min(Customer.expiry))
             .where(Customer.status == CustomerStatus.ACTIVE,
@@ -581,7 +605,8 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
             )).all()
         await db.commit()
 
-    tunnel_of = {rid: tunnel_type_for_ip(ip) for rid, _, _, _, ip, _ in router_rows}
+    tunnel_of = {rid: tunnel_type_for_router(ip, overrides.get(rid))
+                 for rid, _, _, _, ip, _ in router_rows}
     quarantined_routers = {
         rid for rid, last_status, last_online, created, _, _ in router_rows
         if is_router_quarantined(last_status, last_online, created, now,
@@ -693,7 +718,8 @@ def count_recent_drops(checks: Iterable[tuple[int, datetime, bool]], now: dateti
 async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None) -> dict:
     async with database.async_session() as db:
         router_rows = (await db.execute(
-            select(Router.last_status, Router.last_checked_at, Router.ip_address)
+            select(Router.last_status, Router.last_checked_at, Router.ip_address,
+                   Router.management_tunnel)
         )).all()
         check_rows = (await db.execute(
             select(RouterAvailabilityCheck.router_id, RouterAvailabilityCheck.checked_at,
@@ -707,8 +733,8 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
     online = offline = stale = 0
     by_tunnel: dict[str, dict] = {}
     stale_after = timedelta(seconds=ROUTER_STATUS_STALE_AFTER_SECONDS)
-    for last_status, last_checked, ip in router_rows:
-        bucket = by_tunnel.setdefault(tunnel_type_for_ip(ip),
+    for last_status, last_checked, ip, management_tunnel in router_rows:
+        bucket = by_tunnel.setdefault(tunnel_type_for_router(ip, management_tunnel),
                                       {"online": 0, "offline": 0, "stale": 0, "total": 0})
         bucket["total"] += 1
         if last_checked is None or (now - last_checked) > stale_after:

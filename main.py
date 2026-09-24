@@ -2451,6 +2451,17 @@ async def run_load_balancing_migrations():
     logger.info("Load-balancing migrations complete")
 
 
+async def run_management_tunnel_migrations():
+    """Add routers.management_tunnel (e.g. "sstp") so ops health can show routers
+    whose management tunnel differs from what their ip_address range implies.
+    Idempotent, safe to run on every startup."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS management_tunnel VARCHAR(20) NULL
+        """))
+
+
 async def run_router_status_alert_migrations():
     """Add routers.status_alerts_enabled (default-on offline/back-online alerts,
     per-router opt-out) plus the online_notified_at / offline_notified_at
@@ -2892,6 +2903,12 @@ async def startup_event():
         logger.info("Router status-alert migrations completed successfully")
     except Exception as e:
         logger.error(f"Router status-alert migration failed (non-fatal): {e}")
+
+    try:
+        await run_management_tunnel_migrations()
+        logger.info("Management-tunnel migration completed successfully")
+    except Exception as e:
+        logger.error(f"Management-tunnel migration failed (non-fatal): {e}")
 
     try:
         await run_payment_port_attribution_migrations()
