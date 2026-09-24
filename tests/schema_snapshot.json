@@ -789,6 +789,7 @@
   "lb_config",
   "lb_enabled",
   "management_tunnel",
+  "management_tunnel_changed_at",
   "name",
   "offline_notified_at",
   "online_notified_at",
