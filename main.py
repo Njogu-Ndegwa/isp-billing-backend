@@ -2515,6 +2515,24 @@ async def run_router_overload_alert_migrations():
             ADD COLUMN IF NOT EXISTS cpu_load INTEGER NULL,
             ADD COLUMN IF NOT EXISTS cpu_checked_at TIMESTAMP NULL
         """))
+        # Latest router health (push agent + SNMP), one row per router, kept
+        # off the hot routers row.
+        await conn.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS router_health (
+                router_id INTEGER PRIMARY KEY REFERENCES routers(id) ON DELETE CASCADE,
+                source VARCHAR(10) NOT NULL,
+                sampled_at TIMESTAMP NOT NULL,
+                cpu_load INTEGER NULL,
+                memory_free_bytes BIGINT NULL,
+                memory_total_bytes BIGINT NULL,
+                storage_free_bytes BIGINT NULL,
+                storage_total_bytes BIGINT NULL,
+                uptime_seconds BIGINT NULL,
+                routeros_version VARCHAR(40) NULL,
+                board_name VARCHAR(60) NULL,
+                wan_link_downs BIGINT NULL
+            )
+        """))
     logger.info("Router overload-alert migrations complete")
 
 

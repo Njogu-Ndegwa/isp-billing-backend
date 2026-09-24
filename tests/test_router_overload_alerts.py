@@ -219,8 +219,10 @@ async def test_cpu_poll_alerts_owner_and_stores_reading(db, sms_calls, monkeypat
     assert await oa.poll_router_cpu(now=t0 + timedelta(minutes=5)) == 1
     inbox = await _inbox(db, owner.id)
     assert len(inbox) == 1 and "100% CPU" in inbox[0].body
-    await db.refresh(r)
-    assert r.cpu_load == 100 and r.cpu_checked_at is not None
+    from app.db.models import RouterHealth
+    health = await db.get(RouterHealth, router.id)
+    await db.refresh(health)
+    assert health.cpu_load == 100 and health.source == "snmp" and health.sampled_at is not None
 
 
 async def test_cpu_poll_is_off_until_configured(db, monkeypatch):

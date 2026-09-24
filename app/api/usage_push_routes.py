@@ -43,6 +43,8 @@ from app.services.usage_push import (
 )
 from app.services.usage_push_auth import verify_router_token
 
+from app.services import router_health  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["usage-push"])
@@ -114,6 +116,17 @@ class RouterMetricsIn(BaseModel):
     hotspot_active: int = Field(default=0, ge=0)
     pppoe_active: int = Field(default=0, ge=0)
     queue_count: int = Field(default=0, ge=0)
+    # Health (optional: older installs of the script do not send these).
+    # Implausible values are dropped field-by-field in router_health.sanitize.
+    cpu_load: Optional[int] = None
+    free_memory: Optional[int] = None
+    total_memory: Optional[int] = None
+    free_hdd: Optional[int] = None
+    total_hdd: Optional[int] = None
+    uptime: Optional[str] = Field(default=None, max_length=40)
+    version: Optional[str] = Field(default=None, max_length=80)
+    board: Optional[str] = Field(default=None, max_length=80)
+    wan_link_downs: Optional[int] = None
 
 
 class UsagePushIn(BaseModel):
@@ -222,6 +235,23 @@ async def receive_usage_push(
             ],
             router_metrics=metrics,
         )
+
+    if payload.router is not None:
+        # Health goes to its own table in its own short session, after the
+        # usage ingest has committed; failures never affect the push response.
+        r = payload.router
+        sample = router_health.HealthSample(
+            cpu_load=r.cpu_load, memory_free_bytes=r.free_memory,
+            memory_total_bytes=r.total_memory, storage_free_bytes=r.free_hdd,
+            storage_total_bytes=r.total_hdd, uptime_seconds=r.uptime,
+            routeros_version=r.version, board_name=r.board,
+            wan_link_downs=r.wan_link_downs,
+        )
+        if not sample.is_empty():
+            # ``now`` above is a monotonic clock for rate limiting; health rows
+            # need wall-clock UTC, which record_and_evaluate supplies itself.
+            await router_health.record_and_evaluate(
+                router_row.id, sample, source=router_health.SOURCE_PUSH)
 
     if result.over_cap_customer_ids:
         # Enforcement does RouterOS I/O, so it must not run inside this request

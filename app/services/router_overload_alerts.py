@@ -76,10 +76,18 @@ PAYMENT_FAILURE_WINDOW = timedelta(minutes=20)
 PAYMENT_FAILURE_THRESHOLD = 3
 TCP_CHECK_TIMEOUT_SECONDS = 3.0
 
+# Time-based so the same rules work for SNMP (every ~5 min) and the push agent
+# (every ~2 min): every sample inside the window must be at/above the level,
+# there must be at least N of them, they must span most of the window, and no
+# gap between consecutive samples may exceed CPU_SAMPLE_MAX_GAP.
 CPU_WARNING_PERCENT = 90
-CPU_WARNING_SAMPLES = 3      # 3 x 5-min samples ~ sustained for 10 minutes
+CPU_WARNING_WINDOW = timedelta(minutes=10)
+CPU_WARNING_SAMPLES = 3
+CPU_WARNING_MIN_SPAN = timedelta(minutes=8)
 CPU_CRITICAL_PERCENT = 100
+CPU_CRITICAL_WINDOW = timedelta(minutes=5)
 CPU_CRITICAL_SAMPLES = 2
+CPU_CRITICAL_MIN_SPAN = timedelta(minutes=4)
 CPU_SAMPLE_MAX_GAP = timedelta(minutes=8)   # a gap breaks "sustained"
 SNMP_CONCURRENCY = 20
 
@@ -90,7 +98,11 @@ _UPGRADE_HINT = ("If this happens every evening, consider a stronger router "
 
 # router_id -> recent (sampled_at, cpu_percent); process-local on purpose: a
 # restart only delays the "sustained" verdict by a few samples.
-_cpu_history: Dict[int, Deque[Tuple[datetime, int]]] = defaultdict(lambda: deque(maxlen=6))
+_cpu_history: Dict[int, Deque[Tuple[datetime, int]]] = defaultdict(lambda: deque(maxlen=12))
+# (router_id, level) -> local day already attempted; avoids spawning an alert
+# task on every 2-minute push once today's alert has gone (the DB claim in
+# send_overload_alert is still the real once-per-day guarantee).
+_attempted: Dict[Tuple[int, str], str] = {}
 
 
 # --- copy -------------------------------------------------------------------------
@@ -281,19 +293,38 @@ def record_cpu_sample(router_id: int, cpu: int, at: datetime) -> None:
     _cpu_history[router_id].append((at, cpu))
 
 
-def _consecutive(router_id: int, threshold: int, count: int) -> bool:
-    samples = list(_cpu_history.get(router_id, ()))[-count:]
-    if len(samples) < count or any(cpu < threshold for _, cpu in samples):
+def _sustained(router_id: int, threshold: int, window: timedelta,
+               min_samples: int, min_span: timedelta) -> bool:
+    samples = list(_cpu_history.get(router_id, ()))
+    if not samples:
         return False
-    return all(b[0] - a[0] <= CPU_SAMPLE_MAX_GAP for a, b in zip(samples, samples[1:]))
+    latest = samples[-1][0]
+    inside = [(t, cpu) for t, cpu in samples if latest - t <= window]
+    if len(inside) < min_samples or any(cpu < threshold for _, cpu in inside):
+        return False
+    if any(b[0] - a[0] > CPU_SAMPLE_MAX_GAP for a, b in zip(inside, inside[1:])):
+        return False
+    return inside[-1][0] - inside[0][0] >= min_span
 
 
 def evaluate_cpu_level(router_id: int) -> Optional[str]:
-    if _consecutive(router_id, CPU_CRITICAL_PERCENT, CPU_CRITICAL_SAMPLES):
+    if _sustained(router_id, CPU_CRITICAL_PERCENT, CPU_CRITICAL_WINDOW,
+                  CPU_CRITICAL_SAMPLES, CPU_CRITICAL_MIN_SPAN):
         return LEVEL_CRITICAL
-    if _consecutive(router_id, CPU_WARNING_PERCENT, CPU_WARNING_SAMPLES):
+    if _sustained(router_id, CPU_WARNING_PERCENT, CPU_WARNING_WINDOW,
+                  CPU_WARNING_SAMPLES, CPU_WARNING_MIN_SPAN):
         return LEVEL_WARNING
     return None
+
+
+def should_attempt(router_id: int, level: str, now: datetime) -> bool:
+    """True at most once per router/level/local day (process-local)."""
+    day = local_midnight_utc(now).isoformat()
+    key = (router_id, level)
+    if _attempted.get(key) == day:
+        return False
+    _attempted[key] = day
+    return True
 
 
 async def poll_router_cpu(now: Optional[datetime] = None) -> int:
@@ -329,16 +360,12 @@ async def poll_router_cpu(now: Optional[datetime] = None) -> int:
     loads = await asyncio.gather(*[_one(t[2]) for t in targets], return_exceptions=True)
     readings = [(t, load) for t, load in zip(targets, loads) if isinstance(load, int)]
 
-    try:
-        async with database.async_session() as db:
-            for (router_id, _name, _ip), load in readings:
-                await db.execute(update(Router).where(Router.id == router_id)
-                                 .values(cpu_load=load, cpu_checked_at=now))
-            await db.commit()
-    except Exception:
-        logger.exception("SNMP CPU poll could not persist readings")
-
+    # One store for every source (router_health), so the dashboard dial and
+    # the alerts see the same number whether it came from SNMP or the push agent.
+    from app.services import router_health
     for (router_id, name, _ip), load in readings:
+        await router_health.record(router_id, router_health.HealthSample(cpu_load=load),
+                                   source=router_health.SOURCE_SNMP, now=now)
         record_cpu_sample(router_id, load, now)
         level = evaluate_cpu_level(router_id)
         if level is None:
