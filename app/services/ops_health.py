@@ -220,8 +220,10 @@ def read_route_state_file(path: str) -> dict:
 # Display order for per-tunnel breakdowns. Primary planes first, then the
 # insurance planes, then anything the classifier cannot place.
 TUNNEL_TYPES = ("wireguard", "l2tp", "sstp", "wg2_insurance", "aws_insurance", "other")
-# Values of routers.management_tunnel that override the ip_address range.
-MANAGEMENT_TUNNEL_OVERRIDES = frozenset({"sstp"})
+# Values of routers.management_tunnel that override the ip_address range:
+# "sstp" for RouterOS 6 routers moved to the Hetzner SSTP server, "wireguard"
+# for RouterOS 7 routers provisioned on L2TP that now run on Hetzner wg2.
+MANAGEMENT_TUNNEL_OVERRIDES = frozenset({"sstp", "wireguard"})
 
 
 def tunnel_type_for_ip(ip_address: Optional[str]) -> str:

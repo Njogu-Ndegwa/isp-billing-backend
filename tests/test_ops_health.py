@@ -312,6 +312,9 @@ def test_management_tunnel_flag_overrides_the_ip_range():
     assert ops_health.tunnel_type_for_router("10.0.100.77", "sstp") == "sstp"
     assert ops_health.tunnel_type_for_router("10.0.100.77", None) == "l2tp"
     assert ops_health.tunnel_type_for_router("10.0.0.5", "not-a-tunnel") == "wireguard"
+    # RouterOS 7 router provisioned on L2TP, now managed over Hetzner wg2
+    # (kwa mwangi, router 464, 2026-09-24).
+    assert ops_health.tunnel_type_for_router("10.0.100.61", "wireguard") == "wireguard"
     order = ops_health.TUNNEL_TYPES
     assert order.index("l2tp") < order.index("sstp") < order.index("wg2_insurance")
 
