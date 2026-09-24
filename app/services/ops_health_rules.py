@@ -79,6 +79,7 @@ LOCAL_UTC_OFFSET_HOURS = 3   # EAT; mirrors settings.LOCAL_UTC_OFFSET_HOURS
 TUNNEL_LABELS = {
     "wireguard": "WireGuard",
     "l2tp": "L2TP/IPsec",
+    "sstp": "SSTP",
     "wg2_insurance": "wg2 insurance",
     "aws_insurance": "AWS insurance",
     "other": "unclassified tunnel",

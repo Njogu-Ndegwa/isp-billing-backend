@@ -306,6 +306,38 @@ def test_tunnel_type_follows_management_ip_ranges():
     assert ops_health.tunnel_type_for_ip("not-an-ip") == "other"
 
 
+def test_management_tunnel_flag_overrides_the_ip_range():
+    # An SSTP router keeps its 10.0.100.x L2TP-range address (2026-09-24,
+    # Router-0961), so only the explicit flag can place it.
+    assert ops_health.tunnel_type_for_router("10.0.100.77", "sstp") == "sstp"
+    assert ops_health.tunnel_type_for_router("10.0.100.77", None) == "l2tp"
+    assert ops_health.tunnel_type_for_router("10.0.0.5", "not-a-tunnel") == "wireguard"
+    order = ops_health.TUNNEL_TYPES
+    assert order.index("l2tp") < order.index("sstp") < order.index("wg2_insurance")
+
+
+@pytest.mark.asyncio
+async def test_tunnels_and_expiry_sections_count_sstp_routers_separately(db, now):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    l2tp = await make_router(db, reseller, ip_address="10.0.100.20",
+                             last_status=True, last_checked_at=now)
+    sstp = await make_router(db, reseller, ip_address="10.0.100.77", management_tunnel="sstp",
+                             last_status=True, last_checked_at=now, last_online_at=now)
+    await make_customer(db, reseller, plan, sstp, status=CustomerStatus.ACTIVE,
+                        expiry=now - timedelta(minutes=5))
+    await db.commit()
+
+    tunnels = await ops_health.build_tunnels_section(now)
+    assert tunnels["by_tunnel"]["sstp"] == {"online": 1, "offline": 0, "stale": 0, "total": 1}
+    assert tunnels["by_tunnel"]["l2tp"]["total"] == 1
+    assert list(tunnels["by_tunnel"]) == ["l2tp", "sstp"]
+
+    expiry = await ops_health.build_expiry_section(now)
+    assert expiry["hot_by_tunnel"] == {"sstp": {"routers": 1, "customers": 1}}
+    assert l2tp.id
+
+
 @pytest.mark.asyncio
 async def test_provisioning_section_splits_latency_and_backlog_by_tunnel(db, now):
     """L2TP routers slow while WireGuard stays flat: the split must show it and
