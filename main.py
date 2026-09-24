@@ -2458,7 +2458,8 @@ async def run_management_tunnel_migrations():
     async with async_engine.begin() as conn:
         await conn.execute(sa_text("""
             ALTER TABLE routers
-            ADD COLUMN IF NOT EXISTS management_tunnel VARCHAR(20) NULL
+            ADD COLUMN IF NOT EXISTS management_tunnel VARCHAR(20) NULL,
+            ADD COLUMN IF NOT EXISTS management_tunnel_changed_at TIMESTAMP NULL
         """))
 
 

@@ -53,6 +53,7 @@ from app.services import job_registry
 from app.services import ops_health_rules as rules
 from app.services.management_tunnel_health import classify_primary_tunnel
 from app.services.router_availability import ROUTER_STATUS_STALE_AFTER_SECONDS
+from app.services.ops_health_problem_routers import build_problem_routers_section
 
 logger = logging.getLogger(__name__)
 
@@ -721,7 +722,8 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
     async with database.async_session() as db:
         router_rows = (await db.execute(
             select(Router.last_status, Router.last_checked_at, Router.ip_address,
-                   Router.management_tunnel)
+                   Router.management_tunnel, Router.last_online_at, User.subscription_status)
+            .outerjoin(User, User.id == Router.user_id)
         )).all()
         check_rows = (await db.execute(
             select(RouterAvailabilityCheck.router_id, RouterAvailabilityCheck.checked_at,
@@ -732,10 +734,15 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
         )).all()
         await db.commit()
 
-    online = offline = stale = 0
+    online = offline = stale = silent_24h = 0
     by_tunnel: dict[str, dict] = {}
     stale_after = timedelta(seconds=ROUTER_STATUS_STALE_AFTER_SECONDS)
-    for last_status, last_checked, ip, management_tunnel in router_rows:
+    for last_status, last_checked, ip, management_tunnel, last_online, owner_status in router_rows:
+        # "Stale" only means nobody checked in 10 minutes; a quiet healthy router
+        # lands there too. Not heard from for a day is what "probably down" means.
+        # Suspended resellers' routers are cut off on purpose, so not counted.
+        if not is_owner_cut_off(owner_status) and (last_online is None or now - last_online > timedelta(hours=24)):
+            silent_24h += 1
         bucket = by_tunnel.setdefault(tunnel_type_for_router(ip, management_tunnel),
                                       {"online": 0, "offline": 0, "stale": 0, "total": 0})
         bucket["total"] += 1
@@ -752,7 +759,7 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
     return {
         "status": "unknown",
         "counts": {"online": online, "offline": offline, "stale": stale,
-                   "total": len(router_rows)},
+                   "total": len(router_rows), "silent_24h": silent_24h},
         "by_tunnel": {t: by_tunnel[t] for t in TUNNEL_TYPES if t in by_tunnel},
         "recent_drops_10m": drops,
         "platform_event": drops >= rules.TUNNELS_PLATFORM_EVENT_WARN,
@@ -903,6 +910,9 @@ def metrics_from_sections(sections: dict) -> dict:
         "expiry_p95_removal": (exp.get("removal_latency") or {}).get("p95"),
         "expiry_samples_removal": (exp.get("removal_latency") or {}).get("samples", 0),
         "tunnels_offline": (tun.get("counts") or {}).get("offline", 0),
+        "tunnels_silent_24h": (tun.get("counts") or {}).get("silent_24h", 0),
+        "paid_not_connected_24h": (sections.get("problem_routers") or {}).get("paid_not_connected_24h"),
+        "problem_routers_attention": ((sections.get("problem_routers") or {}).get("counts") or {}).get("attention"),
         "safety_net_removals": sn.get("removals_last_hour", 0),
         "active_writers": cp.get("active_writers", 0),
     }
@@ -932,6 +942,7 @@ async def compute_snapshot(now: Optional[datetime] = None,
         ("tunnels", build_tunnels_section),
         ("control_plane", build_control_plane_section),
         ("safety_net", build_safety_net_section),
+        ("problem_routers", build_problem_routers_section),
     ]
     for name, builder in builders:
         try:
@@ -948,7 +959,10 @@ async def compute_snapshot(now: Optional[datetime] = None,
         section["status"] = rules.section_status(name, section, alerts)
     return {
         "generated_at": _iso(now),
-        "overall_status": rules.overall_status(sections),
+        # Problem routers carry their own colours; some router is nearly always
+        # struggling, so they must not hold the whole dashboard amber.
+        "overall_status": rules.overall_status(
+            {k: v for k, v in sections.items() if k != "problem_routers"}),
         "sections": sections,
         "alerts": alerts,
         "metrics": metrics_from_sections(sections),

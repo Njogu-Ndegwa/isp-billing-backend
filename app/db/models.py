@@ -498,6 +498,9 @@ class Router(Base):
     # onto the Hetzner SSTP server; it keeps its 10.0.100.x address, so without
     # this flag it would be counted as L2TP. NULL = infer from ip_address.
     management_tunnel = Column(String(20), nullable=True)
+    # When management_tunnel was last changed: ops health compares the router's
+    # payments and reachability before vs after this moment ("did the fix work").
+    management_tunnel_changed_at = Column(DateTime, nullable=True)
     # On by default, per-router opt-out: when true, the owner gets an inbox message
     # (and an SMS charged to their credits, when phone+balance allow) when the
     # router stays offline past a debounce threshold and again when it comes back

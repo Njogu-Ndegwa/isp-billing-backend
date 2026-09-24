@@ -484,11 +484,13 @@ async def test_payments_section_measures_callback_latency_and_stuck_pending(db, 
 async def test_tunnels_section_counts_fleet_drops(db, now):
     reseller = await make_reseller(db)
     routers = [
-        await make_router(db, reseller, last_status=True, last_checked_at=now)
+        await make_router(db, reseller, last_status=True, last_checked_at=now, last_online_at=now)
         for _ in range(3)
     ]
+    # Unchecked for an hour AND not heard from for two days: stale and silent.
     stale = await make_router(db, reseller, last_status=True,
-                              last_checked_at=now - timedelta(hours=1))
+                              last_checked_at=now - timedelta(hours=1),
+                              last_online_at=now - timedelta(days=2))
     for r in routers[:2]:
         db.add(RouterAvailabilityCheck(router_id=r.id, is_online=True, source="t",
                                        checked_at=now - timedelta(minutes=8)))
@@ -502,7 +504,8 @@ async def test_tunnels_section_counts_fleet_drops(db, now):
     await db.commit()
 
     section = await ops_health.build_tunnels_section(now)
-    assert section["counts"] == {"online": 3, "offline": 0, "stale": 1, "total": 4}
+    assert section["counts"] == {"online": 3, "offline": 0, "stale": 1, "total": 4,
+                                 "silent_24h": 1}
     # Factory routers all sit on 10.0.0.2 -> one WireGuard bucket.
     assert section["by_tunnel"] == {"wireguard": {"online": 3, "offline": 0, "stale": 1, "total": 4}}
     assert section["recent_drops_10m"] == 2
@@ -750,7 +753,8 @@ async def test_ops_health_endpoint_serves_latest_snapshot_and_history(db, client
     assert body["overall_status"] == "healthy"
     assert 100 <= body["snapshot_age_seconds"] <= 200
     assert set(body["sections"]) == {"provisioning", "payments", "expiry", "tunnels",
-                                     "control_plane", "safety_net", "jobs", "db_pool"}
+                                     "control_plane", "safety_net", "problem_routers",
+                                     "jobs", "db_pool"}
     assert body["sections"]["control_plane"]["active_writers"] == 1
     assert len(body["history"]["points"]) == 1
 
