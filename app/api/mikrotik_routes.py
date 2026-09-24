@@ -5,7 +5,7 @@ from sqlalchemy import select, func
 from typing import Optional
 from datetime import datetime, timedelta
 from app.db.database import async_session, get_db
-from app.db.models import Router, Customer, Plan, BandwidthSnapshot, RouterUsageBucket, UserBandwidthUsage
+from app.db.models import Router, RouterHealth, Customer, Plan, BandwidthSnapshot, RouterUsageBucket, UserBandwidthUsage
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.mikrotik_api import MikroTikAPI
@@ -556,28 +556,84 @@ def _queue_health_cache_refresh(
     return {"refresh_in_progress": True, "retry_after_seconds": 5}
 
 
-# Routers enrolled in SNMP CPU monitoring (router_overload_alerts) report CPU
-# as a 1-minute average in the background. The dashboard dial shows that same
-# number while it is fresh, so the reseller sees exactly what the overload
-# alerts act on instead of an instantaneous RouterOS snapshot that the login
-# itself can spike to 100% on a small router.
-SNMP_CPU_MAX_AGE = timedelta(minutes=10)
+# Router health reported by the router itself (router_health: the push agent
+# every ~2 min, or the SNMP pilot poller). While fresh, the dashboard shows
+# exactly these numbers - the same ones the overload alerts act on - and says
+# where they came from, so an operator can see at a glance that reporting works.
+ROUTER_HEALTH_MAX_AGE = timedelta(minutes=10)
 
 
-def _apply_snmp_cpu(result, snmp_row, now: datetime):
-    """Overlay a fresh SNMP CPU reading on a shaped health response. Pure."""
+def _format_uptime(seconds: int) -> str:
+    """Seconds -> RouterOS-style ``3w10h56m27s`` (what the card already shows)."""
+    out, rest = [], int(seconds)
+    for unit, size in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)):
+        n, rest = divmod(rest, size)
+        if n:
+            out.append(f"{n}{unit}")
+    out.append(f"{rest}s")
+    return "".join(out)
+
+
+def _pct_block(free, total):
+    used = total - free
+    return {"total_bytes": total, "free_bytes": free, "used_bytes": used,
+            "used_percent": round(used / total * 100, 1) if total > 0 else 0}
+
+
+def _health_is_fresh(health, now: datetime) -> bool:
+    return (health is not None and health.sampled_at is not None
+            and now - health.sampled_at <= ROUTER_HEALTH_MAX_AGE)
+
+
+def _apply_router_health(result, health, now: datetime):
+    """Overlay the router's own fresh health report on a shaped response. Pure.
+
+    Adds ``health_source`` ('push' | 'snmp' | 'routeros') and, when the report
+    was used, ``health_sampled_at``. Offline routers keep today's payload.
+    """
     if not isinstance(result, dict):
         return result
-    if (snmp_row is not None and snmp_row.snmp_enabled
-            and snmp_row.cpu_load is not None and snmp_row.cpu_checked_at is not None
-            and now - snmp_row.cpu_checked_at <= SNMP_CPU_MAX_AGE
-            and result.get("router_reachable", True) is not False):
-        result["cpu_load_percent"] = int(snmp_row.cpu_load)
-        result["cpu_source"] = "snmp"
-        result["cpu_checked_at"] = snmp_row.cpu_checked_at.isoformat()
-    else:
-        result.setdefault("cpu_source", "routeros")
+    if not _health_is_fresh(health, now) or result.get("router_reachable", True) is False:
+        result.setdefault("health_source", "routeros")
+        return result
+    if health.cpu_load is not None:
+        result["cpu_load_percent"] = int(health.cpu_load)
+    if health.memory_total_bytes and health.memory_free_bytes is not None:
+        result["memory"] = _pct_block(health.memory_free_bytes, health.memory_total_bytes)
+    if health.storage_total_bytes and health.storage_free_bytes is not None:
+        result["storage"] = _pct_block(health.storage_free_bytes, health.storage_total_bytes)
+    system = dict(result.get("system") or {})
+    if health.uptime_seconds is not None:
+        system["uptime"] = _format_uptime(health.uptime_seconds)
+    if health.routeros_version:
+        system["version"] = health.routeros_version
+    if health.board_name:
+        system["board_name"] = health.board_name
+    if system:
+        result["system"] = system
+    result["health_source"] = health.source
+    result["health_sampled_at"] = health.sampled_at.isoformat()
+    if _push_covers_live_fields(health, now):
+        # The router itself reported all of this minutes ago: the tile is
+        # current, not a cached or "updating" fallback. Without this the card
+        # would wait forever for a RouterOS refresh we deliberately skip.
+        result["stale"] = False
+        result["cached"] = False
+        result["live"] = True
+        result["refresh_in_progress"] = False
+        result["retry_after_seconds"] = None
+        result["fallback_reason"] = None
+        result["generated_at"] = health.sampled_at.isoformat()
     return result
+
+
+def _push_covers_live_fields(health, now: datetime) -> bool:
+    """A fresh PUSH report carries everything the dashboard's RouterOS login is
+    for (CPU, memory, storage, uptime, version, board), so that login - extra
+    load on the very routers we worry about - can be skipped. SNMP carries CPU
+    only and does not qualify."""
+    return (_health_is_fresh(health, now) and health.source == "push"
+            and health.memory_total_bytes is not None and health.cpu_load is not None)
 
 
 @router.get("/api/mikrotik/health")
@@ -593,22 +649,23 @@ async def get_mikrotik_health(
 
     This wrapper (a) checks the caller may see ``router_id`` BEFORE any cached
     payload is served (the fresh-cache fast path used to return first), and
-    (b) overlays the SNMP CPU reading for enrolled routers.
+    (b) overlays the router's own fresh health report (router_health).
     """
-    snmp_row = None
+    health = None
     if router_id:
         user = await get_current_user(token, db)
-        query = select(Router.id, Router.snmp_enabled, Router.cpu_load,
-                       Router.cpu_checked_at).where(Router.id == router_id)
+        query = select(Router.id).where(Router.id == router_id)
         if user.role.value != "admin":
             query = query.where(Router.user_id == user.id)
-        snmp_row = (await db.execute(query)).first()
-        if snmp_row is None:
+        if (await db.execute(query)).first() is None:
             raise HTTPException(status_code=404, detail="Router not found or not accessible")
+        health = await db.get(RouterHealth, router_id)
+    now = datetime.utcnow()
     result = await _get_mikrotik_health_impl(
         background_tasks, router_id=router_id, include_sessions=include_sessions,
-        prefer_snapshot=prefer_snapshot, db=db, token=token)
-    return _apply_snmp_cpu(result, snmp_row, datetime.utcnow())
+        prefer_snapshot=prefer_snapshot, db=db, token=token,
+        skip_live_refresh=_push_covers_live_fields(health, now))
+    return _apply_router_health(result, health, datetime.utcnow())
 
 
 async def _get_mikrotik_health_impl(
@@ -618,6 +675,7 @@ async def _get_mikrotik_health_impl(
     prefer_snapshot: bool = True,
     db: AsyncSession = None,
     token: str = None,
+    skip_live_refresh: bool = False,
 ):
     """Get MikroTik router health metrics (CPU, memory, disk, uptime, user counts).
     
@@ -702,13 +760,17 @@ async def _get_mikrotik_health_impl(
         router_is_down = bool(router_obj) and router_recently_offline(router_obj)
 
         if prefer_snapshot and not include_sessions:
-            refresh_meta = _queue_health_cache_refresh(
-                background_tasks,
-                router_id,
-                router_info,
-                router_name,
-                cache_key,
-            )
+            if skip_live_refresh:
+                # The router pushes its own health; no RouterOS login needed.
+                refresh_meta = {"refresh_in_progress": False, "retry_after_seconds": None}
+            else:
+                refresh_meta = _queue_health_cache_refresh(
+                    background_tasks,
+                    router_id,
+                    router_info,
+                    router_name,
+                    cache_key,
+                )
 
             if cached_entry and cached_age is not None and cached_age < _health_cache_stale_ttl:
                 payload = cached_entry["data"]
