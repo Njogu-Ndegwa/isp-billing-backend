@@ -556,6 +556,30 @@ def _queue_health_cache_refresh(
     return {"refresh_in_progress": True, "retry_after_seconds": 5}
 
 
+# Routers enrolled in SNMP CPU monitoring (router_overload_alerts) report CPU
+# as a 1-minute average in the background. The dashboard dial shows that same
+# number while it is fresh, so the reseller sees exactly what the overload
+# alerts act on instead of an instantaneous RouterOS snapshot that the login
+# itself can spike to 100% on a small router.
+SNMP_CPU_MAX_AGE = timedelta(minutes=10)
+
+
+def _apply_snmp_cpu(result, snmp_row, now: datetime):
+    """Overlay a fresh SNMP CPU reading on a shaped health response. Pure."""
+    if not isinstance(result, dict):
+        return result
+    if (snmp_row is not None and snmp_row.snmp_enabled
+            and snmp_row.cpu_load is not None and snmp_row.cpu_checked_at is not None
+            and now - snmp_row.cpu_checked_at <= SNMP_CPU_MAX_AGE
+            and result.get("router_reachable", True) is not False):
+        result["cpu_load_percent"] = int(snmp_row.cpu_load)
+        result["cpu_source"] = "snmp"
+        result["cpu_checked_at"] = snmp_row.cpu_checked_at.isoformat()
+    else:
+        result.setdefault("cpu_source", "routeros")
+    return result
+
+
 @router.get("/api/mikrotik/health")
 async def get_mikrotik_health(
     background_tasks: BackgroundTasks,
@@ -564,6 +588,36 @@ async def get_mikrotik_health(
     prefer_snapshot: bool = True,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
+):
+    """Router health for the dashboard tile; see ``_get_mikrotik_health_impl``.
+
+    This wrapper (a) checks the caller may see ``router_id`` BEFORE any cached
+    payload is served (the fresh-cache fast path used to return first), and
+    (b) overlays the SNMP CPU reading for enrolled routers.
+    """
+    snmp_row = None
+    if router_id:
+        user = await get_current_user(token, db)
+        query = select(Router.id, Router.snmp_enabled, Router.cpu_load,
+                       Router.cpu_checked_at).where(Router.id == router_id)
+        if user.role.value != "admin":
+            query = query.where(Router.user_id == user.id)
+        snmp_row = (await db.execute(query)).first()
+        if snmp_row is None:
+            raise HTTPException(status_code=404, detail="Router not found or not accessible")
+    result = await _get_mikrotik_health_impl(
+        background_tasks, router_id=router_id, include_sessions=include_sessions,
+        prefer_snapshot=prefer_snapshot, db=db, token=token)
+    return _apply_snmp_cpu(result, snmp_row, datetime.utcnow())
+
+
+async def _get_mikrotik_health_impl(
+    background_tasks: BackgroundTasks,
+    router_id: Optional[int] = None,
+    include_sessions: bool = False,
+    prefer_snapshot: bool = True,
+    db: AsyncSession = None,
+    token: str = None,
 ):
     """Get MikroTik router health metrics (CPU, memory, disk, uptime, user counts).
     
