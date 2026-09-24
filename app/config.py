@@ -18,6 +18,13 @@ class Settings(BaseSettings):
 
     # PostgreSQL connection - set via environment variable
     DATABASE_URL: str = "postgresql+asyncpg://isp_user:isp_secure_pass_2024@localhost:5434/isp_billing_db"
+    # Real-time push pilot (2026-09-25). Comma-separated router ids that report
+    # every REALTIME_PUSH_INTERVAL_SECONDS with the v2 payload (hosts, queue
+    # targets, router health), are metered per device from /ip hotspot host
+    # instead of per queue, and get their queues repaired as soon as a report
+    # shows a problem. Every other router keeps today's behaviour.
+    REALTIME_PILOT_ROUTER_IDS: str = "10"
+    REALTIME_PUSH_INTERVAL_SECONDS: int = 10
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10

@@ -209,6 +209,67 @@ def normalize_mac_address(mac: str) -> str:
     clean_mac = re.sub(r'[:-]', '', mac.upper())
     return ':'.join(clean_mac[i:i+2] for i in range(0, 12, 2))
 
+
+_CUSTOMER_QUEUE_NAME_RE = re.compile(r"^(?:plan|queue)_([0-9A-Fa-f]{12})$")
+
+
+def customer_queue_mac(queue: Dict[str, Any]) -> Optional[str]:
+    """MAC a per-customer hotspot queue (``plan_<MAC>`` / legacy ``queue_<MAC>``) belongs to.
+
+    Returns None for anything else on the router (PPPoE dynamic queues,
+    access-credential ``cred_*`` queues, reseller-made queues) — those are not
+    ours to judge.
+    """
+    match = _CUSTOMER_QUEUE_NAME_RE.match(str(queue.get("name", "")).strip())
+    return normalize_mac_address(match.group(1)) if match else None
+
+
+def queue_single_target_ip(queue: Dict[str, Any]) -> Optional[str]:
+    """The one host IP a queue targets (``a.b.c.d`` or ``a.b.c.d/32``), else None."""
+    target = str(queue.get("target", "")).strip()
+    if not target or "," in target:
+        return None
+    ip, _, mask = target.partition("/")
+    if mask and mask != "32":
+        return None
+    try:
+        return str(ipaddress.ip_address(ip.strip()))
+    except ValueError:
+        return None
+
+
+def find_conflicting_customer_queues(
+    queues: List[Dict[str, Any]],
+    ip_owner: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """Per-customer queues whose target IP is currently held by a DIFFERENT device.
+
+    Simple queues match top-down and a packet is counted and limited by the
+    FIRST queue whose target matches. A ``plan_<MAC>`` queue left behind on an
+    IP that DHCP has since handed to another device therefore swallows that
+    device's traffic: the rightful owner's queue further down reads 0 bytes
+    (usage shows 0 MB) and the device gets the stale queue's speed limit.
+    Measured 2026-09-24: 71 of 88 zero-usage customers on push routers.
+
+    ``ip_owner`` maps IP -> normalized MAC of the device on that IP right now
+    (hotspot hosts / active sessions / ARP / bound leases). Disabled queues
+    match nothing, so they are not conflicts.
+    """
+    conflicts = []
+    for queue in queues:
+        if str(queue.get("disabled", "false")).lower() == "true":
+            continue
+        queue_mac = customer_queue_mac(queue)
+        if not queue_mac:
+            continue
+        ip = queue_single_target_ip(queue)
+        if not ip:
+            continue
+        holder = ip_owner.get(ip)
+        if holder and holder != queue_mac:
+            conflicts.append({"queue": queue, "queue_mac": queue_mac, "ip": ip, "holder_mac": holder})
+    return conflicts
+
 class MikroTikAPI:
     def __init__(self, host: str, username: str, password: str, port: int = 8728,
                  timeout: int = 15, connect_timeout: int = 5, lane: str = LANE_DEFAULT):

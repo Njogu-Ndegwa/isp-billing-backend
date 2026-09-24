@@ -102,6 +102,14 @@ class UsageReport:
     queue_name: str = ""
     target_ip: str = ""
     max_limit: str = ""
+    # "queue": a simple-queue counter (default). "host": a /ip hotspot host
+    # counter for one device — real-time pilot routers are metered from these.
+    source: str = "queue"
+
+
+# Device-metered usage rows live under their own key so a queue counter and a
+# host counter for the same MAC can never be diffed against each other.
+HOST_KEY_PREFIX = "host:"
 
 
 @dataclass
@@ -124,6 +132,8 @@ class IngestResult:
     accepted: int = 0
     rejected: int = 0
     over_cap_customer_ids: list[int] = field(default_factory=list)
+    # canonical hotspot MAC -> customer id, for customers live on this router.
+    live_hotspot_customers: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     snapshot_written: bool = False
 
@@ -163,16 +173,29 @@ def _canonical_key(raw: str) -> Optional[str]:
     return normalize_mac_address(key).upper()
 
 
-def _index_customers(customers: Iterable[Customer]) -> dict[str, Customer]:
-    """Map every canonical key a router may legitimately report to its customer."""
+def _index_customers(customers: Iterable[Customer], now: Optional[datetime] = None) -> dict[str, Customer]:
+    """Map every canonical key a router may legitimately report to its customer.
+
+    One device can own several customer rows on a router (an expired one and
+    the one paid today). The live row must win, whatever order the query
+    returned them in — otherwise the paying customer's usage is refused as
+    ``customer_not_live``.
+    """
+    now = now or datetime.utcnow()
     index: dict[str, Customer] = {}
+
+    def _put(key: str, customer: Customer) -> None:
+        current = index.get(key)
+        if current is None or not _customer_is_live(current, now) or _customer_is_live(customer, now):
+            index[key] = customer
+
     for customer in customers:
         if customer.pppoe_username:
-            index[f"pppoe:{customer.pppoe_username}"] = customer
+            _put(f"pppoe:{customer.pppoe_username}", customer)
         if customer.mac_address:
             normalized = normalize_mac_address(customer.mac_address)
             if normalized:
-                index[normalized.upper()] = customer
+                _put(normalized.upper(), customer)
     return index
 
 
@@ -298,12 +321,18 @@ async def ingest_usage_reports(
     now: Optional[datetime] = None,
     session_factory=None,
     router_metrics: Optional[RouterMetrics] = None,
+    meter_hotspot_by_host: bool = False,
 ) -> IngestResult:
     """Apply one router's batch of usage reports.
 
     Returns the counts plus the ids of customers whose period crossed its cap in
     this batch.  Enforcement is deliberately *not* done here — the caller runs it
     with no DB session held.
+
+    ``meter_hotspot_by_host`` (real-time pilot): hotspot usage is credited from
+    ``source="host"`` reports — the device's own counters, which no stale or
+    duplicate queue can steal — and hotspot queue reports are not credited.
+    PPPoE is always metered from its queue.
     """
     now = now or datetime.utcnow()
     factory = session_factory or async_session
@@ -348,21 +377,41 @@ async def ingest_usage_reports(
                 .where(Customer.router_id == router_id)
             )
         ).scalars().all()
-        index = _index_customers(owned)
+        index = _index_customers(owned, now)
+        for key, customer in index.items():
+            if (
+                not key.startswith("pppoe:")
+                and customer.plan is not None
+                and customer.plan.connection_type == ConnectionType.HOTSPOT
+                and _customer_is_live(customer, now)
+            ):
+                result.live_hotspot_customers[key] = customer.id
 
         pending = 0
         for report in reports:
             key = _canonical_key(report.queue_key)
-            if not key:
+            is_host = report.source == "host"
+            if not key or (is_host and key.startswith("pppoe:")):
                 result.rejected += 1
                 result.errors.append("bad_queue_key")
                 continue
 
             customer = index.get(key)
             if customer is None:
+                if is_host:
+                    continue  # any device on the LAN appears here; only customers count
                 result.rejected += 1
                 result.errors.append(f"unknown_queue_key:{key}")
                 continue
+
+            is_hotspot = (
+                customer.plan is not None
+                and customer.plan.connection_type == ConnectionType.HOTSPOT
+            )
+            if is_host and not (meter_hotspot_by_host and is_hotspot):
+                continue
+            if meter_hotspot_by_host and is_hotspot and not is_host and not key.startswith("pppoe:"):
+                continue  # queue gauges only; the host report carries the usage
 
             upload = int(report.upload_bytes or 0)
             download = int(report.download_bytes or 0)
@@ -416,7 +465,7 @@ async def ingest_usage_reports(
                     db,
                     customer=customer,
                     plan=plan,
-                    queue_key=key,
+                    queue_key=f"{HOST_KEY_PREFIX}{key}" if is_host else key,
                     upload_bytes=upload,
                     download_bytes=download,
                     queue_name=report.queue_name or "",

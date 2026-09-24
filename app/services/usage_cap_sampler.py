@@ -40,6 +40,7 @@ from app.db.models import (
 )
 from app.services.fup import evaluate_and_enforce
 from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI, normalize_mac_address
+from app.services.realtime_state import pilot_router_ids
 from app.services.usage_counters import parse_queue_bytes, record_queue_usage_sample
 
 logger = logging.getLogger(__name__)
@@ -195,6 +196,8 @@ def _due_filters(now: datetime):
             ),
         ),
         Router.auth_method == RouterAuthMethod.DIRECT_API,
+        # Pilot routers are metered (and cap-checked) from their own push.
+        Router.id.notin_(list(pilot_router_ids()) or [0]),
     )
 
 

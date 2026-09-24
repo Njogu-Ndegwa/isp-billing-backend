@@ -34,6 +34,9 @@ os.environ.setdefault("MPESA_SHORTCODE", "600980")
 os.environ.setdefault("MPESA_PASSKEY", "test-passkey")
 os.environ.setdefault("MPESA_CALLBACK_URL", "https://example.com/cb")
 os.environ.setdefault("MPESA_ENVIRONMENT", "sandbox")
+# The real-time pilot defaults to a production router id; no test should
+# inherit pilot behaviour by accident. Pilot tests opt in explicitly.
+os.environ.setdefault("REALTIME_PILOT_ROUTER_IDS", "")
 
 from datetime import datetime
 from typing import AsyncIterator

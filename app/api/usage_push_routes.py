@@ -27,11 +27,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.db.database import async_session, db_pool_snapshot
 from app.db.models import Router as RouterModel
@@ -39,9 +41,17 @@ from app.services.usage_push import (
     MAX_REPORTS_PER_BATCH,
     RouterMetrics,
     UsageReport,
+    _canonical_key,
     ingest_usage_reports,
 )
 from app.services.usage_push_auth import verify_router_token
+from app.services import realtime_state
+from app.services.realtime_state import (
+    HostSample,
+    QueueSample,
+    is_pilot_router,
+    pilot_push_interval_seconds,
+)
 
 from app.services import router_health  # noqa: E402
 
@@ -60,6 +70,11 @@ DEFAULT_PUSH_INTERVAL_SECONDS = 120
 # above so a little clock drift or jitter never trips it.
 MIN_SECONDS_BETWEEN_PUSHES = 60
 
+# Real-time pilot routers report every few seconds; they get their own floor.
+PILOT_MIN_SECONDS_BETWEEN_PUSHES = 3
+
+MAX_HOSTS_PER_BATCH = 2000
+
 # Shed load at the same threshold the background samplers use, so push and the
 # background jobs back off together instead of fighting for the last connections.
 POOL_PRESSURE_PERCENT = 60
@@ -77,11 +92,20 @@ _usage_ingest_gate = asyncio.Semaphore(MAX_CONCURRENT_USAGE_INGESTS)
 # identity -> monotonic timestamp of last accepted push.
 _last_push_at: dict[str, float] = {}
 
+# Identities seen belonging to pilot routers (learned on first push, so the
+# rate-limit check stays ahead of the DB lookup).
+_pilot_identities: set[str] = set()
+
+# Background work started from this endpoint (repairs, cap enforcement). Kept
+# referenced so tasks are not garbage-collected mid-flight.
+_background_tasks: set = set()
+
 
 def reset_rate_limiter() -> None:
     """Test hook — the limiter is process state, so tests must start clean."""
     global _usage_ingest_gate
     _last_push_at.clear()
+    _pilot_identities.clear()
     _usage_ingest_gate = asyncio.Semaphore(MAX_CONCURRENT_USAGE_INGESTS)
 
 
@@ -102,6 +126,20 @@ class UsageReportIn(BaseModel):
     queue_name: str = Field(default="", max_length=128)
     target_ip: str = Field(default="", max_length=64)
     max_limit: str = Field(default="", max_length=64)
+    disabled: bool = False
+
+
+class HostReportIn(BaseModel):
+    """One ``/ip hotspot host`` entry (v2 / real-time pilot)."""
+
+    mac: str = Field(max_length=32)
+    ip: str = Field(default="", max_length=64)
+    bytes_in: int = Field(ge=0)
+    bytes_out: int = Field(ge=0)
+    bypassed: bool = False
+    authorized: bool = False
+    idle_time: str = Field(default="", max_length=32)
+    uptime: str = Field(default="", max_length=32)
 
 
 class RouterMetricsIn(BaseModel):
@@ -131,7 +169,9 @@ class RouterMetricsIn(BaseModel):
 
 class UsagePushIn(BaseModel):
     identity: str = Field(max_length=128)
+    v: int = 1
     reports: list[UsageReportIn] = Field(default_factory=list)
+    hosts: list[HostReportIn] = Field(default_factory=list)
     router: Optional[RouterMetricsIn] = None
 
 
@@ -153,7 +193,7 @@ async def receive_usage_push(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     # Refuse an implausible payload before touching the database.
-    if len(payload.reports) > MAX_REPORTS_PER_BATCH:
+    if len(payload.reports) > MAX_REPORTS_PER_BATCH or len(payload.hosts) > MAX_HOSTS_PER_BATCH:
         raise HTTPException(
             status_code=413,
             detail=f"Batch too large; max {MAX_REPORTS_PER_BATCH} reports",
@@ -161,8 +201,13 @@ async def receive_usage_push(
 
     now = time.monotonic()
     last = _last_push_at.get(identity)
-    if last is not None and (now - last) < MIN_SECONDS_BETWEEN_PUSHES:
-        retry_after = int(MIN_SECONDS_BETWEEN_PUSHES - (now - last)) + 1
+    floor = (
+        PILOT_MIN_SECONDS_BETWEEN_PUSHES
+        if identity in _pilot_identities
+        else MIN_SECONDS_BETWEEN_PUSHES
+    )
+    if last is not None and (now - last) < floor:
+        retry_after = int(floor - (now - last)) + 1
         response.headers["Retry-After"] = str(retry_after)
         raise HTTPException(
             status_code=429,
@@ -208,6 +253,9 @@ async def receive_usage_push(
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         _last_push_at[identity] = now
+        pilot = is_pilot_router(router_row.id)
+        if pilot:
+            _pilot_identities.add(identity)
 
         metrics = None
         if payload.router is not None:
@@ -232,8 +280,18 @@ async def receive_usage_push(
                     max_limit=item.max_limit,
                 )
                 for item in payload.reports
-            ],
+            ] + ([
+                UsageReport(
+                    queue_key=host.mac,
+                    upload_bytes=host.bytes_in,
+                    download_bytes=host.bytes_out,
+                    target_ip=host.ip,
+                    source="host",
+                )
+                for host in payload.hosts
+            ] if pilot else []),
             router_metrics=metrics,
+            meter_hotspot_by_host=pilot and bool(payload.hosts),
         )
 
     if payload.router is not None:
@@ -253,6 +311,10 @@ async def receive_usage_push(
             await router_health.record_and_evaluate(
                 router_row.id, sample, source=router_health.SOURCE_PUSH)
 
+    if pilot:
+        _record_live_state(router_row.id, payload, result)
+        _spawn(_enforce_caps(result.over_cap_customer_ids))
+
     if result.over_cap_customer_ids:
         # Enforcement does RouterOS I/O, so it must not run inside this request
         # with anything held. Handing the ids to the existing cap-enforcement
@@ -266,5 +328,115 @@ async def receive_usage_push(
     return {
         "accepted": result.accepted,
         "rejected": result.rejected,
-        "next_push_seconds": DEFAULT_PUSH_INTERVAL_SECONDS,
+        "next_push_seconds": (
+            pilot_push_interval_seconds() if pilot else DEFAULT_PUSH_INTERVAL_SECONDS
+        ),
     }
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+def _record_live_state(router_id: int, payload: UsagePushIn, result) -> None:
+    """Fold a pilot report into the in-memory live view; start a repair if due."""
+    now = datetime.utcnow()
+    queues = []
+    for item in payload.reports:
+        key = _canonical_key(item.queue_key)
+        if key:
+            queues.append(QueueSample(
+                key=key,
+                target_ip=(item.target_ip or "").split("/")[0].strip(),
+                max_limit=item.max_limit or "",
+                disabled=bool(item.disabled),
+                upload_bytes=item.upload_bytes,
+                download_bytes=item.download_bytes,
+            ))
+    hosts = [
+        HostSample(
+            mac=h.mac, ip=h.ip, bytes_in=h.bytes_in, bytes_out=h.bytes_out,
+            bypassed=h.bypassed, authorized=h.authorized,
+            idle_time=h.idle_time, uptime=h.uptime,
+        )
+        for h in payload.hosts
+        if _canonical_key(h.mac)
+    ]
+    state = realtime_state.record_push(
+        router_id,
+        now=now,
+        interval_seconds=pilot_push_interval_seconds(),
+        hosts=hosts,
+        queues=queues,
+        live_customers=result.live_hotspot_customers,
+        metrics=payload.router.model_dump() if payload.router else None,
+    )
+    if payload.hosts and realtime_state.repair_due(state, now):
+        realtime_state.note_repair(router_id, now, {"status": "running"})
+        _spawn(_repair(router_id))
+
+
+async def _repair(router_id: int) -> None:
+    from app.services.mikrotik_background import repair_router_queues_now
+
+    try:
+        details = await repair_router_queues_now(router_id)
+        logger.info("[USAGE-PUSH] Queue repair for router %s: %s", router_id, details)
+        realtime_state.note_repair(router_id, datetime.utcnow(), {"status": "done", **(details or {})})
+    except Exception as exc:
+        logger.warning("[USAGE-PUSH] Queue repair for router %s failed: %s", router_id, exc)
+        realtime_state.note_repair(
+            router_id, datetime.utcnow(), {"status": "failed", "error": str(exc)[:200]}
+        )
+
+
+async def _enforce_caps(customer_ids: list) -> None:
+    """FUP for pilot routers, which the cap sampler no longer watches."""
+    customer_ids = [c for c in customer_ids if c not in _enforcing]
+    if not customer_ids:
+        return
+    _enforcing.update(customer_ids)
+    try:
+        await _enforce_caps_now(customer_ids)
+    finally:
+        _enforcing.difference_update(customer_ids)
+
+
+_enforcing: set = set()
+
+
+async def _enforce_caps_now(customer_ids: list) -> None:
+    from app.db.models import Customer, CustomerUsagePeriod
+    from app.services.fup import evaluate_and_enforce
+
+    for customer_id in customer_ids:
+        try:
+            async with async_session() as db:
+                customer = (
+                    await db.execute(
+                        select(Customer)
+                        .options(selectinload(Customer.plan), selectinload(Customer.router))
+                        .where(Customer.id == customer_id)
+                    )
+                ).scalar_one_or_none()
+                period = (
+                    await db.execute(
+                        select(CustomerUsagePeriod)
+                        .where(
+                            CustomerUsagePeriod.customer_id == customer_id,
+                            CustomerUsagePeriod.closed_at.is_(None),
+                        )
+                        .order_by(CustomerUsagePeriod.period_start.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if customer is None or period is None:
+                    continue
+                # Same helper and pattern as the cap sampler, which relies on
+                # it committing before its router I/O.
+                await evaluate_and_enforce(db, customer, period, plan=customer.plan, now=datetime.utcnow())
+                await db.commit()
+        except Exception as exc:
+            logger.error("[USAGE-PUSH] FUP enforcement failed for customer %s: %s", customer_id, exc)
