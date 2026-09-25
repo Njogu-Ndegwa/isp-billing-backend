@@ -40,8 +40,11 @@ class Settings(BaseSettings):
     # inside WireGuard / L2TP-IPsec, no TLS on the router) a report costs a
     # hAP lite ~1-2 s, so tunnel reports get the base cadence.
     REALTIME_PUSH_INTERVAL_OVERRIDES: str = "351:120,390:120,426:120"
-    # Where pilot routers post when their tunnel reaches this server.
-    REALTIME_TUNNEL_PUSH_URL: str = "http://10.251.0.1/api/router/usage-push"
+    # Where pilot routers post when their tunnel reaches this server. Port
+    # 8088, not 80: routers carry ISP_BILLING_PROXY_RELAY_BLOCK, which rejects
+    # the router's own outbound tcp 80/3128/8080 to non-portal hosts (hotspot
+    # bypass fix) and must stay. Caddy binds 8088 on the tunnel address only.
+    REALTIME_TUNNEL_PUSH_URL: str = "http://10.251.0.1:8088/api/router/usage-push"
     # Router expiry reaper (app/services/expiry_reaper_script.py): tried in this
     # order. The tunnel one is plain HTTP inside the management tunnel (Caddy's
     # 10.251.0.1:8088 site); public HTTPS costs a hAP lite ~5-7 s of full CPU.
