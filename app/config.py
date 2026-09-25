@@ -27,9 +27,12 @@ class Settings(BaseSettings):
     # 351 / 390 / 426 = reseller "aayan" (RB951 / hAP lite / hAP lite).
     REALTIME_PILOT_ROUTER_IDS: str = "10,487,351,390,426"
     REALTIME_PUSH_INTERVAL_SECONDS: int = 10
-    # Per-router starting cadence, "id:seconds,...". Small single-core boards
-    # start slower; every router also backs off on its own reported CPU.
-    REALTIME_PUSH_INTERVAL_OVERRIDES: str = "351:30,390:30,426:30"
+    # Per-router cadence, "id:seconds,...". Measured 2026-09-25 on hAP lite 390
+    # (ROS 6.49.6): one v2 run takes ~11 s and pins the CPU at 100% (HTTPS on
+    # smips); at 30 s the average went 12% -> 41%, at 60 s to 51%. Small boards
+    # therefore stay at 120 s, the cost of today's standard push. Every router
+    # also backs off on its own reported CPU.
+    REALTIME_PUSH_INTERVAL_OVERRIDES: str = "351:120,390:120,426:120"
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10

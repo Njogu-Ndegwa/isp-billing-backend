@@ -18,7 +18,7 @@ router, so the router does no extra work for them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
 from app.config import settings
@@ -50,13 +50,25 @@ def pilot_push_interval_seconds(router_id: Optional[int] = None) -> int:
         if rid.isdigit() and secs.isdigit() and router_id is not None and int(rid) == router_id:
             base = int(secs)
     state = _routers.get(router_id) if router_id is not None else None
-    cpu = state.cpu_load if state is not None else None
-    if cpu is not None:
-        if cpu >= CPU_BACKOFF_HEAVY_PERCENT:
-            base = max(base, 60)
-        elif cpu >= CPU_BACKOFF_PERCENT:
-            base = max(base, 30)
+    if state is not None and state.backoff_seconds:
+        base = max(base, state.backoff_seconds)
     return max(5, min(3600, base))
+
+
+# Once a router reports high CPU it stays backed off this long. The script
+# samples CPU at the start of its run, sometimes in a quiet moment; without
+# this the cadence flip-flopped 30 s <-> 60 s on every report.
+CPU_BACKOFF_HOLD = timedelta(minutes=10)
+
+
+def _cpu_backoff_seconds(cpu: Optional[int]) -> int:
+    if cpu is None:
+        return 0
+    if cpu >= CPU_BACKOFF_HEAVY_PERCENT:
+        return 60
+    if cpu >= CPU_BACKOFF_PERCENT:
+        return 30
+    return 0
 
 
 CPU_BACKOFF_PERCENT = 60
@@ -166,6 +178,8 @@ class RouterLive:
     last_repair_result: Optional[dict] = None
     problem_signature: tuple = ()
     has_hosts: bool = False         # report carried a hosts[] list (v2 metering)
+    backoff_seconds: int = 0        # CPU back-off in force (sticky, see CPU_BACKOFF_HOLD)
+    backoff_until: Optional[datetime] = None
 
 
 _routers: dict[int, RouterLive] = {}
@@ -248,6 +262,13 @@ def record_push(
     for name in ("uptime", "version", "board"):
         if metrics.get(name):
             setattr(state, name, str(metrics[name])[:64])
+    wanted = _cpu_backoff_seconds(state.cpu_load)
+    held = prev.backoff_seconds if (prev and prev.backoff_until and prev.backoff_until > now) else 0
+    if wanted and wanted >= held:
+        state.backoff_seconds, state.backoff_until = wanted, now + CPU_BACKOFF_HOLD
+    elif held:
+        state.backoff_seconds, state.backoff_until = held, prev.backoff_until
+
     rx, tx = metrics.get("iface_rx_bytes"), metrics.get("iface_tx_bytes")
     if rx is not None and tx is not None:
         state.wan_rx_bytes, state.wan_tx_bytes = int(rx), int(tx)
