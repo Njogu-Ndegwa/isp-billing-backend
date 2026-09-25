@@ -261,7 +261,7 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local upt [/system resource get uptime]
     :local ver [/system resource get version]
     :local brd [/system resource get board-name]
-    :local body "{\"identity\":\"$ident\",\"v\":2,\"reports\":["
+    :local body "{\"identity\":\"$ident\",\"v\":3,\"reports\":["
     :local first true
     :local qcount 0
     :foreach q in=[/queue simple find] do={
@@ -314,6 +314,55 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
         }
     } on-error={}
     :set body ($body . "]")
+    # v3: physical ports every report (a handful of rows).
+    :set body ($body . ",\"ports\":[")
+    :local ifirst true
+    :foreach i in=[/interface find where (type="ether" or type="wlan" or type="wifi")] do={
+        :do {
+            :local inm [/interface get $i name]
+            :local iru [/interface get $i running]
+            :local idi [/interface get $i disabled]
+            :local irx [/interface get $i rx-byte]
+            :local itx [/interface get $i tx-byte]
+            :local ild [/interface get $i link-downs]
+            :if (!$ifirst) do={ :set body ($body . ",") }
+            :set body ($body . "{\"name\":\"" . $inm . "\",\"running\":" . $iru . ",\"disabled\":" . $idi . ",\"rx_bytes\":" . $irx . ",\"tx_bytes\":" . $itx . ",\"link_downs\":" . $ild . "}")
+            :set ifirst false
+        } on-error={}
+    }
+    :set body ($body . "]")
+    # v3: long lists every 5th report (~5 min): which device is behind which
+    # port, and the access bindings. They change slowly and can be hundreds of
+    # rows on a big router.
+    :global bwPushN
+    :if ([:typeof $bwPushN] != "num") do={ :set bwPushN 0 }
+    :set bwPushN ($bwPushN + 1)
+    :if (($bwPushN % 5) = 1) do={
+        :set body ($body . ",\"bridge_hosts\":[")
+        :local bfirst true
+        :do {
+            :foreach b in=[/interface bridge host find where !local] do={
+                :local bm [/interface bridge host get $b mac-address]
+                :local bo [/interface bridge host get $b on-interface]
+                :if (!$bfirst) do={ :set body ($body . ",") }
+                :set body ($body . "{\"mac\":\"" . $bm . "\",\"port\":\"" . $bo . "\"}")
+                :set bfirst false
+            }
+        } on-error={}
+        :set body ($body . "],\"bindings\":[")
+        :local gfirst true
+        :do {
+            :foreach g in=[/ip hotspot ip-binding find] do={
+                :local gm [/ip hotspot ip-binding get $g mac-address]
+                :local gt [/ip hotspot ip-binding get $g type]
+                :local gd [/ip hotspot ip-binding get $g disabled]
+                :if (!$gfirst) do={ :set body ($body . ",") }
+                :set body ($body . "{\"mac\":\"" . $gm . "\",\"type\":\"" . $gt . "\",\"disabled\":" . $gd . "}")
+                :set gfirst false
+            }
+        } on-error={}
+        :set body ($body . "]")
+    }
     :do {
         :local rxb [/interface get [find name="__WAN__"] rx-byte]
         :local txb [/interface get [find name="__WAN__"] tx-byte]

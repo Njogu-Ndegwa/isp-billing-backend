@@ -179,6 +179,13 @@ class RouterLive:
     has_hosts: bool = False         # report carried a hosts[] list (v2 metering)
     backoff_seconds: int = 0        # CPU back-off in force (sticky, see CPU_BACKOFF_HOLD)
     backoff_until: Optional[datetime] = None
+    # v3: ports every report; the long lists every ~5 reports, kept until the
+    # next one arrives (with the time they were read).
+    ports: list = field(default_factory=list)
+    bridge_hosts: Optional[dict] = None       # MAC -> port name
+    bridge_hosts_at: Optional[datetime] = None
+    bindings: Optional[list] = None           # [{"mac", "type", "disabled"}]
+    bindings_at: Optional[datetime] = None
 
 
 _routers: dict[int, RouterLive] = {}
@@ -257,6 +264,9 @@ def record_push(
     ppp_sessions: Iterable[PppSample] = (),
     live_pppoe_customers: Optional[dict[str, int]] = None,
     has_hosts: bool = False,
+    ports: Optional[list] = None,
+    bridge_hosts: Optional[list] = None,
+    bindings: Optional[list] = None,
 ) -> RouterLive:
     """Fold one report into the live state and return the router's entry.
 
@@ -267,6 +277,7 @@ def record_push(
     elapsed = (now - prev.received_at).total_seconds() if prev else 0.0
     state = RouterLive(router_id=router_id, received_at=now, interval_seconds=interval_seconds)
     state.has_hosts = has_hosts
+    _fold_v3_lists(state, prev, now, ports, bridge_hosts, bindings)
     state.pushes = (prev.pushes if prev else 0) + 1
     if prev:
         state.last_repair_at = prev.last_repair_at
@@ -392,6 +403,56 @@ def record_push(
     state.no_limit = sum(1 for d in state.devices.values() if d.queue_status == QUEUE_NO_LIMIT)
     _routers[router_id] = state
     return state
+
+
+def _fold_v3_lists(state, prev, now, ports, bridge_hosts, bindings) -> None:
+    elapsed = (now - prev.received_at).total_seconds() if prev else 0.0
+    prev_ports = {p["name"]: p for p in (prev.ports if prev else [])}
+    for port in ports or []:
+        before = prev_ports.get(port["name"])
+        state.ports.append({
+            **port,
+            "rx_bps": _rate(before["rx_bytes"] if before else None, port["rx_bytes"], elapsed),
+            "tx_bps": _rate(before["tx_bytes"] if before else None, port["tx_bytes"], elapsed),
+        })
+    if bridge_hosts is not None:
+        state.bridge_hosts = {
+            normalize_mac_address(h["mac"]).upper(): h["port"] for h in bridge_hosts if h.get("mac")
+        }
+        state.bridge_hosts_at = now
+    elif prev is not None:
+        state.bridge_hosts, state.bridge_hosts_at = prev.bridge_hosts, prev.bridge_hosts_at
+    if bindings is not None:
+        state.bindings, state.bindings_at = list(bindings), now
+    elif prev is not None:
+        state.bindings, state.bindings_at = prev.bindings, prev.bindings_at
+
+
+# How old a pushed long list may be and still replace a RouterOS read. The
+# router sends them every ~5 reports (~5 min at 60 s).
+PUSHED_LIST_MAX_AGE_SECONDS = 900
+
+
+def pushed_bridge_host_map(router_id: Optional[int], now: Optional[datetime] = None) -> Optional[dict]:
+    """MAC -> port from the router's own report, or None if absent/stale."""
+    state = _routers.get(router_id) if router_id is not None else None
+    if state is None or state.bridge_hosts is None or state.bridge_hosts_at is None:
+        return None
+    now = now or datetime.utcnow()
+    if (now - state.bridge_hosts_at).total_seconds() > PUSHED_LIST_MAX_AGE_SECONDS:
+        return None
+    return state.bridge_hosts
+
+
+def pushed_bindings(router_id: Optional[int], now: Optional[datetime] = None) -> Optional[list]:
+    """The router's ip-bindings from its own report, or None if absent/stale."""
+    state = _routers.get(router_id) if router_id is not None else None
+    if state is None or state.bindings is None or state.bindings_at is None:
+        return None
+    now = now or datetime.utcnow()
+    if (now - state.bindings_at).total_seconds() > PUSHED_LIST_MAX_AGE_SECONDS:
+        return None
+    return state.bindings
 
 
 # A repair when the set of problems changes, soon; when the same problems
