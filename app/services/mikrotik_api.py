@@ -1446,7 +1446,8 @@ class MikroTikAPI:
     def add_customer_bypass_mode(
         self, mac_address: str, username: str, password: str,
         time_limit: str, bandwidth_limit: str, comment: str,
-        router_ip: str, router_username: str, router_password: str
+        router_ip: str, router_username: str, router_password: str,
+        expiry: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         import time
         # Rate limiting: small delays between commands to prevent overwhelming MikroTik
@@ -1509,11 +1510,15 @@ class MikroTikAPI:
                     return {"error": result["error"]}
             time.sleep(CMD_DELAY)  # Give router breathing room
 
-            # 3. IP binding (bypassed for seamless auto-access after payment)
+            # 3. IP binding (bypassed for seamless auto-access after payment).
+            #    The comment carries the deadline (EXP:<unix minute>) that the
+            #    router's expiry reaper enforces; see app/services/router_expiry.py.
+            from app.services.router_expiry import binding_comment
+            binding_comment_text = binding_comment(username, expiry)
             binding_args = {
                 "mac-address": mac_address,
                 "type": "bypassed",
-                "comment": f"USER:{username}|EXPIRES:DB_MANAGED|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                "comment": binding_comment_text,
             }
             binding_result = self.send_command("/ip/hotspot/ip-binding/add", binding_args)
             if "error" in binding_result:
@@ -1529,7 +1534,7 @@ class MikroTikAPI:
                     binding_result = self.send_command("/ip/hotspot/ip-binding/set", {
                         "numbers": existing_binding["data"].get(".id"),
                         "type": "bypassed",
-                        "comment": f"USER:{username}|EXPIRES:DB_MANAGED|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        "comment": binding_comment_text,
                     })
                     logger.info(f"Updated existing IP binding for {mac_address}: {binding_result}")
                     if binding_result.get("error"):

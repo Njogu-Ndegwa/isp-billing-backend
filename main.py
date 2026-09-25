@@ -89,6 +89,7 @@ from app.api.admin_metrics_routes import router as admin_metrics_router
 from app.api.lead_routes import router as lead_router
 from app.api.usage_routes import router as usage_router
 from app.api.usage_push_routes import router as usage_push_router
+from app.api.router_expiry_routes import router as router_expiry_router
 from app.api.router_agent_routes import router as router_agent_router
 from app.api.access_credential_routes import router as access_credential_router
 from app.api.shop_routes import router as shop_router
@@ -136,6 +137,7 @@ app.include_router(admin_metrics_router)
 app.include_router(lead_router)
 app.include_router(usage_router)
 app.include_router(usage_push_router)
+app.include_router(router_expiry_router)
 app.include_router(router_agent_router)
 app.include_router(access_credential_router)
 app.include_router(shop_router)
@@ -2463,6 +2465,18 @@ async def run_management_tunnel_migrations():
         """))
 
 
+async def run_expiry_reaper_migrations():
+    """Add routers.expiry_reaper_enabled / expiry_reaper_installed_at: which
+    routers remove their own expired hotspot customers. Idempotent, safe to run
+    on every startup."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS expiry_reaper_enabled BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS expiry_reaper_installed_at TIMESTAMP NULL
+        """))
+
+
 async def run_router_status_alert_migrations():
     """Add routers.status_alerts_enabled (default-on offline/back-online alerts,
     per-router opt-out) plus the online_notified_at / offline_notified_at
@@ -2928,6 +2942,12 @@ async def startup_event():
         logger.info("Management-tunnel migration completed successfully")
     except Exception as e:
         logger.error(f"Management-tunnel migration failed (non-fatal): {e}")
+
+    try:
+        await run_expiry_reaper_migrations()
+        logger.info("Expiry-reaper migration completed successfully")
+    except Exception as e:
+        logger.error(f"Expiry-reaper migration failed (non-fatal): {e}")
 
     try:
         await run_payment_port_attribution_migrations()

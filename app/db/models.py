@@ -501,6 +501,13 @@ class Router(Base):
     # When management_tunnel was last changed: ops health compares the router's
     # payments and reachability before vs after this moment ("did the fix work").
     management_tunnel_changed_at = Column(DateTime, nullable=True)
+    # The router removes its own expired hotspot customers (the "expiry reaper"
+    # scheduler, app/services/expiry_reaper_script.py). While true, the server
+    # cleanup waits a short grace past expiry before acting, so it is the
+    # backstop rather than the first responder. Set by scripts/expiry_reaper_install.py.
+    expiry_reaper_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    # When the reaper was (last) installed: before/after comparison for the pilot.
+    expiry_reaper_installed_at = Column(DateTime, nullable=True)
     # On by default, per-router opt-out: when true, the owner gets an inbox message
     # (and an SMS charged to their credits, when phone+balance allow) when the
     # router stays offline past a debounce threshold and again when it comes back

@@ -791,6 +791,8 @@
   "dual_ports",
   "emergency_active",
   "emergency_message",
+  "expiry_reaper_enabled",
+  "expiry_reaper_installed_at",
   "hotspot_sharing_blocked",
   "id",
   "identity",
