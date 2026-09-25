@@ -237,3 +237,12 @@ def reset_expiry_cleanup_router_memo():
     mikrotik_background._expiry_cleanup_unreachable_routers.clear()
     mikrotik_background._expiry_cleanup_backoff_hydrated = False
     ops_health_problem_routers.reset_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_realtime_state():
+    """Live push state is process memory; no test may inherit another's."""
+    from app.services import realtime_state
+    realtime_state.reset_realtime_state()
+    yield
+    realtime_state.reset_realtime_state()

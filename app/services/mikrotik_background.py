@@ -3275,6 +3275,14 @@ def _fetch_bandwidth_data_sync():
     return {"router_id": None, "active_sessions": active_sessions, "traffic": traffic, "speed_stats": speed_stats, "queues": queues}
 
 
+async def _prune_bandwidth_history(db, now) -> None:
+    cutoff = now - timedelta(days=BANDWIDTH_HISTORY_RETENTION_DAYS)
+    await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
+    await db.execute(delete(RouterUsageBucket).where(RouterUsageBucket.bucket_start < cutoff))
+    await prune_router_availability_history(db, now=now)
+    await db.commit()
+
+
 async def collect_bandwidth_snapshot():
     global _bandwidth_router_cursor
     try:
@@ -3322,11 +3330,15 @@ async def collect_bandwidth_snapshot():
 
             if not eligible_routers:
                 logger.info(
-                    "[BANDWIDTH] No eligible routers this run (total=%d, radius=%d, recently_offline=%d)",
+                    "[BANDWIDTH] No eligible routers this run (total=%d, radius=%d, recently_offline=%d, pushing=%d)",
                     len(routers),
                     skipped_radius,
                     skipped_offline,
+                    skipped_pushing,
                 )
+                # Retention still applies when every router pushes (the push
+                # writes snapshot rows too) — otherwise history grows forever.
+                await _prune_bandwidth_history(db, now)
                 return
 
             start_index = _bandwidth_router_cursor % len(eligible_routers)
@@ -3781,11 +3793,7 @@ async def collect_bandwidth_snapshot():
                         logger.error(f"[BANDWIDTH] Rollback after router error failed: {rb_err}")
                     continue
 
-            cutoff = now - timedelta(days=BANDWIDTH_HISTORY_RETENTION_DAYS)
-            await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
-            await db.execute(delete(RouterUsageBucket).where(RouterUsageBucket.bucket_start < cutoff))
-            await prune_router_availability_history(db, now=now)
-            await db.commit()
+            await _prune_bandwidth_history(db, now)
 
         logger.info(
             "Bandwidth snapshot run processed %d/%d eligible router(s) out of %d total router(s)",
