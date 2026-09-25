@@ -183,10 +183,30 @@ class RouterLive:
 
 _routers: dict[int, RouterLive] = {}
 
+# Every router's last accepted push that carried a router-metrics block (v1
+# with metrics or v2), pilot or not. Lets polling jobs stand down for routers
+# that already report what they would fetch.
+_last_metrics_report: dict[int, datetime] = {}
+METRICS_REPORT_FRESH_SECONDS = 360
+
+
+def note_metrics_report(router_id: int, now: Optional[datetime] = None) -> None:
+    _last_metrics_report[router_id] = now or datetime.utcnow()
+
+
+def reports_metrics(router_id: Optional[int], now: Optional[datetime] = None) -> bool:
+    """True while this router pushes interface counters + session counts itself."""
+    seen = _last_metrics_report.get(router_id) if router_id is not None else None
+    if seen is None:
+        return False
+    now = now or datetime.utcnow()
+    return (now - seen).total_seconds() <= METRICS_REPORT_FRESH_SECONDS
+
 
 def reset_realtime_state() -> None:
     """Test hook."""
     _routers.clear()
+    _last_metrics_report.clear()
 
 
 def get_router_live(router_id: int) -> Optional[RouterLive]:

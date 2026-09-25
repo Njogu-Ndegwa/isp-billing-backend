@@ -363,3 +363,16 @@ async def test_tunnel_reports_skip_the_https_override_but_keep_cpu_back_off(db, 
     busy = await client.post("/api/router/usage-push", json=body,
                              headers={**_auth(), "X-Bitwave-Push-Channel": "tunnel"})
     assert busy.json()["next_push_seconds"] == 120
+
+
+@pytest.mark.asyncio
+async def test_any_router_pushing_metrics_is_marked_so_pollers_stand_down(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "")  # not a pilot: v1 with metrics
+    assert not realtime_state.reports_metrics(router.id)
+    body = _push(1, 1, 1, 1)
+    body.pop("hosts")
+    await client.post("/api/router/usage-push", json=body, headers=_auth())
+    assert realtime_state.reports_metrics(router.id)
+    later = datetime.utcnow() + timedelta(seconds=realtime_state.METRICS_REPORT_FRESH_SECONDS + 5)
+    assert not realtime_state.reports_metrics(router.id, later)   # push stopped: poller resumes

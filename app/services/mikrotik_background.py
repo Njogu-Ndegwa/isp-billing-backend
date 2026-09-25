@@ -53,7 +53,7 @@ from app.services.fup import hotspot_throttle_rate_for_plan
 from app.services import customer_expiry_notifications
 from app.core.protected_devices import is_protected_device
 from app.config import settings
-from app.services.realtime_state import host_metering_active, is_pilot_router
+from app.services.realtime_state import host_metering_active, is_pilot_router, reports_metrics
 import asyncio
 from contextlib import asynccontextmanager
 import logging
@@ -3299,9 +3299,16 @@ async def collect_bandwidth_snapshot():
             eligible_routers = []
             skipped_radius = 0
             skipped_offline = 0
+            skipped_pushing = 0
             for router in routers:
                 if getattr(router, 'auth_method', None) == 'RADIUS':
                     skipped_radius += 1
+                    continue
+                if reports_metrics(router.id, now):
+                    # The router pushes its own interface counters and session
+                    # counts (and the push writes the snapshot row). Logging in
+                    # to read them again only duplicated rows and router load.
+                    skipped_pushing += 1
                     continue
                 if _router_recently_offline(router, now):
                     skipped_offline += 1
@@ -3334,12 +3341,13 @@ async def collect_bandwidth_snapshot():
             processed_count = 0
             logger.info(
                 "[BANDWIDTH] Processing %d/%d eligible router(s) this run "
-                "(total=%d, radius=%d, recently_offline=%d, cursor=%d)",
+                "(total=%d, radius=%d, recently_offline=%d, pushing=%d, cursor=%d)",
                 len(routers_to_process),
                 len(eligible_routers),
                 len(routers),
                 skipped_radius,
                 skipped_offline,
+                skipped_pushing,
                 start_index,
             )
 

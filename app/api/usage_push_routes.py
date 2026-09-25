@@ -335,6 +335,9 @@ async def receive_usage_push(
     # through the router's encrypted management tunnel as plain HTTP.
     via_tunnel = (x_bitwave_push_channel or "").strip().lower() == "tunnel"
 
+    if payload.router is not None:
+        realtime_state.note_metrics_report(router_row.id)
+
     if pilot:
         _record_live_state(router_row.id, payload, result, via_tunnel)
         _spawn(_enforce_caps(result.over_cap_customer_ids))
