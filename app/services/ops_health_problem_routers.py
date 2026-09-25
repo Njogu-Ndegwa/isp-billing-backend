@@ -37,6 +37,7 @@ from sqlalchemy import select
 
 from app.db import database
 from app.db.models import ProvisioningAttempt, ProvisioningState, Router, RouterAvailabilityCheck, User
+from app.services.router_diagnosis import attach_diagnoses
 
 RECENT = timedelta(hours=24)
 LOOKBACK = timedelta(days=7)
@@ -62,6 +63,17 @@ _CACHE: dict = {}
 
 def reset_cache() -> None:
     _CACHE.clear()
+
+
+def latest_section() -> tuple[Optional[dict], Optional[datetime]]:
+    """The last section this process built (without diagnoses) and when."""
+    return _CACHE.get("value"), _CACHE.get("at")
+
+
+def _with_diagnoses(section: dict, now: datetime) -> dict:
+    # Live "what is ailing it" from the router_diagnosis job; in-memory only, no I/O.
+    # Each row gets ``diagnosis`` (dict or None); the cached section is not mutated.
+    return {**section, "routers": attach_diagnoses(section.get("routers") or [], now)}
 
 
 @dataclass
@@ -309,7 +321,7 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
 async def build_problem_routers_section(now: datetime, baselines: Optional[dict] = None) -> dict:
     cached = _CACHE.get("value")
     if cached is not None and now - _CACHE["at"] < CACHE_TTL:
-        return {**cached, "cached": True}
+        return {**_with_diagnoses(cached, now), "cached": True}
 
     from app.services.ops_health import is_owner_cut_off, tunnel_type_for_router
 
@@ -344,4 +356,4 @@ async def build_problem_routers_section(now: datetime, baselines: Optional[dict]
     result = {"status": "unknown", "window_hours": int(RECENT.total_seconds() // 3600),
               **evaluate(routers, check_rows, attempt_rows, now)}
     _CACHE.update(at=now, value=result)
-    return result
+    return _with_diagnoses(result, now)
