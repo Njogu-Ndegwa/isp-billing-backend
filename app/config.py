@@ -25,7 +25,9 @@ class Settings(BaseSettings):
     # shows a problem. Every other router keeps today's behaviour.
     # 10 = Bitwave Wangige, 487 = OPIC INTERNET SERVICES #2 (hotspot + PPPoE),
     # 351 / 390 / 426 = reseller "aayan" (RB951 / hAP lite / hAP lite).
-    REALTIME_PILOT_ROUTER_IDS: str = "10,487,351,390,426"
+    # Canaries 2026-09-25: 224 (RB951, ROS 6.49), 163 (RB951, 7.20),
+    # 521 (RB951, 7.24), 478 (hAP lite, 6 MB free RAM).
+    REALTIME_PILOT_ROUTER_IDS: str = "10,487,351,390,426,224,163,521,478"
     # Uniform cadence for every pilot router (Dennis, 2026-09-25). Over the
     # management tunnel a hAP lite at ~60 s ran at ~19% CPU against a 14% baseline.
     REALTIME_PUSH_INTERVAL_SECONDS: int = 60
