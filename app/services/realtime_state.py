@@ -38,14 +38,16 @@ def is_pilot_router(router_id: Optional[int]) -> bool:
     return router_id is not None and router_id in pilot_router_ids()
 
 
-def pilot_push_interval_seconds(router_id: Optional[int] = None) -> int:
+def pilot_push_interval_seconds(router_id: Optional[int] = None, via_tunnel: bool = False) -> int:
     """Cadence to hand back to a pilot router on its next report.
 
-    Base (or the router's override), then backed off on the router's own last
-    reported CPU: a busy small board is not made busier by reporting more often.
+    Base (or the router's HTTPS override), then backed off on the router's own
+    last reported CPU: a busy small board is not made busier by reporting more
+    often. Overrides exist because of TLS cost, so a report that came through
+    the management tunnel (no TLS on the router) is not held to them.
     """
     base = int(settings.REALTIME_PUSH_INTERVAL_SECONDS or 10)
-    for part in str(settings.REALTIME_PUSH_INTERVAL_OVERRIDES or "").split(","):
+    for part in ("" if via_tunnel else str(settings.REALTIME_PUSH_INTERVAL_OVERRIDES or "")).split(","):
         rid, _, secs = part.strip().partition(":")
         if rid.isdigit() and secs.isdigit() and router_id is not None and int(rid) == router_id:
             base = int(secs)

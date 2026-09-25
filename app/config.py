@@ -32,7 +32,12 @@ class Settings(BaseSettings):
     # smips); at 30 s the average went 12% -> 41%, at 60 s to 51%. Small boards
     # therefore stay at 120 s, the cost of today's standard push. Every router
     # also backs off on its own reported CPU.
+    # Applies to HTTPS reports only: over the management tunnel (plain HTTP
+    # inside WireGuard / L2TP-IPsec, no TLS on the router) a report costs a
+    # hAP lite ~1-2 s, so tunnel reports get the base cadence.
     REALTIME_PUSH_INTERVAL_OVERRIDES: str = "351:120,390:120,426:120"
+    # Where pilot routers post when their tunnel reaches this server.
+    REALTIME_TUNNEL_PUSH_URL: str = "http://10.251.0.1/api/router/usage-push"
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10

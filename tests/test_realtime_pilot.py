@@ -336,3 +336,25 @@ def test_cpu_back_off_is_sticky_so_the_cadence_does_not_flip_flop(monkeypatch):
     assert realtime_state.pilot_push_interval_seconds(10) == 60
     push(now + timedelta(minutes=11), 5)       # hold expired and CPU is fine
     assert realtime_state.pilot_push_interval_seconds(10) == 10
+
+
+@pytest.mark.asyncio
+async def test_tunnel_reports_skip_the_https_override_but_keep_cpu_back_off(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", str(router.id))
+    monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_SECONDS", 10)
+    monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_OVERRIDES", f"{router.id}:120")
+    monkeypatch.setattr(routes, "_repair", lambda router_id: _noop())
+
+    body = _push(1, 1, 0, 0)
+    https = await client.post("/api/router/usage-push", json=body, headers=_auth())
+    assert https.json()["next_push_seconds"] == 120
+
+    tunnel = await client.post("/api/router/usage-push", json=body,
+                               headers={**_auth(), "X-Bitwave-Push-Channel": "tunnel"})
+    assert tunnel.json()["next_push_seconds"] == 10
+
+    body["router"]["cpu_load"] = 95
+    busy = await client.post("/api/router/usage-push", json=body,
+                             headers={**_auth(), "X-Bitwave-Push-Channel": "tunnel"})
+    assert busy.json()["next_push_seconds"] == 60
