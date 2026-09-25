@@ -310,7 +310,7 @@ async def receive_usage_push(
                 for host in payload.hosts
             ] if pilot else []),
             router_metrics=metrics,
-            meter_hotspot_by_host=pilot and bool(payload.hosts),
+            meter_hotspot_by_host=pilot and "hosts" in payload.model_fields_set,
         )
 
     if payload.router is not None:
@@ -348,7 +348,7 @@ async def receive_usage_push(
         "accepted": result.accepted,
         "rejected": result.rejected,
         "next_push_seconds": (
-            pilot_push_interval_seconds() if pilot else DEFAULT_PUSH_INTERVAL_SECONDS
+            pilot_push_interval_seconds(router_row.id) if pilot else DEFAULT_PUSH_INTERVAL_SECONDS
         ),
     }
 
@@ -386,7 +386,7 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result) -> None:
     state = realtime_state.record_push(
         router_id,
         now=now,
-        interval_seconds=pilot_push_interval_seconds(),
+        interval_seconds=pilot_push_interval_seconds(router_id),
         hosts=hosts,
         queues=queues,
         live_customers=result.live_hotspot_customers,
@@ -396,6 +396,7 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result) -> None:
             for p in payload.ppp
         ],
         live_pppoe_customers=result.live_pppoe_customers,
+        has_hosts="hosts" in payload.model_fields_set,
     )
     running = (
         state.last_repair_result is not None

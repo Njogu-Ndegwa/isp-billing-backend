@@ -38,8 +38,49 @@ def is_pilot_router(router_id: Optional[int]) -> bool:
     return router_id is not None and router_id in pilot_router_ids()
 
 
-def pilot_push_interval_seconds() -> int:
-    return max(5, min(3600, int(settings.REALTIME_PUSH_INTERVAL_SECONDS or 10)))
+def pilot_push_interval_seconds(router_id: Optional[int] = None) -> int:
+    """Cadence to hand back to a pilot router on its next report.
+
+    Base (or the router's override), then backed off on the router's own last
+    reported CPU: a busy small board is not made busier by reporting more often.
+    """
+    base = int(settings.REALTIME_PUSH_INTERVAL_SECONDS or 10)
+    for part in str(settings.REALTIME_PUSH_INTERVAL_OVERRIDES or "").split(","):
+        rid, _, secs = part.strip().partition(":")
+        if rid.isdigit() and secs.isdigit() and router_id is not None and int(rid) == router_id:
+            base = int(secs)
+    state = _routers.get(router_id) if router_id is not None else None
+    cpu = state.cpu_load if state is not None else None
+    if cpu is not None:
+        if cpu >= CPU_BACKOFF_HEAVY_PERCENT:
+            base = max(base, 60)
+        elif cpu >= CPU_BACKOFF_PERCENT:
+            base = max(base, 30)
+    return max(5, min(3600, base))
+
+
+CPU_BACKOFF_PERCENT = 60
+CPU_BACKOFF_HEAVY_PERCENT = 80
+
+# How long after its last v2 report a pilot router still counts as metered by
+# the push. Past this (router offline, script removed) the bandwidth poller
+# and cap sampler take it back, so usage is never left uncollected.
+HOST_METERING_FRESH_SECONDS = 180
+
+
+def host_metering_active(router_id: Optional[int], now: Optional[datetime] = None) -> bool:
+    """True while a pilot router's usage is being metered from its v2 push."""
+    if not is_pilot_router(router_id):
+        return False
+    state = _routers.get(router_id)
+    if state is None or not state.has_hosts:
+        return False
+    now = now or datetime.utcnow()
+    return (now - state.received_at).total_seconds() <= HOST_METERING_FRESH_SECONDS
+
+
+def host_metered_router_ids(now: Optional[datetime] = None) -> list[int]:
+    return [rid for rid in pilot_router_ids() if host_metering_active(rid, now)]
 
 
 # Queue status for a live customer, from the router's own queue list.
@@ -124,6 +165,7 @@ class RouterLive:
     last_repair_at: Optional[datetime] = None
     last_repair_result: Optional[dict] = None
     problem_signature: tuple = ()
+    has_hosts: bool = False         # report carried a hosts[] list (v2 metering)
 
 
 _routers: dict[int, RouterLive] = {}
@@ -181,6 +223,7 @@ def record_push(
     metrics: Optional[dict] = None,
     ppp_sessions: Iterable[PppSample] = (),
     live_pppoe_customers: Optional[dict[str, int]] = None,
+    has_hosts: bool = False,
 ) -> RouterLive:
     """Fold one report into the live state and return the router's entry.
 
@@ -190,6 +233,7 @@ def record_push(
     prev = _routers.get(router_id)
     elapsed = (now - prev.received_at).total_seconds() if prev else 0.0
     state = RouterLive(router_id=router_id, received_at=now, interval_seconds=interval_seconds)
+    state.has_hosts = has_hosts
     state.pushes = (prev.pushes if prev else 0) + 1
     if prev:
         state.last_repair_at = prev.last_repair_at

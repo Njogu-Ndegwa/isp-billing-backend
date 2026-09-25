@@ -23,9 +23,13 @@ class Settings(BaseSettings):
     # targets, router health), are metered per device from /ip hotspot host
     # instead of per queue, and get their queues repaired as soon as a report
     # shows a problem. Every other router keeps today's behaviour.
-    # 10 = Bitwave Wangige, 487 = OPIC INTERNET SERVICES #2 (hotspot + PPPoE).
-    REALTIME_PILOT_ROUTER_IDS: str = "10,487"
+    # 10 = Bitwave Wangige, 487 = OPIC INTERNET SERVICES #2 (hotspot + PPPoE),
+    # 351 / 390 / 426 = reseller "aayan" (RB951 / hAP lite / hAP lite).
+    REALTIME_PILOT_ROUTER_IDS: str = "10,487,351,390,426"
     REALTIME_PUSH_INTERVAL_SECONDS: int = 10
+    # Per-router starting cadence, "id:seconds,...". Small single-core boards
+    # start slower; every router also backs off on its own reported CPU.
+    REALTIME_PUSH_INTERVAL_OVERRIDES: str = "351:30,390:30,426:30"
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10
