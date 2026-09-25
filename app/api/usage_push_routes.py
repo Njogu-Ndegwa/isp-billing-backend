@@ -195,6 +195,7 @@ async def receive_usage_push(
     payload: UsagePushIn,
     response: Response,
     authorization: Optional[str] = Header(default=None),
+    x_bitwave_push_channel: Optional[str] = Header(default=None),
 ):
     identity = (payload.identity or "").strip()
     presented = ""
@@ -330,8 +331,12 @@ async def receive_usage_push(
             await router_health.record_and_evaluate(
                 router_row.id, sample, source=router_health.SOURCE_PUSH)
 
+    # Set by the tunnel-only Caddy site (http://10.251.0.1): the report came
+    # through the router's encrypted management tunnel as plain HTTP.
+    via_tunnel = (x_bitwave_push_channel or "").strip().lower() == "tunnel"
+
     if pilot:
-        _record_live_state(router_row.id, payload, result)
+        _record_live_state(router_row.id, payload, result, via_tunnel)
         _spawn(_enforce_caps(result.over_cap_customer_ids))
 
     if result.over_cap_customer_ids:
@@ -348,7 +353,7 @@ async def receive_usage_push(
         "accepted": result.accepted,
         "rejected": result.rejected,
         "next_push_seconds": (
-            pilot_push_interval_seconds(router_row.id) if pilot else DEFAULT_PUSH_INTERVAL_SECONDS
+            pilot_push_interval_seconds(router_row.id, via_tunnel) if pilot else DEFAULT_PUSH_INTERVAL_SECONDS
         ),
     }
 
@@ -359,7 +364,7 @@ def _spawn(coro) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-def _record_live_state(router_id: int, payload: UsagePushIn, result) -> None:
+def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel: bool = False) -> None:
     """Fold a pilot report into the in-memory live view; start a repair if due."""
     now = datetime.utcnow()
     queues = []
@@ -386,7 +391,7 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result) -> None:
     state = realtime_state.record_push(
         router_id,
         now=now,
-        interval_seconds=pilot_push_interval_seconds(router_id),
+        interval_seconds=pilot_push_interval_seconds(router_id, via_tunnel),
         hosts=hosts,
         queues=queues,
         live_customers=result.live_hotspot_customers,
