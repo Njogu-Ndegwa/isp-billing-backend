@@ -6,15 +6,18 @@ short session, no network I/O):
 
 * ``router_availability_checks`` -> how often the router was reachable, and how
   many times it dropped (online -> offline);
-* ``provisioning_attempts``       -> paid deliveries: first-try success and
-  payments that were never connected (state ``failed``).
+* ``provisioning_attempts``       -> paid deliveries: first-try success,
+  payments that were never connected (state ``failed``), and payments still
+  WAITING right now (``retry_pending`` / stuck in flight). A waiting payment only
+  turns ``failed`` after hours of retries, so without the live count a router
+  whose customers are paying into a dead tunnel stays invisible until then.
 
 Each router is judged on an AFTER window against a BEFORE window. For a router
 whose management tunnel was changed (``routers.management_tunnel_changed_at``
 within the lookback) the split is at that moment, so a fix shows as a clean
 before/after; otherwise AFTER is the last 24 h and BEFORE the six days before.
 
-States: ``attention`` (bad now), ``recovering`` (was bad, better but not clean
+States: ``attention`` (bad now, or paid customers waiting), ``recovering`` (was bad, better but not clean
 or too little activity to tell), ``fixed`` (was bad, clean since). Routers of
 suspended/inactive resellers are left out: they are cut off at the platform.
 
@@ -43,6 +46,11 @@ MAX_OUTCOME_ROWS = 10       # recovering + fixed
 # Recovering/fixed rows are only worth showing for routers we deliberately fixed,
 # or that had a genuinely bad week; one bad day that healed itself is noise.
 SIGNIFICANT_BEFORE_LOST = 5
+# A healthy delivery lands in seconds and a single transient retry within ~2 min;
+# anything still undelivered after this is a customer who paid and is waiting.
+WAITING_GRACE = timedelta(minutes=5)
+_WAITING_STATES = (ProvisioningState.RETRY_PENDING.value, ProvisioningState.IN_PROGRESS.value,
+                   ProvisioningState.SCHEDULED.value)
 ADVISORY_SOURCES = ("expired_cleanup",)  # failure-only probes; they bias reachability down
 
 _TUNNEL_LABELS = {"sstp": "SSTP", "wireguard": "WireGuard"}
@@ -114,6 +122,27 @@ def classify(before: Window, after: Window) -> Optional[str]:
 
 def _plural(n: int, word: str) -> str:
     return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _age_label(delta: timedelta) -> str:
+    minutes = max(0, int(delta.total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h {minutes:02d}m"
+    return f"{hours // 24} days"
+
+
+def waiting_reason(waiting: int, oldest: datetime, now: datetime,
+                   last_online_at: Optional[datetime]) -> str:
+    text = (f"{_plural(waiting, 'paid customer')} waiting to be connected"
+            f" (oldest {_age_label(now - oldest)})")
+    if last_online_at is None:
+        return text + " · never reached"
+    if now - last_online_at >= WAITING_GRACE:
+        return text + f" · no contact since {last_online_at.strftime('%d %b %H:%M UTC')}"
+    return text
 
 
 def _since_label(fix: Optional[dict]) -> str:
@@ -191,6 +220,8 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
                 w.drops += 1
             prev = online
 
+    waiting: dict[int, int] = defaultdict(int)
+    oldest_waiting: dict[int, datetime] = {}
     for rid, created_at, state, attempt_count, updated_at in attempts:
         if rid not in windows:
             continue
@@ -198,8 +229,11 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
         w = after if created_at >= after.start else before
         w.payments += 1
         state_value = state.value if hasattr(state, "value") else str(state)
-        if state_value in (ProvisioningState.RETRY_PENDING.value, ProvisioningState.IN_PROGRESS.value,
-                           ProvisioningState.SCHEDULED.value):
+        if state_value in _WAITING_STATES:
+            if now - created_at >= WAITING_GRACE:
+                waiting[rid] += 1
+                if rid not in oldest_waiting or created_at < oldest_waiting[rid]:
+                    oldest_waiting[rid] = created_at
             continue
         w.settled += 1
         if state_value == ProvisioningState.FAILED.value:
@@ -210,24 +244,34 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
     rows = []
     for r in routers:
         last_online = r.get("last_online_at")
+        n_waiting = waiting.get(r["id"], 0)
         # No contact for the whole lookback: an abandoned or long-dead site, not a
-        # problem anyone can act on today (the tunnels section counts those).
-        if last_online is None or now - last_online > LOOKBACK:
+        # problem anyone can act on today (the tunnels section counts those) --
+        # unless customers are still paying into it.
+        if not n_waiting and (last_online is None or now - last_online > LOOKBACK):
             continue
         before, after = windows[r["id"]]
-        state = classify(before, after)
-        if not state:
-            continue
         fix = fixes[r["id"]]
-        if state != "attention" and not fix and before.lost < SIGNIFICANT_BEFORE_LOST:
-            continue
+        if n_waiting:
+            state = "attention"
+            reason = waiting_reason(n_waiting, oldest_waiting[r["id"]], now, last_online)
+        else:
+            state = classify(before, after)
+            if not state:
+                continue
+            if state != "attention" and not fix and before.lost < SIGNIFICANT_BEFORE_LOST:
+                continue
+            reason = reason_for(state, before, after, fix, last_online)
+        oldest = oldest_waiting.get(r["id"])
         rows.append({
             "router_id": r["id"],
             "router_name": r.get("name"),
             "reseller": r.get("reseller"),
             "tunnel": r.get("tunnel"),
             "state": state,
-            "reason": reason_for(state, before, after, fix, last_online),
+            "reason": reason,
+            "waiting": n_waiting,
+            "oldest_waiting_at": oldest.replace(microsecond=0).isoformat() + "Z" if oldest else None,
             "fix": fix,
             "window": "since_fix" if fix else "last_24h",
             "after": after.as_dict(),
@@ -236,8 +280,8 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
                                if r.get("last_online_at") else None),
         })
     def _rank(x):
-        # Lost payments first, then first-try failures, then reachability.
-        return (_STATE_ORDER[x["state"]], -x["after"]["lost"], -(100 - (x["after"]["first_try_pct"] or 100)),
+        # Customers waiting now first, then lost payments, first-try failures, reachability.
+        return (_STATE_ORDER[x["state"]], -x["waiting"], -x["after"]["lost"], -(100 - (x["after"]["first_try_pct"] or 100)),
                 x["after"]["reach_pct"] if x["after"]["reach_pct"] is not None else 101,
                 -x["before"]["lost"])
     rows.sort(key=_rank)
@@ -254,6 +298,9 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
         "counts": counts,
         "paid_not_connected_24h": _lost(True),
         "paid_not_connected_daily_avg_before": round(_lost(False) / before_days, 1),
+        # Live: paid customers not yet connected (past the grace period), and on how many routers.
+        "waiting_now": sum(waiting.get(r["id"], 0) for r in routers),
+        "waiting_routers": sum(1 for r in routers if waiting.get(r["id"])),
         "routers": attention + outcomes,
         "routers_total": len(rows),
     }

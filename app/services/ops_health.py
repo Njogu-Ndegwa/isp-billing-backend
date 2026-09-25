@@ -913,6 +913,7 @@ def metrics_from_sections(sections: dict) -> dict:
         "tunnels_silent_24h": (tun.get("counts") or {}).get("silent_24h", 0),
         "paid_not_connected_24h": (sections.get("problem_routers") or {}).get("paid_not_connected_24h"),
         "problem_routers_attention": ((sections.get("problem_routers") or {}).get("counts") or {}).get("attention"),
+        "paid_waiting_now": (sections.get("problem_routers") or {}).get("waiting_now"),
         "safety_net_removals": sn.get("removals_last_hour", 0),
         "active_writers": cp.get("active_writers", 0),
     }
