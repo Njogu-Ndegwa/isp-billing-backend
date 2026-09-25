@@ -299,10 +299,10 @@ def test_realtime_script_reports_ppp_sessions():
 def test_small_routers_start_slower_and_back_off_on_their_own_cpu(monkeypatch):
     monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "10,390")
     monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_SECONDS", 10)
-    monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_OVERRIDES", "390:30")
+    monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_OVERRIDES", "390:120")
     now = datetime(2026, 9, 25, 12, 0, 0)
     assert realtime_state.pilot_push_interval_seconds(10) == 10
-    assert realtime_state.pilot_push_interval_seconds(390) == 30
+    assert realtime_state.pilot_push_interval_seconds(390) == 120
 
     for cpu, expected in ((20, 10), (65, 30), (92, 60)):
         realtime_state.record_push(10, now=now, interval_seconds=10, hosts=[], queues=[],
@@ -321,3 +321,18 @@ def test_poller_takes_a_pilot_router_back_when_its_push_stops(monkeypatch):
     assert realtime_state.host_metered_router_ids(now + timedelta(seconds=60)) == [426]
     # Push stopped: after the freshness window the poller takes it back.
     assert not realtime_state.host_metering_active(426, now + timedelta(minutes=10))
+
+
+def test_cpu_back_off_is_sticky_so_the_cadence_does_not_flip_flop(monkeypatch):
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "10")
+    monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_SECONDS", 10)
+    monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_OVERRIDES", "")
+    now = datetime(2026, 9, 25, 12, 0, 0)
+    push = lambda t, cpu: realtime_state.record_push(10, now=t, interval_seconds=10, hosts=[], queues=[],
+                                                     live_customers={}, metrics={"cpu_load": cpu}, has_hosts=True)
+    push(now, 95)
+    assert realtime_state.pilot_push_interval_seconds(10) == 60
+    push(now + timedelta(seconds=60), 5)       # quiet sample right after: still backed off
+    assert realtime_state.pilot_push_interval_seconds(10) == 60
+    push(now + timedelta(minutes=11), 5)       # hold expired and CPU is fine
+    assert realtime_state.pilot_push_interval_seconds(10) == 10
