@@ -104,6 +104,20 @@ class RouterLockManager:
             async with self._locks[router_key]:
                 yield
 
+    @asynccontextmanager
+    async def acquire_router_only(self, router_key: str):
+        """Serialize with other work on THIS router, without a fleet slot.
+
+        For single-router work that is already rate-limited by its caller (the
+        real-time pilot's on-demand repair). Waiting for one of the shared
+        slots put it behind fleet jobs retrying unreachable routers: on the
+        first pilot run it sat queued for 6+ minutes.
+        """
+        if router_key not in self._locks:
+            self._locks[router_key] = asyncio.Lock()
+        async with self._locks[router_key]:
+            yield
+
 
 router_locks = RouterLockManager()
 
@@ -2335,7 +2349,7 @@ async def repair_router_queues_now(router_id: int) -> dict:
         await db.commit()
 
     router_key = f"{router_info['ip']}:{router_info['port']}"
-    async with router_locks.acquire(router_key):
+    async with router_locks.acquire_router_only(router_key):
         result = await asyncio.to_thread(
             _sync_single_router_queues_sync, router_info, items, True,
         )
