@@ -125,6 +125,27 @@ class Settings(BaseSettings):
     INSURANCE_L2TP_IPSEC_PSK: str = ""
     INSURANCE_MANAGER_TIMEOUT: int = 10
 
+    # SSTP management tunnel for new RouterOS 6 (vpn_type="l2tp") routers.
+    # Off by default: with the flag off, token creation and the generated .rsc
+    # are exactly what they were before SSTP existed. When on, a new v6 token
+    # gets an SSTP client to the Hetzner accel-ppp server (unit
+    # router-mgmt-sstp, ops/sstp/) instead of the standby Hetzner L2TP; the
+    # primary L2TP to AWS stays as a fallback. The SSTP login is registered
+    # through the insurance manager (INSURANCE_WG_MANAGER_URL) /add-sstp-peer.
+    SSTP_PROVISIONING_ENABLED: bool = False
+    # host:port -- RouterOS 6.48/6.49 take the port INSIDE connect-to.
+    SSTP_SERVER: str = "91.98.238.12:4443"
+    # accel-ppp gw-ip-address; the source address the server uses towards SSTP
+    # routers, so it must be allowed on the router's API service.
+    SSTP_SERVER_VPN_IP: str = "10.251.0.1"
+    # Router 10.0.X.Y gets SSTP peer address 10.251.X.Y (same host offset).
+    SSTP_SUBNET: str = "10.251.0.0/16"
+    # PUBLIC CA certificate (PEM) that signed the SSTP server cert
+    # (/etc/accel-ppp-router-mgmt/ca.crt, CN "Bitwave Router Management CA").
+    # Served to routers at GET /api/provision/router-mgmt-ca.crt. Literal "\n"
+    # sequences are accepted so it fits on one .env line. Never the CA key.
+    ROUTER_MGMT_CA_PEM: str = ""
+
     # --- Messaging / SMS -------------------------------------------------
     SMS_PROVIDER: str = "talksasa"
     SMS_SENDER_ID: str = "TALKSASA"

@@ -40,6 +40,17 @@ LOGIN_PAGE_PATH = os.path.join(
 
 API_USERNAME = "bitwave-api"
 
+# SSTP management tunnel (RouterOS 6). Names match the manual runbook
+# (skill migrate-router-to-sstp) so provisioned and migrated routers look the
+# same on the router and to the ops tooling.
+SSTP_ROUTER_INTERFACE = "sstp-hetzner"
+SSTP_MGMT_LOOPBACK = "lo-mgmt"
+ROUTER_MGMT_CA_CN = "Bitwave Router Management CA"
+ROUTER_MGMT_CA_FILE = "router-mgmt-ca.crt"
+ROUTER_MGMT_CA_PATH = "/api/provision/router-mgmt-ca.crt"
+# hAP lite has no RTC; certificate checks need a sane clock.
+SSTP_NTP_SERVER = "162.159.200.1"
+
 
 def _downgrade_https_to_http(base_url: str) -> str:
     """Return an HTTP version of base_url when it explicitly uses HTTPS."""
@@ -304,6 +315,96 @@ def generate_l2tp_username(identity: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# SSTP management tunnel (RouterOS 6, Hetzner accel-ppp)
+# ---------------------------------------------------------------------------
+
+def generate_sstp_username(identity: str) -> str:
+    """SSTP login used by the runbook and chap-secrets, e.g. 'sstp-Router-0005'."""
+    return f"sstp-{identity}"
+
+
+def derive_sstp_ip(router_ip: str) -> str:
+    """Router 10.0.X.Y -> its SSTP peer address 10.251.X.Y (SSTP_SUBNET)."""
+    return derive_insurance_ip(router_ip, settings.SSTP_SUBNET)
+
+
+def router_mgmt_ca_pem() -> str:
+    """Return the public router-management CA certificate PEM, or "" if unset.
+
+    ROUTER_MGMT_CA_PEM may carry literal "\\n" sequences so it fits on one
+    .env line. Anything that is not a plain certificate -- above all anything
+    containing a private key -- is refused, so a paste mistake can never be
+    served to the internet.
+    """
+    raw = (settings.ROUTER_MGMT_CA_PEM or "").strip()
+    if not raw:
+        return ""
+    pem = raw.replace("\\n", "\n").replace("\r\n", "\n").strip() + "\n"
+    if "PRIVATE KEY" in pem:
+        logger.error("ROUTER_MGMT_CA_PEM contains a private key; refusing to use or serve it")
+        return ""
+    if "-----BEGIN CERTIFICATE-----" not in pem or "-----END CERTIFICATE-----" not in pem:
+        logger.error("ROUTER_MGMT_CA_PEM is not a PEM certificate; ignoring it")
+        return ""
+    return pem
+
+
+def sstp_provisioning_active(vpn_type: str) -> bool:
+    """New RouterOS 6 tokens get SSTP only while the rollout flag is on."""
+    return bool(settings.SSTP_PROVISIONING_ENABLED) and (vpn_type or "").lower() == "l2tp"
+
+
+def token_uses_sstp(token: ProvisioningToken) -> bool:
+    """Decided once at token creation: a token with SSTP credentials gets the
+    SSTP block for its whole life, even if the flag is flipped afterwards."""
+    return (token.vpn_type or "").lower() == "l2tp" and bool(token.sstp_username)
+
+
+def _sstp_server_is_valid(server: str) -> bool:
+    host, sep, port = (server or "").strip().rpartition(":")
+    if not sep or not host or not port.isdigit():
+        return False
+    return all(ch.isalnum() or ch in ".-" for ch in host)
+
+
+def _require_sstp_settings() -> None:
+    missing = []
+    if not _sstp_server_is_valid(settings.SSTP_SERVER):
+        missing.append("SSTP_SERVER (host:port)")
+    if not (settings.SSTP_SUBNET or "").strip():
+        missing.append("SSTP_SUBNET")
+    if not router_mgmt_ca_pem():
+        missing.append("ROUTER_MGMT_CA_PEM")
+    if missing:
+        raise ValueError(
+            "SSTP provisioning is enabled but setting(s) are missing or invalid: "
+            + ", ".join(missing)
+        )
+
+
+async def register_sstp_peer(username: str, password: str, ip: str):
+    """Add/replace the router's login in the SSTP chap-secrets via the insurance manager."""
+    from app.services.insurance_wireguard import insurance_manager_request
+
+    return await insurance_manager_request(
+        "POST",
+        "/add-sstp-peer",
+        json={"username": username, "password": password, "ip": ip},
+    )
+
+
+async def remove_sstp_peer(username: str):
+    """Remove the router's SSTP login via the insurance manager."""
+    from app.services.insurance_wireguard import insurance_manager_request
+
+    return await insurance_manager_request(
+        "DELETE",
+        "/remove-sstp-peer",
+        json={"username": username},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -366,6 +467,8 @@ def get_login_page_html() -> str:
 
 def _rsc_header(token: ProvisioningToken) -> str:
     vpn_label = "WireGuard" if token.vpn_type == "wireguard" else "L2TP/IPsec"
+    if token_uses_sstp(token):
+        vpn_label = "SSTP (Hetzner) + L2TP/IPsec fallback"
     return f"""# ============================================================
 # Bitwave ISP Auto-Provisioning Script
 # Router: {token.identity} ({token.router_name})
@@ -579,6 +682,87 @@ def _rsc_backup_l2tp(token: ProvisioningToken) -> str:
 :delay 15s"""
 
 
+def _rsc_vpn_sstp(token: ProvisioningToken) -> str:
+    base_url = provision_base_url_for_vpn(token.vpn_type)
+    cert_flag = fetch_certificate_flag_for_url(base_url, token.vpn_type)
+    server = settings.SSTP_SERVER.strip()
+    iface = SSTP_ROUTER_INTERFACE
+    loopback = SSTP_MGMT_LOOPBACK
+    mgmt_ip = token.wireguard_ip
+    # Every value inside the [:parse "..."] strings below is quote-free
+    # (identity Router-NNNN, alphanumeric password, host:port), so no escaping
+    # is needed.
+    client_params = (
+        f"connect-to={server} user={token.sstp_username} password={token.sstp_password} "
+        "profile=default add-default-route=no verify-server-certificate=yes "
+        "verify-server-address-from-certificate=yes disabled=no"
+    )
+    return f"""
+# ---- STEP 3B: SSTP MANAGEMENT TUNNEL (Hetzner, TLS over TCP) ----
+# L2TP/IPsec cannot serve two routers behind one public (CGNAT) IP and gets
+# stranded by NAT/PPPoE resets; SSTP is one TCP connection per router.
+# l2tp-aws above stays configured as the fallback path. The Hetzner standby
+# L2TP (l2tp-aws2) is deliberately NOT configured here: it would claim the
+# same 10.251.x.y peer address as this tunnel.
+# Commands that differ between RouterOS versions go through [:parse] so an
+# unsupported build logs a warning instead of aborting the import.
+
+:if ([:len [/certificate find where common-name="{ROUTER_MGMT_CA_CN}"]] = 0) do={{
+    :do {{
+        /tool fetch url="{base_url}{ROUTER_MGMT_CA_PATH}" dst-path={ROUTER_MGMT_CA_FILE}{cert_flag}
+        :delay 2s
+        /certificate import file-name={ROUTER_MGMT_CA_FILE} passphrase=""
+        :log info "Provisioning: router management CA imported"
+    }} on-error={{
+        :log warning "Provisioning: could not fetch/import the router management CA -- SSTP will not verify"
+    }}
+}}
+:do {{ /certificate set [find where common-name="{ROUTER_MGMT_CA_CN}"] trusted=yes }} on-error={{}}
+
+# SSTP certificate checks need a correct clock (hAP lite has no RTC).
+:do {{
+    :local bwSetNtp [:parse "/system ntp client set enabled=yes primary-ntp={SSTP_NTP_SERVER}"]
+    $bwSetNtp
+}} on-error={{
+    :log warning "Provisioning: could not enable the NTP client"
+}}
+
+# add-then-set so re-running this script converges. In RouterOS 6.48/6.49 the
+# port lives INSIDE connect-to (ip:port).
+:do {{
+    :local bwSstpAdd [:parse "/interface sstp-client add name={iface} {client_params}"]
+    $bwSstpAdd
+}} on-error={{
+    :do {{
+        :local bwSstpSet [:parse "/interface sstp-client set [find where name={iface}] {client_params}"]
+        $bwSstpSet
+    }} on-error={{
+        :log warning "Provisioning: RouterOS rejected the SSTP client settings"
+    }}
+}}
+
+# Pin the management IP on a loopback: otherwise it only lives on the L2TP
+# interface, and traffic routed to it over SSTP would not be accepted.
+:if ([:len [/interface bridge find where name={loopback}]] = 0) do={{
+    :do {{ /interface bridge add name={loopback} comment="Management IP pin (SSTP)" }} on-error={{}}
+}}
+:if ([:len [/ip address find where address="{mgmt_ip}/32" and interface={loopback}]] = 0) do={{
+    :do {{ /ip address add address={mgmt_ip}/32 interface={loopback} comment="Management IP pin (SSTP)" }} on-error={{}}
+}}
+
+:log info "Provisioning: SSTP tunnel configured, waiting for connection..."
+:delay 10s
+
+:do {{
+    :local sstpRunning [:len [/interface sstp-client find where name={iface} running=yes]]
+    :if ($sstpRunning = 0) do={{
+        :log warning "Provisioning: SSTP tunnel not yet connected -- it keeps retrying (L2TP remains as fallback)"
+    }} else={{
+        :log info "Provisioning: SSTP tunnel connected"
+    }}
+}} on-error={{}}"""
+
+
 def _rsc_hotspot(token: ProvisioningToken) -> str:
     # Pick the hotspot html-directory at script-render time based on
     # (vpn_type, is_routerboard):
@@ -776,16 +960,25 @@ def _rsc_walled_garden(token: ProvisioningToken) -> str:
 :log info "Provisioning: Walled garden configured" """
 
 
-def _rsc_api_access() -> str:
+def _rsc_api_access(extra_sources: Optional[list] = None) -> str:
     sources = [str(WG_SERVER_IP)]
     backup_source = (settings.INSURANCE_SERVER_VPN_IP or "").strip()
     if backup_source and backup_source not in sources:
         sources.append(backup_source)
+    for extra in extra_sources or []:
+        extra = (extra or "").strip()
+        if extra and extra not in sources:
+            sources.append(extra)
 
     address_list = ",".join(f"{source}/32" for source in sources)
     firewall_lines = []
     for source in sources:
-        comment = "Allow API from primary AWS" if source == str(WG_SERVER_IP) else "Allow API from backup AWS"
+        if source == str(WG_SERVER_IP):
+            comment = "Allow API from primary AWS"
+        elif source == backup_source:
+            comment = "Allow API from backup AWS"
+        else:
+            comment = "Allow API from SSTP server"
         firewall_lines.append(
             f':do {{ /ip firewall filter add chain=input protocol=tcp dst-port=8728 '
             f'src-address={source} action=accept comment="{comment}" place-before=0 }} on-error={{}}'
@@ -861,9 +1054,15 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     parts.append(_rsc_wan_setup())
     parts.append(_rsc_lan_setup())
 
+    use_sstp = token_uses_sstp(token)
     if token.vpn_type == "l2tp":
         parts.append(_rsc_vpn_l2tp(token))
-        parts.append(_rsc_backup_l2tp(token))
+        if use_sstp:
+            # SSTP replaces the standby Hetzner L2TP (both would claim the
+            # same 10.251.x.y); the primary L2TP to AWS stays as fallback.
+            parts.append(_rsc_vpn_sstp(token))
+        else:
+            parts.append(_rsc_backup_l2tp(token))
     else:
         parts.append(_rsc_vpn_wireguard(token))
         parts.append(_rsc_backup_wireguard(token))
@@ -871,7 +1070,7 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     parts.append(_rsc_hotspot(token))
     parts.append(_rsc_login_page(token))
     parts.append(_rsc_walled_garden(token))
-    parts.append(_rsc_api_access())
+    parts.append(_rsc_api_access([settings.SSTP_SERVER_VPN_IP] if use_sstp else None))
     parts.append(_rsc_identity_and_user(token))
     parts.append(_rsc_remove_router_command_agent())
     parts.append(_rsc_notify_and_reboot(token))
@@ -953,6 +1152,9 @@ async def create_provisioning_token(
         )
 
     _require_insurance_settings(vpn_type)
+    use_sstp = sstp_provisioning_active(vpn_type)
+    if use_sstp:
+        _require_sstp_settings()
 
     router_name = await _generate_router_name(db, user_id)
     identity = await _generate_identity(db)
@@ -965,8 +1167,10 @@ async def create_provisioning_token(
     wg_private_key = wg_public_key = server_wg_pubkey = None
     backup_wg_public_key = None
     l2tp_username = l2tp_password = None
+    sstp_username = sstp_password = sstp_ip = None
     primary_registered = False
     backup_registered = False
+    sstp_registered = False
 
     # Release the transaction opened by the allocation SELECTs before the
     # manager HTTP calls. A slow manager must not pin a pooled DB connection.
@@ -995,8 +1199,17 @@ async def create_provisioning_token(
             l2tp_password = generate_api_password(20)
             await register_l2tp_peer(l2tp_username, l2tp_password, vpn_ip)
             primary_registered = True
-            await register_insurance_l2tp_peer(l2tp_username, l2tp_password, backup_ip)
-            backup_registered = True
+            if use_sstp:
+                # SSTP takes the Hetzner 10.251.x.y slot the standby L2TP
+                # would otherwise hold, so that L2TP login is not created.
+                sstp_username = generate_sstp_username(identity)
+                sstp_password = generate_api_password(24)
+                sstp_ip = derive_sstp_ip(vpn_ip)
+                await register_sstp_peer(sstp_username, sstp_password, sstp_ip)
+                sstp_registered = True
+            else:
+                await register_insurance_l2tp_peer(l2tp_username, l2tp_password, backup_ip)
+                backup_registered = True
 
         token_obj = ProvisioningToken(
             user_id=user_id,
@@ -1012,6 +1225,8 @@ async def create_provisioning_token(
             server_wg_pubkey=server_wg_pubkey,
             l2tp_username=l2tp_username,
             l2tp_password=l2tp_password,
+            sstp_username=sstp_username,
+            sstp_password=sstp_password,
             server_public_ip=settings.SERVER_PUBLIC_IP,
             payment_methods=payment_methods or ["mpesa", "voucher"],
             # v7 always uses unified `hotspot` html-directory; only honour the
@@ -1047,6 +1262,12 @@ async def create_provisioning_token(
                 logger.warning(f"Failed to roll back primary WG peer for {vpn_ip}: {cleanup_err}")
         else:
             try:
+                if sstp_registered and sstp_username:
+                    await remove_sstp_peer(sstp_username)
+                    logger.info(f"Rolled back SSTP peer {sstp_username} ({sstp_ip}) after failure")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to roll back SSTP peer {sstp_username} ({sstp_ip}): {cleanup_err}")
+            try:
                 if backup_registered and l2tp_username:
                     from app.services.insurance_l2tp import remove_insurance_l2tp_peer
 
@@ -1064,7 +1285,7 @@ async def create_provisioning_token(
 
     logger.info(
         f"Provisioning token created: identity={identity} vpn_ip={vpn_ip} "
-        f"vpn_type={vpn_type} by user_id={user_id}"
+        f"vpn_type={vpn_type} sstp={'yes' if sstp_username else 'no'} by user_id={user_id}"
     )
     return token_obj
 
@@ -1097,6 +1318,10 @@ async def complete_provisioning(
         # The generated RouterOS script no longer installs the outbound agent.
         router_agent_enabled=False,
     )
+    if token_uses_sstp(token):
+        # Ops health would otherwise infer L2TP from the 10.0.100.x address.
+        router_obj.management_tunnel = "sstp"
+        router_obj.management_tunnel_changed_at = datetime.utcnow()
     db.add(router_obj)
     await db.flush()
 

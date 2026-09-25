@@ -473,6 +473,13 @@ async def run_radius_migrations():
         else:
             logger.info("Migration: provisioning_tokens is_routerboard column already exists, skipping")
 
+        # --- Provisioning tokens: SSTP management-tunnel credentials (RouterOS 6) ---
+        await conn.execute(sa_text("""
+            ALTER TABLE provisioning_tokens
+            ADD COLUMN IF NOT EXISTS sstp_username VARCHAR NULL,
+            ADD COLUMN IF NOT EXISTS sstp_password VARCHAR NULL
+        """))
+
         # --- PPPoE columns on customers table ---
         result = await conn.execute(sa_text("""
             SELECT column_name
