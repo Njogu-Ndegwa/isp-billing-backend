@@ -53,7 +53,7 @@ from app.services.fup import hotspot_throttle_rate_for_plan
 from app.services import customer_expiry_notifications
 from app.core.protected_devices import is_protected_device
 from app.config import settings
-from app.services.realtime_state import is_pilot_router
+from app.services.realtime_state import host_metering_active, is_pilot_router
 import asyncio
 from contextlib import asynccontextmanager
 import logging
@@ -3504,10 +3504,12 @@ async def collect_bandwidth_snapshot():
                     db.add(snapshot)
 
                     queues = raw.get("queues", {})
-                    if is_pilot_router(router_id):
+                    if host_metering_active(router_id):
                         # Pilot routers are metered per device from their own
                         # push; crediting queue counters here too would count
-                        # the same traffic twice.
+                        # the same traffic twice. Only while the push is
+                        # actually arriving — otherwise this poller is the
+                        # router's usage collector, as before.
                         queues = {}
                     if queues.get("success") and queues.get("data"):
                         # Load the router's customer/plan rows once. Previously
