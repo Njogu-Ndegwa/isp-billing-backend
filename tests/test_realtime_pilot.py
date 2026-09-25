@@ -304,7 +304,7 @@ def test_small_routers_start_slower_and_back_off_on_their_own_cpu(monkeypatch):
     assert realtime_state.pilot_push_interval_seconds(10) == 10
     assert realtime_state.pilot_push_interval_seconds(390) == 120
 
-    for cpu, expected in ((20, 10), (65, 30), (92, 60)):
+    for cpu, expected in ((20, 10), (65, 10), (92, 120)):
         realtime_state.record_push(10, now=now, interval_seconds=10, hosts=[], queues=[],
                                    live_customers={}, metrics={"cpu_load": cpu}, has_hosts=True)
         assert realtime_state.pilot_push_interval_seconds(10) == expected
@@ -323,6 +323,11 @@ def test_poller_takes_a_pilot_router_back_when_its_push_stops(monkeypatch):
     assert not realtime_state.host_metering_active(426, now + timedelta(minutes=10))
 
 
+def test_default_cadence_is_uniform_60_seconds():
+    from app.config import Settings
+    assert Settings.model_fields["REALTIME_PUSH_INTERVAL_SECONDS"].default == 60
+
+
 def test_cpu_back_off_is_sticky_so_the_cadence_does_not_flip_flop(monkeypatch):
     monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "10")
     monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_SECONDS", 10)
@@ -331,9 +336,9 @@ def test_cpu_back_off_is_sticky_so_the_cadence_does_not_flip_flop(monkeypatch):
     push = lambda t, cpu: realtime_state.record_push(10, now=t, interval_seconds=10, hosts=[], queues=[],
                                                      live_customers={}, metrics={"cpu_load": cpu}, has_hosts=True)
     push(now, 95)
-    assert realtime_state.pilot_push_interval_seconds(10) == 60
+    assert realtime_state.pilot_push_interval_seconds(10) == 120
     push(now + timedelta(seconds=60), 5)       # quiet sample right after: still backed off
-    assert realtime_state.pilot_push_interval_seconds(10) == 60
+    assert realtime_state.pilot_push_interval_seconds(10) == 120
     push(now + timedelta(minutes=11), 5)       # hold expired and CPU is fine
     assert realtime_state.pilot_push_interval_seconds(10) == 10
 
@@ -357,4 +362,4 @@ async def test_tunnel_reports_skip_the_https_override_but_keep_cpu_back_off(db, 
     body["router"]["cpu_load"] = 95
     busy = await client.post("/api/router/usage-push", json=body,
                              headers={**_auth(), "X-Bitwave-Push-Channel": "tunnel"})
-    assert busy.json()["next_push_seconds"] == 60
+    assert busy.json()["next_push_seconds"] == 120
