@@ -15,8 +15,10 @@ from app.db.models import (
     Customer,
     CustomerUsagePeriod,
     Plan,
+    Router,
     UserRole,
 )
+from app.services import realtime_state
 from app.services.auth import verify_token, get_current_user
 from app.services.usage_tracking import get_open_period
 
@@ -43,6 +45,21 @@ class PeriodOut(BaseModel):
     closed_at: Optional[datetime]
 
 
+class LiveOut(BaseModel):
+    """Seconds-fresh view of one device, from the real-time push pilot."""
+
+    online: bool
+    ip: Optional[str]
+    rate_down_bps: Optional[float]
+    rate_up_bps: Optional[float]
+    seen_at: datetime
+    reported_at: datetime
+    report_age_seconds: float
+    interval_seconds: int
+    queue_status: str
+    max_limit: Optional[str]
+
+
 class UsageOut(BaseModel):
     customer_id: int
     connection_type: Optional[str]
@@ -51,6 +68,7 @@ class UsageOut(BaseModel):
     plan_data_cap_mb: Optional[int]
     plan_fup_action: Optional[str]
     period: Optional[PeriodOut]
+    live: Optional[LiveOut] = None
 
 
 class BulkUsageRequest(BaseModel):
@@ -108,6 +126,25 @@ def _serialize_period(p: CustomerUsagePeriod) -> PeriodOut:
     )
 
 
+def _live_for(customer: Customer) -> Optional[LiveOut]:
+    router_live = realtime_state.get_router_live(customer.router_id) if customer.router_id else None
+    device = realtime_state.get_device_live(customer.router_id, customer.mac_address)
+    if router_live is None or device is None:
+        return None
+    return LiveOut(
+        online=device.online,
+        ip=device.ip or None,
+        rate_down_bps=device.rate_down_bps,
+        rate_up_bps=device.rate_up_bps,
+        seen_at=device.seen_at,
+        reported_at=router_live.received_at,
+        report_age_seconds=round((datetime.utcnow() - router_live.received_at).total_seconds(), 1),
+        interval_seconds=router_live.interval_seconds,
+        queue_status=device.queue_status,
+        max_limit=device.max_limit,
+    )
+
+
 def _serialize_usage(
     customer: Customer,
     open_period: Optional[CustomerUsagePeriod],
@@ -121,6 +158,7 @@ def _serialize_usage(
         plan_data_cap_mb=plan.data_cap_mb if plan else None,
         plan_fup_action=plan.fup_action.value if (plan and plan.fup_action) else None,
         period=_serialize_period(open_period) if open_period else None,
+        live=_live_for(customer),
     )
 
 
@@ -304,3 +342,140 @@ async def get_top_usage_for_reseller(
             )
         )
     return out
+
+
+
+# ------------------------------ Router live view ------------------------------
+
+
+class LiveDeviceOut(BaseModel):
+    customer_id: Optional[int]
+    customer_name: Optional[str]
+    mac: str
+    ip: Optional[str]
+    online: bool
+    rate_down_bps: Optional[float]
+    rate_up_bps: Optional[float]
+    session_download_bytes: int
+    session_upload_bytes: int
+    seen_at: datetime
+    queue_status: str
+    max_limit: Optional[str]
+
+
+class RouterLiveOut(BaseModel):
+    router_id: int
+    reported_at: datetime
+    report_age_seconds: float
+    interval_seconds: int
+    pushes_since_restart: int
+    cpu_load: Optional[int]
+    free_memory: Optional[int]
+    total_memory: Optional[int]
+    uptime: str
+    version: str
+    board: str
+    wan_rx_bps: Optional[float]
+    wan_tx_bps: Optional[float]
+    hotspot_active: int
+    pppoe_active: int
+    queue_count: int
+    orphan_queues: int
+    shadowed: int
+    no_limit: int
+    last_repair_at: Optional[datetime]
+    last_repair_result: Optional[dict]
+    devices: list[LiveDeviceOut]
+
+
+@router.get("/api/routers/{router_id}/live", response_model=RouterLiveOut)
+async def get_router_live(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Seconds-fresh router and per-device state (real-time push pilot routers).
+
+    Served from memory; 404 when the router is not reporting live.
+    """
+    user = await get_current_user(token, db)
+    stmt = select(Router.id).where(Router.id == router_id)
+    if user.role != UserRole.ADMIN:
+        stmt = stmt.where(Router.user_id == user.id)
+    if (await db.execute(stmt)).scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+
+    state = realtime_state.get_router_live(router_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="This router is not reporting live data")
+
+    customer_ids = [d.customer_id for d in state.devices.values() if d.customer_id]
+    names = {}
+    if customer_ids:
+        rows = await db.execute(select(Customer.id, Customer.name).where(Customer.id.in_(customer_ids)))
+        names = {cid: name for cid, name in rows.all()}
+
+    devices = sorted(
+        state.devices.values(),
+        key=lambda d: (not d.online, -(d.rate_down_bps or 0), d.mac),
+    )
+    return RouterLiveOut(
+        router_id=router_id,
+        reported_at=state.received_at,
+        report_age_seconds=round((datetime.utcnow() - state.received_at).total_seconds(), 1),
+        interval_seconds=state.interval_seconds,
+        pushes_since_restart=state.pushes,
+        cpu_load=state.cpu_load,
+        free_memory=state.free_memory,
+        total_memory=state.total_memory,
+        uptime=state.uptime,
+        version=state.version,
+        board=state.board,
+        wan_rx_bps=state.wan_rx_bps,
+        wan_tx_bps=state.wan_tx_bps,
+        hotspot_active=state.hotspot_active,
+        pppoe_active=state.pppoe_active,
+        queue_count=state.queue_count,
+        orphan_queues=state.orphan_queues,
+        shadowed=state.shadowed,
+        no_limit=state.no_limit,
+        last_repair_at=state.last_repair_at,
+        last_repair_result=state.last_repair_result,
+        devices=[
+            LiveDeviceOut(
+                customer_id=d.customer_id,
+                customer_name=names.get(d.customer_id),
+                mac=d.mac,
+                ip=d.ip or None,
+                online=d.online,
+                rate_down_bps=d.rate_down_bps,
+                rate_up_bps=d.rate_up_bps,
+                session_download_bytes=d.bytes_out,
+                session_upload_bytes=d.bytes_in,
+                seen_at=d.seen_at,
+                queue_status=d.queue_status,
+                max_limit=d.max_limit,
+            )
+            for d in devices
+        ],
+    )
+
+
+@router.get("/api/realtime/routers", response_model=list[int])
+async def list_live_router_ids(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Ids of the caller's routers that are reporting live right now."""
+    user = await get_current_user(token, db)
+    ids = [
+        rid for rid in realtime_state.pilot_router_ids()
+        if (state := realtime_state.get_router_live(rid)) is not None
+        and (datetime.utcnow() - state.received_at).total_seconds() < 300
+    ]
+    if not ids:
+        return []
+    stmt = select(Router.id).where(Router.id.in_(ids))
+    if user.role != UserRole.ADMIN:
+        stmt = stmt.where(Router.user_id == user.id)
+    return sorted((await db.execute(stmt)).scalars().all())

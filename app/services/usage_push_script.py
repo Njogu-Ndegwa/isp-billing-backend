@@ -221,3 +221,141 @@ def render_logout_hook_attach(profile_name: str) -> str:
         f'/ip hotspot user profile set [find name="{profile}"] '
         f'on-logout="/system script run {LOGOUT_SCRIPT_NAME}"'
     )
+
+
+# ---------------------------------------------------------------------------
+# v2 reporter — real-time pilot
+# ---------------------------------------------------------------------------
+#
+# Same channel, more facts per report, and a cadence the server can actually
+# change. The v1 reporter posts with ``output=none``, so it never saw the
+# ``next_push_seconds`` the server returns and every router stayed on the
+# interval it was installed with. v2 reads the reply and retunes its own
+# scheduler.
+#
+# Per report:
+#   reports[] — every plan_/pppoe queue in ROUTER ORDER (order decides which
+#               queue a packet hits) with its target, max-limit and disabled.
+#   hosts[]   — every bypassed or authorized /ip hotspot host: the device's own
+#               byte counters, which are what the pilot meters usage from.
+#   router{}  — WAN counters, CPU, memory, uptime, version, board, counts.
+#
+# Only reads, plus one write: the scheduler's own interval. Parsing uses
+# :find/:pick, not :deserialize, so it runs on RouterOS 6 as well as 7.
+
+_REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
+/system script remove [find name="__SCRIPT__"]
+/system script remove [find name="__LOGOUT__"]
+/system scheduler remove [find name="__SCHED__"]
+
+/system script add name="__SCRIPT__" policy=read,write,test,policy source={
+    :local url "__URL__"
+    :local tok "__TOKEN__"
+    :local ident "__IDENT__"
+    # Health first, so this script's own work does not inflate the CPU figure.
+    :local cpu [/system resource get cpu-load]
+    :local fm [/system resource get free-memory]
+    :local tm [/system resource get total-memory]
+    :local fh [/system resource get free-hdd-space]
+    :local th [/system resource get total-hdd-space]
+    :local upt [/system resource get uptime]
+    :local ver [/system resource get version]
+    :local brd [/system resource get board-name]
+    :local body "{\"identity\":\"$ident\",\"v\":2,\"reports\":["
+    :local first true
+    :local qcount 0
+    :foreach q in=[/queue simple find] do={
+        :local qn [/queue simple get $q name]
+        :local key ""
+        :if ([:pick $qn 0 5] = "plan_") do={ :set key [:pick $qn 5 [:len $qn]] }
+        :if ([:pick $qn 0 7] = "<pppoe-") do={ :set key ("pppoe:" . [:pick $qn 7 ([:len $qn] - 1)]) }
+        :if ($key != "") do={
+            :local qb [/queue simple get $q bytes]
+            :local qt [:tostr [/queue simple get $q target]]
+            :local ql [/queue simple get $q max-limit]
+            :local qd [/queue simple get $q disabled]
+            :local up [:pick $qb 0 [:find $qb "/"]]
+            :local dn [:pick $qb ([:find $qb "/"] + 1) [:len $qb]]
+            :if (!$first) do={ :set body ($body . ",") }
+            :set body ($body . "{\"queue_key\":\"" . $key . "\",\"upload_bytes\":" . $up . ",\"download_bytes\":" . $dn . ",\"target_ip\":\"" . $qt . "\",\"max_limit\":\"" . $ql . "\",\"disabled\":" . $qd . "}")
+            :set first false
+            :set qcount ($qcount + 1)
+        }
+    }
+    :set body ($body . "],\"hosts\":[")
+    :local hfirst true
+    :local hids ([/ip hotspot host find where bypassed] , [/ip hotspot host find where authorized])
+    :foreach h in=$hids do={
+        :do {
+            :local hm [/ip hotspot host get $h mac-address]
+            :local ha [/ip hotspot host get $h address]
+            :local hbi [/ip hotspot host get $h bytes-in]
+            :local hbo [/ip hotspot host get $h bytes-out]
+            :local hby [/ip hotspot host get $h bypassed]
+            :local hau [/ip hotspot host get $h authorized]
+            :local hit [/ip hotspot host get $h idle-time]
+            :local hup [/ip hotspot host get $h uptime]
+            :if (!$hfirst) do={ :set body ($body . ",") }
+            :set body ($body . "{\"mac\":\"" . $hm . "\",\"ip\":\"" . $ha . "\",\"bytes_in\":" . $hbi . ",\"bytes_out\":" . $hbo . ",\"bypassed\":" . $hby . ",\"authorized\":" . $hau . ",\"idle_time\":\"" . $hit . "\",\"uptime\":\"" . $hup . "\"}")
+            :set hfirst false
+        } on-error={}
+    }
+    :set body ($body . "]")
+    :do {
+        :local rxb [/interface get [find name="__WAN__"] rx-byte]
+        :local txb [/interface get [find name="__WAN__"] tx-byte]
+        :local hs ([:len [/ip hotspot host find where authorized]] + [:len [/ip hotspot host find where bypassed]])
+        :local pp [:len [/ppp active find]]
+        :set body ($body . ",\"router\":{\"iface_rx_bytes\":" . $rxb . ",\"iface_tx_bytes\":" . $txb . ",\"hotspot_active\":" . $hs . ",\"pppoe_active\":" . $pp . ",\"queue_count\":" . $qcount . ",\"cpu_load\":" . $cpu . ",\"free_memory\":" . $fm . ",\"total_memory\":" . $tm . ",\"free_hdd\":" . $fh . ",\"total_hdd\":" . $th . ",\"uptime\":\"" . $upt . "\",\"version\":\"" . $ver . "\",\"board\":\"" . $brd . "\"}")
+    } on-error={ :log info "usage-push: metrics skipped" }
+    :set body ($body . "}")
+    :do {
+        :local res [/tool fetch url=$url http-method=post http-header-field=("Content-Type: application/json,Authorization: Bearer " . $tok) http-data=$body output=user as-value]
+        :local d ($res->"data")
+        :local p [:find $d "\"next_push_seconds\":"]
+        :if ([:typeof $p] = "num") do={
+            :local s ($p + 20)
+            :local e [:find $d "}" $s]
+            :local n [:tonum [:pick $d $s $e]]
+            :if (([:typeof $n] = "num") && ($n >= 5) && ($n <= 3600)) do={
+                :local want [:totime ($n . "s")]
+                :if ([/system scheduler get [find name="__SCHED__"] interval] != $want) do={
+                    /system scheduler set [find name="__SCHED__"] interval=$want
+                    :log info ("usage-push: interval now " . $n . "s")
+                }
+            }
+        }
+    } on-error={ :log info "usage-push: deferred" }
+}
+
+/system scheduler add name="__SCHED__" interval=__INTERVAL__s start-time=startup on-event="/system script run __SCRIPT__" policy=read,write,test,policy comment="Bitwave usage reporting v2 (real-time)"
+:log info "usage-push v2: installed for __IDENT__"
+'''
+
+_WAN_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+
+
+def render_realtime_push_script(
+    *,
+    identity: str,
+    endpoint_url: str,
+    interval_seconds: int = 10,
+    wan_interface: str = "ether1",
+) -> str:
+    """Render the v2 (real-time pilot) reporter. See the block comment above."""
+    identity = _require(identity, _IDENTITY_RE, "identity")
+    endpoint_url = _require(endpoint_url, _URL_RE, "endpoint_url")
+    wan = _require(wan_interface, _WAN_RE, "wan_interface")
+    if not (5 <= int(interval_seconds) <= 3600):
+        raise ValueError("usage-push script: interval must be 5..3600 seconds")
+    return (
+        _REALTIME_TEMPLATE
+        .replace("__SCRIPT__", SCRIPT_NAME)
+        .replace("__LOGOUT__", LOGOUT_SCRIPT_NAME)
+        .replace("__SCHED__", SCHEDULER_NAME)
+        .replace("__URL__", endpoint_url)
+        .replace("__TOKEN__", derive_router_token(identity))
+        .replace("__IDENT__", identity)
+        .replace("__WAN__", wan)
+        .replace("__INTERVAL__", str(int(interval_seconds)))
+    )

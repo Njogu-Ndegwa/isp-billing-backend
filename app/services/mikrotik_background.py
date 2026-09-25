@@ -38,6 +38,8 @@ from app.db.models import (
 from app.services.mikrotik_api import (
     LANE_BACKGROUND,
     MikroTikAPI,
+    customer_queue_mac,
+    find_conflicting_customer_queues,
     is_hotspot_parent_queue_name,
     normalize_mac_address,
 )
@@ -51,6 +53,7 @@ from app.services.fup import hotspot_throttle_rate_for_plan
 from app.services import customer_expiry_notifications
 from app.core.protected_devices import is_protected_device
 from app.config import settings
+from app.services.realtime_state import is_pilot_router
 import asyncio
 from contextlib import asynccontextmanager
 import logging
@@ -2248,7 +2251,256 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
 # QUEUE SYNC (background job, rotating bounded router batch)
 # =============================================================================
 
-def _sync_single_router_queues_sync(router_info: dict, customers_data: list) -> dict:
+SYNC_MAX_QUEUE_CONFLICT_FIXES_PER_RUN = 50
+
+
+def _queue_sync_customer_item(c, fup_period) -> dict:
+    """One customer's entry for queue sync: the speed their queue must enforce."""
+    plan_speed = c.plan.speed
+    fup_action = (
+        fup_period.fup_action_taken
+        or fup_period.fup_action_snapshot
+        or c.plan.fup_action
+        if fup_period
+        else None
+    )
+    if fup_action == FupAction.THROTTLE:
+        plan_speed = hotspot_throttle_rate_for_plan(c.plan)
+    return {
+        "id": c.id,
+        "mac_address": c.mac_address,
+        "plan_speed": plan_speed,
+        "fup_active": bool(fup_period),
+        "fup_action": fup_action.value if fup_action else None,
+    }
+
+
+def _queue_sync_router_info(router) -> dict:
+    return {
+        "id": router.id,
+        "ip": router.ip_address, "username": router.username,
+        "password": router.password, "port": router.port, "name": router.name,
+    }
+
+
+async def repair_router_queues_now(router_id: int) -> dict:
+    """Run queue sync (with hygiene) for ONE router, right now.
+
+    Used by the real-time push pilot: when a report shows a shadowed, missing
+    or orphan queue, the fix should not wait for the router's turn in the
+    rotation (~2 h). DB is read in one short session and released before any
+    RouterOS I/O; the router lock serialises this with the scheduled sync.
+    """
+    if _background_db_pool_is_busy("QUEUE-REPAIR"):
+        return {"skipped": "db_busy"}
+    now = datetime.utcnow()
+    async with async_session() as db:
+        router = await db.get(Router, router_id)
+        if router is None or router.auth_method != RouterAuthMethod.DIRECT_API:
+            await db.commit()
+            return {"skipped": "not_direct_api"}
+        customers = (
+            await db.execute(
+                select(Customer)
+                .join(Plan, Customer.plan_id == Plan.id)
+                .where(
+                    Customer.router_id == router_id,
+                    Customer.status == CustomerStatus.ACTIVE,
+                    Customer.mac_address.isnot(None),
+                    Customer.expiry > now,
+                    Plan.connection_type == ConnectionType.HOTSPOT,
+                )
+                .options(selectinload(Customer.plan))
+            )
+        ).scalars().all()
+        fup_periods = {
+            p.customer_id: p
+            for p in (
+                await db.execute(
+                    select(CustomerUsagePeriod).where(
+                        CustomerUsagePeriod.customer_id.in_([c.id for c in customers] or [0]),
+                        CustomerUsagePeriod.closed_at.is_(None),
+                        CustomerUsagePeriod.fup_triggered_at.isnot(None),
+                        CustomerUsagePeriod.fup_reverted_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+        }
+        items = [
+            _queue_sync_customer_item(c, fup_periods.get(c.id))
+            for c in customers
+            if c.plan and c.plan.speed
+        ]
+        router_info = _queue_sync_router_info(router)
+        await db.commit()
+
+    router_key = f"{router_info['ip']}:{router_info['port']}"
+    async with router_locks.acquire(router_key):
+        result = await asyncio.to_thread(
+            _sync_single_router_queues_sync, router_info, items, True,
+        )
+    return result.get("details") or {}
+
+
+def _build_ip_owner_map(
+    dhcp_leases: list,
+    arp_entries: list,
+    hotspot_hosts: list,
+    hotspot_active: list,
+) -> dict:
+    """IP -> normalized MAC of the device on that IP right now.
+
+    Later sources override earlier ones: a lease can outlive the device that
+    held it, while hotspot host / active entries are what the router is
+    forwarding for at this moment.
+    """
+    ip_owner = {}
+
+    def _put(ip, mac):
+        if ip and mac:
+            ip_owner[str(ip).strip()] = normalize_mac_address(mac)
+
+    for lease in dhcp_leases:
+        if str(lease.get("status", "bound")).lower() == "bound":
+            _put(lease.get("address"), lease.get("mac-address"))
+    for entry in arp_entries:
+        if str(entry.get("complete", "true")).lower() != "false":
+            _put(entry.get("address"), entry.get("mac-address"))
+    for host in hotspot_hosts:
+        _put(host.get("address"), host.get("mac-address"))
+        _put(host.get("to-address"), host.get("mac-address"))
+    for session in hotspot_active:
+        _put(session.get("address"), session.get("mac-address"))
+    return ip_owner
+
+
+def _resolve_queue_ip_conflicts(
+    api,
+    router_name: str,
+    existing_queues: list,
+    customers_data: list,
+    dhcp_leases: list,
+    arp_entries: list,
+    hotspot_hosts: list,
+    hotspot_active: list,
+) -> int:
+    """Stop stale per-customer queues from swallowing another device's traffic.
+
+    See ``find_conflicting_customer_queues``. A conflicting queue whose MAC is
+    an active customer on this router is disabled — queue sync re-targets and
+    re-enables it when that device next appears. Anything else (expired,
+    deleted, never-paid MAC) is removed. Runs after the per-customer pass so
+    queues it just re-targeted are judged on their new IP.
+    """
+    ip_owner = _build_ip_owner_map(dhcp_leases, arp_entries, hotspot_hosts, hotspot_active)
+    conflicts = find_conflicting_customer_queues(existing_queues, ip_owner)
+    if not conflicts:
+        return 0
+
+    active_macs = {
+        normalize_mac_address(c["mac_address"])
+        for c in customers_data
+        if c.get("mac_address")
+    }
+    fixed = 0
+    for conflict in conflicts[:SYNC_MAX_QUEUE_CONFLICT_FIXES_PER_RUN]:
+        queue = conflict["queue"]
+        queue_id = queue.get(".id")
+        if not queue_id:
+            continue
+        time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)
+        if conflict["queue_mac"] in active_macs:
+            action = "disabled"
+            result = api.send_command("/queue/simple/set", {"numbers": queue_id, "disabled": "yes"})
+        else:
+            action = "removed"
+            result = api.send_command("/queue/simple/remove", {"numbers": queue_id})
+        if result.get("error"):
+            logger.warning(
+                "[SYNC] %s: failed to fix queue %s shadowing %s on %s: %s",
+                router_name, queue.get("name"), conflict["holder_mac"], conflict["ip"], result["error"],
+            )
+            continue
+        fixed += 1
+        logger.warning(
+            "[SYNC] %s: %s queue %s — its target %s now belongs to %s",
+            router_name, action, queue.get("name"), conflict["ip"], conflict["holder_mac"],
+        )
+    if len(conflicts) > SYNC_MAX_QUEUE_CONFLICT_FIXES_PER_RUN:
+        logger.info(
+            "[SYNC] %s: %d more shadowing queue(s) left for the next run",
+            router_name, len(conflicts) - SYNC_MAX_QUEUE_CONFLICT_FIXES_PER_RUN,
+        )
+    return fixed
+
+
+def _sweep_orphan_customer_queues(
+    api,
+    router_name: str,
+    existing_queues: list,
+    customers_data: list,
+) -> set:
+    """Remove ``plan_<MAC>`` queues that belong to nobody entitled to them.
+
+    A queue grants nothing — access comes from the ip-binding — so a queue whose
+    MAC is neither an active customer on this router nor holding any binding is
+    dead weight. It is not harmless, though: it keeps its old target IP, and the
+    moment DHCP hands that IP to a new customer it sits above their queue and
+    takes their traffic. Measured 2026-09-24: Bitwave Wangige carried 60 such
+    queues (customers expired in March, some never in the DB) against 11 live
+    customers, and every zero-usage customer there was shadowed by one.
+
+    The binding check is the safety net for a paying device the DB places on
+    another router: it keeps its binding here, so its queue is left alone. If the
+    binding list cannot be read, nothing is removed.
+
+    Returns the ``.id`` of every queue removed.
+    """
+    bindings_result = api.get_ip_bindings_minimal()
+    if bindings_result.get("error") or not bindings_result.get("success", True):
+        logger.warning(
+            "[SYNC] %s: skipping orphan-queue sweep, could not read ip-bindings: %s",
+            router_name, bindings_result.get("error"),
+        )
+        return set()
+    bound_macs = {
+        normalize_mac_address(b["mac-address"])
+        for b in bindings_result.get("data") or []
+        if b.get("mac-address")
+    }
+    active_macs = {
+        normalize_mac_address(c["mac_address"])
+        for c in customers_data
+        if c.get("mac_address")
+    }
+    orphans = [
+        q for q in existing_queues
+        if q.get(".id")
+        and (mac := customer_queue_mac(q))
+        and mac not in active_macs
+        and mac not in bound_macs
+    ]
+    removed = set()
+    for queue in orphans[:SYNC_MAX_QUEUE_CONFLICT_FIXES_PER_RUN]:
+        time.sleep(SYNC_DELAY_BETWEEN_CUSTOMERS)
+        result = api.send_command("/queue/simple/remove", {"numbers": queue[".id"]})
+        if result.get("error"):
+            logger.warning(
+                "[SYNC] %s: failed to remove orphan queue %s: %s",
+                router_name, queue.get("name"), result["error"],
+            )
+            continue
+        removed.add(queue[".id"])
+    if removed:
+        logger.warning(
+            "[SYNC] %s: removed %d orphan queue(s) with no active customer and no binding%s",
+            router_name, len(removed),
+            f" ({len(orphans) - len(removed)} left for the next run)" if len(orphans) > len(removed) else "",
+        )
+    return removed
+
+
+def _sync_single_router_queues_sync(router_info: dict, customers_data: list, queue_hygiene: bool = False) -> dict:
     """
     Queue sync for ONE router.
 
@@ -2517,6 +2769,10 @@ def _sync_single_router_queues_sync(router_info: dict, customers_data: list) -> 
                             errors += 1
                         else:
                             logger.info(f"[SYNC] Updated queue {queue_name} -> {client_ip} ({rate_limit})")
+                            # Keep the in-memory view current for the
+                            # conflict pass below.
+                            existing_queue["target"] = f"{client_ip}/32"
+                            existing_queue["disabled"] = "false"
                             updated_queues.append({"name": queue_name, "ip": client_ip, "limit": rate_limit})
                             synced += 1
                             total_operations += 1
@@ -2566,12 +2822,26 @@ def _sync_single_router_queues_sync(router_info: dict, customers_data: list) -> 
                 logger.error(f"[SYNC] Error syncing customer {cust['id']} ({cust['mac_address']}): {e}")
                 errors += 1
 
+        conflicts_fixed = 0
+        # Orphan sweep + shadowing fix: real-time pilot routers only for now
+        # (fleet rollout is tracked separately).
+        if queue_hygiene and api.connected:
+            orphans_removed = _sweep_orphan_customer_queues(
+                api, router_name, existing_queues, customers_data,
+            )
+            conflicts_fixed = len(orphans_removed) + _resolve_queue_ip_conflicts(
+                api, router_name,
+                [q for q in existing_queues if q.get(".id") not in orphans_removed],
+                customers_data, dhcp_leases, arp_entries, hotspot_hosts, hotspot_active,
+            )
+
         logger.info(f"[SYNC] Router {router_name} Summary:")
         logger.info(f"[SYNC]    - Queues created: {len(created_queues)}")
         logger.info(f"[SYNC]    - Queues updated: {len(updated_queues)}")
         logger.info(f"[SYNC]    - Skipped (no IP): {skipped_no_ip}")
         logger.info(f"[SYNC]    - Skipped (already correct): {skipped_already_ok}")
         logger.info(f"[SYNC]    - Errors: {errors}")
+        logger.info(f"[SYNC]    - Shadowing queues fixed: {conflicts_fixed}")
         if created_queues:
             logger.info(f"[SYNC] Created queues: {[q['name'] + '=' + q['limit'] for q in created_queues]}")
         if updated_queues:
@@ -2583,6 +2853,7 @@ def _sync_single_router_queues_sync(router_info: dict, customers_data: list) -> 
         results["details"] = {
             "router": router_name, "synced": synced, "errors": errors,
             "skipped_no_ip": skipped_no_ip, "skipped_already_ok": skipped_already_ok,
+            "shadowing_queues_fixed": conflicts_fixed,
         }
     except Exception as e:
         logger.error(f"[SYNC] Error processing router {router_name}: {e}")
@@ -2694,31 +2965,10 @@ async def sync_active_user_queues():
                     skipped_offline_router_keys.add(router_key)
                     continue
 
-                plan_speed = c.plan.speed
-                fup_period = fup_periods_by_customer_id.get(c.id)
-                fup_action = (
-                    fup_period.fup_action_taken
-                    or fup_period.fup_action_snapshot
-                    or c.plan.fup_action
-                    if fup_period
-                    else None
-                )
-                if fup_action == FupAction.THROTTLE:
-                    plan_speed = hotspot_throttle_rate_for_plan(c.plan)
-
-                customer_data = {
-                    "id": c.id,
-                    "mac_address": c.mac_address,
-                    "plan_speed": plan_speed,
-                    "fup_active": bool(fup_period),
-                    "fup_action": fup_action.value if fup_action else None,
-                }
+                customer_data = _queue_sync_customer_item(c, fup_periods_by_customer_id.get(c.id))
                 if router_key not in router_customers_map:
                     router_customers_map[router_key] = {
-                        "router": {
-                            "ip": c.router.ip_address, "username": c.router.username,
-                            "password": c.router.password, "port": c.router.port, "name": c.router.name
-                        },
+                        "router": _queue_sync_router_info(c.router),
                         "customers": []
                     }
                 router_customers_map[router_key]["customers"].append(customer_data)
@@ -2743,6 +2993,12 @@ async def sync_active_user_queues():
             ordered_router_items = all_router_items[start_index:] + all_router_items[:start_index]
             pending_router_items = ordered_router_items[:QUEUE_SYNC_MAX_ROUTERS_PER_RUN]
             _queue_sync_router_cursor = (start_index + len(pending_router_items)) % len(all_router_items)
+            # Pilot routers are repaired every run, not once per rotation.
+            pending_keys = {rk for rk, _ in pending_router_items}
+            pending_router_items += [
+                (rk, rd) for rk, rd in all_router_items
+                if rk not in pending_keys and is_pilot_router(rd["router"].get("id"))
+            ]
 
             logger.info(
                 "[SYNC] Processing %d/%d eligible router(s) this run (cursor=%d)",
@@ -2765,6 +3021,7 @@ async def sync_active_user_queues():
                 async with router_locks.acquire(rk):
                     return await asyncio.to_thread(
                         _sync_single_router_queues_sync, rd["router"], rd["customers"],
+                        *((True,) if is_pilot_router(rd["router"].get("id")) else ()),
                     )
             except Exception as exc:
                 logger.error("[SYNC] Router task %s crashed: %s", rk, exc)
@@ -3233,6 +3490,11 @@ async def collect_bandwidth_snapshot():
                     db.add(snapshot)
 
                     queues = raw.get("queues", {})
+                    if is_pilot_router(router_id):
+                        # Pilot routers are metered per device from their own
+                        # push; crediting queue counters here too would count
+                        # the same traffic twice.
+                        queues = {}
                     if queues.get("success") and queues.get("data"):
                         # Load the router's customer/plan rows once. Previously
                         # every simple queue issued its own customer SELECT and
