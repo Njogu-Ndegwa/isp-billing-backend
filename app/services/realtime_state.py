@@ -62,6 +62,14 @@ class HostSample:
 
 
 @dataclass
+class PppSample:
+    name: str
+    address: str
+    uptime: str = ""
+    caller_id: str = ""
+
+
+@dataclass
 class QueueSample:
     key: str            # canonical MAC (upper, colons) or pppoe:<user>
     target_ip: str
@@ -73,7 +81,7 @@ class QueueSample:
 
 @dataclass
 class DeviceLive:
-    mac: str
+    mac: str                        # MAC for hotspot, "pppoe:<user>" for PPPoE
     customer_id: Optional[int]
     ip: str
     online: bool
@@ -87,6 +95,7 @@ class DeviceLive:
     queue_status: str
     limited_by: Optional[str]       # key of the queue that actually matches
     max_limit: Optional[str]        # max-limit of that queue
+    kind: str = "hotspot"           # "hotspot" | "pppoe"
 
 
 @dataclass
@@ -138,6 +147,13 @@ def get_device_live(router_id: Optional[int], mac: Optional[str]) -> Optional[De
     return state.devices.get(normalize_mac_address(mac).upper())
 
 
+def get_pppoe_live(router_id: Optional[int], username: Optional[str]) -> Optional[DeviceLive]:
+    if router_id is None or not username:
+        return None
+    state = _routers.get(router_id)
+    return state.devices.get(f"pppoe:{username}") if state else None
+
+
 def _rate(prev: Optional[int], cur: int, seconds: float) -> Optional[float]:
     if prev is None or seconds <= 0 or cur < prev:
         # First sighting, or the counter reset (host re-created, reboot):
@@ -163,6 +179,8 @@ def record_push(
     queues: list[QueueSample],
     live_customers: dict[str, int],
     metrics: Optional[dict] = None,
+    ppp_sessions: Iterable[PppSample] = (),
+    live_pppoe_customers: Optional[dict[str, int]] = None,
 ) -> RouterLive:
     """Fold one report into the live state and return the router's entry.
 
@@ -245,6 +263,42 @@ def record_push(
             queue_status=QUEUE_OFFLINE,
             limited_by=None,
             max_limit=None,
+        )
+
+    # PPPoE: a session is online when it is in /ppp active; its dynamic queue
+    # <pppoe-USER> carries the session's counters (and its speed limit).
+    sessions = {f"pppoe:{p.name}": p for p in ppp_sessions}
+    queue_by_key = {q.key: q for q in queues}
+    for key, customer_id in (live_pppoe_customers or {}).items():
+        session = sessions.get(key)
+        queue = queue_by_key.get(key)
+        before = prev.devices.get(key) if prev else None
+        online = session is not None
+        continuous = online and before is not None and before.online
+        up = queue.upload_bytes if queue else 0
+        down = queue.download_bytes if queue else 0
+        if not online:
+            status = QUEUE_OFFLINE
+        elif queue is None or queue.disabled:
+            status = QUEUE_NO_LIMIT
+        else:
+            status = QUEUE_OK
+        state.devices[key] = DeviceLive(
+            mac=key,
+            customer_id=customer_id,
+            ip=session.address if session else (before.ip if before else ""),
+            online=online,
+            bytes_in=up if online else 0,
+            bytes_out=down if online else 0,
+            rate_up_bps=_rate(before.bytes_in if continuous else None, up, elapsed) if online else None,
+            rate_down_bps=_rate(before.bytes_out if continuous else None, down, elapsed) if online else None,
+            seen_at=now if online else (before.seen_at if before else now),
+            idle_time="",
+            uptime=session.uptime if session else "",
+            queue_status=status,
+            limited_by=key if (online and queue and not queue.disabled) else None,
+            max_limit=queue.max_limit if (online and queue) else None,
+            kind="pppoe",
         )
 
     state.orphan_queues = sum(

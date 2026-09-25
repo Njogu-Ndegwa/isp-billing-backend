@@ -300,6 +300,19 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :set hfirst false
         } on-error={}
     }
+    :set body ($body . "],\"ppp\":[")
+    :local pfirst true
+    :do {
+        :foreach a in=[/ppp active find] do={
+            :local an [/ppp active get $a name]
+            :local aa [/ppp active get $a address]
+            :local au [/ppp active get $a uptime]
+            :local ac [/ppp active get $a caller-id]
+            :if (!$pfirst) do={ :set body ($body . ",") }
+            :set body ($body . "{\"name\":\"" . $an . "\",\"address\":\"" . $aa . "\",\"uptime\":\"" . $au . "\",\"caller_id\":\"" . $ac . "\"}")
+            :set pfirst false
+        }
+    } on-error={}
     :set body ($body . "]")
     :do {
         :local rxb [/interface get [find name="__WAN__"] rx-byte]
