@@ -363,3 +363,37 @@ async def test_tunnel_reports_skip_the_https_override_but_keep_cpu_back_off(db, 
     busy = await client.post("/api/router/usage-push", json=body,
                              headers={**_auth(), "X-Bitwave-Push-Channel": "tunnel"})
     assert busy.json()["next_push_seconds"] == 120
+
+
+@pytest.mark.asyncio
+async def test_any_router_pushing_metrics_is_marked_so_pollers_stand_down(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "")  # not a pilot: v1 with metrics
+    assert not realtime_state.reports_metrics(router.id)
+    body = _push(1, 1, 1, 1)
+    body.pop("hosts")
+    await client.post("/api/router/usage-push", json=body, headers=_auth())
+    assert realtime_state.reports_metrics(router.id)
+    later = datetime.utcnow() + timedelta(seconds=realtime_state.METRICS_REPORT_FRESH_SECONDS + 5)
+    assert not realtime_state.reports_metrics(router.id, later)   # push stopped: poller resumes
+
+
+@pytest.mark.asyncio
+async def test_retention_still_prunes_when_every_router_pushes(db, session_factory, monkeypatch):
+    from app.db.models import BandwidthSnapshot
+    from app.services import mikrotik_background
+
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller, identity="Router-0999")
+    db.add(BandwidthSnapshot(router_id=router.id, recorded_at=datetime.utcnow() - timedelta(days=45),
+                             interface_rx_bytes=0, interface_tx_bytes=0))
+    await db.commit()
+    realtime_state.note_metrics_report(router.id)          # the only router pushes
+    monkeypatch.setattr(mikrotik_background, "async_session", session_factory, raising=False)
+    monkeypatch.setattr(mikrotik_background, "_background_db_pool_is_busy", lambda *_: False, raising=False)
+
+    await mikrotik_background.collect_bandwidth_snapshot()
+
+    async with session_factory() as s:
+        left = (await s.execute(select(BandwidthSnapshot).where(BandwidthSnapshot.router_id == router.id))).scalars().all()
+    assert left == []

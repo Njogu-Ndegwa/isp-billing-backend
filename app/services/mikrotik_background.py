@@ -53,7 +53,7 @@ from app.services.fup import hotspot_throttle_rate_for_plan
 from app.services import customer_expiry_notifications
 from app.core.protected_devices import is_protected_device
 from app.config import settings
-from app.services.realtime_state import host_metering_active, is_pilot_router
+from app.services.realtime_state import host_metering_active, is_pilot_router, reports_metrics
 import asyncio
 from contextlib import asynccontextmanager
 import logging
@@ -3275,6 +3275,14 @@ def _fetch_bandwidth_data_sync():
     return {"router_id": None, "active_sessions": active_sessions, "traffic": traffic, "speed_stats": speed_stats, "queues": queues}
 
 
+async def _prune_bandwidth_history(db, now) -> None:
+    cutoff = now - timedelta(days=BANDWIDTH_HISTORY_RETENTION_DAYS)
+    await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
+    await db.execute(delete(RouterUsageBucket).where(RouterUsageBucket.bucket_start < cutoff))
+    await prune_router_availability_history(db, now=now)
+    await db.commit()
+
+
 async def collect_bandwidth_snapshot():
     global _bandwidth_router_cursor
     try:
@@ -3299,9 +3307,16 @@ async def collect_bandwidth_snapshot():
             eligible_routers = []
             skipped_radius = 0
             skipped_offline = 0
+            skipped_pushing = 0
             for router in routers:
                 if getattr(router, 'auth_method', None) == 'RADIUS':
                     skipped_radius += 1
+                    continue
+                if reports_metrics(router.id, now):
+                    # The router pushes its own interface counters and session
+                    # counts (and the push writes the snapshot row). Logging in
+                    # to read them again only duplicated rows and router load.
+                    skipped_pushing += 1
                     continue
                 if _router_recently_offline(router, now):
                     skipped_offline += 1
@@ -3315,11 +3330,15 @@ async def collect_bandwidth_snapshot():
 
             if not eligible_routers:
                 logger.info(
-                    "[BANDWIDTH] No eligible routers this run (total=%d, radius=%d, recently_offline=%d)",
+                    "[BANDWIDTH] No eligible routers this run (total=%d, radius=%d, recently_offline=%d, pushing=%d)",
                     len(routers),
                     skipped_radius,
                     skipped_offline,
+                    skipped_pushing,
                 )
+                # Retention still applies when every router pushes (the push
+                # writes snapshot rows too) — otherwise history grows forever.
+                await _prune_bandwidth_history(db, now)
                 return
 
             start_index = _bandwidth_router_cursor % len(eligible_routers)
@@ -3334,12 +3353,13 @@ async def collect_bandwidth_snapshot():
             processed_count = 0
             logger.info(
                 "[BANDWIDTH] Processing %d/%d eligible router(s) this run "
-                "(total=%d, radius=%d, recently_offline=%d, cursor=%d)",
+                "(total=%d, radius=%d, recently_offline=%d, pushing=%d, cursor=%d)",
                 len(routers_to_process),
                 len(eligible_routers),
                 len(routers),
                 skipped_radius,
                 skipped_offline,
+                skipped_pushing,
                 start_index,
             )
 
@@ -3773,11 +3793,7 @@ async def collect_bandwidth_snapshot():
                         logger.error(f"[BANDWIDTH] Rollback after router error failed: {rb_err}")
                     continue
 
-            cutoff = now - timedelta(days=BANDWIDTH_HISTORY_RETENTION_DAYS)
-            await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
-            await db.execute(delete(RouterUsageBucket).where(RouterUsageBucket.bucket_start < cutoff))
-            await prune_router_availability_history(db, now=now)
-            await db.commit()
+            await _prune_bandwidth_history(db, now)
 
         logger.info(
             "Bandwidth snapshot run processed %d/%d eligible router(s) out of %d total router(s)",
