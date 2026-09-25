@@ -152,6 +152,7 @@ app.include_router(outage_compensation_router)
 # --- Background job imports ---
 from app.services.mikrotik_background import (
     cleanup_expired_users_background,
+    expiry_housekeeping_background,
     reconcile_inactive_pppoe_access_background,
     collect_bandwidth_snapshot,
     sync_active_user_queues,
@@ -2980,11 +2981,25 @@ async def startup_event():
         logger.info("Plan cache warmed up with background scheduler disabled")
         return
 
+    # 45 s, down from 67 s: a run now reads each router once and has its own
+    # lane, so it usually finishes in well under the interval, and a customer
+    # waits on average half an interval before the next run picks them up.
     scheduler.add_job(
         cleanup_expired_users_background,
-        trigger=IntervalTrigger(seconds=67),
+        trigger=IntervalTrigger(seconds=45),
         id='cleanup_expired_users',
         name='Remove expired hotspot users from MikroTik',
+        replace_existing=True,
+        max_instances=1
+    )
+    # Safety-net bypass scan + idle-credential reaper. Split out of the job
+    # above so the 5-6 min fleet scan no longer pauses removals; each keeps its
+    # own 10 / 5 min cadence via the guards inside.
+    scheduler.add_job(
+        expiry_housekeeping_background,
+        trigger=IntervalTrigger(seconds=73),
+        id='expiry_housekeeping',
+        name='Safety-net bypass scan and idle credential reaper',
         replace_existing=True,
         max_instances=1
     )
