@@ -81,10 +81,50 @@ def test_flapping_reachability_counts_drops_and_needs_attention():
     assert row["reason"] == "Reachable 50% of the time in the last 24h (10 drops)"
 
 
-def test_retrying_payments_are_not_counted_as_lost_or_first_try_failures():
-    pending = [(1, NOW - timedelta(minutes=5), ProvisioningState.RETRY_PENDING, 3, None)] * 15
-    out = pr.evaluate([_router(1)], [], pending, NOW)
+def _waiting(rid, minutes_ago, state=ProvisioningState.RETRY_PENDING, tries=3):
+    return (rid, NOW - timedelta(minutes=minutes_ago), state, tries, None)
+
+
+def test_a_payment_still_retrying_within_the_grace_period_is_not_a_problem():
+    out = pr.evaluate([_router(1)], [], [_waiting(1, 2)] * 3 + [_paid(1, 1)] * 5, NOW)
     assert out["routers"] == []
+    assert out["waiting_now"] == 0 and out["waiting_routers"] == 0
+
+
+def test_retrying_payments_are_waiting_customers_not_lost_or_first_try_failures():
+    out = pr.evaluate([_router(1)], [], [_waiting(1, 20)] * 15, NOW)
+    row = out["routers"][0]
+    assert row["state"] == "attention" and row["waiting"] == 15
+    assert row["after"]["lost"] == 0 and row["after"]["first_try_pct"] is None
+
+
+def test_customers_paying_into_a_dead_tunnel_top_the_list_before_any_retry_gives_up():
+    # 2026-09-25 RONGAI (448): WireGuard went silent 08:05 UTC while customers kept
+    # paying; 23 sat in retry_pending, none failed yet, reachability still ~90% for
+    # the day -- the card showed nothing. Now it leads the list.
+    went_dark = NOW - timedelta(hours=2)
+    rongai = _router(448, name="RONGAI", tunnel="wireguard", last_online_at=went_dark)
+    checks = [(448, NOW - timedelta(minutes=30 * i), i > 4) for i in range(1, 40)]
+    attempts = ([_paid(448, h) for h in range(3, 23)]
+                + [_waiting(448, m) for m in (118, 100, 75, 40, 12)]
+                + [_waiting(448, 3)])  # still inside the grace period
+    lossy = [_paid(2, h, FAILED) for h in (1, 2, 3)]  # another router with lost payments
+    out = pr.evaluate([_router(2), rongai], checks, attempts + lossy, NOW)
+    assert [r["router_id"] for r in out["routers"]] == [448, 2]
+    row = out["routers"][0]
+    assert row["state"] == "attention" and row["waiting"] == 5
+    assert row["reason"] == ("5 paid customers waiting to be connected (oldest 1h 58m)"
+                             " · no contact since 25 Sep 10:00 UTC")
+    assert row["oldest_waiting_at"] == "2026-09-25T10:02:00Z"
+    assert out["waiting_now"] == 5 and out["waiting_routers"] == 1
+    assert out["counts"]["attention"] == 2
+
+
+def test_a_router_silent_for_a_week_is_still_listed_while_customers_pay_into_it():
+    dead = _router(1, last_online_at=NOW - timedelta(days=9))
+    out = pr.evaluate([dead], [], [_waiting(1, 30, state=ProvisioningState.IN_PROGRESS, tries=1)], NOW)
+    assert out["routers"][0]["reason"] == ("1 paid customer waiting to be connected (oldest 30 min)"
+                                           " · no contact since 16 Sep 12:00 UTC")
 
 
 def test_fleet_headline_compares_last_day_with_the_daily_average_before():
