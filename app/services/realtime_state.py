@@ -64,22 +64,19 @@ CPU_BACKOFF_HOLD = timedelta(minutes=10)
 
 
 def _cpu_backoff_seconds(cpu: Optional[int]) -> int:
-    if cpu is None:
-        return 0
-    if cpu >= CPU_BACKOFF_HEAVY_PERCENT:
-        return 60
-    if cpu >= CPU_BACKOFF_PERCENT:
-        return 30
+    if cpu is not None and cpu >= CPU_BACKOFF_HEAVY_PERCENT:
+        return 120
     return 0
 
 
-CPU_BACKOFF_PERCENT = 60
 CPU_BACKOFF_HEAVY_PERCENT = 80
 
 # How long after its last v2 report a pilot router still counts as metered by
 # the push. Past this (router offline, script removed) the bandwidth poller
 # and cap sampler take it back, so usage is never left uncollected.
-HOST_METERING_FRESH_SECONDS = 180
+# Several report intervals (60 s, or 120 s for small boards on HTTPS), so one
+# late report does not hand the router back to the poller and count it twice.
+HOST_METERING_FRESH_SECONDS = 360
 
 
 def host_metering_active(router_id: Optional[int], now: Optional[datetime] = None) -> bool:

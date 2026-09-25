@@ -26,7 +26,9 @@ class Settings(BaseSettings):
     # 10 = Bitwave Wangige, 487 = OPIC INTERNET SERVICES #2 (hotspot + PPPoE),
     # 351 / 390 / 426 = reseller "aayan" (RB951 / hAP lite / hAP lite).
     REALTIME_PILOT_ROUTER_IDS: str = "10,487,351,390,426"
-    REALTIME_PUSH_INTERVAL_SECONDS: int = 10
+    # Uniform cadence for every pilot router (Dennis, 2026-09-25). Over the
+    # management tunnel a hAP lite at ~60 s ran at ~19% CPU against a 14% baseline.
+    REALTIME_PUSH_INTERVAL_SECONDS: int = 60
     # Per-router cadence, "id:seconds,...". Measured 2026-09-25 on hAP lite 390
     # (ROS 6.49.6): one v2 run takes ~11 s and pins the CPU at 100% (HTTPS on
     # smips); at 30 s the average went 12% -> 41%, at 60 s to 51%. Small boards
