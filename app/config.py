@@ -23,7 +23,8 @@ class Settings(BaseSettings):
     # targets, router health), are metered per device from /ip hotspot host
     # instead of per queue, and get their queues repaired as soon as a report
     # shows a problem. Every other router keeps today's behaviour.
-    REALTIME_PILOT_ROUTER_IDS: str = "10"
+    # 10 = Bitwave Wangige, 487 = OPIC INTERNET SERVICES #2 (hotspot + PPPoE).
+    REALTIME_PILOT_ROUTER_IDS: str = "10,487"
     REALTIME_PUSH_INTERVAL_SECONDS: int = 10
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15

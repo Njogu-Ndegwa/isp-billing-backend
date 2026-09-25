@@ -134,6 +134,8 @@ class IngestResult:
     over_cap_customer_ids: list[int] = field(default_factory=list)
     # canonical hotspot MAC -> customer id, for customers live on this router.
     live_hotspot_customers: dict[str, int] = field(default_factory=dict)
+    # "pppoe:<username>" -> customer id, for PPPoE customers live on this router.
+    live_pppoe_customers: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     snapshot_written: bool = False
 
@@ -386,6 +388,13 @@ async def ingest_usage_reports(
                 and _customer_is_live(customer, now)
             ):
                 result.live_hotspot_customers[key] = customer.id
+            elif (
+                key.startswith("pppoe:")
+                and customer.plan is not None
+                and customer.plan.connection_type == ConnectionType.PPPOE
+                and _customer_is_live(customer, now)
+            ):
+                result.live_pppoe_customers[key] = customer.id
 
         pending = 0
         for report in reports:

@@ -128,7 +128,10 @@ def _serialize_period(p: CustomerUsagePeriod) -> PeriodOut:
 
 def _live_for(customer: Customer) -> Optional[LiveOut]:
     router_live = realtime_state.get_router_live(customer.router_id) if customer.router_id else None
-    device = realtime_state.get_device_live(customer.router_id, customer.mac_address)
+    device = (
+        realtime_state.get_device_live(customer.router_id, customer.mac_address)
+        or realtime_state.get_pppoe_live(customer.router_id, customer.pppoe_username)
+    )
     if router_live is None or device is None:
         return None
     return LiveOut(
@@ -349,6 +352,7 @@ async def get_top_usage_for_reseller(
 
 
 class LiveDeviceOut(BaseModel):
+    kind: str
     customer_id: Optional[int]
     customer_name: Optional[str]
     mac: str
@@ -443,6 +447,7 @@ async def get_router_live(
         last_repair_result=state.last_repair_result,
         devices=[
             LiveDeviceOut(
+                kind=d.kind,
                 customer_id=d.customer_id,
                 customer_name=names.get(d.customer_id),
                 mac=d.mac,

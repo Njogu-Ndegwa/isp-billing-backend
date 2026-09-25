@@ -268,3 +268,29 @@ async def test_no_second_repair_while_one_is_running(db, client, monkeypatch):
         await client.post("/api/router/usage-push", json=_push(1, 1, 0, 0, shadow=True), headers=_auth())
 
     assert started == [router.id]
+
+
+def test_pppoe_sessions_show_live_with_speed_from_their_session_queue():
+    now = datetime(2026, 9, 25, 11, 0, 0)
+    key = "pppoe:Jeff01"
+    q = lambda up, dn: [QueueSample(key=key, target_ip="", max_limit="5400000/5400000",
+                                     disabled=False, upload_bytes=up, download_bytes=dn)]
+    session = [realtime_state.PppSample(name="Jeff01", address="192.168.89.253", uptime="57m")]
+
+    realtime_state.record_push(9, now=now, interval_seconds=10, hosts=[], queues=q(0, 0),
+                               live_customers={}, ppp_sessions=session,
+                               live_pppoe_customers={key: 33284, "pppoe:TEST": 13653})
+    s2 = realtime_state.record_push(9, now=now + timedelta(seconds=10), interval_seconds=10, hosts=[],
+                                    queues=q(125_000, 1_250_000), live_customers={}, ppp_sessions=session,
+                                    live_pppoe_customers={key: 33284, "pppoe:TEST": 13653})
+    jeff = realtime_state.get_pppoe_live(9, "Jeff01")
+    assert jeff.online and jeff.kind == "pppoe" and jeff.ip == "192.168.89.253"
+    assert jeff.rate_down_bps == pytest.approx(1_000_000)
+    assert jeff.queue_status == realtime_state.QUEUE_OK and jeff.max_limit == "5400000/5400000"
+    assert realtime_state.get_pppoe_live(9, "TEST").queue_status == realtime_state.QUEUE_OFFLINE
+    assert s2.orphan_queues == 0  # PPPoE queues are never orphans
+
+
+def test_realtime_script_reports_ppp_sessions():
+    script = render_realtime_push_script(identity="Router-1178", endpoint_url="https://isp.example.com/api/router/usage-push")
+    assert "/ppp active find" in script and '\\"ppp\\":[' in script

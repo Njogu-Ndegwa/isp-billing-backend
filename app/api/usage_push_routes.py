@@ -48,6 +48,7 @@ from app.services.usage_push_auth import verify_router_token
 from app.services import realtime_state
 from app.services.realtime_state import (
     HostSample,
+    PppSample,
     QueueSample,
     is_pilot_router,
     pilot_push_interval_seconds,
@@ -146,6 +147,15 @@ class HostReportIn(BaseModel):
     uptime: str = Field(default="", max_length=32)
 
 
+class PppActiveIn(BaseModel):
+    """One ``/ppp active`` session (v2 / real-time pilot)."""
+
+    name: str = Field(max_length=64)
+    address: str = Field(default="", max_length=64)
+    uptime: str = Field(default="", max_length=32)
+    caller_id: str = Field(default="", max_length=64)
+
+
 class RouterMetricsIn(BaseModel):
     """Optional router-level readings — interface counters and session counts.
 
@@ -176,6 +186,7 @@ class UsagePushIn(BaseModel):
     v: int = 1
     reports: list[UsageReportIn] = Field(default_factory=list)
     hosts: list[HostReportIn] = Field(default_factory=list)
+    ppp: list[PppActiveIn] = Field(default_factory=list)
     router: Optional[RouterMetricsIn] = None
 
 
@@ -197,7 +208,11 @@ async def receive_usage_push(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     # Refuse an implausible payload before touching the database.
-    if len(payload.reports) > MAX_REPORTS_PER_BATCH or len(payload.hosts) > MAX_HOSTS_PER_BATCH:
+    if (
+        len(payload.reports) > MAX_REPORTS_PER_BATCH
+        or len(payload.hosts) > MAX_HOSTS_PER_BATCH
+        or len(payload.ppp) > MAX_HOSTS_PER_BATCH
+    ):
         raise HTTPException(
             status_code=413,
             detail=f"Batch too large; max {MAX_REPORTS_PER_BATCH} reports",
@@ -376,6 +391,11 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result) -> None:
         queues=queues,
         live_customers=result.live_hotspot_customers,
         metrics=payload.router.model_dump() if payload.router else None,
+        ppp_sessions=[
+            PppSample(name=p.name, address=p.address, uptime=p.uptime, caller_id=p.caller_id)
+            for p in payload.ppp
+        ],
+        live_pppoe_customers=result.live_pppoe_customers,
     )
     running = (
         state.last_repair_result is not None
