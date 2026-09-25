@@ -232,3 +232,39 @@ def test_index_prefers_the_live_row_when_a_device_has_several():
     expired = C(1, CustomerStatus.INACTIVE, -90)
     assert _index_customers([live, expired])[MAC].id == 2
     assert _index_customers([expired, live])[MAC].id == 2
+
+
+@pytest.mark.asyncio
+async def test_router_only_lock_does_not_wait_for_fleet_slots():
+    import asyncio
+
+    from app.services.mikrotik_background import RouterLockManager
+
+    locks = RouterLockManager(max_concurrent=1)
+    async with locks.acquire("10.0.0.99:8728"):          # the only fleet slot is taken
+        async with locks.acquire_router_only("10.0.0.5:8728"):
+            pass                                          # ...and this still gets in
+        with pytest.raises(asyncio.TimeoutError):
+            async def same_router():
+                async with locks.acquire_router_only("10.0.0.99:8728"):
+                    pass
+            await asyncio.wait_for(same_router(), 0.05)   # same router still serializes
+
+
+@pytest.mark.asyncio
+async def test_no_second_repair_while_one_is_running(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", str(router.id))
+    started = []
+
+    async def slow_repair(router_id):
+        started.append(router_id)  # never calls note_repair: stays "running"
+
+    monkeypatch.setattr(routes, "_repair", slow_repair)
+    monkeypatch.setattr(realtime_state, "REPAIR_PERSISTENT_PROBLEM_SECONDS", 0)
+    monkeypatch.setattr(realtime_state, "REPAIR_COOLDOWN_SECONDS", 0)
+
+    for _ in range(3):
+        await client.post("/api/router/usage-push", json=_push(1, 1, 0, 0, shadow=True), headers=_auth())
+
+    assert started == [router.id]

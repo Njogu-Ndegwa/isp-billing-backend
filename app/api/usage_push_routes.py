@@ -75,6 +75,10 @@ PILOT_MIN_SECONDS_BETWEEN_PUSHES = 3
 
 MAX_HOSTS_PER_BATCH = 2000
 
+# One repair per router at a time; a repair still marked running after this is
+# presumed lost and may be started again.
+REPAIR_RUNNING_GRACE_SECONDS = 600
+
 # Shed load at the same threshold the background samplers use, so push and the
 # background jobs back off together instead of fighting for the last connections.
 POOL_PRESSURE_PERCENT = 60
@@ -373,7 +377,13 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result) -> None:
         live_customers=result.live_hotspot_customers,
         metrics=payload.router.model_dump() if payload.router else None,
     )
-    if payload.hosts and realtime_state.repair_due(state, now):
+    running = (
+        state.last_repair_result is not None
+        and state.last_repair_result.get("status") == "running"
+        and state.last_repair_at is not None
+        and (now - state.last_repair_at).total_seconds() < REPAIR_RUNNING_GRACE_SECONDS
+    )
+    if payload.hosts and not running and realtime_state.repair_due(state, now):
         realtime_state.note_repair(router_id, now, {"status": "running"})
         _spawn(_repair(router_id))
 
