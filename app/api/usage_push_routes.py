@@ -422,7 +422,10 @@ async def receive_usage_push(
         "accepted": result.accepted,
         "rejected": result.rejected,
         "next_push_seconds": (
-            pilot_push_interval_seconds(router_row.id, via_tunnel) if pilot else DEFAULT_PUSH_INTERVAL_SECONDS
+            SMALL_BOARD_PUSH_SECONDS
+            if payload.v >= 3 and payload.router is not None and is_small_board(payload.router.board)
+            else pilot_push_interval_seconds(router_row.id, via_tunnel) if pilot
+            else DEFAULT_PUSH_INTERVAL_SECONDS
         ),
     }
 
@@ -540,6 +543,19 @@ async def log_rejected_push(request, exc) -> None:
         )
     except Exception as log_exc:  # never let logging break the response
         logger.debug("[USAGE-PUSH] could not log a rejected push: %s", log_exc)
+
+
+# hAP lite / hAP mini (smips, 32 MB): on 2026-09-26 the real-time push on top of
+# our other schedulers pinned them at 100% CPU with ~5 MB free, delaying a paying
+# customer. The installer no longer puts v3 on them; any v3 script still on one
+# (router offline during rollback) is told to report once an hour, which makes it
+# harmless without logging in. Usage there falls back to server polling.
+SMALL_BOARD_PUSH_SECONDS = 3600
+_SMALL_BOARD_RE = re.compile(r"hap\s*(lite|mini)|rb9[34]1", re.IGNORECASE)
+
+
+def is_small_board(board: Optional[str]) -> bool:
+    return bool(board and _SMALL_BOARD_RE.search(board))
 
 
 async def _repair(router_id: int) -> None:

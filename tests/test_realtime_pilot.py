@@ -654,3 +654,16 @@ def test_entries_that_vanish_mid_walk_are_skipped_not_sent_empty():
     assert "[:len $an] > 0" in script
     src = script[script.index("source={\n"):script.index("\n}\n\n/system scheduler add")]
     assert src.count("{") == src.count("}")
+
+
+@pytest.mark.asyncio
+async def test_hap_lite_left_with_the_v3_script_is_told_to_report_hourly(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "")
+    body = {**_push(0, 0, 0, 0), "v": 3}
+    body["router"] = {**body["router"], "board": "hAP lite"}
+    r = await client.post("/api/router/usage-push", json=body, headers=_auth())
+    assert r.status_code == 200
+    assert r.json()["next_push_seconds"] == routes.SMALL_BOARD_PUSH_SECONDS
+    assert routes.is_small_board("RB941-2nD") and routes.is_small_board("hAP mini")
+    assert not routes.is_small_board("hAP ac lite") and not routes.is_small_board("RB951Ui-2HnD")
