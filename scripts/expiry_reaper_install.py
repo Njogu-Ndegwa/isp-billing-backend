@@ -36,7 +36,7 @@ from app.services.expiry_reaper_script import (
     COMMENT, POLICY, SCHEDULER_NAME, SCRIPT_NAME, render_expiry_reaper_script, script_source,
 )
 from app.services.mikrotik_api import MikroTikAPI
-from app.services.router_expiry import expiry_minute, normalize_mac, with_exp_tag
+from app.services.router_expiry import expiry_second, normalize_mac, with_exp_tag
 
 APPLY = os.environ.get("APPLY") == "1"
 UNINSTALL = os.environ.get("UNINSTALL") == "1"
@@ -101,7 +101,7 @@ def tag_bindings(api, paid: dict[str, datetime]) -> str:
             skipped += 1
             continue
         comment = b.get("comment", "")
-        new = with_exp_tag(comment, expiry_minute(paid[mac]))
+        new = with_exp_tag(comment, expiry_second(paid[mac]))
         if new == comment:
             continue
         changed += 1
