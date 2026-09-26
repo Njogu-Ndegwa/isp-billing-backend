@@ -25,7 +25,17 @@ from app.config import settings
 from app.services.mikrotik_api import normalize_mac_address
 
 
-def pilot_router_ids() -> frozenset[int]:
+# A router is on real-time push when it is listed in REALTIME_PILOT_ROUTER_IDS
+# or when it is actually sending the real-time report (payload v3+, which only
+# scripts/realtime_push_install.py puts on a router). The second rule is what
+# lets the fleet be moved in batches without a redeploy per batch, and rolled
+# back per router by restoring its old script: membership lapses this long
+# after its last real-time report, and the poller/cap sampler take it back.
+REALTIME_MEMBERSHIP_FRESH_SECONDS = 900
+_realtime_seen: dict[int, datetime] = {}
+
+
+def configured_pilot_router_ids() -> frozenset[int]:
     ids = set()
     for part in str(settings.REALTIME_PILOT_ROUTER_IDS or "").split(","):
         part = part.strip()
@@ -34,8 +44,30 @@ def pilot_router_ids() -> frozenset[int]:
     return frozenset(ids)
 
 
+def note_realtime_report(router_id: int, now: Optional[datetime] = None) -> None:
+    """Record that this router just sent a real-time (v3+) report."""
+    _realtime_seen[router_id] = now or datetime.utcnow()
+
+
+def _reporting_router_ids(now: Optional[datetime] = None) -> set[int]:
+    now = now or datetime.utcnow()
+    return {
+        rid for rid, at in _realtime_seen.items()
+        if (now - at).total_seconds() <= REALTIME_MEMBERSHIP_FRESH_SECONDS
+    }
+
+
+def pilot_router_ids() -> frozenset[int]:
+    return frozenset(configured_pilot_router_ids() | _reporting_router_ids())
+
+
 def is_pilot_router(router_id: Optional[int]) -> bool:
-    return router_id is not None and router_id in pilot_router_ids()
+    if router_id is None:
+        return False
+    if router_id in configured_pilot_router_ids():
+        return True
+    at = _realtime_seen.get(router_id)
+    return at is not None and (datetime.utcnow() - at).total_seconds() <= REALTIME_MEMBERSHIP_FRESH_SECONDS
 
 
 def pilot_push_interval_seconds(router_id: Optional[int] = None, via_tunnel: bool = False) -> int:
@@ -220,6 +252,7 @@ def reports_metrics(router_id: Optional[int], now: Optional[datetime] = None) ->
 def reset_realtime_state() -> None:
     """Test hook."""
     _routers.clear()
+    _realtime_seen.clear()
     _last_metrics_report.clear()
 
 

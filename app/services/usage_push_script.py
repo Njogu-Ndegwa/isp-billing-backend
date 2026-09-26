@@ -352,7 +352,7 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :global bwPushN
     :if ([:typeof $bwPushN] != "num") do={ :set bwPushN 0 }
     :set bwPushN ($bwPushN + 1)
-    :if (($bwPushN % 5) = 1) do={
+    :if (($bwPushN % __LISTS_EVERY__) = 1) do={
         :set body ($body . ",\"bridge_hosts\":[")
         :local bfirst true
         :do {
@@ -468,13 +468,21 @@ def render_realtime_push_script(
     endpoint_url: str,
     interval_seconds: int = 10,
     wan_interface: str = "ether1",
+    lists_every: int = 5,
 ) -> str:
-    """Render the v2 (real-time pilot) reporter. See the block comment above."""
+    """Render the v2 (real-time pilot) reporter. See the block comment above.
+
+    ``lists_every``: the slow-changing lists (device-per-port, bindings,
+    leases, neighbours, bridge ports) ride every Nth report. Smallest boards
+    use a larger N; keep N x interval under the 15-minute list freshness.
+    """
     identity = _require(identity, _IDENTITY_RE, "identity")
     endpoint_url = _require(endpoint_url, _URL_RE, "endpoint_url")
     wan = _require(wan_interface, _WAN_RE, "wan_interface")
     if not (5 <= int(interval_seconds) <= 3600):
         raise ValueError("usage-push script: interval must be 5..3600 seconds")
+    if not (2 <= int(lists_every) <= 15):
+        raise ValueError("usage-push script: lists_every must be 2..15")
     return (
         _REALTIME_TEMPLATE
         .replace("__SCRIPT__", SCRIPT_NAME)
@@ -485,4 +493,5 @@ def render_realtime_push_script(
         .replace("__IDENT__", identity)
         .replace("__WAN__", wan)
         .replace("__INTERVAL__", str(int(interval_seconds)))
+        .replace("__LISTS_EVERY__", str(int(lists_every)))
     )
