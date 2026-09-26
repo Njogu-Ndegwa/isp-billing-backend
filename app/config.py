@@ -69,6 +69,22 @@ class Settings(BaseSettings):
     # seconds before the customer row switches to the NEW MAC, and a check-in
     # in that gap must not re-add the OLD MAC as an orphan binding.
     CHECKIN_MISSING_GRACE_SECONDS: int = 60
+    # Per-router delivery mode for the push-vs-check-in A/B (2026-09-26).
+    # Comma lists of router ids; a router in neither list (or in both) keeps
+    # the default "both paths" behaviour.
+    #   CHECKIN_PUSH_ONLY_ROUTER_IDS: the check-in never sends A/Q lines there
+    #     (it still accepts reports and records 'observed').
+    #   CHECKIN_ONLY_ROUTER_IDS: the payment-time push is skipped; the
+    #     check-in sends A lines with no grace. Effective only while the
+    #     channel can deliver (enabled, not killed, mode=add, router in
+    #     CHECKIN_ROUTER_IDS); otherwise the push runs as usual.
+    # Empty both lists to roll back.
+    CHECKIN_PUSH_ONLY_ROUTER_IDS: str = ""
+    CHECKIN_ONLY_ROUTER_IDS: str = ""
+    # Safety net for CHECKIN_ONLY routers: if the check-in has not delivered
+    # this long after the attempt was created, the normal push/retry path
+    # takes over.
+    CHECKIN_ONLY_FALLBACK_SECONDS: int = 120
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable
 
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, not_, or_, select, text
 
 from app.config import settings
 from app.db.database import async_session, db_pool_snapshot
@@ -784,6 +784,180 @@ async def _persist_provisioning_result(
     return result
 
 
+# ---------------------------------------------------------------------------
+# checkin_only routers (push-vs-check-in A/B): the payment-time push is left
+# to the router's check-in, with a timed push fallback as the safety net.
+# ---------------------------------------------------------------------------
+
+# Push paths that must never be deferred: they ARE the fallback/backstop.
+CHECKIN_FALLBACK_ACTION = "checkin_only_fallback"
+_NEVER_DEFER_ACTIONS = frozenset({"hotspot_retry", "hotspot_retry_verify", CHECKIN_FALLBACK_ACTION})
+# The retry job leaves a deferred attempt alone a little past the fallback
+# deadline so the in-process fallback timer gets first go; after a restart
+# (timer lost) the retry job is the fallback.
+CHECKIN_FALLBACK_RETRY_SLACK_SECONDS = 30
+
+_fallback_tasks: set = set()
+
+
+def _checkin_only_decision(
+    attempt: ProvisioningAttempt,
+    router_id: int | None,
+    router_auth_method: Any,
+    action: str,
+    now: datetime,
+) -> tuple[str, float] | None:
+    """Should this push be left to the check-in? Pure; no I/O.
+
+    Returns ``("defer", seconds_until_fallback)``, ``("delivered", 0)`` when
+    the check-in already delivered this attempt inside the window, or None to
+    push as usual.
+    """
+    from app.services import checkin_delivery
+
+    if router_id is None or action in _NEVER_DEFER_ACTIONS:
+        return None
+    if not checkin_delivery.checkin_only_active(router_id):
+        return None
+    if _enum_value(router_auth_method) != RouterAuthMethod.DIRECT_API.value:
+        return None  # RADIUS routers get no A lines; the check-in cannot deliver
+    if attempt.router_id != router_id:
+        return None
+    if _enum_value(attempt.entrypoint) not in checkin_delivery.CHECKIN_DEFERRABLE_ENTRYPOINTS:
+        return None
+    if attempt.created_at is None:
+        return None
+    remaining = checkin_delivery.checkin_only_fallback_seconds() - (now - attempt.created_at).total_seconds()
+    if remaining <= 0:
+        return None  # the check-in had its window: push now
+    state = _enum_value(attempt.provisioning_state)
+    if state == ProvisioningState.ROUTER_UPDATED.value and attempt.delivered_via is not None:
+        return ("delivered", 0.0)
+    if state == ProvisioningState.SCHEDULED.value:
+        return ("defer", remaining)
+    return None
+
+
+def _spawn_checkin_fallback(
+    delay: float,
+    customer_id: int,
+    router_id: int,
+    hotspot_payload: Dict[str, Any],
+    attempt_id: int,
+) -> None:
+    task = asyncio.create_task(
+        _checkin_only_fallback_after(delay, customer_id, router_id, hotspot_payload, attempt_id)
+    )
+    _fallback_tasks.add(task)
+    task.add_done_callback(_fallback_tasks.discard)
+
+
+async def _checkin_only_fallback_after(
+    delay: float,
+    customer_id: int,
+    router_id: int,
+    hotspot_payload: Dict[str, Any],
+    attempt_id: int,
+) -> Dict[str, Any] | None:
+    """The safety net: push if the check-in has not delivered by the deadline.
+
+    Sleeps with no DB session held, then one short read. Only an attempt that
+    is still ``scheduled`` is pushed: delivered means the check-in won, and
+    in_progress/retry_pending means another push (the retry job) has it.
+    """
+    try:
+        await asyncio.sleep(max(0.0, delay))
+        async with async_session() as db:
+            attempt = await db.get(ProvisioningAttempt, attempt_id)
+            state = _enum_value(attempt.provisioning_state) if attempt else None
+            await db.commit()
+        if state != ProvisioningState.SCHEDULED.value:
+            return None
+        await log_provisioning_event(
+            customer_id=customer_id,
+            router_id=router_id,
+            mac_address=hotspot_payload.get("mac_address"),
+            action=CHECKIN_FALLBACK_ACTION,
+            status="started",
+            details="checkin_only: check-in did not deliver within the fallback window; pushing",
+            attempt_id=attempt_id,
+        )
+        logger.warning(
+            "[PROVISION] checkin_only router %s: attempt %s not delivered by check-in; push fallback",
+            router_id, attempt_id,
+        )
+        return await provision_hotspot_customer(
+            customer_id, router_id, hotspot_payload, CHECKIN_FALLBACK_ACTION, attempt_id,
+        )
+    except Exception as exc:  # the retry job is the backstop
+        logger.error("[PROVISION] checkin_only fallback for attempt %s failed: %s", attempt_id, exc)
+        return None
+
+
+async def _maybe_defer_to_checkin(
+    *,
+    customer_id: int,
+    router_id: int,
+    hotspot_payload: Dict[str, Any],
+    action: str,
+    attempt_id: int,
+    now: datetime,
+) -> Dict[str, Any] | None:
+    """Leave this push to the check-in? Returns the caller's result, or None to push.
+
+    One short read (attempt + router auth method), released before the log
+    write and before the fallback timer is armed.
+    """
+    async with async_session() as db:
+        attempt = await db.get(ProvisioningAttempt, attempt_id)
+        auth_method = None
+        if attempt is not None:
+            auth_method = (
+                await db.execute(select(Router.auth_method).where(Router.id == router_id))
+            ).scalar_one_or_none()
+        decision = (
+            _checkin_only_decision(attempt, router_id, auth_method, action, now)
+            if attempt is not None else None
+        )
+        delivery = serialize_delivery_attempt(attempt) if decision is not None else None
+        await db.commit()
+
+    if decision is None:
+        return None
+    kind, remaining = decision
+    if kind == "delivered":
+        logger.info(
+            "[PROVISION] checkin_only router %s: attempt %s already delivered by check-in; no push",
+            router_id, attempt_id,
+        )
+        return {"success": True, "skipped_push": "delivered_by_checkin",
+                "provisioning_error": None, "delivery": delivery}
+
+    await log_provisioning_event(
+        customer_id=customer_id,
+        router_id=router_id,
+        mac_address=hotspot_payload.get("mac_address"),
+        action="checkin_only_deferred",
+        status="deferred",
+        details=(
+            f"{action}: push left to router check-in (checkin_only); "
+            f"fallback push in {int(remaining)}s if not delivered"
+        ),
+        attempt_id=attempt_id,
+    )
+    logger.info(
+        "[PROVISION] checkin_only router %s: attempt %s left to check-in; fallback push in %ds",
+        router_id, attempt_id, int(remaining),
+    )
+    _spawn_checkin_fallback(remaining, customer_id, router_id, hotspot_payload, attempt_id)
+    return {
+        "success": False,
+        "deferred_to_checkin": True,
+        "provisioning_error": None,
+        "delivery": delivery,
+    }
+
+
 async def provision_hotspot_customer(
     customer_id: int,
     router_id: int | None,
@@ -792,12 +966,33 @@ async def provision_hotspot_customer(
     attempt_id: int | None = None,
     verify_only: bool = False,
 ) -> Dict[str, Any]:
-    """Provision a hotspot customer and persist the result for later reconciliation."""
+    """Provision a hotspot customer and persist the result for later reconciliation.
+
+    On a checkin_only router (``CHECKIN_ONLY_ROUTER_IDS``, channel live) a
+    fresh payment/voucher attempt is NOT pushed: it stays ``scheduled`` for the
+    router's check-in, and a timer pushes it after
+    ``CHECKIN_ONLY_FALLBACK_SECONDS`` if the check-in has not delivered.
+    """
     router_ip = hotspot_payload.get("router_ip")
     mac_address = hotspot_payload.get("mac_address")
     now = datetime.utcnow()
 
     attempt: ProvisioningAttempt | None = None
+
+    if attempt_id is not None and not verify_only and router_id is not None:
+        from app.services.checkin_delivery import checkin_only_active
+
+        if checkin_only_active(router_id) and action not in _NEVER_DEFER_ACTIONS:
+            deferred = await _maybe_defer_to_checkin(
+                customer_id=customer_id,
+                router_id=router_id,
+                hotspot_payload=hotspot_payload,
+                action=action,
+                attempt_id=attempt_id,
+                now=now,
+            )
+            if deferred is not None:
+                return deferred
 
     if attempt_id is not None:
         async with async_session() as db:
@@ -933,6 +1128,35 @@ async def _process_hotspot_retry_router_groups(router_groups: dict[str, list]) -
     )
 
 
+def _retry_scheduled_clause(now: datetime):
+    """``scheduled`` attempts the retry job may push.
+
+    A payment attempt on a checkin_only router is ``scheduled`` on purpose
+    while it waits for the check-in: the retry job leaves it alone until the
+    fallback deadline (+ slack for the in-process timer). After that, or if
+    the channel is switched off (kill switch, shadow, list emptied), it is an
+    ordinary stranded attempt again and gets pushed.
+    """
+    from app.services import checkin_delivery
+
+    clause = ProvisioningAttempt.provisioning_state == ProvisioningState.SCHEDULED
+    waiting_ids = checkin_delivery.effective_checkin_only_router_ids()
+    if not waiting_ids:
+        return clause
+    hold_cutoff = now - timedelta(
+        seconds=checkin_delivery.checkin_only_fallback_seconds() + CHECKIN_FALLBACK_RETRY_SLACK_SECONDS
+    )
+    entrypoints = [
+        ProvisioningAttemptEntrypoint(value) for value in sorted(checkin_delivery.CHECKIN_DEFERRABLE_ENTRYPOINTS)
+    ]
+    waiting_for_checkin = and_(
+        ProvisioningAttempt.router_id.in_(sorted(waiting_ids)),
+        ProvisioningAttempt.entrypoint.in_(entrypoints),
+        ProvisioningAttempt.created_at > hold_cutoff,
+    )
+    return and_(clause, not_(waiting_for_checkin))
+
+
 async def retry_pending_hotspot_provisioning_background():
     """
     Retry or verify direct API hotspot delivery using provisioning attempts.
@@ -959,6 +1183,7 @@ async def retry_pending_hotspot_provisioning_background():
 
         work_items: list[tuple[ProvisioningAttempt, Customer, Plan, Router, bool]] = []
         queued_attempt_ids: set[int] = set()
+        scheduled_clause = _retry_scheduled_clause(now)
 
         async with async_session() as db:
             terminal_candidates = (
@@ -1001,7 +1226,7 @@ async def retry_pending_hotspot_provisioning_background():
                         Plan.connection_type == ConnectionType.HOTSPOT,
                         Router.auth_method == RouterAuthMethod.DIRECT_API,
                         or_(
-                            ProvisioningAttempt.provisioning_state == ProvisioningState.SCHEDULED,
+                            scheduled_clause,
                             and_(
                                 ProvisioningAttempt.provisioning_state == ProvisioningState.IN_PROGRESS,
                                 or_(
