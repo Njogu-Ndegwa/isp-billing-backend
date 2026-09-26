@@ -621,6 +621,7 @@
   "is_routerboard",
   "l2tp_password",
   "l2tp_username",
+  "management_tunnel",
   "payment_methods",
   "provisioned_at",
   "router_admin_password",

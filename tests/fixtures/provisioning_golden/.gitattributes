@@ -1,0 +1,2 @@
+# Byte-for-byte goldens: never let autocrlf rewrite them.
+*.rsc -text

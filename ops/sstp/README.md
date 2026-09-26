@@ -51,8 +51,10 @@ Facts behind the config:
   `10.251.X.Y`.
 - The router must own `10.0.X.Y` on a loopback bridge (`lo-mgmt`), because
   otherwise that address only exists on the L2TP interface.
-- The AWS primary L2TP (`l2tp-aws`) stays configured as a fallback. It can
-  hold the same `10.0.X.Y` as `lo-mgmt` without trouble; this was tested.
+- On a router moved by hand, the AWS primary L2TP (`l2tp-aws`) may stay
+  configured as a fallback. It can hold the same `10.0.X.Y` as `lo-mgmt`
+  without trouble; this was tested. Routers provisioned new with
+  `PROVISION_MGMT_TO_HETZNER=true` get SSTP only (one management tunnel).
 - Only `ca.crt` is public. Never commit or copy `ca.key`, `server.key`,
   chap-secrets, or any `*.password` file. `create-cert.sh` refuses to replace
   an existing CA, because a new CA would break every router that trusts the
@@ -61,25 +63,24 @@ Facts behind the config:
 ## Moving an existing router
 
 Use the Claude Code skill **`migrate-router-to-sstp`** (runbook plus scripts).
-It covers ROS version checks, staging, the switch with automatic revert,
-pinning the loopback, verification, setting `routers.management_tunnel='sstp'`,
-and rollback.
+It covers ROS version checks, sta## New routers (provisioning)
 
-## New routers (provisioning)
-
-When `SSTP_PROVISIONING_ENABLED=true`, a new RouterOS 6 token (`vpn_type=l2tp`)
-does the following:
+When `PROVISION_MGMT_TO_HETZNER=true`, a new RouterOS 6 token (`vpn_type=l2tp`)
+gets SSTP as its **only** management tunnel (RouterOS 7 tokens get WireGuard
+`wg-hz` to wg2 instead). For a v6 token provisioning:
 
 1. Registers `sstp-<identity>` with a random 24-character password and
    `10.251.X.Y` through the insurance manager's `POST /add-sstp-peer`. That
    endpoint writes the chap-secrets file named by `SSTP_CHAP_SECRETS`,
-   atomically, with a backup, at mode 0600. No Hetzner insurance L2TP login is
-   created for these tokens.
-2. Produces a `.rsc` that keeps the `l2tp-aws` block and replaces the
-   `l2tp-aws2` block with an SSTP block. That block fetches and trusts the CA
-   from `GET /api/provision/router-mgmt-ca.crt` (served from
-   `ROUTER_MGMT_CA_PEM`), turns on NTP, adds or updates `sstp-hetzner`, and
-   pins `10.0.X.Y/32` on `lo-mgmt`.
+   atomically, with a backup, at mode 0600. Nothing is registered on AWS: no
+   `l2tp-aws` login and no Hetzner insurance L2TP login.
+2. Produces a `.rsc` with no L2TP block at all. The SSTP block fetches and
+   trusts the CA from `GET /api/provision/router-mgmt-ca.crt` (served from
+   `ROUTER_MGMT_CA_PEM`), turns on NTP, adds or updates `sstp-hetzner`
+   (`connect-to=IP:4443` on v6, `connect-to=IP port=4443` if the router
+   actually runs v7), and pins `10.0.X.Y/32` on `lo-mgmt`. The API service
+   accepts only `10.251.0.1`, with its firewall accept placed at the top of
+   the filter table.
 3. On `/complete`, sets `routers.management_tunnel='sstp'`.
 
-With the flag off, token creation and the script are unchanged.
+With the flag off, token creation and the script are byte-for-byte unchanged.

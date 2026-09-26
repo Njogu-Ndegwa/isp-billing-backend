@@ -1,10 +1,10 @@
-"""SSTP management tunnel for new RouterOS 6 routers (flag SSTP_PROVISIONING_ENABLED).
+"""SSTP management tunnel for new RouterOS 6 routers (PROVISION_MGMT_TO_HETZNER).
 
-The flag must deploy dark: off (or on, for a token created without SSTP
-credentials) the script and token creation behave exactly as before. On, a v6
-token gets an SSTP login on the Hetzner accel-ppp server (10.251.X.Y for its
-10.0.X.Y), an SSTP block in place of the standby Hetzner L2TP, and the router
-is flagged management_tunnel='sstp' when it completes.
+With the flag on, a v6 (vpn_type="l2tp") token gets an SSTP login on the
+Hetzner accel-ppp server (10.251.X.Y for its 10.0.X.Y) and a script whose ONLY
+management tunnel is sstp-hetzner -- no l2tp-aws to AWS, no standby L2TP. The
+router is flagged management_tunnel='sstp' when it completes. With the flag
+off nothing changes (tests/test_provisioning_hetzner.py pins the bytes).
 """
 
 import importlib.util
@@ -26,7 +26,23 @@ CA_PEM = (
 PROBE = ':local bwHsProbe [:parse "/ip hotspot profile find"]'
 
 
-def _l2tp_token(sstp: bool) -> ProvisioningToken:
+def _sstp_token() -> ProvisioningToken:
+    return ProvisioningToken(
+        token="abc123",
+        router_name="Test Router",
+        identity="Router-0001",
+        vpn_type="l2tp",
+        wireguard_ip="10.0.100.77",
+        router_admin_password="ApiPassword123",
+        server_public_ip="91.98.238.12",
+        sstp_username="sstp-Router-0001",
+        sstp_password="SstpPassword1234567890ab",
+        management_tunnel="sstp",
+        payment_methods=["mpesa", "voucher"],
+    )
+
+
+def _legacy_l2tp_token() -> ProvisioningToken:
     return ProvisioningToken(
         token="abc123",
         router_name="Test Router",
@@ -37,8 +53,6 @@ def _l2tp_token(sstp: bool) -> ProvisioningToken:
         server_public_ip="203.0.113.10",
         l2tp_username="l2tp-Router-0001",
         l2tp_password="L2tpPassword123",
-        sstp_username="sstp-Router-0001" if sstp else None,
-        sstp_password="SstpPassword1234567890ab" if sstp else None,
         payment_methods=["mpesa", "voucher"],
     )
 
@@ -52,15 +66,20 @@ def _settings(monkeypatch, *, enabled: bool, ca: str = CA_PEM):
     monkeypatch.setattr(s, "INSURANCE_WG_MANAGER_SECRET", "insurance-secret")
     monkeypatch.setattr(s, "INSURANCE_SERVER_PUBLIC_IP", "91.98.238.12")
     monkeypatch.setattr(s, "INSURANCE_SERVER_WG_PUBLIC_KEY", "insurance-server-public")
-    monkeypatch.setattr(s, "INSURANCE_SERVER_VPN_IP", "10.250.0.1")
-    monkeypatch.setattr(s, "INSURANCE_WG_SUBNET", "10.250.0.0/16")
+    monkeypatch.setattr(s, "INSURANCE_SERVER_VPN_IP", "10.251.0.1")
+    monkeypatch.setattr(s, "INSURANCE_WG_PORT", 51823)
+    monkeypatch.setattr(s, "INSURANCE_WG_SUBNET", "10.251.0.0/16")
     monkeypatch.setattr(s, "INSURANCE_L2TP_INTERFACE", "l2tp-aws2")
     monkeypatch.setattr(s, "INSURANCE_L2TP_IPSEC_PSK", "insurance-psk")
-    monkeypatch.setattr(s, "SSTP_PROVISIONING_ENABLED", enabled)
+    monkeypatch.setattr(s, "PROVISION_MGMT_TO_HETZNER", enabled)
     monkeypatch.setattr(s, "SSTP_SERVER", "91.98.238.12:4443")
     monkeypatch.setattr(s, "SSTP_SERVER_VPN_IP", "10.251.0.1")
     monkeypatch.setattr(s, "SSTP_SUBNET", "10.251.0.0/16")
     monkeypatch.setattr(s, "ROUTER_MGMT_CA_PEM", ca)
+
+
+def _commands(script: str) -> list:
+    return [l for l in script.splitlines() if l.strip() and not l.strip().startswith("#")]
 
 
 # ---------------------------------------------------------------------------
@@ -69,40 +88,32 @@ def _settings(monkeypatch, *, enabled: bool, ca: str = CA_PEM):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_token_without_sstp_creds_keeps_the_old_l2tp_script(monkeypatch, enabled):
-    # Tokens created before the flag was on (or while it is off) must keep
-    # rendering the standby Hetzner L2TP and nothing SSTP.
+def test_legacy_token_keeps_the_old_l2tp_script_whatever_the_flag(monkeypatch, enabled):
+    # Tokens issued before the flag was on keep rendering AWS + standby L2TP
+    # and nothing SSTP, even after the flag is flipped.
     _settings(monkeypatch, enabled=enabled)
-    script = provisioning.generate_rsc_script(_l2tp_token(sstp=False))
+    script = provisioning.generate_rsc_script(_legacy_l2tp_token())
 
     assert "STEP 3B: BACKUP L2TP/IPsec VPN" in script
     assert "l2tp-client add name=l2tp-aws2" in script
     assert "sstp" not in script.lower()
     assert "lo-mgmt" not in script
-    assert "10.251.0.1" not in script
     assert "# VPN Type: L2TP/IPsec\n" in script
 
 
-def test_sstp_token_script_has_sstp_block_and_keeps_aws_fallback(monkeypatch):
+def test_sstp_token_script_has_only_the_sstp_tunnel(monkeypatch):
     _settings(monkeypatch, enabled=True)
-    script = provisioning.generate_rsc_script(_l2tp_token(sstp=True))
+    script = provisioning.generate_rsc_script(_sstp_token())
+    commands = "\n".join(_commands(script))
 
-    # Primary L2TP to AWS stays as the fallback path.
-    assert "/interface l2tp-client add name=l2tp-aws connect-to=203.0.113.10" in script
-    # The Hetzner standby L2TP would claim the same 10.251.X.Y: dropped.
-    commands = [l for l in script.splitlines() if not l.strip().startswith("#")]
-    assert not any("l2tp-aws2" in l for l in commands)
-    assert "BACKUP L2TP" not in script
-
-    assert "STEP 3B: SSTP MANAGEMENT TUNNEL" in script
-    assert (
-        "/interface sstp-client add name=sstp-hetzner connect-to=91.98.238.12:4443 "
-        "user=sstp-Router-0001 password=SstpPassword1234567890ab profile=default "
-        "add-default-route=no verify-server-certificate=yes "
-        "verify-server-address-from-certificate=yes disabled=no"
-    ) in script
-    # Re-run safe: add falls back to set.
-    assert "/interface sstp-client set [find where name=sstp-hetzner] connect-to=91.98.238.12:4443" in script
+    # ONE management tunnel: no L2TP of any kind, nothing towards AWS.
+    assert "l2tp" not in commands.lower()
+    assert "203.0.113.10" not in script
+    assert "wireguard" not in commands.lower()
+    assert "STEP 3: SSTP MANAGEMENT TUNNEL TO HETZNER (RouterOS v6)" in script
+    assert "# VPN Type: SSTP to Hetzner (sstp-hetzner), only management tunnel" in script
+    assert "# Management IP: 10.0.100.77 (pinned on lo-mgmt)" in script
+    assert "# Tunnel IP: 10.251.100.77" in script
 
     # CA fetched over the v6 bootstrap base URL (HTTP), imported and trusted.
     assert (
@@ -113,34 +124,69 @@ def test_sstp_token_script_has_sstp_block_and_keeps_aws_fallback(monkeypatch):
     assert '/certificate set [find where common-name="Bitwave Router Management CA"] trusted=yes' in script
     assert "/system ntp client set enabled=yes primary-ntp=162.159.200.1" in script
 
-    # Management IP pinned on the loopback, guarded for re-runs.
-    assert "/interface bridge add name=lo-mgmt" in script
-    assert "/ip address add address=10.0.100.77/32 interface=lo-mgmt" in script
-    assert '[/ip address find where address="10.0.100.77/32" and interface=lo-mgmt]' in script
-
     assert "/interface sstp-client find where name=sstp-hetzner running=yes" in script
     assert "Provisioning: SSTP tunnel connected" in script
 
-    # The server reaches SSTP routers from 10.251.0.1: allowed on the API.
-    assert "/ip service set api address=10.0.0.1/32,10.250.0.1/32,10.251.0.1/32" in script
-    assert "src-address=10.251.0.1" in script
-    assert "# VPN Type: SSTP (Hetzner) + L2TP/IPsec fallback" in script
-
-    # Order: AWS L2TP, then SSTP, then the hotspot.
-    assert script.index("STEP 3: L2TP/IPsec VPN") < script.index("STEP 3B: SSTP") < script.index("STEP 4")
+    # Order: SSTP, then the hotspot.
+    assert script.index("STEP 2: LAN") < script.index("STEP 3: SSTP") < script.index("STEP 4")
 
 
-def test_sstp_block_does_not_duplicate_api_source_when_insurance_ip_matches(monkeypatch):
+def test_sstp_connect_to_syntax_per_routeros_version(monkeypatch):
     _settings(monkeypatch, enabled=True)
-    monkeypatch.setattr(provisioning.settings, "INSURANCE_SERVER_VPN_IP", "10.251.0.1")
-    script = provisioning.generate_rsc_script(_l2tp_token(sstp=True))
-    assert "/ip service set api address=10.0.0.1/32,10.251.0.1/32 port=8728" in script
-    assert script.count("src-address=10.251.0.1") == 1
+    assert provisioning.sstp_connect_to("91.98.238.12:4443", 6) == "connect-to=91.98.238.12:4443"
+    assert provisioning.sstp_connect_to("91.98.238.12:4443", 7) == "connect-to=91.98.238.12 port=4443"
+
+    script = provisioning.generate_rsc_script(_sstp_token())
+    creds = (
+        "user=sstp-Router-0001 password=SstpPassword1234567890ab profile=default "
+        "add-default-route=no verify-server-certificate=yes "
+        "verify-server-address-from-certificate=yes disabled=no"
+    )
+    v6_add = f"/interface sstp-client add name=sstp-hetzner connect-to=91.98.238.12:4443 {creds}"
+    v7_add = f"/interface sstp-client add name=sstp-hetzner connect-to=91.98.238.12 port=4443 {creds}"
+    assert v6_add in script and v7_add in script
+    # Re-run safe: add falls back to set, in both forms.
+    assert "/interface sstp-client set [find where name=sstp-hetzner] connect-to=91.98.238.12:4443 " in script
+    assert "/interface sstp-client set [find where name=sstp-hetzner] connect-to=91.98.238.12 port=4443 " in script
+    # The v7 form is chosen by the running version, the v6 form otherwise.
+    branch = ':if ([:pick [/system resource get version] 0 1] = "7") do={'
+    assert branch in script
+    v7_at = script.index(v7_add)
+    assert script.index(branch) < v7_at < script.index("} else={", v7_at) < script.index(v6_add)
+    # Never the broken WinBox form (port typed twice).
+    assert ":44443" not in script and "4443:4443" not in script
+
+
+def test_sstp_script_pins_mgmt_ip_on_loopback(monkeypatch):
+    _settings(monkeypatch, enabled=True)
+    script = provisioning.generate_rsc_script(_sstp_token())
+    assert "/interface bridge add name=lo-mgmt" in script
+    assert "/ip address add address=10.0.100.77/32 interface=lo-mgmt" in script
+    assert '[/ip address find where address="10.0.100.77/32" and interface=lo-mgmt]' in script
+    # The tunnel address itself is not put on the loopback.
+    assert "10.251.100.77/32 interface=lo-mgmt" not in script
+
+
+def test_sstp_script_api_only_from_hetzner_at_top_of_filter(monkeypatch):
+    _settings(monkeypatch, enabled=True)
+    script = provisioning.generate_rsc_script(_sstp_token())
+
+    assert "/ip service set api address=10.251.0.1/32 port=8728 disabled=no" in script
+    assert "10.0.0.1" not in script  # the AWS primary server address
+    api_rule = (
+        "/ip firewall filter add chain=input protocol=tcp dst-port=8728 src-address=10.251.0.1 "
+        'action=accept comment="Allow API from Hetzner management" place-before=$bwFirstRule'
+    )
+    assert api_rule in script
+    assert ":local bwFirstRule [:pick [/ip firewall filter find where dynamic=no] 0]" in script
+    # SSTP is an outbound TCP client: no UDP/tunnel input allow is needed.
+    assert "dst-port=500,4500,1701" not in script
+    assert "Allow WireGuard" not in script
 
 
 def test_sstp_script_obeys_parse_safety_rules(monkeypatch):
     _settings(monkeypatch, enabled=True)
-    script = provisioning.generate_rsc_script(_l2tp_token(sstp=True))
+    script = provisioning.generate_rsc_script(_sstp_token())
 
     assert not any(line.rstrip().endswith("\\") for line in script.splitlines())
     before_probe = script[: script.index(PROBE)]
@@ -153,12 +199,14 @@ def test_sstp_script_obeys_parse_safety_rules(monkeypatch):
         stripped = line.strip()
         if "sstp-client add" in stripped or "sstp-client set" in stripped or "ntp client set" in stripped:
             assert "[:parse \"" in stripped, stripped
+    # Balanced braces: a stray one aborts the whole import.
+    assert script.count("{") == script.count("}")
 
 
 def test_https_legacy_base_url_disables_cert_check_on_ca_fetch(monkeypatch):
     _settings(monkeypatch, enabled=True)
     monkeypatch.setattr(provisioning.settings, "PROVISION_LEGACY_BASE_URL", "https://legacy.example.net")
-    script = provisioning.generate_rsc_script(_l2tp_token(sstp=True))
+    script = provisioning.generate_rsc_script(_sstp_token())
     assert (
         '/tool fetch url="https://legacy.example.net/api/provision/router-mgmt-ca.crt" '
         "dst-path=router-mgmt-ca.crt check-certificate=no"
@@ -227,11 +275,12 @@ async def test_flag_off_l2tp_token_has_no_sstp(db, monkeypatch):
     token = await provisioning.create_provisioning_token(db, user.id, vpn_type="l2tp")
 
     assert token.sstp_username is None and token.sstp_password is None
+    assert token.management_tunnel is None
     assert [c[0] for c in calls] == ["primary-l2tp", "backup-l2tp"]
 
 
 @pytest.mark.asyncio
-async def test_flag_on_l2tp_token_registers_sstp_peer_instead_of_hetzner_l2tp(db, monkeypatch):
+async def test_flag_on_l2tp_token_registers_only_the_sstp_peer(db, monkeypatch):
     _settings(monkeypatch, enabled=True)
     user = await _user(db, 2002)
     calls = []
@@ -239,42 +288,19 @@ async def test_flag_on_l2tp_token_registers_sstp_peer_instead_of_hetzner_l2tp(db
 
     token = await provisioning.create_provisioning_token(db, user.id, vpn_type="l2tp")
 
+    assert token.management_tunnel == "sstp"
     assert token.sstp_username == f"sstp-{token.identity}"
     assert len(token.sstp_password) == 24 and token.sstp_password.isalnum()
+    # 10.0.X.Y DB address from the usual v6 range; tunnel address is its twin.
+    assert token.wireguard_ip.startswith("10.0.1")
     expected_ip = "10.251." + ".".join(token.wireguard_ip.split(".")[2:])
-    assert ("sstp", token.sstp_username, token.sstp_password, expected_ip) in calls
-    assert not any(c[0] == "backup-l2tp" for c in calls)
-    assert ("primary-l2tp", token.l2tp_username, token.wireguard_ip) in calls
+    # ONLY the SSTP login: no AWS L2TP, no standby L2TP.
+    assert calls == [("sstp", token.sstp_username, token.sstp_password, expected_ip)]
+    assert token.l2tp_username is None and token.l2tp_password is None
+    assert token.server_public_ip == "91.98.238.12"
 
     script = provisioning.generate_rsc_script(token)
     assert f"user={token.sstp_username} password={token.sstp_password}" in script
-
-
-@pytest.mark.asyncio
-async def test_flag_on_wireguard_token_is_untouched(db, monkeypatch):
-    from app.services import insurance_wireguard
-
-    _settings(monkeypatch, enabled=True)
-    user = await _user(db, 2003)
-
-    async def ok(*_a, **_k):
-        return {"status": "ok"}
-
-    async def server_key():
-        return "server-public"
-
-    monkeypatch.setattr(provisioning, "register_wireguard_peer", ok)
-    monkeypatch.setattr(provisioning, "get_server_wg_public_key", server_key)
-    monkeypatch.setattr(insurance_wireguard, "register_insurance_peer", ok)
-
-    async def must_not_run(*_a, **_k):
-        pytest.fail("SSTP peer registered for a WireGuard token")
-
-    monkeypatch.setattr(provisioning, "register_sstp_peer", must_not_run)
-
-    token = await provisioning.create_provisioning_token(db, user.id, vpn_type="wireguard")
-    assert token.sstp_username is None
-    assert "sstp" not in provisioning.generate_rsc_script(token).lower()
 
 
 @pytest.mark.asyncio
@@ -294,11 +320,11 @@ async def test_sstp_peer_rolled_back_when_token_save_fails(db, monkeypatch):
 
     sstp_user = next(c[1] for c in calls if c[0] == "sstp")
     assert ("remove-sstp", sstp_user) in calls
-    assert any(c[0] == "remove-primary-l2tp" for c in calls)
+    assert not any(c[0].endswith("l2tp") for c in calls)
 
 
 @pytest.mark.asyncio
-async def test_sstp_registration_failure_rolls_back_primary_only(db, monkeypatch):
+async def test_sstp_registration_failure_leaves_nothing_to_roll_back(db, monkeypatch):
     _settings(monkeypatch, enabled=True)
     user = await _user(db, 2005)
     calls = []
@@ -307,8 +333,7 @@ async def test_sstp_registration_failure_rolls_back_primary_only(db, monkeypatch
     with pytest.raises(RuntimeError, match="manager down"):
         await provisioning.create_provisioning_token(db, user.id, vpn_type="l2tp")
 
-    assert any(c[0] == "remove-primary-l2tp" for c in calls)
-    assert not any(c[0] == "remove-sstp" for c in calls)
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -333,7 +358,7 @@ async def test_flag_on_without_ca_refuses_before_any_manager_call(db, monkeypatc
 async def test_complete_provisioning_flags_sstp_routers(db, monkeypatch, sstp):
     _settings(monkeypatch, enabled=True)
     user = await _user(db, 2010 + int(sstp))
-    token = _l2tp_token(sstp=sstp)
+    token = _sstp_token() if sstp else _legacy_l2tp_token()
     token.user_id = user.id
     token.status = ProvisioningTokenStatus.PENDING
     db.add(token)

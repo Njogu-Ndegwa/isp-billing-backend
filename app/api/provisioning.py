@@ -114,11 +114,16 @@ async def create_provision_token(
             "then tap the physical reset button on the router (quick tap, do NOT hold)."
         )
 
+    if token_obj.management_tunnel == "sstp":
+        # v6 tokens issued under PROVISION_MGMT_TO_HETZNER use SSTP, not L2TP.
+        note = note.replace("(L2TP/IPsec VPN)", "(SSTP management tunnel)")
+
     return {
         "token": token_obj.token,
         "router_name": token_obj.router_name,
         "identity": token_obj.identity,
         "vpn_type": token_obj.vpn_type,
+        "management_tunnel": token_obj.management_tunnel,
         "is_routerboard": token_obj.is_routerboard,
         "vpn_ip": token_obj.wireguard_ip,
         "backup_vpn_ip": derive_insurance_ip(token_obj.wireguard_ip),
@@ -150,6 +155,7 @@ async def list_provision_tokens(
             "router_name": t.router_name,
             "identity": t.identity,
             "vpn_type": t.vpn_type,
+            "management_tunnel": t.management_tunnel,
             "is_routerboard": t.is_routerboard,
             "vpn_ip": t.wireguard_ip,
             "backup_vpn_ip": derive_insurance_ip(t.wireguard_ip),
@@ -277,6 +283,7 @@ async def complete_provision(
         "vpn_ip": router_obj.ip_address,
         "backup_vpn_ip": derive_insurance_ip(router_obj.ip_address),
         "vpn_type": token_obj.vpn_type,
+        "management_tunnel": router_obj.management_tunnel,
         "message": f"Router '{router_obj.name}' registered successfully",
     }
 
