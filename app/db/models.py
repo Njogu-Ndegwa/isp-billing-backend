@@ -994,6 +994,11 @@ class ProvisioningToken(Base):
     wg_public_key = Column(String, nullable=True)
     l2tp_username = Column(String, nullable=True)
     l2tp_password = Column(String, nullable=True)
+    # Set only for RouterOS 6 tokens created while SSTP_PROVISIONING_ENABLED:
+    # the router then gets an SSTP management tunnel to Hetzner (login
+    # sstp-<identity>). NULL = no SSTP block in the script.
+    sstp_username = Column(String, nullable=True)
+    sstp_password = Column(String, nullable=True)
     server_wg_pubkey = Column(String, nullable=True)
     server_public_ip = Column(String(45), nullable=False)
     payment_methods = Column(JSON, nullable=False, server_default='["mpesa", "voucher"]')
