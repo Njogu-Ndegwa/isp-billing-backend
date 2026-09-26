@@ -476,3 +476,40 @@ async def test_safety_net_uses_pushed_bindings_without_logging_in(db, session_fa
         await mb._cleanup_bypassing_for_all_routers(s)
 
     assert removed == [{OLD_MAC}]    # only the orphan bypass binding; the live customer and the block stay
+
+
+def test_ports_card_is_served_from_the_push_with_the_live_read_shape(monkeypatch):
+    from app.api import router_operations as ro
+
+    def boom(*a, **k):
+        raise AssertionError("must not log in to the router")
+
+    monkeypatch.setattr(ro, "MikroTikAPI", boom)
+    now = datetime.utcnow()
+    realtime_state.record_push(
+        55, now=now, interval_seconds=60, hosts=[], queues=[], live_customers={},
+        metrics={"cpu_load": 7, "free_memory": 900, "total_memory": 1024, "version": "7.14", "board": "RB4011iGS+"},
+        ports=[{"name": "ether2", "running": True, "disabled": False, "rx_bytes": 10, "tx_bytes": 20,
+                "link_downs": 1, "rx_packets": 5, "tx_packets": 6, "rx_errors": 0, "tx_errors": 0, "last_link_up": "sep/25"},
+               {"name": "ether3", "running": False, "disabled": False, "rx_bytes": 0, "tx_bytes": 0, "link_downs": 0}],
+        bridge_hosts=[{"mac": MAC, "port": "ether2"}, {"mac": OLD_MAC, "port": "ether2"}],
+        leases=[{"mac": OLD_MAC, "ip": "192.168.88.77", "host": "Galaxy-A14", "status": "bound"}],
+        bridge_ports=[{"interface": "ether2", "bridge": "bridge"}],
+        hosts_raw=[{"mac": MAC, "ip": "192.168.88.50", "bytes_in": 1, "bytes_out": 2, "bypassed": True, "authorized": False}],
+        ppp_raw=[],
+    )
+    customers = {MAC: {"id": 9, "name": "Guest 9", "status": "active", "pppoe": False}}
+    result = ro._port_analytics_from_push({"id": 55, "name": "R", "identity": "Router-0721", "ip": "10.0.0.9"},
+                                          customers, {"ether2": {"total": 100.0, "today": 0, "this_week": 0,
+                                                                 "this_month": 100.0, "paying_customers": 1}})
+    assert result["source"] == "push" and result["success"]
+    ether2 = next(p for p in result["ports"] if p["port"] == "ether2")
+    assert ether2["link"]["up"] and ether2["bridge"] == "bridge" and ether2["link"]["link_downs"] == 1
+    assert ether2["counts"]["learned_macs"] == 2 and ether2["counts"]["known_customers_connected"] == 1
+    names = {d["mac"]: d["name"] for d in ether2["downstream_devices_sample"]}
+    assert names[MAC] == "Guest 9" and names[OLD_MAC] == "Galaxy-A14"
+    assert ether2["revenue"]["this_month"] == 100.0
+    assert result["system"]["board_name"] == "RB4011iGS+"
+    # No fresh push: the endpoint falls back to the live read.
+    realtime_state.reset_realtime_state()
+    assert ro._port_analytics_from_push({"id": 55, "name": "R", "identity": "", "ip": ""}, {}, {}) is None

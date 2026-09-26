@@ -163,6 +163,23 @@ class PortIn(BaseModel):
     rx_bytes: int = Field(default=0, ge=0)
     tx_bytes: int = Field(default=0, ge=0)
     link_downs: int = Field(default=0, ge=0)
+    rx_packets: int = Field(default=0, ge=0)
+    tx_packets: int = Field(default=0, ge=0)
+    rx_errors: int = Field(default=0, ge=0)
+    tx_errors: int = Field(default=0, ge=0)
+    last_link_up: str = Field(default="", max_length=40)
+
+
+class LeaseIn(BaseModel):
+    mac: str = Field(default="", max_length=32)
+    ip: str = Field(default="", max_length=64)
+    host: str = Field(default="", max_length=128)
+    status: str = Field(default="", max_length=32)
+
+
+class BridgePortIn(BaseModel):
+    interface: str = Field(default="", max_length=64)
+    bridge: str = Field(default="", max_length=64)
 
 
 class BridgeHostIn(BaseModel):
@@ -211,6 +228,8 @@ class UsagePushIn(BaseModel):
     ports: Optional[list[PortIn]] = None
     bridge_hosts: Optional[list[BridgeHostIn]] = None
     bindings: Optional[list[BindingIn]] = None
+    leases: Optional[list[LeaseIn]] = None
+    bridge_ports: Optional[list[BridgePortIn]] = None
     router: Optional[RouterMetricsIn] = None
 
 
@@ -240,6 +259,8 @@ async def receive_usage_push(
         or len(payload.ports or []) > MAX_HOSTS_PER_BATCH
         or len(payload.bridge_hosts or []) > MAX_HOSTS_PER_BATCH
         or len(payload.bindings or []) > MAX_HOSTS_PER_BATCH
+        or len(payload.leases or []) > MAX_HOSTS_PER_BATCH
+        or len(payload.bridge_ports or []) > MAX_HOSTS_PER_BATCH
     ):
         raise HTTPException(
             status_code=413,
@@ -435,6 +456,10 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
         ports=[p.model_dump() for p in payload.ports] if payload.ports is not None else None,
         bridge_hosts=[b.model_dump() for b in payload.bridge_hosts] if payload.bridge_hosts is not None else None,
         bindings=[b.model_dump() for b in payload.bindings] if payload.bindings is not None else None,
+        leases=[x.model_dump() for x in payload.leases] if payload.leases is not None else None,
+        bridge_ports=[x.model_dump() for x in payload.bridge_ports] if payload.bridge_ports is not None else None,
+        hosts_raw=[h.model_dump() for h in payload.hosts],
+        ppp_raw=[p.model_dump() for p in payload.ppp],
     )
     running = (
         state.last_repair_result is not None
