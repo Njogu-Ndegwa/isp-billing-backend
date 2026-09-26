@@ -302,6 +302,7 @@ async def admin_ops_health(
     now = datetime.utcnow()
     latest = await ops_health.load_latest_snapshot()
     points = await ops_health.load_history_points(now, 24)
+    router_names = await ops_health.load_router_names(ops_health.router_ids_in_points(points))
     if latest is None:
         return {
             "generated_at": None,
@@ -309,7 +310,7 @@ async def admin_ops_health(
             "overall_status": "unknown",
             "alerts": [],
             "sections": {},
-            "history": {"points": points},
+            "history": {"points": points, "router_names": router_names},
         }
     age = max(0, int((now - latest["generated_at"]).total_seconds()))
     return {
@@ -318,7 +319,7 @@ async def admin_ops_health(
         "overall_status": latest["overall_status"],
         "alerts": latest["alerts"],
         "sections": latest["sections"],
-        "history": {"points": points},
+        "history": {"points": points, "router_names": router_names},
     }
 
 
@@ -367,7 +368,9 @@ async def admin_ops_health_history(
 ):
     await _require_admin(token, db)
     await db.commit()
-    return {"points": await ops_health.load_history_points(datetime.utcnow(), hours)}
+    points = await ops_health.load_history_points(datetime.utcnow(), hours)
+    return {"points": points,
+            "router_names": await ops_health.load_router_names(ops_health.router_ids_in_points(points))}
 
 
 # ---------------------------------------------------------------------------

@@ -70,6 +70,8 @@ DROP_WINDOW = timedelta(minutes=10)
 ALERT_DEDUPE = timedelta(minutes=30)
 HISTORY_BUCKET = timedelta(minutes=5)
 HISTORY_MAX_HOURS = 168
+BREAKDOWN_TOP_N = 10        # routers kept per snapshot for the per-router graphs
+OFFLINE_IDS_CAP = 40
 EXPIRY_QUARANTINE_AFTER = timedelta(days=3)   # same rule as mikrotik_background
 DEACTIVATION_ACTIONS = ("hotspot_deactivation", "pppoe_deactivation")
 SAFETY_NET_ACTION = "safety_net_binding_removed"
@@ -626,6 +628,7 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
     total = hot = quarantined = suspended_owner = 0
     oldest_hot: Optional[datetime] = None
     hot_by_tunnel: dict[str, dict] = {}
+    hot_routers: list[tuple[int, int]] = []
     for router_id, n, oldest in group_rows:
         n = int(n)
         total += n
@@ -638,6 +641,7 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
             quarantined += n
             continue
         hot += n
+        hot_routers.append((router_id, n))
         entry = hot_by_tunnel.setdefault(tunnel_of.get(router_id, "other"),
                                          {"routers": 0, "customers": 0})
         entry["routers"] += 1
@@ -679,6 +683,9 @@ async def build_expiry_section(now: datetime, baselines: Optional[dict] = None) 
         "expired_active_quarantined": quarantined,
         "expired_active_suspended_owner": suspended_owner,
         "hot_by_tunnel": hot_by_tunnel,
+        # Who holds the backlog: feeds the per-router expiry graph.
+        "hot_routers": [{"router_id": rid, "customers": n}
+                        for rid, n in sorted(hot_routers, key=lambda x: -x[1])[:BREAKDOWN_TOP_N]],
         "oldest_hot_expired_minutes": (
             round(_seconds(now, oldest_hot) / 60, 1) if oldest_hot else None
         ),
@@ -722,7 +729,8 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
     async with database.async_session() as db:
         router_rows = (await db.execute(
             select(Router.last_status, Router.last_checked_at, Router.ip_address,
-                   Router.management_tunnel, Router.last_online_at, User.subscription_status)
+                   Router.management_tunnel, Router.last_online_at, User.subscription_status,
+                   Router.id)
             .outerjoin(User, User.id == Router.user_id)
         )).all()
         check_rows = (await db.execute(
@@ -735,9 +743,10 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
         await db.commit()
 
     online = offline = stale = silent_24h = 0
+    offline_ids: list[int] = []
     by_tunnel: dict[str, dict] = {}
     stale_after = timedelta(seconds=ROUTER_STATUS_STALE_AFTER_SECONDS)
-    for last_status, last_checked, ip, management_tunnel, last_online, owner_status in router_rows:
+    for last_status, last_checked, ip, management_tunnel, last_online, owner_status, router_id in router_rows:
         # "Stale" only means nobody checked in 10 minutes; a quiet healthy router
         # lands there too. Not heard from for a day is what "probably down" means.
         # Suspended resellers' routers are cut off on purpose, so not counted.
@@ -755,6 +764,7 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
         else:
             offline += 1
             bucket["offline"] += 1
+            offline_ids.append(router_id)
     drops = count_recent_drops(check_rows, now)
     return {
         "status": "unknown",
@@ -762,6 +772,7 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
                    "total": len(router_rows), "silent_24h": silent_24h},
         "by_tunnel": {t: by_tunnel[t] for t in TUNNEL_TYPES if t in by_tunnel},
         "recent_drops_10m": drops,
+        "offline_router_ids": sorted(offline_ids)[:OFFLINE_IDS_CAP],
         "platform_event": drops >= rules.TUNNELS_PLATFORM_EVENT_WARN,
         "control_path": read_route_state_file(getattr(settings, "OPS_ROUTE_STATE_FILE", "")),
     }
@@ -915,6 +926,12 @@ def metrics_from_sections(sections: dict) -> dict:
         "problem_routers_attention": ((sections.get("problem_routers") or {}).get("counts") or {}).get("attention"),
         "paid_waiting_now": (sections.get("problem_routers") or {}).get("waiting_now"),
         "safety_net_removals": sn.get("removals_last_hour", 0),
+        # Per-router breakdowns for the stacked graphs ({router_id: count}).
+        "retry_by_router": {str(r["router_id"]): r["pending"]
+                            for r in (prov.get("top_routers") or [])[:BREAKDOWN_TOP_N] if r.get("pending")},
+        "expiry_hot_by_router": {str(r["router_id"]): r["customers"]
+                                 for r in (exp.get("hot_routers") or [])[:BREAKDOWN_TOP_N]},
+        "offline_router_ids": list(tun.get("offline_router_ids") or []),
         "active_writers": cp.get("active_writers", 0),
     }
 
@@ -1236,6 +1253,30 @@ async def load_history_points(now: datetime, hours: int) -> list[dict]:
         )).all()
         await db.commit()
     return sample_history_points([(g, m) for g, m in rows])
+
+
+BREAKDOWN_KEYS = ("retry_by_router", "expiry_hot_by_router")
+
+
+def router_ids_in_points(points: list[dict]) -> set[int]:
+    ids: set[int] = set()
+    for p in points:
+        for key in BREAKDOWN_KEYS:
+            ids.update(int(k) for k in (p.get(key) or {}) if str(k).isdigit())
+        ids.update(int(i) for i in (p.get("offline_router_ids") or []) if str(i).isdigit())
+    return ids
+
+
+async def load_router_names(ids: set[int]) -> dict[str, str]:
+    """{router_id: name} for the routers the per-router graphs mention."""
+    if not ids:
+        return {}
+    async with database.async_session() as db:
+        rows = (await db.execute(
+            select(Router.id, Router.name).where(Router.id.in_(sorted(ids)))
+        )).all()
+        await db.commit()
+    return {str(rid): name for rid, name in rows}
 
 
 async def load_latest_snapshot() -> Optional[dict]:
