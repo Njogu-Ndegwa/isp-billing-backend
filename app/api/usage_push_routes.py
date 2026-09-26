@@ -334,6 +334,10 @@ async def receive_usage_push(
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         _last_push_at[identity] = now
+        # Sending the real-time report (v3+) is what enrols a router; see
+        # realtime_state.REALTIME_MEMBERSHIP_FRESH_SECONDS.
+        if payload.v >= 3:
+            realtime_state.note_realtime_report(router_row.id)
         pilot = is_pilot_router(router_row.id)
         if pilot:
             _pilot_identities.add(identity)
@@ -486,11 +490,25 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
         _spawn(_repair(router_id))
 
 
+# Queue repairs are RouterOS work; after a deploy every real-time router with a
+# queue problem asks for one on its first report. Run a few at a time.
+_REPAIR_CONCURRENCY = 3
+_repair_slots: Optional[asyncio.Semaphore] = None
+
+
+def _repair_semaphore() -> asyncio.Semaphore:
+    global _repair_slots
+    if _repair_slots is None:
+        _repair_slots = asyncio.Semaphore(_REPAIR_CONCURRENCY)
+    return _repair_slots
+
+
 async def _repair(router_id: int) -> None:
     from app.services.mikrotik_background import repair_router_queues_now
 
     try:
-        details = await repair_router_queues_now(router_id)
+        async with _repair_semaphore():
+            details = await repair_router_queues_now(router_id)
         logger.info("[USAGE-PUSH] Queue repair for router %s: %s", router_id, details)
         realtime_state.note_repair(router_id, datetime.utcnow(), {"status": "done", **(details or {})})
     except Exception as exc:
