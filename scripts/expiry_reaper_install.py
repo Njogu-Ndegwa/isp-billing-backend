@@ -12,7 +12,7 @@ Without APPLY=1 it only reports what it would change. With APPLY=1, per router:
    has not confirmed, and a no-RTC board needs NTP to get one after a reboot).
 2. EXP:<minute> added to the ip-binding comment of every customer who is
    ACTIVE with a future expiry (new payments get it from provisioning).
-3. The reaper script + 1-minute scheduler, then one run.
+3. The reaper script + 1-minute scheduler (first run by the scheduler).
 4. routers.expiry_reaper_enabled = true (the server cleanup then waits 3 min
    past expiry on this router before acting as backstop).
 
@@ -163,15 +163,14 @@ def install(r, paid):
         if added.get("error"):
             print(f"   scheduler add FAILED: {added['error']}")
             return False
-        sid = [s for s in api.send_command("/system/script/print").get("data") or []
-               if s.get("name") == SCRIPT_NAME][0][".id"]
-        t0 = time.time()
-        run = api.send_command("/system/script/run", {".id": sid})
-        took = time.time() - t0
+        # No immediate run: a manual run plus the scheduler's first run seconds
+        # later trips the endpoint's per-router rate limit (5-min back-off, seen
+        # on the first installs). Wait for the scheduled run and read its state.
+        time.sleep(75)
         env = {e.get("name"): e.get("value") for e in api.send_command("/system/script/environment/print").get("data") or []
                if str(e.get("name", "")).startswith("bwExp")}
-        print(f"   installed; first run {took:.1f}s {run.get('error') or ''}")
-        print(f"   state: {env}")
+        print("   installed; after first scheduled run: "
+              f"clock_ok={env.get('bwExpClockOk')} beat={env.get('bwExpBeat')} retry_at={env.get('bwExpRetryAt')}")
         return True
     finally:
         api.disconnect()
