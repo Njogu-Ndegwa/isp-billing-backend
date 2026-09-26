@@ -459,7 +459,7 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
 :log info "usage-push v2: installed for __IDENT__"
 '''
 
-_WAN_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_WAN_RE = re.compile(r"^[A-Za-z0-9._\[\]-]{1,32}$")  # "Ether1[WAN]" exists in the fleet
 
 
 def render_realtime_push_script(

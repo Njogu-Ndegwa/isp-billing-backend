@@ -596,6 +596,12 @@ def test_smallest_boards_can_send_the_long_lists_less_often():
                                          lists_every=10, wan_interface="pppoe-out1")
     assert "($bwPushN % 10) = 1" in script
     assert '[find name="pppoe-out1"]' in script
+    renamed = render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/x",
+                                          wan_interface="Ether1[WAN]")   # router 349
+    assert '[find name="Ether1[WAN]"]' in renamed
+    with pytest.raises(ValueError):
+        render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/x",
+                                    wan_interface='ether1"] ; /system reset')
     with pytest.raises(ValueError):
         render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/x", lists_every=40)
 
