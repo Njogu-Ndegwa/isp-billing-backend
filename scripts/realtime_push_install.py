@@ -10,7 +10,7 @@ Without APPLY=1 it only reports what it would do.
 Transport per router: if the router's route to the server's tunnel address
 (10.251.0.1) goes through an ENCRYPTED tunnel — WireGuard, L2TP with IPsec, or
 SSTP — the report is posted as plain HTTP inside that tunnel
-(settings.REALTIME_TUNNEL_PUSH_URL). No TLS on the router: on a hAP lite an
+(settings.REALTIME_TUNNEL_PUSH_URL, port 8088). No TLS on the router: on a hAP lite an
 HTTPS report cost ~5-7 s at 100% CPU, a tunnel HTTP request ~1-2 s. Otherwise
 it falls back to the public HTTPS endpoint. While the tunnel is down no live
 data arrives; usage is cumulative, so the next report catches up.
