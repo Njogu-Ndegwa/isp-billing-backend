@@ -629,6 +629,8 @@
   "server_public_ip",
   "server_wg_pubkey",
   "ssid",
+  "sstp_password",
+  "sstp_username",
   "status",
   "token",
   "user_id",

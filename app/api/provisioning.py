@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
@@ -17,6 +17,7 @@ from app.services.provisioning import (
     complete_provisioning,
     is_token_expired,
     derive_insurance_ip,
+    router_mgmt_ca_pem,
 )
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,25 @@ async def list_provision_tokens(
 
 
 # ── Public endpoints (called by the MikroTik during provisioning) ────────
+
+
+# Declared before /api/provision/{provision_token} so the literal path wins.
+@router.get("/api/provision/router-mgmt-ca.crt")
+async def serve_router_mgmt_ca():
+    """Public CA certificate that signed the SSTP management server's cert.
+
+    RouterOS 6 routers fetch and trust it during provisioning so the SSTP
+    client can run with verify-server-certificate=yes. It is a public
+    certificate, not a secret; 404 until ROUTER_MGMT_CA_PEM is configured.
+    """
+    pem = router_mgmt_ca_pem()
+    if not pem:
+        raise HTTPException(status_code=404, detail="Router management CA is not configured")
+    return Response(
+        content=pem,
+        media_type="application/x-pem-file",
+        headers={"Content-Disposition": 'attachment; filename="router-mgmt-ca.crt"'},
+    )
 
 
 @router.get("/api/provision/{provision_token}", response_class=PlainTextResponse)
