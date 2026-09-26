@@ -90,6 +90,7 @@ from app.api.lead_routes import router as lead_router
 from app.api.usage_routes import router as usage_router
 from app.api.usage_push_routes import router as usage_push_router
 from app.api.router_expiry_routes import router as router_expiry_router
+from app.api.router_checkin_routes import router as router_checkin_router
 from app.api.router_agent_routes import router as router_agent_router
 from app.api.access_credential_routes import router as access_credential_router
 from app.api.shop_routes import router as shop_router
@@ -138,6 +139,7 @@ app.include_router(lead_router)
 app.include_router(usage_router)
 app.include_router(usage_push_router)
 app.include_router(router_expiry_router)
+app.include_router(router_checkin_router)
 app.include_router(router_agent_router)
 app.include_router(access_credential_router)
 app.include_router(shop_router)

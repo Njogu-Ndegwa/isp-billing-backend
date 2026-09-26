@@ -179,6 +179,12 @@ async def _resolve_router(
     now: datetime,
 ) -> dict[int, str]:
     """Router I/O with no DB session open; returns payment_id -> port_name."""
+    from app.services.realtime_state import pushed_bridge_host_map
+
+    reported = pushed_bridge_host_map(router_id, now)
+    if reported is not None:
+        # The router reports which MAC is behind which port (v3 push).
+        return {p.payment_id: reported[p.mac] for p in payments if p.mac in reported}
     async with semaphore:
         result = await asyncio.to_thread(_fetch_mac_port_map_sync, info)
     if result.get("error"):

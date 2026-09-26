@@ -363,3 +363,116 @@ async def test_tunnel_reports_skip_the_https_override_but_keep_cpu_back_off(db, 
     busy = await client.post("/api/router/usage-push", json=body,
                              headers={**_auth(), "X-Bitwave-Push-Channel": "tunnel"})
     assert busy.json()["next_push_seconds"] == 120
+
+
+@pytest.mark.asyncio
+async def test_any_router_pushing_metrics_is_marked_so_pollers_stand_down(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "")  # not a pilot: v1 with metrics
+    assert not realtime_state.reports_metrics(router.id)
+    body = _push(1, 1, 1, 1)
+    body.pop("hosts")
+    await client.post("/api/router/usage-push", json=body, headers=_auth())
+    assert realtime_state.reports_metrics(router.id)
+    later = datetime.utcnow() + timedelta(seconds=realtime_state.METRICS_REPORT_FRESH_SECONDS + 5)
+    assert not realtime_state.reports_metrics(router.id, later)   # push stopped: poller resumes
+
+
+@pytest.mark.asyncio
+async def test_retention_still_prunes_when_every_router_pushes(db, session_factory, monkeypatch):
+    from app.db.models import BandwidthSnapshot
+    from app.services import mikrotik_background
+
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller, identity="Router-0999")
+    db.add(BandwidthSnapshot(router_id=router.id, recorded_at=datetime.utcnow() - timedelta(days=45),
+                             interface_rx_bytes=0, interface_tx_bytes=0))
+    await db.commit()
+    realtime_state.note_metrics_report(router.id)          # the only router pushes
+    monkeypatch.setattr(mikrotik_background, "async_session", session_factory, raising=False)
+    monkeypatch.setattr(mikrotik_background, "_background_db_pool_is_busy", lambda *_: False, raising=False)
+
+    await mikrotik_background.collect_bandwidth_snapshot()
+
+    async with session_factory() as s:
+        left = (await s.execute(select(BandwidthSnapshot).where(BandwidthSnapshot.router_id == router.id))).scalars().all()
+    assert left == []
+
+
+# ------------------------------------------------------------------ v3 lists
+
+@pytest.mark.asyncio
+async def test_v3_ports_every_report_long_lists_kept_between_reports(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", str(router.id))
+    monkeypatch.setattr(routes, "_repair", lambda router_id: _noop())
+    full = _push(1, 1, 0, 0)
+    full["ports"] = [{"name": "ether2", "running": True, "disabled": False, "rx_bytes": 1000, "tx_bytes": 2000, "link_downs": 3}]
+    full["bridge_hosts"] = [{"mac": MAC.lower(), "port": "ether2"}]
+    full["bindings"] = [{"mac": MAC, "type": "bypassed", "disabled": False}, {"mac": OLD_MAC, "type": "bypassed", "disabled": False}]
+    assert (await client.post("/api/router/usage-push", json=full, headers=_auth())).status_code == 200
+
+    light = _push(2, 2, 0, 0)
+    light["ports"] = [{"name": "ether2", "running": True, "disabled": False, "rx_bytes": 126000, "tx_bytes": 2000, "link_downs": 3}]
+    assert (await client.post("/api/router/usage-push", json=light, headers=_auth())).status_code == 200
+
+    state = realtime_state.get_router_live(router.id)
+    assert state.ports[0]["rx_bps"] and state.ports[0]["rx_bps"] > 0
+    assert realtime_state.pushed_bridge_host_map(router.id) == {MAC: "ether2"}   # kept from the full report
+    assert len(realtime_state.pushed_bindings(router.id)) == 2
+    stale = datetime.utcnow() + timedelta(seconds=realtime_state.PUSHED_LIST_MAX_AGE_SECONDS + 5)
+    assert realtime_state.pushed_bindings(router.id, stale) is None
+
+
+@pytest.mark.asyncio
+async def test_port_attribution_uses_the_pushed_map_without_logging_in(monkeypatch):
+    from app.services import payment_port_attribution as ppa
+
+    now = datetime(2026, 9, 25, 20, 0, 0)
+    realtime_state.record_push(77, now=now, interval_seconds=60, hosts=[], queues=[], live_customers={},
+                               bridge_hosts=[{"mac": MAC, "port": "ether3"}])
+
+    def boom(*a, **k):
+        raise AssertionError("must not log in to the router")
+
+    monkeypatch.setattr(ppa, "_fetch_mac_port_map_sync", boom)
+    payments = [ppa.PendingPayment(501, MAC, 77), ppa.PendingPayment(502, OLD_MAC, 77)]
+    import asyncio
+    stamped = await ppa._resolve_router(77, {}, payments, asyncio.Semaphore(1), now)
+    assert stamped == {501: "ether3"}
+
+
+def test_realtime_script_v3_reports_ports_and_long_lists_every_fifth_run():
+    script = render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/api/router/usage-push")
+    assert '\\"v\\":3' in script
+    assert '/interface find where (type="ether" or type="wlan" or type="wifi")' in script
+    assert "($bwPushN % 5) = 1" in script
+    assert "/interface bridge host find where !local" in script and "/ip hotspot ip-binding find" in script
+    assert all(ord(c) < 128 for c in script)
+
+
+@pytest.mark.asyncio
+async def test_safety_net_uses_pushed_bindings_without_logging_in(db, session_factory, monkeypatch):
+    from app.services import mikrotik_background as mb
+
+    router, customer = await _setup(db)      # MAC is a live customer; OLD_MAC is nobody
+    realtime_state.record_push(router.id, now=datetime.utcnow(), interval_seconds=60, hosts=[], queues=[],
+                               live_customers={}, bindings=[
+                                   {"mac": MAC, "type": "bypassed", "disabled": False},
+                                   {"mac": OLD_MAC, "type": "bypassed", "disabled": False},
+                                   {"mac": "AA:BB:CC:77:77:77", "type": "blocked", "disabled": False},
+                               ])
+
+    def boom(*a, **k):
+        raise AssertionError("must not log in to read bindings")
+
+    removed = []
+    monkeypatch.setattr(mb, "_find_router_binding_cleanup_candidates_sync", boom)
+    monkeypatch.setattr(mb, "_remove_router_bindings_sync", lambda ri, macs: removed.append(set(macs)) or len(macs))
+    monkeypatch.setattr(mb, "async_session", session_factory, raising=False)
+    monkeypatch.setattr(mb, "AsyncSessionLocal", session_factory, raising=False)
+
+    async with session_factory() as s:
+        await mb._cleanup_bypassing_for_all_routers(s)
+
+    assert removed == [{OLD_MAC}]    # only the orphan bypass binding; the live customer and the block stay

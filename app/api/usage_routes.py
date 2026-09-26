@@ -367,6 +367,16 @@ class LiveDeviceOut(BaseModel):
     max_limit: Optional[str]
 
 
+class LivePortOut(BaseModel):
+    name: str
+    running: bool
+    disabled: bool
+    rx_bps: Optional[float]
+    tx_bps: Optional[float]
+    link_downs: int
+    devices: Optional[int]      # devices seen behind this port (last long-list report)
+
+
 class RouterLiveOut(BaseModel):
     router_id: int
     reported_at: datetime
@@ -390,6 +400,9 @@ class RouterLiveOut(BaseModel):
     last_repair_at: Optional[datetime]
     last_repair_result: Optional[dict]
     devices: list[LiveDeviceOut]
+    ports: list[LivePortOut] = []
+    bridge_hosts_at: Optional[datetime] = None
+    bindings_count: Optional[int] = None
 
 
 @router.get("/api/routers/{router_id}/live", response_model=RouterLiveOut)
@@ -445,6 +458,17 @@ async def get_router_live(
         no_limit=state.no_limit,
         last_repair_at=state.last_repair_at,
         last_repair_result=state.last_repair_result,
+        ports=[
+            LivePortOut(
+                name=p["name"], running=bool(p.get("running")), disabled=bool(p.get("disabled")),
+                rx_bps=p.get("rx_bps"), tx_bps=p.get("tx_bps"), link_downs=int(p.get("link_downs") or 0),
+                devices=(sum(1 for port in state.bridge_hosts.values() if port == p["name"])
+                         if state.bridge_hosts is not None else None),
+            )
+            for p in state.ports
+        ],
+        bridge_hosts_at=state.bridge_hosts_at,
+        bindings_count=len(state.bindings) if state.bindings is not None else None,
         devices=[
             LiveDeviceOut(
                 kind=d.kind,

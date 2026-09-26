@@ -156,6 +156,26 @@ class PppActiveIn(BaseModel):
     caller_id: str = Field(default="", max_length=64)
 
 
+class PortIn(BaseModel):
+    name: str = Field(max_length=64)
+    running: bool = False
+    disabled: bool = False
+    rx_bytes: int = Field(default=0, ge=0)
+    tx_bytes: int = Field(default=0, ge=0)
+    link_downs: int = Field(default=0, ge=0)
+
+
+class BridgeHostIn(BaseModel):
+    mac: str = Field(max_length=32)
+    port: str = Field(default="", max_length=64)
+
+
+class BindingIn(BaseModel):
+    mac: str = Field(default="", max_length=32)
+    type: str = Field(default="", max_length=16)
+    disabled: bool = False
+
+
 class RouterMetricsIn(BaseModel):
     """Optional router-level readings — interface counters and session counts.
 
@@ -187,6 +207,10 @@ class UsagePushIn(BaseModel):
     reports: list[UsageReportIn] = Field(default_factory=list)
     hosts: list[HostReportIn] = Field(default_factory=list)
     ppp: list[PppActiveIn] = Field(default_factory=list)
+    # v3. None = not in this report (the long lists come every ~5 reports).
+    ports: Optional[list[PortIn]] = None
+    bridge_hosts: Optional[list[BridgeHostIn]] = None
+    bindings: Optional[list[BindingIn]] = None
     router: Optional[RouterMetricsIn] = None
 
 
@@ -213,6 +237,9 @@ async def receive_usage_push(
         len(payload.reports) > MAX_REPORTS_PER_BATCH
         or len(payload.hosts) > MAX_HOSTS_PER_BATCH
         or len(payload.ppp) > MAX_HOSTS_PER_BATCH
+        or len(payload.ports or []) > MAX_HOSTS_PER_BATCH
+        or len(payload.bridge_hosts or []) > MAX_HOSTS_PER_BATCH
+        or len(payload.bindings or []) > MAX_HOSTS_PER_BATCH
     ):
         raise HTTPException(
             status_code=413,
@@ -335,6 +362,9 @@ async def receive_usage_push(
     # through the router's encrypted management tunnel as plain HTTP.
     via_tunnel = (x_bitwave_push_channel or "").strip().lower() == "tunnel"
 
+    if payload.router is not None:
+        realtime_state.note_metrics_report(router_row.id)
+
     if pilot:
         _record_live_state(router_row.id, payload, result, via_tunnel)
         _spawn(_enforce_caps(result.over_cap_customer_ids))
@@ -402,6 +432,9 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
         ],
         live_pppoe_customers=result.live_pppoe_customers,
         has_hosts="hosts" in payload.model_fields_set,
+        ports=[p.model_dump() for p in payload.ports] if payload.ports is not None else None,
+        bridge_hosts=[b.model_dump() for b in payload.bridge_hosts] if payload.bridge_hosts is not None else None,
+        bindings=[b.model_dump() for b in payload.bindings] if payload.bindings is not None else None,
     )
     running = (
         state.last_repair_result is not None
