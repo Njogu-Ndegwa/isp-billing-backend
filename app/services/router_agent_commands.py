@@ -288,6 +288,7 @@ async def queue_hotspot_provision_command(
         comment=hotspot_payload.get("comment", ""),
         expires_at=None,
         lb_enabled=bool(hotspot_payload.get("lb_enabled")),
+        binding_expiry=original_expiry,
     )
     entitlement_key = (
         f"attempt:{attempt_id}"
@@ -734,6 +735,7 @@ async def _queue_hotspot_repair_after_stale_remove(
         comment=f"CID:{customer.id}|stale-removal-repair",
         expires_at=None,
         lb_enabled=bool(router.lb_enabled),
+        binding_expiry=customer.expiry,
     )
     db.add(
         RouterCommand(

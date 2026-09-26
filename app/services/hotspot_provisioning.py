@@ -12,6 +12,9 @@ from app.config import settings
 from app.db.database import async_session, db_pool_snapshot
 from app.services.router_availability import record_router_availability
 from app.db.models import (
+    DELIVERED_VIA_CHECKIN,
+    DELIVERED_VIA_OBSERVED,
+    DELIVERED_VIA_PUSH,
     ConnectionType,
     Customer,
     CustomerStatus,
@@ -506,6 +509,7 @@ def _call_mikrotik_bypass_sync(hotspot_payload: dict, verify_only: bool = False)
             router_ip,
             router_username,
             router_password,
+            expiry=hotspot_payload.get("customer_expiry"),
         )
 
         logger.info("[PROVISION] MikroTik API response: %s", provision_result)
@@ -588,6 +592,15 @@ def _attempt_should_be_terminal(attempt: ProvisioningAttempt, now: datetime) -> 
     )
 
 
+def _delivered_by_checkin(attempt: ProvisioningAttempt) -> bool:
+    """The router's check-in already confirmed this customer on the router,
+    whether it added the binding itself ('checkin') or only saw it ('observed')."""
+    return (
+        _enum_value(attempt.provisioning_state) == ProvisioningState.ROUTER_UPDATED.value
+        and attempt.delivered_via in (DELIVERED_VIA_CHECKIN, DELIVERED_VIA_OBSERVED)
+    )
+
+
 async def _persist_provisioning_result(
     *,
     result: Dict[str, Any],
@@ -651,7 +664,14 @@ async def _persist_provisioning_result(
         if attempt_id is not None:
             async with async_session() as db:
                 refreshed_attempt = await db.get(ProvisioningAttempt, attempt_id)
-                if refreshed_attempt:
+                if refreshed_attempt and _delivered_by_checkin(refreshed_attempt):
+                    # The router's check-in showed this customer present while
+                    # this push was in flight. A late push failure must not
+                    # drag a delivered payment back into retry (nor into the
+                    # overload alert's failure count): leave the row as is.
+                    final_state = ProvisioningState.ROUTER_UPDATED
+                    await db.commit()
+                elif refreshed_attempt:
                     if _attempt_should_be_terminal(refreshed_attempt, datetime.utcnow()):
                         final_state = ProvisioningState.FAILED
                     refreshed_attempt.provisioning_state = final_state
@@ -661,12 +681,18 @@ async def _persist_provisioning_result(
                     await db.commit()
                     await db.refresh(refreshed_attempt)
 
+        if final_state == ProvisioningState.FAILED:
+            failure_status = "failed"
+        elif final_state == ProvisioningState.ROUTER_UPDATED:
+            failure_status = "push_failed_after_checkin_delivery"
+        else:
+            failure_status = "retry_pending"
         await log_provisioning_event(
             customer_id=customer_id,
             router_id=router_id,
             mac_address=mac_address,
             action=action,
-            status="failed" if final_state == ProvisioningState.FAILED else "retry_pending",
+            status=failure_status,
             details=f"router={router_ip}",
             error=provisioning_error,
             attempt_id=attempt_id,
@@ -708,6 +734,12 @@ async def _persist_provisioning_result(
                 refreshed_attempt.provisioning_state = ProvisioningState.ROUTER_UPDATED
                 refreshed_attempt.online_state = ProvisioningOnlineState(online_state_value)
                 refreshed_attempt.router_updated_at = datetime.utcnow()
+                # First path to land wins: a check-in may have confirmed the
+                # customer while this (slow) push was still in flight.
+                if refreshed_attempt.delivered_via is None:
+                    refreshed_attempt.delivered_via = DELIVERED_VIA_PUSH
+                if refreshed_attempt.access_seen_at is None:
+                    refreshed_attempt.access_seen_at = refreshed_attempt.router_updated_at
                 refreshed_attempt.last_error = None
                 refreshed_attempt.updated_at = datetime.utcnow()
                 if online_state_value == ProvisioningOnlineState.ONLINE.value:

@@ -76,6 +76,10 @@ ROUTER_AGENT_ALIVE_WINDOW = timedelta(minutes=15)
 # expired" text long after the fact only confuses the customer and burns SMS
 # credits. Enforcement still happens; only the notification is suppressed.
 EXPIRY_NOTIFICATION_MAX_OVERDUE = timedelta(days=7)
+# Routers with the expiry reaper remove their own expired hotspot customers
+# within about a minute. The server waits this long past expiry before acting
+# on them, so it is the backstop (and the pilot measures the router, not us).
+EXPIRY_REAPER_GRACE = timedelta(minutes=3)
 SAFETY_NET_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
 ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL = timedelta(minutes=5)
 BANDWIDTH_MAX_ROUTERS_PER_RUN = 8
@@ -1524,6 +1528,7 @@ async def cleanup_expired_users_background():
             long_offline_quarantined = []
             agent_cleanup_items: dict[int, dict] = {}
             batch_deferred = []
+            reaper_deferred = []
             directly_deactivated_ids: set[int] = set()
             scheduled_router_cleanup_count = 0
             per_router_cleanup_counts: dict[str, int] = {}
@@ -1605,6 +1610,10 @@ async def cleanup_expired_users_background():
                 if c.router and _router_long_offline(c.router, now):
                     long_offline_quarantined.append(c.id)
                     continue
+                if (c.router and getattr(c.router, "expiry_reaper_enabled", False)
+                        and c.expiry and now - c.expiry < EXPIRY_REAPER_GRACE):
+                    reaper_deferred.append(c.id)
+                    continue
                 if c.router and _router_agent_alive(c.router, now):
                     agent_cleanup_items[c.id] = {
                         "kind": "hotspot",
@@ -1660,6 +1669,12 @@ async def cleanup_expired_users_background():
                     len(long_offline_quarantined),
                     ROUTER_LONG_OFFLINE_CLEANUP_QUARANTINE,
                     long_offline_quarantined[:50],
+                )
+
+            if reaper_deferred:
+                logger.info(
+                    "[CRON] Left %d customer(s) to their router's expiry reaper for up to %s: %s",
+                    len(reaper_deferred), EXPIRY_REAPER_GRACE, reaper_deferred[:50],
                 )
 
             if batch_deferred:
@@ -3289,9 +3304,15 @@ def _fetch_bandwidth_data_sync():
 
 
 async def _prune_bandwidth_history(db, now) -> None:
+    from app.db.models import CustomerUsageBucket
+    from app.services.usage_tracking import CUSTOMER_USAGE_BUCKET_RETENTION_DAYS
+
     cutoff = now - timedelta(days=BANDWIDTH_HISTORY_RETENTION_DAYS)
     await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
     await db.execute(delete(RouterUsageBucket).where(RouterUsageBucket.bucket_start < cutoff))
+    await db.execute(delete(CustomerUsageBucket).where(
+        CustomerUsageBucket.bucket_start < now - timedelta(days=CUSTOMER_USAGE_BUCKET_RETENTION_DAYS)
+    ))
     await prune_router_availability_history(db, now=now)
     await db.commit()
 

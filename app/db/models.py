@@ -69,6 +69,22 @@ class ProvisioningState(str, enum.Enum):
     FAILED = "failed"
 
 
+# provisioning_attempts.delivered_via values (plain varchar, not a PG enum, so
+# a future path needs no enum migration).
+#   push     - the direct API push added the customer.
+#   checkin  - the router's check-in applier added the binding itself (the
+#              router reported it in c=, or, for an applier too old to send
+#              c=, the server sent it an A line after the payment).
+#   observed - the check-in saw the customer present on the router after the
+#              push had given up (retry_pending/failed), but not via a binding
+#              the check-in added: some other path (router agent, a retry, a
+#              legacy binding) delivered it. Counted separately so the pilot
+#              numbers credit the check-in only for what it actually did.
+DELIVERED_VIA_PUSH = "push"
+DELIVERED_VIA_CHECKIN = "checkin"
+DELIVERED_VIA_OBSERVED = "observed"
+
+
 class ProvisioningOnlineState(str, enum.Enum):
     UNKNOWN = "unknown"
     OFFLINE = "offline"
@@ -501,6 +517,13 @@ class Router(Base):
     # When management_tunnel was last changed: ops health compares the router's
     # payments and reachability before vs after this moment ("did the fix work").
     management_tunnel_changed_at = Column(DateTime, nullable=True)
+    # The router removes its own expired hotspot customers (the "expiry reaper"
+    # scheduler, app/services/expiry_reaper_script.py). While true, the server
+    # cleanup waits a short grace past expiry before acting, so it is the
+    # backstop rather than the first responder. Set by scripts/expiry_reaper_install.py.
+    expiry_reaper_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    # When the reaper was (last) installed: before/after comparison for the pilot.
+    expiry_reaper_installed_at = Column(DateTime, nullable=True)
     # On by default, per-router opt-out: when true, the owner gets an inbox message
     # (and an SMS charged to their credits, when phone+balance allow) when the
     # router stays offline past a debounce threshold and again when it comes back
@@ -596,6 +619,16 @@ class ProvisioningAttempt(Base):
     last_attempt_at = Column(DateTime, nullable=True)
     router_updated_at = Column(DateTime, nullable=True)
     last_online_at = Column(DateTime, nullable=True)
+    # Which path got the customer onto the router: 'push' (direct API),
+    # 'checkin' (the check-in applier added the binding) or 'observed' (the
+    # check-in saw the customer present after the push gave up, via a binding
+    # it did not add). See DELIVERED_VIA_* above. NULL on rows from before
+    # 2026-09-26 and on other paths (PPPoE, router agent).
+    # Startup migration: run_checkin_delivery_migrations() in main.py.
+    delivered_via = Column(String(16), nullable=True)
+    # When access was first confirmed (push: router_updated_at; check-in: the
+    # report that showed the MAC). access_seen_at - created_at = payment->access.
+    access_seen_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -763,6 +796,30 @@ class RouterUsageBucket(Base):
     pppoe_upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
     pppoe_download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class CustomerUsageBucket(Base):
+    """Per-customer hourly ledger of bytes credited (2026-09-26).
+
+    Written by ``record_usage`` in the same transaction that credits the
+    customer's period, like ``RouterUsageBucket`` — so "top users over the last
+    hour / today / 7 days / 30 days" is a sum over real credited usage for any
+    window, instead of lifetime router counters (which ranked customers who
+    expired months ago at the top). ``router_id`` is the router the usage was
+    credited on. Retention: see ``CUSTOMER_USAGE_BUCKET_RETENTION_DAYS``.
+    """
+    __tablename__ = "customer_usage_buckets"
+    __table_args__ = (
+        UniqueConstraint("customer_id", "bucket_start", name="uq_customer_usage_bucket"),
+        Index("ix_customer_usage_buckets_router_start", "router_id", "bucket_start"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
+    bucket_start = Column(DateTime, nullable=False, index=True)
+    upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 

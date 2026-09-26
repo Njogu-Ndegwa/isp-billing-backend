@@ -5,6 +5,7 @@ All routes require admin role (same auth as /api/admin/* endpoints).
 """
 
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -29,6 +30,7 @@ from app.services.management_tunnel_health import (
 )
 
 router = APIRouter(tags=["admin-metrics"])
+logger = logging.getLogger(__name__)
 
 
 async def _require_admin(token: str, db: AsyncSession) -> User:
@@ -49,6 +51,35 @@ async def admin_router_agent_metrics(
     from app.api.router_agent_routes import router_agent_metrics_snapshot
 
     return router_agent_metrics_snapshot()
+
+
+@router.get("/api/admin/checkin-pilot")
+async def admin_checkin_pilot_stats(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Process-local counters of the router check-in delivery pilot.
+
+    Shadow mode records here what it WOULD have sent, and how long each paid
+    MAC stayed missing from its router before the push (or pull) landed.
+
+    ``delivery_paths_24h`` (DB, one short read in its own session): per-path
+    delivery counts (push / checkin / observed / other / undelivered) and p50/p95 of
+    payment->access (access_seen_at - created_at) for pilot routers vs the
+    rest of the fleet, over attempts created in the last 24 h.
+    """
+
+    await _require_admin(token, db)
+    await db.commit()
+    from app.services.checkin_delivery import delivery_path_metrics, stats_snapshot
+
+    snapshot = stats_snapshot()
+    try:
+        snapshot["delivery_paths_24h"] = await delivery_path_metrics()
+    except Exception as exc:  # the in-memory counters are still useful alone
+        logger.warning("checkin-pilot delivery metrics failed: %s", exc)
+        snapshot["delivery_paths_24h"] = {"error": "unavailable"}
+    return snapshot
 
 
 @router.get("/api/admin/db-pool")
@@ -339,6 +370,25 @@ async def admin_ops_health_window(
     start = start.replace(tzinfo=None) if start.tzinfo else start
     end_value = end.replace(tzinfo=None) if (end and end.tzinfo) else (end or datetime.utcnow())
     return await build_window_report(start, end_value, router_id=router_id, owner_id=owner_id)
+
+
+@router.get("/api/admin/ops-health/problem-routers")
+async def admin_ops_health_problem_routers(
+    hours: int = Query(24, ge=1, le=72, description="Judge routers on the last N hours"),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Problem routers judged live on a chosen window (last 1h, 6h, 3 days...).
+
+    Same rules as the snapshot's ``problem_routers`` section, with thresholds
+    scaled to the window and the rules returned as ``criteria``. DB-only, one
+    short session (shared for 60 s across windows).
+    """
+    await _require_admin(token, db)
+    await db.commit()
+    from app.services.ops_health_problem_routers import build_problem_routers_window
+
+    return await build_problem_routers_window(datetime.utcnow(), hours)
 
 
 @router.get("/api/admin/ops-health/history")

@@ -26,6 +26,7 @@ from app.db.models import (
     DurationUnit,
     Plan,
     RouterUsageBucket,
+    CustomerUsageBucket,
 )
 
 # Dashboard-bar ledger granularity. Five minutes matches the push snapshot
@@ -79,6 +80,46 @@ async def _add_usage_to_router_bucket(
     else:
         bucket.hotspot_upload_bytes = (bucket.hotspot_upload_bytes or 0) + delta_upload_bytes
         bucket.hotspot_download_bytes = (bucket.hotspot_download_bytes or 0) + delta_download_bytes
+    bucket.updated_at = now
+
+
+CUSTOMER_USAGE_BUCKET_RETENTION_DAYS = 35
+
+
+def customer_bucket_start_for(now: datetime) -> datetime:
+    """Floor a timestamp to its hour (per-customer ledger granularity)."""
+    return now.replace(minute=0, second=0, microsecond=0)
+
+
+async def _add_usage_to_customer_bucket(
+    db: AsyncSession,
+    customer: Customer,
+    *,
+    delta_upload_bytes: int,
+    delta_download_bytes: int,
+    now: datetime,
+) -> None:
+    """Accumulate credited deltas onto the customer's current hourly bucket.
+
+    Same transaction and same select-then-upsert rules as
+    ``_add_usage_to_router_bucket``: a byte is in this ledger iff the same
+    commit credited it to the customer's period.
+    """
+    start = customer_bucket_start_for(now)
+    bucket = (
+        await db.execute(
+            select(CustomerUsageBucket).where(
+                CustomerUsageBucket.customer_id == customer.id,
+                CustomerUsageBucket.bucket_start == start,
+            )
+        )
+    ).scalars().first()
+    if bucket is None:
+        bucket = CustomerUsageBucket(customer_id=customer.id, router_id=customer.router_id, bucket_start=start)
+        db.add(bucket)
+        await db.flush()
+    bucket.upload_bytes = (bucket.upload_bytes or 0) + delta_upload_bytes
+    bucket.download_bytes = (bucket.download_bytes or 0) + delta_download_bytes
     bucket.updated_at = now
 
 
@@ -230,6 +271,13 @@ async def record_usage(
                 delta_download_bytes=delta_download_bytes,
                 now=now or datetime.utcnow(),
             )
+        await _add_usage_to_customer_bucket(
+            db,
+            customer,
+            delta_upload_bytes=delta_upload_bytes,
+            delta_download_bytes=delta_download_bytes,
+            now=now or datetime.utcnow(),
+        )
     return period
 
 

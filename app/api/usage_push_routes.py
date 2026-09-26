@@ -25,6 +25,7 @@ the server and can be tuned without touching a thousand devices.
 from __future__ import annotations
 
 import asyncio
+import re
 import logging
 import time
 from datetime import datetime
@@ -163,6 +164,34 @@ class PortIn(BaseModel):
     rx_bytes: int = Field(default=0, ge=0)
     tx_bytes: int = Field(default=0, ge=0)
     link_downs: int = Field(default=0, ge=0)
+    rx_packets: int = Field(default=0, ge=0)
+    tx_packets: int = Field(default=0, ge=0)
+    rx_errors: int = Field(default=0, ge=0)
+    tx_errors: int = Field(default=0, ge=0)
+    last_link_up: str = Field(default="", max_length=40)
+
+
+class LeaseIn(BaseModel):
+    mac: str = Field(default="", max_length=32)
+    ip: str = Field(default="", max_length=64)
+    host: str = Field(default="", max_length=128)
+    status: str = Field(default="", max_length=32)
+    comment: str = Field(default="", max_length=256)
+
+
+class NeighborIn(BaseModel):
+    mac: str = Field(default="", max_length=32)
+    identity: str = Field(default="", max_length=128)
+    board: str = Field(default="", max_length=128)
+    platform: str = Field(default="", max_length=64)
+    version: str = Field(default="", max_length=128)
+    interface: str = Field(default="", max_length=128)
+    address: str = Field(default="", max_length=64)
+
+
+class BridgePortIn(BaseModel):
+    interface: str = Field(default="", max_length=64)
+    bridge: str = Field(default="", max_length=64)
 
 
 class BridgeHostIn(BaseModel):
@@ -211,6 +240,9 @@ class UsagePushIn(BaseModel):
     ports: Optional[list[PortIn]] = None
     bridge_hosts: Optional[list[BridgeHostIn]] = None
     bindings: Optional[list[BindingIn]] = None
+    leases: Optional[list[LeaseIn]] = None
+    neighbors: Optional[list[NeighborIn]] = None
+    bridge_ports: Optional[list[BridgePortIn]] = None
     router: Optional[RouterMetricsIn] = None
 
 
@@ -240,6 +272,9 @@ async def receive_usage_push(
         or len(payload.ports or []) > MAX_HOSTS_PER_BATCH
         or len(payload.bridge_hosts or []) > MAX_HOSTS_PER_BATCH
         or len(payload.bindings or []) > MAX_HOSTS_PER_BATCH
+        or len(payload.leases or []) > MAX_HOSTS_PER_BATCH
+        or len(payload.neighbors or []) > MAX_HOSTS_PER_BATCH
+        or len(payload.bridge_ports or []) > MAX_HOSTS_PER_BATCH
     ):
         raise HTTPException(
             status_code=413,
@@ -300,6 +335,10 @@ async def receive_usage_push(
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         _last_push_at[identity] = now
+        # Sending the real-time report (v3+) is what enrols a router; see
+        # realtime_state.REALTIME_MEMBERSHIP_FRESH_SECONDS.
+        if payload.v >= 3:
+            realtime_state.note_realtime_report(router_row.id)
         pilot = is_pilot_router(router_row.id)
         if pilot:
             _pilot_identities.add(identity)
@@ -383,7 +422,10 @@ async def receive_usage_push(
         "accepted": result.accepted,
         "rejected": result.rejected,
         "next_push_seconds": (
-            pilot_push_interval_seconds(router_row.id, via_tunnel) if pilot else DEFAULT_PUSH_INTERVAL_SECONDS
+            SMALL_BOARD_PUSH_SECONDS
+            if payload.v >= 3 and payload.router is not None and is_small_board(payload.router.board)
+            else pilot_push_interval_seconds(router_row.id, via_tunnel) if pilot
+            else DEFAULT_PUSH_INTERVAL_SECONDS
         ),
     }
 
@@ -435,6 +477,11 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
         ports=[p.model_dump() for p in payload.ports] if payload.ports is not None else None,
         bridge_hosts=[b.model_dump() for b in payload.bridge_hosts] if payload.bridge_hosts is not None else None,
         bindings=[b.model_dump() for b in payload.bindings] if payload.bindings is not None else None,
+        leases=[x.model_dump() for x in payload.leases] if payload.leases is not None else None,
+        neighbors=[x.model_dump() for x in payload.neighbors] if payload.neighbors is not None else None,
+        bridge_ports=[x.model_dump() for x in payload.bridge_ports] if payload.bridge_ports is not None else None,
+        hosts_raw=[h.model_dump() for h in payload.hosts],
+        ppp_raw=[p.model_dump() for p in payload.ppp],
     )
     running = (
         state.last_repair_result is not None
@@ -447,11 +494,76 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
         _spawn(_repair(router_id))
 
 
+# Queue repairs are RouterOS work; after a deploy every real-time router with a
+# queue problem asks for one on its first report. Run a few at a time.
+_REPAIR_CONCURRENCY = 3
+_repair_slots: Optional[asyncio.Semaphore] = None
+
+
+def _repair_semaphore() -> asyncio.Semaphore:
+    global _repair_slots
+    if _repair_slots is None:
+        _repair_slots = asyncio.Semaphore(_REPAIR_CONCURRENCY)
+    return _repair_slots
+
+
+_IDENTITY_IN_BODY = re.compile(rb'"identity"\s*:\s*"([^"]{1,64})"')
+
+
+async def log_rejected_push(request, exc) -> None:
+    """Log a rejected (422) router push: which router, which field, the offending text.
+
+    Called from the app's RequestValidationError handler. Only acts on the
+    push path; never raises.
+    """
+    try:
+        if request.url.path != "/api/router/usage-push":
+            return
+        raw = b""
+        try:
+            raw = await request.body()
+        except Exception:
+            pass
+        m = _IDENTITY_IN_BODY.search(raw or b"")
+        identity = m.group(1).decode("ascii", "replace") if m else "?"
+        details = []
+        for err in exc.errors()[:5]:
+            loc = err.get("loc") or ()
+            snippet = ""
+            if err.get("type") == "json_invalid" and len(loc) > 1 and isinstance(loc[1], int):
+                pos = loc[1]
+                snippet = (raw[max(0, pos - 60): pos + 60]).decode("utf-8", "backslashreplace")
+            else:
+                snippet = str(err.get("input"))[:80]
+            details.append(f"{'.'.join(str(x) for x in loc)} {err.get('type')} {snippet!r}")
+        logger.warning(
+            "[USAGE-PUSH] 422 from %s via %s (%d bytes): %s",
+            identity, request.headers.get("x-bitwave-push-channel") or "https",
+            len(raw or b""), " | ".join(details),
+        )
+    except Exception as log_exc:  # never let logging break the response
+        logger.debug("[USAGE-PUSH] could not log a rejected push: %s", log_exc)
+
+
+# hAP lite / hAP mini (smips, 32 MB): on 2026-09-26 the real-time push on top of
+# our other schedulers pinned them at 100% CPU with ~5 MB free, delaying a paying
+# customer. The installer no longer puts v3 on them; any v3 script still on one
+# (router offline during rollback) is told to report once an hour, which makes it
+# harmless without logging in. Usage there falls back to server polling.
+SMALL_BOARD_PUSH_SECONDS = 3600
+_SMALL_BOARD_RE = re.compile(r"hap\s*(lite|mini)|rb9[34]1", re.IGNORECASE)
+
+
+def is_small_board(board: Optional[str]) -> bool:
+    return bool(board and _SMALL_BOARD_RE.search(board))
+
+
 async def _repair(router_id: int) -> None:
     from app.services.mikrotik_background import repair_router_queues_now
 
     try:
-        details = await repair_router_queues_now(router_id)
+        async with _repair_semaphore():
+            details = await repair_router_queues_now(router_id)
         logger.info("[USAGE-PUSH] Queue repair for router %s: %s", router_id, details)
         realtime_state.note_repair(router_id, datetime.utcnow(), {"status": "done", **(details or {})})
     except Exception as exc:

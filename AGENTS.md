@@ -138,6 +138,14 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   `/accessing-production-server`.
 - Never commit SSH private keys, passwords, or credentials — public keys only.
 
+## Router Push Agent (usage + health)
+
+- One owner, one script, one tool. Before installing, editing or copying
+  `bitwave-usage-push` on ANY router read
+  [`docs/agent-memory/realtime-push-rollout.md`](docs/agent-memory/realtime-push-rollout.md)
+  and use `scripts/realtime_push_install.py`. Never copy a script off a live
+  router: token and identity are per router.
+
 ## Router Provisioning Gotchas
 
 - Provisioning import dies with `Script Error: expected end of command` at an

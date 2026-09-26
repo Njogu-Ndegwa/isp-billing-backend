@@ -223,6 +223,15 @@
   "support_rating",
   "value_for_money"
  ],
+ "customer_usage_buckets": [
+  "bucket_start",
+  "customer_id",
+  "download_bytes",
+  "id",
+  "router_id",
+  "updated_at",
+  "upload_bytes"
+ ],
  "customer_usage_periods": [
   "cap_mb_snapshot",
   "closed_at",
@@ -573,9 +582,11 @@
   "whatsapp_group_url"
  ],
  "provisioning_attempts": [
+  "access_seen_at",
   "attempt_count",
   "created_at",
   "customer_id",
+  "delivered_via",
   "entrypoint",
   "external_reference",
   "id",
@@ -791,6 +802,8 @@
   "dual_ports",
   "emergency_active",
   "emergency_message",
+  "expiry_reaper_enabled",
+  "expiry_reaper_installed_at",
   "hotspot_sharing_blocked",
   "id",
   "identity",

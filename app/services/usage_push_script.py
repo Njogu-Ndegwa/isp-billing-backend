@@ -264,7 +264,12 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local body "{\"identity\":\"$ident\",\"v\":3,\"reports\":["
     :local first true
     :local qcount 0
+    # An entry can vanish between find and get (customer logs out, queue
+    # removed). ROS 7 then returns EMPTY values instead of an error, which
+    # wrote "upload_bytes":, and got the whole report rejected (2026-09-26,
+    # busy routers 118/221/256). Every loop skips an entry that came back empty.
     :foreach q in=[/queue simple find] do={
+      :do {
         :local qn [/queue simple get $q name]
         :local key ""
         :if ([:pick $qn 0 5] = "plan_") do={ :set key [:pick $qn 5 [:len $qn]] }
@@ -274,13 +279,17 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local qt [:tostr [/queue simple get $q target]]
             :local ql [/queue simple get $q max-limit]
             :local qd [/queue simple get $q disabled]
-            :local up [:pick $qb 0 [:find $qb "/"]]
-            :local dn [:pick $qb ([:find $qb "/"] + 1) [:len $qb]]
-            :if (!$first) do={ :set body ($body . ",") }
-            :set body ($body . "{\"queue_key\":\"" . $key . "\",\"upload_bytes\":" . $up . ",\"download_bytes\":" . $dn . ",\"target_ip\":\"" . $qt . "\",\"max_limit\":\"" . $ql . "\",\"disabled\":" . $qd . "}")
-            :set first false
-            :set qcount ($qcount + 1)
+            :local slash [:find $qb "/"]
+            :if (([:typeof $slash] = "num") && ([:typeof $qd] = "bool")) do={
+                :local up [:pick $qb 0 $slash]
+                :local dn [:pick $qb ($slash + 1) [:len $qb]]
+                :if (!$first) do={ :set body ($body . ",") }
+                :set body ($body . "{\"queue_key\":\"" . $key . "\",\"upload_bytes\":" . $up . ",\"download_bytes\":" . $dn . ",\"target_ip\":\"" . $qt . "\",\"max_limit\":\"" . $ql . "\",\"disabled\":" . $qd . "}")
+                :set first false
+                :set qcount ($qcount + 1)
+            }
         }
+      } on-error={}
     }
     :set body ($body . "],\"hosts\":[")
     :local hfirst true
@@ -295,9 +304,11 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local hau [/ip hotspot host get $h authorized]
             :local hit [/ip hotspot host get $h idle-time]
             :local hup [/ip hotspot host get $h uptime]
+            :if (([:len $hm] > 0) && ([:typeof $hbi] = "num") && ([:typeof $hbo] = "num") && ([:typeof $hby] = "bool") && ([:typeof $hau] = "bool")) do={
             :if (!$hfirst) do={ :set body ($body . ",") }
             :set body ($body . "{\"mac\":\"" . $hm . "\",\"ip\":\"" . $ha . "\",\"bytes_in\":" . $hbi . ",\"bytes_out\":" . $hbo . ",\"bypassed\":" . $hby . ",\"authorized\":" . $hau . ",\"idle_time\":\"" . $hit . "\",\"uptime\":\"" . $hup . "\"}")
             :set hfirst false
+            }
         } on-error={}
     }
     :set body ($body . "],\"ppp\":[")
@@ -308,9 +319,11 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local aa [/ppp active get $a address]
             :local au [/ppp active get $a uptime]
             :local ac [/ppp active get $a caller-id]
+            :if ([:len $an] > 0) do={
             :if (!$pfirst) do={ :set body ($body . ",") }
             :set body ($body . "{\"name\":\"" . $an . "\",\"address\":\"" . $aa . "\",\"uptime\":\"" . $au . "\",\"caller_id\":\"" . $ac . "\"}")
             :set pfirst false
+            }
         }
     } on-error={}
     :set body ($body . "]")
@@ -325,8 +338,23 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local irx [/interface get $i rx-byte]
             :local itx [/interface get $i tx-byte]
             :local ild [/interface get $i link-downs]
+            :local irp [/interface get $i rx-packet]
+            :local itp [/interface get $i tx-packet]
+            :local ire [/interface get $i rx-error]
+            :local ite [/interface get $i tx-error]
+            :local ilu [:tostr [/interface get $i last-link-up-time]]
+            # Some drivers (RB4011 ethernet/SFP on ROS 7) return no value for
+            # a counter; an empty value made the JSON invalid ("rx_errors":,)
+            # and every report from those routers was rejected (2026-09-26).
+            :if ([:typeof $irx] != "num") do={ :set irx 0 }
+            :if ([:typeof $itx] != "num") do={ :set itx 0 }
+            :if ([:typeof $ild] != "num") do={ :set ild 0 }
+            :if ([:typeof $irp] != "num") do={ :set irp 0 }
+            :if ([:typeof $itp] != "num") do={ :set itp 0 }
+            :if ([:typeof $ire] != "num") do={ :set ire 0 }
+            :if ([:typeof $ite] != "num") do={ :set ite 0 }
             :if (!$ifirst) do={ :set body ($body . ",") }
-            :set body ($body . "{\"name\":\"" . $inm . "\",\"running\":" . $iru . ",\"disabled\":" . $idi . ",\"rx_bytes\":" . $irx . ",\"tx_bytes\":" . $itx . ",\"link_downs\":" . $ild . "}")
+            :set body ($body . "{\"name\":\"" . $inm . "\",\"running\":" . $iru . ",\"disabled\":" . $idi . ",\"rx_bytes\":" . $irx . ",\"tx_bytes\":" . $itx . ",\"link_downs\":" . $ild . ",\"rx_packets\":" . $irp . ",\"tx_packets\":" . $itp . ",\"rx_errors\":" . $ire . ",\"tx_errors\":" . $ite . ",\"last_link_up\":\"" . $ilu . "\"}")
             :set ifirst false
         } on-error={}
     }
@@ -337,7 +365,7 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :global bwPushN
     :if ([:typeof $bwPushN] != "num") do={ :set bwPushN 0 }
     :set bwPushN ($bwPushN + 1)
-    :if (($bwPushN % 5) = 1) do={
+    :if (($bwPushN % __LISTS_EVERY__) = 1) do={
         :set body ($body . ",\"bridge_hosts\":[")
         :local bfirst true
         :do {
@@ -356,9 +384,61 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
                 :local gm [/ip hotspot ip-binding get $g mac-address]
                 :local gt [/ip hotspot ip-binding get $g type]
                 :local gd [/ip hotspot ip-binding get $g disabled]
+                :if ([:typeof $gd] = "bool") do={
                 :if (!$gfirst) do={ :set body ($body . ",") }
                 :set body ($body . "{\"mac\":\"" . $gm . "\",\"type\":\"" . $gt . "\",\"disabled\":" . $gd . "}")
                 :set gfirst false
+                }
+            }
+        } on-error={}
+        # DHCP leases give devices their names on the ports card. A host-name
+        # carrying a quote or backslash would break the JSON, so it is dropped.
+        :set body ($body . "],\"leases\":[")
+        :local lfirst true
+        :do {
+            :foreach l in=[/ip dhcp-server lease find] do={
+                :local lm [/ip dhcp-server lease get $l mac-address]
+                :local la [/ip dhcp-server lease get $l address]
+                :local lh [:tostr [/ip dhcp-server lease get $l host-name]]
+                :local ls [:tostr [/ip dhcp-server lease get $l status]]
+                :local lc [:tostr [/ip dhcp-server lease get $l comment]]
+                :if (([:typeof [:find $lh "\""]] = "num") || ([:typeof [:find $lh "\\"]] = "num")) do={ :set lh "" }
+                :if (([:typeof [:find $lc "\""]] = "num") || ([:typeof [:find $lc "\\"]] = "num")) do={ :set lc "" }
+                :if (!$lfirst) do={ :set body ($body . ",") }
+                :set body ($body . "{\"mac\":\"" . $lm . "\",\"ip\":\"" . $la . "\",\"host\":\"" . $lh . "\",\"status\":\"" . $ls . "\",\"comment\":\"" . $lc . "\"}")
+                :set lfirst false
+            }
+        } on-error={}
+        # Neighbour discovery (MNDP/CDP/LLDP): how the ports card recognises
+        # equipment (APs, switches, other MikroTiks) behind a port.
+        :set body ($body . "],\"neighbors\":[")
+        :local nfirst true
+        :do {
+            :foreach n in=[/ip neighbor find] do={
+                :local nm [:tostr [/ip neighbor get $n mac-address]]
+                :local ni [:tostr [/ip neighbor get $n identity]]
+                :local nb [:tostr [/ip neighbor get $n board]]
+                :local np [:tostr [/ip neighbor get $n platform]]
+                :local nv [:tostr [/ip neighbor get $n version]]
+                :local nf [:tostr [/ip neighbor get $n interface]]
+                :local na [:tostr [/ip neighbor get $n address]]
+                :if (([:typeof [:find $ni "\""]] = "num") || ([:typeof [:find $ni "\\"]] = "num")) do={ :set ni "" }
+                :if (([:typeof [:find $nb "\""]] = "num") || ([:typeof [:find $nb "\\"]] = "num")) do={ :set nb "" }
+                :if (([:typeof [:find $nv "\""]] = "num") || ([:typeof [:find $nv "\\"]] = "num")) do={ :set nv "" }
+                :if (!$nfirst) do={ :set body ($body . ",") }
+                :set body ($body . "{\"mac\":\"" . $nm . "\",\"identity\":\"" . $ni . "\",\"board\":\"" . $nb . "\",\"platform\":\"" . $np . "\",\"version\":\"" . $nv . "\",\"interface\":\"" . $nf . "\",\"address\":\"" . $na . "\"}")
+                :set nfirst false
+            }
+        } on-error={}
+        :set body ($body . "],\"bridge_ports\":[")
+        :local pfirst2 true
+        :do {
+            :foreach p in=[/interface bridge port find] do={
+                :local pi [/interface bridge port get $p interface]
+                :local pb [/interface bridge port get $p bridge]
+                :if (!$pfirst2) do={ :set body ($body . ",") }
+                :set body ($body . "{\"interface\":\"" . $pi . "\",\"bridge\":\"" . $pb . "\"}")
+                :set pfirst2 false
             }
         } on-error={}
         :set body ($body . "]")
@@ -394,7 +474,7 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
 :log info "usage-push v2: installed for __IDENT__"
 '''
 
-_WAN_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_WAN_RE = re.compile(r"^[A-Za-z0-9._\[\]-]{1,32}$")  # "Ether1[WAN]" exists in the fleet
 
 
 def render_realtime_push_script(
@@ -403,13 +483,21 @@ def render_realtime_push_script(
     endpoint_url: str,
     interval_seconds: int = 10,
     wan_interface: str = "ether1",
+    lists_every: int = 5,
 ) -> str:
-    """Render the v2 (real-time pilot) reporter. See the block comment above."""
+    """Render the v2 (real-time pilot) reporter. See the block comment above.
+
+    ``lists_every``: the slow-changing lists (device-per-port, bindings,
+    leases, neighbours, bridge ports) ride every Nth report. Smallest boards
+    use a larger N; keep N x interval under the 15-minute list freshness.
+    """
     identity = _require(identity, _IDENTITY_RE, "identity")
     endpoint_url = _require(endpoint_url, _URL_RE, "endpoint_url")
     wan = _require(wan_interface, _WAN_RE, "wan_interface")
     if not (5 <= int(interval_seconds) <= 3600):
         raise ValueError("usage-push script: interval must be 5..3600 seconds")
+    if not (2 <= int(lists_every) <= 15):
+        raise ValueError("usage-push script: lists_every must be 2..15")
     return (
         _REALTIME_TEMPLATE
         .replace("__SCRIPT__", SCRIPT_NAME)
@@ -420,4 +508,5 @@ def render_realtime_push_script(
         .replace("__IDENT__", identity)
         .replace("__WAN__", wan)
         .replace("__INTERVAL__", str(int(interval_seconds)))
+        .replace("__LISTS_EVERY__", str(int(lists_every)))
     )

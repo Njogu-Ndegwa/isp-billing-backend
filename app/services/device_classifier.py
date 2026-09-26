@@ -44,6 +44,11 @@ INFRASTRUCTURE_OUI_VENDORS: Dict[str, str] = {
     "14CC20": "TP-Link",
     "60E327": "TP-Link",
     "98DAC4": "TP-Link",
+    "105A95": "TP-Link",  # CPE210 (neighbor platform, fleet survey 2026-09-26)
+    "186945": "TP-Link",  # CPE220
+    "C03A55": "TP-Link",  # EAP110-Outdoor
+    "306893": "TP-Link",  # EAP110-Outdoor
+    "B04E26": "TP-Link",  # TL-WR840N
     # Mercusys (TP-Link sub-brand)
     "B83A34": "Mercusys",
     # Cudy (Shenzhen Cudy Technology)
@@ -58,6 +63,16 @@ INFRASTRUCTURE_OUI_VENDORS: Dict[str, str] = {
     "687251": "Ubiquiti",
     "802AA8": "Ubiquiti",
     "0418D6": "Ubiquiti",
+    "AC8BA9": "Ubiquiti",  # NanoStation loco M2 (neighbor platform, fleet survey 2026-09-26)
+    "F492BF": "Ubiquiti",  # NanoStation loco M2
+    "28704E": "Ubiquiti",  # NanoStation loco M2
+    "F4E2C6": "Ubiquiti",  # NanoStation loco M2
+    "68D79A": "Ubiquiti",  # LiteBeam M5
+    # Ruijie / Reyee (neighbor identity "Ruijie"; leases RAP6262G-*, RAP62-OD-*)
+    "105F02": "Ruijie",
+    "58B4BB": "Ruijie",
+    "C4B25B": "Ruijie",
+    "4C4968": "Ruijie",
     # MikroTik
     "488F5A": "MikroTik",
     "DC2C6E": "MikroTik",
@@ -71,6 +86,8 @@ INFRASTRUCTURE_OUI_VENDORS: Dict[str, str] = {
     "2CC81B": "MikroTik",
     "085531": "MikroTik",
     "18FD74": "MikroTik",
+    "D0EA11": "MikroTik",  # RB4011 (neighbor board, fleet survey 2026-09-26)
+    "F41E57": "MikroTik",  # RB951Ui-2HnD
 }
 
 # ---------------------------------------------------------------------------
@@ -93,6 +110,26 @@ INFRASTRUCTURE_HOSTNAME_PREFIXES: tuple = (
     ("routeros", "MikroTik"),
     ("ruijie", "Ruijie"),
     ("reyee", "Ruijie"),
+    ("cambium", "Cambium"),
+)
+
+# Signal 2b: vendor MODEL names that devices use as their default hostname /
+# identity ("RAP6262G-A51ACD", "EAP110-Outdoor-C0-3A-55", "CPE210_MtaaLink",
+# "TL-WR840N", "NanoStation loco M2"). Anchored at the start and followed by a
+# digit or a separator, so ordinary names ("Rapha-phone", "Eapen") don't match.
+INFRASTRUCTURE_HOSTNAME_PATTERNS: tuple = (
+    (re.compile(r"^rap\d"), "Ruijie"),            # Reyee access points (RAP2200, RAP6262G, RAP62-OD)
+    (re.compile(r"^rg-"), "Ruijie"),               # RG-* product line
+    (re.compile(r"^eg\d{3}"), "Ruijie"),           # Reyee gateways (EG105G, EG210G)
+    (re.compile(r"^es\d{3}g"), "Ruijie"),          # Reyee switches (ES205GC, ES209GC)
+    (re.compile(r"^eap\d{3}"), "TP-Link"),         # Omada access points
+    (re.compile(r"^cpe\d{3}"), "TP-Link"),         # Pharos outdoor CPE (CPE210, CPE510)
+    (re.compile(r"^wbs\d{3}"), "TP-Link"),         # Pharos base stations
+    (re.compile(r"^tl-(wr|wa|mr|er)"), "TP-Link"),  # TL-WR840N, TL-WA850RE, ...
+    (re.compile(r"^deco[\s_-]"), "TP-Link"),
+    (re.compile(r"^(nanostation|nanobeam|litebeam|powerbeam|airgrid|nsm\d|loco\s?m\d)"), "Ubiquiti"),
+    (re.compile(r"^(uap|u6|u7)-"), "Ubiquiti"),     # UniFi access points
+    (re.compile(r"^epmp"), "Cambium"),
 )
 
 # Signal 3: a device claiming a gateway identity (x.y.z.1 in the private
@@ -128,6 +165,9 @@ def vendor_from_hostname(hostname: Optional[str]) -> Optional[str]:
         return None
     for prefix, vendor in INFRASTRUCTURE_HOSTNAME_PREFIXES:
         if text.startswith(prefix):
+            return vendor
+    for pattern, vendor in INFRASTRUCTURE_HOSTNAME_PATTERNS:
+        if pattern.match(text):
             return vendor
     return None
 

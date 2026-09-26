@@ -757,6 +757,12 @@ async def register_hotspot_and_pay_api(
             raise HTTPException(status_code=404, detail="Router not found")
         user_id = router.user_id
 
+        # Check-in delivery pilot: a customer is about to pay on this router,
+        # so its next check-in replies ask for the fast cadence. In-memory,
+        # exception-proof, and a no-op unless the pilot is on for this router.
+        from app.services.checkin_delivery import note_payment_initiated
+        note_payment_initiated(request.router_id)
+
         # Block payments if the reseller's subscription is suspended
         if user_id:
             from app.db.models import SubscriptionStatus

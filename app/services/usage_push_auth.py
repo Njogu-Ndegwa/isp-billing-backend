@@ -35,15 +35,37 @@ _PURPOSE = b"usage-push:v1:"
 TOKEN_LENGTH = 32
 
 
+# The check-in delivery channel (``/api/router/checkin``) gets its own
+# namespace: a usage-push token must never authorize entitlement reads, and a
+# check-in token must never be able to post usage.
+_CHECKIN_PURPOSE = b"router-checkin:v1:"
+
+
+def _derive(purpose: bytes, identity: str) -> str:
+    key = settings.SECRET_KEY.encode("utf-8")
+    message = purpose + str(identity or "").strip().encode("utf-8")
+    return hmac.new(key, message, hashlib.sha256).hexdigest()[:TOKEN_LENGTH]
+
+
 def derive_router_token(identity: str) -> str:
     """Return the push token for a router identity.
 
     Deterministic: the same identity and server secret always yield the same
     token, which is what lets the server verify without storing anything.
     """
-    key = settings.SECRET_KEY.encode("utf-8")
-    message = _PURPOSE + str(identity or "").strip().encode("utf-8")
-    return hmac.new(key, message, hashlib.sha256).hexdigest()[:TOKEN_LENGTH]
+    return _derive(_PURPOSE, identity)
+
+
+def derive_checkin_token(identity: str) -> str:
+    """Token for the check-in delivery channel (separate namespace)."""
+    return _derive(_CHECKIN_PURPOSE, identity)
+
+
+def verify_checkin_token(identity: str, presented: str) -> bool:
+    """Constant-time check for the check-in channel; same rules as below."""
+    if not identity or not presented:
+        return False
+    return hmac.compare_digest(derive_checkin_token(identity), str(presented).strip())
 
 
 def verify_router_token(identity: str, presented: str) -> bool:
