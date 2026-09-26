@@ -186,7 +186,8 @@ class RouterLive:
     bridge_hosts_at: Optional[datetime] = None
     bindings: Optional[list] = None           # [{"mac", "type", "disabled"}]
     bindings_at: Optional[datetime] = None
-    leases: Optional[list] = None             # [{"mac", "ip", "host", "status"}]
+    leases: Optional[list] = None             # [{"mac", "ip", "host", "status", "comment"}]
+    neighbors: Optional[list] = None          # /ip neighbor rows (equipment detection)
     bridge_ports: Optional[list] = None       # [{"interface", "bridge"}]
     hosts_raw: list = field(default_factory=list)   # this report's hotspot hosts, as sent
     ppp_raw: list = field(default_factory=list)     # this report's /ppp active, as sent
@@ -275,6 +276,7 @@ def record_push(
     bindings: Optional[list] = None,
     leases: Optional[list] = None,
     bridge_ports: Optional[list] = None,
+    neighbors: Optional[list] = None,
     hosts_raw: Optional[list] = None,
     ppp_raw: Optional[list] = None,
 ) -> RouterLive:
@@ -298,6 +300,10 @@ def record_push(
         state.bridge_ports = list(bridge_ports)
     elif prev is not None:
         state.bridge_ports = prev.bridge_ports
+    if neighbors is not None:
+        state.neighbors = list(neighbors)
+    elif prev is not None:
+        state.neighbors = prev.neighbors
     state.pushes = (prev.pushes if prev else 0) + 1
     if prev:
         state.last_repair_at = prev.last_repair_at

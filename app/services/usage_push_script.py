@@ -386,10 +386,33 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
                 :local la [/ip dhcp-server lease get $l address]
                 :local lh [:tostr [/ip dhcp-server lease get $l host-name]]
                 :local ls [:tostr [/ip dhcp-server lease get $l status]]
+                :local lc [:tostr [/ip dhcp-server lease get $l comment]]
                 :if (([:typeof [:find $lh "\""]] = "num") || ([:typeof [:find $lh "\\"]] = "num")) do={ :set lh "" }
+                :if (([:typeof [:find $lc "\""]] = "num") || ([:typeof [:find $lc "\\"]] = "num")) do={ :set lc "" }
                 :if (!$lfirst) do={ :set body ($body . ",") }
-                :set body ($body . "{\"mac\":\"" . $lm . "\",\"ip\":\"" . $la . "\",\"host\":\"" . $lh . "\",\"status\":\"" . $ls . "\"}")
+                :set body ($body . "{\"mac\":\"" . $lm . "\",\"ip\":\"" . $la . "\",\"host\":\"" . $lh . "\",\"status\":\"" . $ls . "\",\"comment\":\"" . $lc . "\"}")
                 :set lfirst false
+            }
+        } on-error={}
+        # Neighbour discovery (MNDP/CDP/LLDP): how the ports card recognises
+        # equipment (APs, switches, other MikroTiks) behind a port.
+        :set body ($body . "],\"neighbors\":[")
+        :local nfirst true
+        :do {
+            :foreach n in=[/ip neighbor find] do={
+                :local nm [:tostr [/ip neighbor get $n mac-address]]
+                :local ni [:tostr [/ip neighbor get $n identity]]
+                :local nb [:tostr [/ip neighbor get $n board]]
+                :local np [:tostr [/ip neighbor get $n platform]]
+                :local nv [:tostr [/ip neighbor get $n version]]
+                :local nf [:tostr [/ip neighbor get $n interface]]
+                :local na [:tostr [/ip neighbor get $n address]]
+                :if (([:typeof [:find $ni "\""]] = "num") || ([:typeof [:find $ni "\\"]] = "num")) do={ :set ni "" }
+                :if (([:typeof [:find $nb "\""]] = "num") || ([:typeof [:find $nb "\\"]] = "num")) do={ :set nb "" }
+                :if (([:typeof [:find $nv "\""]] = "num") || ([:typeof [:find $nv "\\"]] = "num")) do={ :set nv "" }
+                :if (!$nfirst) do={ :set body ($body . ",") }
+                :set body ($body . "{\"mac\":\"" . $nm . "\",\"identity\":\"" . $ni . "\",\"board\":\"" . $nb . "\",\"platform\":\"" . $np . "\",\"version\":\"" . $nv . "\",\"interface\":\"" . $nf . "\",\"address\":\"" . $na . "\"}")
+                :set nfirst false
             }
         } on-error={}
         :set body ($body . "],\"bridge_ports\":[")

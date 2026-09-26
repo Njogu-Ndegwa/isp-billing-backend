@@ -175,6 +175,17 @@ class LeaseIn(BaseModel):
     ip: str = Field(default="", max_length=64)
     host: str = Field(default="", max_length=128)
     status: str = Field(default="", max_length=32)
+    comment: str = Field(default="", max_length=256)
+
+
+class NeighborIn(BaseModel):
+    mac: str = Field(default="", max_length=32)
+    identity: str = Field(default="", max_length=128)
+    board: str = Field(default="", max_length=128)
+    platform: str = Field(default="", max_length=64)
+    version: str = Field(default="", max_length=128)
+    interface: str = Field(default="", max_length=128)
+    address: str = Field(default="", max_length=64)
 
 
 class BridgePortIn(BaseModel):
@@ -229,6 +240,7 @@ class UsagePushIn(BaseModel):
     bridge_hosts: Optional[list[BridgeHostIn]] = None
     bindings: Optional[list[BindingIn]] = None
     leases: Optional[list[LeaseIn]] = None
+    neighbors: Optional[list[NeighborIn]] = None
     bridge_ports: Optional[list[BridgePortIn]] = None
     router: Optional[RouterMetricsIn] = None
 
@@ -260,6 +272,7 @@ async def receive_usage_push(
         or len(payload.bridge_hosts or []) > MAX_HOSTS_PER_BATCH
         or len(payload.bindings or []) > MAX_HOSTS_PER_BATCH
         or len(payload.leases or []) > MAX_HOSTS_PER_BATCH
+        or len(payload.neighbors or []) > MAX_HOSTS_PER_BATCH
         or len(payload.bridge_ports or []) > MAX_HOSTS_PER_BATCH
     ):
         raise HTTPException(
@@ -457,6 +470,7 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
         bridge_hosts=[b.model_dump() for b in payload.bridge_hosts] if payload.bridge_hosts is not None else None,
         bindings=[b.model_dump() for b in payload.bindings] if payload.bindings is not None else None,
         leases=[x.model_dump() for x in payload.leases] if payload.leases is not None else None,
+        neighbors=[x.model_dump() for x in payload.neighbors] if payload.neighbors is not None else None,
         bridge_ports=[x.model_dump() for x in payload.bridge_ports] if payload.bridge_ports is not None else None,
         hosts_raw=[h.model_dump() for h in payload.hosts],
         ppp_raw=[p.model_dump() for p in payload.ppp],
