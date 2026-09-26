@@ -112,9 +112,6 @@ class FakeCleanupAPI:
     def disconnect(self):
         pass
 
-    def get_client_ip_by_mac(self, mac):
-        return CLIENT_IP
-
     def send_command_optimized(self, command, proplist=None, query=None):
         if command == "/ip/firewall/address-list/print":
             return {"success": True, "data": list(self.lb_paid)}
@@ -125,6 +122,11 @@ class FakeCleanupAPI:
         self.commands.append((command, args))
         if command == "/ip/hotspot/ip-binding/print":
             return {"success": True, "data": list(self.bindings)}
+        if command == "/ip/hotspot/host/print":
+            # cleanup reads the client IP from the hosts snapshot
+            return {"success": True, "data": [
+                {".id": "*H1", "mac-address": MAC, "address": CLIENT_IP},
+            ]}
         if command == "/ip/hotspot/ip-binding/remove":
             self.bindings = [b for b in self.bindings
                              if b.get(".id") != args.get("numbers")]

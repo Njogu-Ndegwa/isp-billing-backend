@@ -3,7 +3,8 @@ MikroTik Background Operations
 ===============================
 
 All background job functions for MikroTik router management:
-- Expired user cleanup (runs every ~67s)
+- Expired user cleanup (runs every ~45s, in its own router lane)
+- Safety-net bypass scan + idle credential reaper (own job, ~10 / 5 min)
 - Queue sync for active users (rotating bounded router batch)
 - Bandwidth snapshot collection (runs every ~157s)
 
@@ -55,7 +56,9 @@ from app.core.protected_devices import is_protected_device
 from app.config import settings
 from app.services.realtime_state import host_metering_active, is_pilot_router, pushed_bindings, reports_metrics
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+import functools
 import logging
 import time
 
@@ -65,8 +68,16 @@ SAFETY_NET_BYPASS_GRACE_PERIOD = timedelta(minutes=5)
 BACKGROUND_DB_BUSY_THRESHOLD_PERCENT = 60
 ROUTER_OFFLINE_CLEANUP_SKIP_PERIOD = ROUTER_OFFLINE_SKIP_PERIOD  # single source: see router_availability
 ROUTER_LONG_OFFLINE_CLEANUP_QUARANTINE = timedelta(days=3)
-EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN = 60
-EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER = 15
+# A router's tables are read once per run however many of its customers are
+# removed (see _cleanup_single_router_hotspot_sync), so a customer costs only
+# its own removes and these caps can sit well above the old 60/15.
+EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_RUN = 150
+EXPIRED_ROUTER_CLEANUP_MAX_CUSTOMERS_PER_ROUTER = 30
+# Expiry removal runs in its own lane: its own fleet slots and its own worker
+# threads. On the shared 3 slots it queued behind the safety-net scan, queue
+# sync and bandwidth jobs; on the default executor (6 threads on the 2-vCPU
+# box) behind every other asyncio.to_thread caller.
+EXPIRY_CLEANUP_CONCURRENCY = 4
 # The outbound agent polls every 2 minutes. One that has not checked in for
 # 15 is not going to execute a queued removal (on RouterOS 7.19+ the script
 # fails on every run), so cleanup does not queue work for it.
@@ -109,6 +120,16 @@ class RouterLockManager:
                 yield
 
     @asynccontextmanager
+    async def acquire_in_lane(self, router_key: str, lane: asyncio.Semaphore):
+        """Serialize with other work on THIS router, taking a slot from *lane*
+        instead of the shared fleet semaphore."""
+        async with lane:
+            if router_key not in self._locks:
+                self._locks[router_key] = asyncio.Lock()
+            async with self._locks[router_key]:
+                yield
+
+    @asynccontextmanager
     async def acquire_router_only(self, router_key: str):
         """Serialize with other work on THIS router, without a fleet slot.
 
@@ -124,9 +145,23 @@ class RouterLockManager:
 
 
 router_locks = RouterLockManager()
+expiry_cleanup_lane = asyncio.Semaphore(EXPIRY_CLEANUP_CONCURRENCY)
+_expiry_cleanup_pool = ThreadPoolExecutor(
+    max_workers=EXPIRY_CLEANUP_CONCURRENCY, thread_name_prefix="expiry-cleanup",
+)
+
+
+async def _run_expiry_router_cleanup(router_key: str, sync_func, *args):
+    """One router's expiry removal, in the expiry lane."""
+    async with router_locks.acquire_in_lane(router_key, expiry_cleanup_lane):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _expiry_cleanup_pool, functools.partial(sync_func, *args),
+        )
 
 # Shared state for background jobs
 cleanup_running = False
+housekeeping_running = False
 queue_sync_running = False
 inactive_pppoe_reconcile_running = False
 _last_safety_net_cleanup_at: datetime | None = None
@@ -569,8 +604,56 @@ async def remove_user_from_mikrotik(mac_address: str, db: AsyncSession) -> dict:
 # EXPIRED USER CLEANUP (background job)
 # =============================================================================
 
+# Tables expiry cleanup reads, ONCE per router per run. It used to re-read all
+# of them (plus up to four more inside get_client_ip_by_mac) for every single
+# customer: ~10 full-table downloads each, 2.5-7 s per customer on healthy
+# routers and 42 s on a slow link (router 210, measured 2026-09-25), so a
+# 15-customer batch there held its slot for ~10 minutes.
+_EXPIRY_SNAPSHOT_COMMANDS = {
+    "active": "/ip/hotspot/active/print",
+    "hosts": "/ip/hotspot/host/print",
+    "arp": "/ip/arp/print",
+    "leases": "/ip/dhcp-server/lease/print",
+    "bindings": "/ip/hotspot/ip-binding/print",
+    "users": "/ip/hotspot/user/print",
+    "queues": "/queue/simple/print",
+}
+
+
+def _removed_ok(result: dict) -> bool:
+    return bool(result.get("success")) or "error" not in result
+
+
+def _mac_of(entry: dict) -> str:
+    mac = entry.get("mac-address", "")
+    return normalize_mac_address(mac) if mac else ""
+
+
+def _client_ip_from_snapshot(snapshot: dict, mac: str) -> str | None:
+    """Same sources and order as MikroTikAPI.get_client_ip_by_mac."""
+    for entry in snapshot["active"]:
+        if _mac_of(entry) == mac and entry.get("address"):
+            return entry["address"]
+    for entry in snapshot["hosts"]:
+        if _mac_of(entry) == mac and (entry.get("address") or entry.get("to-address")):
+            return entry.get("address") or entry.get("to-address")
+    for entry in snapshot["arp"]:
+        if _mac_of(entry) == mac:
+            return entry.get("address")
+    for entry in snapshot["leases"]:
+        if _mac_of(entry) == mac:
+            return entry.get("address")
+    return None
+
+
 def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list) -> dict:
-    """Cleanup expired hotspot users on ONE router."""
+    """Cleanup expired hotspot users on ONE router.
+
+    Reads each table once, removes every expired customer's entries from that
+    snapshot, then re-reads the bindings once to verify. A customer counts as
+    removed only when its ip-binding (what grants access) is gone or was never
+    there, exactly as before.
+    """
     results = {"removed": [], "failed": [], "connected": False}
     if not customers_data:
         return results
@@ -594,16 +677,37 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
     results["connected"] = True
 
     try:
+        snapshot: dict[str, list] = {}
+        binding_fetch_failed = False
+        for name, command in _EXPIRY_SNAPSHOT_COMMANDS.items():
+            reply = api.send_command(command)
+            if not reply.get("success"):
+                if name == "bindings":
+                    binding_fetch_failed = True
+                    logger.error(f"[CRON] Failed to fetch IP bindings on {router_info['name']}: {reply.get('error', 'unknown')}")
+                snapshot[name] = []
+                continue
+            snapshot[name] = reply.get("data") or []
+
+        # Several customers can match one entry (a host by IP); remove it once.
+        gone: dict[str, set] = {name: set() for name in _EXPIRY_SNAPSHOT_COMMANDS}
+
+        def remove(table: str, command: str, entry_id: str) -> bool:
+            if entry_id in gone[table]:
+                return True
+            ok = _removed_ok(api.send_command(command, {"numbers": entry_id}))
+            if ok:
+                gone[table].add(entry_id)
+            return ok
+
+        outcomes: dict[int, dict] = {}
         for cust in customers_data:
             try:
                 normalized_mac = normalize_mac_address(cust["mac_address"])
                 username = normalized_mac.replace(":", "")
-                logger.info(f"[CRON] Processing expired customer {cust['id']}: {cust['name']} ({normalized_mac})")
                 removed = {"user": False, "binding_removed": False, "hosts": 0, "queues": 0, "leases": 0, "active_sessions": 0}
 
-                client_ip = api.get_client_ip_by_mac(normalized_mac)
-                if client_ip:
-                    logger.info(f"[CRON] Found client IP: {client_ip} for MAC {normalized_mac}")
+                client_ip = _client_ip_from_snapshot(snapshot, normalized_mac)
 
                 # Load-balancing hook: an LB_PAID entry outliving its ip-binding
                 # breaks the portal for the next holder of that IP, so remove it
@@ -614,11 +718,6 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
 
                         lb_removed = lb_remove_paid_entry(api, client_ip)
                         removed["lb_paid"] = lb_removed.get("removed", 0)
-                        if lb_removed.get("removed"):
-                            logger.info(
-                                f"[CRON] Removed {lb_removed['removed']} LB_PAID "
-                                f"entrie(s) for {client_ip}"
-                            )
                     except Exception as lb_exc:
                         logger.warning(
                             f"[CRON] LB_PAID removal failed for {client_ip} "
@@ -626,136 +725,93 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                         )
 
                 binding_found = False
-                binding_fetch_failed = False
-                bindings = api.send_command("/ip/hotspot/ip-binding/print")
-                if not bindings.get("success"):
-                    binding_fetch_failed = True
-                    logger.error(f"[CRON] Failed to fetch IP bindings for {normalized_mac}: {bindings.get('error', 'unknown')}")
-                elif bindings.get("data"):
-                    for b in bindings["data"]:
-                        binding_mac = b.get("mac-address", "").upper()
-                        binding_comment = b.get("comment", "")
-                        binding_id = b.get(".id")
-                        mac_match = normalize_mac_address(binding_mac) == normalized_mac if binding_mac else False
-                        username_match = f"USER:{username}" in binding_comment.upper()
-                        if mac_match or username_match:
-                            binding_found = True
-                            logger.info(f"[CRON] Found IP binding to remove: id={binding_id}, mac={binding_mac}, type={b.get('type', 'unknown')}")
-                            remove_result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
-                            if remove_result.get("success") or "error" not in remove_result:
-                                removed["binding_removed"] = True
-                                logger.info(f"[CRON] Successfully removed IP binding for {normalized_mac}")
-                            else:
-                                logger.error(f"[CRON] Failed to remove IP binding: {remove_result.get('error', 'unknown error')}")
-                    if not binding_found:
-                        logger.info(f"[CRON] No IP binding found for {normalized_mac} (may already be removed)")
-                else:
-                    logger.info(f"[CRON] No IP bindings on router (empty list)")
+                binding_remove_failed = False
+                for b in snapshot["bindings"]:
+                    mac_match = _mac_of(b) == normalized_mac
+                    username_match = f"USER:{username}" in b.get("comment", "").upper()
+                    if mac_match or username_match:
+                        binding_found = True
+                        if remove("bindings", "/ip/hotspot/ip-binding/remove", b.get(".id")):
+                            removed["binding_removed"] = True
+                        else:
+                            binding_remove_failed = True
+                            logger.error(f"[CRON] Failed to remove IP binding {b.get('.id')} for {normalized_mac}")
 
-                hosts = api.send_command("/ip/hotspot/host/print")
-                if hosts.get("success") and hosts.get("data"):
-                    for host in hosts["data"]:
-                        host_mac = host.get("mac-address", "").upper()
-                        host_ip = host.get("address", "")
-                        if normalize_mac_address(host_mac) == normalized_mac or host_ip == client_ip:
-                            api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
+                for host in snapshot["hosts"]:
+                    if _mac_of(host) == normalized_mac or (client_ip and host.get("address") == client_ip):
+                        if remove("hosts", "/ip/hotspot/host/remove", host[".id"]):
                             removed["hosts"] += 1
-                            logger.info(f"[CRON] Removed host entry: {host_mac} / {host_ip}")
 
-                users = api.send_command("/ip/hotspot/user/print")
-                if users.get("success") and users.get("data"):
-                    user_found = False
-                    for u in users["data"]:
-                        user_name = u.get("name", "")
-                        user_comment = u.get("comment", "")
-                        user_id = u.get(".id")
-                        name_match = user_name == username
-                        mac_in_comment = normalized_mac.upper() in user_comment.upper() or cust['mac_address'].upper() in user_comment.upper()
-                        if name_match or mac_in_comment:
-                            user_found = True
-                            logger.info(f"[CRON] Found hotspot user to remove: id={user_id}, name={user_name}")
-                            remove_result = api.send_command("/ip/hotspot/user/remove", {"numbers": user_id})
-                            if remove_result.get("success") or "error" not in remove_result:
-                                removed["user"] = True
-                                logger.info(f"[CRON] Successfully removed hotspot user: {user_name}")
-                            else:
-                                logger.error(f"[CRON] Failed to remove hotspot user: {remove_result.get('error', 'unknown error')}")
-                            break
-                    if not user_found:
-                        logger.info(f"[CRON] No hotspot user found for {username} (may already be removed)")
+                for u in snapshot["users"]:
+                    comment = u.get("comment", "").upper()
+                    if (u.get("name", "") == username
+                            or normalized_mac.upper() in comment
+                            or cust["mac_address"].upper() in comment):
+                        if remove("users", "/ip/hotspot/user/remove", u.get(".id")):
+                            removed["user"] = True
+                        break
 
-                active_sessions = api.send_command("/ip/hotspot/active/print")
-                if active_sessions.get("success") and active_sessions.get("data"):
-                    for session in active_sessions["data"]:
-                        session_mac = session.get("mac-address", "").upper()
-                        session_user = session.get("user", "").upper()
-                        session_ip = session.get("address", "")
-                        session_id = session.get(".id")
-                        mac_match = normalize_mac_address(session_mac) == normalized_mac if session_mac else False
-                        user_match = session_user == username.upper()
-                        if mac_match or user_match:
-                            logger.info(f"[CRON] Found active session to disconnect: id={session_id}, user={session_user}, ip={session_ip}")
-                            remove_result = api.send_command("/ip/hotspot/active/remove", {"numbers": session_id})
-                            if remove_result.get("success") or "error" not in remove_result:
-                                removed["active_sessions"] += 1
-                                logger.info(f"[CRON] Disconnected active session: {session_user} ({session_ip})")
-                            else:
-                                logger.error(f"[CRON] Failed to disconnect session: {remove_result.get('error', 'unknown error')}")
+                for session in snapshot["active"]:
+                    if (_mac_of(session) == normalized_mac
+                            or session.get("user", "").upper() == username.upper()):
+                        if remove("active", "/ip/hotspot/active/remove", session.get(".id")):
+                            removed["active_sessions"] += 1
 
-                queues = api.send_command("/queue/simple/print")
-                if queues.get("success") and queues.get("data"):
-                    for q in queues["data"]:
-                        queue_name = q.get("name", "")
-                        queue_comment = q.get("comment", "")
-                        if (queue_name == f"queue_{username}" or
-                            queue_name == f"plan_{username}" or
-                            normalized_mac.upper() in queue_comment.upper() or
-                            f"MAC:{cust['mac_address']}" in queue_comment):
-                            api.send_command("/queue/simple/remove", {"numbers": q[".id"]})
+                for q in snapshot["queues"]:
+                    queue_name = q.get("name", "")
+                    queue_comment = q.get("comment", "")
+                    if (queue_name in (f"queue_{username}", f"plan_{username}")
+                            or normalized_mac.upper() in queue_comment.upper()
+                            or f"MAC:{cust['mac_address']}" in queue_comment):
+                        if remove("queues", "/queue/simple/remove", q[".id"]):
                             removed["queues"] += 1
-                            logger.info(f"[CRON] Removed queue: {queue_name}")
 
-                leases = api.send_command("/ip/dhcp-server/lease/print")
-                if leases.get("success") and leases.get("data"):
-                    for lease in leases["data"]:
-                        if normalize_mac_address(lease.get("mac-address", "")) == normalized_mac:
-                            api.send_command("/ip/dhcp-server/lease/remove", {"numbers": lease[".id"]})
+                for lease in snapshot["leases"]:
+                    if _mac_of(lease) == normalized_mac:
+                        if remove("leases", "/ip/dhcp-server/lease/remove", lease[".id"]):
                             removed["leases"] += 1
-                            logger.info(f"[CRON] Removed DHCP lease for {normalized_mac}")
 
-                verify_bindings = api.send_command("/ip/hotspot/ip-binding/print")
-                if verify_bindings.get("success") and verify_bindings.get("data"):
-                    binding_still_exists = False
-                    for b in verify_bindings["data"]:
-                        if normalize_mac_address(b.get("mac-address", "")) == normalized_mac:
-                            binding_still_exists = True
-                            logger.error(f"[CRON] VERIFICATION FAILED: IP binding STILL EXISTS for {normalized_mac}!")
-                            retry_result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
-                            if retry_result.get("success") or "error" not in retry_result:
-                                logger.info(f"[CRON] Retry removal succeeded for {normalized_mac}")
-                                removed["binding_removed"] = True
-                            else:
-                                logger.error(f"[CRON] Retry removal FAILED: {retry_result.get('error', 'unknown')}")
-                            break
-                    if not binding_still_exists and removed.get("binding_removed"):
-                        logger.info(f"[CRON] VERIFICATION: IP binding successfully removed for {normalized_mac}")
-
-                if binding_fetch_failed:
-                    results["failed"].append({"id": cust["id"], "error": "Could not fetch IP bindings - user status unknown"})
-                    logger.error(f"[CRON] FAILED to check bindings for {cust['name']} - keeping ACTIVE for retry")
-                elif removed.get("binding_removed"):
-                    results["removed"].append({"id": cust["id"], "details": removed})
-                    logger.info(f"[CRON] Expired customer {cust['name']} FULLY removed: {removed}")
-                elif not binding_found:
-                    results["removed"].append({"id": cust["id"], "details": removed})
-                    logger.info(f"[CRON] Expired customer {cust['name']} had no binding (already removed): {removed}")
-                else:
-                    results["failed"].append({"id": cust["id"], "error": "IP binding removal failed - user may still have access"})
-                    logger.error(f"[CRON] FAILED to remove binding for {cust['name']} - keeping ACTIVE for retry")
-
+                outcomes[cust["id"]] = {
+                    "cust": cust, "mac": normalized_mac, "removed": removed,
+                    "binding_found": binding_found, "remove_failed": binding_remove_failed,
+                }
             except Exception as e:
                 results["failed"].append({"id": cust["id"], "error": str(e)})
                 logger.error(f"[CRON] Failed to remove customer {cust['id']}: {e}")
+
+        # One verification read for the whole batch: a binding still carrying
+        # an expired customer's MAC gets one more removal attempt.
+        still_bound: dict[str, str] = {}
+        if not binding_fetch_failed and any(o["binding_found"] for o in outcomes.values()):
+            verify = api.send_command("/ip/hotspot/ip-binding/print")
+            if verify.get("success"):
+                wanted = {o["mac"] for o in outcomes.values()}
+                for b in verify.get("data") or []:
+                    mac = _mac_of(b)
+                    if mac in wanted:
+                        still_bound[mac] = b.get(".id")
+
+        for customer_id, o in outcomes.items():
+            cust, removed = o["cust"], o["removed"]
+            if o["mac"] in still_bound:
+                logger.error(f"[CRON] VERIFICATION FAILED: IP binding STILL EXISTS for {o['mac']}!")
+                retry = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": still_bound[o["mac"]]})
+                if _removed_ok(retry):
+                    removed["binding_removed"] = True
+                    o["remove_failed"] = False
+                else:
+                    o["remove_failed"] = True
+                    logger.error(f"[CRON] Retry removal FAILED: {retry.get('error', 'unknown')}")
+
+            if binding_fetch_failed:
+                results["failed"].append({"id": customer_id, "error": "Could not fetch IP bindings - user status unknown"})
+                logger.error(f"[CRON] FAILED to check bindings for {cust['name']} - keeping ACTIVE for retry")
+            elif o["binding_found"] and o["remove_failed"]:
+                results["failed"].append({"id": customer_id, "error": "IP binding removal failed - user may still have access"})
+                logger.error(f"[CRON] FAILED to remove binding for {cust['name']} - keeping ACTIVE for retry")
+            else:
+                results["removed"].append({"id": customer_id, "details": removed})
+                logger.info(f"[CRON] Expired customer {cust['name']} removed: {removed}")
     finally:
         api.disconnect()
 
@@ -1449,7 +1505,7 @@ async def _deactivate_expired_identityless_customers(db: AsyncSession, now: date
 
 
 async def cleanup_expired_users_background():
-    global cleanup_running, _last_safety_net_cleanup_at, _last_access_credential_reaper_at
+    global cleanup_running
     if cleanup_running:
         logger.warning("[CRON] Previous cleanup still running, skipping this run")
         return
@@ -1702,10 +1758,9 @@ async def cleanup_expired_users_background():
             connected_router_ids: set[int] = set()
             if router_customers_map:
                 async def _hotspot_task(rk, rd):
-                    async with router_locks.acquire(rk):
-                        return await asyncio.to_thread(
-                            _cleanup_single_router_hotspot_sync, rd["router"], rd["customers"],
-                        )
+                    return await _run_expiry_router_cleanup(
+                        rk, _cleanup_single_router_hotspot_sync, rd["router"], rd["customers"],
+                    )
 
                 hotspot_items = list(router_customers_map.items())
                 hotspot_outcomes = await asyncio.gather(
@@ -1729,10 +1784,9 @@ async def cleanup_expired_users_background():
             pppoe_results = {"removed": [], "failed": [], "routers_connected": 0}
             if router_pppoe_map:
                 async def _pppoe_task(rk, rd):
-                    async with router_locks.acquire(rk):
-                        return await asyncio.to_thread(
-                            _cleanup_single_router_pppoe_sync, rd["router"], rd["customers"],
-                        )
+                    return await _run_expiry_router_cleanup(
+                        rk, _cleanup_single_router_pppoe_sync, rd["router"], rd["customers"],
+                    )
 
                 pppoe_items = list(router_pppoe_map.items())
                 pppoe_outcomes = await asyncio.gather(
@@ -1991,34 +2045,6 @@ async def cleanup_expired_users_background():
                         f"(hotspot={len(mikrotik_results['removed'])}, pppoe={len(pppoe_results['removed'])}), "
                         f"{failed_total} failed")
 
-            now_optional = datetime.utcnow()
-            if _background_db_pool_is_busy("CRON-SAFETY-NET"):
-                logger.warning("[CRON] Skipping safety net and access credential reaper due to DB pool pressure")
-                return
-
-            try:
-                if _interval_due(_last_safety_net_cleanup_at, now_optional, SAFETY_NET_CLEANUP_MIN_INTERVAL):
-                    logger.info("[CRON] Running safety net bypass cleanup...")
-                    _last_safety_net_cleanup_at = now_optional
-                    bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
-                    if bypass_cleaned > 0:
-                        logger.warning(f"[CRON] Safety net removed {bypass_cleaned} orphaned IP bindings!")
-                else:
-                    logger.debug("[CRON] Safety net cleanup not due yet")
-            except Exception as bypass_err:
-                logger.error(f"[CRON] Safety net cleanup failed: {bypass_err}")
-
-            try:
-                if _interval_due(_last_access_credential_reaper_at, now_optional, ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL):
-                    _last_access_credential_reaper_at = now_optional
-                    released = await _reap_idle_access_credentials(db)
-                    if released:
-                        logger.info(f"[CRON] Released {released} idle access credential(s)")
-                else:
-                    logger.debug("[CRON] Access credential reaper not due yet")
-            except Exception as reap_err:
-                logger.error(f"[CRON] Access credential reaper failed: {reap_err}")
-
     except Exception as e:
         from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
         from app.db.database import db_pool_status
@@ -2028,6 +2054,47 @@ async def cleanup_expired_users_background():
             logger.error("[CRON] DB pool status at cleanup failure: %s", db_pool_status())
     finally:
         cleanup_running = False
+
+
+async def expiry_housekeeping_background():
+    """Safety-net bypass scan and idle access-credential reaper.
+
+    These used to run at the tail of cleanup_expired_users_background, and the
+    fleet-wide safety-net scan (5-6 min per pass on 2026-09-25) held that job
+    for its whole duration: no expired customer was removed for 5-6 minutes
+    out of every ~10. On their own schedule they keep their cadence (the
+    interval guards below) without delaying removals.
+    """
+    global housekeeping_running, _last_safety_net_cleanup_at, _last_access_credential_reaper_at
+    if housekeeping_running:
+        return
+    if _background_db_pool_is_busy("CRON-SAFETY-NET"):
+        return
+    housekeeping_running = True
+    try:
+        now = datetime.utcnow()
+        try:
+            if _interval_due(_last_safety_net_cleanup_at, now, SAFETY_NET_CLEANUP_MIN_INTERVAL):
+                logger.info("[CRON] Running safety net bypass cleanup...")
+                _last_safety_net_cleanup_at = now
+                async with async_session() as db:
+                    bypass_cleaned = await _cleanup_bypassing_for_all_routers(db)
+                if bypass_cleaned > 0:
+                    logger.warning(f"[CRON] Safety net removed {bypass_cleaned} orphaned IP bindings!")
+        except Exception as bypass_err:
+            logger.error(f"[CRON] Safety net cleanup failed: {bypass_err}")
+
+        try:
+            if _interval_due(_last_access_credential_reaper_at, now, ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL):
+                _last_access_credential_reaper_at = now
+                async with async_session() as db:
+                    released = await _reap_idle_access_credentials(db)
+                if released:
+                    logger.info(f"[CRON] Released {released} idle access credential(s)")
+        except Exception as reap_err:
+            logger.error(f"[CRON] Access credential reaper failed: {reap_err}")
+    finally:
+        housekeeping_running = False
 
 
 # =============================================================================
