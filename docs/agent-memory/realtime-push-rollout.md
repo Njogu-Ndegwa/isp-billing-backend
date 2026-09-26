@@ -1,4 +1,4 @@
-# Real-time usage push (v2) — rollout record and rules
+# Real-time usage push (v3) — rollout record and rules
 
 Single source of truth for the router push agent (`bitwave-usage-push`). **Read
 this before installing, editing or copying any push script on a router.**
@@ -29,7 +29,14 @@ Owner: the "Real-time customer metrics" session (handed over 2026-09-25 from
   next report catches up. (The old internet push reported through tunnel
   outages — known trade-off, accepted by Dennis.)
 
-## Server behaviour for pilot routers (`REALTIME_PILOT_ROUTER_IDS`)
+## Which routers are on it
+
+A router is on the real-time push when it is listed in `REALTIME_PILOT_ROUTER_IDS`
+**or** has sent a v3 report in the last 15 min (`realtime_state.note_realtime_report`).
+Only the installer puts v3 on a router, so installing is the opt-in and restoring
+the old script is the opt-out. No redeploy per batch.
+
+## Server behaviour for real-time routers
 
 - Hotspot usage metered per device from host counters (`host:<MAC>` rows);
   PPPoE from its session queue. Poller and cap sampler stand down only while
@@ -51,43 +58,37 @@ Owner: the "Real-time customer metrics" session (handed over 2026-09-25 from
 
 ## Tools
 
-- Install / update: `scripts/realtime_push_install.py` (dry run unless
-  `APPLY=1`; refuses unencrypted tunnels; prints what it does):
-  `docker exec -e ROUTER_IDS=... [-e APPLY=1] -i isp_billing_hetzner_app python - < scripts/realtime_push_install.py`
-- Rollback on a router: `/system scheduler remove [find name="bitwave-usage-push"]; /system script remove [find name="bitwave-usage-push"]`
-  (the poller takes the router back within 6 min).
+- Install / update / roll back: `scripts/realtime_push_install.py`. Dry run unless `APPLY=1`.
+  - `ROLLBACK=1` restores `bitwave-usage-push-prev` (kept on the router at install), or removes the push when there was none.
+  - `SKIP_RUN=1` skips the first run over the API, so the scheduler's first tick sends it.
+  - It detects the WAN (active default route), refuses unencrypted tunnels and skips hAP lite/mini (see below).
+  - It prints one `RESULT` JSON line per router.
+  - Always take the installer from `origin/main` after a merge: a stale copy put the push on a hAP lite (439) on 2026-09-26.
 
-## Router status (2026-09-25)
+  `docker exec -e ROUTER_IDS=... [-e APPLY=1|-e ROLLBACK=1] [-e SKIP_RUN=1] -i isp_billing_hetzner_app python - < scripts/realtime_push_install.py`
+- Rejected reports are logged as `[USAGE-PUSH] 422 from <identity> via <channel>: <field> <text>`.
+- Measuring what we cost a router: `/tool profile duration=60` (read-only). Scripts show as `console`; API logins and fetches show as `management`; TLS shows as `ssl`/`ssld`.
 
-| Router | Board / ROS | Push | Notes |
-|---|---|---|---|
-| 10 Bitwave Wangige | RB4011, 7.14 | v2 tunnel 60 s | pilot; also SNMP pilot |
-| 487 OPIC #2 | RB4011, 7.21.4 | v2 tunnel 60 s | pilot; hotspot + PPPoE |
-| 390 aplite Gataka | hAP lite, 6.49.6 | v2 tunnel 60 s | pilot; measured below |
-| 351 HOME951, 426 LEADERS APLITE | RB951 / hAP lite | none | pilot list, unreachable — install when back |
-| 141, 256, 118, 224, 163 | mixed | v1 + health, 2 min HTTPS | old "stage 1"; replace with v2 |
-| 371 lee net, 195 Bilawaya | hAP lite / RB951 | — | SNMP pilot (cross-check ~1 week) |
+## Fleet status (2026-09-26, end of rollout day)
 
-Measured on hAP lite 390: one HTTPS request 4.9–6.8 s at 100% CPU; one tunnel
-HTTP request 1.4–1.9 s; building the report 0.7–1.4 s. Average CPU at ~60 s:
-51% over HTTPS, 19–23% over the tunnel (baseline ~14%).
+- **On the push: 52 routers** (RB951, hEX S, RB4011, RB5009, L009, hAP ax, hAP ac lite; ROS 6.49 to 7.24; WireGuard / SSTP / L2TP+IPsec). All reporting every minute; no rejected reports since #121.
+- **Cost measured with `/tool profile` (60 s):** usage push + expiry reaper = 1–3% CPU on an RB951, under 1% on RB4011/RB5009/hAP ax.
+  - The big cost was `bitwave-checkin` at 10 s over HTTPS: 30–45% on RB951s. Fixed by #124 (other session): 221 went from 85% to 16% CPU, 316 from 64% to 23%.
+- **Server at ~50 routers:** app ~5–17% CPU, DB ~5%, pool 0–2.
+- The first reports also cleared hundreds of shadowing queues (e.g. 57 on 247, 54 on 446, 50 on 316).
 
-## Held back (and why)
+## Not on the push (and why)
 
-- 221 KARAMA, 247 Jomvu, 227 Beyond #1, 218 hEX S: multi-WAN / failover
-  routing (the report's WAN figure reads `ether1` only). 227 = dual-WAN PCC
-  with LB_PAID.
-- 222 Ella net: CPU-optimised RB951.
-- 174 Kenny #3, 258 ENNIKO: CPU spikes (47–55%).
-- 184 sad #3, 308 dee.maria, 75 Kaloleni: CPU 69–86% at survey time.
-- 371 lee net: 100% CPU every evening from ~17:00 EAT.
-- 530 Githurai: no encrypted tunnel to Hetzner.
+- **hAP lite / hAP mini (smips, 32 MB): stay on server polling — Dennis's decision, 2026-09-26.** With the push on top of our other schedulers (watchdog, check-in, command agent, reaper), 483 and 486 sat at 100% CPU with ~5 MB free and a paying customer's access was delayed ~11 min. The push was rolled back on all of them.
+  - The installer skips them (`ALLOW_SMALL=1` overrides; don't use it).
+  - The server answers any v3 report from one with `next_push_seconds=3600`.
+- 351 HOME951: tunnel ping fails, so HTTPS; 80–90% CPU on an RB951. Rolled back.
+- 131 Major1 Net: RouterOS device-mode "configuration flagged" blocks adding the scheduler. A security flag; needs the physical button.
+- 365 / 367 Yetunet: the API connection drops on every script upload.
+- 210 Lux, 378 TSJFIBERNET (on the push, down since 14:09 UTC): offline. 426 LEADERS: no encrypted tunnel.
 
-## Next (pending Dennis)
+## Gotchas learnt
 
-1. Canaries, one day each measured like 390: 224 (RB951, ROS 6), 163 (RB951,
-   7.20), 521 (RB951, 7.24), 478 (hAP lite, 6 MB free).
-2. Then ~10 routers/day: first the v1 routers, then those with no push.
-3. Automation: add v2 to provisioning (via the backup tunnel it already
-   creates) + a daily sweep that installs/updates on reachable eligible routers;
-   drop the static pilot list in favour of "v2 reports are arriving".
+- ROS 7 returns **empty** values for an entry that disappears between `find` and `get`. Every unquoted JSON field must be type-checked, or the whole report is rejected (#121).
+- ROS 7 drivers can return empty counters (RB4011 rx-error, #109).
+- `routers.last_online_at` only moves when something touches the router, so a quiet router looks offline. Check with ping + tcp/8728 from the host before calling one down.
