@@ -70,6 +70,36 @@ def test_hostname_non_vendor_returns_none():
     assert vendor_from_hostname("my-tenda-box") is None
 
 
+def test_hostname_vendor_model_names_seen_in_the_fleet():
+    # Default hostnames/identities captured from live routers (survey 2026-09-26).
+    # The first one is the AP on Bitwave Wangige ether6 that showed no equipment.
+    assert vendor_from_hostname("RAP6262G-A51ACD") == "Ruijie"
+    assert vendor_from_hostname("RAP62-OD-58B4BB") == "Ruijie"
+    assert vendor_from_hostname("ES205GC") == "Ruijie"
+    assert vendor_from_hostname("EG105G-P") == "Ruijie"
+    assert vendor_from_hostname("EAP110-Outdoor-C0-3A-55-FE-49-42") == "TP-Link"
+    assert vendor_from_hostname("CPE210_MtaaLink") == "TP-Link"
+    assert vendor_from_hostname("TL-WR840N") == "TP-Link"
+    assert vendor_from_hostname("NanoStation loco M2") == "Ubiquiti"
+    assert vendor_from_hostname("LiteBeam M5") == "Ubiquiti"
+    assert vendor_from_hostname("UAP-AC-Lite") == "Ubiquiti"
+
+
+def test_hostname_model_patterns_ignore_ordinary_names():
+    for name in ("Rapha-phone", "Eapen-PC", "Esther-PC", "cpe", "Decorator", "egg",
+                 "android-1b03699d6a", "Galaxy-A05", "Infinix-SMART-20", "itel-A05s"):
+        assert vendor_from_hostname(name) is None, name
+
+
+def test_oui_vendors_identified_by_their_own_announcements():
+    # MAC prefixes of devices that announced their make over neighbor discovery.
+    assert vendor_from_mac("10:5F:02:A5:1A:CD") == "Ruijie"
+    assert vendor_from_mac("58:B4:BB:19:24:85") == "Ruijie"
+    assert vendor_from_mac("10:5A:95:60:FE:90") == "TP-Link"
+    assert vendor_from_mac("F4:92:BF:B2:82:38") == "Ubiquiti"
+    assert vendor_from_mac("D0:EA:11:00:00:01") == "MikroTik"
+
+
 # ---------------------------------------------------------------------------
 # Hotspot subnet inference + gateway-claim detection
 # ---------------------------------------------------------------------------
