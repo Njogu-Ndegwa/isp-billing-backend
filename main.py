@@ -1646,10 +1646,40 @@ async def run_fup_usage_migrations():
             "ON router_usage_buckets (bucket_start)"
         ))
 
+        # Per-customer hourly usage ledger (top users over any window,
+        # 2026-09-26). Written by record_usage alongside router_usage_buckets.
+        await conn.execute(sa_text(
+            """
+            CREATE TABLE IF NOT EXISTS customer_usage_buckets (
+                id SERIAL PRIMARY KEY,
+                customer_id INTEGER NOT NULL REFERENCES customers(id),
+                router_id INTEGER REFERENCES routers(id),
+                bucket_start TIMESTAMP NOT NULL,
+                upload_bytes BIGINT NOT NULL DEFAULT 0,
+                download_bytes BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_customer_usage_bucket UNIQUE (customer_id, bucket_start)
+            )
+            """
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_customer_usage_buckets_customer_id "
+            "ON customer_usage_buckets (customer_id)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_customer_usage_buckets_bucket_start "
+            "ON customer_usage_buckets (bucket_start)"
+        ))
+        await conn.execute(sa_text(
+            "CREATE INDEX IF NOT EXISTS ix_customer_usage_buckets_router_start "
+            "ON customer_usage_buckets (router_id, bucket_start)"
+        ))
+
         logger.info(
             "Migration: Ensured FUP enum, plans/user_bandwidth_usage columns, "
             "bandwidth snapshot service counters, customer_usage_periods table, "
-            "usage_cap_watch_state table, and router_usage_buckets ledger"
+            "usage_cap_watch_state table, router_usage_buckets and "
+            "customer_usage_buckets ledgers"
         )
 
 

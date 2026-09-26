@@ -665,7 +665,54 @@ async def get_mikrotik_health(
         background_tasks, router_id=router_id, include_sessions=include_sessions,
         prefer_snapshot=prefer_snapshot, db=db, token=token,
         skip_live_refresh=_push_covers_live_fields(health, now))
-    return _apply_router_health(result, health, datetime.utcnow())
+    result = _apply_router_health(result, health, datetime.utcnow())
+    return _apply_live_push(result, router_id)
+
+
+# How fresh the router's own report must be to replace the snapshot's 5-minute
+# average and the (skipped) RouterOS interface read.
+LIVE_PUSH_MAX_AGE_SECONDS = 180
+
+
+def _apply_live_push(result, router_id: Optional[int]):
+    """For routers on the real-time push: current Mbps is the router's own
+    per-report WAN rate (not a 5-minute snapshot average), and the interfaces
+    panel shows the ports from its report (the RouterOS login that used to fill
+    it is skipped for pushing routers). Pure w.r.t. the DB."""
+    from app.services import realtime_state
+
+    if not isinstance(result, dict) or not router_id:
+        return result
+    state = realtime_state.get_router_live(router_id)
+    if state is None:
+        return result
+    age = (datetime.utcnow() - state.received_at).total_seconds()
+    if age > LIVE_PUSH_MAX_AGE_SECONDS:
+        return result
+    if state.wan_rx_bps is not None and state.wan_tx_bps is not None:
+        result["bandwidth"] = {
+            "download_mbps": round(state.wan_rx_bps / 1_000_000, 2),
+            "upload_mbps": round(state.wan_tx_bps / 1_000_000, 2),
+        }
+        result["snapshot_age_seconds"] = round(age, 1)
+        result["bandwidth_source"] = "push"
+    if state.ports:
+        result["interfaces"] = [
+            {
+                "name": p["name"],
+                "type": "ether" if p["name"].startswith(("ether", "sfp", "combo", "qsfp")) else "wlan",
+                "running": bool(p.get("running")),
+                "disabled": bool(p.get("disabled")),
+                "rx_byte": int(p.get("rx_bytes") or 0),
+                "tx_byte": int(p.get("tx_bytes") or 0),
+                "rx_packet": int(p.get("rx_packets") or 0),
+                "tx_packet": int(p.get("tx_packets") or 0),
+                "rx_error": int(p.get("rx_errors") or 0),
+                "tx_error": int(p.get("tx_errors") or 0),
+            }
+            for p in state.ports
+        ]
+    return result
 
 
 async def _get_mikrotik_health_impl(
@@ -1582,24 +1629,56 @@ async def get_bandwidth_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+TOP_USERS_WINDOWS = {
+    "1h": "Last hour",
+    "today": "Today",
+    "7d": "Last 7 days",
+    "30d": "Last 30 days",
+}
+
+
+def _top_users_window(window: str, now: datetime) -> tuple[datetime, datetime, str]:
+    """(start, end, label) of a top-users window, in UTC. 'today' starts at local midnight."""
+    if window == "1h":
+        return now - timedelta(hours=1), now, TOP_USERS_WINDOWS["1h"]
+    if window == "7d":
+        return now - timedelta(days=7), now, TOP_USERS_WINDOWS["7d"]
+    if window == "30d":
+        return now - timedelta(days=30), now, TOP_USERS_WINDOWS["30d"]
+    offset = timedelta(hours=settings.LOCAL_UTC_OFFSET_HOURS)
+    local_now = now + offset
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return local_midnight - offset, now, TOP_USERS_WINDOWS["today"]
+
+
 @router.get("/api/mikrotik/top-users")
 async def get_top_bandwidth_users(
-    limit: int = 10, 
+    limit: int = 10,
     router_id: Optional[int] = None,
+    window: str = "today",
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """
-    Get top bandwidth users sorted by total download.
-    Reads from cached DB data (updated every 2 min by background job).
-    
+    """Top customers by data actually used in a time window.
+
+    Summed from the per-customer hourly usage ledger (customer_usage_buckets),
+    which record_usage writes in the same transaction that credits each
+    customer — the same numbers as their usage bars and caps. Replaces the old
+    "live" list, which ranked lifetime router queue counters and put customers
+    who expired months ago at the top.
+
     Query params:
-    - limit: Number of top users to return (default 10)
-    - router_id: Optional router ID to filter users for a specific router
+    - window: 1h | today (since local midnight) | 7d | 30d
+    - router_id: optional; otherwise all routers the caller can see
+    - limit: number of customers (default 10, max 100)
     """
+    from app.db.models import CustomerUsageBucket
+
     try:
         user = await get_current_user(token, db)
-        
+        window = window if window in TOP_USERS_WINDOWS else "today"
+        limit = max(1, min(int(limit or 10), 100))
+
         router_name = None
         if router_id:
             router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
@@ -1607,96 +1686,100 @@ async def get_top_bandwidth_users(
                 raise HTTPException(status_code=404, detail="Router not found or not accessible")
             router_name = router_obj.name
 
-        if user.role.value == "admin" and not router_id:
-            owned_router_filter = None
-        else:
-            owned_router_ids = select(Router.id).where(Router.user_id == user.id)
-            owned_router_filter = Customer.router_id.in_(owned_router_ids)
+        now = datetime.utcnow()
+        window_start, window_end, window_label = _top_users_window(window, now)
 
-        base_join = select(
-            UserBandwidthUsage,
-            Customer,
-            Plan.connection_type.label("connection_type"),
-        ).join(
-            Customer, UserBandwidthUsage.customer_id == Customer.id
-        ).outerjoin(Plan, Customer.plan_id == Plan.id)
-
+        scope = []
         if router_id:
-            query = base_join.where(
-                Customer.router_id == router_id
-            ).order_by(UserBandwidthUsage.download_bytes.desc()).limit(limit)
-        elif owned_router_filter is not None:
-            query = base_join.where(
-                owned_router_filter
-            ).order_by(UserBandwidthUsage.download_bytes.desc()).limit(limit)
-        else:
-            query = base_join.order_by(
-                UserBandwidthUsage.download_bytes.desc()
-            ).limit(limit)
-        
-        result = await db.execute(query)
-        usage_records = result.all()
-        
+            scope.append(CustomerUsageBucket.router_id == router_id)
+        elif user.role.value != "admin":
+            scope.append(CustomerUsageBucket.router_id.in_(select(Router.id).where(Router.user_id == user.id)))
+
+        # Hourly buckets: a bucket belongs to the window when its hour overlaps it.
+        in_window = [
+            CustomerUsageBucket.bucket_start >= window_start.replace(minute=0, second=0, microsecond=0),
+            CustomerUsageBucket.bucket_start <= window_end,
+            *scope,
+        ]
+        upload_sum = func.coalesce(func.sum(CustomerUsageBucket.upload_bytes), 0)
+        download_sum = func.coalesce(func.sum(CustomerUsageBucket.download_bytes), 0)
+        ranked = (
+            select(
+                CustomerUsageBucket.customer_id,
+                upload_sum.label("up"),
+                download_sum.label("down"),
+            )
+            .where(*in_window)
+            .group_by(CustomerUsageBucket.customer_id)
+            .having((upload_sum + download_sum) > 0)
+            .order_by((upload_sum + download_sum).desc())
+        )
+        rows = (await db.execute(ranked.limit(limit))).all()
+        total_tracked = (
+            await db.execute(select(func.count()).select_from(ranked.subquery()))
+        ).scalar() or 0
+        history_since = (
+            await db.execute(select(func.min(CustomerUsageBucket.bucket_start)).where(*scope))
+        ).scalar()
+
+        customers = {}
+        if rows:
+            customer_rows = await db.execute(
+                select(Customer, Plan.connection_type)
+                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                .where(Customer.id.in_([r.customer_id for r in rows]))
+            )
+            customers = {c.id: (c, ct) for c, ct in customer_rows.all()}
+
+        mb = 1024 * 1024
         users = []
-        for u, customer, connection_type in usage_records:
-            total_bytes = u.upload_bytes + u.download_bytes
-            connection_value = (
-                connection_type.value
-                if hasattr(connection_type, "value")
-                else connection_type
+        for customer_id, up, down in rows:
+            customer, connection_type = customers.get(customer_id, (None, None))
+            connection_value = getattr(connection_type, "value", connection_type) or (
+                "pppoe" if customer is not None and customer.pppoe_username and not customer.mac_address else "hotspot"
             )
-            if not connection_value:
-                connection_value = "pppoe" if str(u.mac_address or "").startswith("pppoe:") else "hotspot"
             identifier = (
-                customer.pppoe_username
-                if connection_value == "pppoe"
-                else customer.mac_address
+                (customer.pppoe_username if connection_value == "pppoe" else customer.mac_address)
+                if customer is not None else None
             )
-            
+            up, down = int(up or 0), int(down or 0)
             users.append({
-                "mac": u.mac_address,
-                "target": u.target_ip,
-                "queueName": u.queue_name,
+                "mac": identifier or f"customer:{customer_id}",
+                "target": "",
+                "queueName": "",
                 "connectionType": connection_value,
                 "serviceLabel": "PPPoE" if connection_value == "pppoe" else "Hotspot",
                 "identifier": identifier,
-                "uploadBytes": u.upload_bytes,
-                "downloadBytes": u.download_bytes,
-                "totalBytes": total_bytes,
-                "uploadMB": round(u.upload_bytes / (1024 * 1024), 2),
-                "downloadMB": round(u.download_bytes / (1024 * 1024), 2),
-                "totalMB": round(total_bytes / (1024 * 1024), 2),
-                "downloadGB": round(u.download_bytes / (1024 * 1024 * 1024), 2),
-                "maxLimit": u.max_limit,
-                "lastUpdated": u.last_updated.isoformat() if u.last_updated else None,
-                "customerId": u.customer_id,
-                "customerName": customer.name,
-                "customerPhone": customer.phone,
-                "routerId": customer.router_id
+                "uploadBytes": up,
+                "downloadBytes": down,
+                "totalBytes": up + down,
+                "uploadMB": round(up / mb, 2),
+                "downloadMB": round(down / mb, 2),
+                "totalMB": round((up + down) / mb, 2),
+                "downloadGB": round(down / (mb * 1024), 2),
+                "maxLimit": "",
+                "currentRate": "0/0",
+                "disabled": False,
+                "customerId": customer_id,
+                "customerName": customer.name if customer is not None else None,
+                "customerPhone": customer.phone if customer is not None else None,
             })
-        
-        if router_id:
-            count_query = select(func.count()).select_from(UserBandwidthUsage).join(
-                Customer, UserBandwidthUsage.customer_id == Customer.id
-            ).where(Customer.router_id == router_id)
-        elif owned_router_filter is not None:
-            count_query = select(func.count()).select_from(UserBandwidthUsage).join(
-                Customer, UserBandwidthUsage.customer_id == Customer.id
-            ).where(owned_router_filter)
-        else:
-            count_query = select(func.count()).select_from(UserBandwidthUsage).join(
-                Customer, UserBandwidthUsage.customer_id == Customer.id
-            )
-        count_result = await db.execute(count_query)
-        total_count = count_result.scalar() or 0
-        
+
         return {
             "router_id": router_id,
             "router_name": router_name,
+            "window": window,
+            "windowLabel": window_label,
+            "windowStart": window_start.isoformat(),
+            "windowEnd": window_end.isoformat(),
+            # Hourly history began when the ledger shipped; a window reaching
+            # further back is only partly covered.
+            "historySince": history_since.isoformat() if history_since else None,
+            "windowFullyCovered": bool(history_since and history_since <= window_start),
             "topUsers": users,
-            "totalTracked": total_count,
-            "totalQueues": total_count,
-            "generatedAt": datetime.utcnow().isoformat()
+            "totalTracked": total_tracked,
+            "totalQueues": total_tracked,
+            "generatedAt": now.isoformat(),
         }
     except HTTPException:
         raise

@@ -223,6 +223,15 @@
   "support_rating",
   "value_for_money"
  ],
+ "customer_usage_buckets": [
+  "bucket_start",
+  "customer_id",
+  "download_bytes",
+  "id",
+  "router_id",
+  "updated_at",
+  "upload_bytes"
+ ],
  "customer_usage_periods": [
   "cap_mb_snapshot",
   "closed_at",

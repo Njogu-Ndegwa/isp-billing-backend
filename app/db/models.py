@@ -787,6 +787,30 @@ class RouterUsageBucket(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
+class CustomerUsageBucket(Base):
+    """Per-customer hourly ledger of bytes credited (2026-09-26).
+
+    Written by ``record_usage`` in the same transaction that credits the
+    customer's period, like ``RouterUsageBucket`` — so "top users over the last
+    hour / today / 7 days / 30 days" is a sum over real credited usage for any
+    window, instead of lifetime router counters (which ranked customers who
+    expired months ago at the top). ``router_id`` is the router the usage was
+    credited on. Retention: see ``CUSTOMER_USAGE_BUCKET_RETENTION_DAYS``.
+    """
+    __tablename__ = "customer_usage_buckets"
+    __table_args__ = (
+        UniqueConstraint("customer_id", "bucket_start", name="uq_customer_usage_bucket"),
+        Index("ix_customer_usage_buckets_router_start", "router_id", "bucket_start"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
+    bucket_start = Column(DateTime, nullable=False, index=True)
+    upload_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    download_bytes = Column(BigInteger, default=0, server_default="0", nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class UserBandwidthUsage(Base):
     """Track cumulative bandwidth usage per user for top downloaders.
 
