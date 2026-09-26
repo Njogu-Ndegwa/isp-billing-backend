@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     REALTIME_PUSH_INTERVAL_OVERRIDES: str = "351:120,390:120,426:120"
     # Where pilot routers post when their tunnel reaches this server.
     REALTIME_TUNNEL_PUSH_URL: str = "http://10.251.0.1/api/router/usage-push"
+    # Router expiry reaper (app/services/expiry_reaper_script.py): tried in this
+    # order. The tunnel one is plain HTTP inside the management tunnel (Caddy's
+    # 10.251.0.1:8088 site); public HTTPS costs a hAP lite ~5-7 s of full CPU.
+    EXPIRY_REAPER_TUNNEL_URL: str = "http://10.251.0.1:8088/api/router/expiry-check"
+    EXPIRY_REAPER_PUBLIC_URL: str = "https://isp.bitwavetechnologies.net/api/router/expiry-check"
     # Router check-in delivery pilot (2026-09-26). The router POSTs the MACs of
     # its app-tagged bypass bindings to /api/router/checkin; the server answers
     # with the paid MACs it is missing. Off by default, and only routers listed

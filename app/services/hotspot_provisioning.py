@@ -506,6 +506,7 @@ def _call_mikrotik_bypass_sync(hotspot_payload: dict, verify_only: bool = False)
             router_ip,
             router_username,
             router_password,
+            expiry=hotspot_payload.get("customer_expiry"),
         )
 
         logger.info("[PROVISION] MikroTik API response: %s", provision_result)
