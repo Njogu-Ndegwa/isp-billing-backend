@@ -186,6 +186,10 @@ from app.services.mikrotik_lb_background import reconcile_lb_paid_background
 from app.services.payment_port_attribution import attribute_recent_payment_ports_background
 from app.services.router_status_alerts import scan_and_notify_offline_routers
 from app.services.router_overload_alerts import poll_router_cpu, scan_payment_overload
+from app.services.router_reachability_probe import (
+    PROBE_INTERVAL_SECONDS as ROUTER_REACHABILITY_PROBE_SECONDS,
+    probe_router_reachability,
+)
 from app.services.customer_expiry_notifications import scan_customer_expiry_reminders
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_background
@@ -2565,6 +2569,20 @@ async def run_router_status_alert_migrations():
     logger.info("Router status-alert migrations complete")
 
 
+async def run_router_reachability_probe_migrations():
+    """Record, once, when the reachability probe went live: outages that began
+    before it are not announced to resellers (router_status_alerts
+    OUTAGE_ALERTS_FROM_SETTING). ON CONFLICT DO NOTHING keeps the first value
+    across restarts. Idempotent."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            INSERT INTO app_settings (key, value)
+            VALUES ('router_outage_alerts_from',
+                    to_char(timezone('utc', now()), 'YYYY-MM-DD"T"HH24:MI:SS'))
+            ON CONFLICT (key) DO NOTHING
+        """))
+
+
 async def run_router_overload_alert_migrations():
     """Columns for router overload alerts and SNMP CPU monitoring. All nullable
     or defaulted, so existing rows keep today's behaviour (no router is SNMP
@@ -3012,6 +3030,7 @@ async def startup_event():
     try:
         await run_router_status_alert_migrations()
         await run_router_overload_alert_migrations()
+        await run_router_reachability_probe_migrations()
         logger.info("Router status-alert migrations completed successfully")
     except Exception as e:
         logger.error(f"Router status-alert migration failed (non-fatal): {e}")
@@ -3132,6 +3151,15 @@ async def startup_event():
         name='Send opt-in router offline alerts (DB-only, debounced)',
         replace_existing=True,
         max_instances=1
+    )
+    scheduler.add_job(
+        probe_router_reachability,
+        trigger=IntervalTrigger(seconds=ROUTER_REACHABILITY_PROBE_SECONDS),
+        id='router_reachability_probe',
+        name='Keep router online/offline status current (bare TCP connect to the API port, no login)',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         scan_payment_overload,
