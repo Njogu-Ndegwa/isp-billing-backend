@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
@@ -17,6 +17,7 @@ from app.services.provisioning import (
     complete_provisioning,
     is_token_expired,
     derive_insurance_ip,
+    router_mgmt_ca_pem,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,11 +114,16 @@ async def create_provision_token(
             "then tap the physical reset button on the router (quick tap, do NOT hold)."
         )
 
+    if token_obj.management_tunnel == "sstp":
+        # v6 tokens issued under PROVISION_MGMT_TO_HETZNER use SSTP, not L2TP.
+        note = note.replace("(L2TP/IPsec VPN)", "(SSTP management tunnel)")
+
     return {
         "token": token_obj.token,
         "router_name": token_obj.router_name,
         "identity": token_obj.identity,
         "vpn_type": token_obj.vpn_type,
+        "management_tunnel": token_obj.management_tunnel,
         "is_routerboard": token_obj.is_routerboard,
         "vpn_ip": token_obj.wireguard_ip,
         "backup_vpn_ip": derive_insurance_ip(token_obj.wireguard_ip),
@@ -149,6 +155,7 @@ async def list_provision_tokens(
             "router_name": t.router_name,
             "identity": t.identity,
             "vpn_type": t.vpn_type,
+            "management_tunnel": t.management_tunnel,
             "is_routerboard": t.is_routerboard,
             "vpn_ip": t.wireguard_ip,
             "backup_vpn_ip": derive_insurance_ip(t.wireguard_ip),
@@ -164,6 +171,25 @@ async def list_provision_tokens(
 
 
 # ── Public endpoints (called by the MikroTik during provisioning) ────────
+
+
+# Declared before /api/provision/{provision_token} so the literal path wins.
+@router.get("/api/provision/router-mgmt-ca.crt")
+async def serve_router_mgmt_ca():
+    """Public CA certificate that signed the SSTP management server's cert.
+
+    RouterOS 6 routers fetch and trust it during provisioning so the SSTP
+    client can run with verify-server-certificate=yes. It is a public
+    certificate, not a secret; 404 until ROUTER_MGMT_CA_PEM is configured.
+    """
+    pem = router_mgmt_ca_pem()
+    if not pem:
+        raise HTTPException(status_code=404, detail="Router management CA is not configured")
+    return Response(
+        content=pem,
+        media_type="application/x-pem-file",
+        headers={"Content-Disposition": 'attachment; filename="router-mgmt-ca.crt"'},
+    )
 
 
 @router.get("/api/provision/{provision_token}", response_class=PlainTextResponse)
@@ -257,6 +283,7 @@ async def complete_provision(
         "vpn_ip": router_obj.ip_address,
         "backup_vpn_ip": derive_insurance_ip(router_obj.ip_address),
         "vpn_type": token_obj.vpn_type,
+        "management_tunnel": router_obj.management_tunnel,
         "message": f"Router '{router_obj.name}' registered successfully",
     }
 

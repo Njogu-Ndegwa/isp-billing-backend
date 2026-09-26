@@ -478,6 +478,16 @@ async def run_radius_migrations():
         else:
             logger.info("Migration: provisioning_tokens is_routerboard column already exists, skipping")
 
+        # --- Provisioning tokens: single Hetzner management tunnel ---
+        # sstp_* = RouterOS 6 SSTP login; management_tunnel = which tunnel the
+        # token was issued with ("wireguard"/"sstp"; NULL = legacy AWS layout).
+        await conn.execute(sa_text("""
+            ALTER TABLE provisioning_tokens
+            ADD COLUMN IF NOT EXISTS sstp_username VARCHAR NULL,
+            ADD COLUMN IF NOT EXISTS sstp_password VARCHAR NULL,
+            ADD COLUMN IF NOT EXISTS management_tunnel VARCHAR(20) NULL
+        """))
+
         # --- PPPoE columns on customers table ---
         result = await conn.execute(sa_text("""
             SELECT column_name

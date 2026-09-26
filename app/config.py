@@ -161,6 +161,36 @@ class Settings(BaseSettings):
     INSURANCE_L2TP_IPSEC_PSK: str = ""
     INSURANCE_MANAGER_TIMEOUT: int = 10
 
+    # Single management tunnel to Hetzner for NEW routers. Off by default: with
+    # the flag off, token creation and the generated .rsc are byte-for-byte
+    # what they were before (AWS primary + Hetzner insurance/standby). When on,
+    # a new token gets exactly ONE management tunnel, to the Hetzner server:
+    #   * RouterOS 7 (vpn_type="wireguard"): WireGuard `wg-hz` to the wg2
+    #     manager at INSURANCE_WG_MANAGER_URL (endpoint
+    #     INSURANCE_SERVER_PUBLIC_IP:INSURANCE_WG_PORT, address 10.251.X.Y).
+    #   * RouterOS 6 (vpn_type="l2tp"): SSTP client `sstp-hetzner` to the
+    #     accel-ppp server SSTP_SERVER (login registered through the same
+    #     manager's /add-sstp-peer, address 10.251.X.Y).
+    # The router keeps its 10.0.X.Y DB address pinned on a loopback bridge
+    # `lo-mgmt`; the host's route-sync steers 10.0.X.Y over the tunnel. The
+    # decision is stored on the token (provisioning_tokens.management_tunnel),
+    # so flipping the flag never changes a token that was already issued.
+    PROVISION_MGMT_TO_HETZNER: bool = False
+    # host:port of the SSTP server. RouterOS 6 takes the port INSIDE
+    # connect-to (ip:port); RouterOS 7 takes a separate port= (the script
+    # picks the right form at import time).
+    SSTP_SERVER: str = "91.98.238.12:4443"
+    # accel-ppp gw-ip-address; the source address the server uses towards SSTP
+    # routers, so it must be allowed on the router's API service.
+    SSTP_SERVER_VPN_IP: str = "10.251.0.1"
+    # Router 10.0.X.Y gets SSTP peer address 10.251.X.Y (same host offset).
+    SSTP_SUBNET: str = "10.251.0.0/16"
+    # PUBLIC CA certificate (PEM) that signed the SSTP server cert
+    # (/etc/accel-ppp-router-mgmt/ca.crt, CN "Bitwave Router Management CA").
+    # Served to routers at GET /api/provision/router-mgmt-ca.crt. Literal "\n"
+    # sequences are accepted so it fits on one .env line. Never the CA key.
+    ROUTER_MGMT_CA_PEM: str = ""
+
     # --- Messaging / SMS -------------------------------------------------
     SMS_PROVIDER: str = "talksasa"
     SMS_SENDER_ID: str = "TALKSASA"
