@@ -46,6 +46,7 @@ APPLY = os.environ.get("APPLY") == "1"
 # Small boards without a route to the tunnel address would call us over public
 # HTTPS (5-7 s of full CPU per call on a hAP lite): skipped unless allowed.
 ALLOW_HTTPS = os.environ.get("ALLOW_HTTPS") == "1"
+ALLOW_BUSY = os.environ.get("ALLOW_BUSY") == "1"
 WEAK_BOARDS = ("hAP lite", "hAP mini", "hAP ac lite", "cAP lite", "RB9", "RB750", "RB941", "RB931", "hEX lite", "mAP")
 UNINSTALL = os.environ.get("UNINSTALL") == "1"
 IDS = [int(x) for x in os.environ.get("ROUTER_IDS", "").split(",") if x.strip().isdigit()]
@@ -162,6 +163,18 @@ def install(r, paid) -> str:
             return "removed" if APPLY else "dry-run"
         if not _version_ok(version):
             return f"skipped: RouterOS {version} too old"
+        # hAP lite (RB941, 32 MB, smips) is excluded (2026-09-26): 371 and 483
+        # were pinned at 100% CPU with 5-7 MB free under the stack of Bitwave
+        # schedulers; the server cleanup keeps enforcing expiry on them.
+        model = (first(api, "/system/routerboard/print").get("model") or "")
+        if any(k in f"{board} {model}".lower() for k in ("hap lite", "rb941", "hap mini", "rb931")):
+            return f"skipped: small board {board or model} (hAP lite class excluded)"
+        try:
+            busy = int(cpu) >= 90
+        except (TypeError, ValueError):
+            busy = False
+        if busy and not ALLOW_BUSY:
+            return f"skipped: CPU at {cpu}% (set ALLOW_BUSY=1 to install anyway)"
         if not tunnel_ok and not ALLOW_HTTPS and any(w.lower() in board.lower() for w in WEAK_BOARDS):
             return f"skipped: {board} has no tunnel route (set ALLOW_HTTPS=1 to install anyway)"
         if api.send_command("/ip/hotspot/ip-binding/print").get("error"):
