@@ -89,6 +89,10 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
     :if ([:pick $ms 0 1] = "0") do={ :set ms [:pick $ms 1 2] }
     :local h [:tonum $hs]
     :local mi [:tonum $ms]
+    :local ss [:pick $t 6 8]
+    :if ([:pick $ss 0 1] = "0") do={ :set ss [:pick $ss 1 2] }
+    :local se [:tonum $ss]
+    :if ([:typeof $se] != "num") do={ :set se 0 }
     :local g [:tostr [/system clock get gmt-offset]]
     :local sign 1
     :if ([:pick $g 0 1] = "-") do={
@@ -263,7 +267,7 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 :do { /ip hotspot host remove [find where mac-address=$m] } on-error={}
                 :do { /ip hotspot user remove [find where name=$u] } on-error={}
                 :do { /queue simple remove [find where name=("plan_" . $u)] } on-error={}
-                :if ([:len $bwExpDone] < 700) do={ :set bwExpDone ($bwExpDone . $m . "@" . $nowm . ",") }
+                :if ([:len $bwExpDone] < 700) do={ :set bwExpDone ($bwExpDone . $m . "@" . (($nowm * 60) + $se) . ",") }
                 :log info ("expiry-reaper: removed " . $m)
             }
         }

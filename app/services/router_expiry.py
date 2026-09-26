@@ -60,6 +60,15 @@ def minute_to_datetime(minute: int) -> datetime:
     return datetime.fromtimestamp(int(minute) * 60, tz=timezone.utc).replace(tzinfo=None)
 
 
+def done_time_to_datetime(value: int) -> datetime:
+    """When the router says it removed a customer. Scripts report unix
+    SECONDS (so removal speed is measurable below a minute); the first pilot
+    install reported unix minutes. The two ranges cannot overlap."""
+    value = int(value)
+    seconds = value if value >= 1_000_000_000 else value * 60
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(tzinfo=None)
+
+
 def binding_comment(username: str, expiry: Optional[datetime], now: Optional[datetime] = None) -> str:
     """The ip-binding comment written at provisioning. Keeps the long-standing
     ``USER:`` and ``EXPIRES:DB_MANAGED`` fields (matched elsewhere) and adds the
