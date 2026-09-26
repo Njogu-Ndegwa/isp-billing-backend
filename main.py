@@ -3343,10 +3343,13 @@ async def startup_event():
 
     # "What is ailing this router" for the Problem routers card
     # (app/services/router_diagnosis.py). Probes the <=15 routers in
-    # `attention`: 5 raw TCP connects + one background-lane API login each,
-    # 4 at a time on its own thread pool. Reads its inputs in one short
-    # session and closes it before any socket opens; writes nothing to the
-    # DB (results live in memory); skips the tick when the DB pool is busy.
+    # `attention`: 5 timed raw TCP connects + at most one background-lane API
+    # login each (a few small prints while logged in), 4 at a time on its own
+    # thread pool. The login is skipped for a router already reporting
+    # CPU >= 90% / low memory, or whose login timed out < 15 min ago. Reads
+    # its inputs in one short session and closes it before any socket opens;
+    # writes nothing to the DB (results live in memory); skips the tick when
+    # the DB pool is busy.
     async def _router_diagnosis_background():
         from app.services.router_diagnosis import run_diagnosis_cycle
         try:
