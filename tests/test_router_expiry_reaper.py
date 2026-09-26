@@ -19,6 +19,7 @@ from app.services.router_expiry import (
     clock_ok,
     decide,
     expiry_minute,
+    expiry_second,
     parse_request,
     render_reply,
     with_exp_tag,
@@ -44,7 +45,7 @@ def test_expiry_minute_rounds_up_so_the_router_never_asks_early():
 def test_binding_comment_keeps_legacy_fields_and_adds_the_deadline():
     c = binding_comment("AABBCC000001", datetime(2026, 9, 25, 18, 0), now=datetime(2026, 9, 25, 12, 0))
     assert c.startswith("USER:AABBCC000001|EXPIRES:DB_MANAGED|EXP:")
-    assert f"EXP:{expiry_minute(datetime(2026, 9, 25, 18, 0))}|" in c
+    assert f"EXP:{expiry_second(datetime(2026, 9, 25, 18, 0))}|" in c
     assert "EXP:" not in binding_comment("X", None)
 
 
@@ -76,7 +77,7 @@ def test_decide_per_mac_with_phantom_rows():
     ]
     remove, keep, forget = decide([MAC_A, MAC_B, MAC_C, "AA:BB:CC:00:00:09"], rows, now)
     assert remove == [MAC_A, MAC_C]
-    assert keep == [(MAC_B, expiry_minute(now + timedelta(hours=5)))]
+    assert keep == [(MAC_B, expiry_second(now + timedelta(hours=5)))]
     assert forget == ["AA:BB:CC:00:00:09"]
 
 
@@ -87,9 +88,23 @@ def test_reply_always_has_every_segment():
 
 def test_clock_is_trusted_only_within_five_minutes():
     now = datetime(2026, 9, 25, 12, 0)
-    m = expiry_minute(now)
-    assert clock_ok(m + 5, now) and clock_ok(m - 5, now)
-    assert not clock_ok(m + 6, now) and not clock_ok(None, now)
+    s = expiry_second(now)
+    assert clock_ok(s + 300, now) and clock_ok(s - 300, now)
+    assert not clock_ok(s + 301, now) and not clock_ok(None, now)
+    assert clock_ok(expiry_minute(now), now)          # first installs send minutes
+
+
+def test_expiry_second_rounds_up():
+    assert expiry_second(datetime(2026, 9, 25, 18, 0, 0)) == calendar.timegm((2026, 9, 25, 18, 0, 0))
+    assert expiry_second(datetime(2026, 9, 25, 18, 0, 0, 1)) == calendar.timegm((2026, 9, 25, 18, 0, 1))
+
+
+def test_script_compares_in_seconds_and_still_reads_minute_tags():
+    s = _script()
+    assert ":local nows (($nowm * 60) + $se)" in s
+    assert ":if ($x <= $nows) do={" in s
+    assert ':if (([:typeof $x] = "num") && ($x < 1000000000)) do={ :set x ($x * 60) }' in s
+    assert "$nowm >=" not in s and "$x <= $nowm" not in s
 
 
 # --- the RouterOS script ----------------------------------------------------
@@ -232,7 +247,7 @@ async def test_endpoint_decides_remove_keep_and_forget(client, db):
     body = r.text
     assert body.startswith("BW1;C=1;")
     assert f";R={MAC_A},;" in body
-    assert f";K={MAC_B}@{expiry_minute(now + timedelta(hours=2))},;" in body
+    assert f";K={MAC_B}@{expiry_second(now + timedelta(hours=2))},;" in body
     assert f";X={MAC_C},;" in body
 
 
@@ -335,7 +350,7 @@ def test_done_time_accepts_seconds_and_the_first_installs_minutes():
 def test_script_reports_removals_in_seconds():
     s = _script()
     assert ':local ss [:pick $t 6 8]' in s
-    assert '($bwExpDone . $m . "@" . (($nowm * 60) + $se) . ",")' in s
+    assert '($bwExpDone . $m . "@" . $nows . ",")' in s
 
 
 @pytest.mark.asyncio

@@ -131,6 +131,8 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
         :local days ((($era * 146097) + $doe) - 719468)
         :set nowm (((($days * 1440) + ($h * 60)) + $mi) - $offm)
     }
+    # Deadlines and all timers are unix SECONDS; nowm is only a step towards it.
+    :local nows (($nowm * 60) + $se)
 
     # A clock that is not plausible (a no-RTC board just rebooted into 1970)
     # does nothing at all until NTP fixes it; the platform is the backstop.
@@ -138,8 +140,8 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
         # --- which deadlines have passed ------------------------------------
         :local cnt [:len [/ip hotspot ip-binding find]]
         :local due ""
-        :if (($nowm >= $bwExpNext) || ($cnt != $bwExpCount) || ([:len $bwExpDone] > 0)) do={
-            :local nxt ($nowm + 5)
+        :if (($nows >= $bwExpNext) || ($cnt != $bwExpCount) || ([:len $bwExpDone] > 0)) do={
+            :local nxt ($nows + 300)
             :foreach b in=[/ip hotspot ip-binding find where comment~"EXP:"] do={
                 :local cm [/ip hotspot ip-binding get $b comment]
                 :local p [:find $cm "EXP:"]
@@ -147,11 +149,13 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 :local e [:find $v "|"]
                 :if ([:typeof $e] = "num") do={ :set v [:pick $v 0 $e] }
                 :local x [:tonum $v]
+                # Tags written before 2026-09-26 07:30 UTC are unix minutes.
+                :if (([:typeof $x] = "num") && ($x < 1000000000)) do={ :set x ($x * 60) }
                 :if ([:typeof $x] = "num") do={
-                    :if ($x <= $nowm) do={
+                    :if ($x <= $nows) do={
                         :local bm [:tostr [/ip hotspot ip-binding get $b mac-address]]
                         :if (([:len $bm] = 17) && ([:len $due] < 700)) do={ :set due ($due . $bm . ",") }
-                        :set nxt $nowm
+                        :set nxt $nows
                     } else={
                         :if ($x < $nxt) do={ :set nxt $x }
                     }
@@ -164,10 +168,10 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
         # --- ask / report ---------------------------------------------------
         :local todo ""
         :local docall false
-        :if (($due != "") || ([:len $bwExpDone] > 0) || (($nowm - $bwExpBeat) >= 60)) do={ :set docall true }
-        :if ($nowm < $bwExpRetryAt) do={ :set docall false }
+        :if (($due != "") || ([:len $bwExpDone] > 0) || (($nows - $bwExpBeat) >= 3600)) do={ :set docall true }
+        :if ($nows < $bwExpRetryAt) do={ :set docall false }
         :if ($docall) do={
-            :local body ("ident=" . $ident . "&now=" . $nowm . "&due=" . $due . "&done=" . $bwExpDone)
+            :local body ("ident=" . $ident . "&now=" . $nows . "&due=" . $due . "&done=" . $bwExpDone)
             :local hdr ("Content-Type: text/plain,Authorization: Bearer " . $tok)
             :local rd ""
             :local ok false
@@ -184,7 +188,7 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 } on-error={}
             }
             :if ($ok && ([:pick $rd 0 3] = "BW1")) do={
-                :set bwExpBeat $nowm
+                :set bwExpBeat $nows
                 :set bwExpRetryAt 0
                 :set bwExpDone ""
                 :set bwExpClockOk ([:typeof [:find $rd ";C=1;"]] = "num")
@@ -245,11 +249,11 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 # Server unreachable. Try again in 5 minutes; meanwhile enforce
                 # our own deadlines, but only with a clock the server confirmed
                 # since this router booted.
-                :set bwExpRetryAt ($nowm + 5)
+                :set bwExpRetryAt ($nows + 300)
                 :if ($bwExpClockOk) do={ :set todo $due }
             }
         } else={
-            :if (($due != "") && ($nowm < $bwExpRetryAt) && $bwExpClockOk) do={ :set todo $due }
+            :if (($due != "") && ($nows < $bwExpRetryAt) && $bwExpClockOk) do={ :set todo $due }
         }
 
         # --- remove ---------------------------------------------------------
@@ -267,7 +271,7 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 :do { /ip hotspot host remove [find where mac-address=$m] } on-error={}
                 :do { /ip hotspot user remove [find where name=$u] } on-error={}
                 :do { /queue simple remove [find where name=("plan_" . $u)] } on-error={}
-                :if ([:len $bwExpDone] < 700) do={ :set bwExpDone ($bwExpDone . $m . "@" . (($nowm * 60) + $se) . ",") }
+                :if ([:len $bwExpDone] < 700) do={ :set bwExpDone ($bwExpDone . $m . "@" . $nows . ",") }
                 :log info ("expiry-reaper: removed " . $m)
             }
         }

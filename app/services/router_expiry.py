@@ -3,8 +3,9 @@
 The router enforces the deadline, the platform decides and records:
 
 1. Provisioning writes the customer's deadline into the ip-binding comment as
-   ``EXP:<unix minute, UTC, rounded up>``. A plain integer, so RouterOS 6 and 7
-   compare it with no date parsing beyond "what minute is it now".
+   ``EXP:<unix second, UTC, rounded up>``. A plain integer, so RouterOS 6 and 7
+   compare it with no date parsing beyond "what second is it now". (Tags from
+   the first pilot installs are unix minutes; both sides still read them.)
 2. Once a minute the reaper script (``expiry_reaper_script.py``) collects the
    bindings whose deadline has passed and asks the server about them
    (``POST /api/router/expiry-check``). The server answers per MAC:
@@ -47,12 +48,26 @@ CLOCK_TOLERANCE_MINUTES = 5  # router clock this close to ours counts as trusted
 DONE_MINUTE_MAX_SKEW = 60
 
 
+def expiry_second(expiry: datetime) -> int:
+    """Unix second (UTC) at or after ``expiry``: the deadline the router
+    enforces. Rounded UP so the router is never ahead of the real expiry."""
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return math.ceil(expiry.timestamp())
+
+
 def expiry_minute(expiry: datetime) -> int:
-    """Unix minute (UTC) at or after ``expiry``. Rounded UP: a router asking at
-    the tagged minute must never be ahead of the real expiry."""
+    """Unix minute at or after ``expiry`` (the first pilot installs' tag unit)."""
     if expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=timezone.utc)
     return math.ceil(expiry.timestamp() / 60)
+
+
+def to_seconds(value: int) -> int:
+    """Router-reported times and tags: unix seconds, or unix minutes from the
+    first pilot installs. The two ranges cannot overlap."""
+    value = int(value)
+    return value if value >= 1_000_000_000 else value * 60
 
 
 def minute_to_datetime(minute: int) -> datetime:
@@ -64,9 +79,7 @@ def done_time_to_datetime(value: int) -> datetime:
     """When the router says it removed a customer. Scripts report unix
     SECONDS (so removal speed is measurable below a minute); the first pilot
     install reported unix minutes. The two ranges cannot overlap."""
-    value = int(value)
-    seconds = value if value >= 1_000_000_000 else value * 60
-    return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(tzinfo=None)
+    return datetime.fromtimestamp(to_seconds(value), tz=timezone.utc).replace(tzinfo=None)
 
 
 def binding_comment(username: str, expiry: Optional[datetime], now: Optional[datetime] = None) -> str:
@@ -76,7 +89,7 @@ def binding_comment(username: str, expiry: Optional[datetime], now: Optional[dat
     stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     parts = [f"USER:{username}", "EXPIRES:DB_MANAGED"]
     if expiry is not None:
-        parts.append(f"{EXP_TAG}{expiry_minute(expiry)}")
+        parts.append(f"{EXP_TAG}{expiry_second(expiry)}")
     parts.append(stamp)
     return "|".join(parts)
 
@@ -144,7 +157,9 @@ def parse_request(body: str) -> ExpiryCheckRequest:
 def clock_ok(router_now: Optional[int], server_now: datetime) -> bool:
     if router_now is None:
         return False
-    return abs(router_now - int(expiry_minute(server_now))) <= CLOCK_TOLERANCE_MINUTES
+    if server_now.tzinfo is None:
+        server_now = server_now.replace(tzinfo=timezone.utc)
+    return abs(to_seconds(router_now) - server_now.timestamp()) <= CLOCK_TOLERANCE_MINUTES * 60
 
 
 @dataclass
@@ -176,7 +191,7 @@ def decide(due: Iterable[str], rows: Iterable[CustomerRow], now: datetime) -> tu
             continue
         live = [r.expiry for r in found if r.active and r.expiry is not None and r.expiry > now]
         if live:
-            keep.append((mac, expiry_minute(max(live))))
+            keep.append((mac, expiry_second(max(live))))
         elif any(r.active and r.expiry is None for r in found):
             forget.append(mac)  # no deadline to enforce; leave it to the platform
         else:
