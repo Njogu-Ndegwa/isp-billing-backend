@@ -25,7 +25,11 @@ Per run:
 
 1. Skip if another copy is still running (a slow fetch at a 5 s interval).
 2. Collect the MACs of ip-bindings whose comment contains ``USER:``, and the
-   subset with no ``plan_<MAC without colons>`` simple queue.
+   ``CHECKIN``-tagged subset with no ``plan_<MAC without colons>`` simple
+   queue. Only check-in bindings are queue-checked (a string match on the
+   comment first), so a router with hundreds of push bindings does not run a
+   queue lookup per binding every minute; the server only acts on Q lines
+   for check-in bindings anyway.
 3. POST ``v=1&id=<identity>&n=<count>&macs=<csv>&q=<csv>`` with the check-in
    token. Sending ``q=`` (even empty) tells the server this applier
    understands ``Q`` lines; it is left out if the queue check itself failed.
@@ -81,12 +85,15 @@ _TEMPLATE = r''':local url "__URL__"
                 :if ($n > 0) do={ :set macs ($macs . ",") }
                 :set macs ($macs . $bm)
                 :set n ($n + 1)
-                :local rf ([:pick $bm 0 2] . [:pick $bm 3 5] . [:pick $bm 6 8] . [:pick $bm 9 11] . [:pick $bm 12 14] . [:pick $bm 15 17])
                 :do {
-                    :if ([:len [/queue simple find where name=("plan_" . $rf)]] = 0) do={
-                        :if ($nq > 0) do={ :set qmacs ($qmacs . ",") }
-                        :set qmacs ($qmacs . $bm)
-                        :set nq ($nq + 1)
+                    :local bc [:tostr [/ip hotspot ip-binding get $b comment]]
+                    :if ([:typeof [:find $bc "CHECKIN"]] = "num") do={
+                        :local rf ([:pick $bm 0 2] . [:pick $bm 3 5] . [:pick $bm 6 8] . [:pick $bm 9 11] . [:pick $bm 12 14] . [:pick $bm 15 17])
+                        :if ([:len [/queue simple find where name=("plan_" . $rf)]] = 0) do={
+                            :if ($nq > 0) do={ :set qmacs ($qmacs . ",") }
+                            :set qmacs ($qmacs . $bm)
+                            :set nq ($nq + 1)
+                        }
                     }
                 } on-error={ :set qOk false }
             }

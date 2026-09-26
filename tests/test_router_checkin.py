@@ -1059,6 +1059,28 @@ def test_applier_reports_bindings_without_queue():
     assert '("v=1&id=" . $ident . "&n=" . $n . "&macs=" . $macs)' in src
 
 
+def test_applier_queue_checks_only_checkin_bindings():
+    """Queue lookups cost router CPU every check-in: only CHECKIN bindings get one.
+
+    Push bindings (USER: without CHECKIN) are still reported in macs= but must
+    never reach the /queue simple find, and q= is still sent (maybe empty).
+    """
+    src = _src()
+    collect = src[src.index(':foreach b in=[/ip hotspot ip-binding find where comment~"USER:"]'):
+                  src.index(":local post (")]
+    gate = collect.index('[:typeof [:find $bc "CHECKIN"]] = "num"')
+    assert ":local bc [:tostr [/ip hotspot ip-binding get $b comment]]" in collect
+    # Every queue lookup in the collection loop sits behind the CHECKIN gate...
+    assert collect.count("/queue simple find") == 1
+    assert gate < collect.index("/queue simple find")
+    # ...while every USER: binding is still counted into macs= before it.
+    assert collect.index(":set macs ($macs . $bm)") < gate
+    assert collect.index(":set n ($n + 1)") < gate
+    # q= is still sent even when no CHECKIN binding lacks a queue.
+    assert ':if ($qOk) do={ :set post ($post . "&q=" . $qmacs) }' in src
+    assert ':local qmacs ""' in src
+
+
 def test_applier_validates_q_lines_before_any_change():
     src = _src()
     first_write = min(src.index(c) for c in ("/ip hotspot ip-binding add", "/queue simple add", "/queue simple remove"))

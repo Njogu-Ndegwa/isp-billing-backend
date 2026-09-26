@@ -15,7 +15,8 @@ Protocol (plain text both ways, no JSON, no script):
                      Authorization: Bearer <check-in token>
                      body: ``v=1&id=<identity>&n=<count>&macs=AA:..,BB:..&q=CC:..``
                      (``macs``: the MACs of its ``USER:``-tagged ip-bindings;
-                     ``q``: the subset with no ``plan_<ref>`` simple queue.
+                     ``q``: the CHECKIN-tagged ones with no ``plan_<ref>``
+                     simple queue.
                      ``q`` is optional: appliers older than 2026-09-26 omit it)
 
   server -> router   BWE1,<seq>,<count>,<next_s>
