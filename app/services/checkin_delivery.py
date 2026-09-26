@@ -57,6 +57,10 @@ Per-router delivery mode (the push-vs-check-in A/B, env lists): ``push_only``
 routers never get A/Q lines; ``checkin_only`` routers get no payment-time
 push (``hotspot_provisioning``) and their A lines skip the grace, with a push
 fallback after ``CHECKIN_ONLY_FALLBACK_SECONDS``; everyone else is ``both``.
+A checkin_only payment whose MAC is already bound (renewal while still bound:
+the applier never edits an existing binding) is handed to the push at once,
+at payment time when the latest report shows it bound, else when the next
+report does (``renewal_handoff_candidates``).
 
 Design rules (see AGENTS.md "Database Session Discipline"):
 
@@ -92,7 +96,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import aliased
 
 from app.config import settings
@@ -267,6 +271,19 @@ DELIVERY_CHECKIN_ONLY = "checkin_only"
 DELIVERY_MODES = (DELIVERY_PUSH_ONLY, DELIVERY_CHECKIN_ONLY, DELIVERY_BOTH)
 
 DEFAULT_CHECKIN_ONLY_FALLBACK_SECONDS = 120
+
+# provisioning_logs markers the A/B scoreboard reads (no schema change).
+# A checkin_only payment whose MAC was already bound, handed to the push at
+# once instead of waiting for the fallback (written by hotspot_provisioning).
+ACTION_RENEWAL_HANDOFF = "checkin_only_renewal_handoff"
+# Written once per customer-waiting attempt on a pilot router, at its first
+# provisioning call, when a fresh check-in report says whether the MAC was
+# already bound: status BOUND or NOT_BOUND. No row = unknown.
+ACTION_BOUND_AT_PAYMENT = "checkin_bound_at_payment"
+BOUND_STATUS_BOUND = "bound"
+BOUND_STATUS_NOT_BOUND = "not_bound"
+# Statuses ``_persist_provisioning_result`` logs when a push failed.
+PUSH_FAILURE_STATUSES = ("retry_pending", "failed", "push_failed_after_checkin_delivery")
 
 # The attempts the A/B is about: a customer paid (or redeemed a voucher) and
 # is waiting. Only these are ever deferred to the check-in, and only these are
@@ -637,6 +654,10 @@ class RouterCheckinStats:
     # Missing MACs sent with no in-memory history because their provisioning
     # attempt's created_at already cleared the grace (survives a restart).
     sent_by_attempt_age_total: int = 0
+    # checkin_only: waiting payments whose MAC the report showed already bound
+    # (renewal while still bound). The applier never modifies a binding it did
+    # not just add, so these are handed to the push at once.
+    renewal_handoffs_total: int = 0
     count_mismatch_total: int = 0
     invalid_macs_total: int = 0
     last_unknown_log_at: float = 0.0
@@ -676,6 +697,19 @@ _router_cache: dict[str, RouterRef] = {}
 # not re-add it before the normal grace. Lost on restart, which only costs the
 # guard for one grace window.
 _last_present: dict[tuple[int, str], float] = {}
+# router -> (monotonic, MACs with a usable binding) from its latest trusted
+# report (count matched). Lets the payment path tell "new device" from
+# "renewal while still bound" without any router I/O. Lost on restart, which
+# only means "unknown" until the router's next check-in.
+_last_report: dict[int, tuple[float, frozenset[str]]] = {}
+# router -> monotonic deadline while a customer-waiting provisioning attempt
+# is young (set when the attempt row is created, whatever the entrypoint). A
+# check-in inside it is never shed for pool pressure; it does NOT change the
+# poll cadence (an undelivered attempt already does that from the DB).
+_awaiting_until: dict[int, float] = {}
+# attempt id -> monotonic time a renewal hand-off was last requested for it,
+# so one waiting attempt is handed off once, not on every check-in.
+_handoff_requested: dict[int, float] = {}
 
 
 def reset_state() -> None:
@@ -683,6 +717,9 @@ def reset_state() -> None:
     _stats.clear()
     _missing_since.clear()
     _last_present.clear()
+    _last_report.clear()
+    _awaiting_until.clear()
+    _handoff_requested.clear()
     _offers.clear()
     _queue_offers.clear()
     _sent_at.clear()
@@ -713,6 +750,76 @@ def payment_hint_active(router_id: int, now_mono: Optional[float] = None) -> boo
         return False
     now_mono = time.monotonic() if now_mono is None else now_mono
     return (now_mono - ts) <= PAYMENT_HINT_SECONDS
+
+
+# How long after an attempt row is created its router's check-ins are exempt
+# from pool-pressure shedding: the checkin_only fallback window plus the retry
+# job's slack, so the exemption outlives the whole time the check-in is the
+# only thing that can deliver.
+AWAITING_EXTRA_SECONDS = 30
+
+
+def note_attempt_created(router_id: Optional[int], entrypoint=None) -> None:
+    """Called whenever a hotspot provisioning attempt row is created or reused.
+
+    Every entrypoint goes through ``get_or_create_provisioning_attempt``
+    (STK callback, reconciliation, vouchers, device pairing, the retry job's
+    safety net), so no payment path can forget it. Like
+    ``note_payment_initiated`` it is pure in-memory and exception-proof.
+
+    What it can and cannot do: the router polls on its own schedule, so no
+    server-side hint can make it ask sooner than its next scheduled check-in
+    (an STK hint only helps because it lands while the customer is still
+    typing the PIN). What it does guarantee is that the check-ins which follow
+    are never shed for DB pool pressure while the payment is waiting.
+    """
+    try:
+        if router_id is None or not settings.CHECKIN_ENABLED:
+            return
+        entry = entrypoint.value if hasattr(entrypoint, "value") else str(entrypoint or "")
+        if entry not in CHECKIN_DEFERRABLE_ENTRYPOINTS:
+            return
+        rid = int(router_id)
+        if rid not in checkin_router_ids() or delivery_mode(rid) == DELIVERY_PUSH_ONLY:
+            return
+        until = time.monotonic() + checkin_only_fallback_seconds() + AWAITING_EXTRA_SECONDS
+        if until > _awaiting_until.get(rid, 0.0):
+            _awaiting_until[rid] = until
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def shed_exempt(router_id: Optional[int], now_mono: Optional[float] = None) -> bool:
+    """A check-in from this router must not be shed for pool pressure: a
+    customer is paying (STK hint) or a paid attempt is young."""
+    if router_id is None:
+        return False
+    now_mono = time.monotonic() if now_mono is None else now_mono
+    return payment_hint_active(router_id, now_mono) or _awaiting_until.get(router_id, 0.0) >= now_mono
+
+
+# A report older than this is not trusted to say whether a MAC is bound now:
+# two normal polls plus jitter, so one late poll does not blank it out.
+REPORT_FRESH_SECONDS = 2 * NORMAL_POLL_SECONDS + 2 * NORMAL_POLL_JITTER_SECONDS + 48
+
+
+def mac_bound_on_router(router_id: Optional[int], mac: Optional[str],
+                        now_mono: Optional[float] = None) -> Optional[bool]:
+    """Did the router's latest trusted check-in report hold a usable binding
+    for ``mac``? None = unknown (not a pilot router, no fresh report)."""
+    try:
+        if router_id is None or not mac:
+            return None
+        norm = normalize_reported_mac(mac)
+        seen = _last_report.get(int(router_id))
+        if norm is None or seen is None:
+            return None
+        now_mono = time.monotonic() if now_mono is None else now_mono
+        if now_mono - seen[0] > REPORT_FRESH_SECONDS:
+            return None
+        return norm in seen[1]
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 def rate_limited(identity: str, now_mono: Optional[float] = None) -> bool:
@@ -762,9 +869,11 @@ def stats_snapshot() -> dict:
                 "left_to_push_total": s.left_to_push_total,
                 "push_only_suppressed_total": s.push_only_suppressed_total,
                 "sent_by_attempt_age_total": s.sent_by_attempt_age_total,
+                "renewal_handoffs_total": s.renewal_handoffs_total,
                 "count_mismatch_total": s.count_mismatch_total,
                 "invalid_macs_total": s.invalid_macs_total,
                 "payment_hot": payment_hint_active(rid),
+                "shed_exempt": shed_exempt(rid),
                 "currently_missing": sorted(
                     mac for (r, mac) in _missing_since if r == rid
                 ),
@@ -813,6 +922,8 @@ class PendingAttempt:
     # Set by ``delivery_candidates``: 'checkin' or 'observed', and why.
     via: Optional[str] = None
     evidence: str = ""
+    # ProvisioningAttemptEntrypoint value; "" when unknown (tests, old callers).
+    entrypoint: str = ""
 
 
 @dataclass(frozen=True)
@@ -866,6 +977,7 @@ async def load_checkin_state(router_id: int, now: datetime) -> CheckinState:
                     ProvisioningAttempt.provisioning_state,
                     ProvisioningAttempt.created_at,
                     Customer.mac_address,
+                    ProvisioningAttempt.entrypoint,
                 )
                 .join(Customer, Customer.id == ProvisioningAttempt.customer_id)
                 .join(Plan, Plan.id == Customer.plan_id)
@@ -903,7 +1015,7 @@ async def load_checkin_state(router_id: int, now: datetime) -> CheckinState:
             continue
         entries.append(entry)
     pending = []
-    for attempt_id, customer_id, state, created_at, mac in pending_rows:
+    for attempt_id, customer_id, state, created_at, mac, entrypoint in pending_rows:
         norm = normalize_reported_mac(mac or "")
         if norm is None:
             continue
@@ -913,6 +1025,7 @@ async def load_checkin_state(router_id: int, now: datetime) -> CheckinState:
             mac=norm,
             state=state.value if hasattr(state, "value") else str(state),
             created_at=created_at,
+            entrypoint=entrypoint.value if hasattr(entrypoint, "value") else str(entrypoint or ""),
         ))
     return CheckinState(desired=entries, undelivered_recent=undelivered, pending=pending)
 
@@ -1003,6 +1116,8 @@ def decide(
             rid, report.declared_count, report.tokens,
         )
         return Decision([], [], unknown, next_poll_seconds(lines_sent=0, payment_hot=payment_hot, router_id=rid, rng=rng))
+
+    _last_report[rid] = (now_mono, report.present)
 
     # Tracking also forgets any MAC that stopped being desired (e.g. the OLD
     # MAC after a Reconnect), so its grace clock can never mature.
@@ -1301,6 +1416,62 @@ def delivery_candidates(
     return out[:MAX_RECORDS_PER_CHECKIN]
 
 
+# A hand-off already requested for an attempt is not requested again for
+# this long (the push sets it in_progress within a second or two; this only
+# stops a slow push from being asked for twice).
+HANDOFF_REQUEST_MEMORY_SECONDS = 120
+
+
+def renewal_handoff_candidates(
+    report: CheckinReport,
+    pending: Iterable[PendingAttempt],
+    router_id: Optional[int],
+    now_mono: Optional[float] = None,
+) -> list[PendingAttempt]:
+    """checkin_only: waiting payments the check-in can never deliver.
+
+    A payment on a checkin_only router waits ``scheduled`` for the check-in.
+    If the report shows the customer's MAC already holding a usable binding
+    (a renewal while still bound, or a foreign/leftover binding), the applier
+    will not touch it (it only adds bindings that are missing, and never edits
+    one it did not add for this payment), so the EXP tag and the queue rate
+    would stay stale until the fallback push. Those attempts are handed to
+    the push now: it is the path that updates an existing binding.
+
+    Pure apart from in-memory bookkeeping; the caller runs the push after the
+    reply. An attempt the report lets the check-in record (``classify_delivery``
+    says 'checkin') is not a hand-off.
+    """
+    if router_id is None or not report.count_matches or not checkin_only_active(router_id):
+        return []
+    now_mono = time.monotonic() if now_mono is None else now_mono
+    for key in [k for k, t in _handoff_requested.items() if now_mono - t > HANDOFF_REQUEST_MEMORY_SECONDS]:
+        _handoff_requested.pop(key, None)
+    out: list[PendingAttempt] = []
+    for p in pending:
+        if (
+            p.state != ProvisioningState.SCHEDULED.value
+            or p.entrypoint not in CHECKIN_DEFERRABLE_ENTRYPOINTS
+            or p.mac not in report.present
+            or p.attempt_id in _handoff_requested
+        ):
+            continue
+        via, _ = classify_delivery(report, p, router_id, True)
+        if via is not None:
+            continue  # the check-in added it for this payment: it records it
+        _handoff_requested[p.attempt_id] = now_mono
+        out.append(p)
+    if out:
+        stats = _stats.setdefault(int(router_id), RouterCheckinStats())
+        stats.renewal_handoffs_total += len(out)
+        logger.info(
+            "[CHECKIN] checkin_only router %s: %d waiting payment(s) already bound on the "
+            "router; handing to the push now: %s",
+            router_id, len(out), ",".join(f"{p.attempt_id}:{p.mac}" for p in out),
+        )
+    return out
+
+
 def _truncate(value: str, limit: int = 255) -> str:
     return value if len(value) <= limit else value[: limit - 3] + "..."
 
@@ -1429,6 +1600,36 @@ METRICS_ROW_LIMIT = 20000
 _METRIC_PATHS = (DELIVERED_VIA_PUSH, DELIVERED_VIA_CHECKIN, DELIVERED_VIA_OBSERVED)
 
 
+MARKER_ID_CHUNK = 1000
+
+
+def _enum_str(value) -> str:
+    return value.value if hasattr(value, "value") else str(value or "")
+
+
+@dataclass
+class _Marks:
+    renewal_handoff: bool = False
+    bound: Optional[bool] = None  # first bound-at-payment marker; None = unknown
+    push_failed: bool = False
+
+
+def _attempt_marks(log_rows) -> dict[int, _Marks]:
+    out: dict[int, _Marks] = {}
+    for attempt_id, action, status in log_rows:
+        if attempt_id is None:
+            continue
+        m = out.setdefault(int(attempt_id), _Marks())
+        if action == ACTION_RENEWAL_HANDOFF:
+            m.renewal_handoff = True
+        elif action == ACTION_BOUND_AT_PAYMENT:
+            if m.bound is None and status in (BOUND_STATUS_BOUND, BOUND_STATUS_NOT_BOUND):
+                m.bound = status == BOUND_STATUS_BOUND
+        if status in PUSH_FAILURE_STATUSES:
+            m.push_failed = True
+    return out
+
+
 def _percentile(sorted_values: list[float], p: float) -> Optional[float]:
     """Nearest-rank percentile of an already sorted list."""
     if not sorted_values:
@@ -1465,12 +1666,34 @@ async def delivery_path_metrics(now: Optional[datetime] = None) -> dict:
                     ProvisioningAttempt.access_seen_at,
                     ProvisioningAttempt.entrypoint,
                     ProvisioningAttempt.attempt_count,
+                    ProvisioningAttempt.id,
                 )
                 .where(ProvisioningAttempt.created_at >= start)
                 .order_by(ProvisioningAttempt.created_at.desc())
                 .limit(METRICS_ROW_LIMIT)
             )
         ).all()
+        # The A/B attempts' markers (hand-off, bound-at-payment, push
+        # failures), over the provisioning_logs.attempt_id index.
+        ab_ids = sorted(
+            int(r[7]) for r in rows
+            if r[0] in pilot_ids and _enum_str(r[5]) in CHECKIN_DEFERRABLE_ENTRYPOINTS
+        )
+        log_rows = []
+        for i in range(0, len(ab_ids), MARKER_ID_CHUNK):
+            log_rows.extend((
+                await db.execute(
+                    select(ProvisioningLog.attempt_id, ProvisioningLog.action, ProvisioningLog.status)
+                    .where(
+                        ProvisioningLog.attempt_id.in_(ab_ids[i:i + MARKER_ID_CHUNK]),
+                        or_(
+                            ProvisioningLog.action.in_((ACTION_RENEWAL_HANDOFF, ACTION_BOUND_AT_PAYMENT)),
+                            ProvisioningLog.status.in_(PUSH_FAILURE_STATUSES),
+                        ),
+                    )
+                    .order_by(ProvisioningLog.id)
+                )
+            ).all())
         await db.commit()
 
     def _empty():
@@ -1479,9 +1702,9 @@ async def delivery_path_metrics(now: Optional[datetime] = None) -> dict:
                 "_lat": {"all": [], **{path: [] for path in _METRIC_PATHS}}}
 
     groups = {"pilot": _empty(), "rest": _empty()}
-    by_mode = _ModeMetrics(pilot_ids)
-    for router_id, state, via, created_at, seen_at, entrypoint, attempt_count in rows:
-        by_mode.add(router_id, state, via, created_at, seen_at, entrypoint, attempt_count)
+    by_mode = _ModeMetrics(pilot_ids, _attempt_marks(log_rows))
+    for router_id, state, via, created_at, seen_at, entrypoint, attempt_count, attempt_id in rows:
+        by_mode.add(router_id, state, via, created_at, seen_at, entrypoint, attempt_count, attempt_id)
         g = groups["pilot" if router_id in pilot_ids else "rest"]
         g["attempts"] += 1
         state_value = state.value if hasattr(state, "value") else str(state)
@@ -1511,6 +1734,19 @@ async def delivery_path_metrics(now: Optional[datetime] = None) -> dict:
     return out
 
 
+DEVICE_CLASSES = ("new_device", "already_bound", "unknown")
+
+
+def _latency_block(values: list[float]) -> dict:
+    lat = sorted(values)
+    return {
+        "samples": len(lat),
+        "p50_seconds": _percentile(lat, 0.50),
+        "p95_seconds": _percentile(lat, 0.95),
+        "max_seconds": round(lat[-1], 1) if lat else None,
+    }
+
+
 class _ModeMetrics:
     """The A/B scoreboard: pilot routers grouped by their delivery arm.
 
@@ -1520,48 +1756,74 @@ class _ModeMetrics:
     its CURRENT configured one: moving a router between lists moves its last
     24 h with it.
 
+    * ``renewal_handoffs`` (checkin_only only): the customer's MAC was already
+      bound when they paid, so the check-in could not deliver it and it went
+      to the push at once (``ACTION_RENEWAL_HANDOFF`` log). Not a check-in
+      failure: excluded from ``fallbacks_triggered`` and from the
+      ``first_try_pct`` denominator.
     * ``first_try``: delivered by the arm's own first move. push_only/both:
       the first push landed (``attempt_count`` <= 1, via push or check-in).
       checkin_only: the check-in delivered before any push ran
-      (``attempt_count`` == 0).
+      (``attempt_count`` == 0). ``first_try_pct`` = first_try / (attempts -
+      renewal_handoffs).
     * ``fallbacks_triggered`` (checkin_only only): the check-in had not
       delivered within the fallback window, so the push ran
-      (``attempt_count`` >= 1). None for the other arms.
+      (``attempt_count`` >= 1, hand-offs excluded). None for the other arms.
     * ``payment_to_access``: access_seen_at - created_at, delivered rows.
+      ``payment_to_access_by_device`` splits it: ``new_device`` (the MAC had
+      no binding when the customer paid), ``already_bound`` (renewal while
+      still bound, or a hand-off), ``unknown`` (no fresh check-in report at
+      payment time, e.g. right after a restart). Compare arms on
+      ``new_device``: it is the case the check-in actually has to deliver.
+    * ``push_failed``: attempts where a push failed at least once
+      (``attempt_count`` > 1, or a failure status logged for the attempt).
+      ``rescues``: those that were delivered anyway, by path.
     """
 
-    def __init__(self, pilot_ids: frozenset[int]):
+    def __init__(self, pilot_ids: frozenset[int], marks: Optional[dict] = None):
         self.pilot_ids = pilot_ids
+        self.marks: dict[int, _Marks] = marks or {}
         self.mode_of = {rid: delivery_mode(rid) for rid in pilot_ids}
         self.groups = {
             mode: {
                 "attempts": 0, "delivered": 0, "undelivered": 0, "first_try": 0,
-                "fallbacks_triggered": 0,
+                "fallbacks_triggered": 0, "renewal_handoffs": 0, "push_failed": 0,
                 "delivered_via": {path: 0 for path in (*_METRIC_PATHS, "other")},
+                "rescues": {"total": 0, "delivered_via": {path: 0 for path in (*_METRIC_PATHS, "other")}},
                 "_lat": [],
+                "_lat_by_device": {c: [] for c in DEVICE_CLASSES},
             }
             for mode in DELIVERY_MODES
         }
 
-    def add(self, router_id, state, via, created_at, seen_at, entrypoint, attempt_count) -> None:
+    def add(self, router_id, state, via, created_at, seen_at, entrypoint, attempt_count,
+            attempt_id=None) -> None:
         if router_id not in self.pilot_ids:
             return
-        entry = entrypoint.value if hasattr(entrypoint, "value") else str(entrypoint or "")
-        if entry not in CHECKIN_DEFERRABLE_ENTRYPOINTS:
+        if _enum_str(entrypoint) not in CHECKIN_DEFERRABLE_ENTRYPOINTS:
             return
         mode = self.mode_of[router_id]
         g = self.groups[mode]
+        marks = self.marks.get(int(attempt_id)) if attempt_id is not None else None
+        marks = marks or _Marks()
         g["attempts"] += 1
         tries = int(attempt_count or 0)
-        if mode == DELIVERY_CHECKIN_ONLY and tries >= 1:
+        if mode == DELIVERY_CHECKIN_ONLY and marks.renewal_handoff:
+            g["renewal_handoffs"] += 1
+        elif mode == DELIVERY_CHECKIN_ONLY and tries >= 1:
             g["fallbacks_triggered"] += 1
-        state_value = state.value if hasattr(state, "value") else str(state)
-        if state_value != ProvisioningState.ROUTER_UPDATED.value:
+        push_failed = tries > 1 or marks.push_failed
+        if push_failed:
+            g["push_failed"] += 1
+        if _enum_str(state) != ProvisioningState.ROUTER_UPDATED.value:
             g["undelivered"] += 1
             return
         g["delivered"] += 1
         path = via if via in _METRIC_PATHS else "other"
         g["delivered_via"][path] += 1
+        if push_failed:
+            g["rescues"]["total"] += 1
+            g["rescues"]["delivered_via"][path] += 1
         max_tries = 0 if mode == DELIVERY_CHECKIN_ONLY else 1
         if path in (DELIVERED_VIA_PUSH, DELIVERED_VIA_CHECKIN) and tries <= max_tries:
             g["first_try"] += 1
@@ -1569,23 +1831,29 @@ class _ModeMetrics:
             seconds = (seen_at - created_at).total_seconds()
             if seconds >= 0:
                 g["_lat"].append(seconds)
+                if marks.renewal_handoff or marks.bound is True:
+                    device = "already_bound"
+                elif marks.bound is False:
+                    device = "new_device"
+                else:
+                    device = "unknown"
+                g["_lat_by_device"][device].append(seconds)
 
     def summary(self) -> dict:
         out = {}
         for mode, g in self.groups.items():
-            lat = sorted(g.pop("_lat"))
-            attempts = g["attempts"]
+            lat = g.pop("_lat")
+            by_device = g.pop("_lat_by_device")
+            is_co = mode == DELIVERY_CHECKIN_ONLY
+            judged = g["attempts"] - (g["renewal_handoffs"] if is_co else 0)
             out[mode] = {
                 **g,
                 "router_ids": sorted(rid for rid, m in self.mode_of.items() if m == mode),
-                "fallbacks_triggered": g["fallbacks_triggered"] if mode == DELIVERY_CHECKIN_ONLY else None,
-                "first_try_pct": round(100 * g["first_try"] / attempts, 1) if attempts else None,
-                "payment_to_access": {
-                    "samples": len(lat),
-                    "p50_seconds": _percentile(lat, 0.50),
-                    "p95_seconds": _percentile(lat, 0.95),
-                    "max_seconds": round(lat[-1], 1) if lat else None,
-                },
+                "fallbacks_triggered": g["fallbacks_triggered"] if is_co else None,
+                "renewal_handoffs": g["renewal_handoffs"] if is_co else None,
+                "first_try_pct": round(100 * g["first_try"] / judged, 1) if judged > 0 else None,
+                "payment_to_access": _latency_block(lat),
+                "payment_to_access_by_device": {c: _latency_block(by_device[c]) for c in DEVICE_CLASSES},
             }
         return {
             "entrypoints": sorted(CHECKIN_DEFERRABLE_ENTRYPOINTS),

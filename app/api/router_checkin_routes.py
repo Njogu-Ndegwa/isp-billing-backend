@@ -13,7 +13,8 @@ Order of work, cheapest first, and never any router I/O:
 5. Router lookup (cached identity -> id; short session on a miss). Unknown
    identity -> 401; router not in the allowlist -> empty idle frame.
 6. Pool pressure -> empty frame, unless a customer on this router is paying
-   right now (never shed the one case the channel exists for).
+   right now or a paid attempt on it is young (never shed the one case the
+   channel exists for).
 7. One short read of the desired state (session released), then a pure diff.
 8. After the reply is decided: if the report shows a paid customer present
    whose provisioning attempt is still undelivered, ONE short write session
@@ -21,6 +22,10 @@ Order of work, cheapest first, and never any router I/O:
    'observed' if the push had given up; see ``classify_delivery``). It runs as a background task after the
    response is sent, only when there is something to mark, and is skipped
    under pool pressure (the next check-in retries it; it is idempotent).
+9. checkin_only routers: a waiting payment whose MAC the report shows already
+   bound (renewal while still bound) is handed to the push at once, after
+   the reply (the applier cannot update an existing binding). No router I/O
+   here: the push is the existing payment path, run as a background task.
 
 Every reply that is not a 400/401 is a well-formed ``BWE1`` frame, so the
 router's validator can treat anything else (Cloudflare error page, captive
@@ -72,6 +77,19 @@ def _frame(body: str, background: Optional[BackgroundTasks] = None) -> PlainText
     return PlainTextResponse(body, headers=_HEADERS, background=background)
 
 
+async def _hand_off(attempt_ids: list[int]) -> None:
+    """Background: wake the push for renewals the check-in cannot deliver.
+
+    Async on purpose: a plain function would run in Starlette's threadpool,
+    away from the event loop the push timers live on."""
+    try:
+        from app.services.hotspot_provisioning import request_renewal_handoffs
+
+        request_renewal_handoffs(attempt_ids)
+    except Exception:  # never let this break the channel; the fallback timer remains
+        logger.exception("[CHECKIN] renewal hand-off of %s failed", attempt_ids)
+
+
 async def _record_deliveries(router_id: int, candidates: list) -> None:
     """Background: settle undelivered attempts the report proved delivered."""
     try:
@@ -112,7 +130,7 @@ async def router_checkin(
 
     cached = svc._router_cache.get(report.identity)
     under_pressure = _pool_under_pressure()
-    if under_pressure and (cached is None or not svc.payment_hint_active(cached.id)):
+    if under_pressure and (cached is None or not svc.shed_exempt(cached.id)):
         logger.warning("[CHECKIN] shedding check-in from %s: DB pool under pressure", report.identity)
         return _frame(svc.idle_frame(svc.NORMAL_POLL_SECONDS))
 
@@ -140,6 +158,10 @@ async def router_checkin(
     if candidates:
         background = BackgroundTasks()
         background.add_task(_record_deliveries, router_ref.id, candidates)
+    handoffs = svc.renewal_handoff_candidates(report, state.pending, router_ref.id)
+    if handoffs:
+        background = background or BackgroundTasks()
+        background.add_task(_hand_off, [p.attempt_id for p in handoffs])
     return _frame(
         svc.render_frame(svc._seq(), decision.lines, decision.next_s, decision.queue_lines),
         background,

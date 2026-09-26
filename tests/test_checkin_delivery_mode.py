@@ -517,11 +517,13 @@ async def test_waiting_attempt_is_not_flagged_as_a_failure(pilot, monkeypatch):
 async def test_checkin_only_router_is_fast_while_an_attempt_is_undelivered(client, pilot, monkeypatch):
     db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
     _arm(monkeypatch, checkin_only=str(router.id), pilot_ids=str(router.id))
+    handed = []
+    monkeypatch.setattr(hsp, "request_renewal_handoffs", lambda ids: handed.extend(ids))
     idle = svc.NORMAL_POLL_SECONDS - svc.NORMAL_POLL_JITTER_SECONDS
     resp = await _checkin(client, [M1, M2])
     assert _parse_frame(resp.text)[2] >= idle                      # idle polling stays slow
     # A payment waiting for the check-in (renewal while still bound, so no
-    # A line applies): fast until it is settled.
+    # A line applies; it is handed to the push): fast until it is settled.
     await _payment_attempt(db, paid, router)
     resp = await _checkin(client, [M1, M2])
     assert _parse_frame(resp.text)[2] == svc.FAST_POLL_SECONDS
