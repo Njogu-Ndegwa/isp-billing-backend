@@ -119,9 +119,18 @@ FAST_POLL_SECONDS = 10  # a payment is in flight / undelivered on this router
 CONFIRM_POLL_SECONDS = 5  # lines were just sent: confirm them on the next report
 IDLE_POLL_SECONDS = 600  # disabled / kill switch / not in the pilot
 
-# How long after an STK push (or an undelivered provisioning attempt) the
-# router stays on the fast cadence.
+# How far back an undelivered provisioning attempt keeps the router on the
+# fast cadence. Only UNDELIVERED attempts count: once the push (or a check-in)
+# delivers, the router drops back to the normal cadence.
 PAYMENT_HOT_SECONDS = 300
+
+# How long a bare "STK push initiated" hint keeps the router fast before any
+# attempt exists. It only has to cover the customer completing the M-Pesa
+# prompt; after that an undelivered attempt (above) is what keeps it fast.
+# It was 300 s (the same window as undelivered attempts), which kept busy
+# routers on the 10 s HTTPS cadence almost permanently: measured 2026-09-26 at
+# 28-44% CPU on RB951s (75, 221, 316) versus 0.2-4% at the 60 s cadence.
+PAYMENT_HINT_SECONDS = 90
 
 # One router may check in at most this often; faster calls get an empty frame.
 MIN_SECONDS_BETWEEN_CHECKINS = 3
@@ -584,7 +593,7 @@ def payment_hint_active(router_id: int, now_mono: Optional[float] = None) -> boo
     if ts is None:
         return False
     now_mono = time.monotonic() if now_mono is None else now_mono
-    return (now_mono - ts) <= PAYMENT_HOT_SECONDS
+    return (now_mono - ts) <= PAYMENT_HINT_SECONDS
 
 
 def rate_limited(identity: str, now_mono: Optional[float] = None) -> bool:

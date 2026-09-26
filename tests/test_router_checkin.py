@@ -1414,3 +1414,25 @@ def test_applier_body_parses_on_the_server():
             "&q=&c=AA:BB:CC:00:00:02&o=86:A0:C0:5C:AA:90")
     rep = svc.parse_checkin_body(body.encode())
     assert rep.count_matches and rep.reports_queues and rep.reports_checkin_added and rep.reports_others
+
+
+def test_payment_hint_expires_after_hint_window(monkeypatch):
+    """A bare STK hint keeps a pilot router fast only for PAYMENT_HINT_SECONDS,
+    not the 300 s undelivered-attempt window (busy RB951s sat on the 10 s HTTPS
+    cadence almost permanently and burned 28-44% CPU)."""
+    monkeypatch.setattr(svc.settings, "CHECKIN_ENABLED", True)
+    monkeypatch.setattr(svc, "checkin_router_ids", lambda: frozenset({4242}))
+    svc._payment_hint.pop(4242, None)
+    svc.note_payment_initiated(4242)
+    start = svc._payment_hint[4242]
+    assert svc.PAYMENT_HINT_SECONDS < svc.PAYMENT_HOT_SECONDS
+    assert svc.payment_hint_active(4242, start + svc.PAYMENT_HINT_SECONDS - 1) is True
+    assert svc.payment_hint_active(4242, start + svc.PAYMENT_HINT_SECONDS + 1) is False
+    svc._payment_hint.pop(4242, None)
+
+
+def test_delivered_router_returns_to_normal_cadence():
+    """No undelivered attempt and no fresh hint => normal ~60 s cadence."""
+    n = svc.next_poll_seconds(lines_sent=0, payment_hot=False, router_id=10)
+    assert svc.NORMAL_POLL_SECONDS - svc.NORMAL_POLL_JITTER_SECONDS <= n <= svc.NORMAL_POLL_SECONDS + svc.NORMAL_POLL_JITTER_SECONDS
+    assert svc.next_poll_seconds(lines_sent=0, payment_hot=True, router_id=10) == svc.FAST_POLL_SECONDS
