@@ -642,3 +642,15 @@ async def test_rejected_push_is_logged_with_the_router_and_the_bad_text(caplog):
     assert "detail" in r.json()                     # FastAPI's default 422 body, unchanged
     logged = " ".join(rec.getMessage() for rec in caplog.records)
     assert "422 from Router-0574" in logged and "json_invalid" in logged and "bad" in logged
+
+def test_entries_that_vanish_mid_walk_are_skipped_not_sent_empty():
+    # 2026-09-26 rollout: a hotspot host that logged out between find and get
+    # came back empty on ROS 7 and wrote "bytes_in":, - the whole report was
+    # rejected (routers 118/221/256/302). Every unquoted field is now checked.
+    script = render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/x")
+    assert '([:len $hm] > 0) && ([:typeof $hbi] = "num") && ([:typeof $hbo] = "num")' in script
+    assert '([:typeof $slash] = "num") && ([:typeof $qd] = "bool")' in script
+    assert '[:typeof $gd] = "bool"' in script
+    assert "[:len $an] > 0" in script
+    src = script[script.index("source={\n"):script.index("\n}\n\n/system scheduler add")]
+    assert src.count("{") == src.count("}")
