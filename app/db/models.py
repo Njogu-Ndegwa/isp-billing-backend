@@ -524,6 +524,13 @@ class Router(Base):
     expiry_reaper_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     # When the reaper was (last) installed: before/after comparison for the pilot.
     expiry_reaper_installed_at = Column(DateTime, nullable=True)
+    # Who removes this router's expired hotspot customers, as decided by the
+    # enrolment job (app/services/expiry_reaper_enrol.py): "router" (the reaper)
+    # or "server" (cleanup job only, e.g. hAP lite class boards). NULL = not
+    # decided yet. The reason says why ("small board hAP lite", "installed").
+    expiry_reaper_mode = Column(String(10), nullable=True)
+    expiry_reaper_reason = Column(String(120), nullable=True)
+    expiry_reaper_checked_at = Column(DateTime, nullable=True)
     # On by default, per-router opt-out: when true, the owner gets an inbox message
     # (and an SMS charged to their credits, when phone+balance allow) when the
     # router stays offline past a debounce threshold and again when it comes back

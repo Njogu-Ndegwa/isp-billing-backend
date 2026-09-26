@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     # 10.251.0.1:8088 site); public HTTPS costs a hAP lite ~5-7 s of full CPU.
     EXPIRY_REAPER_TUNNEL_URL: str = "http://10.251.0.1:8088/api/router/expiry-check"
     EXPIRY_REAPER_PUBLIC_URL: str = "https://isp.bitwavetechnologies.net/api/router/expiry-check"
+    # Automatic reaper enrolment (app/services/expiry_reaper_enrol.py): every
+    # 30 min, up to EXPIRY_REAPER_ENROL_BATCH routers not yet on the reaper are
+    # classified; hAP lite class boards stay on server-side removal, other
+    # eligible boards get the reaper installed. Off until switched on.
+    EXPIRY_REAPER_AUTO_ENROL: bool = False
+    EXPIRY_REAPER_ENROL_BATCH: int = 5
     # Router check-in delivery pilot (2026-09-26). The router POSTs the MACs of
     # its app-tagged bypass bindings to /api/router/checkin; the server answers
     # with the paid MACs it is missing. Off by default, and only routers listed
