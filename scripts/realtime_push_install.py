@@ -20,8 +20,14 @@ Transport per router: if the router's route to the server's tunnel address
 SSTP — the report is posted as plain HTTP inside that tunnel
 (settings.REALTIME_TUNNEL_PUSH_URL, port 8088). No TLS on the router: on a hAP
 lite an HTTPS report cost ~5-7 s at 100% CPU, a tunnel HTTP request ~1-2 s.
-Otherwise it falls back to the public HTTPS endpoint — except on the smallest
-boards (smips: hAP lite/mini), which are skipped unless FORCE_HTTPS=1.
+Otherwise it falls back to the public HTTPS endpoint.
+
+The smallest boards (smips: hAP lite/mini, 32 MB RAM) are skipped unless
+ALLOW_SMALL=1: on 2026-09-26 hAP lites already carrying several of our
+schedulers (watchdog, check-in, command agent, expiry reaper) sat at 100% CPU
+with ~5 MB free once the real-time push was added (483, 486), and a paying
+customer's access was delayed. They stay on server polling until a slim
+variant exists.
 
 WAN: the interface of the active default route (ether1 is only the fallback),
 so routers with a renamed or PPPoE/LTE uplink still report bandwidth.
@@ -51,6 +57,10 @@ SMALL_ARCHITECTURES = {"smips"}          # hAP lite / hAP mini: 650 MHz single c
 APPLY = os.environ.get("APPLY") == "1"
 ROLLBACK = os.environ.get("ROLLBACK") == "1"
 FORCE_HTTPS = os.environ.get("FORCE_HTTPS") == "1"
+ALLOW_SMALL = os.environ.get("ALLOW_SMALL") == "1"
+# Don't run the first report over the API (the scheduler's first tick does it).
+# For hAP lites whose API session drops while the run pins the CPU.
+SKIP_RUN = os.environ.get("SKIP_RUN") == "1"
 IDS = [int(x) for x in os.environ.get("ROUTER_IDS", "").split(",") if x.strip().isdigit()]
 
 
@@ -130,7 +140,7 @@ def recent_push_log(api):
     lines = [
         f"{row.get('time', '')} {row.get('message', '')}"
         for row in _data(api.send_command("/log/print"))
-        if "usage-push" in (row.get("message") or "")
+        if (row.get("message") or "").startswith("usage-push")
     ]
     return lines[-4:]
 
@@ -198,6 +208,9 @@ def install(r):
         print(f"{r['id']} {r['name']}: {res.get('board-name')} ({arch}) ROS {res.get('version')} "
               f"tunnel={iface or '-'} ({kind}) ping={'ok' if ping_ok else 'fail'} wan={wan} "
               f"lists_every={lists_every} had={result['had_script']} -> {url}")
+        if small and not ALLOW_SMALL:
+            print("   SKIPPED: smallest board (smips, 32 MB) - stays on server polling")
+            return {**result, "status": "skipped_small_board"}
         if small and not via_tunnel and not FORCE_HTTPS:
             print("   SKIPPED: smallest board with no working encrypted tunnel (HTTPS too heavy)")
             return {**result, "status": "skipped_small_https"}
@@ -220,6 +233,10 @@ def install(r):
         if res_s.get("error"):
             print(f"   script: {res_s['error']}")
             return {**result, "status": "script_failed", "error": str(res_s["error"])[:200]}
+        sid = find_one(api, "/system/script", SCRIPT_NAME)[".id"]
+        t0 = time.time()
+        run = {} if SKIP_RUN else c("/system/script/run", {".id": sid})
+        result["first_run_seconds"] = None if SKIP_RUN else round(time.time() - t0, 1)
         sched = find_one(api, "/system/scheduler", SCHEDULER_NAME)
         res_c = (c("/system/scheduler/set", {".id": sched[".id"], "disabled": "no", "interval": "60s",
                                              "comment": COMMENT})
@@ -230,10 +247,6 @@ def install(r):
         if res_c.get("error"):
             print(f"   scheduler: {res_c['error']}")
             return {**result, "status": "scheduler_failed", "error": str(res_c["error"])[:200]}
-        sid = find_one(api, "/system/script", SCRIPT_NAME)[".id"]
-        t0 = time.time()
-        run = c("/system/script/run", {".id": sid})
-        result["first_run_seconds"] = round(time.time() - t0, 1)
         result["log"] = recent_push_log(api)
         bad = [line for line in result["log"][-1:] if "deferred" in line or "skipped" in line]
         print(f"   installed; one report took {result['first_run_seconds']}s {run.get('error') or ''}")

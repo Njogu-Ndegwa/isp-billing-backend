@@ -264,7 +264,12 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local body "{\"identity\":\"$ident\",\"v\":3,\"reports\":["
     :local first true
     :local qcount 0
+    # An entry can vanish between find and get (customer logs out, queue
+    # removed). ROS 7 then returns EMPTY values instead of an error, which
+    # wrote "upload_bytes":, and got the whole report rejected (2026-09-26,
+    # busy routers 118/221/256). Every loop skips an entry that came back empty.
     :foreach q in=[/queue simple find] do={
+      :do {
         :local qn [/queue simple get $q name]
         :local key ""
         :if ([:pick $qn 0 5] = "plan_") do={ :set key [:pick $qn 5 [:len $qn]] }
@@ -274,13 +279,17 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local qt [:tostr [/queue simple get $q target]]
             :local ql [/queue simple get $q max-limit]
             :local qd [/queue simple get $q disabled]
-            :local up [:pick $qb 0 [:find $qb "/"]]
-            :local dn [:pick $qb ([:find $qb "/"] + 1) [:len $qb]]
-            :if (!$first) do={ :set body ($body . ",") }
-            :set body ($body . "{\"queue_key\":\"" . $key . "\",\"upload_bytes\":" . $up . ",\"download_bytes\":" . $dn . ",\"target_ip\":\"" . $qt . "\",\"max_limit\":\"" . $ql . "\",\"disabled\":" . $qd . "}")
-            :set first false
-            :set qcount ($qcount + 1)
+            :local slash [:find $qb "/"]
+            :if (([:typeof $slash] = "num") && ([:typeof $qd] = "bool")) do={
+                :local up [:pick $qb 0 $slash]
+                :local dn [:pick $qb ($slash + 1) [:len $qb]]
+                :if (!$first) do={ :set body ($body . ",") }
+                :set body ($body . "{\"queue_key\":\"" . $key . "\",\"upload_bytes\":" . $up . ",\"download_bytes\":" . $dn . ",\"target_ip\":\"" . $qt . "\",\"max_limit\":\"" . $ql . "\",\"disabled\":" . $qd . "}")
+                :set first false
+                :set qcount ($qcount + 1)
+            }
         }
+      } on-error={}
     }
     :set body ($body . "],\"hosts\":[")
     :local hfirst true
@@ -295,9 +304,11 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local hau [/ip hotspot host get $h authorized]
             :local hit [/ip hotspot host get $h idle-time]
             :local hup [/ip hotspot host get $h uptime]
+            :if (([:len $hm] > 0) && ([:typeof $hbi] = "num") && ([:typeof $hbo] = "num") && ([:typeof $hby] = "bool") && ([:typeof $hau] = "bool")) do={
             :if (!$hfirst) do={ :set body ($body . ",") }
             :set body ($body . "{\"mac\":\"" . $hm . "\",\"ip\":\"" . $ha . "\",\"bytes_in\":" . $hbi . ",\"bytes_out\":" . $hbo . ",\"bypassed\":" . $hby . ",\"authorized\":" . $hau . ",\"idle_time\":\"" . $hit . "\",\"uptime\":\"" . $hup . "\"}")
             :set hfirst false
+            }
         } on-error={}
     }
     :set body ($body . "],\"ppp\":[")
@@ -308,9 +319,11 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local aa [/ppp active get $a address]
             :local au [/ppp active get $a uptime]
             :local ac [/ppp active get $a caller-id]
+            :if ([:len $an] > 0) do={
             :if (!$pfirst) do={ :set body ($body . ",") }
             :set body ($body . "{\"name\":\"" . $an . "\",\"address\":\"" . $aa . "\",\"uptime\":\"" . $au . "\",\"caller_id\":\"" . $ac . "\"}")
             :set pfirst false
+            }
         }
     } on-error={}
     :set body ($body . "]")
@@ -371,9 +384,11 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
                 :local gm [/ip hotspot ip-binding get $g mac-address]
                 :local gt [/ip hotspot ip-binding get $g type]
                 :local gd [/ip hotspot ip-binding get $g disabled]
+                :if ([:typeof $gd] = "bool") do={
                 :if (!$gfirst) do={ :set body ($body . ",") }
                 :set body ($body . "{\"mac\":\"" . $gm . "\",\"type\":\"" . $gt . "\",\"disabled\":" . $gd . "}")
                 :set gfirst false
+                }
             }
         } on-error={}
         # DHCP leases give devices their names on the ports card. A host-name
