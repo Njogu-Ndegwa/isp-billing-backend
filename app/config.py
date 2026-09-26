@@ -42,6 +42,19 @@ class Settings(BaseSettings):
     REALTIME_PUSH_INTERVAL_OVERRIDES: str = "351:120,390:120,426:120"
     # Where pilot routers post when their tunnel reaches this server.
     REALTIME_TUNNEL_PUSH_URL: str = "http://10.251.0.1/api/router/usage-push"
+    # Router check-in delivery pilot (2026-09-26). The router POSTs the MACs of
+    # its app-tagged bypass bindings to /api/router/checkin; the server answers
+    # with the paid MACs it is missing. Off by default, and only routers listed
+    # in CHECKIN_ROUTER_IDS ("12,47") are ever answered with work.
+    # CHECKIN_MODE: "shadow" = compute + log what would be sent, reply with
+    # nothing; "add" = reply with add lines. Removals are never sent (pilot).
+    # CHECKIN_KILL_SWITCH makes every reply an empty idle frame, which also
+    # reaches routers whose management tunnel is down.
+    CHECKIN_ENABLED: bool = False
+    CHECKIN_ROUTER_IDS: str = ""
+    CHECKIN_MODE: str = "shadow"
+    CHECKIN_KILL_SWITCH: bool = False
+    CHECKIN_MAX_LINES_PER_REPLY: int = 10
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10

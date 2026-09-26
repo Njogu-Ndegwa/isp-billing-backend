@@ -51,6 +51,24 @@ async def admin_router_agent_metrics(
     return router_agent_metrics_snapshot()
 
 
+@router.get("/api/admin/checkin-pilot")
+async def admin_checkin_pilot_stats(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Process-local counters of the router check-in delivery pilot.
+
+    Shadow mode records here what it WOULD have sent, and how long each paid
+    MAC stayed missing from its router before the push (or pull) landed.
+    """
+
+    await _require_admin(token, db)
+    await db.commit()
+    from app.services.checkin_delivery import stats_snapshot
+
+    return stats_snapshot()
+
+
 @router.get("/api/admin/db-pool")
 async def admin_db_pool_status(
     include_activity: bool = Query(
