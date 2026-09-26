@@ -133,6 +133,7 @@ async def router_checkin(
         undelivered_recent=state.undelivered_recent,
         mode=svc.checkin_mode(),
         now=now,
+        pending=state.pending,
     )
     background = None
     candidates = svc.delivery_candidates(report, state.pending, router_ref.id)
