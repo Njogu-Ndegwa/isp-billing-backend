@@ -287,10 +287,14 @@ async def client(pilot, monkeypatch):
         yield c
 
 
-async def _checkin(client, macs=(), identity=IDENT, token=None, n=None, q=None):
+async def _checkin(client, macs=(), identity=IDENT, token=None, n=None, q=None, c=None, o=None):
     body = f"v=1&id={identity}&n={len(macs) if n is None else n}&macs={','.join(macs)}"
     if q is not None:
         body += f"&q={','.join(q)}"
+    if c is not None:
+        body += f"&c={','.join(c)}"
+    if o is not None:
+        body += f"&o={','.join(o)}"
     tok = derive_checkin_token(identity) if token is None else token
     svc._last_checkin.clear()  # tests call faster than the per-router floor
     return await client.post(
@@ -562,15 +566,19 @@ NEW = "AA:BB:CC:00:00:0B"
 ROUTER = svc.RouterRef(id=7, auth_method="direct_api", lb_enabled=False, fetched_at=0.0)
 
 
-def _report(macs, q=None):
+def _report(macs, q=None, c=None, o=None):
     body = f"v=1&id={IDENT}&n={len(macs)}&macs={','.join(macs)}"
     if q is not None:
         body += f"&q={','.join(q)}"
+    if c is not None:
+        body += f"&c={','.join(c)}"
+    if o is not None:
+        body += f"&o={','.join(o)}"
     return svc.parse_checkin_body(body.encode())
 
 
-def _decide(macs, desired, t, q=None, mode="add"):
-    return svc.decide(router=ROUTER, report=_report(macs, q), desired=desired,
+def _decide(macs, desired, t, q=None, mode="add", o=None):
+    return svc.decide(router=ROUTER, report=_report(macs, q, o=o), desired=desired,
                       undelivered_recent=False, mode=mode, now=datetime.utcnow(), now_mono=t)
 
 
@@ -819,7 +827,7 @@ async def test_present_mac_marks_undelivered_attempt_delivered_like_a_push(clien
 
     db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
     a = await _attempt(db, paid, router)
-    await _checkin(client, ["AA:BB:CC:00:00:01", "AA:BB:CC:00:00:02"])
+    await _checkin(client, ["AA:BB:CC:00:00:01", "AA:BB:CC:00:00:02"], c=["AA:BB:CC:00:00:01"])
     await db.refresh(a)
     assert a.provisioning_state == ProvisioningState.ROUTER_UPDATED
     assert a.delivered_via == "checkin"
@@ -843,7 +851,7 @@ async def test_failed_attempt_with_exhausted_retry_window_is_marked_delivered(cl
     db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
     a = await _attempt(db, paid, router, state=ProvisioningState.FAILED, age=timedelta(hours=6),
                        attempt_count=14)
-    await _checkin(client, ["AA:BB:CC:00:00:01", "AA:BB:CC:00:00:02"])
+    await _checkin(client, ["AA:BB:CC:00:00:01", "AA:BB:CC:00:00:02"], c=["AA:BB:CC:00:00:01"])
     await db.refresh(a)
     assert a.provisioning_state == ProvisioningState.ROUTER_UPDATED and a.delivered_via == "checkin"
     assert "previous_state=failed" in (await _logs(db, a.id))[0].details
@@ -941,6 +949,11 @@ async def test_checkin_delivery_clears_consumers_backlog_and_alerts(client, pilo
 # Fix 2a: the push records itself, and a late push failure cannot regress
 # ---------------------------------------------------------------------------
 
+def _note_a_line_sent(router_id, mac, when=None):
+    """As if ``decide`` had just sent an A line for ``mac`` to this router."""
+    svc._sent_at[(router_id, mac)] = (0.0, when or datetime.utcnow())
+
+
 def _push_payload(customer):
     return {"mac_address": customer.mac_address, "username": customer.mac_address.replace(":", "")}
 
@@ -967,8 +980,10 @@ async def test_push_after_checkin_keeps_checkin_attribution(pilot):
 
     db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
     a = await _attempt(db, paid, router, state=ProvisioningState.IN_PROGRESS)
-    cands = svc.delivery_candidates(_report(["AA:BB:CC:00:00:01"]),
-                                    (await svc.load_checkin_state(router.id, datetime.utcnow())).pending)
+    _note_a_line_sent(router.id, "AA:BB:CC:00:00:01")
+    cands = svc.delivery_candidates(_report(["AA:BB:CC:00:00:01"], c=["AA:BB:CC:00:00:01"]),
+                                    (await svc.load_checkin_state(router.id, datetime.utcnow())).pending,
+                                    router.id)
     assert await svc.record_checkin_deliveries(router.id, cands) == 1
     await db.refresh(a)
     seen = a.access_seen_at
@@ -987,8 +1002,10 @@ async def test_late_push_failure_does_not_regress_a_checkin_delivery(pilot):
 
     db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
     a = await _attempt(db, paid, router, state=ProvisioningState.IN_PROGRESS)
-    cands = svc.delivery_candidates(_report(["AA:BB:CC:00:00:01"]),
-                                    (await svc.load_checkin_state(router.id, datetime.utcnow())).pending)
+    _note_a_line_sent(router.id, "AA:BB:CC:00:00:01")
+    cands = svc.delivery_candidates(_report(["AA:BB:CC:00:00:01"], c=["AA:BB:CC:00:00:01"]),
+                                    (await svc.load_checkin_state(router.id, datetime.utcnow())).pending,
+                                    router.id)
     await svc.record_checkin_deliveries(router.id, cands)
     result = await hsp._persist_provisioning_result(
         result={"error": "Failed to connect to router"}, verify_only=False,
@@ -1026,6 +1043,7 @@ async def test_delivery_path_metrics_split_pilot_and_rest(pilot, monkeypatch):
     await add(router.id, ProvisioningState.ROUTER_UPDATED, "checkin", 600, 40)
     await add(router.id, ProvisioningState.ROUTER_UPDATED, "push", 600, 10)
     await add(router.id, ProvisioningState.RETRY_PENDING, None, 600, None)
+    await add(router.id, ProvisioningState.ROUTER_UPDATED, "observed", 600, 300)
     await add(other.id, ProvisioningState.ROUTER_UPDATED, "push", 600, 5)
     await add(other.id, ProvisioningState.ROUTER_UPDATED, None, 600, None)   # pre-2026-09-26 row
     await add(other.id, ProvisioningState.ROUTER_UPDATED, "push", 3 * 86400, 5)  # outside 24 h
@@ -1033,10 +1051,13 @@ async def test_delivery_path_metrics_split_pilot_and_rest(pilot, monkeypatch):
 
     m = await svc.delivery_path_metrics(now)
     assert m["pilot_router_ids"] == [router.id]
-    assert m["pilot"]["counts"] == {"push": 1, "checkin": 1, "other": 0, "undelivered": 1}
-    assert m["pilot"]["payment_to_access"] == {"samples": 2, "p50_seconds": 10.0, "p95_seconds": 40.0}
+    # 'observed' is its own bucket, never folded into 'checkin'.
+    assert m["pilot"]["counts"] == {"push": 1, "checkin": 1, "observed": 1, "other": 0, "undelivered": 1}
+    assert m["pilot"]["payment_to_access"] == {"samples": 3, "p50_seconds": 40.0, "p95_seconds": 300.0}
     assert m["pilot"]["payment_to_access_by_path"]["checkin"]["p50_seconds"] == 40.0
-    assert m["rest"]["counts"] == {"push": 1, "checkin": 0, "other": 1, "undelivered": 0}
+    assert m["pilot"]["payment_to_access_by_path"]["observed"] == {
+        "samples": 1, "p50_seconds": 300.0, "p95_seconds": 300.0}
+    assert m["rest"]["counts"] == {"push": 1, "checkin": 0, "observed": 0, "other": 1, "undelivered": 0}
     assert m["rest"]["payment_to_access"]["p95_seconds"] == 5.0
 
 
@@ -1069,7 +1090,7 @@ def test_applier_queue_checks_only_checkin_bindings():
     collect = src[src.index(':foreach b in=[/ip hotspot ip-binding find where comment~"USER:"]'):
                   src.index(":local post (")]
     gate = collect.index('[:typeof [:find $bc "CHECKIN"]] = "num"')
-    assert ":local bc [:tostr [/ip hotspot ip-binding get $b comment]]" in collect
+    assert ":set bc [:tostr [/ip hotspot ip-binding get $b comment]]" in collect
     # Every queue lookup in the collection loop sits behind the CHECKIN gate...
     assert collect.count("/queue simple find") == 1
     assert gate < collect.index("/queue simple find")
@@ -1100,3 +1121,296 @@ def test_applier_q_line_only_queues_checkin_bindings_that_lack_a_queue():
     assert src.index("/ip hotspot host get $h address") < src.index("/ip hotspot host remove")
     # A Q line never adds or kicks anything.
     assert src.index(':if ($kind = "A") do={\n                        :do {\n                            /ip hotspot ip-binding add') > 0
+
+
+# ---------------------------------------------------------------------------
+# Honest attribution (2026-09-26): c= says which bindings the check-in added,
+# o= reports untagged bindings so they are never offered again.
+# ---------------------------------------------------------------------------
+
+M1 = "AA:BB:CC:00:00:01"
+LEGACY = "86:A0:C0:5C:AA:90"
+
+
+def _pending(state, mac=M1, created_at=None, attempt_id=1):
+    return svc.PendingAttempt(
+        attempt_id=attempt_id, customer_id=1, mac=mac, state=state,
+        created_at=created_at or datetime.utcnow() - timedelta(seconds=10),
+    )
+
+
+def test_parse_body_c_and_o_fields():
+    rep = svc.parse_checkin_body(
+        b"v=1&id=R1&n=2&macs=AA:BB:CC:00:00:01,AA:BB:CC:00:00:02"
+        b"&q=&c=aa:bb:cc:00:00:02,AA:BB:CC:00:00:09,junk&o=86:a0:c0:5c:aa:90,junk")
+    assert rep.reports_checkin_added and rep.checkin_added == {"AA:BB:CC:00:00:02"}  # subset of macs
+    assert rep.reports_others and rep.others == {LEGACY}
+    assert rep.present == {"AA:BB:CC:00:00:01", "AA:BB:CC:00:00:02", LEGACY}
+    assert rep.count_matches  # o= never counts toward n=
+    old = svc.parse_checkin_body(b"v=1&id=R1&n=1&macs=AA:BB:CC:00:00:01")
+    assert not old.reports_checkin_added and not old.reports_others
+    assert old.present == {"AA:BB:CC:00:00:01"}
+    empty = svc.parse_checkin_body(b"v=1&id=R1&n=0&macs=&c=&o=")
+    assert empty.reports_checkin_added and empty.reports_others
+    assert empty.checkin_added == frozenset() and empty.others == frozenset()
+
+
+def test_oversized_o_is_truncated_not_rejected():
+    macs = ",".join(f"AA:BB:CC:00:{i // 256:02X}:{i % 256:02X}" for i in range(svc.MAX_REPORTED_OTHERS + 50))
+    rep = svc.parse_checkin_body(f"v=1&id=R1&n=0&macs=&o={macs}".encode())
+    assert len(rep.others) == svc.MAX_REPORTED_OTHERS
+
+
+def test_o_mac_is_never_offered_and_never_unknown(grace60):
+    """Router 10 / 86:A0:C0:5C:AA:90: a paid MAC whose binding has no USER: tag."""
+    desired = [_entry(LEGACY)]
+    for i in range(svc.MAX_OFFERS_BEFORE_BACKOFF + 3):
+        d = _decide([], desired, 1000.0 + 61 * i, o=[LEGACY])
+        assert d.lines == [] and d.would_send == [] and d.in_grace == []
+    assert (ROUTER.id, LEGACY) not in svc._offers        # never offered, so never paused
+    assert (ROUTER.id, LEGACY) not in svc._missing_since
+    # An untagged binding nobody paid for is not "unknown" either: macs= only.
+    d = _decide(["AA:BB:CC:00:00:77"], [], 2000.0, o=["AA:BB:CC:00:00:55"])
+    assert d.unknown == {"AA:BB:CC:00:00:77"}
+    assert svc.stats_snapshot()["routers"][ROUTER.id]["last_others"] == 1
+
+
+def test_mac_leaving_o_is_offered_after_grace(grace60):
+    desired = [_entry(LEGACY)]
+    _decide([], desired, 1000.0, o=[LEGACY])
+    assert _decide([], desired, 1010.0, o=[]).lines == []          # grace starts now
+    assert [e.mac for e in _decide([], desired, 1070.0, o=[]).lines] == [LEGACY]
+
+
+@pytest.mark.parametrize("state", ["in_progress", "scheduled", "retry_pending", "failed"])
+def test_in_c_is_checkin_when_the_check_in_sent_it(state):
+    svc.reset_state()
+    p = _pending(state)
+    svc._sent_at[(ROUTER.id, M1)] = (0.0, datetime.utcnow())
+    via, evidence = svc.classify_delivery(_report([M1], c=[M1]), p, ROUTER.id)
+    assert via == "checkin" and evidence == "in c="
+
+
+def test_in_c_retry_pending_is_checkin_even_without_memory():
+    """The router's own word is enough once the push has given up (e.g. after a restart)."""
+    svc.reset_state()
+    assert svc.classify_delivery(_report([M1], c=[M1]), _pending("retry_pending"), ROUTER.id)[0] == "checkin"
+    assert svc.classify_delivery(_report([M1], c=[M1]), _pending("failed"), ROUTER.id)[0] == "checkin"
+
+
+@pytest.mark.parametrize("sent_offset", [None, timedelta(minutes=-10)], ids=["no-memory", "sent-before-payment"])
+def test_in_c_but_push_in_flight_needs_an_a_line_for_this_payment(sent_offset):
+    """A CHECKIN binding from an EARLIER purchase must not steal a push running now."""
+    svc.reset_state()
+    p = _pending("in_progress")
+    if sent_offset is not None:
+        svc._sent_at[(ROUTER.id, M1)] = (0.0, p.created_at + sent_offset)
+    assert svc.classify_delivery(_report([M1], c=[M1]), p, ROUTER.id)[0] is None
+
+
+@pytest.mark.parametrize("state", ["in_progress", "scheduled"])
+def test_not_in_c_push_owned_attempt_is_left_to_the_push(state):
+    """Production 2026-09-26 (router 10, attempt 210330): the PUSH added the MAC."""
+    svc.reset_state()
+    svc._sent_at[(ROUTER.id, M1)] = (0.0, datetime.utcnow())  # even an A line sent does not override c=
+    assert svc.classify_delivery(_report([M1], c=[]), _pending(state), ROUTER.id)[0] is None
+
+
+@pytest.mark.parametrize("state", ["retry_pending", "failed"])
+def test_not_in_c_after_push_gave_up_is_observed(state):
+    svc.reset_state()
+    via, evidence = svc.classify_delivery(_report([M1], c=[]), _pending(state), ROUTER.id)
+    assert via == "observed" and evidence == "not in c="
+
+
+def test_old_applier_without_c_falls_back_to_a_line_memory():
+    svc.reset_state()
+    rep = _report([M1])   # no c=, no o=
+    assert svc.classify_delivery(rep, _pending("in_progress"), ROUTER.id)[0] is None
+    assert svc.classify_delivery(rep, _pending("retry_pending"), ROUTER.id)[0] == "observed"
+    svc._sent_at[(ROUTER.id, M1)] = (0.0, datetime.utcnow())
+    assert svc.classify_delivery(rep, _pending("in_progress"), ROUTER.id) == ("checkin", "no c=; A line sent")
+    assert svc.classify_delivery(rep, _pending("retry_pending"), ROUTER.id)[0] == "checkin"
+    # An A line older than the payment is not evidence for THIS payment.
+    later = _pending("retry_pending", created_at=datetime.utcnow() + timedelta(minutes=5))
+    assert svc.classify_delivery(rep, later, ROUTER.id)[0] == "observed"
+
+
+@pytest.mark.parametrize("c", [None, [], [M1]], ids=["old-applier", "empty-c", "c-outside-macs"])
+def test_o_only_mac_is_never_credited_to_the_check_in(c):
+    svc.reset_state()
+    svc._sent_at[(ROUTER.id, M1)] = (0.0, datetime.utcnow())
+    rep = _report([], c=c, o=[M1])
+    assert M1 not in rep.checkin_added   # c= outside macs= is ignored
+    assert svc.classify_delivery(rep, _pending("in_progress"), ROUTER.id)[0] is None
+    assert svc.classify_delivery(rep, _pending("retry_pending"), ROUTER.id) == ("observed", "o= (untagged binding)")
+
+
+def test_absent_mac_is_never_recorded():
+    svc.reset_state()
+    assert svc.classify_delivery(_report([], c=[], o=[]), _pending("retry_pending"), ROUTER.id) == (None, "")
+
+
+def test_delivery_candidates_carry_via_and_count_left_to_push():
+    svc.reset_state()
+    pend = [_pending("in_progress", attempt_id=1),
+            _pending("retry_pending", mac="AA:BB:CC:00:00:02", attempt_id=2)]
+    cands = svc.delivery_candidates(_report([M1, "AA:BB:CC:00:00:02"], c=[]), pend, ROUTER.id)
+    assert [(c.attempt_id, c.via) for c in cands] == [(2, "observed")]
+    assert svc._stats[ROUTER.id].left_to_push_total == 1
+
+
+@pytest.mark.asyncio
+async def test_endpoint_push_owned_attempt_not_in_c_is_untouched_then_push_records_itself(client, pilot):
+    from app.services import hotspot_provisioning as hsp
+
+    db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
+    a = await _attempt(db, paid, router, state=ProvisioningState.IN_PROGRESS, age=timedelta(seconds=9))
+    await _checkin(client, [M1, "AA:BB:CC:00:00:02"], q=[], c=[], o=[])
+    await db.refresh(a)
+    assert a.provisioning_state == ProvisioningState.IN_PROGRESS and a.delivered_via is None
+    assert await _logs(db, a.id) == []
+    await hsp._persist_provisioning_result(
+        result={"provision_result": {}, "online_state": "online"}, verify_only=False,
+        customer_id=paid.id, router_id=router.id, router_ip="10.0.0.2", mac_address=paid.mac_address,
+        action="hotspot_payment", attempt_id=a.id, hotspot_payload=_push_payload(paid),
+    )
+    await db.refresh(a)
+    assert a.provisioning_state == ProvisioningState.ROUTER_UPDATED and a.delivered_via == "push"
+
+
+@pytest.mark.asyncio
+async def test_endpoint_retry_pending_present_via_o_is_observed_and_not_offered(client, pilot):
+    db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
+    a = await _attempt(db, paid, router)   # retry_pending: the push gave up
+    resp = await _checkin(client, ["AA:BB:CC:00:00:02"], q=[], c=[], o=[M1])
+    _, count, _, ops = _parse_frame(resp.text)
+    assert count == 0 and ops == []        # no A line for a MAC the router already binds
+    await db.refresh(a)
+    assert a.provisioning_state == ProvisioningState.ROUTER_UPDATED
+    assert a.delivered_via == "observed" and a.access_seen_at is not None and a.last_error is None
+    logs = await _logs(db, a.id)
+    assert len(logs) == 1 and "observed present by check-in" in logs[0].details
+    assert "via=observed" in logs[0].details and "evidence=o= (untagged binding)" in logs[0].details
+    snap = svc.stats_snapshot()["routers"][router.id]
+    assert snap["observed_deliveries_total"] == 1 and snap["checkin_deliveries_total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_endpoint_old_applier_fallback_credits_only_what_it_sent(client, pilot):
+    db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
+    a = await _attempt(db, paid, router, state=ProvisioningState.IN_PROGRESS, age=timedelta(seconds=30))
+    resp = await _checkin(client, ["AA:BB:CC:00:00:02"])          # 01 missing -> A line (grace 0)
+    assert [o["mac"] for o in _parse_frame(resp.text)[3]] == [M1]
+    await _checkin(client, [M1, "AA:BB:CC:00:00:02"])             # old applier: no c=
+    await db.refresh(a)
+    assert a.provisioning_state == ProvisioningState.ROUTER_UPDATED and a.delivered_via == "checkin"
+    assert "a_line_sent=yes" in (await _logs(db, a.id))[0].details
+
+
+@pytest.mark.asyncio
+async def test_observed_is_not_written_if_a_push_started_meanwhile(pilot):
+    db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
+    a = await _attempt(db, paid, router)
+    state = await svc.load_checkin_state(router.id, datetime.utcnow())
+    cands = svc.delivery_candidates(_report([M1], c=[]), state.pending, router.id)
+    assert [c.via for c in cands] == ["observed"]
+    a.provisioning_state = ProvisioningState.IN_PROGRESS   # retry job picked it up
+    await db.commit()
+    assert await svc.record_checkin_deliveries(router.id, cands) == 0
+    await db.refresh(a)
+    assert a.provisioning_state == ProvisioningState.IN_PROGRESS and a.delivered_via is None
+
+
+@pytest.mark.asyncio
+async def test_late_push_failure_does_not_regress_an_observed_delivery(pilot):
+    from app.services import hotspot_provisioning as hsp
+
+    db, router, paid = pilot["db"], pilot["router"], pilot["paid"]
+    a = await _attempt(db, paid, router)
+    cands = svc.delivery_candidates(_report([M1], c=[]),
+                                    (await svc.load_checkin_state(router.id, datetime.utcnow())).pending,
+                                    router.id)
+    assert await svc.record_checkin_deliveries(router.id, cands) == 1
+    await hsp._persist_provisioning_result(
+        result={"error": "Failed to connect to router"}, verify_only=False,
+        customer_id=paid.id, router_id=router.id, router_ip="10.0.0.2", mac_address=paid.mac_address,
+        action="hotspot_payment", attempt_id=a.id, hotspot_payload=_push_payload(paid),
+    )
+    await db.refresh(a)
+    assert a.provisioning_state == ProvisioningState.ROUTER_UPDATED and a.delivered_via == "observed"
+
+
+def test_delivered_via_fits_its_column():
+    from app.db.models import DELIVERED_VIA_OBSERVED, ProvisioningAttempt as PA
+    assert DELIVERED_VIA_OBSERVED == "observed"
+    assert len(DELIVERED_VIA_OBSERVED) <= PA.__table__.c.delivered_via.type.length
+
+
+# ---------------------------------------------------------------------------
+# Applier: c= and o= (static checks)
+# ---------------------------------------------------------------------------
+
+def _collect_block(src):
+    return src[src.index(':foreach b in=[/ip hotspot ip-binding find where comment~"USER:"]'):
+               src.index(":local post (")]
+
+
+def test_applier_reports_checkin_bindings_from_the_same_comment_read():
+    src = _src()
+    collect = _collect_block(src)
+    # One comment read per USER: binding, shared by c= and q=.
+    assert collect.count("/ip hotspot ip-binding get $b comment") == 1
+    read = collect.index(":set bc [:tostr [/ip hotspot ip-binding get $b comment]]")
+    gate = collect.index('[:typeof [:find $bc "CHECKIN"]] = "num"')
+    assert read < gate < collect.index(":set cmacs ($cmacs . $bm)") < collect.index("/queue simple find")
+    # A failed comment read drops c= (a partial list would read as complete).
+    assert collect.index(":set cOk false") < gate
+    assert ':if ($cOk) do={ :set post ($post . "&c=" . $cmacs) }' in src
+    assert ':local cmacs ""' in src
+
+
+def test_applier_reports_other_bindings_with_one_capped_find():
+    from app.services.checkin_applier_script import MAX_OTHER_MACS
+
+    src = _src()
+    finds = re.findall(r"/ip hotspot ip-binding find where [^\]]*", src)
+    others = [f for f in finds if "!(" in f]
+    assert others == ['/ip hotspot ip-binding find where type!="blocked" && disabled=no && !(comment~"USER:")']
+    block = src[src.index(others[0]):src.index(":local post (")]
+    # The cap is checked before the per-binding read, so a router with many
+    # untagged bindings pays one find and at most MAX_OTHER_MACS reads.
+    assert block.index(f":if ($nOth < {MAX_OTHER_MACS}) do={{") < block.index("get $b mac-address")
+    assert "on-error={ :set oOk false }" in block
+    assert ':if ($oOk) do={ :set post ($post . "&o=" . $omacs) }' in src
+
+
+def test_applier_post_field_order_and_back_compat():
+    from app.services.checkin_applier_script import MAX_OTHER_MACS
+
+    src = _src()
+    post = src[src.index(":local post ("):src.index(':local d ""')]
+    # macs first (unchanged for old servers), o= last: a truncated tail can only
+    # shorten the advisory list, never c= or q=.
+    assert post.index("&q=") < post.index("&c=") < post.index("&o=")
+    assert '("v=1&id=" . $ident . "&n=" . $n . "&macs=" . $macs)' in post
+    # A full o= plus a busy router's macs= stays far below the server cap.
+    assert 18 * (MAX_OTHER_MACS + 600) < svc.MAX_BODY_BYTES
+
+
+def test_applier_keeps_ros6_conventions_for_new_variables():
+    src = _src()
+    # No variable named like a RouterOS literal, no loop control RouterOS lacks.
+    for bad in (":local no ", ":local yes ", ":local true ", ":local false ", ":break", ":continue"):
+        assert bad not in src
+    assert src.count("{") == src.count("}") and src.count("[") == src.count("]")
+    assert src.count("(") == src.count(")") and src.count('"') % 2 == 0
+    assert "__" not in src.replace("DB_MANAGED", "")
+
+
+def test_applier_body_parses_on_the_server():
+    """What the applier builds (all fields, some empty) is a valid report."""
+    body = ("v=1&id=Router-0721&n=2&macs=AA:BB:CC:00:00:01,AA:BB:CC:00:00:02"
+            "&q=&c=AA:BB:CC:00:00:02&o=86:A0:C0:5C:AA:90")
+    rep = svc.parse_checkin_body(body.encode())
+    assert rep.count_matches and rep.reports_queues and rep.reports_checkin_added and rep.reports_others

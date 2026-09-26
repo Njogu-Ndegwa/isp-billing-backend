@@ -2746,7 +2746,7 @@ async def run_hot_path_index_migrations():
 async def run_checkin_delivery_migrations():
     """Record which path delivered a paid hotspot customer (2026-09-26).
 
-    provisioning_attempts.delivered_via ('push' | 'checkin') and
+    provisioning_attempts.delivered_via ('push' | 'checkin' | 'observed') and
     access_seen_at. Both nullable with no default, so the ALTER is a catalog
     change only (no table rewrite). Idempotent: ADD COLUMN IF NOT EXISTS.
 

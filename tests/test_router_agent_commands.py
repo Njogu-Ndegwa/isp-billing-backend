@@ -533,3 +533,27 @@ async def test_oversized_router_action_is_rejected_before_database_use():
             command_type="hotspot_provision",
             action_script="x" * (commands.MAX_ACTION_SCRIPT_BYTES + 1),
         )
+
+
+
+@pytest.mark.asyncio
+async def test_agent_provision_script_tags_the_binding_like_the_push(db, session_factory, monkeypatch):
+    from app.services.router_expiry import expiry_second
+
+    monkeypatch.setattr(commands, "async_session", session_factory)
+    reseller, plan, router = await _enabled_hotspot(db)
+    expiry = datetime.utcnow() + timedelta(hours=1)
+    customer = await make_customer(
+        db, reseller, plan, router, status=CustomerStatus.ACTIVE, expiry=expiry,
+    )
+    payload = _payload(customer, router)
+    payload["comment"] = "Payment successful for Guest 2758"
+    command_id = await commands.queue_hotspot_provision_command(
+        router_id=router.id, customer_id=customer.id, attempt_id=None, hotspot_payload=payload,
+    )
+    command = await db.get(RouterCommand, command_id)
+    lines = command.action_script.splitlines()
+    binding = lines[lines.index("/ip hotspot ip-binding") + 1]
+    username = customer.mac_address.replace(":", "")
+    assert f'comment="USER:{username}|EXPIRES:DB_MANAGED|EXP:{expiry_second(expiry)}|' in binding
+    assert "Payment successful" not in binding

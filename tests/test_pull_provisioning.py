@@ -128,3 +128,36 @@ def test_nonpositive_expiry_is_dropped(bad_exp):
         rate_limit="1M/1M", time_limit="20m", expires_at=bad_exp,
     )
     assert "PULL-EXPIRES" not in rsc
+
+
+# --- ip-binding comment: same USER: format as the API push (2026-09-26) ---
+
+def _binding_line(rsc):
+    lines = rsc.splitlines()
+    return lines[lines.index("/ip hotspot ip-binding") + 1]
+
+
+def test_binding_gets_push_user_tag_not_the_free_text_comment():
+    """The free-text comment ("Payment successful for <name>") belongs on the hotspot
+    user. On the binding it hid the customer from the check-in report (no USER:),
+    so the check-in kept offering to re-add a MAC the router already had."""
+    from datetime import datetime
+
+    rsc = render_hotspot_provision_rsc(
+        username="AABBCCDDEEFF", password="p", mac_address="AA:BB:CC:DD:EE:FF",
+        rate_limit="1M/1M", time_limit="1d", comment="Payment successful for Guest 2758",
+        binding_expiry=datetime(2026, 10, 1),
+    )
+    binding = _binding_line(rsc)
+    assert "Payment successful" not in binding
+    assert binding.count('comment="USER:AABBCCDDEEFF|EXPIRES:DB_MANAGED|EXP:1790812800|') == 2
+    assert 'comment="Payment successful for Guest 2758"' in rsc   # still on the user
+
+
+def test_binding_comment_without_expiry_has_no_exp_tag():
+    rsc = render_hotspot_provision_rsc(
+        username="u1", password="p", mac_address="AA:BB:CC:DD:EE:FF",
+        rate_limit="1M/1M", time_limit="1d", comment="x",
+    )
+    binding = _binding_line(rsc)
+    assert 'comment="USER:u1|EXPIRES:DB_MANAGED|' in binding and "EXP:" not in binding

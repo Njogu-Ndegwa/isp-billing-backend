@@ -30,9 +30,16 @@ Per run:
    comment first), so a router with hundreds of push bindings does not run a
    queue lookup per binding every minute; the server only acts on Q lines
    for check-in bindings anyway.
-3. POST ``v=1&id=<identity>&n=<count>&macs=<csv>&q=<csv>`` with the check-in
-   token. Sending ``q=`` (even empty) tells the server this applier
-   understands ``Q`` lines; it is left out if the queue check itself failed.
+   The same comment read yields ``c=``: the CHECKIN-tagged MACs, i.e. the
+   bindings this applier added itself (so the server credits the check-in
+   only for those). One more find collects ``o=``: MACs of every other
+   enabled, non-blocked binding (no ``USER:`` in the comment), capped at
+   ``MAX_OTHER_MACS``, so the server never offers an add for a MAC that
+   already has a legacy/agent/reseller binding.
+3. POST ``v=1&id=<identity>&n=<count>&macs=<csv>&q=<csv>&c=<csv>&o=<csv>``
+   with the check-in token. Sending ``q=``/``c=``/``o=`` (even empty) tells
+   the server this applier supports them; each is left out if its own read
+   failed (a partial list would be read as a complete one).
 4. Validate the WHOLE frame first: ``BWE1,`` header, every line a well-formed
    ``A`` or ``Q`` line, an ``END`` line, and the header count equal to the
    number of lines. Anything else (Cloudflare page, captive portal,
@@ -63,6 +70,14 @@ INITIAL_INTERVAL_SECONDS = 60
 
 CHECK_CERTIFICATE_VALUES = ("no", "yes", "yes-without-crl")
 
+# Cap on o= (other bindings). The POST body is a script string variable;
+# RouterOS strings built in a script are not bound by the 4 KB file-read
+# limit, but a small body keeps the fetch cheap on a hAP lite and well under
+# the server's MAX_BODY_BYTES. 150 MACs = ~2.7 KB. Beyond the cap an
+# untagged binding for a paid MAC is simply offered (and backed off) as
+# before this field existed.
+MAX_OTHER_MACS = 150
+
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _URL_RE = re.compile(r"^https?://[A-Za-z0-9._:/-]{3,200}$")
 
@@ -78,6 +93,12 @@ _TEMPLATE = r''':local url "__URL__"
     :local qmacs ""
     :local nq 0
     :local qOk true
+    :local cmacs ""
+    :local nc 0
+    :local cOk true
+    :local omacs ""
+    :local nOth 0
+    :local oOk true
     :do {
         :foreach b in=[/ip hotspot ip-binding find where comment~"USER:"] do={
             :local bm [:tostr [/ip hotspot ip-binding get $b mac-address]]
@@ -85,22 +106,48 @@ _TEMPLATE = r''':local url "__URL__"
                 :if ($n > 0) do={ :set macs ($macs . ",") }
                 :set macs ($macs . $bm)
                 :set n ($n + 1)
+                :local bc ""
                 :do {
-                    :local bc [:tostr [/ip hotspot ip-binding get $b comment]]
-                    :if ([:typeof [:find $bc "CHECKIN"]] = "num") do={
+                    :set bc [:tostr [/ip hotspot ip-binding get $b comment]]
+                } on-error={
+                    :set cOk false
+                    :set qOk false
+                }
+                :if ([:typeof [:find $bc "CHECKIN"]] = "num") do={
+                    :if ($nc > 0) do={ :set cmacs ($cmacs . ",") }
+                    :set cmacs ($cmacs . $bm)
+                    :set nc ($nc + 1)
+                    :do {
                         :local rf ([:pick $bm 0 2] . [:pick $bm 3 5] . [:pick $bm 6 8] . [:pick $bm 9 11] . [:pick $bm 12 14] . [:pick $bm 15 17])
                         :if ([:len [/queue simple find where name=("plan_" . $rf)]] = 0) do={
                             :if ($nq > 0) do={ :set qmacs ($qmacs . ",") }
                             :set qmacs ($qmacs . $bm)
                             :set nq ($nq + 1)
                         }
-                    }
-                } on-error={ :set qOk false }
+                    } on-error={ :set qOk false }
+                }
             }
         }
     } on-error={ :set readOk false }
+    # Other usable bindings (no USER: tag: legacy, agent or reseller ones), so
+    # the server never offers an add the applier would refuse. One find, and
+    # no per-binding read once the cap is reached.
+    :do {
+        :foreach b in=[/ip hotspot ip-binding find where type!="blocked" && disabled=no && !(comment~"USER:")] do={
+            :if ($nOth < __OCAP__) do={
+                :local om [:tostr [/ip hotspot ip-binding get $b mac-address]]
+                :if ([:len $om] = 17) do={
+                    :if ($nOth > 0) do={ :set omacs ($omacs . ",") }
+                    :set omacs ($omacs . $om)
+                    :set nOth ($nOth + 1)
+                }
+            }
+        }
+    } on-error={ :set oOk false }
     :local post ("v=1&id=" . $ident . "&n=" . $n . "&macs=" . $macs)
     :if ($qOk) do={ :set post ($post . "&q=" . $qmacs) }
+    :if ($cOk) do={ :set post ($post . "&c=" . $cmacs) }
+    :if ($oOk) do={ :set post ($post . "&o=" . $omacs) }
     :local d ""
     :if ($readOk) do={
         :do {
@@ -335,6 +382,7 @@ def render_checkin_applier_source(
         .replace("__SCRIPT__", SCRIPT_NAME)
         .replace("__SCHED__", SCHEDULER_NAME)
         .replace("__CHECKCERT__", check_certificate)
+        .replace("__OCAP__", str(int(MAX_OTHER_MACS)))
     )
 
 
