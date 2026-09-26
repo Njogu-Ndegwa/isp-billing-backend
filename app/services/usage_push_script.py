@@ -325,8 +325,13 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local irx [/interface get $i rx-byte]
             :local itx [/interface get $i tx-byte]
             :local ild [/interface get $i link-downs]
+            :local irp [/interface get $i rx-packet]
+            :local itp [/interface get $i tx-packet]
+            :local ire [/interface get $i rx-error]
+            :local ite [/interface get $i tx-error]
+            :local ilu [:tostr [/interface get $i last-link-up-time]]
             :if (!$ifirst) do={ :set body ($body . ",") }
-            :set body ($body . "{\"name\":\"" . $inm . "\",\"running\":" . $iru . ",\"disabled\":" . $idi . ",\"rx_bytes\":" . $irx . ",\"tx_bytes\":" . $itx . ",\"link_downs\":" . $ild . "}")
+            :set body ($body . "{\"name\":\"" . $inm . "\",\"running\":" . $iru . ",\"disabled\":" . $idi . ",\"rx_bytes\":" . $irx . ",\"tx_bytes\":" . $itx . ",\"link_downs\":" . $ild . ",\"rx_packets\":" . $irp . ",\"tx_packets\":" . $itp . ",\"rx_errors\":" . $ire . ",\"tx_errors\":" . $ite . ",\"last_link_up\":\"" . $ilu . "\"}")
             :set ifirst false
         } on-error={}
     }
@@ -359,6 +364,33 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
                 :if (!$gfirst) do={ :set body ($body . ",") }
                 :set body ($body . "{\"mac\":\"" . $gm . "\",\"type\":\"" . $gt . "\",\"disabled\":" . $gd . "}")
                 :set gfirst false
+            }
+        } on-error={}
+        # DHCP leases give devices their names on the ports card. A host-name
+        # carrying a quote or backslash would break the JSON, so it is dropped.
+        :set body ($body . "],\"leases\":[")
+        :local lfirst true
+        :do {
+            :foreach l in=[/ip dhcp-server lease find] do={
+                :local lm [/ip dhcp-server lease get $l mac-address]
+                :local la [/ip dhcp-server lease get $l address]
+                :local lh [:tostr [/ip dhcp-server lease get $l host-name]]
+                :local ls [:tostr [/ip dhcp-server lease get $l status]]
+                :if (([:typeof [:find $lh "\""]] = "num") || ([:typeof [:find $lh "\\"]] = "num")) do={ :set lh "" }
+                :if (!$lfirst) do={ :set body ($body . ",") }
+                :set body ($body . "{\"mac\":\"" . $lm . "\",\"ip\":\"" . $la . "\",\"host\":\"" . $lh . "\",\"status\":\"" . $ls . "\"}")
+                :set lfirst false
+            }
+        } on-error={}
+        :set body ($body . "],\"bridge_ports\":[")
+        :local pfirst2 true
+        :do {
+            :foreach p in=[/interface bridge port find] do={
+                :local pi [/interface bridge port get $p interface]
+                :local pb [/interface bridge port get $p bridge]
+                :if (!$pfirst2) do={ :set body ($body . ",") }
+                :set body ($body . "{\"interface\":\"" . $pi . "\",\"bridge\":\"" . $pb . "\"}")
+                :set pfirst2 false
             }
         } on-error={}
         :set body ($body . "]")

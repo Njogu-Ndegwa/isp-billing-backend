@@ -186,6 +186,12 @@ class RouterLive:
     bridge_hosts_at: Optional[datetime] = None
     bindings: Optional[list] = None           # [{"mac", "type", "disabled"}]
     bindings_at: Optional[datetime] = None
+    leases: Optional[list] = None             # [{"mac", "ip", "host", "status"}]
+    bridge_ports: Optional[list] = None       # [{"interface", "bridge"}]
+    hosts_raw: list = field(default_factory=list)   # this report's hotspot hosts, as sent
+    ppp_raw: list = field(default_factory=list)     # this report's /ppp active, as sent
+    free_hdd: Optional[int] = None
+    total_hdd: Optional[int] = None
 
 
 _routers: dict[int, RouterLive] = {}
@@ -267,6 +273,10 @@ def record_push(
     ports: Optional[list] = None,
     bridge_hosts: Optional[list] = None,
     bindings: Optional[list] = None,
+    leases: Optional[list] = None,
+    bridge_ports: Optional[list] = None,
+    hosts_raw: Optional[list] = None,
+    ppp_raw: Optional[list] = None,
 ) -> RouterLive:
     """Fold one report into the live state and return the router's entry.
 
@@ -278,6 +288,16 @@ def record_push(
     state = RouterLive(router_id=router_id, received_at=now, interval_seconds=interval_seconds)
     state.has_hosts = has_hosts
     _fold_v3_lists(state, prev, now, ports, bridge_hosts, bindings)
+    state.hosts_raw = list(hosts_raw or [])
+    state.ppp_raw = list(ppp_raw or [])
+    if leases is not None:
+        state.leases = list(leases)
+    elif prev is not None:
+        state.leases = prev.leases
+    if bridge_ports is not None:
+        state.bridge_ports = list(bridge_ports)
+    elif prev is not None:
+        state.bridge_ports = prev.bridge_ports
     state.pushes = (prev.pushes if prev else 0) + 1
     if prev:
         state.last_repair_at = prev.last_repair_at
@@ -285,7 +305,8 @@ def record_push(
         state.problem_signature = prev.problem_signature
 
     metrics = metrics or {}
-    for name in ("cpu_load", "free_memory", "total_memory", "hotspot_active", "pppoe_active", "queue_count"):
+    for name in ("cpu_load", "free_memory", "total_memory", "hotspot_active", "pppoe_active", "queue_count",
+                 "free_hdd", "total_hdd"):
         value = metrics.get(name)
         if value is not None:
             setattr(state, name, int(value))
