@@ -2711,10 +2711,17 @@ def _port_analytics_from_push(
             {"mac-address": mac, "on-interface": port, "local": "false"}
             for mac, port in state.bridge_hosts.items()
         ],
-        neighbor_rows=[],
+        neighbor_rows=[
+            {"mac-address": n.get("mac", ""), "identity": n.get("identity", ""),
+             "board": n.get("board", ""), "platform": n.get("platform", ""),
+             "version": n.get("version", ""), "interface": n.get("interface", ""),
+             "address": n.get("address", "")}
+            for n in (state.neighbors or [])
+        ],
         dhcp_rows=[
             {"mac-address": lease.get("mac", ""), "address": lease.get("ip", ""),
-             "host-name": lease.get("host", ""), "status": lease.get("status", "")}
+             "host-name": lease.get("host", ""), "status": lease.get("status", ""),
+             "comment": lease.get("comment", "")}
             for lease in (state.leases or [])
         ],
         arp_rows=[],

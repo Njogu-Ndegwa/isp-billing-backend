@@ -528,3 +528,27 @@ def test_every_numeric_port_counter_is_guarded_against_an_empty_value():
     assert numeric
     for var in numeric:
         assert f'[:typeof ${var}] != "num"' in ports_block, var
+
+
+def test_ports_card_from_push_recognises_equipment_from_neighbours_and_lease_comments(monkeypatch):
+    # Regression 2026-09-26: the push-served ports card stopped showing equipment
+    # because the report had no /ip neighbor rows (the live read's main signal).
+    from app.api import router_operations as ro
+
+    monkeypatch.setattr(ro, "MikroTikAPI", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no login")))
+    ap_mac, switch_mac = "11:22:33:44:55:66", "22:33:44:55:66:77"
+    realtime_state.record_push(
+        56, now=datetime.utcnow(), interval_seconds=60, hosts=[], queues=[], live_customers={},
+        ports=[{"name": "ether9", "running": True, "disabled": False, "rx_bytes": 1, "tx_bytes": 1, "link_downs": 0}],
+        bridge_hosts=[{"mac": ap_mac, "port": "ether9"}, {"mac": switch_mac, "port": "ether9"}],
+        neighbors=[{"mac": ap_mac, "identity": "Tower-AP-1", "board": "cAP ac", "platform": "MikroTik",
+                    "version": "7.14", "interface": "ether9", "address": "192.168.88.2"}],
+        leases=[{"mac": switch_mac, "ip": "192.168.88.3", "host": "", "status": "bound", "comment": "switch ruijie"}],
+        bridge_ports=[], hosts_raw=[], ppp_raw=[],
+    )
+    result = ro._port_analytics_from_push({"id": 56, "name": "R", "identity": "", "ip": ""}, {}, {})
+    ether9 = result["ports"][0]
+    infra = {d["mac"]: d for d in ether9["infrastructure"]}
+    assert set(infra) == {ap_mac, switch_mac}
+    assert infra[ap_mac]["name"] == "Tower-AP-1" and infra[ap_mac]["source"] == "neighbor"
+    assert ether9["counts"]["infrastructure_devices"] == 2
