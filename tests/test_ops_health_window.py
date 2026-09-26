@@ -323,3 +323,20 @@ async def test_window_endpoint_resolves_owner_by_email_or_id(db, client, monkeyp
 
     r = await client.get("/api/admin/ops-health/window", params={**base, "owner": ""})
     assert r.status_code == 200 and r.json()["owner"] is None
+
+
+@pytest.mark.asyncio
+async def test_problem_routers_endpoint_is_admin_only_and_bounds_the_window(db, client, monkeypatch):
+    _auth_as(monkeypatch, await make_reseller(db))
+    assert (await client.get("/api/admin/ops-health/problem-routers")).status_code == 403
+
+    _auth_as(monkeypatch, await make_admin(db))
+    r = await client.get("/api/admin/ops-health/problem-routers", params={"hours": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["window_hours"] == 1 and body["window_label"] == "1h"
+    assert body["counts"] == {"attention": 0, "recovering": 0, "fixed": 0}
+    assert body["criteria"] and body["generated_at"].endswith("Z")
+    assert (await client.get("/api/admin/ops-health/problem-routers")).json()["window_hours"] == 24
+    for bad in (0, 73):
+        assert (await client.get("/api/admin/ops-health/problem-routers", params={"hours": bad})).status_code == 422

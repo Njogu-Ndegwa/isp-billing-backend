@@ -182,3 +182,96 @@ def test_routers_silent_for_the_whole_week_are_left_out_and_recent_outages_say_d
     out = pr.evaluate([dead, down], checks, [], NOW)
     assert [r["router_id"] for r in out["routers"]] == [2]
     assert out["routers"][0]["reason"] == "Down: no contact since 24 Sep 16:00 UTC"
+
+
+# --- on-demand windows: "is it still a problem in the last hour?" -------------
+
+HOUR = timedelta(hours=1)
+
+
+def test_a_fix_shows_within_the_hour_instead_of_waiting_a_day():
+    # Flagged by the 24h card for 3 lost payments this morning; two clean
+    # deliveries since the fix are enough to call it fixed in a 1h window.
+    attempts = [_paid(1, 5, FAILED), _paid(1, 6, FAILED), _paid(1, 7, FAILED),
+                _paid(1, 0.5), _paid(1, 0.2)]
+    assert pr.evaluate([_router(1)], [], attempts, NOW)["routers"][0]["state"] == "attention"
+    out = pr.evaluate([_router(1)], [], attempts, NOW, window=HOUR)
+    row = out["routers"][0]
+    assert row["state"] == "fixed" and row["window"] == "last_window"
+    assert row["reason"] == "Clean in the last 1h: 2 payments, all connected (before: 3 not connected)"
+    assert out["window_hours"] == 1 and out["window_label"] == "1h"
+
+
+def test_a_quiet_hour_after_a_bad_morning_is_recovering_not_fixed():
+    attempts = [_paid(1, 5, FAILED), _paid(1, 6, FAILED), _paid(1, 0.5)]
+    row = pr.evaluate([_router(1)], [], attempts, NOW, window=HOUR)["routers"][0]
+    assert row["state"] == "recovering"
+    assert row["reason"].startswith("Too little activity in the last 1h to confirm the fix")
+
+
+def test_a_short_window_keeps_ignoring_a_week_old_blip():
+    # Healed two days ago; the 24h card does not list it, neither does the 1h view.
+    healed = [_paid(1, 48, FAILED), _paid(1, 49, FAILED)] + [_paid(1, h) for h in range(1, 12)]
+    assert pr.evaluate([_router(1)], [], healed, NOW, window=HOUR)["routers"] == []
+
+
+def test_short_windows_scale_the_evidence_needed_to_judge_reachability():
+    checks = [(1, NOW - timedelta(minutes=m), m == 50) for m in (10, 25, 40, 50)]  # 1 of 4 online
+    assert pr.evaluate([_router(1)], checks, [], NOW)["routers"] == []  # 24h needs 12 checks
+    row = pr.evaluate([_router(1)], checks, [], NOW, window=HOUR)["routers"][0]
+    assert row["state"] == "attention"
+    assert row["reason"] == "Reachable 25% of the time in the last 1h (1 drop)"
+    assert pr.thresholds_for(HOUR) == pr.Thresholds(first_try_payments=5, reach_checks=4,
+                                                    evidence_payments=2, evidence_checks=4)
+    assert pr.thresholds_for(timedelta(hours=72)) == pr.DEFAULT_THRESHOLDS
+
+
+def test_a_window_splits_on_a_tunnel_move_only_when_the_move_is_inside_it():
+    before = [_paid(1, 5, FAILED), _paid(1, 6, FAILED)]
+    after = [_paid(1, 0.4), _paid(1, 0.3), _paid(1, 0.1)]
+    recent_move = _router(1, management_tunnel="sstp", changed_at=NOW - timedelta(minutes=45), tunnel="sstp")
+    row = pr.evaluate([recent_move], [], before + after, NOW, window=HOUR)["routers"][0]
+    assert row["window"] == "since_fix" and row["state"] == "fixed"
+    assert row["reason"].startswith("Clean since the move to SSTP (25 Sep 11:15 UTC)")
+
+    old_move = _router(1, management_tunnel="sstp", changed_at=NOW - timedelta(days=2), tunnel="sstp")
+    row = pr.evaluate([old_move], [], before + after, NOW, window=HOUR)["routers"][0]
+    assert row["window"] == "last_window" and row["fix"]["label"] == "SSTP"
+    assert row["reason"].startswith("Clean in the last 1h: 3 payments")
+
+
+def test_window_headline_compares_with_the_average_window_before():
+    attempts = [_paid(1, 2, FAILED)] * 3 + [_paid(1, 30, FAILED)] * 12
+    out = pr.evaluate([_router(1)], [], attempts, NOW, window=timedelta(hours=6))
+    assert out["paid_not_connected_window"] == 3
+    assert out["paid_not_connected_avg_before"] == 0.4  # 12 over 27 six-hour windows
+    assert out["paid_not_connected_24h"] == 3  # the fixed-day figures are still there
+    assert out["window_label"] == "6h"
+    assert pr.window_label(timedelta(hours=72)) == "3 days"
+
+
+def test_window_criteria_spell_out_the_scaled_thresholds():
+    rules = " ".join(pr.criteria(HOUR))
+    assert "in the last 1h" in rules
+    assert "once 5+ payments" in rules and "once 4+ checks" in rules
+    assert "at least 2 payments or 4 checks" in rules
+    assert "once 10+ payments" in " ".join(pr.criteria())
+    assert "criteria" not in pr.evaluate([_router(1)], [], [], NOW)  # kept out of stored snapshots
+
+
+@pytest.mark.asyncio
+async def test_window_build_clamps_hours_and_shares_one_read(db, monkeypatch):
+    now = datetime.utcnow()
+    reads = []
+    real = pr.database.async_session
+
+    def counting():
+        reads.append(1)
+        return real()
+    monkeypatch.setattr(pr.database, "async_session", counting)
+    one = await pr.build_problem_routers_window(now, 0)
+    three_days = await pr.build_problem_routers_window(now + timedelta(seconds=5), 500)
+    assert one["window_hours"] == 1 and three_days["window_hours"] == 72
+    assert len(reads) == 1
+    await pr.build_problem_routers_window(now + timedelta(minutes=2), 6)
+    assert len(reads) == 2
