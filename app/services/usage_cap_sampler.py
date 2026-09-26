@@ -121,16 +121,31 @@ def _router_info(router: Router) -> dict[str, Any]:
     }
 
 
-async def _seed_missing_watch_states(db, now: datetime) -> int:
-    """Create watch rows for active capped direct-API customers in small batches."""
-    state_missing = UsageCapWatchState.id.is_(None)
-    capped_plan_or_period = or_(
+def _needs_cap_watch():
+    """Customers the sampler must keep polling.
+
+    Anyone with a cap on the plan or the open period, plus anyone whose open
+    period is still throttled/blocked. The last group matters when a reseller
+    removes a cap: without it the customer drops out of the watch and the
+    throttle is never lifted.
+    """
+    return or_(
         and_(Plan.data_cap_mb.isnot(None), Plan.data_cap_mb > 0),
         and_(
             CustomerUsagePeriod.cap_mb_snapshot.isnot(None),
             CustomerUsagePeriod.cap_mb_snapshot > 0,
         ),
+        and_(
+            CustomerUsagePeriod.fup_triggered_at.isnot(None),
+            CustomerUsagePeriod.fup_reverted_at.is_(None),
+        ),
     )
+
+
+async def _seed_missing_watch_states(db, now: datetime) -> int:
+    """Create watch rows for active capped direct-API customers in small batches."""
+    state_missing = UsageCapWatchState.id.is_(None)
+    capped_plan_or_period = _needs_cap_watch()
     stmt = (
         select(Customer, Plan)
         .join(Plan, Customer.plan_id == Plan.id)
@@ -188,13 +203,7 @@ def _due_filters(now: datetime):
         Customer.status == CustomerStatus.ACTIVE,
         Customer.router_id.isnot(None),
         Plan.connection_type.in_([ConnectionType.HOTSPOT, ConnectionType.PPPOE]),
-        or_(
-            and_(Plan.data_cap_mb.isnot(None), Plan.data_cap_mb > 0),
-            and_(
-                CustomerUsagePeriod.cap_mb_snapshot.isnot(None),
-                CustomerUsagePeriod.cap_mb_snapshot > 0,
-            ),
-        ),
+        _needs_cap_watch(),
         Router.auth_method == RouterAuthMethod.DIRECT_API,
         # Pilot routers are metered (and cap-checked) from their own push,
         # while it is arriving.
@@ -534,13 +543,16 @@ async def _persist_samples(samples: list[QueueSample], now: datetime) -> list[in
 
             cap_mb = update.period.cap_mb_snapshot if (update.period and update.period.cap_mb_snapshot is not None) else plan.data_cap_mb
             cap_bytes = int(cap_mb or 0) * 1024 * 1024
-            if (
-                update.period
-                and cap_bytes > 0
-                and int(update.period.total_bytes or 0) >= cap_bytes
-                and update.period.fup_triggered_at is None
-            ):
-                over_cap_customer_ids.append(customer.id)
+            if update.period:
+                over_cap = cap_bytes > 0 and int(update.period.total_bytes or 0) >= cap_bytes
+                triggered = update.period.fup_triggered_at is not None
+                reverted = update.period.fup_reverted_at is not None
+                if over_cap and not triggered:
+                    over_cap_customer_ids.append(customer.id)
+                elif triggered and not reverted and not over_cap:
+                    # Cap removed or raised above usage: evaluate_and_enforce
+                    # lifts the throttle.
+                    over_cap_customer_ids.append(customer.id)
 
         await db.commit()
 

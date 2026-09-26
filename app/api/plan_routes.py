@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router, FupAction
+from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router, FupAction, CustomerUsagePeriod
 from app.services.auth import verify_token, get_current_user
 from app.services.plan_cache import (
     get_plans_cached,
@@ -35,6 +35,31 @@ def _parse_fup_action(value: Optional[str]) -> Optional[FupAction]:
             detail=f"Invalid fup_action. Must be one of: {', '.join(VALID_FUP_ACTIONS)}",
         )
     return FupAction(value.lower())
+
+
+async def _loosen_open_period_caps(db: AsyncSession, plan_id: int, new_cap_mb: Optional[int]) -> int:
+    """Carry a removed or raised plan cap into customers' open usage periods.
+
+    Periods snapshot the cap when they open, so without this a reseller who
+    lifts a cap still sees their customers throttled until each one renews.
+    Only ever loosens: a lowered cap still waits for the next period. The cap
+    sampler then lifts any throttle that is no longer over the cap.
+    """
+    customer_ids = select(Customer.id).where(Customer.plan_id == plan_id)
+    conditions = [
+        CustomerUsagePeriod.customer_id.in_(customer_ids),
+        CustomerUsagePeriod.closed_at.is_(None),
+        CustomerUsagePeriod.cap_mb_snapshot.isnot(None),
+    ]
+    if new_cap_mb is not None:
+        conditions.append(CustomerUsagePeriod.cap_mb_snapshot < new_cap_mb)
+    result = await db.execute(
+        update(CustomerUsagePeriod)
+        .where(*conditions)
+        .values(cap_mb_snapshot=new_cap_mb)
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount or 0
 
 
 def _serialize_plan_fup(plan: Plan) -> dict:
@@ -406,6 +431,12 @@ async def update_plan_api(
                 if request.data_cap_mb is not None and request.data_cap_mb > 0
                 else None
             )
+            loosened = await _loosen_open_period_caps(db, plan.id, plan.data_cap_mb)
+            if loosened:
+                logger.info(
+                    f"Plan {plan_id}: cap now {plan.data_cap_mb} MB, "
+                    f"loosened {loosened} open usage period(s)"
+                )
         if "fup_action" in fields_set:
             plan.fup_action = _parse_fup_action(request.fup_action)
         if "fup_throttle_profile" in fields_set:

@@ -120,6 +120,58 @@ def _apply_pppoe_headroom(rate_limit: str, factor: float) -> str:
     return f"{scaled_upload}/{scaled_download}"
 
 
+def ensure_plan_pppoe_profile(api: MikroTikAPI, bandwidth_limit: str) -> dict:
+    """Ensure the ``pppoe_<rate>`` profile a plan's customers normally sit on.
+
+    Shared by provisioning and by FUP revert, so a customer released from a
+    throttle lands on exactly the profile provisioning would have given them.
+    Caller owns the connection.
+    """
+    base_rate_limit = api._parse_speed_to_mikrotik(bandwidth_limit)
+    headroom_factor = float(getattr(settings, "PPPOE_RATE_LIMIT_HEADROOM", 1.0) or 1.0)
+    rate_limit = _apply_pppoe_headroom(base_rate_limit, headroom_factor)
+    profile_name = f"pppoe_{base_rate_limit.replace('/', '_')}"
+
+    base_profile = api.get_active_pppoe_profile()
+    base_profile_data = base_profile.get("data") if base_profile.get("found") else {}
+
+    # Fall back to the standard infrastructure defaults when the server lookup
+    # doesn't resolve them. This covers: (a) customer provisioned before PPPoE
+    # ports are configured on the router, and (b) any race/timing window where
+    # the server is not yet visible. Without these fallbacks the created profile
+    # would have no remote-address, so RouterOS accepts the PPPoE auth but then
+    # fails to assign an IP -- the session silently drops at IPCP.
+    local_address = base_profile_data.get("local_address") or PPPOE_DEFAULT_LOCAL_ADDRESS
+    pool_name = base_profile_data.get("remote_address") or PPPOE_DEFAULT_POOL_NAME
+
+    if pool_name == PPPOE_DEFAULT_POOL_NAME:
+        pool_result = api.ensure_ip_pool(PPPOE_DEFAULT_POOL_NAME, PPPOE_DEFAULT_POOL_RANGE)
+        if pool_result.get("error"):
+            logger.error(f"[PPPoE] IP pool ensure failed: {pool_result['error']}")
+            return {"error": f"IP pool ensure failed: {pool_result['error']}"}
+
+    profile_result = api.ensure_pppoe_profile(
+        profile_name,
+        rate_limit,
+        local_address=local_address,
+        pool_name=pool_name,
+        dns_server=base_profile_data.get("dns_server", ""),
+        change_tcp_mss=base_profile_data.get("change_tcp_mss", ""),
+    )
+    if profile_result.get("error"):
+        logger.error(f"[PPPoE] Profile creation failed: {profile_result['error']}")
+        return {"error": f"Profile creation failed: {profile_result['error']}"}
+
+    return {
+        "profile": profile_name,
+        "base_rate_limit": base_rate_limit,
+        "rate_limit": rate_limit,
+        "headroom_factor": headroom_factor,
+        "pool_name": pool_name,
+        "profile_result": profile_result,
+    }
+
+
 def _provision_pppoe_sync(payload: dict) -> dict:
     """
     Synchronous PPPoE provisioning -- runs in thread pool.
@@ -143,40 +195,15 @@ def _provision_pppoe_sync(payload: dict) -> dict:
         return {"error": "Failed to connect to router"}
 
     try:
-        base_rate_limit = api._parse_speed_to_mikrotik(payload["bandwidth_limit"])
-        headroom_factor = float(getattr(settings, "PPPOE_RATE_LIMIT_HEADROOM", 1.0) or 1.0)
-        rate_limit = _apply_pppoe_headroom(base_rate_limit, headroom_factor)
-        profile_name = f"pppoe_{base_rate_limit.replace('/', '_')}"
-
-        base_profile = api.get_active_pppoe_profile()
-        base_profile_data = base_profile.get("data") if base_profile.get("found") else {}
-
-        # Fall back to the standard infrastructure defaults when the server lookup
-        # doesn't resolve them. This covers: (a) customer provisioned before PPPoE
-        # ports are configured on the router, and (b) any race/timing window where
-        # the server is not yet visible. Without these fallbacks the created profile
-        # would have no remote-address, so RouterOS accepts the PPPoE auth but then
-        # fails to assign an IP -- the session silently drops at IPCP.
-        local_address = base_profile_data.get("local_address") or PPPOE_DEFAULT_LOCAL_ADDRESS
-        pool_name = base_profile_data.get("remote_address") or PPPOE_DEFAULT_POOL_NAME
-
-        if pool_name == PPPOE_DEFAULT_POOL_NAME:
-            pool_result = api.ensure_ip_pool(PPPOE_DEFAULT_POOL_NAME, PPPOE_DEFAULT_POOL_RANGE)
-            if pool_result.get("error"):
-                logger.error(f"[PPPoE] IP pool ensure failed: {pool_result['error']}")
-                return {"error": f"IP pool ensure failed: {pool_result['error']}"}
-
-        profile_result = api.ensure_pppoe_profile(
-            profile_name,
-            rate_limit,
-            local_address=local_address,
-            pool_name=pool_name,
-            dns_server=base_profile_data.get("dns_server", ""),
-            change_tcp_mss=base_profile_data.get("change_tcp_mss", ""),
-        )
-        if profile_result.get("error"):
-            logger.error(f"[PPPoE] Profile creation failed: {profile_result['error']}")
-            return {"error": f"Profile creation failed: {profile_result['error']}"}
+        ensured = ensure_plan_pppoe_profile(api, payload["bandwidth_limit"])
+        if ensured.get("error"):
+            return ensured
+        profile_name = ensured["profile"]
+        base_rate_limit = ensured["base_rate_limit"]
+        rate_limit = ensured["rate_limit"]
+        headroom_factor = ensured["headroom_factor"]
+        pool_name = ensured["pool_name"]
+        profile_result = ensured["profile_result"]
 
         comment = payload.get("comment", "")
         secret_result = api.add_pppoe_secret(
