@@ -27,11 +27,10 @@ from app.db.models import Customer, CustomerStatus, ProvisioningLog, Router as R
 from app.services import customer_expiry_notifications
 from app.services.router_expiry import (
     DONE_MINUTE_MAX_SKEW,
+    done_time_to_datetime,
     CustomerRow,
     clock_ok,
     decide,
-    expiry_minute,
-    minute_to_datetime,
     parse_request,
     render_reply,
 )
@@ -157,8 +156,10 @@ async def expiry_check(request: Request, authorization: Optional[str] = Header(d
             by_mac.setdefault((c.mac_address or "").upper(), []).append(c)
         for mac, minute in req.done:
             removed_at = now
-            if trusted and minute is not None and abs(minute - expiry_minute(now)) <= DONE_MINUTE_MAX_SKEW:
-                removed_at = min(minute_to_datetime(minute), now)
+            if trusted and minute is not None:
+                reported = done_time_to_datetime(minute)
+                if abs((reported - now).total_seconds()) <= DONE_MINUTE_MAX_SKEW * 60:
+                    removed_at = min(reported, now)
             for c in by_mac.get(mac, []):
                 if c.status != CustomerStatus.ACTIVE or c.expiry is None:
                     continue

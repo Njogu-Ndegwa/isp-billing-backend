@@ -319,3 +319,33 @@ async def test_server_cleanup_waits_for_the_reaper_then_acts(db, session_factory
 
     assert sorted(seen) == sorted([stale.id, other.id])
     assert fresh.id not in seen
+
+
+# --- removal time in seconds ------------------------------------------------
+
+def test_done_time_accepts_seconds_and_the_first_installs_minutes():
+    from app.services.router_expiry import done_time_to_datetime
+
+    t = datetime(2026, 9, 26, 7, 15, 42)
+    secs = calendar.timegm(t.timetuple())
+    assert done_time_to_datetime(secs) == t
+    assert done_time_to_datetime(secs // 60) == datetime(2026, 9, 26, 7, 15)
+
+
+def test_script_reports_removals_in_seconds():
+    s = _script()
+    assert ':local ss [:pick $t 6 8]' in s
+    assert '($bwExpDone . $m . "@" . (($nowm * 60) + $se) . ",")' in s
+
+
+@pytest.mark.asyncio
+async def test_removal_logged_at_the_routers_second(client, db, session_factory):
+    now = datetime.utcnow()
+    router, (cust,) = await _router_with(db, [(MAC_A, CustomerStatus.ACTIVE, now - timedelta(minutes=2))])
+    removed = now.replace(microsecond=0) - timedelta(seconds=37)
+    secs = calendar.timegm(removed.timetuple())
+    r = await _post(client, f"ident={IDENT}&now={_now_minute()}&due=&done={MAC_A}@{secs},")
+    assert r.status_code == 200
+    async with session_factory() as s:
+        log = (await s.execute(select(ProvisioningLog).where(ProvisioningLog.customer_id == cust.id))).scalars().one()
+    assert log.log_date == removed
