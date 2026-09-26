@@ -372,6 +372,25 @@ async def admin_ops_health_window(
     return await build_window_report(start, end_value, router_id=router_id, owner_id=owner_id)
 
 
+@router.get("/api/admin/ops-health/problem-routers")
+async def admin_ops_health_problem_routers(
+    hours: int = Query(24, ge=1, le=72, description="Judge routers on the last N hours"),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Problem routers judged live on a chosen window (last 1h, 6h, 3 days...).
+
+    Same rules as the snapshot's ``problem_routers`` section, with thresholds
+    scaled to the window and the rules returned as ``criteria``. DB-only, one
+    short session (shared for 60 s across windows).
+    """
+    await _require_admin(token, db)
+    await db.commit()
+    from app.services.ops_health_problem_routers import build_problem_routers_window
+
+    return await build_problem_routers_window(datetime.utcnow(), hours)
+
+
 @router.get("/api/admin/ops-health/history")
 async def admin_ops_health_history(
     hours: int = Query(24, ge=1, le=ops_health.HISTORY_MAX_HOURS),
