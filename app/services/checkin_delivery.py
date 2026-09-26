@@ -304,11 +304,24 @@ def compute_diff(
     return missing, unknown
 
 
-def next_poll_seconds(*, lines_sent: int, payment_hot: bool, rng: random.Random | None = None) -> int:
+def next_poll_seconds(
+    *,
+    lines_sent: int,
+    payment_hot: bool,
+    router_id: int | None = None,
+    rng: random.Random | None = None,
+) -> int:
     if lines_sent > 0:
         return CONFIRM_POLL_SECONDS
     if payment_hot:
         return FAST_POLL_SECONDS
+    span = 2 * NORMAL_POLL_JITTER_SECONDS + 1
+    if router_id is not None and rng is None:
+        # Stable per router: the applier rewrites its scheduler whenever next_s changes, and
+        # every scheduler change is a config write to the router's flash. A fresh random value
+        # on each check-in rewrote it every minute; a fixed per-router offset still spreads the
+        # fleet across the window but only changes when the cadence really changes.
+        return NORMAL_POLL_SECONDS + (int(router_id) * 7919) % span - NORMAL_POLL_JITTER_SECONDS
     r = rng or random
     return NORMAL_POLL_SECONDS + r.randint(-NORMAL_POLL_JITTER_SECONDS, NORMAL_POLL_JITTER_SECONDS)
 
@@ -550,7 +563,7 @@ def decide(
             "[CHECKIN] router %s: declared n=%s but %d MACs received; replying empty",
             rid, report.declared_count, report.tokens,
         )
-        return Decision([], [], unknown, next_poll_seconds(lines_sent=0, payment_hot=payment_hot, rng=rng))
+        return Decision([], [], unknown, next_poll_seconds(lines_sent=0, payment_hot=payment_hot, router_id=rid, rng=rng))
 
     offerable = [e for e in missing if _offerable(rid, e.mac, now_mono)]
     would_send = offerable[: max_lines_per_reply()]
@@ -591,7 +604,7 @@ def decide(
         lines=lines,
         would_send=would_send,
         unknown=unknown,
-        next_s=next_poll_seconds(lines_sent=len(lines), payment_hot=payment_hot, rng=rng),
+        next_s=next_poll_seconds(lines_sent=len(lines), payment_hot=payment_hot, router_id=rid, rng=rng),
     )
 
 

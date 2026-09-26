@@ -158,6 +158,20 @@ def test_compute_diff_dedupes_mac_keeping_latest_expiry():
     assert len(missing) == 1 and missing[0].expiry_epoch == 1790009999
 
 
+def test_idle_poll_interval_is_stable_per_router():
+    # The applier rewrites its scheduler (a flash write) whenever next_s changes, so the
+    # idle cadence must not change between check-ins of the same router.
+    for rid in (292, 426, 448):
+        first = svc.next_poll_seconds(lines_sent=0, payment_hot=False, router_id=rid)
+        assert all(svc.next_poll_seconds(lines_sent=0, payment_hot=False, router_id=rid) == first
+                   for _ in range(20))
+        assert 54 <= first <= 66
+    spread = {svc.next_poll_seconds(lines_sent=0, payment_hot=False, router_id=rid) for rid in range(1, 60)}
+    assert len(spread) > 5  # still spreads the fleet across the window
+    assert svc.next_poll_seconds(lines_sent=0, payment_hot=True, router_id=448) == 10
+    assert svc.next_poll_seconds(lines_sent=1, payment_hot=False, router_id=448) == 5
+
+
 def test_next_poll_seconds():
     assert svc.next_poll_seconds(lines_sent=2, payment_hot=True) == 5
     assert svc.next_poll_seconds(lines_sent=0, payment_hot=True) == 10
