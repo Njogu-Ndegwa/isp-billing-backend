@@ -330,6 +330,16 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local ire [/interface get $i rx-error]
             :local ite [/interface get $i tx-error]
             :local ilu [:tostr [/interface get $i last-link-up-time]]
+            # Some drivers (RB4011 ethernet/SFP on ROS 7) return no value for
+            # a counter; an empty value made the JSON invalid ("rx_errors":,)
+            # and every report from those routers was rejected (2026-09-26).
+            :if ([:typeof $irx] != "num") do={ :set irx 0 }
+            :if ([:typeof $itx] != "num") do={ :set itx 0 }
+            :if ([:typeof $ild] != "num") do={ :set ild 0 }
+            :if ([:typeof $irp] != "num") do={ :set irp 0 }
+            :if ([:typeof $itp] != "num") do={ :set itp 0 }
+            :if ([:typeof $ire] != "num") do={ :set ire 0 }
+            :if ([:typeof $ite] != "num") do={ :set ite 0 }
             :if (!$ifirst) do={ :set body ($body . ",") }
             :set body ($body . "{\"name\":\"" . $inm . "\",\"running\":" . $iru . ",\"disabled\":" . $idi . ",\"rx_bytes\":" . $irx . ",\"tx_bytes\":" . $itx . ",\"link_downs\":" . $ild . ",\"rx_packets\":" . $irp . ",\"tx_packets\":" . $itp . ",\"rx_errors\":" . $ire . ",\"tx_errors\":" . $ite . ",\"last_link_up\":\"" . $ilu . "\"}")
             :set ifirst false

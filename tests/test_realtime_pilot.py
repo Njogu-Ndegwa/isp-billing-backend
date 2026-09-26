@@ -513,3 +513,18 @@ def test_ports_card_is_served_from_the_push_with_the_live_read_shape(monkeypatch
     # No fresh push: the endpoint falls back to the live read.
     realtime_state.reset_realtime_state()
     assert ro._port_analytics_from_push({"id": 55, "name": "R", "identity": "", "ip": ""}, {}, {}) is None
+
+
+def test_every_numeric_port_counter_is_guarded_against_an_empty_value():
+    # RB4011 on ROS 7 returns no value for rx-error/tx-error; unguarded, the
+    # report carried "rx_errors":, and was rejected (Wangige/OPIC, 2026-09-26).
+    import re
+    script = render_realtime_push_script(identity="Router-0721", endpoint_url="http://10.251.0.1:8088/api/router/usage-push")
+    start = script.index('",\\"ports\\":[")')
+    ports_block = script[start:script.index("bwPushN")]
+    pairs = re.findall(r'\\"(\w+)\\":" \. \$(\w+) \. "', ports_block)
+    numeric = {var for key, var in pairs if key not in ("running", "disabled")}
+    assert {"rx_errors", "tx_errors", "rx_packets"} <= {key for key, _ in pairs}
+    assert numeric
+    for var in numeric:
+        assert f'[:typeof ${var}] != "num"' in ports_block, var
