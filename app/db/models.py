@@ -69,6 +69,12 @@ class ProvisioningState(str, enum.Enum):
     FAILED = "failed"
 
 
+# provisioning_attempts.delivered_via values (plain varchar, not a PG enum, so
+# a future path needs no enum migration).
+DELIVERED_VIA_PUSH = "push"
+DELIVERED_VIA_CHECKIN = "checkin"
+
+
 class ProvisioningOnlineState(str, enum.Enum):
     UNKNOWN = "unknown"
     OFFLINE = "offline"
@@ -603,6 +609,14 @@ class ProvisioningAttempt(Base):
     last_attempt_at = Column(DateTime, nullable=True)
     router_updated_at = Column(DateTime, nullable=True)
     last_online_at = Column(DateTime, nullable=True)
+    # Which path got the customer onto the router: 'push' (direct API) or
+    # 'checkin' (the router's check-in report showed the MAC present). NULL on
+    # rows from before 2026-09-26 and on other paths (PPPoE, router agent).
+    # Startup migration: run_checkin_delivery_migrations() in main.py.
+    delivered_via = Column(String(16), nullable=True)
+    # When access was first confirmed (push: router_updated_at; check-in: the
+    # report that showed the MAC). access_seen_at - created_at = payment->access.
+    access_seen_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

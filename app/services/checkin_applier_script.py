@@ -17,23 +17,31 @@ Portability rules this template keeps (RouterOS 6.48 - 7.21):
 * ``:find`` is never called with a start offset (its start semantics are not
   documented); lines are split by re-slicing the remaining text instead, and
   ``A`` line fields are taken at fixed offsets (MAC 2..19, ref = last 12,
-  epoch = the 10 chars before the ref's comma);
+  epoch = the 10 chars before the ref's comma); ``Q`` lines likewise (MAC
+  2..19, ref = last 12, rate = between);
 * nothing is remembered between runs — every run reads its own bindings.
 
 Per run:
 
 1. Skip if another copy is still running (a slow fetch at a 5 s interval).
-2. Collect the MACs of ip-bindings whose comment contains ``USER:``.
-3. POST ``v=1&id=<identity>&n=<count>&macs=<csv>`` with the check-in token.
+2. Collect the MACs of ip-bindings whose comment contains ``USER:``, and the
+   subset with no ``plan_<MAC without colons>`` simple queue.
+3. POST ``v=1&id=<identity>&n=<count>&macs=<csv>&q=<csv>`` with the check-in
+   token. Sending ``q=`` (even empty) tells the server this applier
+   understands ``Q`` lines; it is left out if the queue check itself failed.
 4. Validate the WHOLE frame first: ``BWE1,`` header, every line a well-formed
-   ``A`` line, an ``END`` line, and the header count equal to the number of
-   lines. Anything else (Cloudflare page, captive portal, truncation) applies
-   nothing and drops the interval back to at least 60 s.
+   ``A`` or ``Q`` line, an ``END`` line, and the header count equal to the
+   number of lines. Anything else (Cloudflare page, captive portal,
+   truncation) applies nothing and drops the interval back to at least 60 s.
 5. For each ``A`` line whose MAC has NO ip-binding at all: add the bypassed
    binding with the push's comment format, kick that MAC's hotspot active +
    host entries (only on this new add), and replace its ``plan_<ref>`` simple
    queue exactly like ``MikroTikAPI.add_customer_bypass_mode``. A MAC that
    already has any binding (ours or a reseller's block) is left alone.
+   For each ``Q`` line: only if the MAC has a ``CHECKIN``-tagged binding and
+   still no ``plan_<ref>`` queue, and its IP is now known (hotspot host, arp,
+   dhcp lease), create the queue exactly as the ``A`` path does. No IP yet
+   means nothing happens; the server offers it again on a later check-in.
 6. Set its own scheduler interval to the header's ``next_s`` (5..3600).
 """
 
@@ -63,6 +71,9 @@ _TEMPLATE = r''':local url "__URL__"
     :local macs ""
     :local n 0
     :local readOk true
+    :local qmacs ""
+    :local nq 0
+    :local qOk true
     :do {
         :foreach b in=[/ip hotspot ip-binding find where comment~"USER:"] do={
             :local bm [:tostr [/ip hotspot ip-binding get $b mac-address]]
@@ -70,13 +81,23 @@ _TEMPLATE = r''':local url "__URL__"
                 :if ($n > 0) do={ :set macs ($macs . ",") }
                 :set macs ($macs . $bm)
                 :set n ($n + 1)
+                :local rf ([:pick $bm 0 2] . [:pick $bm 3 5] . [:pick $bm 6 8] . [:pick $bm 9 11] . [:pick $bm 12 14] . [:pick $bm 15 17])
+                :do {
+                    :if ([:len [/queue simple find where name=("plan_" . $rf)]] = 0) do={
+                        :if ($nq > 0) do={ :set qmacs ($qmacs . ",") }
+                        :set qmacs ($qmacs . $bm)
+                        :set nq ($nq + 1)
+                    }
+                } on-error={ :set qOk false }
             }
         }
     } on-error={ :set readOk false }
+    :local post ("v=1&id=" . $ident . "&n=" . $n . "&macs=" . $macs)
+    :if ($qOk) do={ :set post ($post . "&q=" . $qmacs) }
     :local d ""
     :if ($readOk) do={
         :do {
-            :local res [/tool fetch url=$url http-method=post http-header-field=("Content-Type: text/plain,Authorization: Bearer " . $tok) http-data=("v=1&id=" . $ident . "&n=" . $n . "&macs=" . $macs) check-certificate=__CHECKCERT__ output=user as-value]
+            :local res [/tool fetch url=$url http-method=post http-header-field=("Content-Type: text/plain,Authorization: Bearer " . $tok) http-data=$post check-certificate=__CHECKCERT__ output=user as-value]
             :if (($res->"status") = "finished") do={ :set d [:tostr ($res->"data")] }
         } on-error={ :log info "checkin: deferred" }
     }
@@ -139,6 +160,17 @@ _TEMPLATE = r''':local url "__URL__"
                         }
                     }
                 }
+                :if (($ll >= 36) && ($ll <= 70)) do={
+                    :if (([:pick $ln 0 2] = "Q,") && ([:pick $ln 19 20] = ",") && ([:pick $ln ($ll - 13) ($ll - 12)] = ",")) do={
+                        :local vm [:pick $ln 2 19]
+                        :local vr [:pick $ln 20 ($ll - 13)]
+                        :if (([:pick $vm 2 3] = ":") && ([:pick $vm 5 6] = ":") && ([:pick $vm 8 9] = ":") && ([:pick $vm 11 12] = ":") && ([:pick $vm 14 15] = ":")) do={
+                            :if (([:typeof [:find $vr "/"]] = "num") && ([:typeof [:find $vr ","]] != "num")) do={
+                                :set ok true
+                            }
+                        }
+                    }
+                }
                 :if ($ok) do={ :set cnt ($cnt + 1) } else={ :set bad true }
             }
         }
@@ -168,10 +200,28 @@ _TEMPLATE = r''':local url "__URL__"
                 :set done true
             } else={
                 :local ll [:len $ln]
+                :local kind [:pick $ln 0 1]
                 :local mac [:pick $ln 2 19]
-                :local rate [:pick $ln 20 ($ll - 24)]
                 :local ref [:pick $ln ($ll - 12) $ll]
-                :if ([:len [/ip hotspot ip-binding find where mac-address=$mac]] = 0) do={
+                :local rate ""
+                :local need false
+                :if ($kind = "A") do={
+                    :set rate [:pick $ln 20 ($ll - 24)]
+                    :if ([:len [/ip hotspot ip-binding find where mac-address=$mac]] = 0) do={
+                        :set need true
+                    } else={
+                        :log info ("checkin: " . $mac . " already has a binding, left alone")
+                    }
+                }
+                :if ($kind = "Q") do={
+                    :set rate [:pick $ln 20 ($ll - 13)]
+                    :do {
+                        :if ([:len [/ip hotspot ip-binding find where mac-address=$mac comment~"CHECKIN"]] > 0) do={
+                            :if ([:len [/queue simple find where name=("plan_" . $ref)]] = 0) do={ :set need true }
+                        }
+                    } on-error={}
+                }
+                :if ($need) do={
                     :local ip ""
                     :do {
                         :foreach h in=[/ip hotspot host find where mac-address=$mac] do={
@@ -193,13 +243,17 @@ _TEMPLATE = r''':local url "__URL__"
                         } on-error={}
                     }
                     :local added false
-                    :do {
-                        /ip hotspot ip-binding add mac-address=$mac type=bypassed comment=("USER:" . $ref . "|EXPIRES:DB_MANAGED|CHECKIN")
-                        :set added true
-                    } on-error={ :log warning ("checkin: bypass add failed " . $mac) }
+                    :if ($kind = "A") do={
+                        :do {
+                            /ip hotspot ip-binding add mac-address=$mac type=bypassed comment=("USER:" . $ref . "|EXPIRES:DB_MANAGED|CHECKIN")
+                            :set added true
+                        } on-error={ :log warning ("checkin: bypass add failed " . $mac) }
+                    }
                     :if ($added) do={
                         :do { /ip hotspot active remove [find where mac-address=$mac] } on-error={}
                         :do { /ip hotspot host remove [find where mac-address=$mac] } on-error={}
+                    }
+                    :if ($added || ($kind = "Q")) do={
                         :if ($ip != "") do={
                             :local qn ("plan_" . $ref)
                             :do {
@@ -214,13 +268,12 @@ _TEMPLATE = r''':local url "__URL__"
                                     }
                                 }
                             } on-error={}
+                            :if ($kind = "Q") do={ :log info ("checkin: queued " . $mac) }
                         } else={
-                            :log info ("checkin: no IP yet for " . $mac . ", queue left to sync")
+                            :if ($added) do={ :log info ("checkin: no IP yet for " . $mac . ", queue left to sync") }
                         }
-                        :log info ("checkin: bypassed " . $mac)
+                        :if ($added) do={ :log info ("checkin: bypassed " . $mac) }
                     }
-                } else={
-                    :log info ("checkin: " . $mac . " already has a binding, left alone")
                 }
             }
         }

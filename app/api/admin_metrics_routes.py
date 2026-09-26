@@ -5,6 +5,7 @@ All routes require admin role (same auth as /api/admin/* endpoints).
 """
 
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -29,6 +30,7 @@ from app.services.management_tunnel_health import (
 )
 
 router = APIRouter(tags=["admin-metrics"])
+logger = logging.getLogger(__name__)
 
 
 async def _require_admin(token: str, db: AsyncSession) -> User:
@@ -60,13 +62,24 @@ async def admin_checkin_pilot_stats(
 
     Shadow mode records here what it WOULD have sent, and how long each paid
     MAC stayed missing from its router before the push (or pull) landed.
+
+    ``delivery_paths_24h`` (DB, one short read in its own session): per-path
+    delivery counts (push / checkin / other / undelivered) and p50/p95 of
+    payment->access (access_seen_at - created_at) for pilot routers vs the
+    rest of the fleet, over attempts created in the last 24 h.
     """
 
     await _require_admin(token, db)
     await db.commit()
-    from app.services.checkin_delivery import stats_snapshot
+    from app.services.checkin_delivery import delivery_path_metrics, stats_snapshot
 
-    return stats_snapshot()
+    snapshot = stats_snapshot()
+    try:
+        snapshot["delivery_paths_24h"] = await delivery_path_metrics()
+    except Exception as exc:  # the in-memory counters are still useful alone
+        logger.warning("checkin-pilot delivery metrics failed: %s", exc)
+        snapshot["delivery_paths_24h"] = {"error": "unavailable"}
+    return snapshot
 
 
 @router.get("/api/admin/db-pool")

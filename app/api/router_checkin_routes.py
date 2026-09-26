@@ -15,6 +15,11 @@ Order of work, cheapest first, and never any router I/O:
 6. Pool pressure -> empty frame, unless a customer on this router is paying
    right now (never shed the one case the channel exists for).
 7. One short read of the desired state (session released), then a pure diff.
+8. After the reply is decided: if the report shows a paid customer present
+   whose provisioning attempt is still undelivered, ONE short write session
+   marks it delivered via check-in. It runs as a background task after the
+   response is sent, only when there is something to mark, and is skipped
+   under pool pressure (the next check-in retries it; it is idempotent).
 
 Every reply that is not a 400/401 is a well-formed ``BWE1`` frame, so the
 router's validator can treat anything else (Cloudflare error page, captive
@@ -28,7 +33,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Header, Request
+from fastapi import APIRouter, BackgroundTasks, Header, Request
 from fastapi.responses import PlainTextResponse
 
 from app.db.database import db_pool_snapshot
@@ -62,8 +67,19 @@ def _pool_under_pressure() -> bool:
         return False
 
 
-def _frame(body: str) -> PlainTextResponse:
-    return PlainTextResponse(body, headers=_HEADERS)
+def _frame(body: str, background: Optional[BackgroundTasks] = None) -> PlainTextResponse:
+    return PlainTextResponse(body, headers=_HEADERS, background=background)
+
+
+async def _record_deliveries(router_id: int, candidates: list) -> None:
+    """Background: settle undelivered attempts the report proved delivered."""
+    try:
+        if _pool_under_pressure():
+            return  # idempotent; the next check-in offers it again
+        async with _read_gate:
+            await svc.record_checkin_deliveries(router_id, candidates)
+    except Exception:  # never let bookkeeping break the channel
+        logger.exception("[CHECKIN] router %s: recording check-in deliveries failed", router_id)
 
 
 def _plain(status: int, text: str) -> PlainTextResponse:
@@ -107,14 +123,22 @@ async def router_checkin(
         if router_ref.id not in svc.checkin_router_ids():
             return _frame(svc.idle_frame())
         now = datetime.utcnow()
-        desired, undelivered = await svc.load_desired_state(router_ref.id, now)
+        state = await svc.load_checkin_state(router_ref.id, now)
 
     decision = svc.decide(
         router=router_ref,
         report=report,
-        desired=desired,
-        undelivered_recent=undelivered,
+        desired=state.desired,
+        undelivered_recent=state.undelivered_recent,
         mode=svc.checkin_mode(),
         now=now,
     )
-    return _frame(svc.render_frame(svc._seq(), decision.lines, decision.next_s))
+    background = None
+    candidates = svc.delivery_candidates(report, state.pending)
+    if candidates:
+        background = BackgroundTasks()
+        background.add_task(_record_deliveries, router_ref.id, candidates)
+    return _frame(
+        svc.render_frame(svc._seq(), decision.lines, decision.next_s, decision.queue_lines),
+        background,
+    )

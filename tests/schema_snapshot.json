@@ -573,9 +573,11 @@
   "whatsapp_group_url"
  ],
  "provisioning_attempts": [
+  "access_seen_at",
   "attempt_count",
   "created_at",
   "customer_id",
+  "delivered_via",
   "entrypoint",
   "external_reference",
   "id",
