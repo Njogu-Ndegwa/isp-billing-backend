@@ -2569,6 +2569,20 @@ async def run_router_status_alert_migrations():
     logger.info("Router status-alert migrations complete")
 
 
+async def run_router_reachability_probe_migrations():
+    """Record, once, when the reachability probe went live: outages that began
+    before it are not announced to resellers (router_status_alerts
+    OUTAGE_ALERTS_FROM_SETTING). ON CONFLICT DO NOTHING keeps the first value
+    across restarts. Idempotent."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            INSERT INTO app_settings (key, value)
+            VALUES ('router_outage_alerts_from',
+                    to_char(timezone('utc', now()), 'YYYY-MM-DD"T"HH24:MI:SS'))
+            ON CONFLICT (key) DO NOTHING
+        """))
+
+
 async def run_router_overload_alert_migrations():
     """Columns for router overload alerts and SNMP CPU monitoring. All nullable
     or defaulted, so existing rows keep today's behaviour (no router is SNMP
@@ -3016,6 +3030,7 @@ async def startup_event():
     try:
         await run_router_status_alert_migrations()
         await run_router_overload_alert_migrations()
+        await run_router_reachability_probe_migrations()
         logger.info("Router status-alert migrations completed successfully")
     except Exception as e:
         logger.error(f"Router status-alert migration failed (non-fatal): {e}")

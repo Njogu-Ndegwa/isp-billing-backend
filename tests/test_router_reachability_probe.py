@@ -96,3 +96,33 @@ async def test_sheds_when_the_db_pool_is_busy(db):
     reachable, calls = _answering(set())
     assert await probe.probe_router_reachability(reachable=reachable, pool_is_busy=lambda: True) == {"skipped": "db_busy"}
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_outages_that_began_before_the_probe_are_not_announced(db, session_factory):
+    # Dennis 2026-09-26: the probe confirms old, unnoticed outages; their
+    # resellers get no late "went offline" message. New outages still do.
+    from app.db.models import AppSetting
+    from app.services import router_status_alerts as alerts
+
+    went_live = datetime.utcnow() - timedelta(hours=1)
+    reseller = await make_reseller(db)
+    old = await _router(db, reseller, "10.0.9.5", last_status=False, status_alerts_enabled=True,
+                        last_checked_at=datetime.utcnow(), last_online_at=went_live - timedelta(hours=5))
+    new = await _router(db, reseller, "10.0.9.6", last_status=False, status_alerts_enabled=True,
+                        last_checked_at=datetime.utcnow(), last_online_at=datetime.utcnow() - timedelta(minutes=30))
+    await db.commit()
+    now = datetime.utcnow()
+
+    async with session_factory() as s:   # no cutoff row: both eligible, as before the probe
+        both = set((await s.execute(select(Router.id).where(
+            *alerts._offline_candidate_filters(now, await alerts._outage_alerts_from(s))))).scalars())
+    assert {old.id, new.id} <= both
+
+    async with session_factory() as s:
+        s.add(AppSetting(key=alerts.OUTAGE_ALERTS_FROM_SETTING, value=went_live.strftime("%Y-%m-%dT%H:%M:%S")))
+        await s.commit()
+    async with session_factory() as s:
+        ids = set((await s.execute(select(Router.id).where(
+            *alerts._offline_candidate_filters(now, await alerts._outage_alerts_from(s))))).scalars())
+    assert new.id in ids and old.id not in ids
