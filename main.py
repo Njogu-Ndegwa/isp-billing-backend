@@ -3176,13 +3176,19 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
+    # First run ~20 s after startup rather than a full interval: a restart
+    # loses the in-process checkin_only fallback timers, and this job re-arms
+    # them (and pushes anything stranded) so a waiting payment is not held an
+    # extra ~97 s by the deploy.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     scheduler.add_job(
         retry_pending_hotspot_provisioning_background,
         trigger=IntervalTrigger(seconds=97),
         id='retry_pending_hotspot_provisioning',
         name='Retry stranded hotspot provisioning',
         replace_existing=True,
-        max_instances=1
+        max_instances=1,
+        next_run_time=_dt.now(_tz.utc) + _td(seconds=20),
     )
     scheduler.add_job(
         retry_pending_pppoe_provisioning_background,

@@ -1507,6 +1507,11 @@ async def pair_device_and_pay(
         if payment_method_enum == PaymentMethod.MOBILE_MONEY:
             from app.services.mpesa import initiate_stk_push
             from app.services.payment_gateway import resolve_router_payment_method, initiate_customer_payment
+            from app.services.checkin_delivery import note_payment_initiated
+
+            # Check-in delivery pilot: payment about to start on this router.
+            # In-memory and exception-proof.
+            note_payment_initiated(request.router_id)
 
             reference = f"DEVICE-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
