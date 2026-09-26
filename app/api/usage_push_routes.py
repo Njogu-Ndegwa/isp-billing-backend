@@ -25,6 +25,7 @@ the server and can be tuned without touching a thousand devices.
 from __future__ import annotations
 
 import asyncio
+import re
 import logging
 import time
 from datetime import datetime
@@ -501,6 +502,44 @@ def _repair_semaphore() -> asyncio.Semaphore:
     if _repair_slots is None:
         _repair_slots = asyncio.Semaphore(_REPAIR_CONCURRENCY)
     return _repair_slots
+
+
+_IDENTITY_IN_BODY = re.compile(rb'"identity"\s*:\s*"([^"]{1,64})"')
+
+
+async def log_rejected_push(request, exc) -> None:
+    """Log a rejected (422) router push: which router, which field, the offending text.
+
+    Called from the app's RequestValidationError handler. Only acts on the
+    push path; never raises.
+    """
+    try:
+        if request.url.path != "/api/router/usage-push":
+            return
+        raw = b""
+        try:
+            raw = await request.body()
+        except Exception:
+            pass
+        m = _IDENTITY_IN_BODY.search(raw or b"")
+        identity = m.group(1).decode("ascii", "replace") if m else "?"
+        details = []
+        for err in exc.errors()[:5]:
+            loc = err.get("loc") or ()
+            snippet = ""
+            if err.get("type") == "json_invalid" and len(loc) > 1 and isinstance(loc[1], int):
+                pos = loc[1]
+                snippet = (raw[max(0, pos - 60): pos + 60]).decode("utf-8", "backslashreplace")
+            else:
+                snippet = str(err.get("input"))[:80]
+            details.append(f"{'.'.join(str(x) for x in loc)} {err.get('type')} {snippet!r}")
+        logger.warning(
+            "[USAGE-PUSH] 422 from %s via %s (%d bytes): %s",
+            identity, request.headers.get("x-bitwave-push-channel") or "https",
+            len(raw or b""), " | ".join(details),
+        )
+    except Exception as log_exc:  # never let logging break the response
+        logger.debug("[USAGE-PUSH] could not log a rejected push: %s", log_exc)
 
 
 async def _repair(router_id: int) -> None:
