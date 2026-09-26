@@ -192,6 +192,9 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 :set bwExpRetryAt 0
                 :set bwExpDone ""
                 :set bwExpClockOk ([:typeof [:find $rd ";C=1;"]] = "num")
+                # Clock not confirmed (e.g. a no-RTC board just rebooted and NTP
+                # has not caught up): check in again in 5 minutes, not an hour.
+                :if (!$bwExpClockOk) do={ :set bwExpBeat ($nows - 3300) }
                 # R: remove
                 :local rp [:find $rd ";R="]
                 :if ([:typeof $rp] = "num") do={ :set todo [:pick $rd ($rp + 3) [:find $rd ";" ($rp + 1)]] }
