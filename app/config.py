@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     CHECKIN_MODE: str = "shadow"
     CHECKIN_KILL_SWITCH: bool = False
     CHECKIN_MAX_LINES_PER_REPLY: int = 10
+    # A paid MAC must be missing from the router's report for at least this
+    # long, across check-ins, before an add line is offered. Covers the
+    # Reconnect race (2026-09-26): the app removes the OLD MAC's binding a few
+    # seconds before the customer row switches to the NEW MAC, and a check-in
+    # in that gap must not re-add the OLD MAC as an orphan binding.
+    CHECKIN_MISSING_GRACE_SECONDS: int = 60
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10

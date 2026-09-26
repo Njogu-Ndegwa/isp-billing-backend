@@ -7,6 +7,7 @@ from app.services.plan_cache import warm_plan_cache
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+import asyncio
 import logging
 
 from app.core.runtime_mode import (
@@ -2712,6 +2713,37 @@ async def run_hot_path_index_migrations():
     logger.info("Migration: hot-path indexes are ready: %s", ", ".join(index_names))
 
 
+async def run_checkin_delivery_migrations():
+    """Record which path delivered a paid hotspot customer (2026-09-26).
+
+    provisioning_attempts.delivered_via ('push' | 'checkin') and
+    access_seen_at. Both nullable with no default, so the ALTER is a catalog
+    change only (no table rewrite). Idempotent: ADD COLUMN IF NOT EXISTS.
+
+    The ORM selects every mapped column, so if this ALTER never lands every
+    provisioning-attempt query fails. App connections carry lock_timeout, and
+    a retry job still running in the previous container can hold a row lock
+    for a moment, so retry a few times with a fresh connection each time
+    (nothing is held across the sleep).
+    """
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(sa_text("""
+                    ALTER TABLE provisioning_attempts
+                    ADD COLUMN IF NOT EXISTS delivered_via VARCHAR(16) NULL,
+                    ADD COLUMN IF NOT EXISTS access_seen_at TIMESTAMP NULL
+                """))
+            logger.info("Migration: provisioning_attempts.delivered_via/access_seen_at ready")
+            return
+        except Exception as exc:  # lock_timeout under a busy table: try again
+            last_exc = exc
+            logger.warning("Check-in delivery migration attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise last_exc
+
+
 async def run_ops_health_migrations():
     """Operations health monitor (app/services/ops_health.py).
 
@@ -2985,6 +3017,11 @@ async def startup_event():
         logger.info("Ops health migrations completed successfully")
     except Exception as e:
         logger.error(f"Ops health migration failed (non-fatal): {e}")
+
+    try:
+        await run_checkin_delivery_migrations()
+    except Exception as e:
+        logger.error(f"CRITICAL: check-in delivery migration failed: {e}")
 
     from app.config import settings as app_settings
     if not scheduler_enabled():
