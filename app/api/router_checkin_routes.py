@@ -17,7 +17,8 @@ Order of work, cheapest first, and never any router I/O:
 7. One short read of the desired state (session released), then a pure diff.
 8. After the reply is decided: if the report shows a paid customer present
    whose provisioning attempt is still undelivered, ONE short write session
-   marks it delivered via check-in. It runs as a background task after the
+   marks it delivered ('checkin' only if the check-in added the binding,
+   'observed' if the push had given up; see ``classify_delivery``). It runs as a background task after the
    response is sent, only when there is something to mark, and is skipped
    under pool pressure (the next check-in retries it; it is idempotent).
 
@@ -134,7 +135,7 @@ async def router_checkin(
         now=now,
     )
     background = None
-    candidates = svc.delivery_candidates(report, state.pending)
+    candidates = svc.delivery_candidates(report, state.pending, router_ref.id)
     if candidates:
         background = BackgroundTasks()
         background.add_task(_record_deliveries, router_ref.id, candidates)

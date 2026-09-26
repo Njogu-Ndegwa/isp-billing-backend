@@ -13,6 +13,7 @@ from app.db.database import async_session, db_pool_snapshot
 from app.services.router_availability import record_router_availability
 from app.db.models import (
     DELIVERED_VIA_CHECKIN,
+    DELIVERED_VIA_OBSERVED,
     DELIVERED_VIA_PUSH,
     ConnectionType,
     Customer,
@@ -592,10 +593,11 @@ def _attempt_should_be_terminal(attempt: ProvisioningAttempt, now: datetime) -> 
 
 
 def _delivered_by_checkin(attempt: ProvisioningAttempt) -> bool:
-    """The router's check-in already confirmed this customer on the router."""
+    """The router's check-in already confirmed this customer on the router,
+    whether it added the binding itself ('checkin') or only saw it ('observed')."""
     return (
         _enum_value(attempt.provisioning_state) == ProvisioningState.ROUTER_UPDATED.value
-        and attempt.delivered_via == DELIVERED_VIA_CHECKIN
+        and attempt.delivered_via in (DELIVERED_VIA_CHECKIN, DELIVERED_VIA_OBSERVED)
     )
 
 

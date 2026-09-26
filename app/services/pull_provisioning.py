@@ -14,6 +14,9 @@ from __future__ import annotations
 import os
 import re
 import logging
+from datetime import datetime
+
+from app.services.router_expiry import binding_comment
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,7 @@ def render_hotspot_provision_rsc(
     rate_limit: str, time_limit: str, comment: str = "",
     expires_at: int | None = None,
     lb_enabled: bool = False,
+    binding_expiry: datetime | None = None,
 ) -> str:
     """Render an idempotent RouterOS script that provisions one hotspot user exactly
     like ``MikroTikAPI.add_customer_bypass_mode`` (profile -> user -> bypassed
@@ -68,7 +72,16 @@ def render_hotspot_provision_rsc(
     ``expires_at`` (unix seconds) is emitted as a leading ``# PULL-EXPIRES`` comment.
     RouterOS ignores ``#`` lines on import, but the pull service reads it and STOPS
     serving the command once the customer's plan has expired — so a delivered command
-    can never keep re-granting access past the paid window (the free-internet bug)."""
+    can never keep re-granting access past the paid window (the free-internet bug).
+
+    ``comment`` goes on the hotspot USER only. The ip-binding gets the same
+    ``USER:<user>|EXPIRES:DB_MANAGED[|EXP:<deadline>]|<stamp>`` comment the API
+    push writes (``router_expiry.binding_comment``; ``binding_expiry`` adds the
+    reaper's deadline). Bindings are recognised by that ``USER:`` tag: the
+    check-in report, the router_operations/cleanup username match and the
+    usage mapper all key on it. Before 2026-09-26 this wrote the free-text
+    ``comment`` ("Payment successful for <name>") onto the binding, which the
+    check-in then reported as missing and kept offering to re-add."""
     user = _require(username, _USERNAME_RE, "username")
     mac = _normalize_mac(mac_address)
     rate = _require(rate_limit, _RATE_RE, "rate_limit")
@@ -76,6 +89,7 @@ def render_hotspot_provision_rsc(
     profile = _require("plan_" + rate.replace("/", "_"), _PROFILE_RE, "profile")
     pw = _ros_quote(password)
     cm = _ros_quote(comment)
+    bcm = _ros_quote(binding_comment(user, binding_expiry))
     lb_timeout_seconds = 60
     if lb_enabled:
         total = 0
@@ -107,8 +121,8 @@ def render_hotspot_provision_rsc(
          f'limit-uptime="{uptime}" comment="{cm}" }}'),
         "/ip hotspot ip-binding",
         (f':if ([:len [find mac-address="{mac}"]] = 0) do={{ add mac-address="{mac}" '
-         f'type=bypassed comment="{cm}" }} else={{ set [find mac-address="{mac}"] '
-         f'type=bypassed comment="{cm}" }}'),
+         f'type=bypassed comment="{bcm}" }} else={{ set [find mac-address="{mac}"] '
+         f'type=bypassed comment="{bcm}" }}'),
         # Capture the address before removing the unauthorized host entry, then
         # force an immediate hotspot re-evaluation so a just-paid device does
         # not remain trapped on the portal until it reconnects.

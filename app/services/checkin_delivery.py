@@ -13,11 +13,18 @@ Protocol (plain text both ways, no JSON, no script):
 
   router -> server   POST /api/router/checkin
                      Authorization: Bearer <check-in token>
-                     body: ``v=1&id=<identity>&n=<count>&macs=AA:..,BB:..&q=CC:..``
+                     body: ``v=1&id=<identity>&n=<count>&macs=AA:..,BB:..&q=CC:..&c=CC:..&o=DD:..``
                      (``macs``: the MACs of its ``USER:``-tagged ip-bindings;
                      ``q``: the CHECKIN-tagged ones with no ``plan_<ref>``
-                     simple queue.
-                     ``q`` is optional: appliers older than 2026-09-26 omit it)
+                     simple queue;
+                     ``c``: the CHECKIN-tagged ones, i.e. bindings the
+                     applier added itself;
+                     ``o``: MACs of OTHER enabled, non-blocked bindings (no
+                     ``USER:`` in the comment: legacy/agent/reseller ones),
+                     capped by the applier.
+                     ``q``, ``c`` and ``o`` are optional: older appliers omit
+                     them. ``c``/``o`` are sent even when empty, so their
+                     presence says the applier supports them.)
 
   server -> router   BWE1,<seq>,<count>,<next_s>
                      A,<mac>,<rate-limit>,<expiry-epoch>,<ref>     (A and Q
@@ -33,6 +40,10 @@ carried ``q=`` (an older applier would reject the whole frame). There is no
 remove line in the pilot: expired MACs the router still reports are only
 counted and logged ("unknown").
 
+A MAC in ``o`` counts as present for ``A`` decisions (the applier leaves any
+existing binding alone, so offering it only loops), but it is not a
+"tagged" binding: the unknown/expired count still uses ``macs`` only.
+
 An ``A`` line is offered only after the MAC has been missing from the
 router's reports for ``CHECKIN_MISSING_GRACE_SECONDS``. The Reconnect flow
 removes the OLD MAC's binding seconds before the customer row switches to the
@@ -46,8 +57,12 @@ Design rules (see AGENTS.md "Database Session Discipline"):
 * One short read per check-in, released before anything else happens. The
   only write is ``record_checkin_deliveries``: when the report shows a paid
   customer present whose provisioning attempt is still undelivered, one short
-  session marks it delivered (``delivered_via='checkin'``) so the dashboard,
-  retry job and overload alerts stop treating it as waiting. It runs after
+  session marks it delivered so the dashboard, retry job and overload alerts
+  stop treating it as waiting. ``delivered_via`` says honestly who did it
+  (``delivery_candidates``): ``checkin`` only when the check-in added the
+  binding itself; ``observed`` when the push had given up and the customer is
+  on the router through some other binding; an attempt the push is still
+  working on (scheduled/in_progress) is left for the push to record. It runs after
   the reply is decided, only when there is something to mark, and never
   touches the hot ``routers`` row. Pilot observations live in process memory
   (single worker), like ``realtime_state``.
@@ -65,7 +80,7 @@ import random
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
@@ -76,6 +91,7 @@ from app.config import settings
 from app.db.database import async_session
 from app.db.models import (
     DELIVERED_VIA_CHECKIN,
+    DELIVERED_VIA_OBSERVED,
     DELIVERED_VIA_PUSH,
     ConnectionType,
     Customer,
@@ -137,12 +153,24 @@ RECORD_LOOKBACK = timedelta(hours=24)
 PENDING_READ_LIMIT = 50
 MAX_RECORDS_PER_CHECKIN = 10
 SENT_MEMORY_SECONDS = 3600
+# An A line counts as "sent for this payment" if it went out no earlier than
+# this before the attempt row was created (both are server UTC clocks).
+SENT_AFTER_SLACK = timedelta(seconds=5)
+# The push is still working on these; the check-in never pre-empts it unless
+# it has proof it added the binding itself for this payment.
+PUSH_OWNED_STATES = frozenset({ProvisioningState.SCHEDULED.value, ProvisioningState.IN_PROGRESS.value})
+# The push has given up (for now); a present customer may be recorded.
+PUSH_GAVE_UP_STATES = frozenset({ProvisioningState.RETRY_PENDING.value, ProvisioningState.FAILED.value})
 
 UNKNOWN_LOG_EVERY_SECONDS = 600
 ROUTER_CACHE_SECONDS = 300
 
 MAX_BODY_BYTES = 32 * 1024
 MAX_REPORTED_MACS = 2000
+# o= is advisory (it only suppresses offers); the applier caps it at
+# ``checkin_applier_script.MAX_OTHER_MACS`` and the server ignores anything
+# beyond this rather than rejecting the whole report.
+MAX_REPORTED_OTHERS = 500
 HARD_MAX_LINES_PER_REPLY = 20  # ~1.3 KB; well under any v6 fetch limit
 
 # --- field whitelists -------------------------------------------------------
@@ -219,10 +247,25 @@ class CheckinReport:
     queue_missing: frozenset[str] = frozenset()
     # The applier sent ``q=`` at all, i.e. it understands Q lines.
     reports_queues: bool = False
+    # ``c=``: MACs whose binding carries the CHECKIN tag, i.e. the applier
+    # added it itself (subset of macs).
+    checkin_added: frozenset[str] = frozenset()
+    # The applier sent ``c=`` at all; without it the server falls back to its
+    # own memory of the A lines it sent.
+    reports_checkin_added: bool = False
+    # ``o=``: MACs of other (non-USER:) enabled, non-blocked bindings. Present
+    # for A-line decisions, never "unknown", never credited to the check-in.
+    others: frozenset[str] = frozenset()
+    reports_others: bool = False
 
     @property
     def count_matches(self) -> bool:
         return self.declared_count is not None and self.declared_count == self.tokens
+
+    @property
+    def present(self) -> frozenset[str]:
+        """Every MAC the router holds a usable binding for."""
+        return self.macs | self.others
 
 
 class BadCheckin(ValueError):
@@ -234,8 +277,17 @@ def normalize_reported_mac(raw: str) -> Optional[str]:
     return mac if _MAC_RE.match(mac) else None
 
 
+def _mac_set(value: str, limit: int) -> set[str]:
+    out = set()
+    for token in [t for t in value.split(",") if t.strip()][:limit]:
+        mac = normalize_reported_mac(token)
+        if mac is not None:
+            out.add(mac)
+    return out
+
+
 def parse_checkin_body(raw: bytes) -> CheckinReport:
-    """Parse ``v=1&id=<identity>&n=<count>&macs=A,B,C[&q=A,B]``.
+    """Parse ``v=1&id=<identity>&n=<count>&macs=A,B,C[&q=A,B][&c=A][&o=D,E]``.
 
     Tolerant of field order and a trailing newline; strict about content. An
     unparseable body raises ``BadCheckin`` (the endpoint answers 400).
@@ -281,6 +333,14 @@ def parse_checkin_body(raw: bytes) -> CheckinReport:
             # (truncation, garbage) is ignored rather than acted on.
             if mac is not None and mac in macs:
                 queue_missing.add(mac)
+    reports_checkin_added = "c" in fields
+    # Only USER: bindings can carry the CHECKIN tag, so anything outside macs
+    # (truncation, garbage) is ignored.
+    checkin_added = (
+        _mac_set(fields.get("c", ""), MAX_REPORTED_MACS) & macs if reports_checkin_added else set()
+    )
+    reports_others = "o" in fields
+    others = _mac_set(fields.get("o", ""), MAX_REPORTED_OTHERS) if reports_others else set()
     return CheckinReport(
         identity=identity,
         declared_count=declared,
@@ -289,6 +349,10 @@ def parse_checkin_body(raw: bytes) -> CheckinReport:
         invalid=invalid,
         queue_missing=frozenset(queue_missing),
         reports_queues=reports_queues,
+        checkin_added=frozenset(checkin_added),
+        reports_checkin_added=reports_checkin_added,
+        others=frozenset(others),
+        reports_others=reports_others,
     )
 
 
@@ -445,7 +509,13 @@ class RouterCheckinStats:
     would_queue_total: int = 0
     last_queue_missing: int = 0
     held_in_grace_total: int = 0
+    last_others: int = 0
     deliveries_recorded_total: int = 0
+    checkin_deliveries_total: int = 0
+    observed_deliveries_total: int = 0
+    # Pending attempts on a present MAC left alone because the push still
+    # owns them and nothing proves the check-in added the binding.
+    left_to_push_total: int = 0
     count_mismatch_total: int = 0
     invalid_macs_total: int = 0
     last_unknown_log_at: float = 0.0
@@ -472,9 +542,10 @@ _stats: dict[int, RouterCheckinStats] = {}
 _missing_since: dict[tuple[int, str], float] = {}
 _offers: dict[tuple[int, str], _Offer] = {}
 _queue_offers: dict[tuple[int, str], _Offer] = {}
-# (router, MAC) -> when this process last sent an A line for it; lets the
-# delivery record say whether the check-in itself added the binding.
-_sent_at: dict[tuple[int, str], float] = {}
+# (router, MAC) -> (monotonic, UTC wall clock) of the last A line this process
+# sent for it. The fallback evidence that the check-in added a binding when
+# the applier is too old to report c=; also noted in the delivery log.
+_sent_at: dict[tuple[int, str], tuple[float, datetime]] = {}
 _payment_hint: dict[int, float] = {}
 _last_checkin: dict[str, float] = {}
 _router_cache: dict[str, RouterRef] = {}
@@ -547,7 +618,11 @@ def stats_snapshot() -> dict:
                 "would_queue_total": s.would_queue_total,
                 "last_queue_missing": s.last_queue_missing,
                 "held_in_grace_total": s.held_in_grace_total,
+                "last_others": s.last_others,
                 "deliveries_recorded_total": s.deliveries_recorded_total,
+                "checkin_deliveries_total": s.checkin_deliveries_total,
+                "observed_deliveries_total": s.observed_deliveries_total,
+                "left_to_push_total": s.left_to_push_total,
                 "count_mismatch_total": s.count_mismatch_total,
                 "invalid_macs_total": s.invalid_macs_total,
                 "payment_hot": payment_hint_active(rid),
@@ -596,6 +671,9 @@ class PendingAttempt:
     mac: str  # the customer's CURRENT MAC, normalized
     state: str
     created_at: datetime
+    # Set by ``delivery_candidates``: 'checkin' or 'observed', and why.
+    via: Optional[str] = None
+    evidence: str = ""
 
 
 @dataclass(frozen=True)
@@ -740,11 +818,16 @@ def decide(
     stats.checkins += 1
     stats.last_checkin_at = now
     stats.last_reported = len(report.macs)
+    stats.last_others = len(report.others)
     stats.last_desired = len(desired)
     stats.invalid_macs_total += report.invalid
     _prune_sent(rid, now_mono)
 
-    missing, unknown = compute_diff(desired, report.macs)
+    # Unknown = tagged (USER:) bindings with no paid customer; o= bindings are
+    # not ours to judge. Missing = no usable binding at all: the applier leaves
+    # any existing binding alone, so offering an o= MAC would only loop.
+    _, unknown = compute_diff(desired, report.macs)
+    missing, _ = compute_diff(desired, report.present)
     stats.last_missing = len(missing)
     stats.last_unknown = len(unknown)
 
@@ -762,7 +845,7 @@ def decide(
 
     # Tracking also forgets any MAC that stopped being desired (e.g. the OLD
     # MAC after a Reconnect), so its grace clock can never mature.
-    _track_missing(rid, missing, report.macs, desired, now_mono, stats)
+    _track_missing(rid, missing, report.present, desired, now_mono, stats)
 
     grace = missing_grace_seconds()
     eligible: list[DesiredEntry] = []
@@ -795,7 +878,7 @@ def decide(
             stats.lines_sent_total += len(lines)
             for e in lines:
                 _note_offer(_offers, rid, e.mac, now_mono, MAX_OFFERS_BEFORE_BACKOFF, OFFER_BACKOFF_SECONDS)
-                _sent_at[(rid, e.mac)] = now_mono
+                _sent_at[(rid, e.mac)] = (now_mono, now)
             logger.info(
                 "[CHECKIN] router %s: sending %d add line(s): %s%s",
                 rid, len(lines), ",".join(e.mac for e in lines),
@@ -880,7 +963,7 @@ def _queue_candidates(rid: int, report: CheckinReport, desired: list[DesiredEntr
 
 
 def _prune_sent(rid: int, now_mono: float) -> None:
-    for key in [k for k, t in _sent_at.items() if k[0] == rid and now_mono - t > SENT_MEMORY_SECONDS]:
+    for key in [k for k, t in _sent_at.items() if k[0] == rid and now_mono - t[0] > SENT_MEMORY_SECONDS]:
         _sent_at.pop(key, None)
 
 
@@ -911,15 +994,82 @@ def _track_missing(rid, missing, reported, desired, now_mono, stats) -> None:
 # Recording deliveries the check-in observed (one short write session)
 # ---------------------------------------------------------------------------
 
-def delivery_candidates(report: CheckinReport, pending: Iterable[PendingAttempt]) -> list[PendingAttempt]:
-    """Undelivered attempts whose customer's current MAC the router reports.
+def _sent_for_payment(router_id: Optional[int], p: PendingAttempt) -> bool:
+    """This process sent an A line for the MAC at/after the attempt was created."""
+    if router_id is None:
+        return False
+    sent = _sent_at.get((router_id, p.mac))
+    if sent is None or p.created_at is None:
+        return False
+    return sent[1] >= p.created_at - SENT_AFTER_SLACK
 
-    Pure; the route only opens a write session when this is non-empty. A
-    report whose count does not match is not trusted for this either.
+
+def classify_delivery(
+    report: CheckinReport, p: PendingAttempt, router_id: Optional[int] = None
+) -> tuple[Optional[str], str]:
+    """Decide what, if anything, the check-in may record for one attempt.
+
+    Returns ``(via, evidence)``; ``via`` None means "leave it alone".
+
+    * Not present (in neither ``macs`` nor ``o``): nothing proven.
+    * The check-in added the binding: ``c=`` lists the MAC (the router's own
+      word), or, for an applier too old to send ``c=``, this process sent an
+      A line for it after the payment. A MAC seen only in ``o=`` never
+      qualifies: check-in bindings always carry ``USER:``.
+      -> ``checkin``. A scheduled/in_progress attempt additionally needs the
+      A-line memory: a CHECKIN binding left over from an earlier purchase
+      (renewal while still bound) must not steal a push running right now.
+    * Otherwise the check-in did not add it. Scheduled/in_progress: the push
+      owns it and records itself. Retry_pending/failed: the customer is on the
+      router although the push gave up -> ``observed``.
+    """
+    in_macs = p.mac in report.macs
+    if not (in_macs or p.mac in report.others):
+        return None, ""
+    sent = _sent_for_payment(router_id, p)
+    if not in_macs:
+        added, evidence = False, "o= (untagged binding)"
+    elif report.reports_checkin_added:
+        added = p.mac in report.checkin_added
+        evidence = "in c=" if added else "not in c="
+    else:
+        added = sent
+        evidence = "no c=; A line sent" if added else "no c=; no A line sent"
+    if added:
+        if p.state in PUSH_OWNED_STATES and not sent:
+            return None, "in c= but push in flight and no A line sent for this payment"
+        return DELIVERED_VIA_CHECKIN, evidence
+    if p.state in PUSH_GAVE_UP_STATES:
+        return DELIVERED_VIA_OBSERVED, evidence
+    return None, evidence
+
+
+def delivery_candidates(
+    report: CheckinReport,
+    pending: Iterable[PendingAttempt],
+    router_id: Optional[int] = None,
+) -> list[PendingAttempt]:
+    """Undelivered attempts the report lets us record, each with its ``via``.
+
+    Pure apart from reading the in-memory A-line record (``router_id`` None =
+    no memory). The route only opens a write session when this is non-empty.
+    A report whose count does not match is not trusted for this either. See
+    ``classify_delivery`` for the rules.
     """
     if not report.count_matches:
         return []
-    return [p for p in pending if p.mac in report.macs][:MAX_RECORDS_PER_CHECKIN]
+    out: list[PendingAttempt] = []
+    left = 0
+    for p in pending:
+        via, evidence = classify_delivery(report, p, router_id)
+        if via is None:
+            if p.mac in report.present:
+                left += 1
+            continue
+        out.append(replace(p, via=via, evidence=evidence))
+    if left and router_id is not None:
+        _stats.setdefault(router_id, RouterCheckinStats()).left_to_push_total += left
+    return out[:MAX_RECORDS_PER_CHECKIN]
 
 
 def _truncate(value: str, limit: int = 255) -> str:
@@ -933,25 +1083,32 @@ async def record_checkin_deliveries(
 ) -> int:
     """Mark attempts delivered because the router's report shows the MAC.
 
+    Candidates come from ``delivery_candidates`` and carry ``via``:
+    ``checkin`` (the check-in added the binding) or ``observed`` (present
+    through a binding it did not add, after the push gave up). A candidate
+    without ``via`` is treated as ``observed``: never over-credit.
+
     The attempt ends in the state a successful push leaves it in
     (``router_updated``, ``router_updated_at``, ``last_error`` cleared) plus
-    ``delivered_via='checkin'`` and ``access_seen_at``, so every consumer
-    keyed on ``provisioning_state`` (retry job, ops health, session monitor,
-    overload alerts) sees it delivered. ``online_state`` is ``unknown``: a
-    binding in the report is not proof the device is connected, and the push
-    only writes ``offline`` after actually polling the router's hosts — the
-    session monitor would read ``offline`` as "client still offline".
+    ``delivered_via`` and ``access_seen_at``, so every consumer keyed on
+    ``provisioning_state`` (retry job, ops health, session monitor, overload
+    alerts) sees it delivered. ``online_state`` is ``unknown``: a binding in
+    the report is not proof the device is connected, and the push only writes
+    ``offline`` after actually polling the router's hosts — the session
+    monitor would read ``offline`` as "client still offline".
 
     Idempotent: the update is conditional on the attempt still being
-    undelivered and the customer still ACTIVE, unexpired, on this router with
-    the same MAC (re-checked under the row lock; rows a push holds are
-    skipped, not waited on). One short session; no I/O inside it.
+    undelivered (for ``observed``: still retry_pending/failed, so a push that
+    started meanwhile keeps it) and the customer still ACTIVE, unexpired, on
+    this router with the same MAC (re-checked under the row lock; rows a push
+    holds are skipped, not waited on). One short session; no I/O inside it.
     """
     if not candidates:
         return 0
     now = now or datetime.utcnow()
     by_id = {p.attempt_id: p for p in candidates[:MAX_RECORDS_PER_CHECKIN]}
     recorded: list[str] = []
+    by_via = {DELIVERED_VIA_CHECKIN: 0, DELIVERED_VIA_OBSERVED: 0}
     async with async_session() as db:
         rows = (
             await db.execute(
@@ -974,6 +1131,9 @@ async def record_checkin_deliveries(
             pending = by_id.get(attempt.id)
             if pending is None:
                 continue
+            via = DELIVERED_VIA_CHECKIN if pending.via == DELIVERED_VIA_CHECKIN else DELIVERED_VIA_OBSERVED
+            previous = attempt.provisioning_state
+            previous = previous.value if hasattr(previous, "value") else str(previous)
             status_value = status.value if hasattr(status, "value") else str(status)
             if (
                 status_value != CustomerStatus.ACTIVE.value
@@ -981,20 +1141,23 @@ async def record_checkin_deliveries(
                 or expiry <= now
                 or customer_router_id != router_id
                 or normalize_reported_mac(mac or "") != pending.mac
+                or (via == DELIVERED_VIA_OBSERVED and previous not in PUSH_GAVE_UP_STATES)
             ):
-                continue  # changed since the read (Reconnect, expiry...): leave it
-            previous = attempt.provisioning_state
-            previous = previous.value if hasattr(previous, "value") else str(previous)
+                continue  # changed since the read (Reconnect, expiry, a push started...): leave it
             attempt.provisioning_state = ProvisioningState.ROUTER_UPDATED
             attempt.online_state = ProvisioningOnlineState.UNKNOWN
             attempt.router_updated_at = now
             if attempt.delivered_via is None:
-                attempt.delivered_via = DELIVERED_VIA_CHECKIN
+                attempt.delivered_via = via
             if attempt.access_seen_at is None:
                 attempt.access_seen_at = now
             attempt.last_error = None
             attempt.updated_at = now
             added_here = (router_id, pending.mac) in _sent_at
+            what = (
+                "delivered via check-in" if via == DELIVERED_VIA_CHECKIN
+                else "observed present by check-in (binding not added by it)"
+            )
             db.add(ProvisioningLog(
                 customer_id=attempt.customer_id,
                 router_id=router_id,
@@ -1003,17 +1166,21 @@ async def record_checkin_deliveries(
                 action="checkin_delivery",
                 status="success",
                 details=_truncate(
-                    f"delivered via check-in at {now:%Y-%m-%dT%H:%M:%S}Z; "
-                    f"router_id={router_id}; previous_state={previous}; "
-                    f"binding_added_by_checkin={'yes' if added_here else 'no'}"
+                    f"{what} at {now:%Y-%m-%dT%H:%M:%S}Z; "
+                    f"router_id={router_id}; previous_state={previous}; via={via}; "
+                    f"evidence={pending.evidence or 'n/a'}; "
+                    f"a_line_sent={'yes' if added_here else 'no'}"
                 ),
                 log_date=now,
             ))
-            recorded.append(f"{attempt.id}:{pending.mac}:{previous}")
+            by_via[via] += 1
+            recorded.append(f"{attempt.id}:{pending.mac}:{previous}:{via}")
         await db.commit()
     if recorded:
         stats = _stats.setdefault(router_id, RouterCheckinStats())
         stats.deliveries_recorded_total += len(recorded)
+        stats.checkin_deliveries_total += by_via[DELIVERED_VIA_CHECKIN]
+        stats.observed_deliveries_total += by_via[DELIVERED_VIA_OBSERVED]
         logger.info(
             "[CHECKIN] router %s: recorded %d delivery(ies) seen by check-in: %s",
             router_id, len(recorded), ",".join(recorded),
@@ -1027,6 +1194,10 @@ async def record_checkin_deliveries(
 
 METRICS_WINDOW = timedelta(hours=24)
 METRICS_ROW_LIMIT = 20000
+# 'observed' is its own bucket: the check-in saw the customer present after
+# the push gave up, but did not add the binding, so it is neither path's win.
+# Its latency is when the check-in first SAW access (an upper bound).
+_METRIC_PATHS = (DELIVERED_VIA_PUSH, DELIVERED_VIA_CHECKIN, DELIVERED_VIA_OBSERVED)
 
 
 def _percentile(sorted_values: list[float], p: float) -> Optional[float]:
@@ -1046,9 +1217,10 @@ def _latency_summary(values: list[float]) -> dict:
 async def delivery_path_metrics(now: Optional[datetime] = None) -> dict:
     """Per-path delivery counts and payment->access latency, pilot vs rest.
 
-    Covers attempts created in the last 24 h. ``other`` = delivered by a path
-    that does not record itself (PPPoE, router agent, rows from before
-    2026-09-26). Latency = access_seen_at - created_at, delivered rows only.
+    Covers attempts created in the last 24 h. ``observed`` = the check-in saw
+    the customer present after the push gave up, via a binding it did not add.
+    ``other`` = delivered by a path that does not record itself (PPPoE, router
+    agent, rows from before 2026-09-26). Latency = access_seen_at - created_at, delivered rows only.
     """
     now = now or datetime.utcnow()
     start = now - METRICS_WINDOW
@@ -1072,8 +1244,8 @@ async def delivery_path_metrics(now: Optional[datetime] = None) -> dict:
 
     def _empty():
         return {"attempts": 0,
-                "counts": {DELIVERED_VIA_PUSH: 0, DELIVERED_VIA_CHECKIN: 0, "other": 0, "undelivered": 0},
-                "_lat": {"all": [], DELIVERED_VIA_PUSH: [], DELIVERED_VIA_CHECKIN: []}}
+                "counts": {path: 0 for path in (*_METRIC_PATHS, "other", "undelivered")},
+                "_lat": {"all": [], **{path: [] for path in _METRIC_PATHS}}}
 
     groups = {"pilot": _empty(), "rest": _empty()}
     for router_id, state, via, created_at, seen_at in rows:
@@ -1083,7 +1255,7 @@ async def delivery_path_metrics(now: Optional[datetime] = None) -> dict:
         if state_value != ProvisioningState.ROUTER_UPDATED.value:
             g["counts"]["undelivered"] += 1
             continue
-        path = via if via in (DELIVERED_VIA_PUSH, DELIVERED_VIA_CHECKIN) else "other"
+        path = via if via in _METRIC_PATHS else "other"
         g["counts"][path] += 1
         if seen_at is not None and created_at is not None:
             seconds = (seen_at - created_at).total_seconds()
@@ -1100,9 +1272,6 @@ async def delivery_path_metrics(now: Optional[datetime] = None) -> dict:
     for name, g in groups.items():
         lat = g.pop("_lat")
         g["payment_to_access"] = _latency_summary(lat["all"])
-        g["payment_to_access_by_path"] = {
-            DELIVERED_VIA_PUSH: _latency_summary(lat[DELIVERED_VIA_PUSH]),
-            DELIVERED_VIA_CHECKIN: _latency_summary(lat[DELIVERED_VIA_CHECKIN]),
-        }
+        g["payment_to_access_by_path"] = {path: _latency_summary(lat[path]) for path in _METRIC_PATHS}
         out[name] = g
     return out

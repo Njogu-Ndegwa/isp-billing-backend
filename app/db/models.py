@@ -71,8 +71,18 @@ class ProvisioningState(str, enum.Enum):
 
 # provisioning_attempts.delivered_via values (plain varchar, not a PG enum, so
 # a future path needs no enum migration).
+#   push     - the direct API push added the customer.
+#   checkin  - the router's check-in applier added the binding itself (the
+#              router reported it in c=, or, for an applier too old to send
+#              c=, the server sent it an A line after the payment).
+#   observed - the check-in saw the customer present on the router after the
+#              push had given up (retry_pending/failed), but not via a binding
+#              the check-in added: some other path (router agent, a retry, a
+#              legacy binding) delivered it. Counted separately so the pilot
+#              numbers credit the check-in only for what it actually did.
 DELIVERED_VIA_PUSH = "push"
 DELIVERED_VIA_CHECKIN = "checkin"
+DELIVERED_VIA_OBSERVED = "observed"
 
 
 class ProvisioningOnlineState(str, enum.Enum):
@@ -609,9 +619,11 @@ class ProvisioningAttempt(Base):
     last_attempt_at = Column(DateTime, nullable=True)
     router_updated_at = Column(DateTime, nullable=True)
     last_online_at = Column(DateTime, nullable=True)
-    # Which path got the customer onto the router: 'push' (direct API) or
-    # 'checkin' (the router's check-in report showed the MAC present). NULL on
-    # rows from before 2026-09-26 and on other paths (PPPoE, router agent).
+    # Which path got the customer onto the router: 'push' (direct API),
+    # 'checkin' (the check-in applier added the binding) or 'observed' (the
+    # check-in saw the customer present after the push gave up, via a binding
+    # it did not add). See DELIVERED_VIA_* above. NULL on rows from before
+    # 2026-09-26 and on other paths (PPPoE, router agent).
     # Startup migration: run_checkin_delivery_migrations() in main.py.
     delivered_via = Column(String(16), nullable=True)
     # When access was first confirmed (push: router_updated_at; check-in: the

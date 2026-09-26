@@ -64,7 +64,7 @@ async def admin_checkin_pilot_stats(
     MAC stayed missing from its router before the push (or pull) landed.
 
     ``delivery_paths_24h`` (DB, one short read in its own session): per-path
-    delivery counts (push / checkin / other / undelivered) and p50/p95 of
+    delivery counts (push / checkin / observed / other / undelivered) and p50/p95 of
     payment->access (access_seen_at - created_at) for pilot routers vs the
     rest of the fleet, over attempts created in the last 24 h.
     """
