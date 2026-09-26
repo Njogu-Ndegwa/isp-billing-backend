@@ -625,3 +625,20 @@ async def test_queue_repairs_run_a_few_at_a_time(monkeypatch):
     monkeypatch.setattr(routes, "_repair_slots", None)
     await asyncio.gather(*(routes._repair(rid) for rid in range(12)))
     assert peak == routes._REPAIR_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_rejected_push_is_logged_with_the_router_and_the_bad_text(caplog):
+    # Rollout 2026-09-26: 422s from a few routers with no way to tell which.
+    import logging
+    from main import app as main_app
+
+    body = b'{"identity":"Router-0574","v":3,"reports":[],"leases":[{"host":"bad\x01name"}]}'
+    caplog.set_level(logging.WARNING)
+    async with AsyncClient(transport=ASGITransport(app=main_app), base_url="http://test") as c:
+        r = await c.post("/api/router/usage-push", content=body,
+                         headers={"Content-Type": "application/json", **_auth()})
+    assert r.status_code == 422
+    assert "detail" in r.json()                     # FastAPI's default 422 body, unchanged
+    logged = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "422 from Router-0574" in logged and "json_invalid" in logged and "bad" in logged
