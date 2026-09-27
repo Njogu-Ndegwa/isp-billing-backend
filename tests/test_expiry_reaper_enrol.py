@@ -269,3 +269,27 @@ async def test_identity_mismatch_is_not_touched(db, wired):
     [o] = await enrol.expiry_reaper_enrol_background()
     assert o.reason.startswith("identity mismatch") and o.mode is None
     assert not fake.did("/system/script/add")
+
+
+# --- tunnel check -------------------------------------------------------------
+
+class _PingFetch:
+    def __init__(self, ping_times, fetch):
+        self.ping_times, self.fetch = ping_times, fetch
+
+    def send_command(self, cmd, args=None):
+        if cmd == "/ping":
+            return {"data": [{"time": t} if t else {"status": "timeout"} for t in self.ping_times]}
+        if cmd == "/tool/fetch":
+            return self.fetch
+        return {"data": []}
+
+
+@pytest.mark.parametrize("pings,fetch,ok", [
+    (["30ms", None, None], {"error": "x"}, True),                              # any ping answer
+    ([None, None, None], {"error": "failure: closing connection: <401 Unauthorized> 10.251.0.1:8088 (4)"}, True),
+    ([None, None, None], {"success": True, "data": [{"status": "finished"}]}, True),
+    ([None, None, None], {"error": "failure: connection timeout"}, False),
+])
+def test_tunnel_reachable_falls_back_to_a_real_http_call(pings, fetch, ok):
+    assert enrol.tunnel_reachable(_PingFetch(pings, fetch), "http://10.251.0.1:8088/x") is ok

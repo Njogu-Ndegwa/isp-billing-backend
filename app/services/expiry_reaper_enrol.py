@@ -80,6 +80,21 @@ def needs_tunnel(board_name: str | None, model: str | None) -> bool:
     return any(m in text_ for m in TUNNEL_REQUIRED_MARKERS)
 
 
+def tunnel_reachable(api, tunnel_url: str, server_ip: str = "10.251.0.1") -> bool:
+    """Can the router reach our tunnel endpoint? A ping first; if every ping is
+    lost, one real HTTP call. Slow links (router 537: 400-570 ms, lossy) lose
+    pings but still get HTTP through; any HTTP answer, even 401, proves it."""
+    pings = api.send_command("/ping", {"address": server_ip, "count": "3"}).get("data") or []
+    if any(p.get("time") for p in pings):
+        return True
+    res = api.send_command("/tool/fetch", {"url": tunnel_url, "http-method": "post",
+                                          "http-data": "ident=probe", "output": "user", "as-value": ""})
+    if res.get("success") or res.get("data"):
+        return True
+    err = str(res.get("error") or "")
+    return "<4" in err or "<5" in err   # e.g. "closing connection: <401 Unauthorized>"
+
+
 def routeros_version_ok(version: str) -> bool:
     """6.43+ (``/tool fetch ... output=user as-value``) or any 7.x."""
     try:
@@ -265,8 +280,7 @@ def probe_and_install_sync(c: Candidate) -> Outcome:
             busy = False
         if busy:
             return Outcome(c.id, None, f"busy: CPU {res.get('cpu-load')}%", board=label)
-        pings = api.send_command("/ping", {"address": TUNNEL_SERVER_IP, "count": "2"}).get("data") or []
-        tunnel_ok = any(p.get("time") for p in pings)
+        tunnel_ok = tunnel_reachable(api, settings.EXPIRY_REAPER_TUNNEL_URL, TUNNEL_SERVER_IP)
         if not tunnel_ok and needs_tunnel(board, model):
             return Outcome(c.id, MODE_SERVER, f"no tunnel route ({label} would use HTTPS)", board=label)
         if api.send_command("/ip/hotspot/ip-binding/print").get("error"):
