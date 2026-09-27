@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from app.db.models import ProvisioningToken, ProvisioningTokenStatus, User, UserRole
 from app.services import provisioning
@@ -355,7 +354,11 @@ async def test_create_endpoint_reports_management_tunnel(db, monkeypatch):
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[verify_token] = lambda: "token"
 
-    response = TestClient(app).post("/api/provision/create", json={"vpn_type": "wireguard"})
+    # In-loop client: a sync TestClient runs the app on another event loop, and
+    # the async DB session from the fixture is bound to this one (fails on Postgres).
+    from httpx import ASGITransport, AsyncClient
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/provision/create", json={"vpn_type": "wireguard"})
 
     assert response.status_code == 200, response.text
     body = response.json()
