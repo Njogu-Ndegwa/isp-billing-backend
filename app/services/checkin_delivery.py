@@ -44,10 +44,14 @@ A MAC in ``o`` counts as present for ``A`` decisions (the applier leaves any
 existing binding alone, so offering it only loops), but it is not a
 "tagged" binding: the unknown/expired count still uses ``macs`` only.
 
-An ``A`` line is offered only after ``CHECKIN_MISSING_GRACE_SECONDS``, so the
-push gets first chance. The clock is the undelivered provisioning attempt's
-DB ``created_at`` when there is one (survives an app restart), else how long
-the MAC has been missing from this process's view of the router's reports.
+Race mode (the default ``both`` delivery mode): the push fires at payment
+time, and the check-in offers an ``A`` line once the MAC's undelivered
+provisioning attempt is ``CHECKIN_RACE_HEAD_START_SECONDS`` old (default 20 s,
+measured from the attempt's DB ``created_at``, so it survives an app restart)
+and the router still does not report it. The push wins most races; the
+check-in catches the ones where the push is slow or broken. A paid MAC with
+no attempt row waits ``CHECKIN_MISSING_GRACE_SECONDS`` of being missing from
+this process's view of the router's reports.
 The Reconnect flow removes the OLD MAC's binding seconds before the customer
 row switches to the NEW MAC, and an immediate offer re-added the OLD MAC as an
 orphan binding the expiry cleanup never removes (2026-09-26); so a MAC seen
@@ -160,6 +164,7 @@ MAX_QUEUE_OFFERS_BEFORE_BACKOFF = 5
 QUEUE_OFFER_BACKOFF_SECONDS = 300
 
 DEFAULT_MISSING_GRACE_SECONDS = 60
+DEFAULT_RACE_HEAD_START_SECONDS = 20
 
 # Recording check-in deliveries on provisioning_attempts.
 UNDELIVERED_STATES = (
@@ -246,6 +251,16 @@ def missing_grace_seconds() -> int:
     return max(0, min(3600, n))
 
 
+def race_head_start_seconds() -> int:
+    """How long the push has alone before the check-in also delivers a paid
+    MAC that has an undelivered attempt (race mode)."""
+    try:
+        n = int(settings.CHECKIN_RACE_HEAD_START_SECONDS)
+    except (TypeError, ValueError, AttributeError):
+        n = DEFAULT_RACE_HEAD_START_SECONDS
+    return max(0, min(3600, n))
+
+
 def max_lines_per_reply() -> int:
     try:
         n = int(settings.CHECKIN_MAX_LINES_PER_REPLY)
@@ -258,7 +273,9 @@ def max_lines_per_reply() -> int:
 # Per-router delivery mode (push-vs-check-in A/B)
 # ---------------------------------------------------------------------------
 #
-# both          default: push at payment time, check-in rescues after grace.
+# both          default ("race mode"): push at payment time, the check-in
+#               also delivers once the attempt is race_head_start_seconds()
+#               old and the MAC is still missing.
 # push_only     the check-in never sends A/Q lines (reports are still
 #               accepted and 'observed' still recorded).
 # checkin_only  the payment-time push is skipped; the check-in sends A lines
@@ -838,6 +855,7 @@ def stats_snapshot() -> dict:
         "kill_switch": bool(settings.CHECKIN_KILL_SWITCH),
         "mode": checkin_mode(),
         "missing_grace_seconds": missing_grace_seconds(),
+        "race_head_start_seconds": race_head_start_seconds(),
         "router_ids": sorted(checkin_router_ids()),
         "delivery_modes": {
             "push_only_router_ids": sorted(push_only_router_ids()),
@@ -1070,8 +1088,8 @@ def decide(
     When is a missing paid MAC offered (an ``A`` line)?
 
     * It has an undelivered provisioning attempt (``pending``): once
-      ``now - attempt.created_at`` reaches the grace (0 on a checkin_only
-      router). ``created_at`` is in the DB, so an app restart does not reset
+      ``now - attempt.created_at`` reaches the race head start (0 on a
+      checkin_only router). ``created_at`` is in the DB, so an app restart does not reset
       the clock, and a router that polls late is not held for another full
       grace after its first late report. Exception: if this process saw the
       MAC ON the router within the last grace seconds, it was most likely
@@ -1125,9 +1143,10 @@ def decide(
     grace = missing_grace_seconds()
     _note_present(rid, desired, report.present, now_mono, grace)
 
-    # The grace measured from the attempt's DB created_at: 0 on a checkin_only
-    # router (there is no push to give first chance to).
-    attempt_grace = 0 if arm == DELIVERY_CHECKIN_ONLY else grace
+    # Measured from the attempt's DB created_at: the race head start the push
+    # gets on a default router, 0 on a checkin_only router (no push to wait
+    # for). The Reconnect guard (_recently_present) keeps the full grace.
+    attempt_grace = 0 if arm == DELIVERY_CHECKIN_ONLY else race_head_start_seconds()
     anchors = _attempt_anchors(pending)
     eligible: list[DesiredEntry] = []
     in_grace: list[DesiredEntry] = []
