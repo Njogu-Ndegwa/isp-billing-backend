@@ -2528,6 +2528,18 @@ async def run_expiry_reaper_migrations():
             ADD COLUMN IF NOT EXISTS expiry_reaper_enabled BOOLEAN NOT NULL DEFAULT false,
             ADD COLUMN IF NOT EXISTS expiry_reaper_installed_at TIMESTAMP NULL
         """))
+        # Enrolment decision (who removes expired customers, and why).
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS expiry_reaper_mode VARCHAR(10) NULL,
+            ADD COLUMN IF NOT EXISTS expiry_reaper_reason VARCHAR(120) NULL,
+            ADD COLUMN IF NOT EXISTS expiry_reaper_checked_at TIMESTAMP NULL
+        """))
+        # Routers installed by hand before the enrolment job existed.
+        await conn.execute(sa_text("""
+            UPDATE routers SET expiry_reaper_mode = 'router', expiry_reaper_reason = 'installed'
+            WHERE expiry_reaper_enabled AND expiry_reaper_mode IS NULL
+        """))
 
 
 async def run_router_status_alert_migrations():
@@ -3118,6 +3130,16 @@ async def startup_event():
     # Safety-net bypass scan + idle-credential reaper. Split out of the job
     # above so the 5-6 min fleet scan no longer pauses removals; each keeps its
     # own 10 / 5 min cadence via the guards inside.
+    # Router expiry reaper enrolment: no-op unless EXPIRY_REAPER_AUTO_ENROL.
+    from app.services.expiry_reaper_enrol import expiry_reaper_enrol_background
+    scheduler.add_job(
+        expiry_reaper_enrol_background,
+        trigger=IntervalTrigger(minutes=30),
+        id='expiry_reaper_enrol',
+        name='Enrol routers onto router-side expiry removal',
+        replace_existing=True,
+        max_instances=1
+    )
     scheduler.add_job(
         expiry_housekeeping_background,
         trigger=IntervalTrigger(seconds=73),

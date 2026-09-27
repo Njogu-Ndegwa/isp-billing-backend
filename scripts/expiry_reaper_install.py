@@ -154,8 +154,8 @@ def install(r, paid) -> str:
         res = first(api, "/system/resource/print")
         version, board, cpu = res.get("version", ""), res.get("board-name") or "", res.get("cpu-load")
         print(f"{r['id']} {r['name']}: {board} {version} cpu {cpu}%")
-        pings = api.send_command("/ping", {"address": TUNNEL_SERVER_IP, "count": "2"}).get("data") or []
-        tunnel_ok = any(p.get("time") for p in pings)
+        from app.services.expiry_reaper_enrol import tunnel_reachable
+        tunnel_ok = tunnel_reachable(api, settings.EXPIRY_REAPER_TUNNEL_URL, TUNNEL_SERVER_IP)
         print(f"   reaches {TUNNEL_SERVER_IP}: {'yes' if tunnel_ok else 'NO (would use public HTTPS)'}")
         if UNINSTALL:
             if APPLY:
