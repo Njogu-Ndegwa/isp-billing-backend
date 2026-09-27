@@ -23,7 +23,12 @@
 
 # ---- STEP 1: WAN / INITIAL SETUP ----
 
-:do { /interface wireless cap set enabled=no } on-error={}
+:do {
+    :local bwCapOff [:parse "/interface wireless cap set enabled=no"]
+    $bwCapOff
+} on-error={
+    :log warning "Provisioning: no legacy wireless package -- CAP mode check skipped"
+}
 
 :if ([:len [/interface bridge find where name=bridge]] = 0) do={
     /interface bridge add name=bridge
@@ -32,25 +37,81 @@
     :log info "Provisioning: bridge interface already exists"
 }
 
-:foreach iface in={ether2;ether3;ether4;ether5} do={
-    :do {
-        :if ([:len [/interface find where name=$iface]] > 0) do={
-            :if ([:len [/interface bridge port find where interface=$iface]] = 0) do={
-                /interface bridge port add interface=$iface bridge=bridge
+:do { /interface bridge port remove [find where interface=ether1] } on-error={}
+
+# Move every LAN port onto the hotspot bridge "bridge": all ethernet ports except
+# ether1 (the WAN) and the WiFi interfaces, even when they already belong to
+# another bridge such as the factory "bridgeLocal".
+:foreach bwIfId in=[/interface find] do={
+    :local bwName [/interface get $bwIfId name]
+    :local bwType [/interface get $bwIfId type]
+    # Match on the NAME too: the hAP lite's power-line port "pwr-line1" reports
+    # type=ether but is not a LAN port (bench, router 541, 2026-09-27).
+    :local bwLanName (([:pick $bwName 0 5] = "ether") || ([:pick $bwName 0 4] = "wlan") || ([:pick $bwName 0 4] = "wifi"))
+    :if (($bwName != "ether1") && $bwLanName && (($bwType = "ether") || ($bwType = "wlan") || ($bwType = "wifi") || ($bwType = "wifiwave2"))) do={
+        :local bwSkip ""
+        :if ([:len [/ip dhcp-client find where interface=$bwName]] > 0) do={ :set bwSkip "it runs a DHCP client (uplink)" }
+        :do {
+            :if ([:len [/interface pppoe-client find where interface=$bwName]] > 0) do={ :set bwSkip "it carries a PPPoE client (uplink)" }
+        } on-error={}
+        :foreach bwAddr in=[/ip address find where interface=$bwName] do={
+            :if ([:pick [/ip address get $bwAddr address] 0 11] != "192.168.88.") do={ :set bwSkip "it has its own IP address" }
+        }
+        :local bwPorts [/interface bridge port find where interface=$bwName and dynamic=no]
+        :if (($bwSkip = "") && ([:len $bwPorts] > 0)) do={
+            :local bwOld [/interface bridge port get [:pick $bwPorts 0] bridge]
+            :if ($bwOld != "bridge") do={
+                :do {
+                    :if ([:len [/interface pppoe-server server find where interface=$bwOld]] > 0) do={ :set bwSkip ("its bridge " . $bwOld . " runs a PPPoE server") }
+                } on-error={}
             }
         }
-    } on-error={}
-}
-
-:do {
-    :if ([:len [/interface find where name=wlan1]] > 0) do={
-        :if ([:len [/interface bridge port find where interface=wlan1]] = 0) do={
-            /interface bridge port add interface=wlan1 bridge=bridge
+        :if ($bwSkip != "") do={
+            :log warning ("Provisioning: " . $bwName . " left out of the hotspot bridge -- " . $bwSkip)
+        } else={
+            :if ([:len $bwPorts] = 0) do={
+                :do {
+                    /interface bridge port add interface=$bwName bridge=bridge
+                    :log info ("Provisioning: " . $bwName . " added to the hotspot bridge")
+                } on-error={
+                    :log warning ("Provisioning: could not add " . $bwName . " to the hotspot bridge")
+                }
+            } else={
+                :local bwOld [/interface bridge port get [:pick $bwPorts 0] bridge]
+                :if ($bwOld != "bridge") do={
+                    :do {
+                        /interface bridge port set [:pick $bwPorts 0] bridge=bridge
+                        :log info ("Provisioning: " . $bwName . " moved from " . $bwOld . " to the hotspot bridge")
+                    } on-error={
+                        :log warning ("Provisioning: could not move " . $bwName . " from " . $bwOld . " to the hotspot bridge")
+                    }
+                }
+            }
         }
     }
-} on-error={}
+}
 
-:do { /interface bridge port remove [find where interface=ether1] } on-error={}
+# A bridge emptied by the move (e.g. the factory bridgeLocal) must not keep a
+# DHCP client (stray default route), DHCP server or 192.168.88.x address
+# (duplicate LAN subnet). Disabled, not deleted. The hotspot LAN bridge itself
+# must never be a DHCP client. (Only DHCP and 192.168.88.x are touched, so an
+# intentionally empty loopback bridge keeps its /32 address.)
+# lo-mgmt (the management-address loopback pin) is never touched.
+:foreach bwBrId in=[/interface bridge find where name!="bridge" and name!="lo-mgmt"] do={
+    :local bwBr [/interface bridge get $bwBrId name]
+    :if ([:len [/interface bridge port find where bridge=$bwBr]] = 0) do={
+        :do { /ip dhcp-client set [find where interface=$bwBr] disabled=yes } on-error={}
+        :do { /ip dhcp-server set [find where interface=$bwBr] disabled=yes } on-error={}
+        :foreach bwAddr in=[/ip address find where interface=$bwBr and dynamic=no] do={
+            :if ([:pick [/ip address get $bwAddr address] 0 11] = "192.168.88.") do={
+                :do { /ip address set $bwAddr disabled=yes } on-error={}
+            }
+        }
+        :log info ("Provisioning: bridge " . $bwBr . " has no ports -- any DHCP client/server or 192.168.88.x address on it is disabled")
+    }
+}
+:do { /ip dhcp-client set [find where interface=bridge] disabled=yes } on-error={}
+
 :do { /ip dhcp-client add interface=ether1 disabled=no comment="WAN uplink" } on-error={}
 :do { /ip firewall nat add chain=srcnat out-interface=ether1 action=masquerade comment="NAT for internet access" } on-error={}
 /ip dns set servers=8.8.8.8,8.8.4.4 allow-remote-requests=yes
@@ -66,6 +127,20 @@
 :do { /ip dhcp-server network add address=192.168.88.0/24 gateway=192.168.88.1 dns-server=8.8.8.8,8.8.4.4 } on-error={}
 
 :log info "Provisioning: LAN and DHCP setup complete" 
+
+# ---- STEP 2b: WIFI ACCESS POINT ----
+# wlan1 -> open access point (the hotspot does the authentication), mode
+# ap-bridge, SSID "Bitwave WiFi", 2.4 GHz b/g/n, auto channel, WPS off. It joined the
+# hotspot bridge in step 1. Skipped on routers without legacy wireless (hEX,
+# RB4011, RB5009, wifi-package v7) and left alone when wlan1 is already an AP
+# with a custom SSID. Runs via [:parse] so a missing wireless menu cannot
+# abort the import.
+:do {
+    :local bwWifiAp [:parse ":if ([:len [/interface wireless find where name=wlan1]] = 0) do={\n    :log info \"Provisioning: no wlan1 on this router -- WiFi AP setup skipped\"\n} else={\n    :local bwMode [/interface wireless get wlan1 mode]\n    :local bwSsid [/interface wireless get wlan1 ssid]\n    :local bwFactory ((\$bwSsid = \"\") || (\$bwSsid = \"MikroTik\") || ([:pick \$bwSsid 0 9] = \"MikroTik-\"))\n    :if ((\$bwMode != \"ap-bridge\") || \$bwFactory) do={\n        :do { /interface wireless security-profiles add name=bw-open mode=none } on-error={}\n        /interface wireless set wlan1 mode=ap-bridge ssid=\"Bitwave WiFi\" security-profile=bw-open disabled=no\n        :do { /interface wireless set wlan1 frequency=auto } on-error={}\n        :do { /interface wireless set wlan1 wps-mode=disabled } on-error={}\n        :do { /interface wireless set wlan1 band=2ghz-b/g/n } on-error={\n            :log warning \"Provisioning: wlan1 rejected band=2ghz-b/g/n (not a 2.4 GHz radio\?) -- band left as is\"\n        }\n        :log info \"Provisioning: wlan1 configured as the hotspot access point\"\n    } else={\n        :log info (\"Provisioning: wlan1 is already an access point (SSID \" . \$bwSsid . \") -- left unchanged\")\n    }\n}"]
+    $bwWifiAp
+} on-error={
+    :log warning "Provisioning: legacy wireless not available -- WiFi AP setup skipped"
+}
 
 # ---- STEP 3: L2TP/IPsec VPN (RouterOS v6) ----
 

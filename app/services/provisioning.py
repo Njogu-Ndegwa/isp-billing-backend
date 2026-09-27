@@ -48,8 +48,22 @@ SSTP_MGMT_LOOPBACK = "lo-mgmt"
 ROUTER_MGMT_CA_CN = "Bitwave Router Management CA"
 ROUTER_MGMT_CA_FILE = "router-mgmt-ca.crt"
 ROUTER_MGMT_CA_PATH = "/api/provision/router-mgmt-ca.crt"
+# The CA is written to this file from inline PEM inside the .rsc (no fetch):
+# `/file print file=bwca` creates "bwca.txt". Some ISPs block TCP 8081 (the
+# plain-HTTP provisioning port), which made the fetch fail on router 541.
+ROUTER_MGMT_CA_INLINE_BASENAME = "bwca"
+ROUTER_MGMT_CA_INLINE_FILE = ROUTER_MGMT_CA_INLINE_BASENAME + ".txt"
+# RouterOS 6 `/file set contents=` is limited to ~4 KB; a CA PEM is 0.7-2 KB.
+ROUTER_MGMT_CA_INLINE_MAX = 4000
 # hAP lite has no RTC; certificate checks need a sane clock.
 SSTP_NTP_SERVER = "162.159.200.1"
+
+# Hotspot WiFi. Tokens have stored ssid="N/A" since 2026-03 (the wireless
+# step was dropped then), so "N/A"/blank falls back to this default.
+DEFAULT_WIFI_SSID = "Bitwave WiFi"
+WIFI_SECURITY_PROFILE = "bw-open"
+# Name of the hotspot bridge every LAN port must belong to.
+HOTSPOT_BRIDGE = "bridge"
 
 # RouterOS 7 WireGuard management tunnel to Hetzner wg2 (PROVISION_MGMT_TO_HETZNER).
 # Same name the manual migrations used (skill migrate-router-to-sstp).
@@ -535,6 +549,65 @@ def get_login_page_html() -> str:
 # .rsc script generation -- shared + VPN-specific sections
 # ---------------------------------------------------------------------------
 
+_ROUTEROS_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "$": "\\$",
+    "?": "\\?",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
+def routeros_escape(value: str) -> str:
+    """Escape text for use INSIDE a RouterOS double-quoted string.
+
+    Backslash, double quote, `$` (variable expansion) and `?` are escaped,
+    newlines/CR/tab become \\n/\\r/\\t, and any other control character a
+    `\\XX` hex escape -- so the result is always a single line and RouterOS
+    reads back exactly `value`.
+    """
+    out = []
+    for ch in value:
+        if ch in _ROUTEROS_ESCAPES:
+            out.append(_ROUTEROS_ESCAPES[ch])
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append("\\%02X" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _rsc_parse_block(code: str, var: str, failure_log: str) -> str:
+    """Run `code` through [:parse "..."] so menus that may not exist on this
+    router (e.g. /interface wireless on wifi-package or wireless-less boards)
+    fail at RUNTIME, where on-error can catch them, instead of aborting the
+    whole import at parse time."""
+    return f""":do {{
+    :local {var} [:parse "{routeros_escape(code.strip())}"]
+    ${var}
+}} on-error={{
+    :log warning "{failure_log}"
+}}"""
+
+
+def hotspot_wifi_ssid(token: ProvisioningToken) -> str:
+    """SSID for the hotspot AP: the token's ssid, or DEFAULT_WIFI_SSID.
+
+    Kept to printable ASCII without RouterOS-special characters and at most
+    32 bytes (the 802.11 limit) so it can never break the generated script.
+    """
+    raw = (getattr(token, "ssid", None) or "").strip()
+    if raw.upper() in ("", "N/A"):
+        raw = DEFAULT_WIFI_SSID
+    cleaned = "".join(
+        ch for ch in raw
+        if 0x20 <= ord(ch) < 0x7F and ch not in '"\\$?;{}[]`'
+    ).strip()[:32].strip()
+    return cleaned or DEFAULT_WIFI_SSID
+
+
 def _rsc_header(token: ProvisioningToken) -> str:
     vpn_label = "WireGuard" if token.vpn_type == "wireguard" else "L2TP/IPsec"
     tunnel_line = f"# Tunnel IP: {token.wireguard_ip}"
@@ -606,11 +679,108 @@ def _rsc_preflight_hotspot(token: ProvisioningToken) -> str:
 }}"""
 
 
+def _rsc_lan_ports() -> str:
+    """Put every LAN port (all ethernet except ether1, plus WiFi) on the
+    hotspot bridge -- MOVING it out of any other bridge.
+
+    The old step only added a port that was in no bridge at all, so on
+    routers whose factory/CAP-mode config had ether2..N and wlan1 in
+    `bridgeLocal` those ports stayed there and cabled APs got no hotspot
+    (routers 539/541, 2026-09-27). Guards, so a re-run on a router in the
+    field cannot break a real uplink or service:
+      * ether1 (the WAN) is never touched;
+      * a port with a DHCP client, a PPPoE client or a non-192.168.88.x
+        address is an uplink/other network, not a LAN port -- left alone;
+      * a port whose current bridge runs a PPPoE server is left alone.
+    A bridge left with no ports afterwards (the old bridgeLocal) has its DHCP
+    client/server and 192.168.88.x address disabled -- never deleted -- so it
+    cannot add a stray default route or a duplicate 192.168.88.0/24.
+    """
+    br = HOTSPOT_BRIDGE
+    return f"""
+# Move every LAN port onto the hotspot bridge "{br}": all ethernet ports except
+# ether1 (the WAN) and the WiFi interfaces, even when they already belong to
+# another bridge such as the factory "bridgeLocal".
+:foreach bwIfId in=[/interface find] do={{
+    :local bwName [/interface get $bwIfId name]
+    :local bwType [/interface get $bwIfId type]
+    # Match on the NAME too: the hAP lite's power-line port "pwr-line1" reports
+    # type=ether but is not a LAN port (bench, router 541, 2026-09-27).
+    :local bwLanName (([:pick $bwName 0 5] = "ether") || ([:pick $bwName 0 4] = "wlan") || ([:pick $bwName 0 4] = "wifi"))
+    :if (($bwName != "ether1") && $bwLanName && (($bwType = "ether") || ($bwType = "wlan") || ($bwType = "wifi") || ($bwType = "wifiwave2"))) do={{
+        :local bwSkip ""
+        :if ([:len [/ip dhcp-client find where interface=$bwName]] > 0) do={{ :set bwSkip "it runs a DHCP client (uplink)" }}
+        :do {{
+            :if ([:len [/interface pppoe-client find where interface=$bwName]] > 0) do={{ :set bwSkip "it carries a PPPoE client (uplink)" }}
+        }} on-error={{}}
+        :foreach bwAddr in=[/ip address find where interface=$bwName] do={{
+            :if ([:pick [/ip address get $bwAddr address] 0 11] != "192.168.88.") do={{ :set bwSkip "it has its own IP address" }}
+        }}
+        :local bwPorts [/interface bridge port find where interface=$bwName and dynamic=no]
+        :if (($bwSkip = "") && ([:len $bwPorts] > 0)) do={{
+            :local bwOld [/interface bridge port get [:pick $bwPorts 0] bridge]
+            :if ($bwOld != "{br}") do={{
+                :do {{
+                    :if ([:len [/interface pppoe-server server find where interface=$bwOld]] > 0) do={{ :set bwSkip ("its bridge " . $bwOld . " runs a PPPoE server") }}
+                }} on-error={{}}
+            }}
+        }}
+        :if ($bwSkip != "") do={{
+            :log warning ("Provisioning: " . $bwName . " left out of the hotspot bridge -- " . $bwSkip)
+        }} else={{
+            :if ([:len $bwPorts] = 0) do={{
+                :do {{
+                    /interface bridge port add interface=$bwName bridge={br}
+                    :log info ("Provisioning: " . $bwName . " added to the hotspot bridge")
+                }} on-error={{
+                    :log warning ("Provisioning: could not add " . $bwName . " to the hotspot bridge")
+                }}
+            }} else={{
+                :local bwOld [/interface bridge port get [:pick $bwPorts 0] bridge]
+                :if ($bwOld != "{br}") do={{
+                    :do {{
+                        /interface bridge port set [:pick $bwPorts 0] bridge={br}
+                        :log info ("Provisioning: " . $bwName . " moved from " . $bwOld . " to the hotspot bridge")
+                    }} on-error={{
+                        :log warning ("Provisioning: could not move " . $bwName . " from " . $bwOld . " to the hotspot bridge")
+                    }}
+                }}
+            }}
+        }}
+    }}
+}}
+
+# A bridge emptied by the move (e.g. the factory bridgeLocal) must not keep a
+# DHCP client (stray default route), DHCP server or 192.168.88.x address
+# (duplicate LAN subnet). Disabled, not deleted. The hotspot LAN bridge itself
+# must never be a DHCP client. (Only DHCP and 192.168.88.x are touched, so an
+# intentionally empty loopback bridge keeps its /32 address.)
+# lo-mgmt (the management-address loopback pin) is never touched.
+:foreach bwBrId in=[/interface bridge find where name!="{br}" and name!="{SSTP_MGMT_LOOPBACK}"] do={{
+    :local bwBr [/interface bridge get $bwBrId name]
+    :if ([:len [/interface bridge port find where bridge=$bwBr]] = 0) do={{
+        :do {{ /ip dhcp-client set [find where interface=$bwBr] disabled=yes }} on-error={{}}
+        :do {{ /ip dhcp-server set [find where interface=$bwBr] disabled=yes }} on-error={{}}
+        :foreach bwAddr in=[/ip address find where interface=$bwBr and dynamic=no] do={{
+            :if ([:pick [/ip address get $bwAddr address] 0 11] = "192.168.88.") do={{
+                :do {{ /ip address set $bwAddr disabled=yes }} on-error={{}}
+            }}
+        }}
+        :log info ("Provisioning: bridge " . $bwBr . " has no ports -- any DHCP client/server or 192.168.88.x address on it is disabled")
+    }}
+}}
+:do {{ /ip dhcp-client set [find where interface={br}] disabled=yes }} on-error={{}}"""
+
+
 def _rsc_wan_setup() -> str:
     return """
 # ---- STEP 1: WAN / INITIAL SETUP ----
 
-:do { /interface wireless cap set enabled=no } on-error={}
+""" + _rsc_parse_block(
+        "/interface wireless cap set enabled=no",
+        "bwCapOff",
+        "Provisioning: no legacy wireless package -- CAP mode check skipped",
+    ) + """
 
 :if ([:len [/interface bridge find where name=bridge]] = 0) do={
     /interface bridge add name=bridge
@@ -619,25 +789,9 @@ def _rsc_wan_setup() -> str:
     :log info "Provisioning: bridge interface already exists"
 }
 
-:foreach iface in={ether2;ether3;ether4;ether5} do={
-    :do {
-        :if ([:len [/interface find where name=$iface]] > 0) do={
-            :if ([:len [/interface bridge port find where interface=$iface]] = 0) do={
-                /interface bridge port add interface=$iface bridge=bridge
-            }
-        }
-    } on-error={}
-}
-
-:do {
-    :if ([:len [/interface find where name=wlan1]] > 0) do={
-        :if ([:len [/interface bridge port find where interface=wlan1]] = 0) do={
-            /interface bridge port add interface=wlan1 bridge=bridge
-        }
-    }
-} on-error={}
-
 :do { /interface bridge port remove [find where interface=ether1] } on-error={}
+""" + _rsc_lan_ports() + """
+
 :do { /ip dhcp-client add interface=ether1 disabled=no comment="WAN uplink" } on-error={}
 :do { /ip firewall nat add chain=srcnat out-interface=ether1 action=masquerade comment="NAT for internet access" } on-error={}
 /ip dns set servers=8.8.8.8,8.8.4.4 allow-remote-requests=yes
@@ -656,6 +810,53 @@ def _rsc_lan_setup() -> str:
 :do { /ip dhcp-server network add address=192.168.88.0/24 gateway=192.168.88.1 dns-server=8.8.8.8,8.8.4.4 } on-error={}
 
 :log info "Provisioning: LAN and DHCP setup complete" """
+
+
+def _rsc_wireless_ap(token: ProvisioningToken) -> str:
+    """Make wlan1 an open hotspot access point.
+
+    Missing since 2026-03 (commit 51bbc79 dropped the wireless step), so a
+    router whose wlan1 was not already an AP -- CAP-mode or no-defaults
+    resets leave it disabled, mode=station, ssid=MikroTik -- never broadcast
+    WiFi (routers 539/541, 2026-09-27).
+
+    Legacy `/interface wireless` only. Routers without it (hEX, RB4011,
+    RB5009, v7 boards on the wifi/wifiwave2 package) don't have that menu,
+    so the block runs through [:parse] and simply logs and skips there.
+    Re-run safe: a wlan1 that is already an AP with a non-factory SSID
+    (the reseller renamed it, or disabled it on purpose) is left untouched.
+    """
+    ssid = hotspot_wifi_ssid(token)
+    profile = WIFI_SECURITY_PROFILE
+    code = f"""
+:if ([:len [/interface wireless find where name=wlan1]] = 0) do={{
+    :log info "Provisioning: no wlan1 on this router -- WiFi AP setup skipped"
+}} else={{
+    :local bwMode [/interface wireless get wlan1 mode]
+    :local bwSsid [/interface wireless get wlan1 ssid]
+    :local bwFactory (($bwSsid = "") || ($bwSsid = "MikroTik") || ([:pick $bwSsid 0 9] = "MikroTik-"))
+    :if (($bwMode != "ap-bridge") || $bwFactory) do={{
+        :do {{ /interface wireless security-profiles add name={profile} mode=none }} on-error={{}}
+        /interface wireless set wlan1 mode=ap-bridge ssid="{routeros_escape(ssid)}" security-profile={profile} disabled=no
+        :do {{ /interface wireless set wlan1 frequency=auto }} on-error={{}}
+        :do {{ /interface wireless set wlan1 wps-mode=disabled }} on-error={{}}
+        :do {{ /interface wireless set wlan1 band=2ghz-b/g/n }} on-error={{
+            :log warning "Provisioning: wlan1 rejected band=2ghz-b/g/n (not a 2.4 GHz radio?) -- band left as is"
+        }}
+        :log info "Provisioning: wlan1 configured as the hotspot access point"
+    }} else={{
+        :log info ("Provisioning: wlan1 is already an access point (SSID " . $bwSsid . ") -- left unchanged")
+    }}
+}}"""
+    return f"""
+# ---- STEP 2b: WIFI ACCESS POINT ----
+# wlan1 -> open access point (the hotspot does the authentication), mode
+# ap-bridge, SSID "{ssid}", 2.4 GHz b/g/n, auto channel, WPS off. It joined the
+# hotspot bridge in step 1. Skipped on routers without legacy wireless (hEX,
+# RB4011, RB5009, wifi-package v7) and left alone when wlan1 is already an AP
+# with a custom SSID. Runs via [:parse] so a missing wireless menu cannot
+# abort the import.
+{_rsc_parse_block(code, "bwWifiAp", "Provisioning: legacy wireless not available -- WiFi AP setup skipped")}"""
 
 
 def _rsc_vpn_wireguard(token: ProvisioningToken) -> str:
@@ -872,9 +1073,65 @@ def _rsc_sstp_client_add_or_set(client_params: str, indent: str) -> str:
     return "\n".join(indent + line for line in lines)
 
 
+def _rsc_mgmt_ca_import() -> str:
+    """Install the router-management CA the SSTP client verifies against.
+
+    Primary: the PEM (ROUTER_MGMT_CA_PEM) is embedded in the script and
+    written to a file on the router -- no download. The old /tool fetch from
+    the plain-HTTP provisioning base (...:8081) failed where ISPs block TCP 8081
+    (router 541, 2026-09-27) and left SSTP unable to verify the server.
+    Fallback, only if the CA is still missing: fetch it over HTTPS from
+    PROVISION_BASE_URL (port 443).
+    """
+    cn = ROUTER_MGMT_CA_CN
+    parts = []
+    pem = router_mgmt_ca_pem()
+    if pem and len(pem) <= ROUTER_MGMT_CA_INLINE_MAX:
+        inline_file = ROUTER_MGMT_CA_INLINE_FILE
+        parts.append(f"""
+# The CA certificate is embedded here (public certificate only) and written to
+# {inline_file}: `/file print file={ROUTER_MGMT_CA_INLINE_BASENAME}` creates the file, `/file set` fills it.
+:if ([:len [/certificate find where common-name="{cn}"]] = 0) do={{
+    :do {{ /file remove [find where name="{inline_file}"] }} on-error={{}}
+    :do {{
+        /file print file={ROUTER_MGMT_CA_INLINE_BASENAME}
+        :delay 2s
+        /file set [find where name="{inline_file}"] contents="{routeros_escape(pem)}"
+        :delay 1s
+        /certificate import file-name={inline_file} passphrase=""
+        :log info "Provisioning: router management CA imported (embedded copy)"
+    }} on-error={{
+        :log warning "Provisioning: embedded router management CA could not be imported -- trying HTTPS download"
+    }}
+    :do {{ /file remove [find where name="{inline_file}"] }} on-error={{}}
+}}""")
+    elif pem:
+        logger.warning(
+            "ROUTER_MGMT_CA_PEM is %d bytes, too long to embed in the .rsc; routers will download it",
+            len(pem),
+        )
+
+    https_base = (settings.PROVISION_BASE_URL or "").strip().rstrip("/")
+    scheme = urlsplit(https_base).scheme.lower()
+    # RouterOS 6 has no public root store, so an HTTPS fetch needs the
+    # certificate check off. That fetch is unauthenticated, like the plain
+    # HTTP fetch it replaces, so it only runs when the embedded copy failed.
+    flag = " check-certificate=no" if scheme == "https" else ""
+    parts.append(f"""
+:if ([:len [/certificate find where common-name="{cn}"]] = 0) do={{
+    :do {{
+        /tool fetch url="{https_base}{ROUTER_MGMT_CA_PATH}" dst-path={ROUTER_MGMT_CA_FILE}{flag}
+        :delay 2s
+        /certificate import file-name={ROUTER_MGMT_CA_FILE} passphrase=""
+        :log info "Provisioning: router management CA imported (downloaded)"
+    }} on-error={{
+        :log warning "Provisioning: could not import the router management CA -- SSTP cannot verify the server"
+    }}
+}}""")
+    return "".join(parts).lstrip("\n")
+
+
 def _rsc_vpn_sstp(token: ProvisioningToken) -> str:
-    base_url = provision_base_url_for_vpn(token.vpn_type)
-    cert_flag = fetch_certificate_flag_for_url(base_url, token.vpn_type)
     server = settings.SSTP_SERVER.strip()
     iface = SSTP_ROUTER_INTERFACE
     tunnel_ip = derive_sstp_ip(token.wireguard_ip)
@@ -895,16 +1152,7 @@ def _rsc_vpn_sstp(token: ProvisioningToken) -> str:
 # Commands that differ between RouterOS versions go through [:parse] so an
 # unsupported build logs a warning instead of aborting the import.
 
-:if ([:len [/certificate find where common-name="{ROUTER_MGMT_CA_CN}"]] = 0) do={{
-    :do {{
-        /tool fetch url="{base_url}{ROUTER_MGMT_CA_PATH}" dst-path={ROUTER_MGMT_CA_FILE}{cert_flag}
-        :delay 2s
-        /certificate import file-name={ROUTER_MGMT_CA_FILE} passphrase=""
-        :log info "Provisioning: router management CA imported"
-    }} on-error={{
-        :log warning "Provisioning: could not fetch/import the router management CA -- SSTP cannot verify the server"
-    }}
-}}
+{_rsc_mgmt_ca_import()}
 :do {{ /certificate set [find where common-name="{ROUTER_MGMT_CA_CN}"] trusted=yes }} on-error={{}}
 
 # SSTP certificate checks need a correct clock (hAP lite has no RTC).
@@ -1243,6 +1491,7 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
 
     parts.append(_rsc_wan_setup())
     parts.append(_rsc_lan_setup())
+    parts.append(_rsc_wireless_ap(token))
 
     hetzner = token_mgmt_to_hetzner(token)
     if hetzner:
@@ -1377,7 +1626,7 @@ async def _create_hetzner_provisioning_token(
             router_name=router_name,
             identity=identity,
             wireguard_ip=vpn_ip,
-            ssid="N/A",
+            ssid=DEFAULT_WIFI_SSID,
             router_admin_password=api_password,
             vpn_type=vpn_type,
             wg_private_key=wg_private_key,
@@ -1506,7 +1755,7 @@ async def create_provisioning_token(
             router_name=router_name,
             identity=identity,
             wireguard_ip=vpn_ip,
-            ssid="N/A",
+            ssid=DEFAULT_WIFI_SSID,
             router_admin_password=api_password,
             vpn_type=vpn_type,
             wg_private_key=wg_private_key,

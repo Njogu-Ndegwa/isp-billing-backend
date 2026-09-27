@@ -97,7 +97,9 @@ def test_legacy_token_keeps_the_old_l2tp_script_whatever_the_flag(monkeypatch, e
     assert "STEP 3B: BACKUP L2TP/IPsec VPN" in script
     assert "l2tp-client add name=l2tp-aws2" in script
     assert "sstp" not in script.lower()
-    assert "lo-mgmt" not in script
+    # No loopback pin for legacy tokens (the LAN-port step only names lo-mgmt
+    # to leave it alone).
+    assert "[/interface bridge find where name=lo-mgmt]" not in script
     assert "# VPN Type: L2TP/IPsec\n" in script
 
 
@@ -115,11 +117,14 @@ def test_sstp_token_script_has_only_the_sstp_tunnel(monkeypatch):
     assert "# Management IP: 10.0.100.77 (pinned on lo-mgmt)" in script
     assert "# Tunnel IP: 10.251.100.77" in script
 
-    # CA fetched over the v6 bootstrap base URL (HTTP), imported and trusted.
-    assert (
-        '/tool fetch url="http://isp.example.net/api/provision/router-mgmt-ca.crt" '
-        "dst-path=router-mgmt-ca.crt\n"
-    ) in script
+    # CA embedded in the script (no download), imported and trusted; an
+    # HTTPS download is only the fallback.
+    assert "/file print file=bwca" in script
+    assert '/certificate import file-name=bwca.txt passphrase=""' in script
+    assert "http://isp.example.net/api/provision/router-mgmt-ca.crt" not in script
+    assert script.index("/file print file=bwca") < script.index(
+        '/tool fetch url="https://isp.example.net/api/provision/router-mgmt-ca.crt"'
+    )
     assert '/certificate import file-name=router-mgmt-ca.crt passphrase=""' in script
     assert '/certificate set [find where common-name="Bitwave Router Management CA"] trusted=yes' in script
     assert "/system ntp client set enabled=yes primary-ntp=162.159.200.1" in script
@@ -203,12 +208,16 @@ def test_sstp_script_obeys_parse_safety_rules(monkeypatch):
     assert script.count("{") == script.count("}")
 
 
-def test_https_legacy_base_url_disables_cert_check_on_ca_fetch(monkeypatch):
+def test_ca_fallback_download_uses_https_base_not_the_legacy_port(monkeypatch):
+    # Some ISPs block TCP 8081 (router 541, 2026-09-27): the CA must never be
+    # fetched from the plain-HTTP legacy base. The fallback is HTTPS (443)
+    # with the certificate check off (RouterOS 6 has no root store).
     _settings(monkeypatch, enabled=True)
-    monkeypatch.setattr(provisioning.settings, "PROVISION_LEGACY_BASE_URL", "https://legacy.example.net")
+    monkeypatch.setattr(provisioning.settings, "PROVISION_LEGACY_BASE_URL", "http://91.98.238.12:8081")
     script = provisioning.generate_rsc_script(_sstp_token())
+    assert "8081/api/provision/router-mgmt-ca.crt" not in script
     assert (
-        '/tool fetch url="https://legacy.example.net/api/provision/router-mgmt-ca.crt" '
+        '/tool fetch url="https://isp.example.net/api/provision/router-mgmt-ca.crt" '
         "dst-path=router-mgmt-ca.crt check-certificate=no"
     ) in script
 
