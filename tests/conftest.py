@@ -37,6 +37,7 @@ os.environ.setdefault("MPESA_ENVIRONMENT", "sandbox")
 # The real-time pilot defaults to a production router id; no test should
 # inherit pilot behaviour by accident. Pilot tests opt in explicitly.
 os.environ.setdefault("REALTIME_PILOT_ROUTER_IDS", "")
+os.environ.setdefault("REALTIME_PUSH_INSTALL_AT_SETUP", "false")  # no background router installs in tests
 
 from datetime import datetime
 from typing import AsyncIterator

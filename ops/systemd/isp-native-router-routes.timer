@@ -1,0 +1,11 @@
+[Unit]
+Description=Continuously reconcile Hetzner-native router routes
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=isp-native-router-routes.service
+
+[Install]
+WantedBy=timers.target

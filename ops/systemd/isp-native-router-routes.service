@@ -1,0 +1,9 @@
+[Unit]
+Description=Prefer active Hetzner-native router management tunnels
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/sbin/ip route replace blackhole 10.0.0.0/16 proto static metric 427
+ExecStartPre=/usr/sbin/ip route replace 10.0.0.0/16 dev wg-aws-transit src 10.0.255.254 metric 400
+ExecStart=/usr/local/sbin/isp-native-router-route-sync
