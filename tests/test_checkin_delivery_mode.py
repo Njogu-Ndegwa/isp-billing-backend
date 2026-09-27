@@ -53,7 +53,8 @@ ROUTER = svc.RouterRef(id=7, auth_method="direct_api", lb_enabled=False, fetched
 _PK = iter(range(1_900_000, 1_999_999))
 
 
-def _arm(monkeypatch, *, push_only="", checkin_only="", pilot_ids=None, grace=60, fallback=120):
+def _arm(monkeypatch, *, push_only="", checkin_only="", pilot_ids=None, grace=60, fallback=120,
+         head_start=None):
     monkeypatch.setattr(settings, "CHECKIN_ENABLED", True)
     monkeypatch.setattr(settings, "CHECKIN_KILL_SWITCH", False)
     monkeypatch.setattr(settings, "CHECKIN_MODE", "add")
@@ -62,6 +63,9 @@ def _arm(monkeypatch, *, push_only="", checkin_only="", pilot_ids=None, grace=60
     monkeypatch.setattr(settings, "CHECKIN_PUSH_ONLY_ROUTER_IDS", push_only)
     monkeypatch.setattr(settings, "CHECKIN_ONLY_ROUTER_IDS", checkin_only)
     monkeypatch.setattr(settings, "CHECKIN_MISSING_GRACE_SECONDS", grace)
+    # The attempt-anchored clock tests below predate race mode; unless a test
+    # says otherwise the push's head start equals the grace, as it did then.
+    monkeypatch.setattr(settings, "CHECKIN_RACE_HEAD_START_SECONDS", grace if head_start is None else head_start)
     monkeypatch.setattr(settings, "CHECKIN_ONLY_FALLBACK_SECONDS", fallback)
     monkeypatch.setattr(settings, "CHECKIN_MAX_LINES_PER_REPLY", 10)
 
@@ -227,6 +231,79 @@ def test_reconnect_guard_holds_a_mac_that_was_just_on_the_router(monkeypatch):
     assert _decide([], [_entry(M1)], 1005.0, pending=pend, now=now).lines == []     # just removed
     assert _decide([], [_entry(M1)], 1059.0, pending=pend, now=now).lines == []
     assert [e.mac for e in _decide([], [_entry(M1)], 1066.0, pending=pend, now=now).lines] == [M1]
+
+
+# ---------------------------------------------------------------------------
+# Race mode: the push gets a short head start, then the check-in also delivers
+# ---------------------------------------------------------------------------
+
+def test_race_mode_default_head_start_is_20_seconds(monkeypatch):
+    monkeypatch.setattr(settings, "CHECKIN_RACE_HEAD_START_SECONDS", svc.DEFAULT_RACE_HEAD_START_SECONDS)
+    assert svc.race_head_start_seconds() == 20
+    assert svc.stats_snapshot()["race_head_start_seconds"] == 20
+
+
+def test_race_mode_holds_a_payment_younger_than_the_head_start(monkeypatch):
+    _arm(monkeypatch, pilot_ids=str(ROUTER.id), grace=60, head_start=20)
+    now = datetime.utcnow()
+    d = _decide([], [_entry(M1)], 1000.0, pending=[_pending(M1, age_s=12, now=now)], now=now,
+                undelivered_recent=True)
+    assert d.lines == [] and [e.mac for e in d.in_grace] == [M1]
+    # Held, but polled fast so the head start is not stretched by the cadence.
+    assert d.next_s == svc.FAST_POLL_SECONDS
+
+
+def test_race_mode_sends_once_the_push_has_had_its_head_start(monkeypatch):
+    """The push is still in flight (or stuck) 20 s after payment and the
+    router does not show the MAC: the check-in delivers too, well before the
+    60 s the old default waited."""
+    _arm(monkeypatch, pilot_ids=str(ROUTER.id), grace=60, head_start=20)
+    now = datetime.utcnow()
+    for state in ("scheduled", "in_progress", "retry_pending"):
+        svc.reset_state()
+        d = _decide([], [_entry(M1)], 1000.0, pending=[_pending(M1, age_s=21, state=state, now=now)],
+                    now=now, undelivered_recent=True)
+        assert [e.mac for e in d.lines] == [M1], state
+        assert d.next_s == svc.CONFIRM_POLL_SECONDS
+
+
+def test_race_mode_never_offers_a_mac_the_push_already_delivered(monkeypatch):
+    _arm(monkeypatch, pilot_ids=str(ROUTER.id), grace=60, head_start=20)
+    now = datetime.utcnow()
+    d = _decide([M1], [_entry(M1)], 1000.0, pending=[_pending(M1, age_s=40, now=now)], now=now)
+    assert d.lines == [] and d.in_grace == []
+
+
+def test_race_mode_keeps_the_full_reconnect_guard(monkeypatch):
+    """A 20 s head start must not shorten the Reconnect guard: a MAC seen on
+    the router moments ago still waits the full 60 s grace."""
+    _arm(monkeypatch, pilot_ids=str(ROUTER.id), grace=60, head_start=20)
+    now = datetime.utcnow()
+    pend = [_pending(M1, age_s=25, state="in_progress", now=now)]
+    _decide([M1], [_entry(M1)], 1000.0, pending=pend, now=now)                      # present
+    assert _decide([], [_entry(M1)], 1005.0, pending=pend, now=now).lines == []     # just removed
+    assert _decide([], [_entry(M1)], 1040.0, pending=pend, now=now).lines == []
+    assert [e.mac for e in _decide([], [_entry(M1)], 1066.0, pending=pend, now=now).lines] == [M1]
+
+
+def test_race_mode_mac_without_attempt_keeps_the_full_grace(monkeypatch):
+    _arm(monkeypatch, pilot_ids=str(ROUTER.id), grace=60, head_start=20)
+    assert _decide([], [_entry(M1)], 1000.0).lines == []
+    assert _decide([], [_entry(M1)], 1030.0).lines == []
+    assert [e.mac for e in _decide([], [_entry(M1)], 1060.0).lines] == [M1]
+
+
+def test_race_mode_push_only_router_still_never_gets_a_lines(monkeypatch):
+    _arm(monkeypatch, push_only=str(ROUTER.id), pilot_ids=str(ROUTER.id), grace=60, head_start=0)
+    now = datetime.utcnow()
+    d = _decide([], [_entry(M1)], 1000.0, pending=[_pending(M1, age_s=300, now=now)], now=now)
+    assert d.lines == []
+
+
+@pytest.mark.parametrize("raw,expected", [(-5, 0), ("junk", 20), (99999, 3600), ("15", 15)])
+def test_race_head_start_setting_is_clamped(monkeypatch, raw, expected):
+    monkeypatch.setattr(settings, "CHECKIN_RACE_HEAD_START_SECONDS", raw)
+    assert svc.race_head_start_seconds() == expected
 
 
 # ---------------------------------------------------------------------------

@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     # the router's own outbound tcp 80/3128/8080 to non-portal hosts (hotspot
     # bypass fix) and must stay. Caddy binds 8088 on the tunnel address only.
     REALTIME_TUNNEL_PUSH_URL: str = "http://10.251.0.1:8088/api/router/usage-push"
+    # New routers get the real-time push when they finish setup (provisioning
+    # /complete), once their encrypted management tunnel answers. hAP lite/mini
+    # are skipped. False = switch off (existing routers are unaffected).
+    REALTIME_PUSH_INSTALL_AT_SETUP: bool = True
     # Router expiry reaper (app/services/expiry_reaper_script.py): tried in this
     # order. The tunnel one is plain HTTP inside the management tunnel (Caddy's
     # 10.251.0.1:8088 site); public HTTPS costs a hAP lite ~5-7 s of full CPU.
@@ -66,7 +70,15 @@ class Settings(BaseSettings):
     # CHECKIN_KILL_SWITCH makes every reply an empty idle frame, which also
     # reaches routers whose management tunnel is down.
     CHECKIN_ENABLED: bool = False
+    # Comma list of router ids, or "all" = every router (only routers running
+    # the applier ever check in, so "all" = every router it is installed on,
+    # which the standard-runtime installer below takes care of for new
+    # routers). CHECKIN_EXCLUDE_ROUTER_IDS always wins over both.
     CHECKIN_ROUTER_IDS: str = ""
+    CHECKIN_EXCLUDE_ROUTER_IDS: str = ""
+    # Where the applier posts. Public HTTPS (through Cloudflare): it keeps
+    # working when the management tunnel is down, which is the point.
+    CHECKIN_ENDPOINT_URL: str = "https://isp.bitwavetechnologies.net/api/router/checkin"
     CHECKIN_MODE: str = "shadow"
     CHECKIN_KILL_SWITCH: bool = False
     CHECKIN_MAX_LINES_PER_REPLY: int = 10
@@ -76,6 +88,14 @@ class Settings(BaseSettings):
     # seconds before the customer row switches to the NEW MAC, and a check-in
     # in that gap must not re-add the OLD MAC as an orphan binding.
     CHECKIN_MISSING_GRACE_SECONDS: int = 60
+    # Race mode (the standard after the 2026-09-26/27 push-vs-check-in A/B):
+    # the push fires at payment time and the check-in sends the A line once
+    # the payment's provisioning attempt is this old and the router still
+    # does not show the MAC. The A/B measured the push landing 78% of
+    # payments within 20 s, so 20 s rarely duplicates its work but catches
+    # the slow tail (push p99 351 s vs check-in p99 146 s). Measured from the
+    # attempt's DB created_at. The Reconnect guard above keeps its own 60 s.
+    CHECKIN_RACE_HEAD_START_SECONDS: int = 20
     # Per-router delivery mode for the push-vs-check-in A/B (2026-09-26).
     # Comma lists of router ids; a router in neither list (or in both) keeps
     # the default "both paths" behaviour.
@@ -92,6 +112,26 @@ class Settings(BaseSettings):
     # this long after the attempt was created, the normal push/retry path
     # takes over.
     CHECKIN_ONLY_FALLBACK_SECONDS: int = 120
+    # Standard router runtime (app/services/standard_runtime_enrol.py): every
+    # 15 min, up to STANDARD_RUNTIME_BATCH in-scope routers get
+    #   * the check-in applier, when the check-in channel is live and enrols
+    #     the router (CHECKIN_ROUTER_IDS / "all"), except hAP lite / smips
+    #     boards (HTTPS check-in cost them ~+40 CPU points) and RADIUS routers;
+    #   * the management-tunnel watchdog (SSTP or WireGuard, from what the
+    #     router has).
+    # The command agent is not part of it (router_agent_enabled stays false).
+    # Off by default: merging changes nothing until this is flipped.
+    STANDARD_RUNTIME_AUTO_INSTALL: bool = False
+    # Scope: routers with id >= STANDARD_RUNTIME_MIN_ROUTER_ID (0 = every
+    # router), plus the ids in STANDARD_RUNTIME_EXTRA_ROUTER_IDS; never the
+    # ids in STANDARD_RUNTIME_EXCLUDE_ROUTER_IDS. Setting the minimum to the
+    # next router id covers "every new router" without touching the fleet.
+    STANDARD_RUNTIME_MIN_ROUTER_ID: int = 0
+    STANDARD_RUNTIME_EXTRA_ROUTER_IDS: str = ""
+    STANDARD_RUNTIME_EXCLUDE_ROUTER_IDS: str = ""
+    STANDARD_RUNTIME_BATCH: int = 5
+    STANDARD_RUNTIME_INSTALL_CHECKIN: bool = True
+    STANDARD_RUNTIME_INSTALL_WATCHDOG: bool = True
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10

@@ -139,7 +139,7 @@ async def router_checkin(
         if router_ref is None:
             # Valid token for an identity with no router: same 401, no enumeration.
             return _plain(401, "unauthorized")
-        if router_ref.id not in svc.checkin_router_ids():
+        if not svc.checkin_router_enrolled(router_ref.id):
             return _frame(svc.idle_frame())
         now = datetime.utcnow()
         state = await svc.load_checkin_state(router_ref.id, now)
