@@ -5,7 +5,8 @@ token gets only WireGuard `wg-hz` to Hetzner wg2 (registered on the Hetzner
 manager, never on AWS) and a RouterOS 6 token only SSTP (see
 test_provisioning_sstp.py). Either way the router keeps its 10.0.X.Y DB
 address, pinned on `lo-mgmt`. With the flag off everything is byte-for-byte
-what origin/main produced (goldens in tests/fixtures/provisioning_golden/).
+the legacy golden (tests/fixtures/provisioning_golden/): the flag changes
+nothing for tokens issued with it off.
 """
 
 import importlib.util
@@ -73,9 +74,9 @@ def _commands(script: str) -> str:
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("name", ["wireguard", "l2tp", "l2tp_routerboard"])
-def test_legacy_tokens_render_byte_for_byte_as_origin_main(monkeypatch, name, enabled):
+def test_legacy_tokens_render_byte_for_byte_as_golden(monkeypatch, name, enabled):
     # A token issued with the flag off (management_tunnel NULL) must render
-    # exactly what origin/main rendered -- also after the flag is switched on.
+    # exactly the legacy golden -- also after the flag is switched on.
     golden = _settings(monkeypatch, enabled=enabled)
     token = golden.tokens()[name]
     expected = (GOLDEN_DIR / f"{name}.rsc").read_bytes()
