@@ -53,8 +53,9 @@ class Settings(BaseSettings):
     # Automatic reaper enrolment (app/services/expiry_reaper_enrol.py): every
     # 30 min, up to EXPIRY_REAPER_ENROL_BATCH routers not yet on the reaper are
     # classified; hAP lite class boards stay on server-side removal, other
-    # eligible boards get the reaper installed. Off until switched on.
-    EXPIRY_REAPER_AUTO_ENROL: bool = False
+    # eligible boards get the reaper installed. On since 2026-09-27 (Dennis:
+    # every new router enrolled automatically); set false to pause.
+    EXPIRY_REAPER_AUTO_ENROL: bool = True
     EXPIRY_REAPER_ENROL_BATCH: int = 5
     # Router check-in delivery pilot (2026-09-26). The router POSTs the MACs of
     # its app-tagged bypass bindings to /api/router/checkin; the server answers

@@ -146,7 +146,7 @@ async def _reload(db, router_id):
 # --- the job ----------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_off_by_default_does_nothing(db, wired, monkeypatch):
+async def test_switched_off_does_nothing(db, wired, monkeypatch):
     monkeypatch.setattr(enrol.settings, "EXPIRY_REAPER_AUTO_ENROL", False)
     r = await _router(db, "10.0.0.50", "Router-5000")
     wired["10.0.0.50"] = FakeRouterOS("Router-5000")
@@ -293,3 +293,9 @@ class _PingFetch:
 ])
 def test_tunnel_reachable_falls_back_to_a_real_http_call(pings, fetch, ok):
     assert enrol.tunnel_reachable(_PingFetch(pings, fetch), "http://10.251.0.1:8088/x") is ok
+
+
+def test_enrolment_is_on_by_default():
+    from app.config import Settings
+    assert Settings.model_fields["EXPIRY_REAPER_AUTO_ENROL"].default is True
+
