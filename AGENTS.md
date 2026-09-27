@@ -200,6 +200,13 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   timestamps unreliable until SNTP syncs after reboot. Server-side gotcha: stale `ppp<N>` iface
   may show `10.0.100.x` via `ip -br addr` even when router is unreachable — confirm with live ping.
 
+- **Standard router runtime (auto-installed)** — `app/services/standard_runtime_enrol.py` (15-min
+  job, off unless `STANDARD_RUNTIME_AUTO_INSTALL=true`) installs the check-in applier (skipped on
+  anything "lite"/smips and RADIUS routers, only where `CHECKIN_ROUTER_IDS` enrols the router;
+  `"all"` = every router) and the SSTP/WireGuard mgmt-tunnel watchdog
+  (`app/services/mgmt_watchdog_script.py`, the app copy of `/root/bw_watchdog.py` v4). State per
+  router in `routers.checkin_*` / `routers.mgmt_watchdog_*`. Never enables the command agent.
+
 - **Insurance tunnel rescue** — when a router's AWS-side L2TP/WG path is dead, reach it over
   the Hetzner wg2 plane from the production box: `ssh -o BatchMode=yes root@91.98.238.12`, then
   connect to `10.251.0.x` (WireGuard peers) or `10.251.100.x` (native L2TP). Manager API is

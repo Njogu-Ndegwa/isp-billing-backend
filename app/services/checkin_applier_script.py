@@ -388,3 +388,83 @@ def render_checkin_applier_source(
 
 def scheduler_on_event() -> str:
     return f"/system script run {SCRIPT_NAME}"
+
+
+# ---------------------------------------------------------------------------
+# Install / uninstall on a connected router (RouterOS I/O only)
+# ---------------------------------------------------------------------------
+#
+# Same steps as scripts/checkin_pilot_install.py, as reusable helpers for the
+# automatic installer (app/services/standard_runtime_enrol.py). Callers must
+# not hold a DB session while calling them. The script is never run over the
+# API: its scheduler runs it, the first check-in within one interval.
+
+def _rows(api, path: str) -> list:
+    return (api.send_command(f"{path}/print") or {}).get("data") or []
+
+
+def _named(api, path: str, name: str) -> list:
+    return [r for r in _rows(api, path) if r.get("name") == name]
+
+
+def install_checkin_applier(
+    api,
+    *,
+    identity: str,
+    endpoint_url: str,
+    check_certificate: str = "no",
+) -> dict:
+    """Install or update the applier script + scheduler. Idempotent.
+
+    Returns ``{"status": ..., "error": ...}`` where status is one of
+    installed / updated / unchanged / scheduler_disabled / script_failed /
+    scheduler_failed. An identical script is not rewritten (no flash write).
+    The scheduler's interval is never touched (the applier owns it). A
+    DISABLED scheduler means someone paused the check-in on this router on
+    purpose (e.g. the 2026-09-26 hAP lite CPU A/B): reported, not re-enabled.
+    """
+    source = render_checkin_applier_source(
+        identity=identity, endpoint_url=endpoint_url, check_certificate=check_certificate,
+    )
+    changed = False
+    res: dict = {}
+    scripts = _named(api, "/system/script", SCRIPT_NAME)
+    if not scripts:
+        res = api.send_command("/system/script/add", {"name": SCRIPT_NAME, "policy": POLICY, "source": source})
+        changed = True
+    elif scripts[0].get("source") != source or scripts[0].get("policy") != POLICY:
+        res = api.send_command("/system/script/set", {".id": scripts[0][".id"], "source": source, "policy": POLICY})
+        changed = True
+    if (res or {}).get("error"):
+        return {"status": "script_failed", "error": str(res["error"])[:200]}
+
+    scheds = _named(api, "/system/scheduler", SCHEDULER_NAME)
+    if not scheds:
+        res = api.send_command("/system/scheduler/add", {
+            "name": SCHEDULER_NAME, "interval": f"{INITIAL_INTERVAL_SECONDS}s", "start-time": "startup",
+            "on-event": scheduler_on_event(), "policy": POLICY, "comment": SCHEDULER_COMMENT,
+        })
+        if (res or {}).get("error"):
+            return {"status": "scheduler_failed", "error": str(res["error"])[:200]}
+        return {"status": "installed", "error": ""}
+    sched = scheds[0]
+    if sched.get("disabled") == "true":
+        return {"status": "scheduler_disabled", "error": ""}
+    if sched.get("on-event") != scheduler_on_event() or sched.get("policy") != POLICY:
+        res = api.send_command("/system/scheduler/set", {
+            ".id": sched[".id"], "on-event": scheduler_on_event(), "policy": POLICY,
+        })
+        if (res or {}).get("error"):
+            return {"status": "scheduler_failed", "error": str(res["error"])[:200]}
+        changed = True
+    return {"status": "updated" if changed else "unchanged", "error": ""}
+
+
+def uninstall_checkin_applier(api) -> None:
+    """Remove the scheduler, then the script. Bindings and queues the applier
+    created stay: they are in the push's own format, so the normal expiry
+    cleanup removes them like any other."""
+    for s in _named(api, "/system/scheduler", SCHEDULER_NAME):
+        api.send_command("/system/scheduler/remove", {".id": s[".id"]})
+    for s in _named(api, "/system/script", SCRIPT_NAME):
+        api.send_command("/system/script/remove", {".id": s[".id"]})

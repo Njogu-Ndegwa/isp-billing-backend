@@ -224,12 +224,45 @@ _QUEUE_LINE_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def checkin_router_ids() -> frozenset[int]:
+    """The explicit ids in CHECKIN_ROUTER_IDS (empty when it is "all")."""
     ids = set()
     for part in str(settings.CHECKIN_ROUTER_IDS or "").split(","):
         part = part.strip()
         if part.isdigit():
             ids.add(int(part))
     return frozenset(ids)
+
+
+def checkin_all_routers() -> bool:
+    """CHECKIN_ROUTER_IDS="all": every router is enrolled (minus the excluded).
+
+    Only routers running the applier ever call /api/router/checkin, so "all"
+    in practice means "every router the applier is installed on", and the
+    automatic installer (standard_runtime_enrol) is what puts it there. New
+    routers then need no env edit.
+    """
+    return str(getattr(settings, "CHECKIN_ROUTER_IDS", "") or "").strip().lower() == "all"
+
+
+def checkin_excluded_router_ids() -> frozenset[int]:
+    return _parse_router_ids(getattr(settings, "CHECKIN_EXCLUDE_ROUTER_IDS", ""))
+
+
+def checkin_router_enrolled(router_id: Optional[int]) -> bool:
+    """Is this router answered with work by the check-in channel (settings only)?
+
+    Listed in CHECKIN_ROUTER_IDS, or CHECKIN_ROUTER_IDS="all"; and never when
+    listed in CHECKIN_EXCLUDE_ROUTER_IDS.
+    """
+    if router_id is None:
+        return False
+    try:
+        rid = int(router_id)
+    except (TypeError, ValueError):
+        return False
+    if rid in checkin_excluded_router_ids():
+        return False
+    return checkin_all_routers() or rid in checkin_router_ids()
 
 
 def checkin_mode() -> str:
@@ -354,7 +387,7 @@ def checkin_can_deliver(router_id: Optional[int]) -> bool:
         router_id is not None
         and checkin_active()
         and checkin_mode() == MODE_ADD
-        and int(router_id) in checkin_router_ids()
+        and checkin_router_enrolled(router_id)
     )
 
 
@@ -363,7 +396,8 @@ def checkin_only_active(router_id: Optional[int]) -> bool:
 
     Only when the router is in the checkin_only arm AND the channel can
     actually deliver. The kill switch, shadow mode, disabling the channel or
-    dropping the router from CHECKIN_ROUTER_IDS all put the push back at once.
+    dropping the router from CHECKIN_ROUTER_IDS (or excluding it) all put the
+    push back at once.
     """
     return delivery_mode(router_id) == DELIVERY_CHECKIN_ONLY and checkin_can_deliver(router_id)
 
@@ -755,7 +789,7 @@ def note_payment_initiated(router_id: Optional[int]) -> None:
         if router_id is None or not settings.CHECKIN_ENABLED:
             return
         rid = int(router_id)
-        if rid in checkin_router_ids():
+        if checkin_router_enrolled(rid):
             _payment_hint[rid] = time.monotonic()
     except Exception:  # pragma: no cover - defensive
         pass
@@ -797,7 +831,7 @@ def note_attempt_created(router_id: Optional[int], entrypoint=None) -> None:
         if entry not in CHECKIN_DEFERRABLE_ENTRYPOINTS:
             return
         rid = int(router_id)
-        if rid not in checkin_router_ids() or delivery_mode(rid) == DELIVERY_PUSH_ONLY:
+        if not checkin_router_enrolled(rid) or delivery_mode(rid) == DELIVERY_PUSH_ONLY:
             return
         until = time.monotonic() + checkin_only_fallback_seconds() + AWAITING_EXTRA_SECONDS
         if until > _awaiting_until.get(rid, 0.0):
@@ -857,6 +891,8 @@ def stats_snapshot() -> dict:
         "missing_grace_seconds": missing_grace_seconds(),
         "race_head_start_seconds": race_head_start_seconds(),
         "router_ids": sorted(checkin_router_ids()),
+        "all_routers": checkin_all_routers(),
+        "excluded_router_ids": sorted(checkin_excluded_router_ids()),
         "delivery_modes": {
             "push_only_router_ids": sorted(push_only_router_ids()),
             "checkin_only_router_ids": sorted(checkin_only_router_ids()),
@@ -1673,8 +1709,18 @@ async def delivery_path_metrics(now: Optional[datetime] = None) -> dict:
     """
     now = now or datetime.utcnow()
     start = now - METRICS_WINDOW
-    pilot_ids = checkin_router_ids()
+    pilot_ids = checkin_router_ids() - checkin_excluded_router_ids()
     async with async_session() as db:
+        if checkin_all_routers():
+            # "all": the pilot group is every router known to run the applier
+            # (installed by the automatic installer, or seen checking in).
+            installed = (
+                await db.execute(select(Router.id).where(Router.checkin_installed_at.isnot(None)))
+            ).scalars().all()
+            pilot_ids = frozenset(
+                (set(pilot_ids) | {int(r) for r in installed} | set(_stats))
+                - checkin_excluded_router_ids()
+            )
         rows = (
             await db.execute(
                 select(

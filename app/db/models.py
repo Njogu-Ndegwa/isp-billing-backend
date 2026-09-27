@@ -531,6 +531,18 @@ class Router(Base):
     expiry_reaper_mode = Column(String(10), nullable=True)
     expiry_reaper_reason = Column(String(120), nullable=True)
     expiry_reaper_checked_at = Column(DateTime, nullable=True)
+    # Standard router runtime, installed by app/services/standard_runtime_enrol.py.
+    # Check-in applier: when it was installed (NULL = not by the installer, or
+    # not yet), why not / what happened last ("small board hAP lite",
+    # "unreachable", "installed"), and when the installer last looked.
+    checkin_installed_at = Column(DateTime, nullable=True)
+    checkin_install_reason = Column(String(120), nullable=True)
+    checkin_checked_at = Column(DateTime, nullable=True)
+    # Management-tunnel watchdog: same, plus which variant ("sstp" / "wg").
+    mgmt_watchdog_installed_at = Column(DateTime, nullable=True)
+    mgmt_watchdog_kind = Column(String(10), nullable=True)
+    mgmt_watchdog_reason = Column(String(120), nullable=True)
+    mgmt_watchdog_checked_at = Column(DateTime, nullable=True)
     # On by default, per-router opt-out: when true, the owner gets an inbox message
     # (and an SMS charged to their credits, when phone+balance allow) when the
     # router stays offline past a debounce threshold and again when it comes back

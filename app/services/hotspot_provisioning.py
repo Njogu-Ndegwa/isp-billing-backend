@@ -864,7 +864,7 @@ def _bound_marker_log(
     from app.services import checkin_delivery
 
     try:
-        if router_id is None or int(router_id) not in checkin_delivery.checkin_router_ids():
+        if router_id is None or not checkin_delivery.checkin_router_enrolled(router_id):
             return None
         bound = checkin_delivery.mac_bound_on_router(router_id, mac_address)
     except Exception:  # pragma: no cover - defensive

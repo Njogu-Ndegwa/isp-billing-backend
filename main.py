@@ -2542,6 +2542,24 @@ async def run_expiry_reaper_migrations():
         """))
 
 
+async def run_standard_runtime_migrations():
+    """Add the routers columns the standard-runtime installer records its work
+    in (app/services/standard_runtime_enrol.py): check-in applier and
+    management-tunnel watchdog, each with installed_at / reason / checked_at.
+    Idempotent, safe to run on every startup."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS checkin_installed_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS checkin_install_reason VARCHAR(120) NULL,
+            ADD COLUMN IF NOT EXISTS checkin_checked_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS mgmt_watchdog_installed_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS mgmt_watchdog_kind VARCHAR(10) NULL,
+            ADD COLUMN IF NOT EXISTS mgmt_watchdog_reason VARCHAR(120) NULL,
+            ADD COLUMN IF NOT EXISTS mgmt_watchdog_checked_at TIMESTAMP NULL
+        """))
+
+
 async def run_router_status_alert_migrations():
     """Add routers.status_alerts_enabled (default-on offline/back-online alerts,
     per-router opt-out) plus the online_notified_at / offline_notified_at
@@ -3061,6 +3079,12 @@ async def startup_event():
         logger.error(f"Expiry-reaper migration failed (non-fatal): {e}")
 
     try:
+        await run_standard_runtime_migrations()
+        logger.info("Standard-runtime migration completed successfully")
+    except Exception as e:
+        logger.error(f"Standard-runtime migration failed (non-fatal): {e}")
+
+    try:
         await run_payment_port_attribution_migrations()
         logger.info("Payment port attribution migrations completed successfully")
     except Exception as e:
@@ -3137,6 +3161,17 @@ async def startup_event():
         trigger=IntervalTrigger(minutes=30),
         id='expiry_reaper_enrol',
         name='Enrol routers onto router-side expiry removal',
+        replace_existing=True,
+        max_instances=1
+    )
+    # Standard router runtime (check-in applier + mgmt-tunnel watchdog):
+    # no-op unless STANDARD_RUNTIME_AUTO_INSTALL.
+    from app.services.standard_runtime_enrol import standard_runtime_enrol_background
+    scheduler.add_job(
+        standard_runtime_enrol_background,
+        trigger=IntervalTrigger(minutes=15),
+        id='standard_runtime_enrol',
+        name='Install check-in applier and mgmt-tunnel watchdog on routers',
         replace_existing=True,
         max_instances=1
     )
