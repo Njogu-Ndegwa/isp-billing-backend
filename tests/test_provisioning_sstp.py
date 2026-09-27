@@ -97,7 +97,9 @@ def test_legacy_token_keeps_the_old_l2tp_script_whatever_the_flag(monkeypatch, e
     assert "STEP 3B: BACKUP L2TP/IPsec VPN" in script
     assert "l2tp-client add name=l2tp-aws2" in script
     assert "sstp" not in script.lower()
-    assert "lo-mgmt" not in script
+    # No loopback pin for legacy tokens (the LAN-port step only names lo-mgmt
+    # to leave it alone).
+    assert "[/interface bridge find where name=lo-mgmt]" not in script
     assert "# VPN Type: L2TP/IPsec\n" in script
 
 

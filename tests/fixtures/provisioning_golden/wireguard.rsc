@@ -45,7 +45,10 @@
 :foreach bwIfId in=[/interface find] do={
     :local bwName [/interface get $bwIfId name]
     :local bwType [/interface get $bwIfId type]
-    :if (($bwName != "ether1") && (($bwType = "ether") || ($bwType = "wlan") || ($bwType = "wifi") || ($bwType = "wifiwave2"))) do={
+    # Match on the NAME too: the hAP lite's power-line port "pwr-line1" reports
+    # type=ether but is not a LAN port (bench, router 541, 2026-09-27).
+    :local bwLanName (([:pick $bwName 0 5] = "ether") || ([:pick $bwName 0 4] = "wlan") || ([:pick $bwName 0 4] = "wifi"))
+    :if (($bwName != "ether1") && $bwLanName && (($bwType = "ether") || ($bwType = "wlan") || ($bwType = "wifi") || ($bwType = "wifiwave2"))) do={
         :local bwSkip ""
         :if ([:len [/ip dhcp-client find where interface=$bwName]] > 0) do={ :set bwSkip "it runs a DHCP client (uplink)" }
         :do {
@@ -93,7 +96,8 @@
 # (duplicate LAN subnet). Disabled, not deleted. The hotspot LAN bridge itself
 # must never be a DHCP client. (Only DHCP and 192.168.88.x are touched, so an
 # intentionally empty loopback bridge keeps its /32 address.)
-:foreach bwBrId in=[/interface bridge find where name!="bridge"] do={
+# lo-mgmt (the management-address loopback pin) is never touched.
+:foreach bwBrId in=[/interface bridge find where name!="bridge" and name!="lo-mgmt"] do={
     :local bwBr [/interface bridge get $bwBrId name]
     :if ([:len [/interface bridge port find where bridge=$bwBr]] = 0) do={
         :do { /ip dhcp-client set [find where interface=$bwBr] disabled=yes } on-error={}

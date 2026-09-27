@@ -162,10 +162,20 @@ def test_port_move_guards_uplinks_and_pppoe(monkeypatch):
     assert "left out of the hotspot bridge" in script
 
 
+def test_only_named_lan_ports_are_candidates(monkeypatch):
+    # The hAP lite's power-line port "pwr-line1" reports type=ether; the bench
+    # run on router 541 (2026-09-27) pulled it into the hotspot. Names gate it.
+    _settings(monkeypatch)
+    script = provisioning.generate_rsc_script(_token("l2tp"))
+    assert '[:pick $bwName 0 5] = "ether"' in script
+    assert '[:pick $bwName 0 4] = "wlan"' in script
+    assert '($bwName != "ether1") && $bwLanName &&' in script
+
+
 def test_emptied_bridges_are_neutralised_not_deleted(monkeypatch):
     _settings(monkeypatch)
     script = provisioning.generate_rsc_script(_token("wireguard"))
-    assert ':foreach bwBrId in=[/interface bridge find where name!="bridge"] do={' in script
+    assert ':foreach bwBrId in=[/interface bridge find where name!="bridge" and name!="lo-mgmt"] do={' in script
     assert ":do { /ip dhcp-client set [find where interface=$bwBr] disabled=yes } on-error={}" in script
     assert ":do { /ip dhcp-server set [find where interface=$bwBr] disabled=yes } on-error={}" in script
     assert ":do { /ip dhcp-client set [find where interface=bridge] disabled=yes } on-error={}" in script
