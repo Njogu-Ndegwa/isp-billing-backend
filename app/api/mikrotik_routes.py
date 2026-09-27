@@ -807,8 +807,13 @@ async def _get_mikrotik_health_impl(
         router_is_down = bool(router_obj) and router_recently_offline(router_obj)
 
         if prefer_snapshot and not include_sessions:
-            if skip_live_refresh:
-                # The router pushes its own health; no RouterOS login needed.
+            if skip_live_refresh or router_is_down:
+                # Pushing router: it reports its own health, no RouterOS login needed.
+                # Router known to be down: a login could only time out, and saying
+                # "refresh in progress" made the card read "Updating" forever and
+                # the dashboard re-fetch every 20 s (QuickNet, router 325,
+                # 2026-09-26). The reachability probe marks it online again within
+                # minutes of recovery, and the next load refreshes normally.
                 refresh_meta = {"refresh_in_progress": False, "retry_after_seconds": None}
             else:
                 refresh_meta = _queue_health_cache_refresh(

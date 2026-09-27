@@ -44,6 +44,7 @@ from sqlalchemy import select
 
 from app.db import database
 from app.db.models import ProvisioningAttempt, ProvisioningState, Router, RouterAvailabilityCheck, User
+from app.services.router_diagnosis import attach_diagnoses
 
 RECENT = timedelta(hours=24)
 LOOKBACK = timedelta(days=7)
@@ -74,6 +75,17 @@ _CACHE: dict = {}
 
 def reset_cache() -> None:
     _CACHE.clear()
+
+
+def latest_section() -> tuple[Optional[dict], Optional[datetime]]:
+    """The last section this process built (without diagnoses) and when."""
+    return _CACHE.get("value"), _CACHE.get("at")
+
+
+def _with_diagnoses(section: dict, now: datetime) -> dict:
+    # Live "what is ailing it" from the router_diagnosis job; in-memory only, no I/O.
+    # Each row gets ``diagnosis`` (dict or None); the cached section is not mutated.
+    return {**section, "routers": attach_diagnoses(section.get("routers") or [], now)}
 
 
 @dataclass(frozen=True)
@@ -473,21 +485,21 @@ async def _load_inputs(now: datetime) -> tuple[list[dict], list, list]:
 async def build_problem_routers_section(now: datetime, baselines: Optional[dict] = None) -> dict:
     cached = _CACHE.get("value")
     if cached is not None and now - _CACHE["at"] < CACHE_TTL:
-        return {**cached, "cached": True}
+        return {**_with_diagnoses(cached, now), "cached": True}
 
     routers, check_rows, attempt_rows = await _load_inputs(now)
     result = {"status": "unknown", "window_hours": int(RECENT.total_seconds() // 3600),
               **evaluate(routers, check_rows, attempt_rows, now)}
     _CACHE.update(at=now, value=result)
-    return result
+    return _with_diagnoses(result, now)
 
 
 async def build_problem_routers_window(now: datetime, hours: int) -> dict:
     """Problem routers judged on the last ``hours`` hours (clamped to 1..72)."""
     hours = max(MIN_WINDOW_HOURS, min(MAX_WINDOW_HOURS, int(hours)))
     routers, check_rows, attempt_rows = await _load_inputs(now)
-    return {
+    return _with_diagnoses({
         "status": "unknown",
         "generated_at": now.replace(microsecond=0).isoformat() + "Z",
         **evaluate(routers, check_rows, attempt_rows, now, window=timedelta(hours=hours)),
-    }
+    }, now)

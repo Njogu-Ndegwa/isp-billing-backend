@@ -90,6 +90,13 @@ MAX_OUTAGE_AGE_FOR_ALERTS = timedelta(hours=48)
 # offline routers are still re-probed at least every ~30 min by background jobs,
 # so a fresh outage always has a recent failed check.
 OFFLINE_STATUS_FRESH_WINDOW = timedelta(minutes=90)
+# The reachability probe (2026-09-26) started confirming outages nothing had
+# noticed. Dennis: no late "went offline" news for outages that began before it
+# went live. The cutoff is written ONCE at the first startup that has the probe
+# (app_settings row, never overwritten), so restarts don't move it; when the
+# row is absent every outage is eligible, as before. Irrelevant after 48 h
+# (MAX_OUTAGE_AGE_FOR_ALERTS).
+OUTAGE_ALERTS_FROM_SETTING = "router_outage_alerts_from"
 MAX_STATUS_ALERTS_PER_ROUTER_PER_DAY = 3
 MAX_STATUS_ALERT_SMS_PER_OWNER_PER_DAY = 4
 
@@ -443,9 +450,23 @@ async def send_router_recovery_notification(
         return False
 
 
-def _offline_candidate_filters(now: datetime):
+async def _outage_alerts_from(db) -> Optional[datetime]:
+    """Outages that began before this are not announced (see OUTAGE_ALERTS_FROM_SETTING)."""
+    from app.db.models import AppSetting
+
+    setting = await db.get(AppSetting, OUTAGE_ALERTS_FROM_SETTING)
+    if setting is None or not setting.value:
+        return None
+    try:
+        return datetime.fromisoformat(setting.value.replace("Z", "")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _offline_candidate_filters(now: datetime, alerts_from: Optional[datetime] = None):
     """WHERE clauses shared by the scan's SELECT and the per-router claim UPDATE."""
-    return (
+    extra = (Router.last_online_at >= alerts_from,) if alerts_from is not None else ()
+    return extra + (
         Router.status_alerts_enabled.is_(True),
         Router.last_status.is_(False),
         Router.last_checked_at.isnot(None),
@@ -475,7 +496,8 @@ async def send_router_offline_notification(
         async with database.async_session() as db:
             claim = await db.execute(
                 update(Router)
-                .where(Router.id == router_id, *_offline_candidate_filters(now))
+                .where(Router.id == router_id,
+                       *_offline_candidate_filters(now, await _outage_alerts_from(db)))
                 .values(offline_notified_at=now)
             )
             if claim.rowcount != 1:
@@ -531,7 +553,7 @@ async def scan_and_notify_offline_routers() -> int:
     try:
         async with database.async_session() as db:
             result = await db.execute(
-                select(Router.id).where(*_offline_candidate_filters(now))
+                select(Router.id).where(*_offline_candidate_filters(now, await _outage_alerts_from(db)))
             )
             candidate_ids = [row[0] for row in result.all()]
     except Exception:

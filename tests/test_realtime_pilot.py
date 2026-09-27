@@ -8,6 +8,7 @@ can no longer turn a paying customer's usage into 0 MB.
 
 from datetime import datetime, timedelta
 
+import asyncio
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
@@ -552,3 +553,117 @@ def test_ports_card_from_push_recognises_equipment_from_neighbours_and_lease_com
     assert set(infra) == {ap_mac, switch_mac}
     assert infra[ap_mac]["name"] == "Tower-AP-1" and infra[ap_mac]["source"] == "neighbor"
     assert ether9["counts"]["infrastructure_devices"] == 2
+
+
+@pytest.mark.asyncio
+async def test_sending_the_v3_report_enrols_an_unlisted_router_and_it_lapses_when_it_stops(
+    db, client, session_factory, monkeypatch,
+):
+    # Fleet rollout: installing the v3 script is the opt-in. No config list,
+    # no redeploy per batch; restoring the old script hands the router back.
+    router, customer = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "")
+
+    v3 = {**_push(0, 0, 0, 0), "v": 3}
+    r1 = await client.post("/api/router/usage-push", json=v3, headers=_auth())
+    assert r1.status_code == 200
+    assert realtime_state.is_pilot_router(router.id)
+    assert r1.json()["next_push_seconds"] == settings.REALTIME_PUSH_INTERVAL_SECONDS
+    routes.reset_rate_limiter()
+    await client.post("/api/router/usage-push", json={**_push(5 * MB, 5 * MB, 0, 0), "v": 3},
+                      headers=_auth())
+    assert (await _period(session_factory, customer.id)).total_bytes == 10 * MB   # metered by host
+    assert router.id in realtime_state.host_metered_router_ids()
+
+    # Script removed / rolled back: last real-time report is now too old.
+    realtime_state.note_realtime_report(router.id, now=datetime.utcnow() - timedelta(
+        seconds=realtime_state.REALTIME_MEMBERSHIP_FRESH_SECONDS + 1))
+    assert not realtime_state.is_pilot_router(router.id)
+    assert router.id not in realtime_state.pilot_router_ids()
+
+
+@pytest.mark.asyncio
+async def test_older_scripts_do_not_enrol_a_router(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "")
+    r = await client.post("/api/router/usage-push", json=_push(0, 0, 0, 0), headers=_auth())  # v2
+    assert r.json()["next_push_seconds"] == routes.DEFAULT_PUSH_INTERVAL_SECONDS
+    assert not realtime_state.is_pilot_router(router.id)
+
+
+def test_smallest_boards_can_send_the_long_lists_less_often():
+    script = render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/api/router/usage-push",
+                                         lists_every=10, wan_interface="pppoe-out1")
+    assert "($bwPushN % 10) = 1" in script
+    assert '[find name="pppoe-out1"]' in script
+    renamed = render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/x",
+                                          wan_interface="Ether1[WAN]")   # router 349
+    assert '[find name="Ether1[WAN]"]' in renamed
+    with pytest.raises(ValueError):
+        render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/x",
+                                    wan_interface='ether1"] ; /system reset')
+    with pytest.raises(ValueError):
+        render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/x", lists_every=40)
+
+
+@pytest.mark.asyncio
+async def test_queue_repairs_run_a_few_at_a_time(monkeypatch):
+    import app.services.mikrotik_background as mb
+
+    running = 0
+    peak = 0
+
+    async def slow_repair(router_id):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.01)
+        running -= 1
+        return {"synced": 0}
+
+    monkeypatch.setattr(mb, "repair_router_queues_now", slow_repair)
+    monkeypatch.setattr(routes, "_repair_slots", None)
+    await asyncio.gather(*(routes._repair(rid) for rid in range(12)))
+    assert peak == routes._REPAIR_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_rejected_push_is_logged_with_the_router_and_the_bad_text(caplog):
+    # Rollout 2026-09-26: 422s from a few routers with no way to tell which.
+    import logging
+    from main import app as main_app
+
+    body = b'{"identity":"Router-0574","v":3,"reports":[],"leases":[{"host":"bad\x01name"}]}'
+    caplog.set_level(logging.WARNING)
+    async with AsyncClient(transport=ASGITransport(app=main_app), base_url="http://test") as c:
+        r = await c.post("/api/router/usage-push", content=body,
+                         headers={"Content-Type": "application/json", **_auth()})
+    assert r.status_code == 422
+    assert "detail" in r.json()                     # FastAPI's default 422 body, unchanged
+    logged = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "422 from Router-0574" in logged and "json_invalid" in logged and "bad" in logged
+
+def test_entries_that_vanish_mid_walk_are_skipped_not_sent_empty():
+    # 2026-09-26 rollout: a hotspot host that logged out between find and get
+    # came back empty on ROS 7 and wrote "bytes_in":, - the whole report was
+    # rejected (routers 118/221/256/302). Every unquoted field is now checked.
+    script = render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/x")
+    assert '([:len $hm] > 0) && ([:typeof $hbi] = "num") && ([:typeof $hbo] = "num")' in script
+    assert '([:typeof $slash] = "num") && ([:typeof $qd] = "bool")' in script
+    assert '[:typeof $gd] = "bool"' in script
+    assert "[:len $an] > 0" in script
+    src = script[script.index("source={\n"):script.index("\n}\n\n/system scheduler add")]
+    assert src.count("{") == src.count("}")
+
+
+@pytest.mark.asyncio
+async def test_hap_lite_left_with_the_v3_script_is_told_to_report_hourly(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "")
+    body = {**_push(0, 0, 0, 0), "v": 3}
+    body["router"] = {**body["router"], "board": "hAP lite"}
+    r = await client.post("/api/router/usage-push", json=body, headers=_auth())
+    assert r.status_code == 200
+    assert r.json()["next_push_seconds"] == routes.SMALL_BOARD_PUSH_SECONDS
+    assert routes.is_small_board("RB941-2nD") and routes.is_small_board("hAP mini")
+    assert not routes.is_small_board("hAP ac lite") and not routes.is_small_board("RB951Ui-2HnD")

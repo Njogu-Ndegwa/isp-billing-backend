@@ -364,3 +364,9 @@ async def test_removal_logged_at_the_routers_second(client, db, session_factory)
     async with session_factory() as s:
         log = (await s.execute(select(ProvisioningLog).where(ProvisioningLog.customer_id == cust.id))).scalars().one()
     assert log.log_date == removed
+
+
+def test_unconfirmed_clock_rechecks_within_five_minutes():
+    s = _script()
+    assert ':if (!$bwExpClockOk) do={ :set bwExpBeat ($nows - 3300) }' in s
+    assert "(($nows - $bwExpBeat) >= 3600)" in s

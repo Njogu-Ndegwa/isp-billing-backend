@@ -264,7 +264,12 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local body "{\"identity\":\"$ident\",\"v\":3,\"reports\":["
     :local first true
     :local qcount 0
+    # An entry can vanish between find and get (customer logs out, queue
+    # removed). ROS 7 then returns EMPTY values instead of an error, which
+    # wrote "upload_bytes":, and got the whole report rejected (2026-09-26,
+    # busy routers 118/221/256). Every loop skips an entry that came back empty.
     :foreach q in=[/queue simple find] do={
+      :do {
         :local qn [/queue simple get $q name]
         :local key ""
         :if ([:pick $qn 0 5] = "plan_") do={ :set key [:pick $qn 5 [:len $qn]] }
@@ -274,13 +279,17 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local qt [:tostr [/queue simple get $q target]]
             :local ql [/queue simple get $q max-limit]
             :local qd [/queue simple get $q disabled]
-            :local up [:pick $qb 0 [:find $qb "/"]]
-            :local dn [:pick $qb ([:find $qb "/"] + 1) [:len $qb]]
-            :if (!$first) do={ :set body ($body . ",") }
-            :set body ($body . "{\"queue_key\":\"" . $key . "\",\"upload_bytes\":" . $up . ",\"download_bytes\":" . $dn . ",\"target_ip\":\"" . $qt . "\",\"max_limit\":\"" . $ql . "\",\"disabled\":" . $qd . "}")
-            :set first false
-            :set qcount ($qcount + 1)
+            :local slash [:find $qb "/"]
+            :if (([:typeof $slash] = "num") && ([:typeof $qd] = "bool")) do={
+                :local up [:pick $qb 0 $slash]
+                :local dn [:pick $qb ($slash + 1) [:len $qb]]
+                :if (!$first) do={ :set body ($body . ",") }
+                :set body ($body . "{\"queue_key\":\"" . $key . "\",\"upload_bytes\":" . $up . ",\"download_bytes\":" . $dn . ",\"target_ip\":\"" . $qt . "\",\"max_limit\":\"" . $ql . "\",\"disabled\":" . $qd . "}")
+                :set first false
+                :set qcount ($qcount + 1)
+            }
         }
+      } on-error={}
     }
     :set body ($body . "],\"hosts\":[")
     :local hfirst true
@@ -295,9 +304,11 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local hau [/ip hotspot host get $h authorized]
             :local hit [/ip hotspot host get $h idle-time]
             :local hup [/ip hotspot host get $h uptime]
+            :if (([:len $hm] > 0) && ([:typeof $hbi] = "num") && ([:typeof $hbo] = "num") && ([:typeof $hby] = "bool") && ([:typeof $hau] = "bool")) do={
             :if (!$hfirst) do={ :set body ($body . ",") }
             :set body ($body . "{\"mac\":\"" . $hm . "\",\"ip\":\"" . $ha . "\",\"bytes_in\":" . $hbi . ",\"bytes_out\":" . $hbo . ",\"bypassed\":" . $hby . ",\"authorized\":" . $hau . ",\"idle_time\":\"" . $hit . "\",\"uptime\":\"" . $hup . "\"}")
             :set hfirst false
+            }
         } on-error={}
     }
     :set body ($body . "],\"ppp\":[")
@@ -308,9 +319,11 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             :local aa [/ppp active get $a address]
             :local au [/ppp active get $a uptime]
             :local ac [/ppp active get $a caller-id]
+            :if ([:len $an] > 0) do={
             :if (!$pfirst) do={ :set body ($body . ",") }
             :set body ($body . "{\"name\":\"" . $an . "\",\"address\":\"" . $aa . "\",\"uptime\":\"" . $au . "\",\"caller_id\":\"" . $ac . "\"}")
             :set pfirst false
+            }
         }
     } on-error={}
     :set body ($body . "]")
@@ -352,7 +365,7 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :global bwPushN
     :if ([:typeof $bwPushN] != "num") do={ :set bwPushN 0 }
     :set bwPushN ($bwPushN + 1)
-    :if (($bwPushN % 5) = 1) do={
+    :if (($bwPushN % __LISTS_EVERY__) = 1) do={
         :set body ($body . ",\"bridge_hosts\":[")
         :local bfirst true
         :do {
@@ -371,9 +384,11 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
                 :local gm [/ip hotspot ip-binding get $g mac-address]
                 :local gt [/ip hotspot ip-binding get $g type]
                 :local gd [/ip hotspot ip-binding get $g disabled]
+                :if ([:typeof $gd] = "bool") do={
                 :if (!$gfirst) do={ :set body ($body . ",") }
                 :set body ($body . "{\"mac\":\"" . $gm . "\",\"type\":\"" . $gt . "\",\"disabled\":" . $gd . "}")
                 :set gfirst false
+                }
             }
         } on-error={}
         # DHCP leases give devices their names on the ports card. A host-name
@@ -459,7 +474,7 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
 :log info "usage-push v2: installed for __IDENT__"
 '''
 
-_WAN_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_WAN_RE = re.compile(r"^[A-Za-z0-9._\[\]-]{1,32}$")  # "Ether1[WAN]" exists in the fleet
 
 
 def render_realtime_push_script(
@@ -468,13 +483,21 @@ def render_realtime_push_script(
     endpoint_url: str,
     interval_seconds: int = 10,
     wan_interface: str = "ether1",
+    lists_every: int = 5,
 ) -> str:
-    """Render the v2 (real-time pilot) reporter. See the block comment above."""
+    """Render the v2 (real-time pilot) reporter. See the block comment above.
+
+    ``lists_every``: the slow-changing lists (device-per-port, bindings,
+    leases, neighbours, bridge ports) ride every Nth report. Smallest boards
+    use a larger N; keep N x interval under the 15-minute list freshness.
+    """
     identity = _require(identity, _IDENTITY_RE, "identity")
     endpoint_url = _require(endpoint_url, _URL_RE, "endpoint_url")
     wan = _require(wan_interface, _WAN_RE, "wan_interface")
     if not (5 <= int(interval_seconds) <= 3600):
         raise ValueError("usage-push script: interval must be 5..3600 seconds")
+    if not (2 <= int(lists_every) <= 15):
+        raise ValueError("usage-push script: lists_every must be 2..15")
     return (
         _REALTIME_TEMPLATE
         .replace("__SCRIPT__", SCRIPT_NAME)
@@ -485,4 +508,5 @@ def render_realtime_push_script(
         .replace("__IDENT__", identity)
         .replace("__WAN__", wan)
         .replace("__INTERVAL__", str(int(interval_seconds)))
+        .replace("__LISTS_EVERY__", str(int(lists_every)))
     )

@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     # 10.251.0.1:8088 site); public HTTPS costs a hAP lite ~5-7 s of full CPU.
     EXPIRY_REAPER_TUNNEL_URL: str = "http://10.251.0.1:8088/api/router/expiry-check"
     EXPIRY_REAPER_PUBLIC_URL: str = "https://isp.bitwavetechnologies.net/api/router/expiry-check"
+    # Automatic reaper enrolment (app/services/expiry_reaper_enrol.py): every
+    # 30 min, up to EXPIRY_REAPER_ENROL_BATCH routers not yet on the reaper are
+    # classified; hAP lite class boards stay on server-side removal, other
+    # eligible boards get the reaper installed. On since 2026-09-27 (Dennis:
+    # every new router enrolled automatically); set false to pause.
+    EXPIRY_REAPER_AUTO_ENROL: bool = True
+    EXPIRY_REAPER_ENROL_BATCH: int = 5
     # Router check-in delivery pilot (2026-09-26). The router POSTs the MACs of
     # its app-tagged bypass bindings to /api/router/checkin; the server answers
     # with the paid MACs it is missing. Off by default, and only routers listed
@@ -69,6 +76,22 @@ class Settings(BaseSettings):
     # seconds before the customer row switches to the NEW MAC, and a check-in
     # in that gap must not re-add the OLD MAC as an orphan binding.
     CHECKIN_MISSING_GRACE_SECONDS: int = 60
+    # Per-router delivery mode for the push-vs-check-in A/B (2026-09-26).
+    # Comma lists of router ids; a router in neither list (or in both) keeps
+    # the default "both paths" behaviour.
+    #   CHECKIN_PUSH_ONLY_ROUTER_IDS: the check-in never sends A/Q lines there
+    #     (it still accepts reports and records 'observed').
+    #   CHECKIN_ONLY_ROUTER_IDS: the payment-time push is skipped; the
+    #     check-in sends A lines with no grace. Effective only while the
+    #     channel can deliver (enabled, not killed, mode=add, router in
+    #     CHECKIN_ROUTER_IDS); otherwise the push runs as usual.
+    # Empty both lists to roll back.
+    CHECKIN_PUSH_ONLY_ROUTER_IDS: str = ""
+    CHECKIN_ONLY_ROUTER_IDS: str = ""
+    # Safety net for CHECKIN_ONLY routers: if the check-in has not delivered
+    # this long after the attempt was created, the normal push/retry path
+    # takes over.
+    CHECKIN_ONLY_FALLBACK_SECONDS: int = 120
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10

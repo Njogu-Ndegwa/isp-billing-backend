@@ -228,15 +228,17 @@ def reset_expiry_cleanup_router_memo():
     reuse low router ids against a fresh database, so a router one test marked
     unreachable would silently be skipped by the next one.
     """
-    from app.services import mikrotik_background, ops_health_problem_routers
+    from app.services import mikrotik_background, ops_health_problem_routers, router_diagnosis
 
     mikrotik_background._expiry_cleanup_unreachable_routers.clear()
     mikrotik_background._expiry_cleanup_backoff_hydrated = False
     ops_health_problem_routers.reset_cache()
+    router_diagnosis.reset()
     yield
     mikrotik_background._expiry_cleanup_unreachable_routers.clear()
     mikrotik_background._expiry_cleanup_backoff_hydrated = False
     ops_health_problem_routers.reset_cache()
+    router_diagnosis.reset()
 
 
 @pytest.fixture(autouse=True)

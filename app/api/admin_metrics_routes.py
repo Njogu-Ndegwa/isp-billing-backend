@@ -67,6 +67,18 @@ async def admin_checkin_pilot_stats(
     delivery counts (push / checkin / observed / other / undelivered) and p50/p95 of
     payment->access (access_seen_at - created_at) for pilot routers vs the
     rest of the fleet, over attempts created in the last 24 h.
+
+    ``delivery_paths_24h.by_mode``: the push-vs-check-in A/B scoreboard.
+    Pilot routers grouped by delivery arm (``push_only`` / ``checkin_only`` /
+    ``both``; env CHECKIN_PUSH_ONLY_ROUTER_IDS / CHECKIN_ONLY_ROUTER_IDS),
+    payment/reconciliation/voucher attempts only: attempts, delivered,
+    first_try (+ pct), delivered_via, p50/p95/max payment->access,
+    fallbacks_triggered (checkin_only) and undelivered. Plus
+    renewal_handoffs (checkin_only: already-bound renewals pushed at once;
+    excluded from fallbacks and from the first_try_pct denominator),
+    payment_to_access_by_device (new_device / already_bound / unknown, from
+    the router's check-in report at payment time: compare arms on
+    new_device), push_failed and rescues (deliveries after a push failure).
     """
 
     await _require_admin(token, db)

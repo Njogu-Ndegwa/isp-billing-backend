@@ -217,3 +217,25 @@ async def test_admin_can_read_any_router(db, monkeypatch, clean_state):
     _cache(router.id, cpu=37)
     out = await mr.get_mikrotik_health(_Tasks(), router_id=router.id, db=db, token="t")
     assert out["cpu_load_percent"] == 37 and out["health_source"] == "routeros"
+
+
+async def test_router_known_to_be_down_is_not_shown_as_updating(db, monkeypatch, clean_state):
+    """QuickNet (router 325) 2026-09-26: offline since the day before, yet the
+    fast path queued a RouterOS login on every request and answered
+    refresh_in_progress=True, so the card said 'Updating' forever and the
+    dashboard re-fetched every 20 s."""
+    owner = await make_reseller(db)
+    now = datetime.utcnow()
+    router = await make_router(db, owner, last_status=False, last_checked_at=now - timedelta(minutes=2),
+                               last_online_at=now - timedelta(days=1))
+    await db.commit()
+    _as(monkeypatch, owner)
+    _cache(router.id)
+    mr._health_cache[router.id]["timestamp"] = now - timedelta(seconds=mr._health_cache_ttl + 1)
+    tasks = _Tasks()
+    out = await mr.get_mikrotik_health(tasks, router_id=router.id, db=db, token="t")
+    assert tasks.calls == []                                   # no login against a dead router
+    assert not out.get("refresh_in_progress")
+    assert out.get("retry_after_seconds") is None              # nothing for the dashboard to retry
+    assert out["stale"] is True and out["live"] is False
+    assert out["fallback_reason"] == "router_recently_offline"  # card: "Offline - Stale"

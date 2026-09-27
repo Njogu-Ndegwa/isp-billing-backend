@@ -600,6 +600,12 @@ async def initiate_mpesa_payment_api(
             if owner_row:
                 account_reference = owner_row.business_name or owner_row.organization_name
 
+        # Check-in delivery pilot: a hotspot customer on this router is about
+        # to pay (same hint as register-and-pay). In-memory, exception-proof.
+        if customer.plan is not None and getattr(customer.plan.connection_type, "value", None) == "hotspot":
+            from app.services.checkin_delivery import note_payment_initiated
+            note_payment_initiated(customer.router_id)
+
         # Check if the customer's router has a configured payment method
         payment_method = None
         if customer.router_id:
