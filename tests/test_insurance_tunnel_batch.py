@@ -264,3 +264,14 @@ def test_l2tp_batch_stages_disabled_standby_without_active_verification(monkeypa
     monkeypatch.setattr(batch, "verify_insurance_router", fail_if_verified)
 
     asyncio.run(run())
+
+
+def test_routers_already_on_hetzner_are_skipped_by_the_batch():
+    # One management tunnel per router: a router whose tunnel already ends on
+    # Hetzner (provisioned under PROVISION_MGMT_TO_HETZNER, or migrated by
+    # hand) must not get an insurance tunnel claiming the same 10.251.X.Y.
+    kwargs = dict(backup_ip_error=None, recently_offline=False, owner_role="reseller", subscription_status="active")
+    for tunnel in ("sstp", "wireguard"):
+        reason = batch._candidate_skip_reason(management_tunnel=tunnel, **kwargs)
+        assert reason and "Hetzner" in reason and tunnel in reason
+    assert batch._candidate_skip_reason(management_tunnel=None, **kwargs) is None

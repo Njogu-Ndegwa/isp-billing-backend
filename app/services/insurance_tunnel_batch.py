@@ -34,6 +34,10 @@ from app.services.router_helpers import connect_to_router
 
 logger = logging.getLogger(__name__)
 
+# routers.management_tunnel values for routers whose ONE management tunnel is
+# already on Hetzner (wg-hz / sstp-hetzner): never add an insurance tunnel.
+HETZNER_MANAGEMENT_TUNNELS = frozenset({"wireguard", "sstp"})
+
 
 TERMINAL_JOB_STATUSES = {"completed", "failed"}
 ACTIVE_JOB_STATUSES = {"queued", "running"}
@@ -200,9 +204,17 @@ def _candidate_skip_reason(
     recently_offline: bool,
     owner_role: Optional[str],
     subscription_status: Optional[str],
+    management_tunnel: Optional[str] = None,
 ) -> Optional[str]:
     if backup_ip_error:
         return backup_ip_error
+    if management_tunnel in HETZNER_MANAGEMENT_TUNNELS:
+        # Its only management tunnel already terminates on Hetzner at
+        # 10.251.X.Y; an insurance tunnel would claim the same address.
+        return (
+            f"Router already manages over Hetzner ({management_tunnel}); "
+            "a backup tunnel would duplicate it"
+        )
     if recently_offline:
         return "Router was recently offline; skipped for batch safety"
     return _owner_skip_reason(owner_role, subscription_status)
@@ -389,6 +401,7 @@ async def load_insurance_tunnel_candidates(
                 recently_offline=router_snapshot.recently_offline,
                 owner_role=owner_role,
                 subscription_status=owner_subscription_status,
+                management_tunnel=getattr(router, "management_tunnel", None),
             )
 
             candidates.append(

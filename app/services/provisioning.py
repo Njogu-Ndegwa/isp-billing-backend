@@ -40,6 +40,23 @@ LOGIN_PAGE_PATH = os.path.join(
 
 API_USERNAME = "bitwave-api"
 
+# SSTP management tunnel (RouterOS 6). Names match the manual runbook
+# (skill migrate-router-to-sstp) so provisioned and migrated routers look the
+# same on the router and to the ops tooling.
+SSTP_ROUTER_INTERFACE = "sstp-hetzner"
+SSTP_MGMT_LOOPBACK = "lo-mgmt"
+ROUTER_MGMT_CA_CN = "Bitwave Router Management CA"
+ROUTER_MGMT_CA_FILE = "router-mgmt-ca.crt"
+ROUTER_MGMT_CA_PATH = "/api/provision/router-mgmt-ca.crt"
+# hAP lite has no RTC; certificate checks need a sane clock.
+SSTP_NTP_SERVER = "162.159.200.1"
+
+# RouterOS 7 WireGuard management tunnel to Hetzner wg2 (PROVISION_MGMT_TO_HETZNER).
+# Same name the manual migrations used (skill migrate-router-to-sstp).
+HETZNER_WG_ROUTER_INTERFACE = "wg-hz"
+HETZNER_WG_FIREWALL_COMMENT = "Allow WireGuard (Hetzner management)"
+HETZNER_API_FIREWALL_COMMENT = "Allow API from Hetzner management"
+
 
 def _downgrade_https_to_http(base_url: str) -> str:
     """Return an HTTP version of base_url when it explicitly uses HTTPS."""
@@ -304,6 +321,160 @@ def generate_l2tp_username(identity: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# SSTP management tunnel (RouterOS 6, Hetzner accel-ppp)
+# ---------------------------------------------------------------------------
+
+def generate_sstp_username(identity: str) -> str:
+    """SSTP login used by the runbook and chap-secrets, e.g. 'sstp-Router-0005'."""
+    return f"sstp-{identity}"
+
+
+def derive_sstp_ip(router_ip: str) -> str:
+    """Router 10.0.X.Y -> its SSTP peer address 10.251.X.Y (SSTP_SUBNET)."""
+    return derive_insurance_ip(router_ip, settings.SSTP_SUBNET)
+
+
+def router_mgmt_ca_pem() -> str:
+    """Return the public router-management CA certificate PEM, or "" if unset.
+
+    ROUTER_MGMT_CA_PEM may carry literal "\\n" sequences so it fits on one
+    .env line. Anything that is not a plain certificate -- above all anything
+    containing a private key -- is refused, so a paste mistake can never be
+    served to the internet.
+    """
+    raw = (settings.ROUTER_MGMT_CA_PEM or "").strip()
+    if not raw:
+        return ""
+    pem = raw.replace("\\n", "\n").replace("\r\n", "\n").strip() + "\n"
+    if "PRIVATE KEY" in pem:
+        logger.error("ROUTER_MGMT_CA_PEM contains a private key; refusing to use or serve it")
+        return ""
+    if "-----BEGIN CERTIFICATE-----" not in pem or "-----END CERTIFICATE-----" not in pem:
+        logger.error("ROUTER_MGMT_CA_PEM is not a PEM certificate; ignoring it")
+        return ""
+    return pem
+
+
+MGMT_TUNNEL_HETZNER_WIREGUARD = "wireguard"
+MGMT_TUNNEL_HETZNER_SSTP = "sstp"
+HETZNER_MGMT_TUNNELS = frozenset({MGMT_TUNNEL_HETZNER_WIREGUARD, MGMT_TUNNEL_HETZNER_SSTP})
+
+
+def mgmt_to_hetzner_active() -> bool:
+    """New tokens get a single Hetzner management tunnel only while the flag is on."""
+    return bool(settings.PROVISION_MGMT_TO_HETZNER)
+
+
+def hetzner_mgmt_tunnel_for(vpn_type: str) -> str:
+    """RouterOS 7 (wireguard tokens) -> wg-hz; RouterOS 6 (l2tp tokens) -> SSTP."""
+    if (vpn_type or "").lower() == "l2tp":
+        return MGMT_TUNNEL_HETZNER_SSTP
+    return MGMT_TUNNEL_HETZNER_WIREGUARD
+
+
+def token_mgmt_to_hetzner(token: ProvisioningToken) -> bool:
+    """Decided once at token creation: a token issued with a Hetzner tunnel
+    keeps rendering it for its whole life, even if the flag is flipped."""
+    return (token.management_tunnel or "") in HETZNER_MGMT_TUNNELS
+
+
+def token_uses_sstp(token: ProvisioningToken) -> bool:
+    return (
+        token.management_tunnel == MGMT_TUNNEL_HETZNER_SSTP
+        and (token.vpn_type or "").lower() == "l2tp"
+        and bool(token.sstp_username)
+    )
+
+
+def _split_sstp_server(server: str) -> Tuple[str, str]:
+    host, sep, port = (server or "").strip().rpartition(":")
+    if not sep:
+        return "", ""
+    return host, port
+
+
+def _sstp_server_is_valid(server: str) -> bool:
+    host, port = _split_sstp_server(server)
+    if not host or not port.isdigit():
+        return False
+    return all(ch.isalnum() or ch in ".-" for ch in host)
+
+
+def sstp_connect_to(server: str, routeros_major: int) -> str:
+    """The sstp-client connect-to argument(s) for a RouterOS major version.
+
+    RouterOS 6 (6.48/6.49) takes the port INSIDE connect-to (``ip:port``);
+    RouterOS 7 takes the address alone plus a separate ``port=``. Mixing
+    them up gave `:44443` / "unable to connect" on 2026-09-24.
+    """
+    host, port = _split_sstp_server(server)
+    if routeros_major >= 7:
+        return f"connect-to={host} port={port}"
+    return f"connect-to={host}:{port}"
+
+
+def _require_sstp_settings() -> None:
+    missing = []
+    if not _sstp_server_is_valid(settings.SSTP_SERVER):
+        missing.append("SSTP_SERVER (host:port)")
+    if not (settings.SSTP_SUBNET or "").strip():
+        missing.append("SSTP_SUBNET")
+    if not router_mgmt_ca_pem():
+        missing.append("ROUTER_MGMT_CA_PEM")
+    if missing:
+        raise ValueError(
+            "SSTP provisioning is enabled but setting(s) are missing or invalid: "
+            + ", ".join(missing)
+        )
+
+
+def _require_hetzner_mgmt_settings(vpn_type: str) -> None:
+    """Everything the single Hetzner tunnel needs, checked before any manager call.
+
+    The AWS settings (SERVER_PUBLIC_IP, WG_MANAGER_URL, L2TP PSK) are
+    deliberately NOT required: nothing in this path touches AWS.
+    """
+    required = [
+        "INSURANCE_WG_MANAGER_URL",
+        "INSURANCE_WG_MANAGER_SECRET",
+        "INSURANCE_SERVER_PUBLIC_IP",
+        "INSURANCE_SERVER_VPN_IP",
+        "INSURANCE_WG_SUBNET",
+    ]
+    if hetzner_mgmt_tunnel_for(vpn_type) == MGMT_TUNNEL_HETZNER_WIREGUARD:
+        required.append("INSURANCE_SERVER_WG_PUBLIC_KEY")
+    missing = [name for name in required if not (str(getattr(settings, name, "") or "")).strip()]
+    if missing:
+        raise ValueError(
+            "PROVISION_MGMT_TO_HETZNER is on but setting(s) are missing: " + ", ".join(missing)
+        )
+    if hetzner_mgmt_tunnel_for(vpn_type) == MGMT_TUNNEL_HETZNER_SSTP:
+        _require_sstp_settings()
+
+
+async def register_sstp_peer(username: str, password: str, ip: str):
+    """Add/replace the router's login in the SSTP chap-secrets via the insurance manager."""
+    from app.services.insurance_wireguard import insurance_manager_request
+
+    return await insurance_manager_request(
+        "POST",
+        "/add-sstp-peer",
+        json={"username": username, "password": password, "ip": ip},
+    )
+
+
+async def remove_sstp_peer(username: str):
+    """Remove the router's SSTP login via the insurance manager."""
+    from app.services.insurance_wireguard import insurance_manager_request
+
+    return await insurance_manager_request(
+        "DELETE",
+        "/remove-sstp-peer",
+        json={"username": username},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -366,11 +537,23 @@ def get_login_page_html() -> str:
 
 def _rsc_header(token: ProvisioningToken) -> str:
     vpn_label = "WireGuard" if token.vpn_type == "wireguard" else "L2TP/IPsec"
+    tunnel_line = f"# Tunnel IP: {token.wireguard_ip}"
+    if token_mgmt_to_hetzner(token):
+        if token_uses_sstp(token):
+            vpn_label = f"SSTP to Hetzner ({SSTP_ROUTER_INTERFACE}), only management tunnel"
+            tunnel_address = derive_sstp_ip(token.wireguard_ip)
+        else:
+            vpn_label = f"WireGuard to Hetzner ({HETZNER_WG_ROUTER_INTERFACE}), only management tunnel"
+            tunnel_address = derive_insurance_ip(token.wireguard_ip, settings.INSURANCE_WG_SUBNET)
+        tunnel_line = (
+            f"# Management IP: {token.wireguard_ip} (pinned on {SSTP_MGMT_LOOPBACK})\n"
+            f"# Tunnel IP: {tunnel_address}"
+        )
     return f"""# ============================================================
 # Bitwave ISP Auto-Provisioning Script
 # Router: {token.identity} ({token.router_name})
 # VPN Type: {vpn_label}
-# Tunnel IP: {token.wireguard_ip}
+{tunnel_line}
 # Generated: {datetime.utcnow().isoformat()}Z
 # ============================================================"""
 
@@ -577,6 +760,186 @@ def _rsc_backup_l2tp(token: ProvisioningToken) -> str:
 
 :log info "Provisioning: backup L2TP/IPsec tunnel staged disabled for single-active failover"
 :delay 15s"""
+
+
+def _rsc_input_accept_first(comment: str, match: str) -> str:
+    """Add an input-chain accept rule at the TOP of the filter table.
+
+    A plain `add` appends, so on routers that still carry MikroTik's default
+    firewall the rule lands below "defconf: drop all not coming from LAN" and
+    never matches (Router-0767 had its "Allow WireGuard" at position 63).
+    `place-before=0` is not reliable in an imported script and fails outright
+    on an empty table, so place it before the first STATIC rule's internal id
+    (dynamic rules such as the hotspot/fasttrack markers cannot be anchors).
+    If the table has no static rule, or placement is refused, append instead
+    -- with nothing static above it, the rule is still ahead of any drop.
+    Removing any copy first keeps re-runs converging on exactly one rule.
+    """
+    add = f'/ip firewall filter add chain=input {match} action=accept comment="{comment}"'
+    return f"""
+:do {{
+    :do {{ /ip firewall filter remove [find where comment="{comment}"] }} on-error={{}}
+    :local bwPlaced false
+    :if ([:len [/ip firewall filter find where dynamic=no]] > 0) do={{
+        :do {{
+            :local bwFirstRule [:pick [/ip firewall filter find where dynamic=no] 0]
+            {add} place-before=$bwFirstRule
+            :set bwPlaced true
+        }} on-error={{
+            :log warning "Provisioning: could not place '{comment}' at the top -- appending it"
+        }}
+    }}
+    :if ($bwPlaced = false) do={{
+        {add}
+    }}
+}} on-error={{
+    :log warning "Provisioning: could not add firewall rule '{comment}'"
+}}"""
+
+
+def _rsc_mgmt_loopback_pin(token: ProvisioningToken) -> str:
+    """Pin the router's DB address 10.0.X.Y on the `lo-mgmt` loopback bridge.
+
+    The app, route-sync and dashboards all address the router by
+    routers.ip_address (10.0.X.Y) while the tunnel itself carries 10.251.X.Y.
+    The host's route-sync sends 10.0.X.Y over the tunnel; the router only
+    accepts it if it owns the address, which the loopback guarantees.
+    """
+    loopback = SSTP_MGMT_LOOPBACK
+    mgmt_ip = token.wireguard_ip
+    return f"""
+# Pin the management IP {mgmt_ip} on a loopback bridge. The server reaches this
+# router at {mgmt_ip} (routers.ip_address) through the tunnel; without the pin
+# the router would not own that address and would drop the traffic.
+:if ([:len [/interface bridge find where name={loopback}]] = 0) do={{
+    :do {{ /interface bridge add name={loopback} comment="Management IP pin" }} on-error={{}}
+}}
+:if ([:len [/ip address find where address="{mgmt_ip}/32" and interface={loopback}]] = 0) do={{
+    :do {{ /ip address add address={mgmt_ip}/32 interface={loopback} comment="Management IP pin" }} on-error={{}}
+}}"""
+
+
+def _rsc_vpn_hetzner_wireguard(token: ProvisioningToken) -> str:
+    iface = HETZNER_WG_ROUTER_INTERFACE
+    port = settings.INSURANCE_WG_PORT
+    tunnel_ip = derive_insurance_ip(token.wireguard_ip, settings.INSURANCE_WG_SUBNET)
+    peer_params = (
+        f'public-key="{token.server_wg_pubkey}" endpoint-address={token.server_public_ip} '
+        f"endpoint-port={port} allowed-address={settings.INSURANCE_WG_SUBNET} persistent-keepalive=25"
+    )
+    return f"""
+# ---- STEP 3: WIREGUARD MANAGEMENT TUNNEL TO HETZNER (RouterOS v7) ----
+# This is the router's ONLY management tunnel: {iface} to the Hetzner wg2
+# server ({token.server_public_ip}:{port}), tunnel address {tunnel_ip}. No AWS
+# tunnel and no standby/insurance tunnel is configured -- a second tunnel
+# would claim the same addresses.
+
+:do {{
+    /interface wireguard add name={iface} listen-port={port} private-key="{token.wg_private_key}"
+}} on-error={{
+    /interface wireguard set [find where name={iface}] listen-port={port} private-key="{token.wg_private_key}"
+}}
+:do {{ /ip address add address={tunnel_ip}/16 interface={iface} }} on-error={{}}
+:do {{
+    /interface wireguard peers add interface={iface} {peer_params}
+}} on-error={{
+    /interface wireguard peers set [find where interface={iface}] {peer_params}
+}}
+{_rsc_input_accept_first(HETZNER_WG_FIREWALL_COMMENT, f"protocol=udp dst-port={port}")}
+{_rsc_mgmt_loopback_pin(token)}
+
+:log info "Provisioning: WireGuard management tunnel to Hetzner configured"
+:delay 3s"""
+
+
+def _rsc_sstp_client_add_or_set(client_params: str, indent: str) -> str:
+    iface = SSTP_ROUTER_INTERFACE
+    # Every value inside the [:parse "..."] strings is quote-free (identity
+    # Router-NNNN, alphanumeric password, host:port), so no escaping is needed.
+    lines = [
+        ":do {",
+        f'    :local bwSstpAdd [:parse "/interface sstp-client add name={iface} {client_params}"]',
+        "    $bwSstpAdd",
+        "} on-error={",
+        "    :do {",
+        f'        :local bwSstpSet [:parse "/interface sstp-client set [find where name={iface}] {client_params}"]',
+        "        $bwSstpSet",
+        "    } on-error={",
+        '        :log warning "Provisioning: RouterOS rejected the SSTP client settings"',
+        "    }",
+        "}",
+    ]
+    return "\n".join(indent + line for line in lines)
+
+
+def _rsc_vpn_sstp(token: ProvisioningToken) -> str:
+    base_url = provision_base_url_for_vpn(token.vpn_type)
+    cert_flag = fetch_certificate_flag_for_url(base_url, token.vpn_type)
+    server = settings.SSTP_SERVER.strip()
+    iface = SSTP_ROUTER_INTERFACE
+    tunnel_ip = derive_sstp_ip(token.wireguard_ip)
+    common = (
+        f"user={token.sstp_username} password={token.sstp_password} "
+        "profile=default add-default-route=no verify-server-certificate=yes "
+        "verify-server-address-from-certificate=yes disabled=no"
+    )
+    v6_params = f"{sstp_connect_to(server, 6)} {common}"
+    v7_params = f"{sstp_connect_to(server, 7)} {common}"
+    return f"""
+# ---- STEP 3: SSTP MANAGEMENT TUNNEL TO HETZNER (RouterOS v6) ----
+# This is the router's ONLY management tunnel: {iface} to the Hetzner
+# accel-ppp server ({server}), login {token.sstp_username}, tunnel address
+# {tunnel_ip}. SSTP is one TCP connection per router, so any number of routers
+# can share a CGNAT address (L2TP/IPsec cannot). No L2TP to AWS and no standby
+# L2TP is configured -- a second tunnel would claim the same addresses.
+# Commands that differ between RouterOS versions go through [:parse] so an
+# unsupported build logs a warning instead of aborting the import.
+
+:if ([:len [/certificate find where common-name="{ROUTER_MGMT_CA_CN}"]] = 0) do={{
+    :do {{
+        /tool fetch url="{base_url}{ROUTER_MGMT_CA_PATH}" dst-path={ROUTER_MGMT_CA_FILE}{cert_flag}
+        :delay 2s
+        /certificate import file-name={ROUTER_MGMT_CA_FILE} passphrase=""
+        :log info "Provisioning: router management CA imported"
+    }} on-error={{
+        :log warning "Provisioning: could not fetch/import the router management CA -- SSTP cannot verify the server"
+    }}
+}}
+:do {{ /certificate set [find where common-name="{ROUTER_MGMT_CA_CN}"] trusted=yes }} on-error={{}}
+
+# SSTP certificate checks need a correct clock (hAP lite has no RTC).
+:do {{
+    :local bwSetNtp [:parse "/system ntp client set enabled=yes primary-ntp={SSTP_NTP_SERVER}"]
+    $bwSetNtp
+}} on-error={{
+    :log warning "Provisioning: could not enable the NTP client"
+}}
+
+# add-then-set so re-running this script converges. RouterOS 6 takes the port
+# INSIDE connect-to (ip:port); RouterOS 7 takes a separate port= -- pick the
+# form for the version actually running (some v6-token routers run v7).
+:do {{
+    :if ([:pick [/system resource get version] 0 1] = "7") do={{
+{_rsc_sstp_client_add_or_set(v7_params, "        ")}
+    }} else={{
+{_rsc_sstp_client_add_or_set(v6_params, "        ")}
+    }}
+}} on-error={{
+    :log warning "Provisioning: could not configure the SSTP client"
+}}
+{_rsc_mgmt_loopback_pin(token)}
+
+:log info "Provisioning: SSTP tunnel configured, waiting for connection..."
+:delay 10s
+
+:do {{
+    :local sstpRunning [:len [/interface sstp-client find where name={iface} running=yes]]
+    :if ($sstpRunning = 0) do={{
+        :log warning "Provisioning: SSTP tunnel not yet connected -- the client keeps retrying"
+    }} else={{
+        :log info "Provisioning: SSTP tunnel connected"
+    }}
+}} on-error={{}}"""
 
 
 def _rsc_hotspot(token: ProvisioningToken) -> str:
@@ -798,6 +1161,26 @@ def _rsc_api_access() -> str:
 {chr(10).join(firewall_lines)}"""
 
 
+def _hetzner_mgmt_server_vpn_ip(token: ProvisioningToken) -> str:
+    """The address the Hetzner host uses towards the router over its tunnel
+    (accel-ppp gw for SSTP, wg2's address for WireGuard) -- the only source
+    the router's API has to accept."""
+    if token_uses_sstp(token):
+        return settings.SSTP_SERVER_VPN_IP.strip()
+    return settings.INSURANCE_SERVER_VPN_IP.strip()
+
+
+def _rsc_api_access_hetzner(token: ProvisioningToken) -> str:
+    source = _hetzner_mgmt_server_vpn_ip(token)
+    return f"""
+# ---- STEP 7: ENABLE MIKROTIK API (Hetzner management tunnel only) ----
+# The Hetzner host reaches this router from {source} (route-sync steers
+# {token.wireguard_ip} over the tunnel); nothing else may use the API.
+
+/ip service set api address={source}/32 port=8728 disabled=no
+{_rsc_input_accept_first(HETZNER_API_FIREWALL_COMMENT, f"protocol=tcp dst-port=8728 src-address={source}")}"""
+
+
 def _rsc_identity_and_user(token: ProvisioningToken) -> str:
     return f"""
 # ---- STEP 8: CREATE API SERVICE ACCOUNT & SET IDENTITY ----
@@ -861,7 +1244,16 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     parts.append(_rsc_wan_setup())
     parts.append(_rsc_lan_setup())
 
-    if token.vpn_type == "l2tp":
+    hetzner = token_mgmt_to_hetzner(token)
+    if hetzner:
+        # PROVISION_MGMT_TO_HETZNER: exactly ONE management tunnel, to Hetzner.
+        # No AWS primary and no insurance/standby duplicate (either would
+        # claim this router's 10.251.X.Y / 10.0.X.Y as well).
+        if token_uses_sstp(token):
+            parts.append(_rsc_vpn_sstp(token))
+        else:
+            parts.append(_rsc_vpn_hetzner_wireguard(token))
+    elif token.vpn_type == "l2tp":
         parts.append(_rsc_vpn_l2tp(token))
         parts.append(_rsc_backup_l2tp(token))
     else:
@@ -871,7 +1263,7 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     parts.append(_rsc_hotspot(token))
     parts.append(_rsc_login_page(token))
     parts.append(_rsc_walled_garden(token))
-    parts.append(_rsc_api_access())
+    parts.append(_rsc_api_access_hetzner(token) if hetzner else _rsc_api_access())
     parts.append(_rsc_identity_and_user(token))
     parts.append(_rsc_remove_router_command_agent())
     parts.append(_rsc_notify_and_reboot(token))
@@ -927,6 +1319,111 @@ async def _generate_router_name(db: AsyncSession, user_id: int) -> str:
 # Token creation (dual WireGuard / L2TP)
 # ---------------------------------------------------------------------------
 
+async def _create_hetzner_provisioning_token(
+    db: AsyncSession,
+    user_id: int,
+    payment_methods: Optional[list],
+    vpn_type: str,
+    is_routerboard: bool,
+) -> ProvisioningToken:
+    """PROVISION_MGMT_TO_HETZNER: one management tunnel, to Hetzner, nothing on AWS.
+
+    * RouterOS 7 (wireguard): router key registered on the Hetzner wg2
+      manager (INSURANCE_WG_MANAGER_URL /add-peer) as 10.251.X.Y/32.
+    * RouterOS 6 (l2tp): SSTP login sstp-<identity> -> 10.251.X.Y written to
+      the accel-ppp chap-secrets by the same manager (/add-sstp-peer).
+
+    The router's DB address stays 10.0.X.Y from the usual ranges; the tunnel
+    address is its 10.251 twin. Nothing is registered on the AWS wg-manager.
+    """
+    mgmt_tunnel = hetzner_mgmt_tunnel_for(vpn_type)
+    _require_hetzner_mgmt_settings(vpn_type)
+
+    router_name = await _generate_router_name(db, user_id)
+    identity = await _generate_identity(db)
+    vpn_ip = await allocate_vpn_ip(db, vpn_type)
+    api_password = generate_api_password()
+    token_value = uuid.uuid4().hex
+
+    wg_private_key = wg_public_key = server_wg_pubkey = None
+    sstp_username = sstp_password = None
+    if mgmt_tunnel == MGMT_TUNNEL_HETZNER_SSTP:
+        tunnel_ip = derive_sstp_ip(vpn_ip)
+        sstp_username = generate_sstp_username(identity)
+        sstp_password = generate_api_password(24)
+    else:
+        tunnel_ip = derive_insurance_ip(vpn_ip, settings.INSURANCE_WG_SUBNET)
+        wg_private_key, wg_public_key = generate_wireguard_keypair()
+        server_wg_pubkey = settings.INSURANCE_SERVER_WG_PUBLIC_KEY.strip()
+
+    registered = False
+
+    # Release the transaction opened by the allocation SELECTs before the
+    # manager HTTP call. A slow manager must not pin a pooled DB connection.
+    await db.commit()
+
+    try:
+        if mgmt_tunnel == MGMT_TUNNEL_HETZNER_SSTP:
+            await register_sstp_peer(sstp_username, sstp_password, tunnel_ip)
+        else:
+            from app.services.insurance_wireguard import register_insurance_peer
+
+            await register_insurance_peer(wg_public_key, tunnel_ip)
+        registered = True
+
+        token_obj = ProvisioningToken(
+            user_id=user_id,
+            token=token_value,
+            router_name=router_name,
+            identity=identity,
+            wireguard_ip=vpn_ip,
+            ssid="N/A",
+            router_admin_password=api_password,
+            vpn_type=vpn_type,
+            wg_private_key=wg_private_key,
+            wg_public_key=wg_public_key,
+            server_wg_pubkey=server_wg_pubkey,
+            sstp_username=sstp_username,
+            sstp_password=sstp_password,
+            management_tunnel=mgmt_tunnel,
+            # The Hetzner server: WireGuard endpoint for v7, and the backend
+            # IP the hotspot walled garden allows.
+            server_public_ip=settings.INSURANCE_SERVER_PUBLIC_IP.strip(),
+            payment_methods=payment_methods or ["mpesa", "voucher"],
+            is_routerboard=bool(is_routerboard) and vpn_type == "l2tp",
+            status=ProvisioningTokenStatus.PENDING,
+        )
+
+        db.add(token_obj)
+        await db.commit()
+        await db.refresh(token_obj)
+    except Exception as inner_err:
+        await db.rollback()
+        logger.error(
+            "Hetzner provisioning failed after tunnel manager work: "
+            f"{type(inner_err).__name__}: {repr(inner_err)}",
+            exc_info=True,
+        )
+        if registered:
+            try:
+                if mgmt_tunnel == MGMT_TUNNEL_HETZNER_SSTP:
+                    await remove_sstp_peer(sstp_username)
+                else:
+                    from app.services.insurance_wireguard import remove_insurance_peer
+
+                    await remove_insurance_peer(wg_public_key)
+                logger.info(f"Rolled back Hetzner {mgmt_tunnel} peer for {tunnel_ip} after failure")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to roll back Hetzner {mgmt_tunnel} peer for {tunnel_ip}: {cleanup_err}")
+        raise
+
+    logger.info(
+        f"Provisioning token created (Hetzner {mgmt_tunnel}): identity={identity} "
+        f"mgmt_ip={vpn_ip} tunnel_ip={tunnel_ip} vpn_type={vpn_type} by user_id={user_id}"
+    )
+    return token_obj
+
+
 async def create_provisioning_token(
     db: AsyncSession,
     user_id: int,
@@ -945,6 +1442,11 @@ async def create_provisioning_token(
     """
     if vpn_type not in ("wireguard", "l2tp"):
         raise ValueError(f"Invalid vpn_type '{vpn_type}'. Must be 'wireguard' or 'l2tp'.")
+
+    if mgmt_to_hetzner_active():
+        return await _create_hetzner_provisioning_token(
+            db, user_id, payment_methods, vpn_type, is_routerboard
+        )
 
     if not settings.SERVER_PUBLIC_IP:
         raise ValueError(
@@ -1097,6 +1599,12 @@ async def complete_provisioning(
         # The generated RouterOS script no longer installs the outbound agent.
         router_agent_enabled=False,
     )
+    if token_mgmt_to_hetzner(token):
+        # "wireguard" (wg-hz) / "sstp" (sstp-hetzner): the router's only
+        # management tunnel, to Hetzner. Ops health would otherwise infer the
+        # tunnel from the 10.0.X.Y range (e.g. L2TP for 10.0.100.x).
+        router_obj.management_tunnel = token.management_tunnel
+        router_obj.management_tunnel_changed_at = datetime.utcnow()
     db.add(router_obj)
     await db.flush()
 

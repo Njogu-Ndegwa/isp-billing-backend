@@ -86,6 +86,8 @@ NETWORK_CALL_SUFFIXES = {
     # WG-manager / provisioning HTTP (app/services/provisioning.py)
     "remove_wireguard_peer",
     "remove_l2tp_peer",
+    "register_sstp_peer",
+    "remove_sstp_peer",
     "add_wireguard_peer",
     "add_l2tp_peer",
     # Insurance manager on the new AWS server (insurance_wireguard.py)

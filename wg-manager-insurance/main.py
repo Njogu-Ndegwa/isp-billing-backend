@@ -4,7 +4,11 @@ import subprocess
 import os
 import logging
 import shlex
+import ipaddress
+import re
+import shutil
 import socket
+import tempfile
 import time
 
 logging.basicConfig(level=logging.INFO)
@@ -17,6 +21,13 @@ WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0")
 SERVER_PUBLIC_KEY_PATH = os.environ.get("WG_SERVER_PUBKEY_PATH", "/etc/wireguard/server_public.key")
 L2TP_CHAP_SECRETS_PATH = os.environ.get("L2TP_CHAP_SECRETS_PATH", "/etc/ppp/chap-secrets")
 L2TP_SERVER_NAME = "l2tp-server"
+# accel-ppp chap-secrets of the SSTP management server (unit router-mgmt-sstp,
+# repo ops/sstp/). Bind-mount the DIRECTORY (not the file) into this container
+# so the atomic rename below stays on one filesystem. Unset = SSTP endpoints
+# answer 503. accel-ppp re-reads chap-secrets on every login: no reload needed.
+SSTP_CHAP_SECRETS = os.environ.get("SSTP_CHAP_SECRETS", "")
+SSTP_USERNAME_RE = re.compile(r"^sstp-[A-Za-z0-9._-]{1,60}$")
+SSTP_PASSWORD_RE = re.compile(r"^[A-Za-z0-9]{12,64}$")
 WG_RECENT_HANDSHAKE_SECONDS = int(os.environ.get("WG_RECENT_HANDSHAKE_SECONDS", "180"))
 
 
@@ -167,6 +178,16 @@ class RemoveL2tpPeerRequest(BaseModel):
     username: str
 
 
+class AddSstpPeerRequest(BaseModel):
+    username: str
+    password: str
+    ip: str
+
+
+class RemoveSstpPeerRequest(BaseModel):
+    username: str
+
+
 class TestRouterRequest(BaseModel):
     ip: str
     port: int = 8728
@@ -218,6 +239,128 @@ def remove_l2tp_peer(req: RemoveL2tpPeerRequest, _=Depends(verify_secret)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to remove L2TP peer: {e}")
+
+
+def _sstp_secrets_path() -> str:
+    if not SSTP_CHAP_SECRETS:
+        raise HTTPException(status_code=503, detail="SSTP_CHAP_SECRETS is not configured")
+    return SSTP_CHAP_SECRETS
+
+
+def _validate_sstp_username(username: str) -> None:
+    if not SSTP_USERNAME_RE.match(username or ""):
+        raise HTTPException(status_code=400, detail="username must look like sstp-<identity>")
+
+
+def _sstp_line_user(line: str):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    return stripped.split()[0]
+
+
+SSTP_BACKUPS_KEPT = 30
+
+
+def _prune_sstp_backups(path: str) -> None:
+    """Keep only the newest SSTP_BACKUPS_KEPT automatic backups."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    prefix = os.path.basename(path) + ".bak."
+    backups = sorted(
+        name for name in os.listdir(directory)
+        if name.startswith(prefix) and name[len(prefix):].isdigit()
+    )
+    for name in backups[:-SSTP_BACKUPS_KEPT]:
+        try:
+            os.unlink(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def _write_sstp_secrets(path: str, lines) -> None:
+    """Back up, then atomically replace chap-secrets with 0600 permissions."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    if os.path.exists(path):
+        backup_path = f"{path}.bak.{time.strftime('%Y%m%d%H%M%S')}"
+        shutil.copy2(path, backup_path)
+        os.chmod(backup_path, 0o600)
+        _prune_sstp_backups(path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".chap-secrets.", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as tmp:
+            tmp.writelines(lines)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def upsert_sstp_secret(path: str, username: str, password: str, ip: str) -> str:
+    """Add or replace one accel-ppp chap-secrets line; returns added|updated|unchanged."""
+    line = f"{username}\t*\t{password}\t{ip}\n"
+    existing = []
+    if os.path.exists(path):
+        with open(path) as f:
+            existing = f.readlines()
+    kept = [l for l in existing if _sstp_line_user(l) != username]
+    if len(kept) == len(existing) - 1 and line in existing:
+        return "unchanged"
+    status = "updated" if len(kept) != len(existing) else "added"
+    if kept and not kept[-1].endswith("\n"):
+        kept[-1] += "\n"
+    _write_sstp_secrets(path, kept + [line])
+    return status
+
+
+def delete_sstp_secret(path: str, username: str) -> bool:
+    """Remove a login's lines; returns False when it was not there (idempotent)."""
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        existing = f.readlines()
+    kept = [l for l in existing if _sstp_line_user(l) != username]
+    if len(kept) == len(existing):
+        return False
+    _write_sstp_secrets(path, kept)
+    return True
+
+
+@app.post("/add-sstp-peer")
+def add_sstp_peer(req: AddSstpPeerRequest, _=Depends(verify_secret)):
+    """Add/replace a RouterOS 6 router's login on the SSTP management server."""
+    path = _sstp_secrets_path()
+    _validate_sstp_username(req.username)
+    if not SSTP_PASSWORD_RE.match(req.password or ""):
+        raise HTTPException(status_code=400, detail="password must be 12-64 alphanumeric characters")
+    try:
+        ip = str(ipaddress.IPv4Address(req.ip))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ip must be an IPv4 address")
+    try:
+        status = upsert_sstp_secret(path, req.username, req.password, ip)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write SSTP chap-secrets: {e}")
+    logger.info(f"SSTP peer {req.username} -> {ip}: {status}")
+    return {"status": "ok", "message": f"SSTP peer {status}", "username": req.username, "ip": ip}
+
+
+@app.delete("/remove-sstp-peer")
+def remove_sstp_peer(req: RemoveSstpPeerRequest, _=Depends(verify_secret)):
+    """Remove a router's SSTP login. Already-absent is not an error."""
+    path = _sstp_secrets_path()
+    _validate_sstp_username(req.username)
+    try:
+        removed = delete_sstp_secret(path, req.username)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write SSTP chap-secrets: {e}")
+    logger.info(f"SSTP peer {req.username} removed={removed}")
+    return {"status": "ok", "message": "SSTP peer removed" if removed else "SSTP peer not present", "removed": removed}
 
 
 @app.post("/add-peer")

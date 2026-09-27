@@ -188,3 +188,53 @@ async def test_delete_reseller_cleans_messaging_and_related_fk_rows(db, monkeypa
     assert unmatched_after.assigned_reseller_id is None
     assert unmatched_after.resolved_by_user_id is None
     assert unmatched_after.resolution_customer_id is None
+
+
+@pytest.mark.asyncio
+async def test_delete_reseller_removes_hetzner_tunnel_logins_not_aws(db, monkeypatch):
+    # Tokens issued under PROVISION_MGMT_TO_HETZNER have their only tunnel on
+    # the Hetzner manager; the AWS wg-manager must not be asked about them.
+    from app.db.models import ProvisioningToken, ProvisioningTokenStatus
+
+    await _create_radius_tables(db)
+    admin = await make_reseller(db, role=UserRole.ADMIN, email="admin-hz-delete@example.com")
+    reseller = await make_reseller(db, email="hz-delete-me@example.com")
+    common = dict(
+        user_id=reseller.id,
+        router_name="R",
+        router_admin_password="x",
+        server_public_ip="91.98.238.12",
+        status=ProvisioningTokenStatus.PENDING,
+    )
+    db.add_all([
+        ProvisioningToken(
+            token="hz-wg", identity="Router-9001", vpn_type="wireguard", wireguard_ip="10.0.0.91",
+            wg_private_key="k", wg_public_key="router-wg-public", management_tunnel="wireguard", **common,
+        ),
+        ProvisioningToken(
+            token="hz-sstp", identity="Router-9002", vpn_type="l2tp", wireguard_ip="10.0.100.92",
+            sstp_username="sstp-Router-9002", sstp_password="p" * 24, management_tunnel="sstp", **common,
+        ),
+    ])
+    await db.commit()
+
+    calls = []
+
+    async def _fake_current_user(token, session):
+        return admin
+
+    def _record(name):
+        async def _call(value):
+            calls.append((name, value))
+        return _call
+
+    monkeypatch.setattr(admin_resellers, "get_current_user", _fake_current_user)
+    monkeypatch.setattr(admin_resellers, "remove_wireguard_peer", _record("aws-wg"))
+    monkeypatch.setattr(admin_resellers, "remove_l2tp_peer", _record("aws-l2tp"))
+    monkeypatch.setattr(admin_resellers, "remove_insurance_peer", _record("hetzner-wg"))
+    monkeypatch.setattr(admin_resellers, "remove_sstp_peer", _record("hetzner-sstp"))
+
+    result = await admin_resellers.delete_reseller(reseller.id, True, db, "token")
+
+    assert result["dry_run"] is False
+    assert sorted(calls) == [("hetzner-sstp", "sstp-Router-9002"), ("hetzner-wg", "router-wg-public")]

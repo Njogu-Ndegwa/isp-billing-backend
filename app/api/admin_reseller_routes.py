@@ -28,7 +28,8 @@ from app.db.models import (
     SmsCampaign, SmsMessage, ResellerInboxMessage,
 )
 from app.services.auth import verify_token, get_current_user, pwd_context
-from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer
+from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer, remove_sstp_peer
+from app.services.insurance_wireguard import remove_insurance_peer
 from app.services.admin_metrics import compute_dashboard_v2_extras
 from app.services.mpesa_b2b import (
     PAYOUT_REVENUE_FILTERS,
@@ -1899,9 +1900,14 @@ async def delete_reseller(
             ProvisioningToken.vpn_type,
             ProvisioningToken.l2tp_username,
             ProvisioningToken.wg_public_key,
+            ProvisioningToken.management_tunnel,
+            ProvisioningToken.sstp_username,
         ).where(
             ProvisioningToken.user_id == reseller_id,
-            ProvisioningToken.wg_public_key.isnot(None),
+            or_(
+                ProvisioningToken.wg_public_key.isnot(None),
+                ProvisioningToken.management_tunnel.isnot(None),
+            ),
         )
     )
     vpn_peers = [dict(row) for row in tokens_result.mappings().all()]
@@ -1912,7 +1918,12 @@ async def delete_reseller(
     wg_failures = []
     for tk in vpn_peers:
         try:
-            if tk["vpn_type"] == "l2tp" and tk["l2tp_username"]:
+            if tk["management_tunnel"] == "sstp" and tk["sstp_username"]:
+                # Single Hetzner tunnel (PROVISION_MGMT_TO_HETZNER): nothing on AWS.
+                await remove_sstp_peer(tk["sstp_username"])
+            elif tk["management_tunnel"] == "wireguard" and tk["wg_public_key"]:
+                await remove_insurance_peer(tk["wg_public_key"])
+            elif tk["vpn_type"] == "l2tp" and tk["l2tp_username"]:
                 await remove_l2tp_peer(tk["l2tp_username"])
             elif tk["wg_public_key"]:
                 await remove_wireguard_peer(tk["wg_public_key"])

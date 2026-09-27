@@ -1,0 +1,14 @@
+[Unit]
+Description=SSTP management tunnel for RouterOS 6 routers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/accel-pppd -c /etc/accel-ppp-router-mgmt/accel-ppp.conf
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
