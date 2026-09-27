@@ -250,6 +250,12 @@ async def complete_provision(
             detail=f"Failed to register router: {e}",
         )
 
+    # Real-time usage push: installed in the background once the new router's
+    # management tunnel answers (hAP lite/mini and tunnel-less routers skipped).
+    from app.services.realtime_push_installer import schedule_install_after_provisioning
+
+    schedule_install_after_provisioning(router_obj.id)
+
     return {
         "status": "provisioned",
         "router_id": router_obj.id,
