@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     # seconds before the customer row switches to the NEW MAC, and a check-in
     # in that gap must not re-add the OLD MAC as an orphan binding.
     CHECKIN_MISSING_GRACE_SECONDS: int = 60
+    # Race mode (the standard after the 2026-09-26/27 push-vs-check-in A/B):
+    # the push fires at payment time and the check-in sends the A line once
+    # the payment's provisioning attempt is this old and the router still
+    # does not show the MAC. The A/B measured the push landing 78% of
+    # payments within 20 s, so 20 s rarely duplicates its work but catches
+    # the slow tail (push p99 351 s vs check-in p99 146 s). Measured from the
+    # attempt's DB created_at. The Reconnect guard above keeps its own 60 s.
+    CHECKIN_RACE_HEAD_START_SECONDS: int = 20
     # Per-router delivery mode for the push-vs-check-in A/B (2026-09-26).
     # Comma lists of router ids; a router in neither list (or in both) keeps
     # the default "both paths" behaviour.
