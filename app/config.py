@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     # the router's own outbound tcp 80/3128/8080 to non-portal hosts (hotspot
     # bypass fix) and must stay. Caddy binds 8088 on the tunnel address only.
     REALTIME_TUNNEL_PUSH_URL: str = "http://10.251.0.1:8088/api/router/usage-push"
+    # New routers get the real-time push when they finish setup (provisioning
+    # /complete), once their encrypted management tunnel answers. hAP lite/mini
+    # are skipped. False = switch off (existing routers are unaffected).
+    REALTIME_PUSH_INSTALL_AT_SETUP: bool = True
     # Router expiry reaper (app/services/expiry_reaper_script.py): tried in this
     # order. The tunnel one is plain HTTP inside the management tunnel (Caddy's
     # 10.251.0.1:8088 site); public HTTPS costs a hAP lite ~5-7 s of full CPU.
