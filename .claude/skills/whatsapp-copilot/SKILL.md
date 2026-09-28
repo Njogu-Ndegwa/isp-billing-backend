@@ -20,6 +20,47 @@ ledger evidence (see Measurement).
   - `raw/` — per-conversation context files; check before drafting to a known contact.
   - `drafts-log.md` — the ledger. Append EVERY draft outcome here.
 
+## Connecting to WhatsApp Web — environment gotchas (all learned the hard way, 2026-07-28/29)
+
+Run through this BEFORE any sweep. Every rule below has a failure behind it.
+
+1. **Start with `tabs_context_mcp`.** If the session's tab group is gone, recreate it and
+   navigate to web.whatsapp.com fresh — never reuse tab ids from memory.
+
+2. **Read the tab title, but know what it means.**
+   - `(N) WhatsApp` = N chats-with-unreads. **It counts CHATS, not messages.** New messages
+     into an already-unread thread do NOT move it — which is exactly what escalation looks
+     like. (Miss: a reseller went 1 → 4 unread with screenshots over 4 hours; the title
+     never moved and four hourly checks reported "nothing new".)
+   - Plain `WhatsApp` (no count) is AMBIGUOUS: zero unreads, still loading, logged out, or
+     the session was claimed by another window. **Never report a missing count as zero.**
+     Confirm the chat list is actually rendered before believing any reading.
+   - So the cheap check is: title as a trigger, then per-chat unread counts from the chat
+     list (`read_page` on the grid) compared against the last-seen map in
+     `whatsapp-corpus/unread-baseline.md`.
+
+3. **"WhatsApp is open in another window" dialog** — the session was taken by Dennis's phone
+   pairing or another browser window. Clicking "Use here" STEALS it back from whatever
+   Dennis is using; do not click it without his explicit OK. Report BLIND instead.
+
+4. **Check the screenshot size.** If screenshots come back tiny (e.g. 341×480) or the
+   conversation pane won't render, the OS window holding the tab is minimized or shrunken.
+   The extension's `resize_window` will claim success while changing nothing — it cannot
+   restore an iconified OS window. Fix at the OS level (PowerShell / Win32
+   `ShowWindow(SW_RESTORE)` + `MoveWindow`), and expect side effects: Chrome may restart,
+   which destroys the tab group AND the local message cache.
+
+5. **After any Chrome restart:** recreate the tab group, re-navigate, wait for the `(N)`
+   title (the store takes ~10-20s to sync), and expect old thread history to be missing —
+   each thread shows a refresh spinner that must be clicked to pull older messages.
+
+6. **Click by element ref, not coordinates.** Get refs from `read_page`/`find`. Viewport
+   and screenshot scales drift apart (1707-px viewport rendering 1568-px screenshots), so
+   coordinate clicks silently miss. If a click does nothing, re-read the page for fresh
+   refs instead of clicking harder.
+
+7. **Escape closes the open chat** — after pressing it, re-find the chat row and reopen.
+
 ## Operating loop
 
 1. **Sweep**: open WhatsApp Web (web.whatsapp.com) via Chrome tools. Capture unread chats.
@@ -30,9 +71,32 @@ ledger evidence (see Measurement).
    - Known personal (always skip, never record): MHS/Mang'u groups, OMNIVOLTAIC groups,
      GEN Z TOM LINK, family contacts (Aunts, toma, Laban, Munchkn, Rhobii), Meta AI, promos.
    - Ambiguous → open, read the last screen; if personal, close and move on. Record nothing.
-3. **Gather context** for each business message: scroll the thread (2× scroll-up minimum),
-   check `raw/<alias>.md` and `contacts-index.md`. Identify: who, category, what they need,
-   any prior promises in the thread.
+3. **Gather context — OPEN THE THREAD. The preview is never enough.**
+   Open every business thread and read the conversation, including images, before drafting
+   OR reporting on it. Scroll up at least twice. Check `raw/<alias>.md` and
+   `contacts-index.md`. Identify: who, category, what they need, any prior promises.
+
+   Dennis, 2026-07-29: *"I expect you to actually be opening the text, because I want you to
+   have the context of the whole conversation. Just the preview doesn't help anything — a
+   message could be long and there could be many messages."*
+
+   A roster preview is ONE truncated line, with no sender, no images, and no indication of
+   how many messages are in the thread. Two failures in two days came from trusting it:
+
+   - An ACTIVE reseller (93 customers, paid that day) was reported as a "churned operator,
+     five weeks silent", from suspended account rows plus a preview. The thread said
+     "hello bro, I managed to onboard" that same afternoon.
+   - The same reseller then sent six messages and two annotated screenshots — red-circled
+     figures proving two panel views disagreed — and they went unseen for a day, because the
+     preview only ever shows the newest line.
+
+   **Opening marks the chat read. That cost is accepted** — Dennis has explicitly chosen full
+   context over preserving the unread flag. Personal chats still stay unopened (step 2).
+
+   Related: the tab-title `(N)` counts unread CHATS, not messages, so extra messages into an
+   already-unread thread never move it. It is a trigger to look, never a report of what is
+   there. And never merely OFFER a read-only check — read-only needs no permission, so run it
+   and report the result.
 4. **Draft** per the Voice Guide below. One draft per thread. Attach: category, confidence
    (high/med/low), and any data you could not verify (mark inline as [NEEDS: …]).
 5. **Present** the batch to Dennis in chat: alias, their message (short quote), the draft,
