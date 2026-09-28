@@ -326,6 +326,13 @@ async def edit_customer(
         await db.commit()
         await db.refresh(customer, attribute_names=["plan", "router"])
 
+        if "expiry" in update_fields and not customer.pppoe_username:
+            # A router that removes its own expired customers holds the
+            # deadline in the binding: move it later if the edit extended it.
+            from app.services.expiry_tag_sync import schedule_expiry_tag_sync
+
+            schedule_expiry_tag_sync([customer.id], "admin expiry edit")
+
         provision_status = None
         if (
             pppoe_changed
