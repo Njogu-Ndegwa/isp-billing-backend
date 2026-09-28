@@ -721,7 +721,7 @@ def count_recent_drops(checks: Iterable[tuple[int, datetime, bool]], now: dateti
 async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None) -> dict:
     async with database.async_session() as db:
         router_rows = (await db.execute(
-            select(Router.last_status, Router.last_checked_at, Router.ip_address,
+            select(Router.id, Router.last_status, Router.last_checked_at, Router.ip_address,
                    Router.management_tunnel, Router.last_online_at, User.subscription_status)
             .outerjoin(User, User.id == Router.user_id)
         )).all()
@@ -737,11 +737,16 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
     online = offline = stale = silent_24h = 0
     by_tunnel: dict[str, dict] = {}
     stale_after = timedelta(seconds=ROUTER_STATUS_STALE_AFTER_SECONDS)
-    for last_status, last_checked, ip, management_tunnel, last_online, owner_status in router_rows:
+    # Suspended resellers (lapsed trials, unpaid) are mostly not users any
+    # more, so their routers are left out of the fleet counts entirely.
+    cut_off_ids: set[int] = set()
+    for router_id, last_status, last_checked, ip, management_tunnel, last_online, owner_status in router_rows:
+        if is_owner_cut_off(owner_status):
+            cut_off_ids.add(router_id)
+            continue
         # "Stale" only means nobody checked in 10 minutes; a quiet healthy router
         # lands there too. Not heard from for a day is what "probably down" means.
-        # Suspended resellers' routers are cut off on purpose, so not counted.
-        if not is_owner_cut_off(owner_status) and (last_online is None or now - last_online > timedelta(hours=24)):
+        if last_online is None or now - last_online > timedelta(hours=24):
             silent_24h += 1
         bucket = by_tunnel.setdefault(tunnel_type_for_router(ip, management_tunnel),
                                       {"online": 0, "offline": 0, "stale": 0, "total": 0})
@@ -755,11 +760,12 @@ async def build_tunnels_section(now: datetime, baselines: Optional[dict] = None)
         else:
             offline += 1
             bucket["offline"] += 1
-    drops = count_recent_drops(check_rows, now)
+    drops = count_recent_drops((c for c in check_rows if c[0] not in cut_off_ids), now)
     return {
         "status": "unknown",
         "counts": {"online": online, "offline": offline, "stale": stale,
-                   "total": len(router_rows), "silent_24h": silent_24h},
+                   "total": len(router_rows) - len(cut_off_ids), "silent_24h": silent_24h,
+                   "cut_off_excluded": len(cut_off_ids)},
         "by_tunnel": {t: by_tunnel[t] for t in TUNNEL_TYPES if t in by_tunnel},
         "recent_drops_10m": drops,
         "platform_event": drops >= rules.TUNNELS_PLATFORM_EVENT_WARN,
