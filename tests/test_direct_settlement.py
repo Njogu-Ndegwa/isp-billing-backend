@@ -332,3 +332,103 @@ async def test_opting_out_is_always_allowed(db, client, monkeypatch):
 
     resp = await client.put("/api/reseller/settlement-mode", json={"settlement_mode": "bogus"})
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Switching mid-stream, and brand-new resellers
+# ---------------------------------------------------------------------------
+
+async def _record(db, reseller, amount, mode):
+    plan = await make_plan(db, reseller, price=amount)
+    customer = await make_customer(db, reseller, plan=plan)
+    db.add(CustomerPayment(
+        customer_id=customer.id, reseller_id=reseller.id, amount=amount,
+        payment_method=PaymentMethod.MOBILE_MONEY, days_paid_for=1,
+        status=PaymentStatus.COMPLETED, collection_mode=mode,
+    ))
+    await db.commit()
+
+
+async def test_switching_to_direct_keeps_the_existing_balance_owed(db, stk):
+    """Money collected before the switch is still paid out; money after is not."""
+    from app.services.direct_settlement import set_settlement_mode
+
+    reseller = await make_reseller(db, settlement_mode=SETTLEMENT_PLATFORM)
+    pm = await make_method(db, reseller, ResellerPaymentMethodType.BANK_ACCOUNT,
+                           bank_paybill_number="247247", bank_account_number=EQUITY_ACCOUNT)
+    await _record(db, reseller, 700.0, CollectionMode.SYSTEM_COLLECTED)
+
+    await set_settlement_mode(db, reseller.id, SETTLEMENT_DIRECT)
+    await db.commit()
+    result = await _pay(db, reseller, pm, reference="AFTER")
+    assert result["collection_mode"] == CollectionMode.DIRECT
+    await _record(db, reseller, 50.0, CollectionMode.DIRECT)
+
+    assert await get_unpaid_balance(db, reseller.id) == 700.0
+
+
+async def test_switching_back_to_platform_collects_again(db, stk):
+    from app.services.direct_settlement import set_settlement_mode
+
+    reseller = await make_reseller(db, settlement_mode=SETTLEMENT_DIRECT)
+    pm = await make_method(db, reseller, ResellerPaymentMethodType.MPESA_TILL,
+                           mpesa_till_number="5550001")
+    assert (await _pay(db, reseller, pm, reference="D"))["collection_mode"] == CollectionMode.DIRECT
+
+    await set_settlement_mode(db, reseller.id, SETTLEMENT_PLATFORM)
+    await db.commit()
+    result = await _pay(db, reseller, pm, reference="P")
+    assert result["collection_mode"] == CollectionMode.SYSTEM_COLLECTED
+    assert stk.calls[-1].get("party_b") is None
+
+
+async def test_payment_in_flight_during_a_switch_keeps_its_original_mode(db):
+    """The mode is snapshotted when the push is raised: a prompt sent while on
+    platform and paid after the reseller switched is still platform money (it
+    landed on the system paybill) and must stay in the payout balance."""
+    from app.services.direct_settlement import set_settlement_mode
+    from app.services.reseller_payments import resolve_mpesa_collection_mode
+
+    reseller = await make_reseller(db, settlement_mode=SETTLEMENT_PLATFORM)
+    pm = await make_method(db, reseller, ResellerPaymentMethodType.MPESA_TILL,
+                           mpesa_till_number="5550001")
+    site = await make_router(db, reseller, payment_method_id=pm.id)
+    plan = await make_plan(db, reseller, price=50)
+    customer = await make_customer(db, reseller, plan=plan, router=site)
+    txn = MpesaTransaction(
+        checkout_request_id="ws_CO_inflight", phone_number="254700000000",
+        amount=50, reference="R", customer_id=customer.id,
+        collection_mode=CollectionMode.SYSTEM_COLLECTED,
+    )
+    db.add(txn)
+    await db.commit()
+
+    await set_settlement_mode(db, reseller.id, SETTLEMENT_DIRECT)
+    await db.commit()
+
+    assert await resolve_mpesa_collection_mode(db, txn, customer) == CollectionMode.SYSTEM_COLLECTED
+
+
+async def test_signup_creates_a_direct_reseller(db):
+    from app.db.models import UserRole
+    from app.services.auth import create_user
+
+    user = await create_user(
+        db, email="brand-new@example.com", password="x" * 12,
+        role=UserRole.RESELLER, organization_name="New ISP",
+    )
+    assert user.settlement_mode == SETTLEMENT_DIRECT
+
+
+async def test_new_direct_reseller_without_a_method_is_platform_collected_until_they_add_one(db, stk):
+    reseller = await make_reseller(db)  # default: direct
+    site = await make_router(db, reseller)
+    assert await resolve_collection_payment_method(db, site.id) is None  # legacy path
+
+    pm = await make_method(db, reseller, ResellerPaymentMethodType.MPESA_PAYBILL,
+                           mpesa_paybill_number="5550002")
+    resolved = await resolve_collection_payment_method(db, site.id)
+    assert resolved is not None and resolved.id == pm.id
+    result = await _pay(db, reseller, resolved, router=site)
+    assert result["collection_mode"] == CollectionMode.DIRECT
+    assert stk.calls[-1]["party_b"] == "5550002"
