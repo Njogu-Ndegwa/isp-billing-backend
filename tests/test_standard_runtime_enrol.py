@@ -647,3 +647,32 @@ def test_complete_callback_schedules_the_install():
     from app.api import provisioning as provisioning_api
     src = inspect.getsource(provisioning_api.complete_provision)
     assert "schedule_install_after_registration(router_obj.id)" in src
+
+
+@pytest.mark.parametrize("reason", [
+    "no hotspot ip-binding table",                 # hotspot still loading after the reboot
+    "script_failed: Not connected",                # API dropped mid-step (router 544)
+    "scheduler_failed: Connection to 10.0.0.9:8728 timed out after 5s",
+    "unreachable",
+])
+def test_setup_retries_on_reboot_symptoms(reason):
+    o = enrol.Outcome(1, checkin=enrol.Component(False, reason), watchdog=enrol.Component(True, "installed (wg, installed)"))
+    assert enrol._setup_retryable(o)
+
+
+@pytest.mark.parametrize("reason", [
+    "small board hAP lite (HTTPS check-in too costly)",
+    "scheduler_failed: failure: configuration flagged, check all router configuration",
+    "identity mismatch: router says Router-9",
+])
+def test_setup_stops_on_real_answers(reason):
+    o = enrol.Outcome(1, checkin=enrol.Component(False, reason))
+    assert not enrol._setup_retryable(o)
+
+
+def test_setup_first_try_waits_out_the_reboot():
+    # /complete is followed by "/system reboot" 5 s later in the setup script.
+    from app.services import provisioning
+    import inspect
+    assert "/system reboot" in inspect.getsource(provisioning._rsc_notify_and_reboot)
+    assert enrol.SETUP_FIRST_DELAY_SECONDS >= 90
