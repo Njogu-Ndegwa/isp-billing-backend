@@ -93,6 +93,14 @@ USER:AABBCC000001|EXPIRES:DB_MANAGED|EXP:1790503452|2026-09-27 10:22:56
 
 A renewal delivered to the router rewrites the tag. A renewal that could not be delivered is handled by the `K` reply (section 4).
 
+**Expiry extended without a payment.** Outage compensation, an admin editing the expiry, and device pairing change the database only. The tag is then earlier than the paid expiry. While the router can reach the server that is harmless, because the `K` reply corrects it at the old deadline. With the server unreachable at that moment, though, the router would fall back to the stale tag and remove a paying customer. `app/services/expiry_tag_sync.py` closes this in two layers:
+- **straight after the change**: compensation and the admin edit call `schedule_expiry_tag_sync(customer_ids)`, which re-tags those bindings within seconds;
+- **every 15 minutes** (job `expiry_tag_reconcile`): every reaper router's bindings are compared with the database, and any tag earlier than the latest paid expiry for that MAC is corrected. This covers the paths that don't call the hook, and routers that were offline when the hook ran.
+
+Both layers only ever move a deadline **later**, and each correction writes an `expiry_tag_resync` provisioning log. Before writing, both the database and the router are read again, so a payment that lands in the meantime (and writes a later tag) is never overwritten with an earlier one. The kill switch is `EXPIRY_TAG_SYNC_ENABLED`. Found on 2026-09-28, when a 6 h compensation on router 141 left six bindings on the old deadline; nobody was removed early.
+
+**PPPoE is not affected.** The reaper only reads hotspot ip-bindings. PPPoE customers are removed by the server job at their database expiry, with no grace period, so a compensation or edit takes effect as soon as it is saved.
+
 Bindings written by other paths (FUP restore, access credentials, public reconnect, shared-subscription devices that log in as hotspot users) carry no `EXP:` tag. The reaper ignores them and the server job removes them as before.
 
 ## 4. The protocol: ask before removing, report after
@@ -272,3 +280,4 @@ Known exceptions (2026-09-28):
 | 2026-09-26 | #100 server job: no safety-net stall, one table read per router, own lane. #123 installer guards |
 | 2026-09-27 | #128 automatic enrolment (on by default), fleet sweep → 59 routers |
 | 2026-09-28 | Enrolment at onboarding (`/complete`), re-check windows by reason and router age |
+| 2026-09-28 | Expiry tag sync: a tag is moved later when compensation or an admin edit extends the expiry, plus a 15-min reconcile |

@@ -3199,6 +3199,17 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
+    # Router EXP deadlines earlier than the paid expiry (an expiry extended
+    # outside a payment) are moved later; see app/services/expiry_tag_sync.py.
+    from app.services.expiry_tag_sync import expiry_tag_reconcile_background
+    scheduler.add_job(
+        expiry_tag_reconcile_background,
+        trigger=IntervalTrigger(minutes=15),
+        id='expiry_tag_reconcile',
+        name='Move early router expiry deadlines to the paid expiry',
+        replace_existing=True,
+        max_instances=1
+    )
     # Standard router runtime (check-in applier + mgmt-tunnel watchdog):
     # no-op unless STANDARD_RUNTIME_AUTO_INSTALL.
     from app.services.standard_runtime_enrol import standard_runtime_enrol_background

@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # every new router enrolled automatically); set false to pause.
     EXPIRY_REAPER_AUTO_ENROL: bool = True
     EXPIRY_REAPER_ENROL_BATCH: int = 5
+    # Keep reaper routers' EXP deadlines in step when an expiry moves later
+    # outside a payment (outage compensation, admin edit, pairing):
+    # app/services/expiry_tag_sync.py. Only ever moves a deadline later.
+    EXPIRY_TAG_SYNC_ENABLED: bool = True
     # Router check-in delivery pilot (2026-09-26). The router POSTs the MACs of
     # its app-tagged bypass bindings to /api/router/checkin; the server answers
     # with the paid MACs it is missing. Off by default, and only routers listed

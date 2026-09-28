@@ -485,6 +485,7 @@ async def apply_outage_compensation(
         reprovision_item_ids = [i.id for i in new_items]
 
     owner_ids = list(owner_new_expiry.keys())
+    companion_ids: list[int] = []
     companions_updated = 0
     if owner_ids:
         # Companion devices share the owner's subscription — mirror the new
@@ -504,6 +505,7 @@ async def apply_outage_compensation(
         )
         for comp in companions:
             comp.expiry = owner_new_expiry[comp.subscription_owner_id]
+            companion_ids.append(comp.id)
             companions_updated += 1
 
         pairings = (
@@ -549,6 +551,14 @@ async def apply_outage_compensation(
     # still be dark. Each customer's outcome lands on its item row.
     if reprovision_item_ids:
         schedule_reprovision(reprovision_item_ids)
+    # Routers that remove their own expired customers hold each deadline in
+    # the binding; move the credited ones later (only ever later).
+    if owner_ids:
+        from app.services.expiry_tag_sync import schedule_expiry_tag_sync
+
+        schedule_expiry_tag_sync(
+            owner_ids + companion_ids, f"outage compensation run {run.id}"
+        )
 
     logger.info(
         "[OUTAGE-COMP] Reseller %s credited %s customer(s) %ss total for outage "
