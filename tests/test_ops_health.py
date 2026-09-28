@@ -740,7 +740,7 @@ async def test_ops_health_endpoint_reports_unknown_before_first_snapshot(db, cli
     assert body["overall_status"] == "unknown"
     assert body["generated_at"] is None and body["snapshot_age_seconds"] is None
     assert body["alerts"] == [] and body["sections"] == {}
-    assert body["history"] == {"points": []}
+    assert body["history"] == {"points": [], "router_names": {}}
 
 
 @pytest.mark.asyncio
@@ -761,3 +761,47 @@ async def test_ops_health_endpoint_serves_latest_snapshot_and_history(db, client
     history = (await client.get("/api/admin/ops-health/history?hours=1")).json()
     assert len(history["points"]) == 1
     assert (await client.get("/api/admin/ops-health/history?hours=0")).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# per-router breakdowns for the stacked graphs
+# ---------------------------------------------------------------------------
+
+def test_metrics_carry_per_router_breakdowns_for_the_graphs():
+    sections = {
+        "provisioning": {"counts": {"retry_pending": 9},
+                         "top_routers": [{"router_id": 486, "pending": 5}, {"router_id": 388, "pending": 3},
+                                         {"router_id": 525, "pending": 0}]},
+        "expiry": {"hot_routers": [{"router_id": 75, "customers": 23}, {"router_id": 396, "customers": 8}]},
+        "tunnels": {"counts": {"offline": 2}, "offline_router_ids": [157, 383]},
+    }
+    m = ops_health.metrics_from_sections(sections)
+    assert m["retry_by_router"] == {"486": 5, "388": 3}   # zero-pending routers dropped
+    assert m["expiry_hot_by_router"] == {"75": 23, "396": 8}
+    assert m["offline_router_ids"] == [157, 383]
+
+
+def test_router_ids_in_points_collects_every_breakdown():
+    points = [{"retry_by_router": {"486": 5}}, {"expiry_hot_by_router": {"75": 2}, "offline_router_ids": [157]},
+              {"t": "x"}]
+    assert ops_health.router_ids_in_points(points) == {486, 75, 157}
+
+
+@pytest.mark.asyncio
+async def test_expiry_and_tunnels_sections_name_the_routers_behind_the_numbers(db, now):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    busy = await make_router(db, reseller, last_status=True, last_checked_at=now, last_online_at=now)
+    down = await make_router(db, reseller, ip_address="10.0.0.3", last_status=False,
+                             last_checked_at=now, last_online_at=now - timedelta(hours=2))
+    for _ in range(3):
+        await make_customer(db, reseller, plan, busy, status=CustomerStatus.ACTIVE,
+                            expiry=now - timedelta(minutes=10))
+    await db.commit()
+
+    expiry = await ops_health.build_expiry_section(now)
+    assert expiry["hot_routers"] == [{"router_id": busy.id, "customers": 3}]
+    tunnels = await ops_health.build_tunnels_section(now)
+    assert tunnels["offline_router_ids"] == [down.id]
+    names = await ops_health.load_router_names({busy.id, down.id})
+    assert names == {str(busy.id): busy.name, str(down.id): down.name}
