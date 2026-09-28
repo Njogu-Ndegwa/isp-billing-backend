@@ -1062,8 +1062,17 @@ async def load_checkin_state(router_id: int, now: datetime) -> CheckinState:
             )
         ).all()
         await db.commit()
-    entries = []
+    # One entry per device: if a MAC has several ACTIVE unexpired rows on this
+    # router, deliver the one that runs longest. The binding's EXP tag comes
+    # from this expiry, and the router-side expiry reaper may act on it alone
+    # while it cannot reach the server, so it must never be the earlier one.
+    latest: dict[str, tuple] = {}
     for mac, expiry, speed in rows:
+        key = (mac or "").strip().upper().replace("-", ":")
+        if key not in latest or expiry > latest[key][1]:
+            latest[key] = (mac, expiry, speed)
+    entries = []
+    for mac, expiry, speed in latest.values():
         entry = desired_entry(mac, speed, expiry)
         if entry is None:
             logger.warning(
