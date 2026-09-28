@@ -1283,6 +1283,41 @@ async def resolve_b2b_payment_method(
     return None
 
 
+def payout_destination(
+    payment_method: ResellerPaymentMethod,
+    reseller: Optional[User],
+) -> tuple[str, str, str]:
+    """Return (party_b, account_reference, command_id) for paying a reseller.
+
+    The single source of truth for WHERE a reseller's money goes: the B2B
+    payout uses it, and direct settlement (app/services/direct_settlement.py)
+    uses it for the STK push's PartyB/AccountReference, so money collected
+    either way lands in exactly the same account.
+    """
+    method_type = payment_method.method_type
+    if isinstance(method_type, str):
+        method_type = ResellerPaymentMethodType(method_type)
+
+    command_id = "BusinessPayBill"
+    if method_type == ResellerPaymentMethodType.BANK_ACCOUNT:
+        party_b = payment_method.bank_paybill_number
+        account_ref = payment_method.bank_account_number or ""
+    elif method_type == ResellerPaymentMethodType.MPESA_PAYBILL:
+        party_b = payment_method.mpesa_paybill_number
+        account_ref = (reseller.organization_name or reseller.email)[:13] if reseller else ""
+    elif method_type == ResellerPaymentMethodType.MPESA_TILL:
+        # Buy Goods merchant till: different receiver type, no account.
+        party_b = payment_method.mpesa_till_number
+        account_ref = ""
+        command_id = "BusinessBuyGoods"
+    else:
+        raise ValueError(f"Payment method type {method_type} not eligible for B2B payout")
+
+    if not party_b:
+        raise ValueError("Payment method has no destination paybill/till number configured")
+    return party_b.strip(), account_ref, command_id
+
+
 # ---------------------------------------------------------------------------
 # Single-reseller payout (used by both manual trigger and daily job)
 # ---------------------------------------------------------------------------
@@ -1512,28 +1547,8 @@ async def payout_reseller(
     if balance < 1:
         raise ValueError("Balance must be at least KES 1")
 
-    method_type = payment_method.method_type
-    if isinstance(method_type, str):
-        method_type = ResellerPaymentMethodType(method_type)
-
-    command_id = "BusinessPayBill"
-    if method_type == ResellerPaymentMethodType.BANK_ACCOUNT:
-        party_b = payment_method.bank_paybill_number
-        account_ref = payment_method.bank_account_number or ""
-    elif method_type == ResellerPaymentMethodType.MPESA_PAYBILL:
-        party_b = payment_method.mpesa_paybill_number
-        reseller = await db.get(User, reseller_id)
-        account_ref = (reseller.organization_name or reseller.email)[:13] if reseller else ""
-    elif method_type == ResellerPaymentMethodType.MPESA_TILL:
-        # Buy Goods merchant till: different receiver type, no account.
-        party_b = payment_method.mpesa_till_number
-        account_ref = ""
-        command_id = "BusinessBuyGoods"
-    else:
-        raise ValueError(f"Payment method type {method_type} not eligible for B2B payout")
-
-    if not party_b:
-        raise ValueError("Payment method has no destination paybill/till number configured")
+    reseller = await db.get(User, reseller_id)
+    party_b, account_ref, command_id = payout_destination(payment_method, reseller)
 
     fee, _, _ = compute_fee_breakdown(balance)
 

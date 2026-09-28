@@ -40,7 +40,7 @@ async def test_system_collected_types_initiate_stk_push(db, monkeypatch, method_
     from app.services import mpesa as mpesa_service
     from app.services.payment_gateway import initiate_customer_payment
 
-    reseller = await make_reseller(db)
+    reseller = await make_reseller(db, settlement_mode="platform")
     router = await make_router(db, reseller)
     plan = await make_plan(db, reseller)
     customer = await make_customer(db, reseller, plan, router)

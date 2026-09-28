@@ -43,6 +43,14 @@ from app.services.mpesa_b2b import (
     resolve_b2b_payment_method,
     set_payout_frequency,
 )
+from app.services.direct_settlement import (
+    SETTLEMENT_DIRECT,
+    VALID_SETTLEMENT_MODES,
+    direct_destination,
+    direct_received_total,
+    get_settlement_mode,
+    set_settlement_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +296,10 @@ class PayoutSettingsUpdate(BaseModel):
     payout_interval_days: Optional[int] = None
 
 
+class SettlementModeUpdate(BaseModel):
+    settlement_mode: str
+
+
 def _serialize_withdrawal_txn(txn: B2BTransaction) -> dict:
     """Reseller-facing subset of a B2B transaction."""
     return {
@@ -334,6 +346,11 @@ async def get_reseller_payout_settings(
         fee, kadogo, net = 0, 0, 0
 
     cooldown_remaining = await _withdrawal_cooldown_remaining(db, user.id)
+    settlement_mode = await get_settlement_mode(db, user.id)
+    direct_target = (
+        direct_destination(pm, user) if pm is not None and pm.is_active else None
+    )
+    direct_received_30d = await direct_received_total(db, user.id, days=30)
 
     blocked_reason = None
     if unresolved is not None:
@@ -377,7 +394,52 @@ async def get_reseller_payout_settings(
         "can_withdraw": blocked_reason is None,
         "blocked_reason": blocked_reason,
         "pending_withdrawal": _serialize_withdrawal_txn(unresolved) if unresolved else None,
+        # 'direct': customer STK payments go straight into payment_method;
+        # 'platform': collected by the system paybill, paid out on schedule.
+        "settlement_mode": settlement_mode,
+        "direct_settlement_available": direct_target is not None,
+        "direct_received_30d": direct_received_30d,
     }
+
+
+@router.put("/api/reseller/settlement-mode")
+async def update_reseller_settlement_mode(
+    request: SettlementModeUpdate,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Choose how customer M-Pesa payments reach the reseller: 'direct' (STK
+    push pays their own paybill/till/bank immediately) or 'platform'
+    (collected by the system paybill, paid out by scheduled B2B). A balance
+    already collected keeps paying out on the existing schedule either way.
+    """
+    user = await _require_reseller(token, db)
+
+    mode = request.settlement_mode.strip().lower()
+    if mode not in VALID_SETTLEMENT_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"settlement_mode must be one of: {', '.join(VALID_SETTLEMENT_MODES)}",
+        )
+
+    if mode == SETTLEMENT_DIRECT:
+        pm = await resolve_b2b_payment_method(db, user.id)
+        if pm is None or not pm.is_active or direct_destination(pm, user) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Add an active M-Pesa paybill, till or bank account (with its "
+                    "account number) under Payment Methods before receiving "
+                    "payments directly."
+                ),
+            )
+
+    previous = await get_settlement_mode(db, user.id)
+    await set_settlement_mode(db, user.id, mode)
+    await db.commit()
+    logger.info("Reseller %s set settlement mode %s -> %s", user.id, previous, mode)
+    return {"settlement_mode": mode}
 
 
 @router.put("/api/reseller/payout-settings")

@@ -1084,6 +1084,7 @@
   "password_hash",
   "preferred_language",
   "role",
+  "settlement_mode",
   "subscription_expires_at",
   "subscription_price_override",
   "subscription_status",

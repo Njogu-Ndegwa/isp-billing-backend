@@ -2479,6 +2479,26 @@ async def run_international_subscription_migrations():
     logger.info("International subscription migrations complete")
 
 
+async def run_settlement_mode_migrations():
+    """Add users.settlement_mode ('platform' | 'direct').
+
+    Two steps, both idempotent. Creating the column backfills every account
+    that exists at the moment it first runs with 'platform' (unchanged
+    behaviour — they opt in to direct settlement themselves); the SET DEFAULT
+    then makes every account created afterwards default to 'direct'. On later
+    startups the create is a no-op (IF NOT EXISTS) and the SET DEFAULT
+    re-asserts the same value."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "ALTER TABLE users "
+            "ADD COLUMN IF NOT EXISTS settlement_mode VARCHAR(20) NOT NULL DEFAULT 'platform'"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE users ALTER COLUMN settlement_mode SET DEFAULT 'direct'"
+        ))
+    logger.info("Settlement mode migrations complete")
+
+
 async def run_pull_channel_migrations():
     """Add routers.pull_channel_enabled (bool, default false) for the outbound
     pull-provisioning channel. Opt-in per router; the command queue itself lives on
@@ -3110,6 +3130,11 @@ async def startup_event():
         await run_international_subscription_migrations()
     except Exception as e:
         logger.error(f"International subscription migration failed (non-fatal): {e}")
+
+    try:
+        await run_settlement_mode_migrations()
+    except Exception as e:
+        logger.error(f"CRITICAL: settlement mode migration failed: {e}")
 
     try:
         await run_feedback_migrations()

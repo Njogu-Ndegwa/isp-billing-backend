@@ -19,6 +19,24 @@ class StkPushResponse:
         self.checkout_request_id = checkout_request_id
         self.merchant_request_id = merchant_request_id
 
+
+class StkPushRejected(HTTPException):
+    """Safaricom answered the push request with an HTTP error status.
+
+    Still an HTTPException(500) so existing callers behave exactly as before;
+    ``safaricom_status`` lets a caller tell an explicit rejection (4xx / 500:
+    no prompt was sent, safe to retry another way) from a gateway failure
+    (502-504: the prompt may or may not have gone out).
+    """
+
+    def __init__(self, safaricom_status: int, detail: str):
+        super().__init__(status_code=500, detail=detail)
+        self.safaricom_status = safaricom_status
+
+    @property
+    def is_definite_rejection(self) -> bool:
+        return 400 <= self.safaricom_status <= 500
+
 async def get_access_token(
     consumer_key: Optional[str] = None,
     consumer_secret: Optional[str] = None,
@@ -52,7 +70,16 @@ async def initiate_stk_push_direct(
     consumer_secret: Optional[str] = None,
     callback_url: Optional[str] = None,
     account_reference: Optional[str] = None,
+    party_b: Optional[str] = None,
+    transaction_type: str = "CustomerPayBillOnline",
 ) -> Optional[StkPushResponse]:
+    """Raise an M-Pesa Express (STK) push.
+
+    ``party_b`` is the account the money lands in; it defaults to the signing
+    ``shortcode``. Direct settlement passes the reseller's own paybill, till
+    (with ``transaction_type="CustomerBuyGoodsOnline"``) or bank paybill here
+    while the system shortcode still signs the request.
+    """
     require_external_side_effects_enabled("M-Pesa STK push")
     try:
         access_token = await get_access_token(
@@ -71,10 +98,10 @@ async def initiate_stk_push_direct(
             "BusinessShortCode": active_shortcode,
             "Password": password,
             "Timestamp": timestamp,
-            "TransactionType": "CustomerPayBillOnline",
+            "TransactionType": transaction_type,
             "Amount": int(amount),
             "PartyA": phone_number,
-            "PartyB": active_shortcode,
+            "PartyB": party_b or active_shortcode,
             "PhoneNumber": phone_number,
             "CallBackURL": active_callback,
             "AccountReference": account_reference or reference,
@@ -111,7 +138,7 @@ async def initiate_stk_push_direct(
     except httpx.HTTPStatusError as e:
         error_msg = f"M-Pesa API returned {e.response.status_code}: {e.response.text}"
         logger.error(f"STK Push initiation failed: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"STK Push initiation failed: {error_msg}")
+        raise StkPushRejected(e.response.status_code, f"STK Push initiation failed: {error_msg}")
     except Exception as e:
         logger.error(f"STK Push initiation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"STK Push initiation failed: {str(e)}")

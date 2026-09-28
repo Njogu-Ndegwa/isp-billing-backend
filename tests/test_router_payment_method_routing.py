@@ -8,10 +8,11 @@ Two separate questions that are easy to conflate:
   * PAYOUT — which paybill/till the platform later sends the reseller's balance
     to. Resolved per RESELLER, and it does NOT look at the router assignment.
 
-The business rule these tests lock down: assigning a paybill or till to a
-router must NOT divert collection away from the platform shortcode. Only a
-reseller who has supplied their own Daraja API keys collects directly. Until
-then every shilling is collected by the platform and paid out afterwards.
+The business rule these tests lock down: for a reseller on PLATFORM
+settlement, assigning a paybill or till to a router must NOT divert
+collection away from the platform shortcode — every shilling is collected by
+the platform and paid out afterwards. (Resellers who opted into DIRECT
+settlement are covered by tests/test_direct_settlement.py.)
 """
 
 import pytest
@@ -146,7 +147,7 @@ async def test_assigned_paybill_or_till_does_not_collect_the_money(
     If this ever fails, customer money is landing in the reseller's account
     instead of the platform's, and the platform cannot reconcile or pay out.
     """
-    reseller = await make_reseller(db)
+    reseller = await make_reseller(db, settlement_mode="platform")
     pm = await make_payment_method(db, reseller, method_type, **fields)
     site = await make_router(db, reseller, payment_method_id=pm.id)
     plan = await make_plan(db, reseller, price=100)
@@ -212,7 +213,7 @@ async def test_only_a_reseller_with_daraja_keys_collects_directly(db, stk):
 
 async def test_two_routers_two_tills_both_still_collected_by_the_platform(db, stk):
     """The realistic setup: different tills per site, one collection account."""
-    reseller = await make_reseller(db)
+    reseller = await make_reseller(db, settlement_mode="platform")
     till_a = await make_payment_method(
         db, reseller, ResellerPaymentMethodType.MPESA_TILL,
         label="Till A", mpesa_till_number="1111111",

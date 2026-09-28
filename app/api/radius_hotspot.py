@@ -387,8 +387,8 @@ async def radius_register_and_pay(
             reference = f"RADIUS-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
             # Check if router has a configured payment method
-            from app.services.payment_gateway import resolve_router_payment_method, initiate_customer_payment
-            router_pm = await resolve_router_payment_method(db, request.router_id)
+            from app.services.payment_gateway import resolve_collection_payment_method, initiate_customer_payment
+            router_pm = await resolve_collection_payment_method(db, request.router_id)
 
             if router_pm:
                 try:
