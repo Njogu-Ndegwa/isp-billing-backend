@@ -36,6 +36,19 @@ logger = logging.getLogger(__name__)
 # How long a pending M-Pesa txn blocks a second STK push for the same customer
 DUP_GUARD_WINDOW = timedelta(minutes=3)
 
+
+def _settlement_of_mpesa(collection_mode) -> str:
+    """'direct' when the money went straight to the reseller's own account
+    (direct settlement / reseller Daraja keys), else 'platform' (collected on
+    the system paybill; NULL legacy rows are platform)."""
+    return "direct" if collection_mode == CollectionMode.DIRECT else "platform"
+
+
+def _settlement_of_c2b(business_shortcode) -> str:
+    from app.config import settings as _settings
+    return "platform" if str(business_shortcode or "") == str(_settings.MPESA_SHORTCODE) else "direct"
+
+
 router = APIRouter(tags=["payments"])
 
 
@@ -1150,11 +1163,16 @@ async def get_mpesa_transactions(
     status: Optional[str] = None,
     limit: int = 200,
     offset: int = 0,
+    settlement: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
     """
     Get all transactions (M-Pesa, voucher, cash, etc.) with filters.
+
+    ``settlement`` ('direct' | 'platform') narrows to M-Pesa money that went
+    straight to the reseller's own account vs. collected by the platform;
+    every M-Pesa row carries the same ``settlement`` field.
 
     Merges two sources:
     - mpesa_transactions (includes pending/failed M-Pesa)
@@ -1207,8 +1225,11 @@ async def get_mpesa_transactions(
         results = []
         mpesa_source_ids = []
         customer_payment_source_ids = []
+        if settlement is not None and settlement not in ("direct", "platform"):
+            raise HTTPException(status_code=400, detail="settlement must be direct or platform")
         want_mpesa = payment_method in (None, "mobile_money")
-        want_other = payment_method != "mobile_money"
+        # Settlement only describes M-Pesa money; cash/vouchers have none.
+        want_other = payment_method != "mobile_money" and settlement is None
 
         # --- Query 1: M-Pesa transactions (preserves pending/failed/expired) ---
         if want_mpesa:
@@ -1233,6 +1254,13 @@ async def get_mpesa_transactions(
                     mpesa_stmt = mpesa_stmt.where(MpesaTransaction.status == mpesa_status)
                 except ValueError:
                     pass
+            if settlement == "direct":
+                mpesa_stmt = mpesa_stmt.where(MpesaTransaction.collection_mode == CollectionMode.DIRECT)
+            elif settlement == "platform":
+                mpesa_stmt = mpesa_stmt.where(or_(
+                    MpesaTransaction.collection_mode.is_(None),
+                    MpesaTransaction.collection_mode != CollectionMode.DIRECT,
+                ))
 
             mpesa_stmt = (
                 mpesa_stmt
@@ -1259,6 +1287,7 @@ async def get_mpesa_transactions(
                     "lipay_tx_no": tx.lipay_tx_no,
                     "status": tx.status.value,
                     "payment_method": "mobile_money",
+                    "settlement": _settlement_of_mpesa(tx.collection_mode),
                     "payment_reference": tx.mpesa_receipt_number,
                     "mpesa_receipt_number": tx.mpesa_receipt_number,
                     "result_code": tx.result_code,
@@ -1433,6 +1462,17 @@ async def get_mpesa_transactions(
                         C2BTransactionStatus.UNMATCHED, C2BTransactionStatus.REJECTED,
                     ]))
 
+            if settlement is not None:
+                from app.config import settings as _settings
+                platform_sc = str(_settings.MPESA_SHORTCODE)
+                if settlement == "platform":
+                    c2b_stmt = c2b_stmt.where(C2BTransaction.business_shortcode == platform_sc)
+                else:
+                    c2b_stmt = c2b_stmt.where(or_(
+                        C2BTransaction.business_shortcode.is_(None),
+                        C2BTransaction.business_shortcode != platform_sc,
+                    ))
+
             c2b_stmt = (
                 c2b_stmt
                 .order_by(C2BTransaction.received_at.desc().nulls_last())
@@ -1451,6 +1491,7 @@ async def get_mpesa_transactions(
                     "lipay_tx_no": None,
                     "status": "completed" if tx.status == C2BTransactionStatus.PROCESSED else tx.status.value,
                     "payment_method": "mobile_money",
+                    "settlement": _settlement_of_c2b(tx.business_shortcode),
                     "payment_reference": tx.trans_id,
                     "mpesa_receipt_number": tx.trans_id,
                     "result_code": None,
@@ -1716,6 +1757,7 @@ async def get_mpesa_transactions_summary(
                     Router.name,
                     Router.id,
                     Plan.connection_type,
+                    MpesaTransaction.collection_mode,
                 )
                 .join(Customer, MpesaTransaction.customer_id == Customer.id)
                 .join(Router, Customer.router_id == Router.id, isouter=True)
@@ -1729,13 +1771,14 @@ async def get_mpesa_transactions_summary(
             if date_end:
                 mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at <= date_end)
 
-            for amount, tx_status, router_name, router_pk, connection_type in (
+            for amount, tx_status, router_name, router_pk, connection_type, collection_mode in (
                 await db.execute(mpesa_stmt)
             ).all():
                 rows.append({
                     "amount": float(amount),
                     "status": tx_status.value,
                     "method": "mobile_money",
+                    "settlement": _settlement_of_mpesa(collection_mode),
                     "router_name": router_name,
                     "router_id": router_pk,
                     "counts_as_revenue": True,
@@ -1843,10 +1886,26 @@ async def get_mpesa_transactions_summary(
         for ct in connection_type_breakdown:
             connection_type_breakdown[ct]["amount"] = round(connection_type_breakdown[ct]["amount"], 2)
 
+        # Where completed M-Pesa money went: straight to the reseller's own
+        # account ('direct') or collected by the platform ('platform').
+        settlement_breakdown: dict = {
+            "direct": {"count": 0, "amount": 0},
+            "platform": {"count": 0, "amount": 0},
+        }
+        for r in rows:
+            st = r.get("settlement")
+            if st not in settlement_breakdown or r["status"] != "completed":
+                continue
+            settlement_breakdown[st]["count"] += 1
+            settlement_breakdown[st]["amount"] += r["amount"]
+        for st in settlement_breakdown:
+            settlement_breakdown[st]["amount"] = round(settlement_breakdown[st]["amount"], 2)
+
         return {
             "total_transactions": total_transactions,
             "total_amount": total_amount,
             "compensation_total": compensation_total,
+            "settlement_breakdown": settlement_breakdown,
             "status_breakdown": status_breakdown,
             "method_breakdown": method_breakdown,
             "router_breakdown": router_breakdown,
