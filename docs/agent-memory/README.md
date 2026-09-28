@@ -25,4 +25,5 @@ Some failures in this project are cross-cutting: FastAPI request handlers, SQLAl
 - Router calls can be slow or hang when an edge device is overloaded, offline, or reachable over a weak management path.
 - DB sessions must not be held while waiting on MikroTik, payment-provider, or other slow network I/O.
 - Dashboard views should prefer cached/snapshot data and avoid live router calls unless the user explicitly requests diagnostics.
+- Expired hotspot customers are removed by the router itself on most routers (reaper), with the server job as backstop; see `../expiry-enforcement-architecture.md`.
 - RADIUS is preferred long-term for subscriber auth/accounting where practical; direct RouterOS API remains useful for router administration and non-RADIUS routers.

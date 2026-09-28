@@ -59,14 +59,24 @@ TUNNEL_REQUIRED_MARKERS = ("rb951", "rb750", "rb9", "hex lite", "map")
 BUSY_CPU_PERCENT = 90
 NTP_SERVER = "162.159.200.1"
 TUNNEL_SERVER_IP = "10.251.0.1"
-# How long a "server" decision stands before the router is looked at again.
-RECHECK_SMALL_BOARD = timedelta(days=7)
-RECHECK_TRANSIENT = timedelta(hours=2)
+# How long a decision stands before the router is looked at again.
+RECHECK_SMALL_BOARD = timedelta(days=7)     # hardware / needs a site visit
+RECHECK_SETUP = timedelta(hours=24)         # fixable remotely (tunnel, hotspot)
+RECHECK_TRANSIENT = timedelta(hours=2)      # unreachable, busy, clock pending
+RECHECK_NEW_ROUTER = timedelta(minutes=30)  # transient, router added < 48 h ago
+NEW_ROUTER_AGE = timedelta(hours=48)
+# At setup: the router calls /complete at the END of its setup script and its
+# tunnel may take a while to come up; the real-time push installer (started by
+# the same callback) goes first, so start a little later and retry (~20 min).
+SETUP_FIRST_DELAY_SECONDS = 150
+SETUP_RETRY_DELAYS_SECONDS = (120, 300, 600)
 # The script's first scheduled run happens within a minute of install.
 VERIFY_WAIT_SECONDS = 75
 
-# Reasons that describe the hardware or setup, not a passing condition.
-_PERMANENT_REASON_PREFIXES = ("small board", "RADIUS")
+# Reasons that describe the hardware or need someone on site.
+_PERMANENT_REASON_PREFIXES = ("small board", "RADIUS", "RouterOS", "scheduler add refused")
+# Reasons that describe setup we can fix remotely.
+_SETUP_REASON_PREFIXES = ("no tunnel route", "no hotspot")
 
 
 def classify_board(board_name: str | None, model: str | None) -> str:
@@ -104,9 +114,14 @@ def routeros_version_ok(version: str) -> bool:
     return major >= 7 or (major == 6 and minor >= 43)
 
 
-def recheck_after(reason: str | None) -> timedelta:
+def recheck_after(reason: str | None, created_at: Optional[datetime] = None,
+                  now: Optional[datetime] = None) -> timedelta:
     if reason and reason.startswith(_PERMANENT_REASON_PREFIXES):
         return RECHECK_SMALL_BOARD
+    if reason and reason.startswith(_SETUP_REASON_PREFIXES):
+        return RECHECK_SETUP
+    if created_at is not None and now is not None and now - created_at < NEW_ROUTER_AGE:
+        return RECHECK_NEW_ROUTER
     return RECHECK_TRANSIENT
 
 
@@ -135,18 +150,20 @@ class Outcome:
 # DB: candidates and results (short sessions only)
 # ---------------------------------------------------------------------------
 
-async def load_candidates(now: datetime, limit: int) -> list[Candidate]:
+async def load_candidates(now: datetime, limit: int, only_id: Optional[int] = None) -> list[Candidate]:
     """Routers not on the reaper, eligible to be looked at now, plus the
-    paid-up hotspot customers whose bindings get tagged at install."""
+    paid-up hotspot customers whose bindings get tagged at install.
+    ``only_id`` (the setup trigger) ignores the recheck window and last_status."""
     async with database.async_session() as db:
         rows = (await db.execute(
             select(Router.id, Router.name, Router.identity, Router.ip_address, Router.username,
                    Router.password, Router.port, Router.auth_method, Router.last_status,
                    Router.expiry_reaper_reason, Router.expiry_reaper_checked_at,
-                   User.subscription_status)
+                   Router.created_at, User.subscription_status)
             .outerjoin(User, User.id == Router.user_id)
             .where(Router.expiry_reaper_enabled.is_(False),
-                   Router.identity.isnot(None), Router.ip_address.isnot(None))
+                   Router.identity.isnot(None), Router.ip_address.isnot(None),
+                   *([Router.id == only_id] if only_id is not None else []))
             .order_by(Router.expiry_reaper_checked_at.is_(None).desc(),
                       Router.expiry_reaper_checked_at, Router.id)
         )).all()
@@ -157,11 +174,15 @@ async def load_candidates(now: datetime, limit: int) -> list[Candidate]:
             owner = getattr(r.subscription_status, "value", r.subscription_status)
             if owner is not None and owner not in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value):
                 continue
-            if r.last_status is False:
+            if r.id in _in_flight:
                 continue
-            checked = r.expiry_reaper_checked_at
-            if checked is not None and now - checked < recheck_after(r.expiry_reaper_reason):
-                continue
+            if only_id is None:
+                if r.last_status is False:
+                    continue
+                checked = r.expiry_reaper_checked_at
+                if checked is not None and now - checked < recheck_after(
+                        r.expiry_reaper_reason, r.created_at, now):
+                    continue
             picked.append(r)
             if len(picked) >= limit:
                 break
@@ -332,23 +353,19 @@ def verify_sync(c: Candidate, outcome: Outcome) -> Outcome:
 # ---------------------------------------------------------------------------
 
 _running = False
+# Router ids being enrolled right now (periodic job or setup trigger), so the
+# two never work on the same router at once.
+_in_flight: set[int] = set()
+_setup_tasks: set = set()
 
 
-async def expiry_reaper_enrol_background(*, now: Optional[datetime] = None) -> list[Outcome]:
-    global _running
-    if not settings.EXPIRY_REAPER_AUTO_ENROL or _running:
-        return []
-    from app.services.mikrotik_background import _background_db_pool_is_busy
-
-    if _background_db_pool_is_busy("REAPER-ENROL"):
-        return []
-    _running = True
+async def _enrol(candidates: list[Candidate], now: datetime) -> list[Outcome]:
+    """Probe/install each candidate, verify installs after one shared wait, and
+    record every decision. No DB session is open during router I/O."""
+    ids = {c.id for c in candidates}
+    _in_flight.update(ids)
     started = time.monotonic()
     try:
-        now = now or datetime.utcnow()
-        candidates = await load_candidates(now, settings.EXPIRY_REAPER_ENROL_BATCH)
-        if not candidates:
-            return []
         outcomes: dict[int, Outcome] = {}
         for c in candidates:
             try:
@@ -373,4 +390,61 @@ async def expiry_reaper_enrol_background(*, now: Optional[datetime] = None) -> l
         )
         return list(outcomes.values())
     finally:
+        _in_flight.difference_update(ids)
+
+
+async def expiry_reaper_enrol_background(*, now: Optional[datetime] = None) -> list[Outcome]:
+    """Periodic catch-all (every 30 min): new routers the setup trigger missed,
+    routers back online, reactivated resellers, fixed tunnels."""
+    global _running
+    if not settings.EXPIRY_REAPER_AUTO_ENROL or _running:
+        return []
+    from app.services.mikrotik_background import _background_db_pool_is_busy
+
+    if _background_db_pool_is_busy("REAPER-ENROL"):
+        return []
+    _running = True
+    try:
+        now = now or datetime.utcnow()
+        candidates = await load_candidates(now, settings.EXPIRY_REAPER_ENROL_BATCH)
+        if not candidates:
+            return []
+        return await _enrol(candidates, now)
+    finally:
         _running = False
+
+
+async def enrol_after_provisioning(router_id: int, *, sleep=asyncio.sleep) -> Optional[Outcome]:
+    """Enrol a router that has just finished onboarding. Never raises.
+
+    Retries while the result is undecided (tunnel not up yet, busy, clock not
+    confirmed); a decided router (installed, or server-side such as a hAP lite)
+    stops at once. Anything still undecided is left to the periodic job.
+    """
+    if not settings.EXPIRY_REAPER_AUTO_ENROL:
+        return None
+    outcome: Optional[Outcome] = None
+    try:
+        await sleep(SETUP_FIRST_DELAY_SECONDS)
+        for delay in (0,) + SETUP_RETRY_DELAYS_SECONDS:
+            if delay:
+                await sleep(delay)
+            candidates = await load_candidates(datetime.utcnow(), 1, only_id=router_id)
+            if not candidates:          # already enrolled, ineligible, or being enrolled by the job
+                return outcome
+            [outcome] = await _enrol(candidates, datetime.utcnow())
+            if outcome.mode is not None:
+                break
+    except Exception:  # noqa: BLE001 - background task: log, never raise
+        logger.exception("[REAPER-ENROL] setup enrolment for router %s failed", router_id)
+    return outcome
+
+
+def schedule_enrol_after_provisioning(router_id: int) -> None:
+    """Fire-and-forget from the provisioning /complete callback. Never raises."""
+    try:
+        task = asyncio.get_running_loop().create_task(enrol_after_provisioning(router_id))
+        _setup_tasks.add(task)
+        task.add_done_callback(_setup_tasks.discard)
+    except Exception:  # noqa: BLE001
+        logger.exception("[REAPER-ENROL] could not schedule setup enrolment for router %s", router_id)

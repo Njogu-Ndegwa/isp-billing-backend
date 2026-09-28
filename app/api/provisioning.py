@@ -282,6 +282,13 @@ async def complete_provision(
 
     schedule_install_after_provisioning(router_obj.id)
 
+    # Expiry removal: the router removes its own expired hotspot customers
+    # (reaper), or the server does for hAP lite class boards. Decided and
+    # installed in the background; the 30-min job catches anything missed.
+    from app.services.expiry_reaper_enrol import schedule_enrol_after_provisioning
+
+    schedule_enrol_after_provisioning(router_obj.id)
+
     return {
         "status": "provisioned",
         "router_id": router_obj.id,
