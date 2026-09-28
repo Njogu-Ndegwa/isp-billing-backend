@@ -56,12 +56,22 @@ the old script is the opt-out. No redeploy per batch.
   script — that killed `bitwave-command-agent`).
 - The endpoint's `now` is `time.monotonic()` (rate limiter) — never a DB time.
 
+## New routers (automatic, no cron)
+
+- When a router finishes setup (`/api/provision/{token}/complete`), or is created by hand (`POST /api/routers/create`), the server installs the push in the background (`app/services/realtime_push_installer.py`).
+  - It waits 60 s, then retries with growing gaps for about 8 h until the encrypted tunnel answers.
+  - hAP lite/mini are skipped, and so are routers with no working encrypted tunnel. There is **no HTTPS fallback any more**.
+  - First real auto-install: 542 Gnet #7 on 2026-09-28.
+- Each app start re-queues it once (3 min after start) for routers added in the last 24 h that aren't pushing. A deploy used to lose the pending in-memory install.
+- Kill switch: `REALTIME_PUSH_INSTALL_AT_SETUP=false`.
+- Dennis (2026-09-27): no scheduled sweep. Existing routers that missed it are covered by re-running the script over online, non-pushing routers.
+
 ## Tools
 
-- Install / update / roll back: `scripts/realtime_push_install.py`. Dry run unless `APPLY=1`.
+- Install / update / roll back: `scripts/realtime_push_install.py` (a wrapper around `app/services/realtime_push_installer.py`). Dry run unless `APPLY=1`.
   - `ROLLBACK=1` restores `bitwave-usage-push-prev` (kept on the router at install), or removes the push when there was none.
   - `SKIP_RUN=1` skips the first run over the API, so the scheduler's first tick sends it.
-  - It detects the WAN (active default route), refuses unencrypted tunnels and skips hAP lite/mini (see below).
+  - It detects the WAN (active default route), skips routers without a working encrypted tunnel (`FORCE_HTTPS=1` overrides) and skips hAP lite/mini (see below).
   - It prints one `RESULT` JSON line per router.
   - Always take the installer from `origin/main` after a merge: a stale copy put the push on a hAP lite (439) on 2026-09-26.
 
