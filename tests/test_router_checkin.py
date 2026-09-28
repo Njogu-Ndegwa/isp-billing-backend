@@ -498,7 +498,10 @@ def test_applier_validates_frame_before_any_change():
 
 def test_applier_matches_push_formats():
     src = _src()
-    assert 'comment=("USER:" . $ref . "|EXPIRES:DB_MANAGED|CHECKIN")' in src
+    # EXP:<unix second> is what the router-side expiry reaper enforces; the
+    # push writes it too (router_expiry.binding_comment).
+    assert 'comment=("USER:" . $ref . "|EXPIRES:DB_MANAGED|CHECKIN|EXP:" . $exp)' in src
+    assert ':set exp [:pick $ln ($ll - 23) ($ll - 13)]' in src
     assert "type=bypassed" in src
     assert ':local qn ("plan_" . $ref)' in src
     assert 'comment=("MAC:" . $mac . "|Plan rate limit")' in src
@@ -1436,3 +1439,23 @@ def test_delivered_router_returns_to_normal_cadence():
     n = svc.next_poll_seconds(lines_sent=0, payment_hot=False, router_id=10)
     assert svc.NORMAL_POLL_SECONDS - svc.NORMAL_POLL_JITTER_SECONDS <= n <= svc.NORMAL_POLL_SECONDS + svc.NORMAL_POLL_JITTER_SECONDS
     assert svc.next_poll_seconds(lines_sent=0, payment_hot=True, router_id=10) == svc.FAST_POLL_SECONDS
+
+
+def test_checkin_binding_exp_tag_matches_the_push_and_the_reaper():
+    """The A line's epoch is the push's rounded-UP expiry second, and the
+    applier's EXP tag round-trips through the reaper's parser (the same
+    offsets the applier validates: 10 digits before the ref)."""
+    import math
+    import re
+    from datetime import timezone
+    from app.services.router_expiry import expiry_second, binding_comment
+    expiry = datetime(2026, 9, 28, 12, 30, 15, 400000)       # sub-second: must round UP
+    e = svc.desired_entry("aa:bb:cc:00:00:01", "3M", expiry)
+    assert e.expiry_epoch == expiry_second(expiry) == math.ceil(expiry.replace(tzinfo=timezone.utc).timestamp())
+    line = svc.format_add_line(e)
+    ll = len(line)
+    exp = line[ll - 23:ll - 13]                                # exactly what the applier picks
+    comment = f"USER:{e.ref}|EXPIRES:DB_MANAGED|CHECKIN|EXP:{exp}"
+    push_exp = re.search(r"EXP:(\d+)", binding_comment(e.ref, expiry)).group(1)
+    assert re.search(r"EXP:(\d+)", comment).group(1) == push_exp
+    assert "CHECKIN" in comment                                 # c= reporting still finds it

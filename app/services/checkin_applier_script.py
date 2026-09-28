@@ -258,9 +258,11 @@ _TEMPLATE = r''':local url "__URL__"
                 :local mac [:pick $ln 2 19]
                 :local ref [:pick $ln ($ll - 12) $ll]
                 :local rate ""
+                :local exp ""
                 :local need false
                 :if ($kind = "A") do={
                     :set rate [:pick $ln 20 ($ll - 24)]
+                    :set exp [:pick $ln ($ll - 23) ($ll - 13)]
                     :if ([:len [/ip hotspot ip-binding find where mac-address=$mac]] = 0) do={
                         :set need true
                     } else={
@@ -299,7 +301,7 @@ _TEMPLATE = r''':local url "__URL__"
                     :local added false
                     :if ($kind = "A") do={
                         :do {
-                            /ip hotspot ip-binding add mac-address=$mac type=bypassed comment=("USER:" . $ref . "|EXPIRES:DB_MANAGED|CHECKIN")
+                            /ip hotspot ip-binding add mac-address=$mac type=bypassed comment=("USER:" . $ref . "|EXPIRES:DB_MANAGED|CHECKIN|EXP:" . $exp)
                             :set added true
                         } on-error={ :log warning ("checkin: bypass add failed " . $mac) }
                     }

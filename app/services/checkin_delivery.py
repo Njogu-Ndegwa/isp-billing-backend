@@ -122,6 +122,7 @@ from app.db.models import (
     RouterAuthMethod,
 )
 from app.services.mikrotik_api import parse_speed_to_mikrotik
+from app.services.router_expiry import expiry_second
 
 logger = logging.getLogger(__name__)
 
@@ -627,7 +628,10 @@ def desired_entry(mac_address: str, speed: str, expiry: datetime) -> Optional[De
     rate = parse_speed_to_mikrotik(speed or "")
     if not rate or not _RATE_RE.match(rate):
         return None
-    epoch = calendar.timegm(expiry.utctimetuple())
+    # The router-side expiry reaper enforces this exact value from the binding's
+    # EXP: tag, which the applier writes: the same rounded-UP second the API push
+    # writes (router_expiry.expiry_second), so the router is never early.
+    epoch = expiry_second(expiry)
     if not _EPOCH_RE.match(str(epoch)):
         return None
     return DesiredEntry(mac=mac, rate=rate, expiry_epoch=epoch, ref=mac.replace(":", ""))
