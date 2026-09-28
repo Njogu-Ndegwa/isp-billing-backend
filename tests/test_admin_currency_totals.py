@@ -362,3 +362,29 @@ async def test_reseller_daily_transactions_stay_in_their_currency(db, client, mo
     daily = (await client.get("/api/dashboard/transactions-daily?period=7d")).json()
     assert daily["currency"] == "XAF"
     assert daily["totals"]["revenue"] == 5_710
+
+
+@pytest.mark.asyncio
+async def test_dashboard_unpaid_excludes_direct_settled_money(db, client, monkeypatch):
+    """Direct-settled M-Pesa is revenue, but the platform never held it, so it
+    is not owed: total_unpaid must match the payout formula, not all M-Pesa."""
+    from app.db.models import CollectionMode
+
+    admin = await make_admin(db)
+    reseller = await make_reseller(db, subscription_status=SubscriptionStatus.ACTIVE)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    customer = await make_customer(db, reseller, plan)
+    for amount, mode in ((300.0, CollectionMode.SYSTEM_COLLECTED), (50.0, CollectionMode.DIRECT)):
+        db.add(CustomerPayment(
+            customer_id=customer.id, reseller_id=reseller.id, amount=amount,
+            payment_method=PaymentMethod.MOBILE_MONEY, days_paid_for=1,
+            status=PaymentStatus.COMPLETED, collection_mode=mode,
+            created_at=_recently(),
+        ))
+    await db.commit()
+    _auth_as(monkeypatch, admin)
+
+    dashboard = (await client.get("/api/admin/dashboard")).json()
+    assert dashboard["revenue"]["all_time_mpesa"] == 350.0
+    assert dashboard["payouts"]["total_unpaid"] == 300.0
+    assert dashboard["payouts"]["direct_settled"] == 50.0

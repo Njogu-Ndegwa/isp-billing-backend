@@ -26,6 +26,7 @@ from app.db.models import (
     SubscriptionShareCode, C2BTransaction, UnmatchedC2BPayment,
     SmsCreditAccount, SmsCreditTransaction, SmsCreditOrder, MessageTemplate,
     SmsCampaign, SmsMessage, ResellerInboxMessage,
+    CollectionMode, PaymentStatus,
 )
 from app.services.auth import verify_token, get_current_user, pwd_context
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer, remove_sstp_peer
@@ -1317,7 +1318,21 @@ async def admin_dashboard(
         .outerjoin(User, User.id == ResellerTransactionCharge.reseller_id)
     )).scalar())
 
-    total_unpaid = round(all_time_mpesa_revenue - total_payouts - total_charges, 2)
+    # What the platform still owes resellers: only money it actually collected
+    # (PAYOUT_REVENUE_FILTERS, same as the B2B payout job). DIRECT payments —
+    # direct settlement, reseller Daraja keys, C2B to a reseller shortcode —
+    # never touched the platform paybill, so they are revenue but not owed.
+    platform_collected_revenue = float((await db.execute(
+        _cp_kes_select(func.coalesce(func.sum(_cp_kes()), 0)).where(*PAYOUT_REVENUE_FILTERS)
+    )).scalar())
+    direct_settled_revenue = round(float((await db.execute(
+        _cp_kes_select(func.coalesce(func.sum(_cp_kes()), 0)).where(
+            MPESA_FILTER,
+            CustomerPayment.status == PaymentStatus.COMPLETED,
+            CustomerPayment.collection_mode == CollectionMode.DIRECT,
+        )
+    )).scalar()), 2)
+    total_unpaid = round(platform_collected_revenue - total_payouts - total_charges, 2)
 
     # B2B payout totals
     b2b_total_sent = float((await db.execute(
@@ -1440,6 +1455,8 @@ async def admin_dashboard(
             "total_paid": total_payouts,
             "total_transaction_charges": total_charges,
             "total_unpaid": total_unpaid,
+            # M-Pesa revenue that settled straight to resellers (not owed).
+            "direct_settled": direct_settled_revenue,
         },
         "b2b_payouts": {
             "total_sent": round(b2b_total_sent, 2),
