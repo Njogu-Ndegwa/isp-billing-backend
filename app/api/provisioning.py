@@ -282,6 +282,13 @@ async def complete_provision(
 
     schedule_install_after_provisioning(router_obj.id)
 
+    # Standard runtime (check-in applier + management-tunnel watchdog): installed
+    # right away, retried briefly while the tunnel comes up; the 15-min job is
+    # the safety net for anything still missing.
+    from app.services.standard_runtime_enrol import schedule_install_after_registration
+
+    schedule_install_after_registration(router_obj.id)
+
     return {
         "status": "provisioned",
         "router_id": router_obj.id,
