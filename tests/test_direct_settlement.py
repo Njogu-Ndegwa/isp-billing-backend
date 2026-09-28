@@ -50,7 +50,7 @@ from tests.factories import make_customer, make_plan, make_reseller, make_router
 
 pytestmark = pytest.mark.asyncio
 
-EQUITY_ACCOUNT = "1520186200177"  # 13 digits — over the documented 12
+EQUITY_ACCOUNT = "1234567890123"  # 13 digits — over the documented 12
 
 
 async def make_method(db, reseller, method_type, **fields):
@@ -124,13 +124,13 @@ async def test_new_reseller_defaults_to_direct(db):
 async def test_direct_till_pays_the_till_with_buy_goods(db, stk):
     reseller = await make_reseller(db, settlement_mode=SETTLEMENT_DIRECT)
     pm = await make_method(db, reseller, ResellerPaymentMethodType.MPESA_TILL,
-                           mpesa_till_number="4760943")
+                           mpesa_till_number="5550001")
 
     result = await _pay(db, reseller, pm)
 
     assert result["collection_mode"] == CollectionMode.DIRECT
     call = stk.calls[-1]
-    assert call["party_b"] == "4760943"
+    assert call["party_b"] == "5550001"
     assert call["transaction_type"] == "CustomerBuyGoodsOnline"
     assert call["account_reference"] == "Test ISP"
     # Signed by the SYSTEM credentials — no reseller shortcode/keys.
@@ -155,12 +155,12 @@ async def test_direct_paybill_uses_the_payout_account_reference(db, stk):
     reseller = await make_reseller(db, settlement_mode=SETTLEMENT_DIRECT,
                                    organization_name="Loooooong Networks Ltd")
     pm = await make_method(db, reseller, ResellerPaymentMethodType.MPESA_PAYBILL,
-                           mpesa_paybill_number=" 4188503 ")
+                           mpesa_paybill_number=" 5550002 ")
 
     await _pay(db, reseller, pm)
 
     call = stk.calls[-1]
-    assert call["party_b"] == "4188503"
+    assert call["party_b"] == "5550002"
     # Same reference the B2B payout sends to this paybill.
     assert call["account_reference"] == "Loooooong Networks Ltd"[:13]
 
@@ -180,7 +180,7 @@ async def test_bank_without_account_number_is_platform_collected(db, stk):
 async def test_platform_reseller_is_unchanged(db, stk):
     reseller = await make_reseller(db, settlement_mode=SETTLEMENT_PLATFORM)
     pm = await make_method(db, reseller, ResellerPaymentMethodType.MPESA_TILL,
-                           mpesa_till_number="4760943")
+                           mpesa_till_number="5550001")
 
     result = await _pay(db, reseller, pm)
 
@@ -195,12 +195,12 @@ async def test_rejected_party_b_falls_back_to_platform_collection(db, monkeypatc
     monkeypatch.setattr(mpesa_service, "initiate_stk_push_direct", spy)
     reseller = await make_reseller(db, settlement_mode=SETTLEMENT_DIRECT)
     pm = await make_method(db, reseller, ResellerPaymentMethodType.MPESA_TILL,
-                           mpesa_till_number="4760943")
+                           mpesa_till_number="5550001")
 
     result = await _pay(db, reseller, pm)
 
     assert len(spy.calls) == 2
-    assert spy.calls[0]["party_b"] == "4760943"
+    assert spy.calls[0]["party_b"] == "5550001"
     assert spy.calls[1].get("party_b") is None
     assert result["collection_mode"] == CollectionMode.SYSTEM_COLLECTED
     assert (await _txn(db, result["checkout_request_id"])).collection_mode == CollectionMode.SYSTEM_COLLECTED
@@ -214,7 +214,7 @@ async def test_gateway_failure_is_not_retried(db, monkeypatch):
     monkeypatch.setattr(mpesa_service, "initiate_stk_push_direct", spy)
     reseller = await make_reseller(db, settlement_mode=SETTLEMENT_DIRECT)
     pm = await make_method(db, reseller, ResellerPaymentMethodType.MPESA_TILL,
-                           mpesa_till_number="4760943")
+                           mpesa_till_number="5550001")
 
     with pytest.raises(StkPushRejected):
         await _pay(db, reseller, pm)
@@ -247,7 +247,7 @@ async def test_unassigned_router_stays_legacy_when_platform(db):
 async def test_unassigned_router_ignores_inactive_default_method(db):
     reseller = await make_reseller(db, settlement_mode=SETTLEMENT_DIRECT)
     pm = await make_method(db, reseller, ResellerPaymentMethodType.MPESA_TILL,
-                           mpesa_till_number="4760943")
+                           mpesa_till_number="5550001")
     pm.is_active = False
     await db.commit()
     site = await make_router(db, reseller)
@@ -313,7 +313,7 @@ async def test_opting_in_requires_an_eligible_method(db, client, monkeypatch):
     assert resp.status_code == 400
 
     await make_method(db, reseller, ResellerPaymentMethodType.MPESA_TILL,
-                      mpesa_till_number="4760943")
+                      mpesa_till_number="5550001")
     resp = await client.put("/api/reseller/settlement-mode", json={"settlement_mode": "direct"})
     assert resp.status_code == 200 and resp.json()["settlement_mode"] == "direct"
 
