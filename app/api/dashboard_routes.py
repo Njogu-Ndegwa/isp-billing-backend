@@ -1422,6 +1422,7 @@ async def get_reseller_account_statement(
 
     date_filters_payout: list = [ResellerPayout.reseller_id == reseller_id]
     date_filters_charge: list = [ResellerTransactionCharge.reseller_id == reseller_id]
+    date_filters_payment: list = []
 
     if start_date:
         try:
@@ -1430,6 +1431,7 @@ async def get_reseller_account_statement(
             raise HTTPException(status_code=400, detail="Invalid start_date format, use YYYY-MM-DD")
         date_filters_payout.append(ResellerPayout.created_at >= sd)
         date_filters_charge.append(ResellerTransactionCharge.created_at >= sd)
+        date_filters_payment.append(CustomerPayment.created_at >= sd)
     if end_date:
         try:
             ed = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
@@ -1437,6 +1439,7 @@ async def get_reseller_account_statement(
             raise HTTPException(status_code=400, detail="Invalid end_date format, use YYYY-MM-DD")
         date_filters_payout.append(ResellerPayout.created_at < ed)
         date_filters_charge.append(ResellerTransactionCharge.created_at < ed)
+        date_filters_payment.append(CustomerPayment.created_at < ed)
 
     # All-time M-Pesa revenue (system-collected). Uses the SAME canonical
     # filters as the payout engine (app/services/mpesa_b2b.py) so the balance
@@ -1475,6 +1478,35 @@ async def get_reseller_account_statement(
     unpaid_balance = round(
         all_time_mpesa + balance_correction - total_paid - total_charges, 2
     )
+
+    # M-Pesa that went straight into the reseller's own paybill/till/bank
+    # (direct settlement or their own Daraja keys). Never part of the balance
+    # above — shown so the reseller sees both halves of their money.
+    from app.db.models import CollectionMode
+
+    def _direct_filters():
+        return [
+            CustomerPayment.reseller_id == reseller_id,
+            CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY,
+            CustomerPayment.status == PaymentStatus.COMPLETED,
+            CustomerPayment.counts_as_revenue == True,  # noqa: E712
+            CustomerPayment.collection_mode == CollectionMode.DIRECT,
+        ]
+
+    total_direct = float((await db.execute(
+        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*_direct_filters())
+    )).scalar())
+    period_direct = float((await db.execute(
+        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+            *_direct_filters(), *date_filters_payment
+        )
+    )).scalar())
+    period_collected = float((await db.execute(
+        select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
+            CustomerPayment.reseller_id == reseller_id, *PAYOUT_REVENUE_FILTERS,
+            *date_filters_payment,
+        )
+    )).scalar())
 
     # Fetch payouts in date range
     payouts_result = await db.execute(
@@ -1534,11 +1566,15 @@ async def get_reseller_account_statement(
             "total_transaction_charges": total_charges,
             "balance_correction": balance_correction,
             "unpaid_balance": unpaid_balance,
+            # Paid straight into the reseller's own account — not owed.
+            "total_direct_received": round(total_direct, 2),
         },
         "period_summary": {
             "total_payouts": round(period_payouts, 2),
             "total_charges": round(period_charges, 2),
             "net": round(period_payouts - period_charges, 2),
+            "direct_received": round(period_direct, 2),
+            "system_collected": round(period_collected, 2),
         },
         "page": page,
         "per_page": per_page,
