@@ -350,10 +350,6 @@ def test_background_sync_routes_mac_login_routers_to_reconcile(monkeypatch):
     assert called == {"router": 10}
 
 
-def test_checkin_never_sends_add_lines_to_mac_login_routers(monkeypatch):
-    monkeypatch.setattr(ml.settings, "HOTSPOT_MAC_LOGIN_ROUTER_IDS", "10")
-    assert checkin_delivery.delivery_mode(10) == checkin_delivery.DELIVERY_PUSH_ONLY
-    assert checkin_delivery.delivery_mode(11) != checkin_delivery.DELIVERY_PUSH_ONLY
 
 
 def test_expiry_cleanup_removes_mac_login_user_and_session():

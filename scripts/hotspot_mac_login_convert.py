@@ -38,7 +38,9 @@ from sqlalchemy.orm import selectinload
 
 from app.db.database import async_engine, async_session
 from app.db.models import ConnectionType, Customer, CustomerStatus, Plan, Router
+from app.config import settings
 from app.services import hotspot_mac_login as ml
+from app.services.checkin_applier_script import SCRIPT_NAME as CHECKIN_SCRIPT, install_checkin_applier
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 
 ROUTER_ID = int(os.environ["ROUTER_ID"])
@@ -59,7 +61,7 @@ async def load():
         if router is None:
             raise SystemExit(f"router {ROUTER_ID} not found")
         info = {
-            "id": router.id, "name": router.name, "ip": router.ip_address,
+            "id": router.id, "name": router.name, "ip": router.ip_address, "identity": router.identity,
             "username": router.username, "password": router.password, "port": router.port,
         }
         rows = (await db.execute(
@@ -152,6 +154,16 @@ def main():
                                  "kick": res.get("kick_result")})
             out("fasttrack flush", ml.flush_fasttracked_connections(api))
             out("failures", failures)
+            # Check-in applier v2 reports MAC-login users and applies U lines,
+            # so the check-in keeps delivering on this router when its
+            # management tunnel is down. Only upgraded where one is installed
+            # (small boards never get the applier).
+            scripts = data(api.send_command("/system/script/print"))
+            if any(s.get("name") == CHECKIN_SCRIPT for s in scripts) and info.get("identity"):
+                out("check-in applier upgrade", install_checkin_applier(
+                    api, identity=info["identity"], endpoint_url=settings.CHECKIN_ENDPOINT_URL))
+            else:
+                out("check-in applier upgrade", "not installed on this router, skipped")
 
         if MODE == "revert":
             for c in customers:

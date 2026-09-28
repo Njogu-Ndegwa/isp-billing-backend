@@ -492,8 +492,10 @@ def test_applier_validates_frame_before_any_change():
     for check in ('= "BWE1,")', '($ln = "END")', "($cnt = $want)", ":set frameOk true",
                   ":if ($frameOk && ($want > 0))"):
         assert src.index(check) < first_write, check
-    # Kicks happen only after a NEW binding was added.
-    assert src.index(":if ($added)") < src.index("/ip hotspot host remove")
+    # Kicks happen only after a NEW binding (A) or NEW MAC-login user (U) was added.
+    u_block = src[src.index(':if ($kind = "U") do={'):src.index(':if ($kind = "Q") do={')]
+    assert u_block.index(":if ($uadded)") < u_block.index("/ip hotspot host remove")
+    assert src.index(":if ($added)") < src.rindex("/ip hotspot host remove")
 
 
 def test_applier_matches_push_formats():
@@ -1080,7 +1082,7 @@ def test_applier_reports_bindings_without_queue():
     assert ':if ($qOk) do={ :set post ($post . "&q=" . $qmacs) }' in src
     assert "http-data=$post" in src
     # The report still carries n= and macs= exactly as before (old servers).
-    assert '("v=1&id=" . $ident . "&n=" . $n . "&macs=" . $macs)' in src
+    assert '("v=2&id=" . $ident . "&n=" . $n . "&macs=" . $macs)' in src
 
 
 def test_applier_queue_checks_only_checkin_bindings():
@@ -1121,7 +1123,7 @@ def test_applier_q_line_only_queues_checkin_bindings_that_lack_a_queue():
     assert src.count("/queue simple add name=$qn") == 1
     assert ':if ($added || ($kind = "Q")) do={' in src
     # The IP is looked up before the kick removes the hotspot host entry.
-    assert src.index("/ip hotspot host get $h address") < src.index("/ip hotspot host remove")
+    assert src.index("/ip hotspot host get $h address") < src.rindex("/ip hotspot host remove")
     # A Q line never adds or kicks anything.
     assert src.index(':if ($kind = "A") do={\n                        :do {\n                            /ip hotspot ip-binding add') > 0
 
@@ -1396,7 +1398,7 @@ def test_applier_post_field_order_and_back_compat():
     # macs first (unchanged for old servers), o= last: a truncated tail can only
     # shorten the advisory list, never c= or q=.
     assert post.index("&q=") < post.index("&c=") < post.index("&o=")
-    assert '("v=1&id=" . $ident . "&n=" . $n . "&macs=" . $macs)' in post
+    assert '("v=2&id=" . $ident . "&n=" . $n . "&macs=" . $macs)' in post
     # A full o= plus a busy router's macs= stays far below the server cap.
     assert 18 * (MAX_OTHER_MACS + 600) < svc.MAX_BODY_BYTES
 

@@ -54,6 +54,14 @@ Per run:
    dhcp lease), create the queue exactly as the ``A`` path does. No IP yet
    means nothing happens; the server offers it again on a later check-in.
 6. Set its own scheduler interval to the header's ``next_s`` (5..3600).
+
+Version 2 (``v=2``, 2026-09-29) adds MAC login (``hotspot_mac_login``): the
+MACs of hotspot users tagged ``MACLOGIN`` are reported with the bindings (and
+in ``c=`` when tagged ``CHECKIN``), and ``U,<mac>,<rate>,<exp>,<t>`` lines make
+such a user (profile ``plan_<rate>`` with that rate-limit, ``T:``/``EXP:`` tags)
+when the MAC has no user yet, drop its tagged bypass binding and kick it so it
+logs in by MAC. The server only sends U lines to MAC-login routers, and never
+sends them (or A lines) to a MAC-login router whose applier is still v1.
 """
 
 from __future__ import annotations
@@ -129,6 +137,26 @@ _TEMPLATE = r''':local url "__URL__"
             }
         }
     } on-error={ :set readOk false }
+    # v2: MAC-login users (hotspot users tagged MACLOGIN, named after the MAC)
+    # are this app's access on MAC-login routers; report them like bindings so
+    # the server sees them as delivered. "^MACLOGIN": "|" is regex alternation.
+    :do {
+        :foreach u in=[/ip hotspot user find where comment~"^MACLOGIN"] do={
+            :local um [:tostr [/ip hotspot user get $u name]]
+            :if ([:len $um] = 17) do={
+                :if ($n > 0) do={ :set macs ($macs . ",") }
+                :set macs ($macs . $um)
+                :set n ($n + 1)
+                :local uc ""
+                :do { :set uc [:tostr [/ip hotspot user get $u comment]] } on-error={ :set cOk false }
+                :if ([:typeof [:find $uc "CHECKIN"]] = "num") do={
+                    :if ($nc > 0) do={ :set cmacs ($cmacs . ",") }
+                    :set cmacs ($cmacs . $um)
+                    :set nc ($nc + 1)
+                }
+            }
+        }
+    } on-error={ :set readOk false }
     # Other usable bindings (no USER: tag: legacy, agent or reseller ones), so
     # the server never offers an add the applier would refuse. One find, and
     # no per-binding read once the cap is reached.
@@ -144,7 +172,7 @@ _TEMPLATE = r''':local url "__URL__"
             }
         }
     } on-error={ :set oOk false }
-    :local post ("v=1&id=" . $ident . "&n=" . $n . "&macs=" . $macs)
+    :local post ("v=2&id=" . $ident . "&n=" . $n . "&macs=" . $macs)
     :if ($qOk) do={ :set post ($post . "&q=" . $qmacs) }
     :if ($cOk) do={ :set post ($post . "&c=" . $cmacs) }
     :if ($oOk) do={ :set post ($post . "&o=" . $omacs) }
@@ -225,6 +253,19 @@ _TEMPLATE = r''':local url "__URL__"
                         }
                     }
                 }
+                :if (($ll >= 45) && ($ll <= 80)) do={
+                    :if (([:pick $ln 0 2] = "U,") && ([:pick $ln 19 20] = ",") && ([:pick $ln ($ll - 22) ($ll - 21)] = ",") && ([:pick $ln ($ll - 11) ($ll - 10)] = ",")) do={
+                        :local vm [:pick $ln 2 19]
+                        :local vr [:pick $ln 20 ($ll - 22)]
+                        :local ve [:tonum [:pick $ln ($ll - 21) ($ll - 11)]]
+                        :local vt [:tonum [:pick $ln ($ll - 10) $ll]]
+                        :if (([:pick $vm 2 3] = ":") && ([:pick $vm 5 6] = ":") && ([:pick $vm 8 9] = ":") && ([:pick $vm 11 12] = ":") && ([:pick $vm 14 15] = ":")) do={
+                            :if (([:typeof [:find $vr "/"]] = "num") && ([:typeof [:find $vr ","]] != "num") && ([:typeof $ve] = "num") && ([:typeof $vt] = "num")) do={
+                                :set ok true
+                            }
+                        }
+                    }
+                }
                 :if ($ok) do={ :set cnt ($cnt + 1) } else={ :set bad true }
             }
         }
@@ -267,6 +308,35 @@ _TEMPLATE = r''':local url "__URL__"
                         :set need true
                     } else={
                         :log info ("checkin: " . $mac . " already has a binding, left alone")
+                    }
+                }
+                :if ($kind = "U") do={
+                    # MAC login: a hotspot user named after the MAC on the
+                    # plan's rate-limited profile; RouterOS makes the queue.
+                    :local urate [:pick $ln 20 ($ll - 22)]
+                    :local uexp [:pick $ln ($ll - 21) ($ll - 11)]
+                    :local uts [:pick $ln ($ll - 10) $ll]
+                    :if ([:len [/ip hotspot user find where name=$mac]] = 0) do={
+                        :local sl [:find $urate "/"]
+                        :local pn ("plan_" . [:pick $urate 0 $sl] . "_" . [:pick $urate ($sl + 1) [:len $urate]])
+                        :local uadded false
+                        :do {
+                            :if ([:len [/ip hotspot user profile find where name=$pn]] = 0) do={
+                                /ip hotspot user profile add name=$pn rate-limit=$urate
+                            }
+                            /ip hotspot user add name=$mac password="" mac-address=$mac profile=$pn comment=("MACLOGIN|MAC:" . $mac . "|T:" . $uts . "|EXP:" . $uexp . "|CHECKIN")
+                            :set uadded true
+                        } on-error={ :log warning ("checkin: mac-login add failed " . $mac) }
+                        :if ($uadded) do={
+                            :do {
+                                :foreach b in=[/ip hotspot ip-binding find where mac-address=$mac type=bypassed comment~"USER:"] do={ /ip hotspot ip-binding remove $b }
+                            } on-error={}
+                            :do { /ip hotspot active remove [find where mac-address=$mac] } on-error={}
+                            :do { /ip hotspot host remove [find where mac-address=$mac] } on-error={}
+                            :log info ("checkin: mac-login " . $mac)
+                        }
+                    } else={
+                        :log info ("checkin: " . $mac . " already has a user, left alone")
                     }
                 }
                 :if ($kind = "Q") do={
