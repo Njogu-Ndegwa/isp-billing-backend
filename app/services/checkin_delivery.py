@@ -215,6 +215,16 @@ _ADD_LINE_RE = re.compile(
     r"^A,(?:[0-9A-F]{2}:){5}[0-9A-F]{2}," + _RATE_PART + "/" + _RATE_PART
     + r",\d{10},[0-9A-F]{12}$"
 )
+# ``U,<mac>,<rate>,<expiry epoch>,<server epoch>``: make a MAC-login user
+# (applier v2). The server epoch becomes the user's T: tag, which the
+# MAC-login reconcile uses for its payment-in-flight grace.
+_USER_LINE_RE = re.compile(
+    r"^U,(?:[0-9A-F]{2}:){5}[0-9A-F]{2}," + _RATE_PART + "/" + _RATE_PART
+    + r",\d{10},\d{10}$"
+)
+# Applier versions: 1 = bypass bindings only; 2 = also reports MAC-login users
+# and applies U lines.
+APPLIER_VERSION_MAC_LOGIN = 2
 _QUEUE_LINE_RE = re.compile(
     r"^Q,(?:[0-9A-F]{2}:){5}[0-9A-F]{2}," + _RATE_PART + "/" + _RATE_PART
     + r",[0-9A-F]{12}$"
@@ -374,10 +384,6 @@ def delivery_mode(router_id: Optional[int]) -> str:
     if router_id is None:
         return DELIVERY_BOTH
     rid = int(router_id)
-    if mac_login_enabled(rid):
-        # MAC-login routers get no bypass bindings at all; an A line would
-        # put one back (and the unlimited static-queue path with it).
-        return DELIVERY_PUSH_ONLY
     push_only = rid in push_only_router_ids()
     checkin_only = rid in checkin_only_router_ids()
     if push_only and not checkin_only:
@@ -447,6 +453,8 @@ class CheckinReport:
     # for A-line decisions, never "unknown", never credited to the check-in.
     others: frozenset[str] = frozenset()
     reports_others: bool = False
+    # ``v=``: 2 = the applier also reports MAC-login users and understands U lines.
+    version: int = 1
 
     @property
     def count_matches(self) -> bool:
@@ -531,6 +539,8 @@ def parse_checkin_body(raw: bytes) -> CheckinReport:
     )
     reports_others = "o" in fields
     others = _mac_set(fields.get("o", ""), MAX_REPORTED_OTHERS) if reports_others else set()
+    v_raw = fields.get("v", "")
+    version = int(v_raw) if v_raw.isdigit() and len(v_raw) <= 3 else 1
     return CheckinReport(
         identity=identity,
         declared_count=declared,
@@ -543,6 +553,7 @@ def parse_checkin_body(raw: bytes) -> CheckinReport:
         reports_checkin_added=reports_checkin_added,
         others=frozenset(others),
         reports_others=reports_others,
+        version=version,
     )
 
 
@@ -569,6 +580,21 @@ def format_add_line(entry: DesiredEntry) -> Optional[str]:
     return line if _ADD_LINE_RE.match(line) else None
 
 
+def format_user_line(entry: DesiredEntry, now_epoch: int) -> Optional[str]:
+    """Render one ``U`` line (MAC-login user), or None if ANY field is unsafe."""
+    mac = str(entry.mac or "")
+    rate = str(entry.rate or "")
+    epoch = str(entry.expiry_epoch)
+    stamp = str(int(now_epoch))
+    if not (_MAC_RE.match(mac) and _RATE_RE.match(rate)
+            and _EPOCH_RE.match(epoch) and _EPOCH_RE.match(stamp)):
+        return None
+    line = f"U,{mac},{rate},{epoch},{stamp}"
+    # The applier parses by fixed offsets: MAC at 2..19, server epoch = last
+    # 10, expiry epoch = the 10 before it.
+    return line if _USER_LINE_RE.match(line) else None
+
+
 def format_queue_line(entry: DesiredEntry) -> Optional[str]:
     """Render one ``Q`` line (``Q,<mac>,<rate>,<ref>``), or None if unsafe."""
     mac = str(entry.mac or "")
@@ -586,14 +612,18 @@ def render_frame(
     entries: Iterable[DesiredEntry],
     next_s: int,
     queue_entries: Iterable[DesiredEntry] = (),
+    add_kind: str = "A",
 ) -> str:
     """Build the reply. Invalid entries are dropped, never emitted.
 
-    ``A`` lines come first, then ``Q`` lines; the header count covers both.
+    ``entries`` are rendered as ``A`` (bypass) lines, or as ``U`` (MAC-login
+    user) lines when ``add_kind == "U"``; then ``Q`` lines. The header count
+    covers all of them.
     """
     lines = []
+    now_epoch = int(time.time())
     for entry in entries:
-        line = format_add_line(entry)
+        line = format_user_line(entry, now_epoch) if add_kind == "U" else format_add_line(entry)
         if line is None:
             logger.warning("[CHECKIN] dropped unsafe line for %r", entry)
             continue
@@ -1123,6 +1153,8 @@ class Decision:
     # Missing paid MACs held back because they have not been missing for the
     # grace period yet (the Reconnect race guard).
     in_grace: list[DesiredEntry] = field(default_factory=list)
+    # "A" = bypass add lines; "U" = MAC-login user lines (MAC-login routers).
+    add_kind: str = "A"
 
 
 def decide(
@@ -1156,6 +1188,13 @@ def decide(
     now_mono = time.monotonic() if now_mono is None else now_mono
     rid = router.id
     arm = delivery_mode(rid)
+    mac_login = mac_login_enabled(rid)
+    if mac_login and report.version < APPLIER_VERSION_MAC_LOGIN:
+        # An old applier neither reports MAC-login users nor understands U
+        # lines: every paid MAC looks missing and an A line would put a bypass
+        # binding back. Deliver nothing (the push still runs) until the
+        # applier is upgraded.
+        arm = DELIVERY_PUSH_ONLY
     stats = _stats.setdefault(rid, RouterCheckinStats())
     stats.checkins += 1
     stats.last_checkin_at = now
@@ -1228,7 +1267,8 @@ def decide(
 
     stats.last_queue_missing = len(report.queue_missing)
     would_queue: list[DesiredEntry] = []
-    if report.reports_queues:
+    if report.reports_queues and not mac_login:
+        # MAC-login routers make their own per-session queue: no Q lines.
         # Only an applier that reported q= understands Q lines.
         would_queue = _queue_candidates(rid, report, desired, now_mono)[: max(0, cap - len(would_send))]
 
@@ -1304,6 +1344,7 @@ def decide(
         queue_lines=queue_lines,
         would_queue=would_queue,
         in_grace=in_grace,
+        add_kind="U" if mac_login else "A",
     )
 
 

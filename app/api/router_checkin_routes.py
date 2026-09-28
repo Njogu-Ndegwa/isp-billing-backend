@@ -163,6 +163,7 @@ async def router_checkin(
         background = background or BackgroundTasks()
         background.add_task(_hand_off, [p.attempt_id for p in handoffs])
     return _frame(
-        svc.render_frame(svc._seq(), decision.lines, decision.next_s, decision.queue_lines),
+        svc.render_frame(svc._seq(), decision.lines, decision.next_s, decision.queue_lines,
+                         add_kind=decision.add_kind),
         background,
     )
