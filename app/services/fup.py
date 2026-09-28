@@ -121,8 +121,16 @@ def _hotspot_identity(customer: Customer) -> tuple[Optional[str], Optional[str]]
 # --------------------------- Sync MikroTik helpers ---------------------------
 
 
-def _set_secret_profile_sync(router_info: dict, username: str, profile: str) -> dict:
-    """Set the PPP secret's ``profile`` and re-enable it; disconnect active session."""
+def _restore_pppoe_plan_profile_sync(router_info: dict, username: str, bandwidth_limit: str) -> dict:
+    """Point the PPP secret back at its plan's ``pppoe_<rate>`` profile and re-enable it.
+
+    Uses the same profile provisioning creates. ``plan.router_profile`` is not
+    used: provisioning never reads it, and on most plans it is blank or
+    ``default``, a profile with no rate limit or address pool.
+    """
+    # Lazy import: pppoe_provisioning pulls in the provisioning stack.
+    from app.services.pppoe_provisioning import ensure_plan_pppoe_profile
+
     api = MikroTikAPI(
         router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
         timeout=15, connect_timeout=5,
@@ -130,9 +138,12 @@ def _set_secret_profile_sync(router_info: dict, username: str, profile: str) -> 
     if not api.connect():
         return {"error": "connect_failed"}
     try:
+        ensured = ensure_plan_pppoe_profile(api, bandwidth_limit)
+        if ensured.get("error"):
+            return {"error": ensured["error"]}
         result = api.send_command("/ppp/secret/set", {
             "numbers": username,
-            "profile": profile,
+            "profile": ensured["profile"],
             "disabled": "no",
         })
         api.disconnect_pppoe_session(username)
@@ -541,14 +552,14 @@ async def restore_normal_profile(
 
     if not customer.pppoe_username:
         return {"error": "no_pppoe_username"}
-    profile = (plan.router_profile if plan else None) or "default"
+    bandwidth_limit = (plan.speed if plan else None) or "10Mbps"
     router = await _load_router(db, customer.router_id)
     if not router:
         return {"error": "no_router"}
     info = _router_info(router)
     await db.commit()
     return await asyncio.to_thread(
-        _set_secret_profile_sync, info, customer.pppoe_username, profile
+        _restore_pppoe_plan_profile_sync, info, customer.pppoe_username, bandwidth_limit
     )
 
 
