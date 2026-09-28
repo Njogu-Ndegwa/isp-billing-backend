@@ -2013,10 +2013,11 @@ async def unpair_device(
                 try:
                     users = api.send_command("/ip/hotspot/user/print")
                     if users.get("success") and users.get("data"):
+                        from app.services.hotspot_mac_login import hotspot_user_is_for_mac
+
                         for u in users["data"]:
-                            if u.get("name", "").upper() == username.upper():
+                            if hotspot_user_is_for_mac(u, device_mac):
                                 api.send_command("/ip/hotspot/user/remove", {".id": u[".id"]})
-                                break
 
                     bindings = api.send_command("/ip/hotspot/ip-binding/print")
                     if bindings.get("success") and bindings.get("data"):

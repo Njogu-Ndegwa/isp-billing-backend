@@ -23,6 +23,7 @@ from typing import Iterable, Optional
 
 from app.config import settings
 from app.services.mikrotik_api import normalize_mac_address
+from app.services.hotspot_mac_login import mac_login_enabled
 
 
 # A router is on real-time push when it is listed in REALTIME_PILOT_ROUTER_IDS
@@ -130,6 +131,9 @@ def host_metered_router_ids(now: Optional[datetime] = None) -> list[int]:
 QUEUE_OK = "ok"                 # their own queue is the one matching their IP
 QUEUE_SHADOWED = "shadowed"     # another queue above theirs takes their traffic
 QUEUE_NO_LIMIT = "no_limit"     # online but no enabled queue matches their IP
+# MAC-login routers: RouterOS makes a <hotspot-MAC> queue per session, which
+# the push script does not report (it only reports plan_ / <pppoe-> queues).
+QUEUE_ROUTER_MANAGED = "router_managed"
 QUEUE_OFFLINE = "offline"       # not on the router right now
 
 
@@ -376,7 +380,9 @@ def record_push(
         before = prev.devices.get(mac) if prev else None
         continuous = before is not None and before.online
         effective = _effective_queue(queues, host.ip)
-        if effective is None:
+        if effective is None and mac_login_enabled(router_id):
+            status = QUEUE_ROUTER_MANAGED
+        elif effective is None:
             status = QUEUE_NO_LIMIT
         elif effective.key == mac:
             status = QUEUE_OK

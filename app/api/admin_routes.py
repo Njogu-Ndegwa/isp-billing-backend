@@ -9,6 +9,7 @@ from app.db.database import get_db
 from app.db.models import Router, Customer, Plan, CustomerStatus
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.hotspot_mac_login import hotspot_user_is_for_mac
 from app.config import settings
 
 import logging
@@ -80,10 +81,9 @@ async def cleanup_all_inactive_users(
                 users = api.send_command("/ip/hotspot/user/print")
                 if users.get("success") and users.get("data"):
                     for u in users["data"]:
-                        if u.get("name") == username:
+                        if hotspot_user_is_for_mac(u, normalized_mac):
                             api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
                             removed["user"] = True
-                            break
                 
                 # Remove IP bindings
                 bindings = api.send_command("/ip/hotspot/ip-binding/print")
@@ -401,7 +401,7 @@ def _cleanup_recently_expired_sync(customers_data: list, delay_ms: int = 200) ->
                 
                 # 2. Remove hotspot user
                 for u in users_data:
-                    if u.get("name") == username:
+                    if hotspot_user_is_for_mac(u, normalized_mac):
                         api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
                         removed["user"] = True
                         removed["was_in_mikrotik"] = True

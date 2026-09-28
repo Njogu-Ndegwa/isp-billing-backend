@@ -31,6 +31,11 @@ from app.db.models import (
     RouterAuthMethod,
 )
 from app.services.mikrotik_api import LANE_PAYMENT, MikroTikAPI, normalize_mac_address
+from app.services.hotspot_mac_login import (
+    mac_login_enabled,
+    provision_customer as provision_mac_login_customer,
+    verify_customer as verify_mac_login_customer,
+)
 from app.services.provisioning_retry_policy import (
     PAID_PROVISIONING_RETRY_MAX_ATTEMPTS,
     retry_due_clause,
@@ -114,6 +119,10 @@ def build_hotspot_payload(customer: Customer, plan: Plan, router: Router, commen
         # listed in LB_PAID, so provisioning adds the entry when LB is on.
         "lb_enabled": bool(getattr(router, "lb_enabled", False)),
         "customer_expiry": customer.expiry,
+        "router_id": router.id,
+        # MAC-login pilot routers: a hotspot user logged in by MAC with a
+        # rate-limited profile instead of a bypassed binding + static queue.
+        "mac_login": mac_login_enabled(router.id),
     }
 
 
@@ -416,6 +425,9 @@ async def get_provisioning_attempt_for_source(
 
 
 def _verify_hotspot_configuration(api: MikroTikAPI, hotspot_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if hotspot_payload.get("mac_login"):
+        return verify_mac_login_customer(api, hotspot_payload["mac_address"])
+
     username = hotspot_payload["username"]
     mac_address = hotspot_payload["mac_address"]
 
@@ -516,18 +528,27 @@ def _call_mikrotik_bypass_sync(hotspot_payload: dict, verify_only: bool = False)
                 ),
             }
 
-        provision_result = api.add_customer_bypass_mode(
-            hotspot_payload["mac_address"],
-            hotspot_payload["username"],
-            hotspot_payload["password"],
-            hotspot_payload["time_limit"],
-            hotspot_payload["bandwidth_limit"],
-            hotspot_payload["comment"],
-            router_ip,
-            router_username,
-            router_password,
-            expiry=hotspot_payload.get("customer_expiry"),
-        )
+        if hotspot_payload.get("mac_login"):
+            provision_result = provision_mac_login_customer(
+                api,
+                hotspot_payload["mac_address"],
+                hotspot_payload["bandwidth_limit"],
+                note=hotspot_payload.get("comment") or "",
+                expiry=hotspot_payload.get("customer_expiry"),
+            )
+        else:
+            provision_result = api.add_customer_bypass_mode(
+                hotspot_payload["mac_address"],
+                hotspot_payload["username"],
+                hotspot_payload["password"],
+                hotspot_payload["time_limit"],
+                hotspot_payload["bandwidth_limit"],
+                hotspot_payload["comment"],
+                router_ip,
+                router_username,
+                router_password,
+                expiry=hotspot_payload.get("customer_expiry"),
+            )
 
         logger.info("[PROVISION] MikroTik API response: %s", provision_result)
 
