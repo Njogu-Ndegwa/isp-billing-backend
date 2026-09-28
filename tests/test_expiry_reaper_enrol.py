@@ -421,3 +421,5 @@ def test_complete_callback_schedules_enrolment():
     from pathlib import Path
     src = (Path(__file__).resolve().parents[1] / "app" / "api" / "provisioning.py").read_text(encoding="utf-8")
     assert "schedule_enrol_after_provisioning(router_obj.id)" in src
+    manual = (Path(__file__).resolve().parents[1] / "app" / "api" / "router_management.py").read_text(encoding="utf-8")
+    assert "schedule_enrol_after_provisioning(router_obj.id)" in manual   # routers created by hand

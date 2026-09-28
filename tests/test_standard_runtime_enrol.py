@@ -534,3 +534,116 @@ async def test_batch_limit_and_new_routers_first(db, wired, monkeypatch):
     # 31 min later the never-looked-at router goes before the two retried ones
     later = datetime.utcnow() + timedelta(minutes=31)
     assert [o.router_id for o in await enrol.standard_runtime_enrol_background(now=later)][0] == ids[2]
+
+
+# --- right after registration (/complete) --------------------------------------
+
+async def _no_sleep(_seconds):
+    return None
+
+
+def test_flagged_device_mode_is_rechecked_weekly_not_every_30_min():
+    reason = ("scheduler_failed: failure: configuration flagged, check all router configuration "
+              "for unauthorized changes and update device-mode")
+    assert enrol.recheck_after(reason) == timedelta(days=7)
+
+
+@pytest.mark.asyncio
+async def test_registration_installs_at_once_and_stops(db, wired):
+    r = await _router(db, "10.0.100.80", "Router-6000")
+    fake = wired["10.0.100.80"] = FakeRouterOS("Router-6000", **SSTP)
+    sleeps = []
+
+    async def rec_sleep(s):
+        sleeps.append(s)
+
+    o = await enrol.install_after_registration(r.id, sleep=rec_sleep)
+    assert o.watchdog.installed and o.checkin.installed
+    assert sleeps == [enrol.SETUP_FIRST_DELAY_SECONDS]        # no retries needed
+    assert fake.connects == 1 and not fake.did("/system/script/run")
+    row = await _reload(db, r.id)
+    assert row.checkin_installed_at and row.mgmt_watchdog_installed_at
+    # the background job then has nothing left to do for it
+    fake.commands.clear()
+    assert await enrol.standard_runtime_enrol_background() == []
+    assert fake.commands == []
+
+
+@pytest.mark.asyncio
+async def test_registration_retries_while_the_tunnel_comes_up(db, wired):
+    r = await _router(db, "10.0.100.81", "Router-6001")
+    fake = wired["10.0.100.81"] = FakeRouterOS("Router-6001", reachable=False, **SSTP)
+    tries = {"n": 0}
+    real_install = enrol.probe_and_install_sync
+
+    def install(c):
+        tries["n"] += 1
+        if tries["n"] == 3:
+            fake.reachable = True              # the tunnel is up by the third try
+        return real_install(c)
+
+    o = await enrol.install_after_registration(r.id, sleep=_no_sleep, install=install)
+    assert tries["n"] == 3 and o.watchdog.installed and o.checkin.installed
+
+
+@pytest.mark.asyncio
+async def test_registration_retries_when_no_tunnel_is_up_yet(db, wired):
+    # At setup "no watched tunnel" is transient (the background job treats it as
+    # permanent for a week): the SSTP client appears on the next try.
+    r = await _router(db, "10.0.100.82", "Router-6002")
+    fake = wired["10.0.100.82"] = FakeRouterOS("Router-6002")
+    real_install = enrol.probe_and_install_sync
+    tries = {"n": 0}
+
+    def install(c):
+        tries["n"] += 1
+        if tries["n"] == 2:
+            fake.sstp = list(SSTP["sstp"])
+        return real_install(c)
+
+    o = await enrol.install_after_registration(r.id, sleep=_no_sleep, install=install)
+    assert tries["n"] == 2 and o.watchdog.installed
+
+
+@pytest.mark.asyncio
+async def test_registration_gives_up_after_the_short_schedule(db, wired):
+    r = await _router(db, "10.0.100.83", "Router-6003")
+    wired["10.0.100.83"] = FakeRouterOS("Router-6003", reachable=False, **SSTP)
+    o = await enrol.install_after_registration(r.id, sleep=_no_sleep)
+    assert o.checkin.reason == "unreachable"
+    assert wired["10.0.100.83"].connects == 1 + len(enrol.SETUP_RETRY_DELAYS_SECONDS)
+    # left to the background job: recorded as a 30-minute recheck
+    assert (await _reload(db, r.id)).checkin_checked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_registration_respects_switch_scope_and_owner(db, wired, monkeypatch):
+    r = await _router(db, "10.0.100.84", "Router-6004")
+    fake = wired["10.0.100.84"] = FakeRouterOS("Router-6004", **SSTP)
+    monkeypatch.setattr(settings, "STANDARD_RUNTIME_AUTO_INSTALL", False)
+    assert await enrol.install_after_registration(r.id, sleep=_no_sleep) is None
+    monkeypatch.setattr(settings, "STANDARD_RUNTIME_AUTO_INSTALL", True)
+    monkeypatch.setattr(settings, "STANDARD_RUNTIME_EXCLUDE_ROUTER_IDS", str(r.id))
+    assert await enrol.install_after_registration(r.id, sleep=_no_sleep) is None
+    suspended = await make_reseller(db, subscription_status=SubscriptionStatus.SUSPENDED)
+    r2 = await _router(db, "10.0.100.85", "Router-6005", reseller=suspended)
+    wired["10.0.100.85"] = FakeRouterOS("Router-6005", **SSTP)
+    assert await enrol.install_after_registration(r2.id, sleep=_no_sleep) is None
+    assert fake.connects == 0 and wired["10.0.100.85"].connects == 0
+
+
+@pytest.mark.asyncio
+async def test_registration_never_raises(db, wired):
+    def boom(_c):
+        raise RuntimeError("router API exploded")
+
+    r = await _router(db, "10.0.100.86", "Router-6006")
+    wired["10.0.100.86"] = FakeRouterOS("Router-6006", **SSTP)
+    await enrol.install_after_registration(r.id, sleep=_no_sleep, install=boom)   # no exception
+
+
+def test_complete_callback_schedules_the_install():
+    import inspect
+    from app.api import provisioning as provisioning_api
+    src = inspect.getsource(provisioning_api.complete_provision)
+    assert "schedule_install_after_registration(router_obj.id)" in src

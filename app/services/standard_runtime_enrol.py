@@ -66,6 +66,10 @@ RECHECK_TRANSIENT = timedelta(minutes=30)
 # Reasons that describe the hardware or a deliberate setup, not a passing condition.
 _PERMANENT_REASON_PREFIXES = (
     "small board", "RouterOS", "no hotspot", "no watched tunnel", "scheduler disabled",
+    # RouterOS device-mode "flagged": every scheduler add is refused until someone
+    # clears it on site (router 131, 2026-09-27/28). Retrying every 30 min only
+    # adds API traffic to a router that is already in trouble.
+    "scheduler_failed: failure: configuration flagged",
 )
 _OK_STATUSES = ("installed", "updated", "unchanged")
 
@@ -348,3 +352,93 @@ async def standard_runtime_enrol_background(*, now: Optional[datetime] = None) -
         return outcomes
     finally:
         _running = False
+
+
+# ---------------------------------------------------------------------------
+# Right after registration (the provisioning /complete callback)
+# ---------------------------------------------------------------------------
+#
+# A new router should not wait for the next job tick (15 min, reset by every
+# app restart) to get the check-in and the watchdog. /complete fires at the
+# END of the router's setup script, when its management tunnel may still be
+# coming up (and route-sync needs up to ~30 s to route it), so this waits a
+# little and retries on a short schedule. Whatever is still missing after
+# that is left to the background job, which keeps running as the safety net.
+
+SETUP_FIRST_DELAY_SECONDS = 20
+SETUP_RETRY_DELAYS_SECONDS = (40, 120, 300, 600)
+# At setup, a tunnel that is not up YET is a passing condition, not a
+# permanent one (the background job treats "no watched tunnel" as permanent).
+_SETUP_RETRYABLE_PREFIXES = ("unreachable", "busy", "no watched tunnel", "error")
+
+_setup_tasks: set = set()
+
+
+async def _load_setup_candidate(router_id: int) -> Optional[Candidate]:
+    """The router as a candidate for an immediate install, or None if it is
+    out of scope, its owner is not active/trial, or it is gone. Short session."""
+    async with database.async_session() as db:
+        row = (await db.execute(
+            select(Router.id, Router.name, Router.identity, Router.ip_address, Router.username,
+                   Router.password, Router.port, Router.auth_method,
+                   Router.checkin_installed_at, Router.mgmt_watchdog_installed_at,
+                   User.subscription_status)
+            .outerjoin(User, User.id == Router.user_id)
+            .where(Router.id == router_id)
+        )).first()
+        await db.commit()
+    if row is None or not row.identity or not row.ip_address or not in_scope(row.id):
+        return None
+    owner = getattr(row.subscription_status, "value", row.subscription_status)
+    if owner is not None and owner not in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value):
+        return None
+    want_checkin = (
+        row.checkin_installed_at is None
+        and row.auth_method != RouterAuthMethod.RADIUS
+        and checkin_wanted(row.id)
+    )
+    want_watchdog = bool(settings.STANDARD_RUNTIME_INSTALL_WATCHDOG) and row.mgmt_watchdog_installed_at is None
+    return Candidate(row.id, row.name, row.identity, row.ip_address, row.username, row.password,
+                     int(row.port or 8728), want_checkin, want_watchdog)
+
+
+def _setup_retryable(o: Outcome) -> bool:
+    return any(
+        comp is not None and not comp.installed and comp.reason.startswith(_SETUP_RETRYABLE_PREFIXES)
+        for comp in (o.watchdog, o.checkin)
+    )
+
+
+async def install_after_registration(router_id: int, *, sleep=asyncio.sleep,
+                                     install=probe_and_install_sync) -> Optional[Outcome]:
+    """Install the standard runtime on a just-registered router. Never raises."""
+    if not settings.STANDARD_RUNTIME_AUTO_INSTALL:
+        return None
+    outcome: Optional[Outcome] = None
+    try:
+        await sleep(SETUP_FIRST_DELAY_SECONDS)
+        for delay in (0,) + SETUP_RETRY_DELAYS_SECONDS:
+            if delay:
+                await sleep(delay)
+            c = await _load_setup_candidate(router_id)            # short session, released
+            if c is None or not (c.want_checkin or c.want_watchdog):
+                break
+            outcome = await asyncio.to_thread(install, c)          # router I/O, no session held
+            await record_outcome(outcome, datetime.utcnow())       # own short session
+            if not _setup_retryable(outcome):
+                break
+        if outcome is not None:
+            logger.info("[STD-RUNTIME] at registration: %s", _describe(outcome))
+    except Exception:  # noqa: BLE001 - the /complete callback must never be affected
+        logger.exception("[STD-RUNTIME] install at registration for router %s failed", router_id)
+    return outcome
+
+
+def schedule_install_after_registration(router_id: int) -> None:
+    """Fire-and-forget from the provisioning /complete callback. Never raises."""
+    try:
+        task = asyncio.get_running_loop().create_task(install_after_registration(router_id))
+        _setup_tasks.add(task)
+        task.add_done_callback(_setup_tasks.discard)
+    except Exception:  # noqa: BLE001
+        logger.exception("[STD-RUNTIME] could not schedule the install for router %s", router_id)

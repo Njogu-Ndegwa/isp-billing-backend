@@ -186,7 +186,7 @@ flowchart TD
 
 Two triggers, one piece of logic (`_enrol` in `expiry_reaper_enrol.py`):
 
-- **At onboarding**: `/complete` schedules a background task. It starts 150 s later, so the router's tunnel comes up and the real-time push installer (started by the same callback) goes first. It retries at 2, 5 and 10 minutes while the result is undecided. A new router is usually decided within a few minutes of setup.
+- **At onboarding**: `/complete` (and `POST /api/routers/create` for routers added by hand) schedules a background task. It starts 150 s later, so the router's tunnel comes up and the real-time push installer (started by the same callback) goes first. It retries at 2, 5 and 10 minutes while the result is undecided. A new router is usually decided within a few minutes of setup.
 - **Every 30 minutes**: the catch-all, up to 5 routers per run. It picks up routers the setup trigger missed, routers back online, reactivated resellers, and fixed tunnels.
 
 The two never work on the same router at once (`_in_flight`).

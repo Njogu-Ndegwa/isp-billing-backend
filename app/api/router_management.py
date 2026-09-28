@@ -1740,6 +1740,16 @@ async def create_router_api(
         await db.refresh(router_obj)
         
         logger.info(f"Router created: {router_obj.id} by user {user.id}")
+
+        # Same as provisioning: real-time usage push once the tunnel answers.
+        from app.services.realtime_push_installer import schedule_install_after_provisioning
+
+        schedule_install_after_provisioning(router_obj.id)
+
+        # ...and expiry removal: reaper, or server-side for hAP lite class.
+        from app.services.expiry_reaper_enrol import schedule_enrol_after_provisioning
+
+        schedule_enrol_after_provisioning(router_obj.id)
         
         return {
             "id": router_obj.id,
