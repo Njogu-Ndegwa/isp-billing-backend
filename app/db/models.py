@@ -176,6 +176,14 @@ class User(Base):
     acquisition_source = Column(String(120), nullable=True, index=True)
     acquisition_campaign = Column(String(190), nullable=True, index=True)
     acquisition_details = Column(JSON, nullable=True)
+    # How this reseller's customer M-Pesa payments settle (app/services/
+    # direct_settlement.py): 'direct' = STK push pays straight into the
+    # reseller's own paybill/till/bank (PartyB), nothing held by the platform;
+    # 'platform' = collected on the system paybill and paid out by scheduled
+    # B2B. Accounts that existed when this shipped were migrated to 'platform'
+    # (they opt in from the Account Statement); new signups default to
+    # 'direct'. Plain string, not a Postgres enum.
+    settlement_mode = Column(String(20), nullable=False, default="direct", server_default="direct")
 
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"

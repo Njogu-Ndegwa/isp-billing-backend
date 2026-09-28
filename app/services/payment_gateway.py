@@ -95,6 +95,31 @@ async def resolve_router_payment_method(
     return None
 
 
+async def resolve_collection_payment_method(
+    db: AsyncSession,
+    router_id: int,
+) -> Optional[ResellerPaymentMethod]:
+    """The payment method a customer payment on this router is initiated with.
+
+    The router's assigned method when it has one. For an unassigned (legacy)
+    router whose owner settles directly, the owner's default payout method —
+    so direct settlement covers the whole fleet, not only routers with an
+    explicit assignment. Otherwise None: the legacy system-collected path,
+    exactly as before.
+    """
+    pm = await resolve_router_payment_method(db, router_id)
+    if pm is not None:
+        return pm
+    owner_id = (await db.execute(
+        select(Router.user_id).where(Router.id == router_id)
+    )).scalar_one_or_none()
+    if owner_id is None:
+        return None
+    from app.services.direct_settlement import default_direct_method
+
+    return await default_direct_method(db, owner_id)
+
+
 async def get_reseller_payment_methods(
     db: AsyncSession,
     user_id: int,
@@ -143,13 +168,38 @@ async def initiate_customer_payment(
             account_reference=account_reference,
         )
 
-    # MPESA_TILL is a payout destination (nightly B2B BusinessBuyGoods), not a
-    # collection channel — customers still pay the platform shortcode via STK.
+    # Paybill / bank / till are payout destinations. A reseller on direct
+    # settlement has the STK push pay straight into that destination
+    # (PartyB); otherwise the customer pays the platform shortcode and the
+    # scheduled B2B pays the reseller out.
     if method_type in (
         ResellerPaymentMethodType.MPESA_PAYBILL,
         ResellerPaymentMethodType.BANK_ACCOUNT,
         ResellerPaymentMethodType.MPESA_TILL,
     ):
+        from app.services.direct_settlement import resolve_direct_destination
+        from app.services.mpesa import StkPushRejected
+
+        destination = await resolve_direct_destination(db, payment_method)
+        if destination is not None:
+            try:
+                return await _initiate_mpesa_direct_settlement(
+                    db, payment_method, customer, phone, amount, reference,
+                    destination, account_reference=account_reference,
+                )
+            except StkPushRejected as rejected:
+                # Safaricom refused this PartyB outright, so no prompt went
+                # out — collect on the platform shortcode instead so the
+                # customer still gets one. A gateway failure (502-504) is
+                # NOT retried: that prompt may already be on their phone.
+                if not rejected.is_definite_rejection:
+                    raise
+                logger.warning(
+                    "Direct settlement STK rejected for method %s (PartyB=%s, %s); "
+                    "falling back to platform collection: %s",
+                    payment_method.id, destination.party_b,
+                    destination.transaction_type, rejected.detail,
+                )
         return await _initiate_mpesa_system_collected(
             db, payment_method, customer, phone, amount, reference,
             account_reference=account_reference,
@@ -233,6 +283,63 @@ async def _initiate_mpesa_with_reseller_keys(
 # ---------------------------------------------------------------------------
 # M-Pesa with system credentials (admin collects, pays reseller manually)
 # ---------------------------------------------------------------------------
+
+async def _initiate_mpesa_direct_settlement(
+    db: AsyncSession,
+    pm: ResellerPaymentMethod,
+    customer: Customer,
+    phone: str,
+    amount: float,
+    reference: str,
+    destination,
+    account_reference: Optional[str] = None,
+) -> dict:
+    """STK push signed by the system shortcode that pays the reseller's own
+    paybill/till/bank (``destination``) — see app/services/direct_settlement.py.
+
+    Stamped CollectionMode.DIRECT at initiation; every STK callback path
+    copies that onto the CustomerPayment, which keeps it out of the B2B
+    payout balance.
+    """
+    from app.services.mpesa import initiate_stk_push_direct
+
+    await db.commit()
+    stk_response = await initiate_stk_push_direct(
+        phone_number=phone,
+        amount=amount,
+        reference=reference,
+        account_reference=destination.account_reference or account_reference,
+        party_b=destination.party_b,
+        transaction_type=destination.transaction_type,
+    )
+
+    mpesa_txn = MpesaTransaction(
+        checkout_request_id=stk_response.checkout_request_id,
+        merchant_request_id=stk_response.merchant_request_id,
+        phone_number=phone,
+        amount=float(amount),
+        reference=reference,
+        customer_id=customer.id,
+        plan_id=customer.plan_id,
+        collection_mode=CollectionMode.DIRECT,
+        status=MpesaTransactionStatus.pending,
+    )
+    db.add(mpesa_txn)
+    await db.flush()
+    logger.info(
+        "Direct settlement STK %s: method=%s PartyB=%s type=%s",
+        stk_response.checkout_request_id, pm.id,
+        destination.party_b, destination.transaction_type,
+    )
+
+    return {
+        "gateway": "mpesa",
+        "collection_mode": CollectionMode.DIRECT,
+        "settlement": "direct",
+        "checkout_request_id": stk_response.checkout_request_id,
+        "merchant_request_id": stk_response.merchant_request_id,
+    }
+
 
 async def _initiate_mpesa_system_collected(
     db: AsyncSession,

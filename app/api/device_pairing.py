@@ -1506,7 +1506,7 @@ async def pair_device_and_pay(
 
         if payment_method_enum == PaymentMethod.MOBILE_MONEY:
             from app.services.mpesa import initiate_stk_push
-            from app.services.payment_gateway import resolve_router_payment_method, initiate_customer_payment
+            from app.services.payment_gateway import resolve_collection_payment_method, initiate_customer_payment
             from app.services.checkin_delivery import note_payment_initiated
 
             # Check-in delivery pilot: payment about to start on this router.
@@ -1522,7 +1522,7 @@ async def pair_device_and_pay(
             owner_shortcode = owner_info.mpesa_shortcode if owner_info else None
             account_reference = (owner_info.business_name or owner_info.organization_name) if owner_info else None
 
-            router_pm = await resolve_router_payment_method(db, request.router_id)
+            router_pm = await resolve_collection_payment_method(db, request.router_id)
 
             if router_pm:
                 gw_result = await initiate_customer_payment(

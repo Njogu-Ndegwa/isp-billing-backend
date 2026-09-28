@@ -567,7 +567,7 @@ async def initiate_mpesa_payment_api(
     try:
         from app.services.mpesa import initiate_stk_push
         from app.services.mpesa_transactions import save_mpesa_transaction, link_transaction_to_customer
-        from app.services.payment_gateway import resolve_router_payment_method, initiate_customer_payment
+        from app.services.payment_gateway import resolve_collection_payment_method, initiate_customer_payment
         
         if request.amount <= 0:
             raise HTTPException(status_code=400, detail="Payment amount must be greater than 0")
@@ -609,7 +609,7 @@ async def initiate_mpesa_payment_api(
         # Check if the customer's router has a configured payment method
         payment_method = None
         if customer.router_id:
-            payment_method = await resolve_router_payment_method(db, customer.router_id)
+            payment_method = await resolve_collection_payment_method(db, customer.router_id)
 
         if payment_method:
             # --- New path: use configured payment method ---
@@ -922,8 +922,8 @@ async def register_hotspot_and_pay_api(
             reference = f"HOTSPOT-{customer.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
             # Check if router has a configured payment method
-            from app.services.payment_gateway import resolve_router_payment_method, initiate_customer_payment
-            router_pm = await resolve_router_payment_method(db, request.router_id)
+            from app.services.payment_gateway import resolve_collection_payment_method, initiate_customer_payment
+            router_pm = await resolve_collection_payment_method(db, request.router_id)
 
             if router_pm:
                 # --- New path: use configured payment method ---
