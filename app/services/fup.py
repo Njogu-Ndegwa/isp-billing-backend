@@ -36,6 +36,11 @@ from app.db.models import (
     Router,
 )
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, parse_speed_to_mikrotik
+from app.services.hotspot_mac_login import (
+    block_customer as mac_login_block_customer,
+    mac_login_enabled,
+    set_customer_rate as mac_login_set_customer_rate,
+)
 
 logger = logging.getLogger("fup")
 
@@ -74,6 +79,7 @@ async def _load_router(db: AsyncSession, router_id: int) -> Optional[Router]:
 
 def _router_info(router: Router) -> dict:
     return {
+        "id": router.id,
         "ip": router.ip_address,
         "username": router.username,
         "password": router.password,
@@ -463,6 +469,26 @@ def _restore_hotspot_sync(router_info: dict, mac_address: str, normal_rate_limit
         api.disconnect()
 
 
+def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, rate_limit: str = "") -> dict:
+    """FUP on a MAC-login router: move the user between profiles, or disable it.
+
+    The router owns the session queue there, so there is no plan_ queue to
+    re-limit; the user's profile carries the rate.
+    """
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "Failed to connect"}
+    try:
+        if action == "block":
+            return mac_login_block_customer(api, normalized_mac)
+        return mac_login_set_customer_rate(api, normalized_mac, rate_limit)
+    finally:
+        api.disconnect()
+
+
 # --------------------------- Public API ---------------------------
 
 
@@ -481,6 +507,8 @@ async def apply_throttle(
         info = _router_info(router)
         rate_limit = hotspot_throttle_rate_for_plan(plan)
         await db.commit()
+        if mac_login_enabled(info["id"]):
+            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, rate_limit)
         return await asyncio.to_thread(
             _set_hotspot_queue_limit_sync, info, normalized_mac, rate_limit
         )
@@ -517,6 +545,8 @@ async def apply_block(
             return {"error": "no_router"}
         info = _router_info(router)
         await db.commit()
+        if mac_login_enabled(info["id"]):
+            return await asyncio.to_thread(_mac_login_sync, info, "block", normalized_mac)
         return await asyncio.to_thread(_block_hotspot_sync, info, normalized_mac)
 
     if not customer.pppoe_username:
@@ -546,6 +576,8 @@ async def restore_normal_profile(
         info = _router_info(router)
         rate_limit = parse_speed_to_mikrotik(plan.speed if plan else "")
         await db.commit()
+        if mac_login_enabled(info["id"]):
+            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, rate_limit)
         return await asyncio.to_thread(
             _restore_hotspot_sync, info, normalized_mac, rate_limit
         )

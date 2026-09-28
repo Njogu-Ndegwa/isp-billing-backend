@@ -1737,12 +1737,14 @@ class MikroTikAPI:
                             results["ip_binding_removed"] += 1
                             logger.info(f"Removed IP binding: {binding_name} ({binding_mac})")
 
-            # 2. Remove Hotspot user
+            # 2. Remove Hotspot user (bypass-era AABBCC... or MAC-login AA:BB:...)
+            from app.services.hotspot_mac_login import hotspot_user_is_for_mac
+
             users = self.send_command("/ip/hotspot/user/print")
             results["hotspot_user_removed"] = False
             if users.get("success") and users.get("data"):
                 for user in users["data"]:
-                    if user.get("name", "").upper() == username.upper():
+                    if hotspot_user_is_for_mac(user, normalized_mac):
                         user_id = user.get(".id")
                         if user_id:
                             self.send_command("/ip/hotspot/user/remove", {"numbers": user_id})
@@ -2155,6 +2157,9 @@ class MikroTikAPI:
                     continue
 
                 mac = user_to_mac.get(username.lower(), "")
+                # MAC-login users are named after the MAC itself.
+                if not mac and re.match(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$", username):
+                    mac = username.upper()
                 # Fallback: this app provisions users as the MAC with no
                 # colons, so we can rebuild a candidate MAC from the username.
                 if not mac and len(username) == 12 and all(

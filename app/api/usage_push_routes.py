@@ -47,6 +47,7 @@ from app.services.usage_push import (
 )
 from app.services.usage_push_auth import verify_router_token
 from app.services import realtime_state
+from app.services.hotspot_mac_login import mac_login_enabled
 from app.services.realtime_state import (
     HostSample,
     PppSample,
@@ -489,7 +490,11 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
         and state.last_repair_at is not None
         and (now - state.last_repair_at).total_seconds() < REPAIR_RUNNING_GRACE_SECONDS
     )
-    if payload.hosts and not running and realtime_state.repair_due(state, now):
+    # MAC-login routers have no plan_ queues (the router makes one per
+    # session), so every device reads as unlimited to this check; they are
+    # reconciled on every scheduled sync instead.
+    if (payload.hosts and not running and not mac_login_enabled(router_id)
+            and realtime_state.repair_due(state, now)):
         realtime_state.note_repair(router_id, now, {"status": "running"})
         _spawn(_repair(router_id))
 

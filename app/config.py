@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     # outside a payment (outage compensation, admin edit, pairing):
     # app/services/expiry_tag_sync.py. Only ever moves a deadline later.
     EXPIRY_TAG_SYNC_ENABLED: bool = True
+    # Hotspot MAC-login pilot (2026-09-28): paid hotspot devices on these
+    # routers are logged in as hotspot users named after their MAC
+    # (login-by=mac) with a rate-limited user profile, instead of getting a
+    # bypassed ip-binding plus a static per-IP queue. The router then owns the
+    # per-session queue, so the limit follows the device across IP changes.
+    # Comma list of router ids. See app/services/hotspot_mac_login.py.
+    HOTSPOT_MAC_LOGIN_ROUTER_IDS: str = ""
     # Router check-in delivery pilot (2026-09-26). The router POSTs the MACs of
     # its app-tagged bypass bindings to /api/router/checkin; the server answers
     # with the paid MACs it is missing. Off by default, and only routers listed

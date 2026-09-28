@@ -122,6 +122,7 @@ from app.db.models import (
     RouterAuthMethod,
 )
 from app.services.mikrotik_api import parse_speed_to_mikrotik
+from app.services.hotspot_mac_login import mac_login_enabled
 from app.services.router_expiry import expiry_second
 
 logger = logging.getLogger(__name__)
@@ -373,6 +374,10 @@ def delivery_mode(router_id: Optional[int]) -> str:
     if router_id is None:
         return DELIVERY_BOTH
     rid = int(router_id)
+    if mac_login_enabled(rid):
+        # MAC-login routers get no bypass bindings at all; an A line would
+        # put one back (and the unlimited static-queue path with it).
+        return DELIVERY_PUSH_ONLY
     push_only = rid in push_only_router_ids()
     checkin_only = rid in checkin_only_router_ids()
     if push_only and not checkin_only:

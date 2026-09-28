@@ -55,6 +55,12 @@ from app.services import customer_expiry_notifications
 from app.core.protected_devices import is_protected_device
 from app.config import settings
 from app.services.realtime_state import host_metering_active, is_pilot_router, pushed_bindings, reports_metrics
+from app.services.hotspot_mac_login import (
+    hotspot_user_is_for_mac,
+    is_mac_login_user,
+    mac_login_enabled,
+    reconcile_router as reconcile_mac_login_router,
+)
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -480,10 +486,10 @@ def _remove_user_from_mikrotik_sync(router_info: dict, normalized_mac: str, user
         users = api.send_command("/ip/hotspot/user/print")
         if users.get("success") and users.get("data"):
             for u in users["data"]:
-                if u.get("name") == username:
+                if hotspot_user_is_for_mac(u, normalized_mac):
                     api.send_command("/ip/hotspot/user/remove", {"numbers": u[".id"]})
                     removed["user"] = True
-                    logger.info(f"[CLEANUP] Removed hotspot user: {username}")
+                    logger.info(f"[CLEANUP] Removed hotspot user: {u.get('name')}")
                     break
 
         bindings = api.send_command("/ip/hotspot/ip-binding/print")
@@ -726,6 +732,7 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
 
                 binding_found = False
                 binding_remove_failed = False
+                mac_login_user_remove_failed = False
                 for b in snapshot["bindings"]:
                     mac_match = _mac_of(b) == normalized_mac
                     username_match = f"USER:{username}" in b.get("comment", "").upper()
@@ -742,14 +749,18 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                         if remove("hosts", "/ip/hotspot/host/remove", host[".id"]):
                             removed["hosts"] += 1
 
+                # Every matching user goes: a MAC-login user left behind logs
+                # the device straight back in, so its removal must succeed.
                 for u in snapshot["users"]:
                     comment = u.get("comment", "").upper()
-                    if (u.get("name", "") == username
+                    if (hotspot_user_is_for_mac(u, normalized_mac)
                             or normalized_mac.upper() in comment
                             or cust["mac_address"].upper() in comment):
                         if remove("users", "/ip/hotspot/user/remove", u.get(".id")):
                             removed["user"] = True
-                        break
+                        elif is_mac_login_user(u):
+                            mac_login_user_remove_failed = True
+                            logger.error(f"[CRON] Failed to remove MAC-login user {u.get('name')} for {normalized_mac}")
 
                 for session in snapshot["active"]:
                     if (_mac_of(session) == normalized_mac
@@ -773,7 +784,8 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
 
                 outcomes[cust["id"]] = {
                     "cust": cust, "mac": normalized_mac, "removed": removed,
-                    "binding_found": binding_found, "remove_failed": binding_remove_failed,
+                    "binding_found": binding_found or mac_login_user_remove_failed,
+                    "remove_failed": binding_remove_failed or mac_login_user_remove_failed,
                 }
             except Exception as e:
                 results["failed"].append({"id": cust["id"], "error": str(e)})
@@ -2438,7 +2450,7 @@ async def repair_router_queues_now(router_id: int) -> dict:
         items = [
             _queue_sync_customer_item(c, fup_periods.get(c.id))
             for c in customers
-            if c.plan and c.plan.speed
+            if c.plan
         ]
         router_info = _queue_sync_router_info(router)
         await db.commit()
@@ -2609,6 +2621,53 @@ def _sweep_orphan_customer_queues(
     return removed
 
 
+def _reconcile_mac_login_router_sync(router_info: dict, customers_data: list) -> dict:
+    """MAC-login routers: the router owns the queues, so reconcile users instead.
+
+    Makes sure every paid customer is a MAC-login user on the right profile,
+    deletes MAC-login users with no paid customer behind them, and keeps the
+    hotspot's login-by / FastTrack exemption in place. See
+    app/services/hotspot_mac_login.py.
+    """
+    results = {"synced": 0, "errors": 0, "skipped": 0, "routers_connected": 0, "details": None}
+    router_name = router_info["name"]
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
+        timeout=30, connect_timeout=5, lane=LANE_BACKGROUND,
+    )
+    try:
+        if not api.connect():
+            results["errors"] = len(customers_data)
+            results["details"] = {"router": router_name, "error": "Connection failed"}
+            return results
+        results["routers_connected"] = 1
+        summary = reconcile_mac_login_router(api, customers_data)
+        results["synced"] = summary.get("provisioned", 0) + summary.get("orphans_removed", 0)
+        results["skipped"] = summary.get("already_ok", 0) + summary.get("blocked_skipped", 0)
+        results["errors"] = len(summary.get("errors") or [])
+        results["details"] = {
+            "router": router_name,
+            "mode": "mac_login",
+            "provisioned": summary.get("provisioned", 0),
+            "already_ok": summary.get("already_ok", 0),
+            "orphans_removed": summary.get("orphans_removed", 0),
+            "errors": (summary.get("errors") or [])[:10],
+        }
+        if summary.get("provisioned") or summary.get("orphans_removed") or summary.get("errors"):
+            logger.warning("[SYNC] MAC-login reconcile on %s: %s", router_name, results["details"])
+        return results
+    except Exception as exc:
+        logger.error("[SYNC] MAC-login reconcile on %s failed: %s", router_name, exc)
+        results["errors"] = len(customers_data)
+        results["details"] = {"router": router_name, "error": str(exc)}
+        return results
+    finally:
+        try:
+            api.disconnect()
+        except Exception:
+            pass
+
+
 def _sync_single_router_queues_sync(router_info: dict, customers_data: list, queue_hygiene: bool = False) -> dict:
     """
     Queue sync for ONE router.
@@ -2632,6 +2691,9 @@ def _sync_single_router_queues_sync(router_info: dict, customers_data: list, que
     }
     if not customers_data:
         return results
+
+    if mac_login_enabled(router_info.get("id")):
+        return _reconcile_mac_login_router_sync(router_info, customers_data)
 
     router_name = router_info["name"]
     router_ip = router_info["ip"]
@@ -3063,7 +3125,7 @@ async def sync_active_user_queues():
             no_router_customers = 0
             skipped_offline_router_keys = set()
             for c in active_customers:
-                if not c.plan or not c.plan.speed or not c.mac_address:
+                if not c.plan or not c.mac_address:
                     continue
                 if not c.router:
                     no_router_customers += 1
@@ -3106,7 +3168,10 @@ async def sync_active_user_queues():
             pending_keys = {rk for rk, _ in pending_router_items}
             pending_router_items += [
                 (rk, rd) for rk, rd in all_router_items
-                if rk not in pending_keys and is_pilot_router(rd["router"].get("id"))
+                if rk not in pending_keys and (
+                    is_pilot_router(rd["router"].get("id"))
+                    or mac_login_enabled(rd["router"].get("id"))
+                )
             ]
 
             logger.info(
