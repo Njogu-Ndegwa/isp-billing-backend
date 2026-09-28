@@ -299,3 +299,127 @@ def test_enrolment_is_on_by_default():
     from app.config import Settings
     assert Settings.model_fields["EXPIRY_REAPER_AUTO_ENROL"].default is True
 
+
+
+# --- re-check windows ---------------------------------------------------------
+
+def test_recheck_windows_by_reason_and_router_age():
+    now = datetime(2026, 9, 28, 12, 0)
+    assert recheck_after("scheduler add refused: failure: configuration flagged") == timedelta(days=7)
+    assert recheck_after("RouterOS 6.40.1 too old") == timedelta(days=7)
+    assert recheck_after("no tunnel route (RB951Ui-2HnD would use HTTPS)") == timedelta(hours=24)
+    assert recheck_after("no hotspot ip-binding table") == timedelta(hours=24)
+    assert recheck_after("unreachable", now - timedelta(hours=3), now) == timedelta(minutes=30)
+    assert recheck_after("unreachable", now - timedelta(days=5), now) == timedelta(hours=2)
+    # a new router's permanent reason still waits a week
+    assert recheck_after("small board hAP lite", now - timedelta(hours=1), now) == timedelta(days=7)
+
+
+@pytest.mark.asyncio
+async def test_new_router_unreachable_is_retried_after_30_minutes(db, wired):
+    now = datetime.utcnow()
+    new = await _router(db, "10.0.2.1", "Router-7001", created_at=now - timedelta(hours=2),
+                        expiry_reaper_reason="unreachable",
+                        expiry_reaper_checked_at=now - timedelta(minutes=40))
+    old = await _router(db, "10.0.2.2", "Router-7002", created_at=now - timedelta(days=9),
+                        expiry_reaper_reason="unreachable",
+                        expiry_reaper_checked_at=now - timedelta(minutes=40))
+    picked = [c.id for c in await enrol.load_candidates(now, 10)]
+    assert new.id in picked and old.id not in picked
+
+
+# --- setup trigger (/complete) ------------------------------------------------
+
+def _sleeps():
+    calls = []
+
+    async def sleep(s):
+        calls.append(s)
+    return calls, sleep
+
+
+@pytest.mark.asyncio
+async def test_setup_trigger_does_nothing_when_switched_off(db, wired, monkeypatch):
+    monkeypatch.setattr(enrol.settings, "EXPIRY_REAPER_AUTO_ENROL", False)
+    r = await _router(db, "10.0.3.1", "Router-7101")
+    wired["10.0.3.1"] = FakeRouterOS("Router-7101")
+    calls, sleep = _sleeps()
+    assert await enrol.enrol_after_provisioning(r.id, sleep=sleep) is None
+    assert calls == [] and wired["10.0.3.1"].commands == []
+
+
+@pytest.mark.asyncio
+async def test_setup_trigger_installs_on_a_new_standard_router(db, wired):
+    r = await _router(db, "10.0.3.2", "Router-7102", last_status=None)
+    wired["10.0.3.2"] = FakeRouterOS("Router-7102")
+    calls, sleep = _sleeps()
+    o = await enrol.enrol_after_provisioning(r.id, sleep=sleep)
+    assert o.installed and calls == [enrol.SETUP_FIRST_DELAY_SECONDS]
+    assert (await _reload(db, r.id)).expiry_reaper_enabled
+
+
+@pytest.mark.asyncio
+async def test_setup_trigger_marks_a_new_hap_lite_server_side_once(db, wired):
+    r = await _router(db, "10.0.3.3", "Router-7103")
+    fake = wired["10.0.3.3"] = FakeRouterOS("Router-7103", board="hAP lite", model="RB941-2nD")
+    calls, sleep = _sleeps()
+    o = await enrol.enrol_after_provisioning(r.id, sleep=sleep)
+    assert (o.mode, o.reason) == (MODE_SERVER, "small board hAP lite")
+    assert calls == [enrol.SETUP_FIRST_DELAY_SECONDS]          # decided: no retries
+    assert not fake.did("/system/script/add")
+
+
+@pytest.mark.asyncio
+async def test_setup_trigger_retries_until_the_tunnel_is_up(db, wired):
+    r = await _router(db, "10.0.3.4", "Router-7104")
+    fake = wired["10.0.3.4"] = FakeRouterOS("Router-7104", reachable=False)
+    calls = []
+
+    async def sleep(s):
+        calls.append(s)
+        if len(calls) == 3:          # tunnel comes up before the third attempt
+            fake.reachable = True
+    o = await enrol.enrol_after_provisioning(r.id, sleep=sleep)
+    assert o.installed
+    assert calls == [enrol.SETUP_FIRST_DELAY_SECONDS, *enrol.SETUP_RETRY_DELAYS_SECONDS[:2]]
+
+
+@pytest.mark.asyncio
+async def test_setup_trigger_gives_up_quietly_and_leaves_it_to_the_job(db, wired):
+    r = await _router(db, "10.0.3.5", "Router-7105")
+    wired["10.0.3.5"] = FakeRouterOS("Router-7105", reachable=False)
+    calls, sleep = _sleeps()
+    o = await enrol.enrol_after_provisioning(r.id, sleep=sleep)
+    assert o.mode is None and o.reason == "unreachable"
+    assert calls == [enrol.SETUP_FIRST_DELAY_SECONDS, *enrol.SETUP_RETRY_DELAYS_SECONDS]
+    assert (await _reload(db, r.id)).expiry_reaper_reason == "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_setup_trigger_and_periodic_job_never_share_a_router(db, wired, monkeypatch):
+    r = await _router(db, "10.0.3.6", "Router-7106")
+    wired["10.0.3.6"] = FakeRouterOS("Router-7106")
+    monkeypatch.setattr(enrol, "_in_flight", {r.id})
+    assert await enrol.expiry_reaper_enrol_background() == []
+    calls, sleep = _sleeps()
+    assert await enrol.enrol_after_provisioning(r.id, sleep=sleep) is None
+    assert wired["10.0.3.6"].commands == []
+
+
+@pytest.mark.asyncio
+async def test_setup_trigger_never_raises(monkeypatch):
+    monkeypatch.setattr(enrol.settings, "EXPIRY_REAPER_AUTO_ENROL", True)
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(enrol, "load_candidates", boom)
+    calls, sleep = _sleeps()
+    assert await enrol.enrol_after_provisioning(1, sleep=sleep) is None
+
+
+def test_complete_callback_schedules_enrolment():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app" / "api" / "provisioning.py").read_text(encoding="utf-8")
+    assert "schedule_enrol_after_provisioning(router_obj.id)" in src
+    manual = (Path(__file__).resolve().parents[1] / "app" / "api" / "router_management.py").read_text(encoding="utf-8")
+    assert "schedule_enrol_after_provisioning(router_obj.id)" in manual   # routers created by hand

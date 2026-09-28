@@ -230,6 +230,18 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   check the router's live `wg-egress` peer endpoint before relying on this note. Don't remove
   the tunnel without checking with Dennis.
 
+## Expiry Enforcement (who removes expired customers)
+
+- Most routers remove their own expired hotspot customers: a 1-min RouterOS
+  script reads an `EXP:<unix seconds>` deadline from the ip-binding comment,
+  asks `POST /api/router/expiry-check` before removing, and reports after. The
+  server cleanup job (every 45 s) is the backstop, with a 3-min grace on those
+  routers. hAP lite class boards stay server-side by design.
+- New routers are enrolled automatically (at `/complete` and every 30 min;
+  `routers.expiry_reaper_mode` / `_reason` say why). Full architecture,
+  protocol, safety rules and runbook:
+  [`docs/expiry-enforcement-architecture.md`](docs/expiry-enforcement-architecture.md).
+
 ## Feedback Board (Ideas + Bugs)
 
 - Shared reseller feedback board (levelsio-style): bug reports / feature ideas
