@@ -1459,3 +1459,23 @@ def test_checkin_binding_exp_tag_matches_the_push_and_the_reaper():
     push_exp = re.search(r"EXP:(\d+)", binding_comment(e.ref, expiry)).group(1)
     assert re.search(r"EXP:(\d+)", comment).group(1) == push_exp
     assert "CHECKIN" in comment                                 # c= reporting still finds it
+
+
+@pytest.mark.asyncio
+async def test_one_desired_entry_per_mac_with_the_latest_expiry(pilot):
+    """A MAC with two paid rows on one router is delivered once, with the later
+    expiry: the binding's EXP tag comes from it, and the router-side reaper may
+    enforce that tag on its own while it cannot reach the server."""
+    import calendar
+    db, router = pilot["db"], pilot["router"]
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, speed="5M/5M")
+    now = datetime.utcnow().replace(microsecond=0)
+    await make_customer(db, reseller, plan, router, mac_address="aa:bb:cc:00:00:21",
+                        status=CustomerStatus.ACTIVE, expiry=now + timedelta(hours=1))
+    await make_customer(db, reseller, plan, router, mac_address="AA:BB:CC:00:00:21",
+                        status=CustomerStatus.ACTIVE, expiry=now + timedelta(hours=9))
+    state = await svc.load_checkin_state(router.id, datetime.utcnow())
+    mine = [e for e in state.desired if e.mac.upper() == "AA:BB:CC:00:00:21"]
+    assert len(mine) == 1
+    assert mine[0].expiry_epoch >= calendar.timegm((now + timedelta(hours=9)).utctimetuple())
