@@ -28,13 +28,14 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import select
 
 from app.config import settings
 from app.db import database
-from app.db.models import Router
+from app.db.models import Router, RouterHealth, User
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.usage_push_script import SCHEDULER_NAME, SCRIPT_NAME, render_realtime_push_script
 
@@ -250,9 +251,18 @@ def install_router(
 # --- at setup -------------------------------------------------------------------
 
 # The router calls /complete at the END of its setup script; its tunnel may take
-# a little longer to come up. Wait, then retry a few times (~20 min in total).
+# a little longer to come up. Wait, then keep trying with growing gaps for
+# ~8 h (a router set up before its uplink is ready, or on a flaky tunnel).
 SETUP_FIRST_DELAY_SECONDS = 60
-SETUP_RETRY_DELAYS_SECONDS = (60, 120, 300, 600)
+SETUP_RETRY_DELAYS_SECONDS = (60, 120, 300, 600, 1800, 3600, 7200, 14400)
+
+# The pending install lives in process memory, so a deploy in the retry window
+# loses it. At startup (once, no scheduler) routers added in the last day that
+# are not pushing get it again. The delay lets pushing routers report first.
+CATCH_UP_WINDOW_HOURS = 24
+CATCH_UP_STARTUP_DELAY_SECONDS = 180
+PUSH_FRESH_MINUTES = 10
+_SMALL_BOARD_RE = re.compile(r"hap\s*(lite|mini)|rb9[34]1", re.IGNORECASE)
 
 _setup_tasks: set = set()
 
@@ -268,13 +278,15 @@ async def _load_router(router_id: int) -> Optional[dict]:
     return info
 
 
-async def install_after_provisioning(router_id: int, *, sleep=asyncio.sleep, install=install_router) -> dict:
+async def install_after_provisioning(router_id: int, *, first_delay: float = SETUP_FIRST_DELAY_SECONDS,
+                                     sleep=asyncio.sleep, install=install_router) -> dict:
     """Put the real-time push on a freshly provisioned router. Never raises."""
     result: dict = {"id": router_id, "status": "disabled"}
     if not settings.REALTIME_PUSH_INSTALL_AT_SETUP:
         return result
     try:
-        await sleep(SETUP_FIRST_DELAY_SECONDS)
+        if first_delay:
+            await sleep(first_delay)
         for delay in (0,) + SETUP_RETRY_DELAYS_SECONDS:
             if delay:
                 await sleep(delay)
@@ -293,11 +305,64 @@ async def install_after_provisioning(router_id: int, *, sleep=asyncio.sleep, ins
     return result
 
 
-def schedule_install_after_provisioning(router_id: int) -> None:
-    """Fire-and-forget from the provisioning /complete callback. Never raises."""
+def schedule_install_after_provisioning(router_id: int, *, first_delay: float = SETUP_FIRST_DELAY_SECONDS) -> None:
+    """Fire-and-forget (setup callback, manual router creation, startup catch-up). Never raises."""
     try:
-        task = asyncio.get_running_loop().create_task(install_after_provisioning(router_id))
+        task = asyncio.get_running_loop().create_task(
+            install_after_provisioning(router_id, first_delay=first_delay))
         _setup_tasks.add(task)
         task.add_done_callback(_setup_tasks.discard)
     except Exception:  # noqa: BLE001
         logger.exception("[REALTIME-PUSH] could not schedule setup install for router %s", router_id)
+
+
+async def recent_routers_without_push(now: Optional[datetime] = None) -> list[int]:
+    """Routers added in the catch-up window, owner not cut off, not pushing, not a known hAP lite."""
+    from app.services.ops_health import is_owner_cut_off
+
+    now = now or datetime.utcnow()
+    async with database.async_session() as db:
+        rows = (await db.execute(
+            select(Router.id, User.subscription_status, RouterHealth.source,
+                   RouterHealth.sampled_at, RouterHealth.board_name)
+            .outerjoin(User, User.id == Router.user_id)
+            .outerjoin(RouterHealth, RouterHealth.router_id == Router.id)
+            .where(Router.created_at >= now - timedelta(hours=CATCH_UP_WINDOW_HOURS))
+        )).all()
+        await db.commit()
+    ids = []
+    for router_id, owner_status, source, sampled_at, board in rows:
+        if is_owner_cut_off(owner_status):
+            continue
+        if source == "push" and sampled_at and now - sampled_at <= timedelta(minutes=PUSH_FRESH_MINUTES):
+            continue
+        if board and _SMALL_BOARD_RE.search(board):
+            continue
+        ids.append(router_id)
+    return ids
+
+
+async def catch_up_after_restart(*, sleep=asyncio.sleep, schedule=schedule_install_after_provisioning) -> list[int]:
+    """Once per app start: re-queue setup installs a deploy may have cut short. Never raises."""
+    if not settings.REALTIME_PUSH_INSTALL_AT_SETUP:
+        return []
+    try:
+        await sleep(CATCH_UP_STARTUP_DELAY_SECONDS)
+        ids = await recent_routers_without_push()
+        for router_id in ids:
+            schedule(router_id, first_delay=0)
+        if ids:
+            logger.info("[REALTIME-PUSH] startup catch-up: setup install queued for routers %s", ids)
+        return ids
+    except Exception:  # noqa: BLE001
+        logger.exception("[REALTIME-PUSH] startup catch-up failed")
+        return []
+
+
+def schedule_catch_up_after_restart() -> None:
+    try:
+        task = asyncio.get_running_loop().create_task(catch_up_after_restart())
+        _setup_tasks.add(task)
+        task.add_done_callback(_setup_tasks.discard)
+    except Exception:  # noqa: BLE001
+        logger.exception("[REALTIME-PUSH] could not schedule the startup catch-up")

@@ -166,3 +166,42 @@ async def test_setup_install_can_be_switched_off(monkeypatch):
 
     out = await rpi.install_after_provisioning(1, install=must_not_run)
     assert out["status"] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_startup_catch_up_requeues_recent_routers_that_are_not_pushing(db, monkeypatch):
+    # A deploy inside a new router's retry window used to lose its setup install.
+    from datetime import datetime, timedelta
+
+    from app.db.models import RouterHealth, SubscriptionStatus
+
+    monkeypatch.setattr(settings, "REALTIME_PUSH_INSTALL_AT_SETUP", True)
+    now = datetime.utcnow()
+    owner = await make_reseller(db)
+    cut_off = await make_reseller(db, subscription_status=SubscriptionStatus.SUSPENDED)
+    new_quiet = await make_router(db, owner, created_at=now - timedelta(hours=2))
+    new_pushing = await make_router(db, owner, created_at=now - timedelta(hours=2))
+    new_hap_lite = await make_router(db, owner, created_at=now - timedelta(hours=2))
+    old_quiet = await make_router(db, owner, created_at=now - timedelta(days=3))
+    suspended = await make_router(db, cut_off, created_at=now - timedelta(hours=2))
+    db.add_all([
+        RouterHealth(router_id=new_pushing.id, source="push", sampled_at=now - timedelta(minutes=1),
+                     board_name="RB951Ui-2HnD"),
+        RouterHealth(router_id=new_hap_lite.id, source="routeros", sampled_at=now - timedelta(hours=1),
+                     board_name="hAP lite"),
+    ])
+    await db.commit()
+    queued, slept = [], []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    ids = await rpi.catch_up_after_restart(sleep=fake_sleep,
+                                           schedule=lambda rid, first_delay: queued.append((rid, first_delay)))
+    assert ids == [new_quiet.id] and queued == [(new_quiet.id, 0)]
+    assert slept == [rpi.CATCH_UP_STARTUP_DELAY_SECONDS]
+    assert old_quiet.id not in ids and suspended.id not in ids
+
+
+def test_setup_retries_span_hours_not_minutes():
+    assert sum(rpi.SETUP_RETRY_DELAYS_SECONDS) + rpi.SETUP_FIRST_DELAY_SECONDS >= 6 * 3600

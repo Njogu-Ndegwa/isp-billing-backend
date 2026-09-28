@@ -3518,6 +3518,12 @@ async def startup_event():
 
     scheduler.start()
     job_registry.sync_jobs(scheduler)
+
+    # Real-time usage push: a deploy can cut short a new router's pending setup
+    # install (it lives in process memory). Re-queue once; not a recurring job.
+    from app.services.realtime_push_installer import schedule_catch_up_after_restart
+
+    schedule_catch_up_after_restart()
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "
         "cap sampler every 19s, queue repair every 313s, hotspot provisioning retry every 97s, "
