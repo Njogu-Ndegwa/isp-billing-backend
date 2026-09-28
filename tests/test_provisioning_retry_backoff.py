@@ -98,7 +98,9 @@ async def test_hotspot_recent_retry_is_not_replayed_before_backoff(db, monkeypat
     await _seed_attempt(
         db,
         attempt_count=5,
-        last_attempt_at=datetime.utcnow() - timedelta(seconds=89),
+        # Attempt 5 waits 90s. 80s is past attempt 4's 75s, and leaves a 10s
+        # margin; 89s flaked on slow CI runners.
+        last_attempt_at=datetime.utcnow() - timedelta(seconds=80),
     )
     groups_seen = []
 

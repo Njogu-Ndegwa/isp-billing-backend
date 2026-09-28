@@ -505,13 +505,35 @@ async def test_tunnels_section_counts_fleet_drops(db, now):
 
     section = await ops_health.build_tunnels_section(now)
     assert section["counts"] == {"online": 3, "offline": 0, "stale": 1, "total": 4,
-                                 "silent_24h": 1}
+                                 "silent_24h": 1, "cut_off_excluded": 0}
     # Factory routers all sit on 10.0.0.2 -> one WireGuard bucket.
     assert section["by_tunnel"] == {"wireguard": {"online": 3, "offline": 0, "stale": 1, "total": 4}}
     assert section["recent_drops_10m"] == 2
     assert section["platform_event"] is False
     assert section["control_path"]["available"] is False
     assert stale.id
+
+
+@pytest.mark.asyncio
+async def test_tunnels_section_leaves_out_suspended_resellers_routers(db, now):
+    active = await make_reseller(db)
+    suspended = await make_reseller(db, subscription_status=SubscriptionStatus.SUSPENDED)
+    live = await make_router(db, active, last_status=True, last_checked_at=now, last_online_at=now)
+    dead = await make_router(db, suspended, last_status=False, last_checked_at=now,
+                             last_online_at=now - timedelta(days=30))
+    await make_router(db, suspended, last_status=True, last_checked_at=now, last_online_at=now)
+    db.add(RouterAvailabilityCheck(router_id=dead.id, is_online=True, source="t",
+                                   checked_at=now - timedelta(minutes=8)))
+    db.add(RouterAvailabilityCheck(router_id=dead.id, is_online=False, source="t",
+                                   checked_at=now - timedelta(minutes=4)))
+    await db.commit()
+
+    section = await ops_health.build_tunnels_section(now)
+    assert section["counts"] == {"online": 1, "offline": 0, "stale": 0, "total": 1,
+                                 "silent_24h": 0, "cut_off_excluded": 2}
+    assert section["by_tunnel"] == {"wireguard": {"online": 1, "offline": 0, "stale": 0, "total": 1}}
+    assert section["recent_drops_10m"] == 0
+    assert live.id
 
 
 def test_count_recent_drops_needs_an_online_to_offline_edge():
