@@ -96,7 +96,7 @@ async def test_paybill_payout_still_uses_business_paybill(db, monkeypatch):
         label="Equity",
         is_active=True,
         bank_paybill_number="247247",
-        bank_account_number="1520186200177",
+        bank_account_number="1234567890123",
     )
     db.add(pm)
     await db.commit()
@@ -110,7 +110,7 @@ async def test_paybill_payout_still_uses_business_paybill(db, monkeypatch):
     payload = captured["payload"]
     assert payload["CommandID"] == "BusinessPayBill"
     assert payload["RecieverIdentifierType"] == "4"
-    assert payload["AccountReference"] == "1520186200177"
+    assert payload["AccountReference"] == "1234567890123"
     assert txn.command_id == "BusinessPayBill"
 
 
