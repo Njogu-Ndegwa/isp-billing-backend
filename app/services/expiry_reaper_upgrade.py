@@ -38,6 +38,10 @@ from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI
 logger = logging.getLogger(__name__)
 
 UPGRADE_RETRY_SECONDS = 6 * 3600
+# A router that checks in while its management tunnel is still coming up
+# (2026-09-29: router 210 reported v1 a few seconds before its tunnel was up)
+# is tried again soon, not in 6 hours.
+UNREACHABLE_RETRY_SECONDS = 10 * 60
 
 _attempted: dict[str, float] = {}
 _tasks: set = set()
@@ -98,6 +102,8 @@ async def upgrade_router(identity: str) -> Optional[str]:
         async with router_locks.acquire_router_only(f"{r.ip_address}:{r.port}"):
             outcome = await asyncio.to_thread(
                 upgrade_script_sync, r.ip_address, r.username, r.password, r.port, r.identity)
+        if outcome == "unreachable" and identity in _attempted:
+            _attempted[identity] -= UPGRADE_RETRY_SECONDS - UNREACHABLE_RETRY_SECONDS
         log = logger.info if outcome in ("upgraded", "current") else logger.warning
         log("[REAPER-UPGRADE] router %s (%s): %s to v%s", r.id, identity, outcome, SCRIPT_VERSION)
         return outcome
