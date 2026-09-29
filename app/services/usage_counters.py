@@ -8,6 +8,7 @@ reseller dashboard continues to read one source of truth.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, Optional
@@ -18,6 +19,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Customer, Plan, UserBandwidthUsage
 from app.services.usage_tracking import record_usage
 
+logger = logging.getLogger(__name__)
+
+# Line-rate ceiling. No real counter can grow faster than the customer's plan
+# speed, so a credit above that is a metering bug, not usage. The ceiling is
+# deliberately loose (2x the faster direction, a 60 s floor on the window for
+# push/poll jitter, plus fixed slack) so it never clips genuine traffic on a
+# queue that bursts or lags; its job is to stop the whole-counter re-bookings
+# that inflated ledgers 10-36x on 2026-09-26..29 (duplicate hotspot host
+# entries per MAC — see docs/agent-memory/incidents/2026-09-29-host-metering-ghost-entries.md).
+LINE_RATE_HEADROOM = 2.0
+LINE_RATE_MIN_WINDOW_SECONDS = 60
+LINE_RATE_SLACK_BYTES = 8 * 1024 * 1024
 
 @dataclass
 class UsageCounterUpdate:
@@ -35,6 +48,64 @@ def parse_queue_bytes(bytes_str: str) -> tuple[int, int]:
     upload = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
     download = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
     return upload, download
+
+
+def _rate_to_bps(token: str) -> int:
+    token = (token or "").strip().upper()
+    if not token:
+        return 0
+    mult = 1
+    if token[-1] in "KMG":
+        mult = {"K": 1_000, "M": 1_000_000, "G": 1_000_000_000}[token[-1]]
+        token = token[:-1]
+    try:
+        return int(float(token) * mult)
+    except ValueError:
+        return 0
+
+
+def plan_line_rate_bps(plan: Optional[Plan]) -> int:
+    """Fastest direction of the plan's speed (``"5M/10M"`` -> 10_000_000), or 0."""
+    speed = str(getattr(plan, "speed", "") or "").strip().split(" ", 1)[0]
+    if not speed:
+        return 0
+    return max((_rate_to_bps(part) for part in speed.split("/")), default=0)
+
+
+def line_rate_ceiling_bytes(plan: Optional[Plan], elapsed_seconds: float) -> Optional[int]:
+    """Most bytes one direction can plausibly move in ``elapsed_seconds``.
+
+    ``None`` when the plan speed is unknown — then nothing is clamped.
+    """
+    rate = plan_line_rate_bps(plan)
+    if rate <= 0:
+        return None
+    window = max(float(elapsed_seconds or 0), 0.0) + LINE_RATE_MIN_WINDOW_SECONDS
+    return int(rate / 8 * window * LINE_RATE_HEADROOM) + LINE_RATE_SLACK_BYTES
+
+
+def clamp_to_line_rate(
+    delta_up: int,
+    delta_dn: int,
+    plan: Optional[Plan],
+    last_sampled_at: Optional[datetime],
+    now: datetime,
+    *,
+    key: str = "",
+) -> tuple[int, int]:
+    """Cap a delta at what the plan's line rate allows since the last sample."""
+    if last_sampled_at is None:
+        return delta_up, delta_dn
+    ceiling = line_rate_ceiling_bytes(plan, (now - last_sampled_at).total_seconds())
+    if ceiling is None or (delta_up <= ceiling and delta_dn <= ceiling):
+        return delta_up, delta_dn
+    logger.warning(
+        "[USAGE] Clamped impossible delta for %s: %s/%s bytes in %.0fs exceeds "
+        "line-rate ceiling %s (plan speed %r)",
+        key, delta_up, delta_dn, (now - last_sampled_at).total_seconds(),
+        ceiling, getattr(plan, "speed", None),
+    )
+    return min(delta_up, ceiling), min(delta_dn, ceiling)
 
 
 def usage_counter_delta(
@@ -156,6 +227,9 @@ async def record_queue_usage_sample(
         delta_up, delta_dn, reset_detected = usage_counter_delta(
             usage, upload_bytes, download_bytes
         )
+        delta_up, delta_dn = clamp_to_line_rate(
+            delta_up, delta_dn, plan, usage.last_updated, now, key=queue_key
+        )
         usage.mac_address = queue_key
         usage.upload_bytes = upload_bytes
         usage.download_bytes = download_bytes
@@ -185,6 +259,10 @@ async def record_queue_usage_sample(
             last_updated=now,
         )
         db.add(usage)
+        # Sessions run with autoflush off: without this, a second sample for the
+        # same key in one batch would not find this pending row and would create
+        # a duplicate, and later samples would alternate between the two rows.
+        await db.flush()
 
     period = None
     if customer and plan:
