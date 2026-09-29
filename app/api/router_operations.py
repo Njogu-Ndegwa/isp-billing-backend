@@ -4176,6 +4176,10 @@ async def _run_port_config(router_id: int, mode: str, apply) -> Any:
             return
         exc = task.exception()
         if isinstance(exc, HTTPException):
+            logger.warning(
+                "Port config (%s) for router %s failed with %s: %s",
+                mode, router_id, exc.status_code, exc.detail,
+            )
             job.update(status="failed", status_code=exc.status_code, error=exc.detail)
         elif exc is not None:
             logger.error("Port config job %s for router %s failed: %s", job_id, router_id, exc)

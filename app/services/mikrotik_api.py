@@ -4708,11 +4708,15 @@ class MikroTikAPI:
                 ),
                 None,
             )
-            if not login_page_url and html_directory is None and existing_profile:
-                existing_dir = (existing_profile.get("html-directory") or "").rstrip("/")
-                if existing_dir:
-                    target_dir = existing_dir
-                    step("profile.preserve_html_directory", True, existing_dir)
+            # Always refresh the directory the hotspot is actually serving.
+            # Switching it (e.g. flash/hotspot -> hotspot) and then failing the
+            # fetch left router 182 serving a directory with no login.html.
+            original_dir = ""
+            if html_directory is None and existing_profile:
+                original_dir = (existing_profile.get("html-directory") or "").rstrip("/")
+                if original_dir:
+                    target_dir = original_dir
+                    step("profile.preserve_html_directory", True, original_dir)
 
             login_dst = f"{target_dir}/login.html"
 
@@ -4767,13 +4771,45 @@ class MikroTikAPI:
             else:
                 step("profile.set_html_directory", True, "already correct")
 
+            provisioning_url_found = bool(login_page_url)
+
+            def _restore_original_dir() -> None:
+                if not original_dir or original_dir == target_dir or not profile.get(".id"):
+                    return
+                self.send_command(
+                    "/ip/hotspot/profile/set",
+                    {"numbers": profile[".id"], "html-directory": original_dir},
+                )
+                step("profile.restore_html_directory", True, original_dir)
+
             if login_page_url:
-                reset = self.reset_hotspot_profile_html_directory(profile_name)
-                if reset.get("error"):
-                    report["warnings"].append(f"reset-html-directory: {reset['error']}")
-                    step("profile.reset_html_directory", False, reset["error"])
+                dir_files: Dict[str, int] = {}
+                listing = self.send_command("/file/print")
+                for item in listing.get("data", []) or [] if listing.get("success") else []:
+                    name = str(item.get("name") or "")
+                    if name.startswith(f"{target_dir}/"):
+                        try:
+                            dir_files[name[len(target_dir) + 1:]] = int(item.get("size") or 0)
+                        except (TypeError, ValueError):
+                            dir_files[name[len(target_dir) + 1:]] = 0
+                had_login = dir_files.get("login.html", 0) > 0
+                support_missing = [
+                    f for f in ("alogin.html", "errors.txt", "redirect.html", "md5.js")
+                    if f not in dir_files
+                ]
+
+                # reset-html-directory also overwrites our custom login.html, so
+                # only run it when the default support files are actually missing.
+                if support_missing:
+                    reset = self.reset_hotspot_profile_html_directory(profile_name)
+                    if reset.get("error"):
+                        report["warnings"].append(f"reset-html-directory: {reset['error']}")
+                        step("profile.reset_html_directory", False, reset["error"])
+                    else:
+                        step("profile.reset_html_directory", True, {"missing": support_missing})
                 else:
-                    step("profile.reset_html_directory", True)
+                    step("profile.reset_html_directory", True, "skipped: default files present")
+                keep_existing_on_failure = had_login and not support_missing
 
                 fetch_mode = urlsplit(login_page_url).scheme.lower() or "http"
                 fetch_params = {
@@ -4786,14 +4822,26 @@ class MikroTikAPI:
 
                 fetch = self.send_command("/tool/fetch", fetch_params)
                 if fetch.get("error"):
-                    return {
-                        "error": f"Could not fetch hotspot login page: {fetch['error']}",
-                        "login_page_url": login_page_url,
-                        "login_path": login_dst,
-                        **report,
-                    }
-                step("tool.fetch_login_page", True, {"url": login_page_url, "dst": login_dst})
+                    if keep_existing_on_failure:
+                        # The router was already serving a login page; keep it
+                        # rather than failing the whole port change.
+                        report["warnings"].append(
+                            f"Could not refresh the hotspot login page ({fetch['error']}); kept the existing one"
+                        )
+                        step("tool.fetch_login_page", False, fetch["error"])
+                        login_page_url = None
+                    else:
+                        _restore_original_dir()
+                        return {
+                            "error": f"Could not fetch hotspot login page: {fetch['error']}",
+                            "login_page_url": login_page_url,
+                            "login_path": login_dst,
+                            **report,
+                        }
+                else:
+                    step("tool.fetch_login_page", True, {"url": login_page_url, "dst": login_dst})
 
+            if login_page_url:
                 login_size = -1
                 for attempt in range(2):
                     if attempt:
@@ -4816,6 +4864,7 @@ class MikroTikAPI:
                         break
 
                 if login_size <= 0:
+                    _restore_original_dir()
                     return {
                         "error": "login.html missing or empty after fetch",
                         "login_page_url": login_page_url,
@@ -4823,7 +4872,7 @@ class MikroTikAPI:
                         **report,
                     }
                 step("file.verify_login_html", True, {"path": login_dst, "size": login_size})
-            else:
+            elif not provisioning_url_found:
                 report["warnings"].append(
                     "No provisioning login-page URL was found; custom hotspot login.html was not refreshed"
                 )
