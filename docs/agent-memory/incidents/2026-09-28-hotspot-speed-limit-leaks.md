@@ -75,3 +75,19 @@ skips simple queues and that a FastTracked connection stays so until it closes.
   fleet-wide flip; Level-4 licence routers allow only 200 logged-in users.
 - Independent of the pilot, fix the bypass path for the rest of the fleet:
   compare `max-limit` in bps, stop the FastTrack rule remove/re-add.
+
+## Addendum 2026-09-29: plan speeds were applied upside down
+
+Plan speeds are stored DOWNLOAD/UPLOAD (the admin plan form builds
+`${download_speed}/${upload_speed}`; resellers sell "5M/2M" as 5 down, 2 up).
+RouterOS rate-limit and queue max-limit are UPLOAD/DOWNLOAD (rx/tx from the
+router). `parse_speed_to_mikrotik` passed the text through unswapped, so every
+asymmetric plan gave customers its smaller number as download. Found on the
+router 333 MAC-login bench test: a "5M/2M" plan produced `5000000/2000000` and
+the iPhone's download peaked at 1.80 Mbps. Scale on 2026-09-29: 631 asymmetric
+plans (571 hotspot, 60 PPPoE), 168 active customers.
+
+Fix: `parse_speed_to_mikrotik` swaps (the single conversion every path uses:
+bypass, MAC login, check-in, pull agent, PPPoE, FUP throttle). Customers
+already online are moved by `scripts/fix_asymmetric_plan_speeds.py`
+(dry-run/apply) after deploy; symmetric plans are untouched.

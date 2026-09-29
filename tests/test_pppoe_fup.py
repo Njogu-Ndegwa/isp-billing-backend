@@ -80,8 +80,9 @@ async def test_pppoe_fup_throttle_derives_rate_and_ensures_speed_profile(db, mon
         {
             "router": router.ip_address,
             "username": "john_doe",
-            "profile": "fup-3M-1M",
-            "rate": "3M/1M",
+            # plan/FUP speeds are download/upload; RouterOS wants upload/download
+            "profile": "fup-1M-3M",
+            "rate": "1M/3M",
         }
     ]
 
