@@ -174,6 +174,7 @@ _last_safety_net_cleanup_at: datetime | None = None
 _last_access_credential_reaper_at: datetime | None = None
 _bandwidth_router_cursor = 0
 _queue_sync_router_cursor = 0
+_mac_login_reconcile_cursor = 0
 _inactive_pppoe_reconcile_cursor = 0
 
 # Rate limiting constants for queue sync
@@ -3072,7 +3073,7 @@ def _sync_queues_mikrotik_sync(router_customers_map: dict) -> dict:
 
 
 async def sync_active_user_queues():
-    global queue_sync_running, _queue_sync_router_cursor
+    global queue_sync_running, _queue_sync_router_cursor, _mac_login_reconcile_cursor
     if queue_sync_running:
         logger.warning("[SYNC] Previous queue sync still running, skipping this run")
         return
@@ -3168,11 +3169,21 @@ async def sync_active_user_queues():
             pending_keys = {rk for rk, _ in pending_router_items}
             pending_router_items += [
                 (rk, rd) for rk, rd in all_router_items
-                if rk not in pending_keys and (
-                    is_pilot_router(rd["router"].get("id"))
-                    or mac_login_enabled(rd["router"].get("id"))
-                )
+                if rk not in pending_keys and is_pilot_router(rd["router"].get("id"))
             ]
+            # MAC-login routers: a cheap reconcile on their own, faster
+            # rotation (fleet-wide, "every run" would be every router).
+            pending_keys = {rk for rk, _ in pending_router_items}
+            mac_login_items = [
+                (rk, rd) for rk, rd in all_router_items
+                if rk not in pending_keys and mac_login_enabled(rd["router"].get("id"))
+            ]
+            if mac_login_items:
+                per_run = max(1, int(getattr(settings, "HOTSPOT_MAC_LOGIN_RECONCILE_PER_RUN", 8) or 8))
+                ml_start = _mac_login_reconcile_cursor % len(mac_login_items)
+                picked = (mac_login_items[ml_start:] + mac_login_items[:ml_start])[:per_run]
+                _mac_login_reconcile_cursor = (ml_start + len(picked)) % len(mac_login_items)
+                pending_router_items += picked
 
             logger.info(
                 "[SYNC] Processing %d/%d eligible router(s) this run (cursor=%d)",

@@ -20,6 +20,13 @@ Runs inside the app container. Read-only unless MODE=apply.
         < scripts/fix_asymmetric_plan_speeds.py
 
 Optional ROUTER_IDS=10,333 limits the run to those routers.
+
+SCOPE=all (default: asymmetric) re-checks EVERY plan, not just asymmetric
+ones: it also moves PPPoE secrets left on a profile with no rate limit
+(e.g. "default"; router 393 had all 7 customers there on 2026-09-29).
+Disabled bypass plan_ queues are only counted, never re-enabled: the queue
+sync's hygiene pass disables a customer's queue when another device took over
+its IP, so re-enabling it here would throttle that other device.
 """
 
 import asyncio
@@ -38,6 +45,7 @@ from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, parse_
 from app.services.pppoe_provisioning import _apply_pppoe_headroom, ensure_plan_pppoe_profile
 
 MODE = os.environ.get("MODE", "dry-run").strip().lower()
+SCOPE = os.environ.get("SCOPE", "asymmetric").strip().lower()
 ONLY = {int(x) for x in os.environ.get("ROUTER_IDS", "").split(",") if x.strip().isdigit()}
 _UNIT = {"": 1, "K": 1_000, "M": 1_000_000, "G": 1_000_000_000}
 
@@ -63,7 +71,6 @@ async def load():
         JOIN routers r ON r.id = c.router_id
         WHERE c.status = 'ACTIVE' AND c.expiry > now()
           AND r.auth_method = 'DIRECT_API' AND r.last_status IS TRUE
-          AND p.speed LIKE '%/%'
           AND NOT EXISTS (
               SELECT 1 FROM customer_usage_periods u
               WHERE u.customer_id = c.id AND u.closed_at IS NULL
@@ -78,7 +85,9 @@ async def load():
     for row in rows:
         rate = parse_speed_to_mikrotik(row["speed"])
         up_down = pair(rate)
-        if not up_down or up_down[0] == up_down[1]:
+        if not up_down:
+            continue
+        if SCOPE != "all" and up_down[0] == up_down[1]:
             continue  # symmetric: unaffected by the swap
         if ONLY and row["router_id"] not in ONLY:
             continue
@@ -90,7 +99,8 @@ async def load():
 def fix_router(rows):
     head = rows[0]
     res = {"router": f'{head["router_id"]} {head["router_name"]}', "customers": len(rows),
-           "fixed": 0, "already_ok": 0, "not_on_router": 0, "errors": []}
+           "fixed": 0, "already_ok": 0, "not_on_router": 0, "disabled_by_hygiene": 0,
+           "by_kind": defaultdict(int), "errors": []}
     api = MikroTikAPI(head["ip_address"], head["username"], head["password"], head["port"] or 8728, timeout=30)
     if not api.connect():
         res["errors"].append("unreachable")
@@ -102,6 +112,7 @@ def fix_router(rows):
         secrets = queues = users = None
         for c in rows:
             kind = str(c["connection_type"]).upper()
+            before = res["fixed"]
             try:
                 if kind.endswith("PPPOE"):
                     secrets = secrets if secrets is not None else {s.get("name"): s for s in d("/ppp/secret/print")}
@@ -145,6 +156,8 @@ def fix_router(rows):
                         or f"MAC:{mac}" in str(q.get("comment", "")).upper())), None)
                     if not q:
                         res["not_on_router"] += 1
+                    elif q.get("disabled") == "true":
+                        res["disabled_by_hygiene"] += 1
                     elif pair(q.get("max-limit")) == pair(c["rate"]):
                         res["already_ok"] += 1
                     elif MODE == "apply":
@@ -154,6 +167,8 @@ def fix_router(rows):
                         res["fixed"] += 1
                     else:
                         res["fixed"] += 1
+                if res["fixed"] > before:
+                    res["by_kind"]["pppoe" if kind.endswith("PPPOE") else ("mac_login" if mac_login else "bypass")] += 1
             except Exception as exc:  # one customer must not stop the router
                 res["errors"].append(f'{c["id"]}: {exc}'[:120])
     finally:
@@ -170,7 +185,7 @@ def main():
     totals = defaultdict(int)
     for rid in sorted(by_router):
         res = fix_router(by_router[rid])
-        for k in ("customers", "fixed", "already_ok", "not_on_router"):
+        for k in ("customers", "fixed", "already_ok", "not_on_router", "disabled_by_hygiene"):
             totals[k] += res[k]
         totals["routers_with_errors"] += bool(res["errors"])
         print("ROUTER", json.dumps(res))

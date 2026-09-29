@@ -380,3 +380,42 @@ def test_expiry_cleanup_removes_mac_login_user_and_session():
     assert [r["id"] for r in result["removed"]] == [1]
     assert router.user(MAC) is None
     assert router.tables["/ip/hotspot/active"] == []
+
+
+# ---------------------------------------------------------------- fleet rollout
+
+@pytest.fixture(autouse=True)
+def _fresh_setup_cache():
+    ml._setup_checked_at.clear()
+    yield
+    ml._setup_checked_at.clear()
+
+
+def test_all_min_id_and_exclude(monkeypatch):
+    s = ml.settings
+    monkeypatch.setattr(s, "HOTSPOT_MAC_LOGIN_ROUTER_IDS", "all")
+    monkeypatch.setattr(s, "HOTSPOT_MAC_LOGIN_EXCLUDE_ROUTER_IDS", "446,221")
+    monkeypatch.setattr(s, "HOTSPOT_MAC_LOGIN_MIN_ROUTER_ID", 0)
+    assert ml.mac_login_enabled(12) and not ml.mac_login_enabled(446)
+
+    monkeypatch.setattr(s, "HOTSPOT_MAC_LOGIN_ROUTER_IDS", "10,333")
+    monkeypatch.setattr(s, "HOTSPOT_MAC_LOGIN_MIN_ROUTER_ID", 540)
+    assert ml.mac_login_enabled(10) and ml.mac_login_enabled(540) and ml.mac_login_enabled(612)
+    assert not ml.mac_login_enabled(12) and not ml.mac_login_enabled(539)
+    monkeypatch.setattr(s, "HOTSPOT_MAC_LOGIN_EXCLUDE_ROUTER_IDS", "612")
+    assert not ml.mac_login_enabled(612)
+
+
+def test_first_payment_on_an_unconverted_router_turns_mac_login_on():
+    router = FakeRouter()  # login-by has no "mac", no FastTrack exemption yet
+    result = ml.provision_customer(router.api(), MAC, "5M/5M")
+
+    assert result["success"], result
+    assert "mac" in router.tables["/ip/hotspot/profile"][0]["login-by"].split(",")
+    assert ml.NO_FASTTRACK_IN_COMMENT in router.filter_comments()
+    # checked once, then not again on the next payment
+    router.writes.clear()
+    ml.provision_customer(router.api(), OTHER, "5M/5M")
+    assert not any(w[0].startswith("/ip/hotspot/profile") or w[0].startswith("/ip/firewall")
+                   for w in router.writes)
+
