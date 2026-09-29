@@ -563,6 +563,7 @@ async def test_payment_method(
             await get_access_token(
                 consumer_key=consumer_key,
                 consumer_secret=consumer_secret,
+                use_cache=False,
             )
             return {"status": "success", "message": "M-Pesa credentials are valid"}
         except Exception as e:
