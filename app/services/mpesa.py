@@ -1,4 +1,7 @@
+import asyncio
 import base64
+import hashlib
+import time
 from datetime import datetime
 from typing import Optional
 import logging
@@ -11,7 +14,68 @@ from app.core.runtime_mode import require_external_side_effects_enabled
 
 logger = logging.getLogger(__name__)
 
-SAFARICOM_TIMEOUT = httpx.Timeout(connect=5.0, read=25.0, write=15.0, pool=5.0)
+# ``connect`` covers TCP + the TLS handshake. From Hetzner (DE) to Safaricom (KE)
+# first packets get lost and handshakes stretch past 5 s: on 2026-09-29 about 1
+# in 8 payment prompts failed with a blank "handshake operation timed out"
+# (curl showed 2.3 s connects; 2 of 8 in-app handshakes timed out).
+SAFARICOM_TIMEOUT = httpx.Timeout(connect=15.0, read=25.0, write=15.0, pool=5.0)
+# Extra attempts when the CONNECTION failed (ConnectError / ConnectTimeout): the
+# request never left, so a retry cannot double-charge or double-prompt. Read
+# timeouts and HTTP errors are never retried here.
+CONNECT_RETRIES = 2
+CONNECT_RETRY_BACKOFF_SECONDS = 0.5
+# Safaricom OAuth tokens live ~3599 s; refresh this long before they expire.
+TOKEN_REFRESH_MARGIN_SECONDS = 120
+
+_token_cache: dict[str, tuple[str, float]] = {}
+_token_locks: dict[str, asyncio.Lock] = {}
+
+
+def _client() -> httpx.AsyncClient:
+    """One place to build the HTTP client (tests swap in a mock transport)."""
+    return httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT)
+
+
+def _base_url() -> str:
+    return "https://api.safaricom.co.ke" if settings.MPESA_ENVIRONMENT == "production" else "https://sandbox.safaricom.co.ke"
+
+
+def _token_cache_key(base_url: str, key: str, secret: str) -> str:
+    return hashlib.sha256(f"{base_url}|{key}|{secret}".encode()).hexdigest()
+
+
+def reset_token_cache() -> None:
+    _token_cache.clear()
+    _token_locks.clear()
+
+
+def _invalidate_token(consumer_key: Optional[str], consumer_secret: Optional[str]) -> None:
+    key = consumer_key or settings.MPESA_CONSUMER_KEY
+    secret = consumer_secret or settings.MPESA_CONSUMER_SECRET
+    _token_cache.pop(_token_cache_key(_base_url(), key, secret), None)
+
+
+async def _send_with_connect_retry(method: str, url: str, **kwargs) -> httpx.Response:
+    """Send once; retry ONLY when the connection could not be made."""
+    last: Optional[Exception] = None
+    for attempt in range(1 + CONNECT_RETRIES):
+        try:
+            async with _client() as client:
+                return await client.request(method, url, **kwargs)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last = exc
+            logger.warning(
+                "Safaricom connection failed (%s, attempt %d/%d): %s",
+                type(exc).__name__, attempt + 1, 1 + CONNECT_RETRIES, exc,
+            )
+            if attempt < CONNECT_RETRIES:
+                await asyncio.sleep(CONNECT_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    assert last is not None
+    raise last
+
+
+def _is_invalid_token_response(response: httpx.Response) -> bool:
+    return response.status_code in (401, 404) and "Invalid Access Token" in (response.text or "")
 
 # --- Direct M-Pesa logic (for legacy/backup use) ---
 class StkPushResponse:
@@ -40,25 +104,47 @@ class StkPushRejected(HTTPException):
 async def get_access_token(
     consumer_key: Optional[str] = None,
     consumer_secret: Optional[str] = None,
+    *,
+    use_cache: bool = True,
 ) -> str:
-    try:
-        key = consumer_key or settings.MPESA_CONSUMER_KEY
-        secret = consumer_secret or settings.MPESA_CONSUMER_SECRET
-        credentials = f"{key}:{secret}"
-        encoded_credentials = base64.b64encode(credentials.encode()).decode()
-        
-        base_url = "https://api.safaricom.co.ke" if settings.MPESA_ENVIRONMENT == "production" else "https://sandbox.safaricom.co.ke"
-        
-        async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
-            response = await client.get(
+    """OAuth token for these credentials, reused until shortly before it expires.
+
+    It used to be fetched afresh for every STK push, doubling the calls over a
+    lossy link. ``use_cache=False`` forces a fresh fetch (credential tests).
+    """
+    key = consumer_key or settings.MPESA_CONSUMER_KEY
+    secret = consumer_secret or settings.MPESA_CONSUMER_SECRET
+    base_url = _base_url()
+    cache_key = _token_cache_key(base_url, key, secret)
+    if use_cache:
+        cached = _token_cache.get(cache_key)
+        if cached and cached[1] > time.monotonic():
+            return cached[0]
+    lock = _token_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        if use_cache:
+            cached = _token_cache.get(cache_key)          # refreshed by a concurrent request
+            if cached and cached[1] > time.monotonic():
+                return cached[0]
+        try:
+            encoded_credentials = base64.b64encode(f"{key}:{secret}".encode()).decode()
+            response = await _send_with_connect_retry(
+                "GET",
                 f"{base_url}/oauth/v1/generate?grant_type=client_credentials",
-                headers={"Authorization": f"Basic {encoded_credentials}"}
+                headers={"Authorization": f"Basic {encoded_credentials}"},
             )
             response.raise_for_status()
-            return response.json()["access_token"]
-    except Exception as e:
-        logger.error(f"Failed to get M-Pesa access token: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get M-Pesa access token: {str(e)}")
+            data = response.json()
+            token = data["access_token"]
+            try:
+                ttl = int(data.get("expires_in", 3599))
+            except (TypeError, ValueError):
+                ttl = 3599
+            _token_cache[cache_key] = (token, time.monotonic() + max(60, ttl - TOKEN_REFRESH_MARGIN_SECONDS))
+            return token
+        except Exception as e:
+            logger.error(f"Failed to get M-Pesa access token: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to get M-Pesa access token: {type(e).__name__}: {e}")
 
 async def initiate_stk_push_direct(
     phone_number: str,
@@ -108,40 +194,50 @@ async def initiate_stk_push_direct(
             "TransactionDesc": "Payment via STK Push"
         }
 
-        base_url = "https://api.safaricom.co.ke" if settings.MPESA_ENVIRONMENT == "production" else "https://sandbox.safaricom.co.ke"
-        
-        async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
-            response = await client.post(
+        base_url = _base_url()
+
+        async def _post(token: str) -> httpx.Response:
+            return await _send_with_connect_retry(
+                "POST",
                 f"{base_url}/mpesa/stkpush/v1/processrequest",
                 json=payload,
                 headers={
-                    "Authorization": f"Bearer {access_token}",
+                    "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json"
-                }
+                },
             )
-            
-            if response.status_code != 200:
-                logger.error(f"M-Pesa API Error {response.status_code}: {response.text}")
-                try:
-                    error_data = response.json()
-                    logger.error(f"M-Pesa Error Details: {error_data}")
-                except:
-                    pass
-            
-            response.raise_for_status()
-            result = response.json()
-            logger.info(f"STK Push initiated: {result}")
-            return StkPushResponse(
-                checkout_request_id=result["CheckoutRequestID"],
-                merchant_request_id=result["MerchantRequestID"]
-            )
+
+        response = await _post(access_token)
+        if _is_invalid_token_response(response):
+            # A reused token was revoked early: Safaricom rejected the request
+            # outright, so fetching a fresh token and sending once more is safe.
+            _invalidate_token(consumer_key, consumer_secret)
+            access_token = await get_access_token(consumer_key=consumer_key, consumer_secret=consumer_secret)
+            response = await _post(access_token)
+        if response.status_code != 200:
+            logger.error(f"M-Pesa API Error {response.status_code}: {response.text}")
+            try:
+                error_data = response.json()
+                logger.error(f"M-Pesa Error Details: {error_data}")
+            except:
+                pass
+        
+        response.raise_for_status()
+        result = response.json()
+        logger.info(f"STK Push initiated: {result}")
+        return StkPushResponse(
+            checkout_request_id=result["CheckoutRequestID"],
+            merchant_request_id=result["MerchantRequestID"]
+        )
     except httpx.HTTPStatusError as e:
         error_msg = f"M-Pesa API returned {e.response.status_code}: {e.response.text}"
         logger.error(f"STK Push initiation failed: {error_msg}")
         raise StkPushRejected(e.response.status_code, f"STK Push initiation failed: {error_msg}")
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"STK Push initiation failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"STK Push initiation failed: {str(e)}")
+        logger.error(f"STK Push initiation failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"STK Push initiation failed: {type(e).__name__}: {e}")
 
 # --- GraphQL Microservice Logic ---
 async def initiate_stk_push_via_graphql_microservice(
