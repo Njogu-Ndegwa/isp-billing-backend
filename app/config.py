@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # every new router enrolled automatically); set false to pause.
     EXPIRY_REAPER_AUTO_ENROL: bool = True
     EXPIRY_REAPER_ENROL_BATCH: int = 5
+    # A router on the reaper that reports an older script version (v= on its
+    # expiry-check call) gets the current script source rewritten in place:
+    # app/services/expiry_reaper_upgrade.py. False = leave scripts as they are.
+    EXPIRY_REAPER_AUTO_UPGRADE: bool = True
     # Keep reaper routers' EXP deadlines in step when an expiry moves later
     # outside a payment (outage compensation, admin edit, pairing):
     # app/services/expiry_tag_sync.py. Only ever moves a deadline later.

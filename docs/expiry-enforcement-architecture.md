@@ -107,6 +107,8 @@ Both layers only ever move a deadline **later**, and each correction writes an `
 
 It sends `v=2`, and the server remembers each router's version. The cleanup job waits the 3-minute grace on a MAC-login router only when that router has reported v2; otherwise it removes at once. The deadline sync covers MAC-login users as well. Nothing touches the user's profile, rate limit or queues, so MAC login's speed enforcement is unchanged.
 
+**Script upgrades happen by themselves.** Every call carries the script version (`v=`). When a router on the reaper reports an older version than the server's `SCRIPT_VERSION`, the server rewrites that router's script source in place (`app/services/expiry_reaper_upgrade.py`, switch `EXPIRY_REAPER_AUTO_UPGRADE`). The scheduler and the script's globals are kept, and each router is tried at most once every 6 hours. Routers that were offline during a fleet rollout catch up the next time they check in. New routers get the current script at enrolment.
+
 **PPPoE is not affected.** The reaper only reads hotspot ip-bindings. PPPoE customers are removed by the server job at their database expiry, with no grace period, so a compensation or edit takes effect as soon as it is saved.
 
 Bindings written by other paths (FUP restore, access credentials, public reconnect, shared-subscription devices that log in as hotspot users) carry no `EXP:` tag. The reaper ignores them and the server job removes them as before.
@@ -288,5 +290,6 @@ Known exceptions (2026-09-28):
 | 2026-09-26 | #100 server job: no safety-net stall, one table read per router, own lane. #123 installer guards |
 | 2026-09-27 | #128 automatic enrolment (on by default), fleet sweep → 59 routers |
 | 2026-09-28 | Enrolment at onboarding (`/complete`), re-check windows by reason and router age |
+| 2026-09-29 | Automatic in-place upgrade of older scripts on check-in |
 | 2026-09-29 | Script v2: MAC-login users enforced on the router; server waits only for routers reporting v2 |
 | 2026-09-28 | Expiry tag sync: a tag is moved later when compensation or an admin edit extends the expiry, plus a 15-min reconcile |
