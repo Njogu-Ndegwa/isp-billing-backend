@@ -2414,6 +2414,9 @@ def _queue_sync_customer_item(c, fup_period) -> dict:
         "plan_speed": plan_speed,
         "fup_active": bool(fup_period),
         "fup_action": fup_action.value if fup_action else None,
+        # MAC-login users carry EXP:<second>; the reconcile writes it from here
+        # so the router expiry reaper can enforce users it (re)creates.
+        "expiry": c.expiry,
     }
 
 
@@ -2672,9 +2675,11 @@ def _reconcile_mac_login_router_sync(router_info: dict, customers_data: list) ->
             "provisioned": summary.get("provisioned", 0),
             "already_ok": summary.get("already_ok", 0),
             "orphans_removed": summary.get("orphans_removed", 0),
+            "unstuck": summary.get("unstuck", 0),
+            "exp_tagged": summary.get("exp_tagged", 0),
             "errors": (summary.get("errors") or [])[:10],
         }
-        if summary.get("provisioned") or summary.get("orphans_removed") or summary.get("errors"):
+        if summary.get("provisioned") or summary.get("orphans_removed") or summary.get("unstuck") or summary.get("errors"):
             logger.warning("[SYNC] MAC-login reconcile on %s: %s", router_name, results["details"])
         return results
     except Exception as exc:

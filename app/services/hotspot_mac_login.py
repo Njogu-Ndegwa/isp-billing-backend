@@ -61,6 +61,16 @@ _setup_checked_at: Dict[str, float] = {}
 MAX_PROVISIONS_PER_RECONCILE = 40
 
 CMD_DELAY = 0.05
+# Two sessions per MAC-login user. The user is locked to its MAC
+# (mac-address=), so the second session can only be the same device: when a
+# phone gets a new IP while its old session is still alive (keepalive 2m), the
+# new IP's MAC login is refused with shared-users=1 ("no more sessions are
+# allowed") and RouterOS never retries it, leaving a paid customer at the portal
+# (router 256, 2026-09-29: 40 min).
+MAC_LOGIN_SHARED_USERS = "2"
+# Per reconcile run, paid devices stuck at the portal whose host entry is
+# cleared so RouterOS retries their MAC login.
+MAX_UNSTICK_PER_RECONCILE = 20
 
 _MAC_NAME_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 _T_RE = re.compile(r"\|T:(\d{9,11})")
@@ -219,6 +229,18 @@ def ensure_router_setup(api) -> Dict[str, Any]:
         out["profiles_updated"].append({"profile": profile.get("name"), "login-by": new_login_by})
         logger.warning("[MAC-LOGIN] %s: login-by now %s", profile.get("name"), new_login_by)
 
+    # Plan profiles: allow a second session for the same device (see
+    # MAC_LOGIN_SHARED_USERS). Covers profiles made by payments, the reconcile
+    # and the check-in applier alike.
+    out["shared_users_set"] = []
+    for up in _data(api.send_command("/ip/hotspot/user/profile/print")):
+        name = str(up.get("name", ""))
+        if not name.startswith("plan_") or str(up.get("shared-users", "")) == MAC_LOGIN_SHARED_USERS:
+            continue
+        if _ok(api.send_command("/ip/hotspot/user/profile/set", {
+                "numbers": up.get(".id"), "shared-users": MAC_LOGIN_SHARED_USERS})):
+            out["shared_users_set"].append(name)
+
     out["fasttrack"] = ensure_hotspot_fasttrack_exemption(api, interfaces)
     if out["fasttrack"].get("error"):
         out["success"] = False
@@ -335,8 +357,20 @@ def _ensure_profile(api, rate_limit: str, cache: Optional[Dict[str, Any]] = None
     profile = profile_name_for_rate(rate_limit)
     if cache is not None and profile in cache:
         return cache[profile]
-    result = api._ensure_hotspot_profile(profile, rate_limit)
+    # Written only when missing or different: rate-limit plus the second
+    # session for the same device (MAC_LOGIN_SHARED_USERS).
+    existing = next((p for p in _data(api.send_command("/ip/hotspot/user/profile/print"))
+                     if p.get("name") == profile), None)
+    wanted = {"rate-limit": rate_limit, "shared-users": MAC_LOGIN_SHARED_USERS}
+    if existing is None:
+        result = api.send_command("/ip/hotspot/user/profile/add", {"name": profile, **wanted})
+    elif any(str(existing.get(k, "")) != v for k, v in wanted.items()):
+        result = api.send_command("/ip/hotspot/user/profile/set", {"numbers": existing.get(".id"), **wanted})
+    else:
+        result = {"success": True, "unchanged": True}
     result = dict(result or {})
+    if not _ok(result):
+        result["error"] = result.get("error") or "profile write failed"
     result["profile"] = profile
     if cache is not None:
         cache[profile] = result
@@ -558,7 +592,7 @@ def reconcile_router(api, customers_data: List[Dict[str, Any]], now: Optional[fl
     now = time.time() if now is None else now
     summary: Dict[str, Any] = {
         "setup": None, "provisioned": 0, "already_ok": 0, "blocked_skipped": 0,
-        "on_bypass": 0, "orphans_removed": 0, "errors": [],
+        "on_bypass": 0, "orphans_removed": 0, "unstuck": 0, "exp_tagged": 0, "errors": [],
     }
     setup = ensure_router_setup(api)
     summary["setup"] = setup
@@ -587,8 +621,27 @@ def reconcile_router(api, customers_data: List[Dict[str, Any]], now: Optional[fl
         if binding.get("mac-address") and str(binding.get("type", "")).lower() == "bypassed":
             bypassed_macs.add(normalize_mac_address(binding["mac-address"]).upper())
 
+    # Paid devices on the network but not logged in: RouterOS tries a MAC
+    # login once, when it first sees a host; if that failed (the user did not
+    # exist yet, or a session limit), clearing the host makes it try again.
+    stuck_hosts: Dict[str, List[str]] = {}
+    active_macs = {
+        normalize_mac_address(a["mac-address"]).upper()
+        for a in _data(api.get_hotspot_active_minimal()) if a.get("mac-address")
+    }
+    for host in _data(api.get_hotspot_hosts_minimal()):
+        hm = host.get("mac-address")
+        if not hm or not host.get(".id"):
+            continue
+        hm = normalize_mac_address(hm).upper()
+        if (str(host.get("authorized", "false")).lower() != "true"
+                and str(host.get("bypassed", "false")).lower() != "true"
+                and hm not in active_macs):
+            stuck_hosts.setdefault(hm, []).append(host[".id"])
+
     profile_cache: Dict[str, Any] = {}
     budget = MAX_PROVISIONS_PER_RECONCILE
+    unstick_budget = MAX_UNSTICK_PER_RECONCILE
     for mac, cust in wanted.items():
         if str(cust.get("fup_action") or "").lower() == "block":
             summary["blocked_skipped"] += 1
@@ -611,6 +664,19 @@ def reconcile_router(api, customers_data: List[Dict[str, Any]], now: Optional[fl
         )
         if healthy:
             summary["already_ok"] += 1
+            if cust.get("expiry") is not None and "|EXP:" not in str(user.get("comment", "")):
+                # No EXP tag: the router reaper cannot expire this user. Tag it
+                # in place (comment only, no kick).
+                if _ok(api.send_command("/ip/hotspot/user/set", {
+                        "numbers": user.get(".id"),
+                        "comment": build_user_comment(mac, "reconcile", expiry=cust["expiry"])})):
+                    summary["exp_tagged"] += 1
+            if mac in stuck_hosts and unstick_budget > 0:
+                unstick_budget -= 1
+                for host_id in stuck_hosts[mac]:
+                    api.send_command("/ip/hotspot/host/remove", {"numbers": host_id})
+                summary["unstuck"] += 1
+                logger.warning("[MAC-LOGIN] paid %s was at the portal; host cleared for a new MAC login", mac)
             continue
         if budget <= 0:
             continue
