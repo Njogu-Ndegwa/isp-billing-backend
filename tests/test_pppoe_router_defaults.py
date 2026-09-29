@@ -9,11 +9,15 @@ def _connected_api():
     return api
 
 
-def test_parse_speed_to_mikrotik_preserves_explicit_up_down_limits():
+def test_parse_speed_to_mikrotik_turns_download_upload_into_routeros_upload_download():
+    # Plans are sold and stored as DOWNLOAD/UPLOAD (admin form: download/upload).
+    # RouterOS rate-limit and queue max-limit are UPLOAD/DOWNLOAD (rx/tx).
     assert parse_speed_to_mikrotik("15Mbps") == "15M/15M"
-    assert parse_speed_to_mikrotik("2M/5M") == "2M/5M"
-    assert parse_speed_to_mikrotik("5/10") == "5M/10M"
-    assert parse_speed_to_mikrotik("5000000/10000000") == "5000000/10000000"
+    assert parse_speed_to_mikrotik("5M/2M") == "2M/5M"      # 5 down, 2 up
+    assert parse_speed_to_mikrotik("2M/5M") == "5M/2M"
+    assert parse_speed_to_mikrotik("5/10") == "10M/5M"
+    assert parse_speed_to_mikrotik("5000000/10000000") == "10000000/5000000"
+    assert parse_speed_to_mikrotik("2m/2m") == "2M/2M"
 
 
 def test_hotspot_html_dir_defaults_to_hotspot_for_live_repairs():

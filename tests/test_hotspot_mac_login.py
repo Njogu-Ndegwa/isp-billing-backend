@@ -220,7 +220,8 @@ def test_provision_updates_an_existing_user_in_place():
     assert result["success"], result
     assert len(router.tables["/ip/hotspot/user"]) == 1
     user = router.user(MAC)
-    assert user["profile"] == "plan_10M_5M"
+    # plan speeds are download/upload; RouterOS profiles are upload/download
+    assert user["profile"] == "plan_5M_10M"
     assert user["disabled"] == "no" and user["limit-uptime"] == "0s"
 
 

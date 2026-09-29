@@ -75,17 +75,25 @@ def _normalize_mikrotik_rate_part(part: str, *, slash_context: bool = False) -> 
 
 def parse_speed_to_mikrotik(speed: str) -> str:
     """
-    Convert speed strings like '2Mbps', '5 Mbps', '512Kbps', or '2M/5M'
-    to MikroTik rate-limit format.
+    Convert a plan speed ('2Mbps', '5 Mbps', '512Kbps', '10M/5M') to RouterOS
+    rate-limit format.
+
+    Plan speeds are DOWNLOAD/UPLOAD: that is how resellers sell them and how
+    the admin plan form builds them (``${download_speed}/${upload_speed}``).
+    RouterOS rate-limit (hotspot/PPP profiles, Mikrotik-Rate-Limit) and simple
+    queue max-limit are the other way round: rx/tx from the router, i.e. the
+    client's UPLOAD/DOWNLOAD. So '10M/5M' becomes '5M/10M' (10 Mbps down,
+    5 Mbps up). Until 2026-09-29 the two were passed through unswapped, which
+    gave every asymmetric plan its smaller number as the download speed.
     """
     if not speed:
         return ""
 
     speed_text = str(speed).strip()
     if "/" in speed_text:
-        upload, download = [part.strip() for part in speed_text.split("/", 1)]
-        normalized_upload = _normalize_mikrotik_rate_part(upload, slash_context=True)
+        download, upload = [part.strip() for part in speed_text.split("/", 1)]
         normalized_download = _normalize_mikrotik_rate_part(download, slash_context=True)
+        normalized_upload = _normalize_mikrotik_rate_part(upload, slash_context=True)
         if normalized_upload and normalized_download:
             return f"{normalized_upload}/{normalized_download}"
         logger.warning(f"Could not parse speed '{speed}', using default 10M/10M")
