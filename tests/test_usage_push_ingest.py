@@ -236,17 +236,20 @@ async def test_push_reports_customers_that_crossed_their_cap(db, session_factory
     )
     key = "AA:BB:CC:CA:FE:01"
 
+    t0 = datetime.utcnow()
     baseline = await usage_push.ingest_usage_reports(
         router.id,
         [UsageReport(queue_key=key, upload_bytes=0, download_bytes=0)],
+        now=t0,
         session_factory=session_factory,
     )
     assert baseline.over_cap_customer_ids == []
 
-    # Cross the 100 MB cap.
+    # Cross the 100 MB cap (five minutes later, within the plan's line rate).
     result = await usage_push.ingest_usage_reports(
         router.id,
         [UsageReport(queue_key=key, upload_bytes=10 * MB, download_bytes=95 * MB)],
+        now=t0 + timedelta(minutes=5),
         session_factory=session_factory,
     )
 
