@@ -2672,9 +2672,10 @@ def _reconcile_mac_login_router_sync(router_info: dict, customers_data: list) ->
             "provisioned": summary.get("provisioned", 0),
             "already_ok": summary.get("already_ok", 0),
             "orphans_removed": summary.get("orphans_removed", 0),
+            "unstuck": summary.get("unstuck", 0),
             "errors": (summary.get("errors") or [])[:10],
         }
-        if summary.get("provisioned") or summary.get("orphans_removed") or summary.get("errors"):
+        if summary.get("provisioned") or summary.get("orphans_removed") or summary.get("unstuck") or summary.get("errors"):
             logger.warning("[SYNC] MAC-login reconcile on %s: %s", router_name, results["details"])
         return results
     except Exception as exc:

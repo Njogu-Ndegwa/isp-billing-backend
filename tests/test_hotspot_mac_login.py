@@ -419,3 +419,48 @@ def test_first_payment_on_an_unconverted_router_turns_mac_login_on():
     assert not any(w[0].startswith("/ip/hotspot/profile") or w[0].startswith("/ip/firewall")
                    for w in router.writes)
 
+
+
+# ---------------------------------------------------------------- IP change
+
+def test_setup_allows_a_second_session_for_the_same_device():
+    router = FakeRouter()
+    router.tables["/ip/hotspot/user/profile"].append(router._row(name="plan_5M_5M", **{"shared-users": "1"}))
+    router.tables["/ip/hotspot/user/profile"].append(router._row(name="voucher_1h", **{"shared-users": "1"}))
+
+    ml.ensure_router_setup(router.api())
+
+    by_name = {p["name"]: p for p in router.tables["/ip/hotspot/user/profile"]}
+    assert by_name["plan_5M_5M"]["shared-users"] == "2"
+    assert by_name["voucher_1h"]["shared-users"] == "1"   # not ours: untouched
+    router.writes.clear()
+    ml.ensure_router_setup(router.api())
+    assert router.writes == []
+
+
+def test_reconcile_clears_the_host_of_a_paid_device_stuck_at_the_portal():
+    router = FakeRouter()
+    ml.provision_customer(router.api(), MAC, "5M/5M")
+    # new IP while the old session was alive: MAC login refused, never retried
+    router.tables["/ip/hotspot/host"].append(router._row(
+        **{"mac-address": MAC, "address": "192.168.88.79", "authorized": "false", "bypassed": "false"}))
+    # an unpaid device at the portal must be left alone
+    router.tables["/ip/hotspot/host"].append(router._row(
+        **{"mac-address": OTHER, "address": "192.168.88.80", "authorized": "false", "bypassed": "false"}))
+
+    summary = ml.reconcile_router(router.api(), [{"mac_address": MAC, "plan_speed": "5M/5M"}])
+
+    assert summary["unstuck"] == 1
+    assert [h["mac-address"] for h in router.tables["/ip/hotspot/host"]] == [OTHER]
+
+
+def test_reconcile_leaves_a_logged_in_device_alone():
+    router = FakeRouter()
+    ml.provision_customer(router.api(), MAC, "5M/5M")
+    router.tables["/ip/hotspot/host"].append(router._row(
+        **{"mac-address": MAC, "address": "192.168.88.79", "authorized": "true", "bypassed": "false"}))
+    router.tables["/ip/hotspot/active"].append(router._row(**{"mac-address": MAC, "user": MAC}))
+
+    summary = ml.reconcile_router(router.api(), [{"mac_address": MAC, "plan_speed": "5M/5M"}])
+
+    assert summary["unstuck"] == 0 and len(router.tables["/ip/hotspot/host"]) == 1
