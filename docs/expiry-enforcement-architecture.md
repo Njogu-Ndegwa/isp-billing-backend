@@ -99,6 +99,14 @@ A renewal delivered to the router rewrites the tag. A renewal that could not be 
 
 Both layers only ever move a deadline **later**, and each correction writes an `expiry_tag_resync` provisioning log. Before writing, both the database and the router are read again, so a payment that lands in the meantime (and writes a later tag) is never overwritten with an earlier one. The kill switch is `EXPIRY_TAG_SYNC_ENABLED`. Found on 2026-09-28, when a 6 h compensation on router 141 left six bindings on the old deadline; nobody was removed early.
 
+**MAC-login routers (script v2, 2026-09-29).** With MAC login (PRs #149–#152, fleet-wide since 2026-09-29), a paid device is a hotspot user named after its MAC, and it carries the same deadline in its comment: `MACLOGIN|MAC:<mac>|T:<epoch>|EXP:<second>`. The v1 script read ip-bindings only, so these customers fell to the server backstop, and median removal went from 30 s to 3.3 min. Script v2:
+- counts and scans those users too;
+- asks about them by MAC;
+- re-dates them on `K` and retires them on `X`;
+- removes the user named with colons as well as the old compact one.
+
+It sends `v=2`, and the server remembers each router's version. The cleanup job waits the 3-minute grace on a MAC-login router only when that router has reported v2; otherwise it removes at once. The deadline sync covers MAC-login users as well. Nothing touches the user's profile, rate limit or queues, so MAC login's speed enforcement is unchanged.
+
 **PPPoE is not affected.** The reaper only reads hotspot ip-bindings. PPPoE customers are removed by the server job at their database expiry, with no grace period, so a compensation or edit takes effect as soon as it is saved.
 
 Bindings written by other paths (FUP restore, access credentials, public reconnect, shared-subscription devices that log in as hotspot users) carry no `EXP:` tag. The reaper ignores them and the server job removes them as before.
@@ -280,4 +288,5 @@ Known exceptions (2026-09-28):
 | 2026-09-26 | #100 server job: no safety-net stall, one table read per router, own lane. #123 installer guards |
 | 2026-09-27 | #128 automatic enrolment (on by default), fleet sweep → 59 routers |
 | 2026-09-28 | Enrolment at onboarding (`/complete`), re-check windows by reason and router age |
+| 2026-09-29 | Script v2: MAC-login users enforced on the router; server waits only for routers reporting v2 |
 | 2026-09-28 | Expiry tag sync: a tag is moved later when compensation or an admin edit extends the expiry, plus a 15-min reconcile |

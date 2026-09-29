@@ -112,6 +112,8 @@ class ExpiryCheckRequest:
     router_now: Optional[int]
     due: list[str] = field(default_factory=list)
     done: list[tuple[str, Optional[int]]] = field(default_factory=list)
+    # Script version (``v=``); scripts before v2 do not send it.
+    version: int = 1
 
 
 def _split(value: str) -> list[str]:
@@ -151,7 +153,33 @@ def parse_request(body: str) -> ExpiryCheckRequest:
         except ValueError:
             minute = None
         done.append((mac, minute))
-    return ExpiryCheckRequest(identity, router_now, due[:MAX_ITEMS_PER_CALL], done[:MAX_ITEMS_PER_CALL])
+    try:
+        version = max(1, int(fields.get("v", "1")))
+    except ValueError:
+        version = 1
+    return ExpiryCheckRequest(identity, router_now, due[:MAX_ITEMS_PER_CALL], done[:MAX_ITEMS_PER_CALL], version)
+
+
+# Script version each router last reported, by identity (process state). v2+
+# also enforces MAC-login hotspot users (``MACLOGIN|...|EXP:``), so the server
+# cleanup may leave those customers to the router for the grace period; an
+# older script cannot see them. Empty after a restart until each router calls
+# (at most an hour): meanwhile the server simply does not wait, which is safe.
+MAC_LOGIN_AWARE_VERSION = 2
+_reaper_versions: dict[str, int] = {}
+
+
+def note_reaper_version(identity: str, version: int) -> None:
+    _reaper_versions[identity] = int(version)
+
+
+def reaper_version(identity: Optional[str]) -> int:
+    return _reaper_versions.get(identity or "", 0)
+
+
+def reset_reaper_versions() -> None:
+    """Test hook."""
+    _reaper_versions.clear()
 
 
 def clock_ok(router_now: Optional[int], server_now: datetime) -> bool:

@@ -17,6 +17,10 @@ Cost, by design (a hAP lite spent 5-7 s at 100% CPU per HTTPS request):
   The binding list is only walked when a deadline has passed, a binding was
   added or removed, or a removal is waiting to be reported, and at most every
   5 minutes otherwise.
+* MAC-login routers (v2, 2026-09-29): a paid device may be a hotspot user named
+  after its MAC (``MACLOGIN|...|EXP:<second>`` comment) instead of an
+  ip-binding. Those users are read, asked about, re-dated and removed exactly
+  like bindings; the script reports ``v=2`` so the server knows it sees them.
 * It calls the server only when a customer is due, a removal needs reporting,
   or every 60 minutes as a heartbeat (the first run after a boot calls at
   once, which is how the router gets its clock confirmed). It tries plain HTTP inside the
@@ -30,6 +34,7 @@ import re
 
 from app.services.usage_push_auth import derive_router_token
 
+SCRIPT_VERSION = 2
 SCRIPT_NAME = "bitwave-expiry-reaper"
 SCHEDULER_NAME = "bitwave-expiry-reaper"
 POLICY = "read,write,test,policy"
@@ -138,7 +143,7 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
     # does nothing at all until NTP fixes it; the platform is the backstop.
     :if ($sane) do={
         # --- which deadlines have passed ------------------------------------
-        :local cnt [:len [/ip hotspot ip-binding find]]
+        :local cnt ([:len [/ip hotspot ip-binding find]] + [:len [/ip hotspot user find where comment~"^MACLOGIN"]])
         :local due ""
         :if (($nows >= $bwExpNext) || ($cnt != $bwExpCount) || ([:len $bwExpDone] > 0)) do={
             :local nxt ($nows + 300)
@@ -161,6 +166,24 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                     }
                 }
             }
+            # MAC-login users: the user is the access, named after the MAC.
+            :foreach u in=[/ip hotspot user find where comment~"^MACLOGIN.*EXP:"] do={
+                :local cm [/ip hotspot user get $u comment]
+                :local p [:find $cm "EXP:"]
+                :local v [:pick $cm ($p + 4) [:len $cm]]
+                :local e [:find $v "|"]
+                :if ([:typeof $e] = "num") do={ :set v [:pick $v 0 $e] }
+                :local x [:tonum $v]
+                :if ([:typeof $x] = "num") do={
+                    :if ($x <= $nows) do={
+                        :local um [:tostr [/ip hotspot user get $u name]]
+                        :if (([:len $um] = 17) && ([:len $due] < 700)) do={ :set due ($due . $um . ",") }
+                        :set nxt $nows
+                    } else={
+                        :if ($x < $nxt) do={ :set nxt $x }
+                    }
+                }
+            }
             :set bwExpNext $nxt
             :set bwExpCount $cnt
         }
@@ -171,7 +194,7 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
         :if (($due != "") || ([:len $bwExpDone] > 0) || (($nows - $bwExpBeat) >= 3600)) do={ :set docall true }
         :if ($nows < $bwExpRetryAt) do={ :set docall false }
         :if ($docall) do={
-            :local body ("ident=" . $ident . "&now=" . $nows . "&due=" . $due . "&done=" . $bwExpDone)
+            :local body ("ident=" . $ident . "&v=__VERSION__&now=" . $nows . "&due=" . $due . "&done=" . $bwExpDone)
             :local hdr ("Content-Type: text/plain,Authorization: Bearer " . $tok)
             :local rd ""
             :local ok false
@@ -224,6 +247,17 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                                     /ip hotspot ip-binding set $kb comment=([:pick $kc 0 ($kx + 4)] . $kv . $krest)
                                 }
                             }
+                            :foreach ku in=[/ip hotspot user find where name=$km comment~"^MACLOGIN"] do={
+                                :local uc [/ip hotspot user get $ku comment]
+                                :local ux [:find $uc "EXP:"]
+                                :if ([:typeof $ux] = "num") do={
+                                    :local utail [:pick $uc ($ux + 4) [:len $uc]]
+                                    :local ue [:find $utail "|"]
+                                    :local urest ""
+                                    :if ([:typeof $ue] = "num") do={ :set urest [:pick $utail $ue [:len $utail]] }
+                                    /ip hotspot user set $ku comment=([:pick $uc 0 ($ux + 4)] . $kv . $urest)
+                                }
+                            }
                         }
                     }
                 }
@@ -243,6 +277,13 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                             :local xx [:find $xc "EXP:"]
                             :if ([:typeof $xx] = "num") do={
                                 /ip hotspot ip-binding set $xb comment=([:pick $xc 0 $xx] . "EXX:" . [:pick $xc ($xx + 4) [:len $xc]])
+                            }
+                        }
+                        :foreach xu in=[/ip hotspot user find where name=$xm comment~"^MACLOGIN"] do={
+                            :local xuc [/ip hotspot user get $xu comment]
+                            :local xux [:find $xuc "EXP:"]
+                            :if ([:typeof $xux] = "num") do={
+                                /ip hotspot user set $xu comment=([:pick $xuc 0 $xux] . "EXX:" . [:pick $xuc ($xux + 4) [:len $xuc]])
                             }
                         }
                     }
@@ -273,6 +314,7 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 :do { /ip hotspot active remove [find where mac-address=$m] } on-error={}
                 :do { /ip hotspot host remove [find where mac-address=$m] } on-error={}
                 :do { /ip hotspot user remove [find where name=$u] } on-error={}
+                :do { /ip hotspot user remove [find where name=$m] } on-error={}
                 :do { /queue simple remove [find where name=("plan_" . $u)] } on-error={}
                 :if ([:len $bwExpDone] < 700) do={ :set bwExpDone ($bwExpDone . $m . "@" . $nows . ",") }
                 :log info ("expiry-reaper: removed " . $m)
@@ -309,6 +351,7 @@ def render_expiry_reaper_script(*, identity: str, tunnel_url: str, public_url: s
         .replace("__PURL__", public_url)
         .replace("__TOKEN__", derive_router_token(identity))
         .replace("__IDENT__", identity)
+        .replace("__VERSION__", str(SCRIPT_VERSION))
     )
 
 

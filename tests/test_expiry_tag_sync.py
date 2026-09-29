@@ -313,3 +313,48 @@ def test_admin_expiry_edit_schedules_a_tag_sync():
     from app.api import customer_routes
     src = inspect.getsource(customer_routes)
     assert 'schedule_expiry_tag_sync([customer.id], "admin expiry edit")' in src
+
+
+# --- MAC-login users (2026-09-29) ----------------------------------------------
+
+def test_mac_login_user_deadline_is_raised_in_place():
+    old = expiry_second(EXP - timedelta(hours=3))
+    user = {".id": "*9", "name": MAC, "_path": sync.USER_PATH,
+            "comment": f"MACLOGIN|MAC:{MAC}|T:1790000000|EXP:{old}|CHECKIN"}
+    [fix] = plan_fixes([user], {MAC: (7, EXP)})
+    assert fix.path == sync.USER_PATH and fix.binding_id == "*9"
+    assert fix.new_comment == f"MACLOGIN|MAC:{MAC}|T:1790000000|EXP:{expiry_second(EXP)}|CHECKIN"
+
+
+class FakeMacLoginRouter(FakeRouterOS):
+    def __init__(self, users):
+        super().__init__([])
+        self.users = users
+
+    def send_command(self, cmd, args=None):
+        if cmd == "/ip/hotspot/user/print":
+            return {"data": [dict(u) for u in self.users]}
+        if cmd == "/ip/hotspot/user/set":
+            self.sets.append(dict(args))
+            for u in self.users:
+                if u[".id"] == args[".id"]:
+                    u["comment"] = args["comment"]
+            return {"data": []}
+        return super().send_command(cmd, args)
+
+
+@pytest.mark.asyncio
+async def test_compensated_mac_login_customer_gets_the_new_deadline(db, wired):
+    reseller, plan, router = await _setup(db)
+    new_expiry = _future(8)
+    c = await make_customer(db, reseller, plan, router, status=CustomerStatus.ACTIVE,
+                            expiry=new_expiry, mac_address=MAC)
+    old = expiry_second(new_expiry - timedelta(hours=3))
+    fake = wired["10.0.9.1"] = FakeMacLoginRouter([
+        {".id": "*9", "name": MAC, "comment": f"MACLOGIN|MAC:{MAC}|T:1|EXP:{old}"},
+        {".id": "*A", "name": "someone", "comment": "not ours|EXP:1000000001"},
+    ])
+
+    assert await sync.sync_expiry_tags([c.id], "outage compensation run 9") == 1
+    assert tag_seconds(fake.users[0]["comment"]) == expiry_second(new_expiry)
+    assert fake.users[1]["comment"] == "not ours|EXP:1000000001"

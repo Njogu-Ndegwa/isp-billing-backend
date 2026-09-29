@@ -24,6 +24,9 @@ Two layers close that gap:
    whatever changed it (including paths that forgot to call layer 1, or a
    router that was offline when layer 1 ran).
 
+MAC-login routers hold the same deadline in the hotspot user's comment
+(``MACLOGIN|MAC:..|T:..|EXP:<second>``); those users are handled like bindings.
+
 Both only ever move a deadline LATER. A tag later than the database (an expiry
 shortened by an admin) is left alone: the server backstop removes that customer
 at the database expiry, and nothing here can cut a paying customer short.
@@ -63,6 +66,9 @@ RECONCILE_BUDGET_SECONDS = 600
 OFFLINE_SKIP = timedelta(minutes=10)
 
 _TAG_RE = re.compile(r"EXP:(\d+)")
+BINDING_PATH = "/ip/hotspot/ip-binding"
+USER_PATH = "/ip/hotspot/user"
+MAC_LOGIN_PREFIX = "MACLOGIN|"
 
 _running = False
 _tasks: set = set()
@@ -88,6 +94,7 @@ class TagFix:
     old_tag: int
     new_tag: int
     new_comment: str
+    path: str = BINDING_PATH
 
 
 def tag_seconds(comment: str) -> Optional[int]:
@@ -104,7 +111,9 @@ def plan_fixes(bindings: Iterable[dict], wanted: dict[str, tuple[int, datetime]]
     """
     fixes: list[TagFix] = []
     for b in bindings:
-        mac = normalize_mac(b.get("mac-address", ""))
+        path = b.get("_path", BINDING_PATH)
+        # A MAC-login user is named after its MAC; a binding carries it.
+        mac = normalize_mac(b.get("name", "") if path == USER_PATH else b.get("mac-address", ""))
         if not mac or mac not in wanted or not b.get(".id"):
             continue
         comment = b.get("comment", "") or ""
@@ -116,7 +125,7 @@ def plan_fixes(bindings: Iterable[dict], wanted: dict[str, tuple[int, datetime]]
         if old >= new:
             continue
         fixes.append(TagFix(b[".id"], mac, customer_id, old, new,
-                            _TAG_RE.sub(f"EXP:{new}", comment, count=1)))
+                            _TAG_RE.sub(f"EXP:{new}", comment, count=1), path))
     return fixes
 
 
@@ -224,13 +233,25 @@ def _api(t: Target) -> MikroTikAPI:
                        timeout=15, connect_timeout=5, lane=LANE_BACKGROUND)
 
 
+def _deadline_holders(api) -> Optional[list[dict]]:
+    """ip-bindings plus MAC-login hotspot users (tagged ``_path``)."""
+    res = api.send_command(f"{BINDING_PATH}/print")
+    if res.get("error"):
+        return None
+    rows = [dict(b, _path=BINDING_PATH) for b in res.get("data") or []]
+    users = api.send_command(f"{USER_PATH}/print")
+    if not users.get("error"):
+        rows += [dict(u, _path=USER_PATH) for u in users.get("data") or []
+                 if str(u.get("comment", "") or "").startswith(MAC_LOGIN_PREFIX)]
+    return rows
+
+
 def read_bindings_sync(t: Target) -> Optional[list[dict]]:
     api = _api(t)
     if not api.connect():
         return None
     try:
-        res = api.send_command("/ip/hotspot/ip-binding/print")
-        return None if res.get("error") else (res.get("data") or [])
+        return _deadline_holders(api)
     finally:
         api.disconnect()
 
@@ -243,11 +264,11 @@ def apply_fixes_sync(t: Target, wanted: dict[str, tuple[int, datetime]]) -> list
         return []
     done: list[TagFix] = []
     try:
-        res = api.send_command("/ip/hotspot/ip-binding/print")
-        if res.get("error"):
+        rows = _deadline_holders(api)
+        if rows is None:
             return []
-        for f in plan_fixes(res.get("data") or [], wanted):
-            out = api.send_command("/ip/hotspot/ip-binding/set",
+        for f in plan_fixes(rows, wanted):
+            out = api.send_command(f"{f.path}/set",
                                    {".id": f.binding_id, "comment": f.new_comment})
             if not out.get("error"):
                 done.append(f)

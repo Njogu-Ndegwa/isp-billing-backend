@@ -123,7 +123,11 @@ def build_user_comment(mac_address: str, note: str = "", now: Optional[float] = 
     parts = [f"{COMMENT_PREFIX}MAC:{mac}", f"T:{stamp}"]
     if expiry is not None:
         try:
-            parts.append(f"EXP:{int(expiry.timestamp())}")
+            # The rounded-UP UTC second, like the bindings' EXP: the router
+            # reaper enforces it (a naive datetime is UTC, whatever the host TZ).
+            from app.services.router_expiry import expiry_second
+
+            parts.append(f"EXP:{expiry_second(expiry)}")
         except Exception:
             pass
     if note:

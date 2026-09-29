@@ -31,6 +31,7 @@ from app.services.router_expiry import (
     CustomerRow,
     clock_ok,
     decide,
+    note_reaper_version,
     parse_request,
     render_reply,
 )
@@ -179,6 +180,7 @@ async def expiry_check(request: Request, authorization: Optional[str] = Header(d
         await db.commit()
 
     last_seen[req.identity] = (now, trusted)
+    note_reaper_version(req.identity, req.version)
     if remove or req.done or not trusted:
         logger.info(
             "[EXPIRY-REAPER] %s: clock %s, due=%d remove=%d keep=%d forget=%d confirmed=%d repaired=%d",
