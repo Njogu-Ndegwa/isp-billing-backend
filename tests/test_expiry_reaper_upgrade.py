@@ -126,3 +126,18 @@ def test_endpoint_asks_for_an_upgrade_with_the_reported_version():
     import inspect
     from app.api import router_expiry_routes
     assert "maybe_schedule_upgrade(req.identity, req.version)" in inspect.getsource(router_expiry_routes)
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_router_is_retried_after_ten_minutes_not_six_hours(db, wired):
+    await _router(db)
+    wired["10.0.7.1"] = FakeRouterOS(source="old", reachable=False)
+    up._attempted["Router-7001"] = 1000.0            # as maybe_schedule_upgrade records it
+    assert await up.upgrade_router("Router-7001") == "unreachable"
+    retry_at = up._attempted["Router-7001"] + up.UPGRADE_RETRY_SECONDS
+    assert retry_at == 1000.0 + up.UNREACHABLE_RETRY_SECONDS
+
+    wired["10.0.7.1"] = FakeRouterOS(source="old")
+    up._attempted["Router-7001"] = 1000.0
+    assert await up.upgrade_router("Router-7001") == "upgraded"
+    assert up._attempted["Router-7001"] == 1000.0     # a real attempt keeps the 6-hour window
