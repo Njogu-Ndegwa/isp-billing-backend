@@ -70,8 +70,17 @@ class Settings(BaseSettings):
     # (login-by=mac) with a rate-limited user profile, instead of getting a
     # bypassed ip-binding plus a static per-IP queue. The router then owns the
     # per-session queue, so the limit follows the device across IP changes.
-    # Comma list of router ids. See app/services/hotspot_mac_login.py.
+    # Comma list of router ids, or "all". See app/services/hotspot_mac_login.py.
     HOTSPOT_MAC_LOGIN_ROUTER_IDS: str = ""
+    # Routers with id >= this are MAC-login from birth (0 = off), so every new
+    # router is speed-limited the Wangige way without being listed.
+    HOTSPOT_MAC_LOGIN_MIN_ROUTER_ID: int = 0
+    # Always wins over the list / "all" / min id (e.g. a Level-4 router with
+    # more than 200 concurrent customers, or a load-balanced one).
+    HOTSPOT_MAC_LOGIN_EXCLUDE_ROUTER_IDS: str = ""
+    # MAC-login routers are reconciled on their own rotation, this many per
+    # queue-sync run (the reconcile is cheap; the fleet cycles in ~N/8 runs).
+    HOTSPOT_MAC_LOGIN_RECONCILE_PER_RUN: int = 8
     # Router check-in delivery pilot (2026-09-26). The router POSTs the MACs of
     # its app-tagged bypass bindings to /api/router/checkin; the server answers
     # with the paid MACs it is missing. Off by default, and only routers listed

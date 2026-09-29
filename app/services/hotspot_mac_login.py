@@ -50,6 +50,12 @@ NO_FASTTRACK_OUT_COMMENT = "ISP_BILLING_HOTSPOT_NO_FASTTRACK_OUT"
 # A tagged user younger than this is never treated as an orphan: the sync may
 # have read the paid-customer list just before a payment committed.
 ORPHAN_GRACE_SECONDS = 15 * 60
+# The payment path makes sure login-by=mac and the FastTrack exemption exist
+# before creating a user, so a router nobody converted (a new router, or one
+# offline during the rollout) works from its first payment. Checked at most
+# once per router per this many seconds per process.
+SETUP_RECHECK_SECONDS = 30 * 60
+_setup_checked_at: Dict[str, float] = {}
 # Per reconcile run, cap the users (re)written so a big router can't hold its
 # lock for long; the rest roll over to the next run.
 MAX_PROVISIONS_PER_RECONCILE = 40
@@ -64,22 +70,40 @@ _T_RE = re.compile(r"\|T:(\d{9,11})")
 # Pure helpers
 # --------------------------------------------------------------------------
 
+def _ids(raw) -> frozenset[int]:
+    return frozenset(int(p.strip()) for p in str(raw or "").split(",") if p.strip().isdigit())
+
+
 def mac_login_router_ids() -> frozenset[int]:
-    ids = set()
-    for part in str(getattr(settings, "HOTSPOT_MAC_LOGIN_ROUTER_IDS", "") or "").split(","):
-        part = part.strip()
-        if part.isdigit():
-            ids.add(int(part))
-    return frozenset(ids)
+    """The explicitly listed router ids (empty when the list is "all")."""
+    return _ids(getattr(settings, "HOTSPOT_MAC_LOGIN_ROUTER_IDS", ""))
+
+
+def mac_login_all_routers() -> bool:
+    return str(getattr(settings, "HOTSPOT_MAC_LOGIN_ROUTER_IDS", "") or "").strip().lower() == "all"
 
 
 def mac_login_enabled(router_id: Optional[int]) -> bool:
+    """Is this router on MAC login?
+
+    Listed, or the list is "all", or its id is at least
+    HOTSPOT_MAC_LOGIN_MIN_ROUTER_ID (new routers); never when excluded.
+    """
     if router_id is None:
         return False
     try:
-        return int(router_id) in mac_login_router_ids()
+        rid = int(router_id)
     except (TypeError, ValueError):
         return False
+    if rid in _ids(getattr(settings, "HOTSPOT_MAC_LOGIN_EXCLUDE_ROUTER_IDS", "")):
+        return False
+    if mac_login_all_routers() or rid in mac_login_router_ids():
+        return True
+    try:
+        floor = int(getattr(settings, "HOTSPOT_MAC_LOGIN_MIN_ROUTER_ID", 0) or 0)
+    except (TypeError, ValueError):
+        floor = 0
+    return floor > 0 and rid >= floor
 
 
 def mac_login_username(mac_address: str) -> str:
@@ -367,6 +391,7 @@ def provision_customer(
     try:
         mac = mac_login_username(mac_address)
         rate_limit = parse_speed_to_mikrotik(bandwidth_limit)
+        setup_result = _ensure_setup_recently(api)
         profile_result = _ensure_profile(api, rate_limit, profile_cache)
         if profile_result.get("error"):
             return {"error": f"profile: {profile_result['error']}", "profile_result": profile_result}
@@ -427,11 +452,34 @@ def provision_customer(
             "hotspot_user_result": user_result,
             "legacy_removed": legacy,
             "kick_result": kicked,
+            "setup_result": setup_result,
             "queue_result": {"skipped": True, "message": "router-managed dynamic hotspot queue"},
         }
     except Exception as exc:
         logger.error("[MAC-LOGIN] provision %s failed: %s", mac_address, exc)
         return {"error": str(exc)}
+
+
+def _ensure_setup_recently(api) -> Dict[str, Any]:
+    """Run ensure_router_setup unless this router passed it recently.
+
+    Never fails the payment: a setup error is logged and returned, and the
+    user is still created (the reconcile retries the setup).
+    """
+    key = f"{getattr(api, 'host', '')}:{getattr(api, 'port', '')}"
+    now = time.monotonic()
+    checked = _setup_checked_at.get(key)
+    if checked is not None and now - checked < SETUP_RECHECK_SECONDS:
+        return {"skipped": "checked recently"}
+    try:
+        result = ensure_router_setup(api)
+    except Exception as exc:  # pragma: no cover - defensive
+        result = {"error": str(exc)}
+    if result.get("error"):
+        logger.warning("[MAC-LOGIN] router %s setup at payment time failed: %s", key, result["error"])
+    else:
+        _setup_checked_at[key] = now
+    return result
 
 
 def verify_customer(api, mac_address: str) -> Dict[str, Any]:
