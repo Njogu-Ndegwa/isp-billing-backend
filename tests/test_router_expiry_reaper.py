@@ -370,3 +370,89 @@ def test_unconfirmed_clock_rechecks_within_five_minutes():
     s = _script()
     assert ':if (!$bwExpClockOk) do={ :set bwExpBeat ($nows - 3300) }' in s
     assert "(($nows - $bwExpBeat) >= 3600)" in s
+
+
+# --- MAC-login routers (script v2, 2026-09-29) ------------------------------
+
+def test_v2_script_reads_asks_about_redates_and_removes_mac_login_users():
+    src = _script()
+    # counted and scanned like bindings, named after the MAC
+    assert '[/ip hotspot user find where comment~"^MACLOGIN"]' in src
+    assert '/ip hotspot user find where comment~"^MACLOGIN.*EXP:"' in src
+    assert '[/ip hotspot user get $u name]' in src
+    # K re-dates the user's deadline, X retires it
+    assert '/ip hotspot user set $ku comment=' in src
+    assert '"EXX:"' in src and '/ip hotspot user set $xu comment=' in src
+    # removal takes the MAC-login user (named with colons) as well as the old one
+    assert '/ip hotspot user remove [find where name=$m]' in src
+    assert '/ip hotspot user remove [find where name=$u]' in src
+    # and it tells the server it can see them
+    assert '"ident=" . $ident . "&v=2&now="' in src
+
+
+def test_parse_request_reads_the_script_version():
+    assert parse_request(f"ident={IDENT}&v=2&now=1&due=&done=").version == 2
+    assert parse_request(f"ident={IDENT}&now=1&due=&done=").version == 1
+    assert parse_request(f"ident={IDENT}&v=x&now=1&due=&done=").version == 1
+
+
+@pytest.mark.asyncio
+async def test_endpoint_remembers_each_routers_script_version(client, db):
+    from app.services.router_expiry import reaper_version, reset_reaper_versions
+
+    reset_reaper_versions()
+    await _router_with(db, [])
+    assert reaper_version(IDENT) == 0
+    r = await _post(client, f"ident={IDENT}&v=2&now={_now_minute()}&due=&done=")
+    assert r.status_code == 200 and reaper_version(IDENT) == 2
+
+
+def test_mac_login_deadline_is_the_rounded_up_utc_second():
+    from app.services.hotspot_mac_login import build_user_comment
+
+    exp = datetime(2026, 9, 29, 7, 29, 17, 377322)
+    comment = build_user_comment("aa:bb:cc:00:00:01", "x", now=1, expiry=exp)
+    assert f"|EXP:{expiry_second(exp)}|" in comment
+    assert expiry_second(exp) == calendar.timegm(exp.timetuple()) + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mac_login,version,waits", [
+    (False, 0, True),    # bindings: every reaper version sees them
+    (True, 1, False),    # MAC login + old script: it cannot see them, do not wait
+    (True, 0, False),    # MAC login, script version not known yet (restart)
+    (True, 2, True),     # MAC login + v2 script: leave them to the router
+])
+async def test_server_waits_for_the_reaper_only_when_it_can_see_the_customer(
+        db, session_factory, monkeypatch, mac_login, version, waits):
+    from app.services import hotspot_mac_login
+    from app.services.router_expiry import note_reaper_version, reset_reaper_versions
+
+    monkeypatch.setattr(mikrotik_background, "async_session", session_factory)
+    monkeypatch.setattr(mikrotik_background, "cleanup_running", False)
+    monkeypatch.setattr(mikrotik_background, "_background_db_pool_is_busy", lambda _n: False)
+    monkeypatch.setattr(mikrotik_background, "_cleanup_bypassing_for_all_routers", _async_zero)
+    monkeypatch.setattr(mikrotik_background, "_reap_idle_access_credentials", _async_zero)
+    monkeypatch.setattr(mikrotik_background, "record_router_availability", _async_zero)
+    monkeypatch.setattr(hotspot_mac_login, "mac_login_enabled", lambda _rid: mac_login)
+    seen = []
+
+    def fake_cleanup(_router, customers):
+        seen.extend(c["id"] for c in customers)
+        return {"removed": [{"id": c["id"], "details": {}} for c in customers], "failed": [], "connected": True}
+
+    monkeypatch.setattr(mikrotik_background, "_cleanup_single_router_hotspot_sync", fake_cleanup)
+    reset_reaper_versions()
+    if version:
+        note_reaper_version("Router-9101", version)
+
+    now = datetime.utcnow()
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    reaper = await make_router(db, reseller, identity="Router-9101", expiry_reaper_enabled=True)
+    fresh = await make_customer(db, reseller, plan, reaper, mac_address=MAC_A,
+                                status=CustomerStatus.ACTIVE, expiry=now - timedelta(minutes=1))
+
+    await mikrotik_background.cleanup_expired_users_background()
+
+    assert (fresh.id not in seen) is waits

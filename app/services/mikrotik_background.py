@@ -336,6 +336,25 @@ def _cleanup_router_unreachable(
     return (now - failed_at) < threshold
 
 
+def _reaper_sees_customer(router) -> bool:
+    """Whether the router's expiry reaper can enforce this router's hotspot
+    customers, so cleanup may leave them to it for EXPIRY_REAPER_GRACE.
+
+    On a MAC-login router a paid device is a hotspot user, not an ip-binding;
+    reaper scripts before v2 only read ip-bindings and never see them, so the
+    server must not wait (2026-09-29: median removal went 30 s -> 3.3 min when
+    MAC login went fleet-wide)."""
+    from app.services.hotspot_mac_login import mac_login_enabled
+    from app.services.router_expiry import MAC_LOGIN_AWARE_VERSION, reaper_version
+
+    try:
+        if not mac_login_enabled(getattr(router, "id", None)):
+            return True
+    except Exception:
+        return True
+    return reaper_version(getattr(router, "identity", None)) >= MAC_LOGIN_AWARE_VERSION
+
+
 def _router_agent_alive(router, now: datetime) -> bool:
     """True when the router's outbound agent has checked in recently enough to
     execute a queued removal."""
@@ -1680,7 +1699,8 @@ async def cleanup_expired_users_background():
                     long_offline_quarantined.append(c.id)
                     continue
                 if (c.router and getattr(c.router, "expiry_reaper_enabled", False)
-                        and c.expiry and now - c.expiry < EXPIRY_REAPER_GRACE):
+                        and c.expiry and now - c.expiry < EXPIRY_REAPER_GRACE
+                        and _reaper_sees_customer(c.router)):
                     reaper_deferred.append(c.id)
                     continue
                 if c.router and _router_agent_alive(c.router, now):
