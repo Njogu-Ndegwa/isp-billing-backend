@@ -112,6 +112,23 @@ class UsageReport:
 HOST_KEY_PREFIX = "host:"
 
 
+def host_usage_key(mac: str, address: str) -> str:
+    """Usage-row key for ONE /ip hotspot host entry: ``host:<MAC>@<address>``.
+
+    A device can hold several host entries at once — a phone on mobile data or
+    a VPN gets a second entry for its stray source address next to its real
+    LAN one (72:7B:64:EB:A4:72 on router 118: 671 MB on .233, 28 KB on
+    10.47.135.116). Keyed by MAC alone, the two counters were diffed against
+    each other every push; each drop looked like a counter reset and the
+    device's whole running total was re-banked once a minute (731 GB booked
+    for a 10 Mbps plan in six hours, 2026-09-29). Each entry is its own
+    monotonic counter, so each gets its own row.
+    """
+    address = str(address or "").strip().split("/", 1)[0]
+    key = f"{HOST_KEY_PREFIX}{mac}@{address}" if address else f"{HOST_KEY_PREFIX}{mac}"
+    return key[:50]  # user_bandwidth_usage.mac_address is String(50)
+
+
 @dataclass
 class RouterMetrics:
     """Router-level numbers a reporter may include alongside its usage batch.
@@ -396,10 +413,18 @@ async def ingest_usage_reports(
             ):
                 result.live_pppoe_customers[key] = customer.id
 
+        # RouterOS can list one host entry twice (its script walks the bypassed
+        # and the authorized lists); crediting both would double-count it.
+        seen_hosts: set[tuple[str, str]] = set()
         pending = 0
         for report in reports:
             key = _canonical_key(report.queue_key)
             is_host = report.source == "host"
+            if is_host and key:
+                host_id = (key, str(report.target_ip or ""))
+                if host_id in seen_hosts:
+                    continue
+                seen_hosts.add(host_id)
             if not key or (is_host and key.startswith("pppoe:")):
                 result.rejected += 1
                 result.errors.append("bad_queue_key")
@@ -474,7 +499,7 @@ async def ingest_usage_reports(
                     db,
                     customer=customer,
                     plan=plan,
-                    queue_key=f"{HOST_KEY_PREFIX}{key}" if is_host else key,
+                    queue_key=host_usage_key(key, report.target_ip) if is_host else key,
                     upload_bytes=upload,
                     download_bytes=download,
                     queue_name=report.queue_name or "",

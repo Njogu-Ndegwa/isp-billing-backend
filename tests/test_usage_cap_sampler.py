@@ -50,6 +50,9 @@ async def test_cap_sampler_updates_usage_period_with_one_router_poll_per_run(
         data_cap_mb=500,
         fup_action=FupAction.THROTTLE,
         fup_throttle_profile="512K/512K",
+        # The two samples land milliseconds apart; the line-rate guard would
+        # (rightly) refuse 595 MB in that window on a slow plan.
+        speed="1G/1G",
     )
     customer = await make_customer(
         db,

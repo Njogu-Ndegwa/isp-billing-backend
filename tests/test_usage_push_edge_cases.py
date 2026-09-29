@@ -172,11 +172,14 @@ async def test_same_mac_on_two_resellers_does_not_share_a_counter(db, session_fa
         expiry=datetime.utcnow() + timedelta(days=30),
     )
 
-    # A is a heavy user; B just connected.
-    for up, dn in ((0, 0), (100 * MB, 400 * MB)):
+    # A is a heavy user; B just connected. A's samples are ten minutes apart
+    # so 400 MB is within what the plan's line rate allows.
+    t0 = datetime.utcnow()
+    for i, (up, dn) in enumerate(((0, 0), (100 * MB, 400 * MB))):
         await usage_push.ingest_usage_reports(
             router_a.id,
             [UsageReport(queue_key="AA:BB:CC:5E:5E:5E", upload_bytes=up, download_bytes=dn)],
+            now=t0 + timedelta(minutes=10 * i),
             session_factory=session_factory,
         )
     for up, dn in ((0, 0), (1 * MB, 2 * MB)):

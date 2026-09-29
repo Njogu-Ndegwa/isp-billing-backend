@@ -50,6 +50,7 @@ from app.services.router_availability import (
     prune_router_availability_history,
 )
 from app.services.usage_tracking import record_usage
+from app.services.usage_counters import clamp_to_line_rate
 from app.services.fup import hotspot_throttle_rate_for_plan
 from app.services import customer_expiry_notifications
 from app.core.protected_devices import is_protected_device
@@ -3795,6 +3796,11 @@ async def collect_bandwidth_snapshot():
                                     delta_up, delta_dn, reset_detected = _usage_counter_delta(
                                         usage, upload_bytes, download_bytes
                                     )
+                                    delta_up, delta_dn = clamp_to_line_rate(
+                                        delta_up, delta_dn,
+                                        customer.plan if customer else None,
+                                        usage.last_updated, now, key=normalized_mac,
+                                    )
                                     if reset_detected:
                                         logger.info(
                                             "[USAGE] Hotspot counter reset for %s "
@@ -3916,6 +3922,11 @@ async def collect_bandwidth_snapshot():
                                 if usage:
                                     delta_up, delta_dn, reset_detected = _usage_counter_delta(
                                         usage, upload_bytes, download_bytes
+                                    )
+                                    delta_up, delta_dn = clamp_to_line_rate(
+                                        delta_up, delta_dn,
+                                        customer.plan if customer else None,
+                                        usage.last_updated, now, key=pppoe_key,
                                     )
                                     if reset_detected:
                                         logger.info(

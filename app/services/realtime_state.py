@@ -296,6 +296,22 @@ def _effective_queue(queues: list[QueueSample], ip: str) -> Optional[QueueSample
     return None
 
 
+def _primary_host_per_mac(hosts: Iterable[HostSample]) -> list[HostSample]:
+    """One entry per device: the busiest of its host entries.
+
+    A phone on mobile data or a VPN also gets a near-empty host entry for its
+    stray source address. Letting whichever came last win showed that ghost's
+    IP and counters as the device, and its rate flip-flopped as a "reset".
+    """
+    best: dict[str, HostSample] = {}
+    for host in hosts:
+        mac = normalize_mac_address(host.mac).upper()
+        current = best.get(mac)
+        if current is None or (host.bytes_in + host.bytes_out) > (current.bytes_in + current.bytes_out):
+            best[mac] = host
+    return list(best.values())
+
+
 def record_push(
     router_id: int,
     *,
@@ -371,7 +387,7 @@ def record_push(
             state.wan_tx_bps = _rate(prev.wan_tx_bytes, state.wan_tx_bytes, elapsed)
 
     seen = set()
-    for host in hosts:
+    for host in _primary_host_per_mac(hosts):
         mac = normalize_mac_address(host.mac).upper()
         customer_id = live_customers.get(mac)
         if customer_id is None:
