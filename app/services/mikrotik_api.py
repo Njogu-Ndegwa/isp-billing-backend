@@ -30,6 +30,15 @@ DUAL_HOTSPOT_PROFILE_NAME = "hsprof-dual"
 DUAL_HOTSPOT_SERVER_NAME = "hotspot-dual"
 DUAL_HOTSPOT_NAT_COMMENT = "NAT for dual hotspot clients"
 
+PPPOE_POOL_NAME = "pppoe-pool"
+PPPOE_NAT_COMMENT = "NAT for PPPoE clients"
+PPPOE_BRIDGE_ADDRESS_COMMENT = "PPPoE bridge address"
+PPPOE_FASTTRACK_BYPASS_COMMENT_PREFIX = "PPPoE bypass FastTrack"
+# The first /24 is the historical default. The others are only used when the
+# router already owns an address in it — e.g. a router whose own internet is a
+# PPPoE session from another of our routers, which hands out 192.168.89.x.
+PPPOE_SUBNET_CANDIDATES = ("192.168.89", "192.168.189", "192.168.199", "172.16.89")
+
 DEFAULT_PPPOE_KEEPALIVE_TIMEOUT = "10"
 DEFAULT_PPPOE_ONE_SESSION_PER_HOST = "yes"
 DEFAULT_PPPOE_PROFILE_ONLY_ONE = "yes"
@@ -2877,6 +2886,249 @@ class MikroTikAPI:
 
         return cidrs
 
+    @staticmethod
+    def pppoe_subnet_layout(prefix: str) -> Dict[str, str]:
+        """Addresses the PPPoE server uses inside one /24 (``prefix`` = first 3 octets)."""
+        return {
+            "prefix": prefix,
+            "subnet": f"{prefix}.0/24",
+            "local_address": f"{prefix}.1",
+            "bridge_ip": f"{prefix}.1/24",
+            "pool_range": f"{prefix}.2-{prefix}.254",
+        }
+
+    def _networks_in_use_outside_pppoe(self, pool_rows: List[Dict[str, Any]], pool_name: str) -> List[Any]:
+        """Networks this router already uses for anything except our PPPoE server.
+
+        Skips the server side of live PPPoE sessions (``<pppoe-NAME>``) and the
+        PPPoE bridge address, since those move together with the pool.
+        """
+        rows = self.send_command("/ip/address/print")
+        if not rows.get("success"):
+            raise RuntimeError(rows.get("error") or "could not read /ip/address")
+
+        networks = []
+        for row in rows.get("data") or []:
+            interface = str(row.get("interface") or "")
+            if interface.startswith("<pppoe-") or interface == "bridge-pppoe":
+                continue
+            if row.get("comment") == PPPOE_BRIDGE_ADDRESS_COMMENT:
+                continue
+            for value in (row.get("address"), row.get("network")):
+                try:
+                    networks.append(ipaddress.ip_network(str(value or "").strip(), strict=False))
+                except ValueError:
+                    pass
+
+        for pool in pool_rows:
+            if pool.get("name") == pool_name:
+                continue
+            for cidr in self._pool_ranges_to_cidrs(pool.get("ranges", "")):
+                networks.append(ipaddress.ip_network(cidr, strict=False))
+        return networks
+
+    def prepare_pppoe_subnet(self, pool_name: str = PPPOE_POOL_NAME) -> Dict[str, Any]:
+        """Pick the PPPoE client subnet for this router, moving it off a clash.
+
+        Keeps the subnet the router already uses unless it overlaps one of the
+        router's own addresses. The common clash is a router whose internet is
+        a PPPoE session from another router of ours: its WAN is 192.168.89.x,
+        so serving PPPoE on 192.168.89.0/24 as well would make the upstream
+        gateway (192.168.89.1) a local address and cut the router off. In that
+        case the pool, PPP profiles, PPPoE bridge address and stale FastTrack
+        bypass rules move to the first free candidate subnet.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            pools = self.send_command("/ip/pool/print")
+            if not pools.get("success"):
+                return {"error": f"Could not read IP pools: {pools.get('error')}"}
+            pool_rows = pools.get("data") or []
+            in_use = self._networks_in_use_outside_pppoe(pool_rows, pool_name)
+
+            current_prefix = None
+            for pool in pool_rows:
+                if pool.get("name") != pool_name:
+                    continue
+                first_ip = str(pool.get("ranges") or "").split(",")[0].split("-")[0].strip()
+                try:
+                    ipaddress.IPv4Address(first_ip)
+                    current_prefix = first_ip.rsplit(".", 1)[0]
+                except ValueError:
+                    current_prefix = None
+                break
+
+            def _is_free(prefix: str) -> bool:
+                candidate = ipaddress.ip_network(f"{prefix}.0/24")
+                return not any(candidate.overlaps(net) for net in in_use)
+
+            candidates = [current_prefix] if current_prefix else []
+            candidates += [p for p in PPPOE_SUBNET_CANDIDATES if p != current_prefix]
+            chosen = next((p for p in candidates if _is_free(p)), None)
+            if chosen is None:
+                return {
+                    "error": (
+                        "No free subnet for PPPoE clients: every candidate overlaps "
+                        "an address already configured on this router"
+                    )
+                }
+
+            layout = self.pppoe_subnet_layout(chosen)
+            if current_prefix and chosen != current_prefix:
+                moved = self._move_pppoe_subnet(current_prefix, layout, pool_rows, pool_name)
+                if moved.get("error"):
+                    return moved
+                layout["moved_from"] = f"{current_prefix}.0/24"
+                layout["warnings"] = moved.get("warnings", [])
+                logger.warning(
+                    "PPPoE subnet %s.0/24 overlaps an address on router %s; moved PPPoE to %s",
+                    current_prefix, self.host, layout["subnet"],
+                )
+            return {"success": True, **layout}
+        except Exception as e:
+            logger.error(f"Error choosing PPPoE subnet: {e}")
+            return {"error": f"Could not choose PPPoE subnet: {e}"}
+
+    def _move_pppoe_subnet(
+        self,
+        old_prefix: str,
+        layout: Dict[str, str],
+        pool_rows: List[Dict[str, Any]],
+        pool_name: str,
+    ) -> Dict[str, Any]:
+        old_net = ipaddress.ip_network(f"{old_prefix}.0/24")
+        warnings: List[str] = []
+
+        def _in_old(value: Any) -> bool:
+            try:
+                return ipaddress.ip_network(str(value or "").strip(), strict=False).subnet_of(old_net)
+            except (ValueError, TypeError):
+                return False
+
+        for pool in pool_rows:
+            if pool.get("name") == pool_name and pool.get(".id"):
+                result = self.send_command(
+                    "/ip/pool/set", {"numbers": pool[".id"], "ranges": layout["pool_range"]},
+                )
+                if result.get("error"):
+                    return {"error": f"Could not move PPPoE pool to {layout['subnet']}: {result['error']}"}
+
+        profiles = self.send_command("/ppp/profile/print")
+        for profile in profiles.get("data") or [] if profiles.get("success") else []:
+            if profile.get(".id") and _in_old(profile.get("local-address")):
+                result = self.send_command(
+                    "/ppp/profile/set",
+                    {"numbers": profile[".id"], "local-address": layout["local_address"]},
+                )
+                if result.get("error"):
+                    warnings.append(f"PPP profile {profile.get('name')}: {result['error']}")
+
+        addresses = self.send_command("/ip/address/print")
+        for row in addresses.get("data") or [] if addresses.get("success") else []:
+            ours = row.get("interface") == "bridge-pppoe" or row.get("comment") == PPPOE_BRIDGE_ADDRESS_COMMENT
+            if ours and row.get(".id") and _in_old(row.get("address")):
+                result = self.send_command(
+                    "/ip/address/set", {"numbers": row[".id"], "address": layout["bridge_ip"]},
+                )
+                if result.get("error"):
+                    warnings.append(f"PPPoE bridge address: {result['error']}")
+
+        filters = self.send_command("/ip/firewall/filter/print")
+        for rule in filters.get("data") or [] if filters.get("success") else []:
+            comment = str(rule.get("comment") or "")
+            if comment.startswith(PPPOE_FASTTRACK_BYPASS_COMMENT_PREFIX) and rule.get(".id"):
+                if _in_old(comment.rsplit(" ", 1)[-1]):
+                    self.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]})
+
+        # Sessions keep their old address until they redial.
+        active = self.send_command("/ppp/active/print")
+        for session in active.get("data") or [] if active.get("success") else []:
+            if session.get(".id") and _in_old(session.get("address")):
+                self.send_command("/ppp/active/remove", {"numbers": session[".id"]})
+
+        return {"success": True, "warnings": warnings}
+
+    def _wan_out_interface(self, wan_port: str = "ether1") -> str:
+        """Interface internet traffic actually leaves by.
+
+        Usually ``ether1``, but when the uplink is a PPPoE client dialled over
+        ether1, traffic leaves through that client interface and a masquerade
+        rule on ether1 never matches.
+        """
+        clients = self.send_command("/interface/pppoe-client/print")
+        for client in clients.get("data") or [] if clients.get("success") else []:
+            if client.get("interface") == wan_port and str(client.get("disabled", "false")).lower() != "true":
+                return client.get("name") or wan_port
+        return wan_port
+
+    def ensure_pppoe_nat(self, subnet: str, comment: str = PPPOE_NAT_COMMENT) -> Dict[str, Any]:
+        """Keep exactly one masquerade rule for the PPPoE subnet.
+
+        RouterOS happily accepts identical NAT rules, so a plain ``add`` on
+        every save piled up one copy per save (17 on one router). This reuses
+        the first managed rule, points it at the current subnet and WAN, and
+        removes the copies.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            out_interface = self._wan_out_interface()
+            rules = self.send_command("/ip/firewall/nat/print")
+            if not rules.get("success"):
+                return {"error": f"Could not read NAT rules: {rules.get('error')}"}
+
+            managed = [
+                r for r in rules.get("data") or []
+                if r.get("comment") == comment
+                or (
+                    r.get("chain") == "srcnat"
+                    and r.get("action") == "masquerade"
+                    and r.get("src-address") == subnet
+                    and not r.get("comment")
+                )
+            ]
+            if not managed:
+                result = self.send_command("/ip/firewall/nat/add", {
+                    "chain": "srcnat",
+                    "src-address": subnet,
+                    "out-interface": out_interface,
+                    "action": "masquerade",
+                    "comment": comment,
+                })
+                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                    return {"error": result["error"]}
+                return {"success": True, "action": "added", "out_interface": out_interface, "removed_duplicates": 0}
+
+            keep, extras = managed[0], managed[1:]
+            updates = {}
+            if keep.get("src-address") != subnet:
+                updates["src-address"] = subnet
+            if keep.get("out-interface") != out_interface:
+                updates["out-interface"] = out_interface
+            if keep.get("comment") != comment:
+                updates["comment"] = comment
+            if updates and keep.get(".id"):
+                result = self.send_command("/ip/firewall/nat/set", {"numbers": keep[".id"], **updates})
+                if result.get("error"):
+                    return {"error": result["error"]}
+
+            removed = 0
+            for rule in extras:
+                if rule.get(".id"):
+                    result = self.send_command("/ip/firewall/nat/remove", {"numbers": rule[".id"]})
+                    if not result.get("error"):
+                        removed += 1
+            return {
+                "success": True,
+                "action": "updated" if updates else "exists",
+                "out_interface": out_interface,
+                "removed_duplicates": removed,
+            }
+        except Exception as e:
+            logger.error(f"Error ensuring PPPoE NAT: {e}")
+            return {"error": str(e)}
+
     def ensure_pppoe_fasttrack_bypass(
         self,
         bridge_name: str = "bridge-pppoe",
@@ -4950,6 +5202,42 @@ class MikroTikAPI:
         if current_state.get("error"):
             return current_state
 
+        subnet = self.prepare_pppoe_subnet(pool_name)
+        if subnet.get("error"):
+            return subnet
+
+        result = self._setup_pppoe_infrastructure_modes(
+            pppoe_ports=pppoe_ports,
+            hotspot_bridge=hotspot_bridge,
+            bridge_name=bridge_name,
+            bridge_ip=subnet["bridge_ip"],
+            pool_name=pool_name,
+            pool_range=subnet["pool_range"],
+            service_name=service_name,
+            current_state=current_state,
+        )
+        if not result.get("error"):
+            notes = list(subnet.get("warnings", []))
+            if subnet.get("moved_from"):
+                notes.append(
+                    f"PPPoE clients now use {subnet['subnet']}: {subnet['moved_from']} clashed "
+                    f"with an address this router already uses (usually its own internet uplink)"
+                )
+            if notes:
+                result["warnings"] = list(result.get("warnings", [])) + notes
+        return result
+
+    def _setup_pppoe_infrastructure_modes(
+        self,
+        pppoe_ports: List[str],
+        hotspot_bridge: str,
+        bridge_name: str,
+        bridge_ip: str,
+        pool_name: str,
+        pool_range: str,
+        service_name: str,
+        current_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
         current_mode = current_state.get("mode", "none")
         bridge_members = set(current_state.get("legacy_bridge_members", []))
         if current_mode in {"legacy_bridge", "mixed"} or bridge_members.intersection(pppoe_ports or []):
@@ -5106,18 +5394,11 @@ class MikroTikAPI:
                 if bind_result.get("error"):
                     port_setup_errors.append(f"Port {port}: {bind_result['error']}")
 
-            if not direct_mode_established:
-                # 6. Add NAT masquerade for PPPoE subnet (ignore if already exists)
-                pppoe_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
-                result = self.send_command("/ip/firewall/nat/add", {
-                    "chain": "srcnat",
-                    "src-address": pppoe_subnet,
-                    "out-interface": "ether1",
-                    "action": "masquerade",
-                    "comment": "NAT for PPPoE clients",
-                })
-                if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                    errors.append(f"NAT: {result['error']}")
+            # 6. Exactly one NAT masquerade for the PPPoE subnet, out the real WAN.
+            pppoe_subnet = pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
+            nat_result = self.ensure_pppoe_nat(pppoe_subnet)
+            if nat_result.get("error"):
+                errors.append(f"NAT: {nat_result['error']}")
 
             # 7. Verify the selected ports are directly attached to PPPoE.
             access_state = self.get_pppoe_access_state(legacy_bridge_name=bridge_name)
@@ -5253,15 +5534,9 @@ class MikroTikAPI:
             if server_result.get("error"):
                 return {"error": f"PPPoE server: {server_result['error']}"}
 
-            result = self.send_command("/ip/firewall/nat/add", {
-                "chain": "srcnat",
-                "src-address": pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24",
-                "out-interface": "ether1",
-                "action": "masquerade",
-                "comment": "NAT for PPPoE clients",
-            })
-            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                errors.append(f"NAT: {result['error']}")
+            nat_result = self.ensure_pppoe_nat(pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24")
+            if nat_result.get("error"):
+                errors.append(f"NAT: {nat_result['error']}")
 
             bypass_result = self.ensure_pppoe_fasttrack_bypass(
                 bridge_name=bridge_name,
@@ -5498,6 +5773,17 @@ class MikroTikAPI:
                     for warning in hotspot_portal_result.get("warnings", [])
                 )
 
+            subnet = self.prepare_pppoe_subnet(pppoe_pool_name)
+            if subnet.get("error"):
+                return {"error": subnet["error"], "partial_errors": errors}
+            pppoe_pool_range, pppoe_local_address = subnet["pool_range"], subnet["bridge_ip"]
+            errors.extend(subnet.get("warnings", []))
+            if subnet.get("moved_from"):
+                errors.append(
+                    f"PPPoE clients now use {subnet['subnet']}: {subnet['moved_from']} clashed "
+                    f"with an address this router already uses (usually its own internet uplink)"
+                )
+
             result = self.send_command("/ip/pool/add", {
                 "name": pppoe_pool_name,
                 "ranges": pppoe_pool_range,
@@ -5524,15 +5810,9 @@ class MikroTikAPI:
                 return {"error": f"PPPoE server on {hotspot_bridge}: {bind_result['error']}"}
 
             pppoe_subnet = pppoe_pool_range.split("-")[0].rsplit(".", 1)[0] + ".0/24"
-            result = self.send_command("/ip/firewall/nat/add", {
-                "chain": "srcnat",
-                "src-address": pppoe_subnet,
-                "out-interface": "ether1",
-                "action": "masquerade",
-                "comment": "NAT for PPPoE clients",
-            })
-            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
-                errors.append(f"NAT: {result['error']}")
+            nat_result = self.ensure_pppoe_nat(pppoe_subnet)
+            if nat_result.get("error"):
+                errors.append(f"NAT: {nat_result['error']}")
 
             bypass_result = self.ensure_pppoe_fasttrack_bypass(
                 bridge_name=hotspot_bridge,
@@ -5871,7 +6151,7 @@ class MikroTikAPI:
                 result = self.send_command("/ip/firewall/nat/add", {
                     "chain": "srcnat",
                     "src-address": plain_subnet,
-                    "out-interface": "ether1",
+                    "out-interface": self._wan_out_interface(),
                     "action": "masquerade",
                     "comment": "NAT for plain clients",
                 })

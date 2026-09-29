@@ -120,6 +120,26 @@ def _apply_pppoe_headroom(rate_limit: str, factor: float) -> str:
     return f"{scaled_upload}/{scaled_download}"
 
 
+def _local_address_from_pool(api: MikroTikAPI) -> str:
+    """Gateway (.1) of the router's existing PPPoE pool, else the default.
+
+    A router whose uplink sits in 192.168.89.0/24 has its PPPoE pool moved to
+    another /24 (see MikroTikAPI.prepare_pppoe_subnet); a profile created with
+    the default gateway would reintroduce the clash.
+    """
+    try:
+        pools = api.send_command("/ip/pool/print")
+        for pool in pools.get("data") or [] if pools.get("success") else []:
+            if pool.get("name") != PPPOE_DEFAULT_POOL_NAME:
+                continue
+            first_ip = str(pool.get("ranges") or "").split(",")[0].split("-")[0].strip()
+            if first_ip.count(".") == 3:
+                return first_ip.rsplit(".", 1)[0] + ".1"
+    except Exception as e:  # never block provisioning on this lookup
+        logger.warning(f"[PPPoE] Could not read {PPPOE_DEFAULT_POOL_NAME} for local address: {e}")
+    return PPPOE_DEFAULT_LOCAL_ADDRESS
+
+
 def ensure_plan_pppoe_profile(api: MikroTikAPI, bandwidth_limit: str) -> dict:
     """Ensure the ``pppoe_<rate>`` profile a plan's customers normally sit on.
 
@@ -141,7 +161,7 @@ def ensure_plan_pppoe_profile(api: MikroTikAPI, bandwidth_limit: str) -> dict:
     # the server is not yet visible. Without these fallbacks the created profile
     # would have no remote-address, so RouterOS accepts the PPPoE auth but then
     # fails to assign an IP -- the session silently drops at IPCP.
-    local_address = base_profile_data.get("local_address") or PPPOE_DEFAULT_LOCAL_ADDRESS
+    local_address = base_profile_data.get("local_address") or _local_address_from_pool(api)
     pool_name = base_profile_data.get("remote_address") or PPPOE_DEFAULT_POOL_NAME
 
     if pool_name == PPPOE_DEFAULT_POOL_NAME:

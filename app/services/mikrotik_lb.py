@@ -42,6 +42,9 @@ MAX_WAN_PORTS = len(PROBE_IPS)  # 4
 
 LB_SRC_NETWORKS = [
     "192.168.88.0/24", "192.168.89.0/24", "192.168.90.0/24", "192.168.91.0/24",
+    # PPPoE subnets used when 192.168.89.0/24 clashes with the router's uplink
+    # (mikrotik_api.PPPOE_SUBNET_CANDIDATES).
+    "192.168.189.0/24", "192.168.199.0/24", "172.16.89.0/24",
 ]
 BACKEND_IPS = ["54.91.202.229", "35.170.199.141", "91.98.238.12"]
 LB_BYPASS_BASE = ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/10"]
