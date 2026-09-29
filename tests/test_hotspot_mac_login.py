@@ -464,3 +464,26 @@ def test_reconcile_leaves_a_logged_in_device_alone():
     summary = ml.reconcile_router(router.api(), [{"mac_address": MAC, "plan_speed": "5M/5M"}])
 
     assert summary["unstuck"] == 0 and len(router.tables["/ip/hotspot/host"]) == 1
+
+
+def test_reconcile_tags_a_user_missing_its_expiry_without_kicking():
+    from datetime import datetime, timedelta
+    router = FakeRouter()
+    ml.provision_customer(router.api(), MAC, "5M/5M")
+    router.user(MAC)["comment"] = f"MACLOGIN|MAC:{MAC}|T:1790000000|reconcile"   # no EXP
+    router.tables["/ip/hotspot/active"].append(router._row(**{"mac-address": MAC, "user": MAC}))
+    expiry = datetime.utcnow() + timedelta(hours=3)
+
+    summary = ml.reconcile_router(router.api(), [{"mac_address": MAC, "plan_speed": "5M/5M", "expiry": expiry}])
+
+    assert summary["exp_tagged"] == 1
+    assert "|EXP:" in router.user(MAC)["comment"]
+    assert len(router.tables["/ip/hotspot/active"]) == 1   # session untouched
+
+
+def test_queue_sync_items_carry_the_expiry():
+    from types import SimpleNamespace
+    from datetime import datetime
+    c = SimpleNamespace(id=1, mac_address=MAC, expiry=datetime(2026, 10, 1),
+                        plan=SimpleNamespace(speed="5M/5M", fup_action=None))
+    assert mikrotik_background._queue_sync_customer_item(c, None)["expiry"] == datetime(2026, 10, 1)

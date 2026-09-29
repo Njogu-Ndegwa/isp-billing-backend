@@ -592,7 +592,7 @@ def reconcile_router(api, customers_data: List[Dict[str, Any]], now: Optional[fl
     now = time.time() if now is None else now
     summary: Dict[str, Any] = {
         "setup": None, "provisioned": 0, "already_ok": 0, "blocked_skipped": 0,
-        "on_bypass": 0, "orphans_removed": 0, "unstuck": 0, "errors": [],
+        "on_bypass": 0, "orphans_removed": 0, "unstuck": 0, "exp_tagged": 0, "errors": [],
     }
     setup = ensure_router_setup(api)
     summary["setup"] = setup
@@ -664,6 +664,13 @@ def reconcile_router(api, customers_data: List[Dict[str, Any]], now: Optional[fl
         )
         if healthy:
             summary["already_ok"] += 1
+            if cust.get("expiry") is not None and "|EXP:" not in str(user.get("comment", "")):
+                # No EXP tag: the router reaper cannot expire this user. Tag it
+                # in place (comment only, no kick).
+                if _ok(api.send_command("/ip/hotspot/user/set", {
+                        "numbers": user.get(".id"),
+                        "comment": build_user_comment(mac, "reconcile", expiry=cust["expiry"])})):
+                    summary["exp_tagged"] += 1
             if mac in stuck_hosts and unstick_budget > 0:
                 unstick_budget -= 1
                 for host_id in stuck_hosts[mac]:
