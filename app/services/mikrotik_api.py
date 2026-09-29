@@ -4821,6 +4821,18 @@ class MikroTikAPI:
                     fetch_params["check-certificate"] = "no"
 
                 fetch = self.send_command("/tool/fetch", fetch_params)
+                if fetch.get("error") and fetch_mode == "http":
+                    # Routers with the anti-bypass rule (ISP_BILLING_PROXY_RELAY_BLOCK)
+                    # reject their own port-80 connections to anything outside
+                    # isp_portal_allow, and the backend now sits behind Cloudflare.
+                    # Port 443 is not blocked (router 182, 2026-09-29).
+                    step("tool.fetch_login_page_http", False, fetch["error"])
+                    fetch = self.send_command("/tool/fetch", {
+                        "url": "https://" + login_page_url.split("://", 1)[1],
+                        "dst-path": login_dst,
+                        "mode": "https",
+                        "check-certificate": "no",
+                    })
                 if fetch.get("error"):
                     if keep_existing_on_failure:
                         # The router was already serving a login page; keep it

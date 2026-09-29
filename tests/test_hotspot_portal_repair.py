@@ -10,7 +10,7 @@ SUPPORT = ["alogin.html", "errors.txt", "redirect.html", "md5.js"]
 URL = "http://isp.example.net/api/provision/tok/login-page"
 
 
-def _api(html_dir, files, fetch_error=None):
+def _api(html_dir, files, fetch_error=None, https_ok=False):
     api = MikroTikAPI("10.0.0.1", "u", "p", 8728)
     api.connected = True
     state = {
@@ -34,7 +34,8 @@ def _api(html_dir, files, fetch_error=None):
         if command == "/file/print":
             return {"success": True, "data": [{"name": n, "size": str(s)} for n, s in state["files"].items()]}
         if command == "/tool/fetch":
-            if fetch_error:
+            state.setdefault("fetch_modes", []).append(args.get("mode"))
+            if fetch_error and not (https_ok and args.get("mode") == "https"):
                 return {"error": fetch_error}
             state["files"][args["dst-path"]] = 2894
             return {"success": True}
@@ -94,3 +95,14 @@ def test_no_login_page_at_all_is_still_an_error():
     result = api.ensure_existing_hotspot_captive_portal(login_page_url=URL)
 
     assert "Could not fetch hotspot login page" in result["error"]
+
+
+def test_http_blocked_by_relay_rule_falls_back_to_https():
+    api, state = _api("hotspot", {name: 100 for name in SUPPORT},
+                      fetch_error="failure: closing connection: <connection failed> 172.67.173.124:80", https_ok=True)
+
+    result = api.ensure_existing_hotspot_captive_portal(login_page_url=URL)
+
+    assert result["success"] is True
+    assert state["fetch_modes"] == ["http", "https"]
+    assert state["files"]["hotspot/login.html"] == 2894
