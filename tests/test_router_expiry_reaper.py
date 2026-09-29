@@ -199,6 +199,9 @@ async def client(session_factory, monkeypatch):
     monkeypatch.setattr(routes, "_pool_under_pressure", lambda: False)
     spawned = []
     monkeypatch.setattr(routes, "_spawn", lambda coro: (spawned.append(coro), coro.close()))
+    # Calls without v= look like old scripts: don't reach for a router here.
+    from app.services import expiry_reaper_upgrade
+    monkeypatch.setattr(expiry_reaper_upgrade.settings, "EXPIRY_REAPER_AUTO_UPGRADE", False)
     routes.reset_rate_limiter()
     application = FastAPI()
     application.include_router(routes.router)

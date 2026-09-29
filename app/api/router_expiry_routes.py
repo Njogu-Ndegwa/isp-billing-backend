@@ -187,6 +187,11 @@ async def expiry_check(request: Request, authorization: Optional[str] = Header(d
             req.identity, "ok" if trusted else f"OFF (router {req.router_now})", len(req.due),
             len(remove), len(keep), len(forget), len(deactivated), len(repairs),
         )
+    # A router still on an older script gets upgraded in place (it just proved
+    # it is online); see app/services/expiry_reaper_upgrade.py.
+    from app.services.expiry_reaper_upgrade import maybe_schedule_upgrade
+
+    maybe_schedule_upgrade(req.identity, req.version)
     if repairs:
         _spawn(_repair_renewed(repairs))
     if deactivated:
