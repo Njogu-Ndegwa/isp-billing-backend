@@ -289,6 +289,20 @@ async def test_flag_off_l2tp_token_has_no_sstp(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ros7_opt_out_still_gives_l2tp_tokens_sstp(db, monkeypatch):
+    _settings(monkeypatch, enabled=True)
+    monkeypatch.setattr(provisioning.settings, "PROVISION_MGMT_TO_HETZNER_ROS7", False)
+    user = await _user(db, 2005)
+    calls = []
+    _fake_managers(monkeypatch, calls)
+
+    token = await provisioning.create_provisioning_token(db, user.id, vpn_type="l2tp")
+
+    assert token.management_tunnel == "sstp"
+    assert [c[0] for c in calls] == ["sstp"]
+
+
+@pytest.mark.asyncio
 async def test_flag_on_l2tp_token_registers_only_the_sstp_peer(db, monkeypatch):
     _settings(monkeypatch, enabled=True)
     user = await _user(db, 2002)
@@ -465,6 +479,27 @@ def test_manager_remove_is_idempotent(tmp_path, monkeypatch):
     assert m.remove_sstp_peer(req)["removed"] is True
     assert m.remove_sstp_peer(req)["removed"] is False
     assert secrets_file.read_text() == "sstp-Router-0006\t*\tAbcdef1234567891\t10.251.100.6\n"
+
+
+def test_manager_evicts_stale_login_on_the_same_ip(tmp_path, monkeypatch):
+    # An expired token's login still holds 10.251.100.69; the ip was reallocated.
+    secrets_file = tmp_path / "chap-secrets"
+    secrets_file.write_text(
+        "# header\n"
+        "sstp-Router-1172\t*\tStalePass1234567\t10.251.100.69\n"
+        "sstp-Router-0961\t*\tOtherPass123456\t10.251.100.77\n"
+    )
+    m = _manager(monkeypatch, secrets_file)
+
+    req = m.AddSstpPeerRequest(username="sstp-Router-1300", password="Abcdef1234567890", ip="10.251.100.69")
+    assert m.add_sstp_peer(req)["message"] == "SSTP peer added"
+
+    assert secrets_file.read_text() == (
+        "# header\n"
+        "sstp-Router-0961\t*\tOtherPass123456\t10.251.100.77\n"
+        "sstp-Router-1300\t*\tAbcdef1234567890\t10.251.100.69\n"
+    )
+    assert m.add_sstp_peer(req)["message"] == "SSTP peer unchanged"
 
 
 def test_manager_creates_missing_file(tmp_path, monkeypatch):

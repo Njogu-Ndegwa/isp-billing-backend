@@ -374,9 +374,17 @@ MGMT_TUNNEL_HETZNER_SSTP = "sstp"
 HETZNER_MGMT_TUNNELS = frozenset({MGMT_TUNNEL_HETZNER_WIREGUARD, MGMT_TUNNEL_HETZNER_SSTP})
 
 
-def mgmt_to_hetzner_active() -> bool:
-    """New tokens get a single Hetzner management tunnel only while the flag is on."""
-    return bool(settings.PROVISION_MGMT_TO_HETZNER)
+def mgmt_to_hetzner_active(vpn_type: str = "") -> bool:
+    """New tokens get a single Hetzner management tunnel only while the flag is on.
+
+    PROVISION_MGMT_TO_HETZNER_ROS7=false limits it to RouterOS 6 (SSTP):
+    RouterOS 7 (wireguard) tokens then keep AWS primary + Hetzner insurance.
+    """
+    if not settings.PROVISION_MGMT_TO_HETZNER:
+        return False
+    if (vpn_type or "").lower() == "wireguard" and not settings.PROVISION_MGMT_TO_HETZNER_ROS7:
+        return False
+    return True
 
 
 def hetzner_mgmt_tunnel_for(vpn_type: str) -> str:
@@ -1692,7 +1700,7 @@ async def create_provisioning_token(
     if vpn_type not in ("wireguard", "l2tp"):
         raise ValueError(f"Invalid vpn_type '{vpn_type}'. Must be 'wireguard' or 'l2tp'.")
 
-    if mgmt_to_hetzner_active():
+    if mgmt_to_hetzner_active(vpn_type):
         return await _create_hetzner_provisioning_token(
             db, user_id, payment_methods, vpn_type, is_routerboard
         )

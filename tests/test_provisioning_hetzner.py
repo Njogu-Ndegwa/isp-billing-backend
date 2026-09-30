@@ -233,6 +233,34 @@ async def test_flag_off_wireguard_token_still_uses_aws_primary_plus_insurance(db
 
 
 @pytest.mark.asyncio
+async def test_flag_on_with_ros7_opted_out_keeps_wireguard_on_aws(db, monkeypatch):
+    _settings(monkeypatch, enabled=True)
+    monkeypatch.setattr(provisioning.settings, "PROVISION_MGMT_TO_HETZNER_ROS7", False)
+    user = await _user(db, 3005)
+    calls = []
+    _fake_managers(monkeypatch, calls)
+
+    token = await provisioning.create_provisioning_token(db, user.id, vpn_type="wireguard")
+
+    assert token.management_tunnel is None
+    assert [c[0] for c in calls] == ["aws-wg", "aws-server-info", "hetzner-wg"]
+    assert token.server_public_ip == "203.0.113.10"
+    assert "wg-aws" in provisioning.generate_rsc_script(token)
+
+
+def test_ros7_opt_out_only_affects_wireguard(monkeypatch):
+    s = provisioning.settings
+    monkeypatch.setattr(s, "PROVISION_MGMT_TO_HETZNER", True)
+    monkeypatch.setattr(s, "PROVISION_MGMT_TO_HETZNER_ROS7", False)
+    assert provisioning.mgmt_to_hetzner_active("l2tp") is True
+    assert provisioning.mgmt_to_hetzner_active("wireguard") is False
+    monkeypatch.setattr(s, "PROVISION_MGMT_TO_HETZNER_ROS7", True)
+    assert provisioning.mgmt_to_hetzner_active("wireguard") is True
+    monkeypatch.setattr(s, "PROVISION_MGMT_TO_HETZNER", False)
+    assert provisioning.mgmt_to_hetzner_active("l2tp") is False
+
+
+@pytest.mark.asyncio
 async def test_flag_on_wireguard_token_registers_only_on_hetzner(db, monkeypatch):
     _settings(monkeypatch, enabled=True)
     monkeypatch.setattr(provisioning.settings, "SERVER_PUBLIC_IP", "")  # AWS not needed
