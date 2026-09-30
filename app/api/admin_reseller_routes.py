@@ -13,7 +13,7 @@ from app.db.models import (
     ResellerTransactionCharge,
     PaymentMethod, Payment, ProvisioningToken, Voucher,
     Subscription, SubscriptionStatus, SubscriptionInvoice, SubscriptionPayment,
-    CustomerRating, UserBandwidthUsage,
+    CustomerRating, UserBandwidthUsage, FreeTrialClaim,
     MpesaTransaction, ProvisioningLog, BandwidthSnapshot,
     RouterLogEntry, RouterAvailabilityCheck,
     ResellerPaymentMethod, ResellerPaymentMethodType,
@@ -2083,6 +2083,10 @@ async def delete_reseller(
 
     # 8. Payments (old table)
     await db.execute(delete(Payment).where(Payment.customer_id.in_(customer_ids)))
+
+    # 8b. Free-trial claims (reference this reseller, its customers, payments,
+    #     plans and routers; must go before customer payments)
+    await db.execute(delete(FreeTrialClaim).where(FreeTrialClaim.user_id == reseller_id))
 
     # 9. Customer payments (delete by both reseller_id and customer_id to
     #    catch cross-reseller references)

@@ -5,14 +5,13 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 
 from app.db.models import (
     ConnectionType,
     Customer,
     CustomerPayment,
     CustomerStatus,
-    CustomerUsagePeriod,
     DurationUnit,
     FreeTrialClaim,
     PlanType,
@@ -99,17 +98,25 @@ async def test_once_only_trial_cannot_be_claimed_twice(db, no_background_provisi
     assert second == {"success": False, "error": TRIAL_ALREADY_USED}
 
 
-async def test_once_only_survives_customer_deletion(db, no_background_provisioning):
+async def test_once_only_survives_customer_deletion(db, monkeypatch, no_background_provisioning):
+    """Deleting the customer through the real endpoint must not make the
+    device eligible for the trial again."""
+    import app.api.customer_routes as customer_routes
     from app.services.free_trial import TRIAL_ALREADY_USED, claim_free_trial
+    from tests.test_admin_reseller_deletion import _create_radius_tables
 
+    await _create_radius_tables(db)
     reseller = await make_reseller(db)
     router = await make_router(db, reseller)
     plan = await _trial_plan(db, reseller)
 
+    async def _current_user(token, session):
+        return reseller
+
+    monkeypatch.setattr(customer_routes, "get_current_user", _current_user)
+
     first = await claim_free_trial(db, plan.id, MAC, router.id)
-    await db.execute(delete(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id == first["customer_id"]))
-    await db.execute(delete(Customer).where(Customer.id == first["customer_id"]))
-    await db.commit()
+    await customer_routes.delete_customer(first["customer_id"], db=db, token="t")
     assert await db.scalar(select(func.count(Customer.id))) == 0
 
     again = await claim_free_trial(db, plan.id, MAC, router.id)
@@ -350,3 +357,32 @@ async def test_expired_trial_is_removed_by_both_expiry_paths(db, no_background_p
         )
     )).scalars().all()
     assert due == [customer.id]
+
+
+async def test_deleting_a_reseller_removes_their_trial_claims(db, monkeypatch, no_background_provisioning):
+    import app.api.admin_reseller_routes as admin_resellers
+    from app.db.models import User, UserRole
+    from app.services.free_trial import claim_free_trial
+    from tests.test_admin_reseller_deletion import _create_radius_tables
+
+    await _create_radius_tables(db)
+    admin = await make_reseller(db, role=UserRole.ADMIN, email="admin-trial@example.com")
+    reseller = await make_reseller(db, email="trial-reseller@example.com")
+    router = await make_router(db, reseller)
+    plan = await _trial_plan(db, reseller)
+    assert (await claim_free_trial(db, plan.id, MAC, router.id))["success"]
+
+    async def _fake_current_user(token, session):
+        return admin
+
+    async def _no_vpn_cleanup(value):
+        return None
+
+    monkeypatch.setattr(admin_resellers, "get_current_user", _fake_current_user)
+    monkeypatch.setattr(admin_resellers, "remove_wireguard_peer", _no_vpn_cleanup)
+    monkeypatch.setattr(admin_resellers, "remove_l2tp_peer", _no_vpn_cleanup)
+
+    await admin_resellers.delete_reseller(reseller.id, True, db, "token")
+
+    assert await db.get(User, reseller.id) is None
+    assert await db.scalar(select(func.count(FreeTrialClaim.id))) == 0
