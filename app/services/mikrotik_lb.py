@@ -37,7 +37,7 @@ import ipaddress
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -943,6 +943,115 @@ def _revert_convert(api, report: dict, port: str, removed_from: List[str],
         _wr(api, report, f"revert.bridge_port.add.{port}",
             "/interface/bridge/port/add", {"bridge": bridge, "interface": port})
     report["reverted"] = True
+
+
+# --- convert dead-man switch -------------------------------------------------
+#
+# Converting a port can cut the very path we manage the router through: on
+# router 537 (2026-09-30) ether2's lease landed in ether1's subnet, the default
+# route and SSTP tunnel followed it, and the API session died mid-convert with
+# ether2 half-converted. A one-shot scheduler ON THE ROUTER undoes the port
+# conversions unless we come back and cancel it — so a lost session heals itself.
+
+DEADMAN_NAME = "ISP_BILLING_LB_DEADMAN"
+LB_DEADMAN_MINUTES = 5
+
+
+def _router_now(api) -> Optional[tuple]:
+    """(datetime, date_format) from /system/clock. v6: 'sep/30/2026'; v7.10+: '2026-09-30'."""
+    clk = _rd(api, "/system/clock/print")
+    if not clk:
+        return None
+    date, tod = clk[0].get("date") or "", clk[0].get("time") or ""
+    for fmt in ("%b/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(f"{date.title()} {tod}", f"{fmt} %H:%M:%S"), fmt
+        except ValueError:
+            continue
+    return None
+
+
+def _deadman_script(ports: List[dict]) -> str:
+    """RouterOS script that returns each converted port to how it was."""
+    parts = []
+    for p in ports:
+        port, comment = p["port"], p["dhcp_comment"]
+        parts.append(f'/ip dhcp-client remove [find interface="{port}" comment="{comment}"]')
+        for wl in p.get("lists", []):
+            parts.append(f'/interface list member remove [find list="{wl}" interface="{port}"]')
+        parts.append(f'/ip firewall nat remove [find comment="{comment}_MASQ"]')
+        if p.get("bridge"):
+            parts.append(
+                f':if ([:len [/interface bridge port find interface="{port}"]] = 0) do={{'
+                f'/interface bridge port add bridge="{p["bridge"]}" interface="{port}"}}'
+            )
+    parts.append(f':log warning "{DEADMAN_NAME}: management lost during convert, ports reverted"')
+    parts.append(f'/system scheduler remove [find name="{DEADMAN_NAME}"]')
+    return "; ".join(parts)
+
+
+def lb_arm_convert_deadman(api, ports: List[str], wan_ports: List[str],
+                           minutes: int = LB_DEADMAN_MINUTES) -> dict:
+    """Arm the router-side revert for *ports* before converting them."""
+    report: dict = {"steps": [], "success": True}
+    now = _router_now(api)
+    if not now:
+        report["aborted"] = "could not read the router clock"
+        _step(report, "deadman.clock", False, report["aborted"])
+        return report
+    router_now, fmt = now
+    bps = _rd(api, "/interface/bridge/port/print", ["interface", "bridge"])
+    members = _rd(api, "/interface/list/member/print", ["list", "interface"])
+    wan1_lists = sorted({m.get("list") for m in members if m.get("interface") == wan_ports[0]})
+    plan = []
+    for port in ports:
+        plan.append({
+            "port": port,
+            "dhcp_comment": _wan_dhcp_comment(wan_ports.index(port)),
+            "bridge": next((b.get("bridge") for b in bps if b.get("interface") == port), None),
+            # only lists the port is NOT already in get reverted
+            "lists": [wl for wl in wan1_lists
+                      if not any(m.get("list") == wl and m.get("interface") == port
+                                 for m in members)],
+        })
+    for s in _rd(api, "/system/scheduler/print", [".id", "name"]):
+        if s.get("name") == DEADMAN_NAME:
+            _wr(api, report, "deadman.remove_stale", "/system/scheduler/remove", {".id": s[".id"]})
+    fire = router_now + timedelta(minutes=minutes)
+    ok = _wr(api, report, "deadman.add", "/system/scheduler/add", {
+        "name": DEADMAN_NAME,
+        "start-date": fire.strftime(fmt).lower(),
+        "start-time": fire.strftime("%H:%M:%S"),
+        "interval": "0s",
+        "on-event": _deadman_script(plan),
+        "comment": "ISP_BILLING load-balancing convert dead-man switch",
+    })
+    report["fires_at"] = fire.isoformat()
+    report["plan"] = plan
+    if not ok:
+        report["aborted"] = "could not arm the dead-man switch"
+    return report
+
+
+def lb_disarm_convert_deadman(api) -> bool:
+    """Cancel the pending revert. True when no dead-man scheduler remains."""
+    for s in _rd(api, "/system/scheduler/print", [".id", "name"]):
+        if s.get("name") == DEADMAN_NAME:
+            api.send_command("/system/scheduler/remove", {".id": s[".id"]})
+    sched = api.send_command_optimized("/system/scheduler/print", proplist=["name"])
+    if not sched.get("success"):
+        return False  # can't confirm — the router will revert on its own
+    return not any(s.get("name") == DEADMAN_NAME for s in sched.get("data", []))
+
+
+def lb_internet_ok(api, targets=("8.8.8.8", "1.1.1.1")) -> bool:
+    """True when the router itself reaches at least one public target."""
+    for addr in targets:
+        r = api.send_command("/ping", {"address": addr, "count": "3"})
+        rows = r.get("data", []) if r.get("success") else []
+        if rows and str(rows[-1].get("received") or "0") not in ("0", ""):
+            return True
+    return False
 
 
 # --- verify ------------------------------------------------------------------
