@@ -111,8 +111,11 @@ def render_pppoe_provision_action(
     comment_q = _ros_quote(comment)
     return f"""# router-agent PPPoE provision {user}
 :do {{ /ip pool add name=pppoe-pool ranges=192.168.89.2-192.168.89.254 }} on-error={{}}
+:local pppoeLocal 192.168.89.1
+:do {{ :set pppoeLocal [/ppp profile get [find name=\"default-pppoe\"] local-address] }} on-error={{}}
+:if ([:len [:tostr $pppoeLocal]] = 0) do={{ :set pppoeLocal 192.168.89.1 }}
 :if ([:len [/ppp profile find name=\"{profile}\"]] = 0) do={{
-    /ppp profile add name=\"{profile}\" local-address=192.168.89.1 remote-address=pppoe-pool rate-limit=\"{rate}\"
+    /ppp profile add name=\"{profile}\" local-address=$pppoeLocal remote-address=pppoe-pool rate-limit=\"{rate}\"
 }} else={{
     /ppp profile set [find name=\"{profile}\"] rate-limit=\"{rate}\"
 }}

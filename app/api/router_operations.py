@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, case
@@ -8,7 +9,7 @@ from datetime import datetime, timedelta
 from dataclasses import asdict
 from pathlib import Path
 
-from app.db.database import db_pool_snapshot, get_db
+from app.db.database import async_session, db_pool_snapshot, get_db
 from app.db.models import (
     Router,
     Customer,
@@ -47,6 +48,7 @@ import hashlib
 import json
 import os
 import tempfile
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -4106,6 +4108,124 @@ async def reboot_router(
     }
 
 
+# Port-mode changes can take minutes on a slow router (dual mode with hotspot
+# repair took 207 s on a hAP lite). Cloudflare drops a request after 100 s, so
+# the reseller saw a failure for a change that had actually been applied, and
+# retried it again and again. Wait inline for a bounded time; past that, answer
+# 202 with a job id, finish in the background and let the dashboard poll.
+_PORT_CONFIG_INLINE_WAIT_SECONDS = 75
+_PORT_CONFIG_JOB_TTL_SECONDS = 3600
+_port_config_jobs: Dict[str, Dict[str, Any]] = {}
+
+
+def _prune_port_config_jobs() -> None:
+    cutoff = time.time() - _PORT_CONFIG_JOB_TTL_SECONDS
+    for job_id, job in list(_port_config_jobs.items()):
+        if job["status"] != "applying" and job.get("finished_at", 0) < cutoff:
+            _port_config_jobs.pop(job_id, None)
+
+
+def _public_port_config_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    public = {k: v for k, v in job.items() if not k.startswith("_")}
+    public["elapsed_seconds"] = round((job.get("finished_at") or time.time()) - job["started_at"], 1)
+    return public
+
+
+async def _persist_router_port_fields(router_id: int, fields: Dict[str, Any]) -> None:
+    """Save port lists in a fresh session — the request's session may be gone."""
+    async with async_session() as session:
+        row = await session.get(Router, router_id)
+        if row is None:
+            return
+        for name, value in fields.items():
+            setattr(row, name, value)
+        await session.commit()
+
+
+async def _run_port_config(router_id: int, mode: str, apply) -> Any:
+    """Run ``apply()`` (router work + DB persist), answering 202 if it runs long."""
+    _prune_port_config_jobs()
+    in_flight = next(
+        (j for j in _port_config_jobs.values() if j["router_id"] == router_id and j["status"] == "applying"),
+        None,
+    )
+    if in_flight:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "A port change for this router is still being applied. Wait for it to finish.",
+                "job_id": in_flight["job_id"],
+                "mode": in_flight["mode"],
+            },
+        )
+
+    job_id = uuid.uuid4().hex
+    job: Dict[str, Any] = {
+        "job_id": job_id,
+        "router_id": router_id,
+        "mode": mode,
+        "status": "applying",
+        "started_at": time.time(),
+    }
+    _port_config_jobs[job_id] = job
+
+    def _record(task: asyncio.Task) -> None:
+        job["finished_at"] = time.time()
+        if task.cancelled():
+            job.update(status="failed", status_code=500, error={"message": "Port change was cancelled"})
+            return
+        exc = task.exception()
+        if isinstance(exc, HTTPException):
+            logger.warning(
+                "Port config (%s) for router %s failed with %s: %s",
+                mode, router_id, exc.status_code, exc.detail,
+            )
+            job.update(status="failed", status_code=exc.status_code, error=exc.detail)
+        elif exc is not None:
+            logger.error("Port config job %s for router %s failed: %s", job_id, router_id, exc)
+            job.update(status="failed", status_code=500, error={"message": str(exc)})
+        else:
+            job.update(status="done", result=task.result())
+
+    task = asyncio.create_task(apply())
+    job["_task"] = task  # keep a strong reference while it runs
+    task.add_done_callback(_record)
+
+    done, _ = await asyncio.wait({task}, timeout=_PORT_CONFIG_INLINE_WAIT_SECONDS)
+    if task in done:
+        return task.result()
+
+    logger.info("Port config for router %s (%s) still running; returning job %s", router_id, mode, job_id)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "applying",
+            "job_id": job_id,
+            "router_id": router_id,
+            "mode": mode,
+            "message": "The router is still applying this change. This can take a few minutes on slower routers.",
+        },
+    )
+
+
+@router.get("/api/routers/{router_id}/port-config-jobs/{job_id}")
+async def get_port_config_job(
+    router_id: int,
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Status of a port-mode change that outlived the inline wait."""
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+    job = _port_config_jobs.get(job_id)
+    if not job or job["router_id"] != router_id:
+        raise HTTPException(status_code=404, detail="Port change not found (it may have expired)")
+    return _public_port_config_job(job)
+
+
 class SetPPPoEPortsRequest(BaseModel):
     ports: List[str]
 
@@ -4363,80 +4483,79 @@ async def set_pppoe_ports(
         "password": router_obj.password,
         "port": router_obj.port,
     }
-    started_at = time.perf_counter()
+    router_name = router_obj.name
     await db.commit()
-    result = await _run_locked_router_thread(
-        router_obj,
-        _apply_pppoe_ports_sync,
-        router_info,
-        new_ports,
-        old_ports,
-        plain_ports_to_remove=plain_ports_to_remove,
-        current_plain_ports=current_plain,
-        dual_ports_to_remove=sorted(dual_overlap) if dual_overlap else None,
-        current_dual_ports=current_dual,
-    )
-    logger.info(
-        "PPPoE port sync for router %s completed in %.2fs (requested=%s)",
-        router_id,
-        time.perf_counter() - started_at,
-        ",".join(new_ports) if new_ports else "(none)",
-    )
 
-    # Update plain_ports in DB if cross-migration happened
-    updated_plain = None
-    if plain_overlap and not result.get("error"):
-        remaining_plain = [p for p in current_plain if p not in plain_overlap]
-        updated_plain = remaining_plain if remaining_plain else None
-        router_obj.plain_ports = updated_plain
+    async def _apply() -> dict:
+        started_at = time.perf_counter()
+        result = await _run_locked_router_thread(
+            router_obj,
+            _apply_pppoe_ports_sync,
+            router_info,
+            new_ports,
+            old_ports,
+            plain_ports_to_remove=plain_ports_to_remove,
+            current_plain_ports=current_plain,
+            dual_ports_to_remove=sorted(dual_overlap) if dual_overlap else None,
+            current_dual_ports=current_dual,
+        )
         logger.info(
-            "Router %s: auto-migrated ports %s from plain to PPPoE",
-            router_id, sorted(plain_overlap),
+            "PPPoE port sync for router %s completed in %.2fs (requested=%s)",
+            router_id,
+            time.perf_counter() - started_at,
+            ",".join(new_ports) if new_ports else "(none)",
         )
 
-    # Update dual_ports in DB if cross-migration happened
-    if dual_overlap and not result.get("error"):
-        remaining_dual = [p for p in current_dual if p not in dual_overlap]
-        router_obj.dual_ports = remaining_dual if remaining_dual else None
-        logger.info(
-            "Router %s: auto-migrated ports %s from dual to dedicated PPPoE",
-            router_id, sorted(dual_overlap),
-        )
+        # Invalidate port status cache so the next GET reflects reality
+        _port_status_cache.pop(router_id, None)
 
-    # Invalidate port status cache so the next GET reflects reality
-    _port_status_cache.pop(router_id, None)
+        if result.get("error") == "connect_failed":
+            raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
+        if result.get("error"):
+            failed_ports = result.get("failed_ports", [])
+            detail = {
+                "message": result["error"],
+                "failed_ports": failed_ports,
+                "pppoe_ports_unchanged": result.get("current_ports", old_ports),
+            }
+            if result.get("partial_errors"):
+                detail["partial_errors"] = result.get("partial_errors", [])
+            raise HTTPException(status_code=500, detail=detail)
 
-    if result.get("error") == "connect_failed":
-        raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
-    if result.get("error"):
-        failed_ports = result.get("failed_ports", [])
-        detail = {
-            "message": result["error"],
-            "failed_ports": failed_ports,
-            "pppoe_ports_unchanged": result.get("current_ports", old_ports),
+        # Only persist to DB after the router confirmed the change
+        fields: Dict[str, Any] = {"pppoe_ports": new_ports if new_ports else None}
+        if plain_overlap:
+            remaining_plain = [p for p in current_plain if p not in plain_overlap]
+            fields["plain_ports"] = remaining_plain if remaining_plain else None
+            logger.info(
+                "Router %s: auto-migrated ports %s from plain to PPPoE",
+                router_id, sorted(plain_overlap),
+            )
+        if dual_overlap:
+            remaining_dual = [p for p in current_dual if p not in dual_overlap]
+            fields["dual_ports"] = remaining_dual if remaining_dual else None
+            logger.info(
+                "Router %s: auto-migrated ports %s from dual to dedicated PPPoE",
+                router_id, sorted(dual_overlap),
+            )
+        await _persist_router_port_fields(router_id, fields)
+
+        resp = {
+            "success": True,
+            "router_id": router_id,
+            "pppoe_ports": new_ports,
+            "warnings": result.get("warnings", []),
+            "message": f"PPPoE ports configured: {', '.join(new_ports)}" if new_ports else "PPPoE ports cleared",
         }
-        if result.get("partial_errors"):
-            detail["partial_errors"] = result.get("partial_errors", [])
-        raise HTTPException(status_code=500, detail=detail)
+        if plain_overlap:
+            resp["migrated_from_plain"] = sorted(plain_overlap)
+            resp["plain_ports"] = fields["plain_ports"]
+        if dual_overlap:
+            resp["migrated_from_dual"] = sorted(dual_overlap)
+            resp["dual_ports"] = fields["dual_ports"]
+        return resp
 
-    # Only persist to DB after the router confirmed the change
-    router_obj.pppoe_ports = new_ports if new_ports else None
-    await db.commit()
-
-    resp = {
-        "success": True,
-        "router_id": router_id,
-        "pppoe_ports": new_ports,
-        "warnings": result.get("warnings", []),
-        "message": f"PPPoE ports configured: {', '.join(new_ports)}" if new_ports else "PPPoE ports cleared",
-    }
-    if plain_overlap:
-        resp["migrated_from_plain"] = sorted(plain_overlap)
-        resp["plain_ports"] = updated_plain
-    if dual_overlap:
-        resp["migrated_from_dual"] = sorted(dual_overlap)
-        resp["dual_ports"] = router_obj.dual_ports
-    return resp
+    return await _run_port_config(router_id, "pppoe", _apply)
 
 
 # =========================================================================
@@ -4621,78 +4740,77 @@ async def set_plain_ports(
         "password": router_obj.password,
         "port": router_obj.port,
     }
-    started_at = time.perf_counter()
+    router_name = router_obj.name
     await db.commit()
-    result = await _run_locked_router_thread(
-        router_obj,
-        _apply_plain_ports_sync,
-        router_info,
-        new_ports,
-        old_ports,
-        pppoe_ports_to_remove=pppoe_ports_to_remove,
-        current_pppoe_ports=current_pppoe,
-        dual_ports_to_remove=sorted(dual_overlap) if dual_overlap else None,
-        current_dual_ports=current_dual,
-    )
-    logger.info(
-        "Plain port sync for router %s completed in %.2fs (requested=%s)",
-        router_id,
-        time.perf_counter() - started_at,
-        ",".join(new_ports) if new_ports else "(none)",
-    )
 
-    # Update PPPoE in DB if cross-migration happened
-    updated_pppoe = None
-    if pppoe_overlap and not result.get("error"):
-        remaining_pppoe = [p for p in current_pppoe if p not in pppoe_overlap]
-        updated_pppoe = remaining_pppoe if remaining_pppoe else None
-        router_obj.pppoe_ports = updated_pppoe
+    async def _apply() -> dict:
+        started_at = time.perf_counter()
+        result = await _run_locked_router_thread(
+            router_obj,
+            _apply_plain_ports_sync,
+            router_info,
+            new_ports,
+            old_ports,
+            pppoe_ports_to_remove=pppoe_ports_to_remove,
+            current_pppoe_ports=current_pppoe,
+            dual_ports_to_remove=sorted(dual_overlap) if dual_overlap else None,
+            current_dual_ports=current_dual,
+        )
         logger.info(
-            "Router %s: auto-migrated ports %s from PPPoE to plain",
-            router_id, sorted(pppoe_overlap),
+            "Plain port sync for router %s completed in %.2fs (requested=%s)",
+            router_id,
+            time.perf_counter() - started_at,
+            ",".join(new_ports) if new_ports else "(none)",
         )
 
-    # Update dual_ports in DB if cross-migration happened
-    if dual_overlap and not result.get("error"):
-        remaining_dual = [p for p in current_dual if p not in dual_overlap]
-        router_obj.dual_ports = remaining_dual if remaining_dual else None
-        logger.info(
-            "Router %s: auto-migrated ports %s from dual to plain",
-            router_id, sorted(dual_overlap),
-        )
+        _port_status_cache.pop(router_id, None)
 
-    _port_status_cache.pop(router_id, None)
+        if result.get("error") == "connect_failed":
+            raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
+        if result.get("error"):
+            failed_ports = result.get("failed_ports", [])
+            detail = {
+                "message": result["error"],
+                "failed_ports": failed_ports,
+                "plain_ports_unchanged": result.get("current_ports", old_ports),
+            }
+            if result.get("partial_errors"):
+                detail["partial_errors"] = result.get("partial_errors", [])
+            raise HTTPException(status_code=500, detail=detail)
 
-    if result.get("error") == "connect_failed":
-        raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
-    if result.get("error"):
-        failed_ports = result.get("failed_ports", [])
-        detail = {
-            "message": result["error"],
-            "failed_ports": failed_ports,
-            "plain_ports_unchanged": result.get("current_ports", old_ports),
+        fields: Dict[str, Any] = {"plain_ports": new_ports if new_ports else None}
+        if pppoe_overlap:
+            remaining_pppoe = [p for p in current_pppoe if p not in pppoe_overlap]
+            fields["pppoe_ports"] = remaining_pppoe if remaining_pppoe else None
+            logger.info(
+                "Router %s: auto-migrated ports %s from PPPoE to plain",
+                router_id, sorted(pppoe_overlap),
+            )
+        if dual_overlap:
+            remaining_dual = [p for p in current_dual if p not in dual_overlap]
+            fields["dual_ports"] = remaining_dual if remaining_dual else None
+            logger.info(
+                "Router %s: auto-migrated ports %s from dual to plain",
+                router_id, sorted(dual_overlap),
+            )
+        await _persist_router_port_fields(router_id, fields)
+
+        resp = {
+            "success": True,
+            "router_id": router_id,
+            "plain_ports": new_ports,
+            "warnings": result.get("warnings", []),
+            "message": f"Plain ports configured: {', '.join(new_ports)}" if new_ports else "Plain ports cleared",
         }
-        if result.get("partial_errors"):
-            detail["partial_errors"] = result.get("partial_errors", [])
-        raise HTTPException(status_code=500, detail=detail)
+        if pppoe_overlap:
+            resp["migrated_from_pppoe"] = sorted(pppoe_overlap)
+            resp["pppoe_ports"] = fields["pppoe_ports"]
+        if dual_overlap:
+            resp["migrated_from_dual"] = sorted(dual_overlap)
+            resp["dual_ports"] = fields["dual_ports"]
+        return resp
 
-    router_obj.plain_ports = new_ports if new_ports else None
-    await db.commit()
-
-    resp = {
-        "success": True,
-        "router_id": router_id,
-        "plain_ports": new_ports,
-        "warnings": result.get("warnings", []),
-        "message": f"Plain ports configured: {', '.join(new_ports)}" if new_ports else "Plain ports cleared",
-    }
-    if pppoe_overlap:
-        resp["migrated_from_pppoe"] = sorted(pppoe_overlap)
-        resp["pppoe_ports"] = updated_pppoe
-    if dual_overlap:
-        resp["migrated_from_dual"] = sorted(dual_overlap)
-        resp["dual_ports"] = router_obj.dual_ports
-    return resp
+    return await _run_port_config(router_id, "plain", _apply)
 
 
 # =========================================================================
@@ -4878,79 +4996,80 @@ async def set_dual_ports(
         if request.repair_hotspot is not None
         else bool(not old_ports or pppoe_overlap or plain_overlap)
     )
-    started_at = time.perf_counter()
+    router_name = router_obj.name
     await db.commit()
-    result = await _run_locked_router_thread(
-        router_obj,
-        _apply_dual_ports_sync,
-        router_info,
-        new_ports,
-        old_ports,
-        pppoe_ports_to_remove=pppoe_ports_to_remove,
-        current_pppoe_ports=current_pppoe,
-        plain_ports_to_remove=plain_ports_to_remove,
-        current_plain_ports=current_plain,
-        repair_hotspot=repair_hotspot,
-    )
-    logger.info(
-        "Dual port sync for router %s completed in %.2fs (requested=%s)",
-        router_id,
-        time.perf_counter() - started_at,
-        ",".join(new_ports) if new_ports else "(none)",
-    )
 
-    # Update PPPoE in DB if cross-migration happened
-    if pppoe_overlap and not result.get("error"):
-        remaining_pppoe = [p for p in current_pppoe if p not in pppoe_overlap]
-        router_obj.pppoe_ports = remaining_pppoe if remaining_pppoe else None
+    async def _apply() -> dict:
+        started_at = time.perf_counter()
+        result = await _run_locked_router_thread(
+            router_obj,
+            _apply_dual_ports_sync,
+            router_info,
+            new_ports,
+            old_ports,
+            pppoe_ports_to_remove=pppoe_ports_to_remove,
+            current_pppoe_ports=current_pppoe,
+            plain_ports_to_remove=plain_ports_to_remove,
+            current_plain_ports=current_plain,
+            repair_hotspot=repair_hotspot,
+        )
         logger.info(
-            "Router %s: auto-migrated ports %s from PPPoE to dual",
-            router_id, sorted(pppoe_overlap),
+            "Dual port sync for router %s completed in %.2fs (requested=%s)",
+            router_id,
+            time.perf_counter() - started_at,
+            ",".join(new_ports) if new_ports else "(none)",
         )
 
-    # Update plain in DB if cross-migration happened
-    if plain_overlap and not result.get("error"):
-        remaining_plain = [p for p in current_plain if p not in plain_overlap]
-        router_obj.plain_ports = remaining_plain if remaining_plain else None
-        logger.info(
-            "Router %s: auto-migrated ports %s from plain to dual",
-            router_id, sorted(plain_overlap),
-        )
+        _port_status_cache.pop(router_id, None)
 
-    _port_status_cache.pop(router_id, None)
+        if result.get("error") == "connect_failed":
+            raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_name}")
+        if result.get("error"):
+            detail = {
+                "message": result["error"],
+                "dual_ports_unchanged": result.get("current_ports", old_ports),
+            }
+            if result.get("partial_errors"):
+                detail["partial_errors"] = result.get("partial_errors", [])
+            raise HTTPException(status_code=500, detail=detail)
 
-    if result.get("error") == "connect_failed":
-        raise HTTPException(status_code=503, detail=f"Failed to connect to router: {router_obj.name}")
-    if result.get("error"):
-        detail = {
-            "message": result["error"],
-            "dual_ports_unchanged": result.get("current_ports", old_ports),
+        fields: Dict[str, Any] = {"dual_ports": new_ports if new_ports else None}
+        if pppoe_overlap:
+            remaining_pppoe = [p for p in current_pppoe if p not in pppoe_overlap]
+            fields["pppoe_ports"] = remaining_pppoe if remaining_pppoe else None
+            logger.info(
+                "Router %s: auto-migrated ports %s from PPPoE to dual",
+                router_id, sorted(pppoe_overlap),
+            )
+        if plain_overlap:
+            remaining_plain = [p for p in current_plain if p not in plain_overlap]
+            fields["plain_ports"] = remaining_plain if remaining_plain else None
+            logger.info(
+                "Router %s: auto-migrated ports %s from plain to dual",
+                router_id, sorted(plain_overlap),
+            )
+        await _persist_router_port_fields(router_id, fields)
+
+        resp = {
+            "success": True,
+            "router_id": router_id,
+            "dual_ports": new_ports,
+            "warnings": result.get("warnings", []),
+            "message": (
+                f"Dual ports configured: {', '.join(new_ports)}"
+                if new_ports
+                else "Dual ports cleared"
+            ),
         }
-        if result.get("partial_errors"):
-            detail["partial_errors"] = result.get("partial_errors", [])
-        raise HTTPException(status_code=500, detail=detail)
+        if pppoe_overlap:
+            resp["migrated_from_pppoe"] = sorted(pppoe_overlap)
+            resp["pppoe_ports"] = fields["pppoe_ports"]
+        if plain_overlap:
+            resp["migrated_from_plain"] = sorted(plain_overlap)
+            resp["plain_ports"] = fields["plain_ports"]
+        return resp
 
-    router_obj.dual_ports = new_ports if new_ports else None
-    await db.commit()
-
-    resp = {
-        "success": True,
-        "router_id": router_id,
-        "dual_ports": new_ports,
-        "warnings": result.get("warnings", []),
-        "message": (
-            f"Dual ports configured: {', '.join(new_ports)}"
-            if new_ports
-            else "Dual ports cleared"
-        ),
-    }
-    if pppoe_overlap:
-        resp["migrated_from_pppoe"] = sorted(pppoe_overlap)
-        resp["pppoe_ports"] = router_obj.pppoe_ports
-    if plain_overlap:
-        resp["migrated_from_plain"] = sorted(plain_overlap)
-        resp["plain_ports"] = router_obj.plain_ports
-    return resp
+    return await _run_port_config(router_id, "dual", _apply)
 
 
 def _heal_dual_mode_sync(
