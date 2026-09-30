@@ -40,6 +40,8 @@ class FakeLBAPI(MikroTikAPI):
         arp=None,
         leases=None,
         sstp_clients=None,
+        clock=None,
+        internet=True,
     ):
         self.connected = True
         self.commands = []
@@ -51,6 +53,9 @@ class FakeLBAPI(MikroTikAPI):
         self.arp = arp or []
         self.leases = leases or []
         self.sstp_clients = sstp_clients or []
+        self.clock = clock if clock is not None else [{"date": "sep/30/2026", "time": "15:05:56"}]
+        self.internet = internet
+        self.schedulers = []
         self.dhcp_clients = dhcp_clients if dhcp_clients is not None else [
             {"interface": "ether1", "status": "bound",
              "gateway": "41.90.1.1", "address": "41.90.1.20/24"},
@@ -110,6 +115,8 @@ class FakeLBAPI(MikroTikAPI):
             "/ip/dhcp-server/lease/print": self.leases,
             "/interface/sstp-client/print": self.sstp_clients,
             "/interface/l2tp-client/print": [],
+            "/system/clock/print": self.clock,
+            "/system/scheduler/print": self.schedulers,
         }
         if self.ros6 and command.startswith(("/routing/table", "/interface/wireguard")):
             return {"error": "no such command prefix"}
@@ -145,6 +152,10 @@ class FakeLBAPI(MikroTikAPI):
         if command.endswith("/print"):
             return self._print(command)
         self.commands.append((command, args))
+        if command == "/ping":
+            return {"success": True,
+                    "data": [{"host": args.get("address"),
+                              "received": "3" if self.internet else "0"}]}
         if command in self.fail_commands:
             return {"error": f"forced failure for {command}"}
         if self.ros6 and command.startswith(("/routing/table", "/interface/wireguard")):
@@ -175,6 +186,10 @@ class FakeLBAPI(MikroTikAPI):
             self.bridge_ports.append(row)
         elif command == "/interface/bridge/port/remove":
             self._remove_by_id(self.bridge_ports, args.get(".id"))
+        elif command == "/system/scheduler/add":
+            self.schedulers.append(row)
+        elif command == "/system/scheduler/remove":
+            self._remove_by_id(self.schedulers, args.get(".id"))
         elif command == "/interface/list/member/add":
             self.list_members.append(row)
         elif command == "/interface/list/member/remove":

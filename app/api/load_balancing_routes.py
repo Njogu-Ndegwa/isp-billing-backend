@@ -219,9 +219,22 @@ def _lb_enable_sync(router_info: dict, wan_ports: List[str],
             report["error"] = apply_report.get("aborted") or "apply reported failed steps"
             return report
 
+        to_convert = [
+            port for port in wan_ports[1:]
+            if ((pre.get("per_port") or {}).get(port) or {}).get("link") == "true"
+        ]
+        deadman = None
+        if to_convert:
+            # Router-side safety net: if converting cuts our management path,
+            # the router reverts the ports itself (see lb_arm_convert_deadman).
+            deadman = mikrotik_lb.lb_arm_convert_deadman(api, to_convert, wan_ports)
+            report["deadman"] = deadman
+            if deadman.get("aborted"):
+                report["deadman_not_armed"] = to_convert
+                to_convert = []  # never convert without it; lines stay dormant
+
         for idx, port in enumerate(wan_ports[1:], start=1):
-            port_state = (pre.get("per_port") or {}).get(port) or {}
-            if port_state.get("link") == "true":
+            if port in to_convert:
                 conv = mikrotik_lb.lb_convert_port(
                     api, port, idx, wan1_port=wan_ports[0], wan_ports=wan_ports
                 )
@@ -237,6 +250,11 @@ def _lb_enable_sync(router_info: dict, wan_ports: List[str],
 
         report["seed"] = mikrotik_lb.lb_seed_paid(api, active_customers)
         report["verify"] = mikrotik_lb.lb_verify(api)
+        if deadman and not deadman.get("aborted"):
+            if report["converted_ports"] and not mikrotik_lb.lb_internet_ok(api):
+                report["deadman_left_armed"] = report["converted_ports"]
+            else:
+                report["deadman_disarmed"] = mikrotik_lb.lb_disarm_convert_deadman(api)
         report["success"] = True
         return report
     finally:
@@ -405,6 +423,24 @@ async def enable_load_balancing(
         warnings.extend(conv.get("warnings") or [])
         if conv.get("reverted"):
             warnings.append(f"{conv.get('aborted')} — the port was put back into the LAN")
+    minutes = mikrotik_lb.LB_DEADMAN_MINUTES
+    if result.get("deadman_not_armed"):
+        warnings.append(
+            f"Could not arm the router's safety revert, so {', '.join(result['deadman_not_armed'])} "
+            "was left as it was (not converted). Retry in a minute."
+        )
+    if result.get("deadman_left_armed"):
+        left = result["deadman_left_armed"]
+        warnings.append(
+            f"The router could not reach the internet after converting {', '.join(left)}; "
+            f"it will put {'them' if len(left) > 1 else 'it'} back into the LAN by itself "
+            f"within {minutes} minutes."
+        )
+    elif result.get("deadman_disarmed") is False:
+        warnings.append(
+            "Could not confirm the router's safety revert was cancelled; if the router "
+            f"lost contact it reverts the converted ports within {minutes} minutes."
+        )
     converted = result.get("converted_ports", [])
     dormant = result.get("dormant_ports", [])
     return {

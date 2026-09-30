@@ -344,3 +344,47 @@ async def test_verify_returns_live_report_and_db_state(db, monkeypatch):
     assert resp["config"] == {"wan_ports": ["ether1", "ether2"]}
     assert resp["applied_at"] == "2026-08-05T12:00:00"
     assert resp["verify"] == verify_report
+
+
+# ---------------------------------------------------------------------------
+# dead-man switch outcomes surface as warnings
+# ---------------------------------------------------------------------------
+
+async def test_enable_warns_when_router_will_revert_the_converted_port(db, monkeypatch):
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    monkeypatch.setattr(lbr, "_run_locked_router_thread",
+                        _fake_runner({**_ENABLE_OK, "deadman_left_armed": ["ether2"]}))
+
+    resp = await lbr.enable_load_balancing(
+        router.id, lbr.LBEnableRequest(wan_ports=["ether1", "ether2"], confirm=True),
+        db, _token(reseller),
+    )
+    assert any("back into the LAN by itself" in w for w in resp["warnings"])
+
+
+async def test_enable_warns_when_safety_net_could_not_be_armed(db, monkeypatch):
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    result = {**_ENABLE_OK, "converted_ports": [], "dormant_ports": ["ether2"],
+              "convert": {}, "deadman_not_armed": ["ether2"]}
+    monkeypatch.setattr(lbr, "_run_locked_router_thread", _fake_runner(result))
+
+    resp = await lbr.enable_load_balancing(
+        router.id, lbr.LBEnableRequest(wan_ports=["ether1", "ether2"], confirm=True),
+        db, _token(reseller),
+    )
+    assert any("safety revert" in w and "not converted" in w for w in resp["warnings"])
+
+
+async def test_enable_quiet_when_safety_net_disarmed(db, monkeypatch):
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    monkeypatch.setattr(lbr, "_run_locked_router_thread",
+                        _fake_runner({**_ENABLE_OK, "deadman_disarmed": True}))
+
+    resp = await lbr.enable_load_balancing(
+        router.id, lbr.LBEnableRequest(wan_ports=["ether1", "ether2"], confirm=True),
+        db, _token(reseller),
+    )
+    assert not any("revert" in w for w in resp["warnings"])
