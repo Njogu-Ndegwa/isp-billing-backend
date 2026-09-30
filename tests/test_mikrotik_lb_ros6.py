@@ -26,7 +26,12 @@ def _router537(**overrides):
                        "local": "false"}],
         ip_addresses=[{"address": "192.168.88.1/24", "interface": "bridge"},
                       {"address": "192.168.100.9/24", "interface": "ether1"}],
-        hotspot_hosts=[{"mac-address": MODEM_MAC, "address": "192.168.100.1"}],
+        # exactly as read live: the hotspot gives the foreign-IP modem a 1:1-NAT
+        # alias inside the LAN, and ARP on the bridge carries that alias
+        hotspot_hosts=[{"mac-address": MODEM_MAC, "address": "192.168.100.1",
+                        "to-address": "192.168.88.151"}],
+        arp=[{"mac-address": MODEM_MAC, "address": "192.168.88.151",
+              "interface": "bridge"}],
         list_members=[{".id": "*M1", "list": "WAN", "interface": "ether1"}],
     )
     kwargs.update(overrides)
@@ -189,7 +194,8 @@ def test_modem_host_entry_blinking_out_is_retried():
         if command == "/ip/hotspot/host/print":
             calls["n"] += 1
             if calls["n"] >= 2:  # back on the second read
-                api.hotspot_hosts = [{"mac-address": MODEM_MAC, "address": "192.168.100.1"}]
+                api.hotspot_hosts = [{"mac-address": MODEM_MAC, "address": "192.168.100.1",
+                                      "to-address": "192.168.88.151"}]
         return original(command)
 
     api._print = flaky
@@ -299,3 +305,17 @@ def test_convert_reverts_modem_port_when_dhcp_never_binds(monkeypatch):
         {"bridge": "bridge", "interface": "ether2"}]
     assert any(p["interface"] == "ether2" for p in api.bridge_ports)
     assert not any(d["interface"] == "ether2" for d in api.dhcp_clients)
+
+
+def test_device_leasing_from_our_dhcp_server_is_always_a_client():
+    api = _router537(leases=[{"mac-address": MODEM_MAC, "status": "bound"}])
+    report = mikrotik_lb.lb_preflight(api, ["ether1", "ether2"])
+    assert any("serves customers" in b for b in report["blockers"])
+
+
+def test_arp_for_a_real_lan_address_still_counts_as_a_client():
+    # same MAC also answering on a LAN address that is NOT the hotspot alias
+    api = _router537(arp=[{"mac-address": MODEM_MAC, "address": "192.168.88.60",
+                           "interface": "bridge"}])
+    report = mikrotik_lb.lb_preflight(api, ["ether1", "ether2"])
+    assert any("serves customers" in b for b in report["blockers"])

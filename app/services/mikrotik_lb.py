@@ -200,12 +200,30 @@ def _classify_port_macs_once(api, macs: List[str], lan_bridge: str) -> dict:
         except ValueError:
             continue
     known: Dict[str, set] = {}
-    for row in (_rd(api, "/ip/hotspot/host/print", ["mac-address", "address"])
-                + _rd(api, "/ip/arp/print", ["mac-address", "address"])):
+    # A device with a foreign static IP gets a hotspot 1:1-NAT alias (to-address)
+    # inside the LAN, and an ARP entry for that alias on the bridge. The alias is
+    # the hotspot's doing, not the device's address — ignore it (router 537's
+    # modem: address 192.168.100.1, to-address/ARP 192.168.88.151).
+    nat_alias: Dict[str, set] = {}
+    for h in _rd(api, "/ip/hotspot/host/print", ["mac-address", "address", "to-address"]):
+        mac = (h.get("mac-address") or "").upper()
+        if not mac or not h.get("address"):
+            continue
+        known.setdefault(mac, set()).add(h["address"])
+        if h.get("to-address") and h["to-address"] != h["address"]:
+            nat_alias.setdefault(mac, set()).add(h["to-address"])
+    for row in _rd(api, "/ip/arp/print", ["mac-address", "address"]):
         mac = (row.get("mac-address") or "").upper()
-        if mac and row.get("address"):
+        if mac and row.get("address") and row["address"] not in nat_alias.get(mac, set()):
             known.setdefault(mac, set()).add(row["address"])
+    # Anything leasing from our own DHCP server is a LAN client, full stop.
+    leased = {(x.get("mac-address") or "").upper()
+              for x in _rd(api, "/ip/dhcp-server/lease/print", ["mac-address", "status"])
+              if x.get("status") == "bound"}
     for mac in macs:
+        if (mac or "").upper() in leased:
+            out["clients"].append(mac)
+            continue
         ips = set()
         for raw in known.get((mac or "").upper(), set()):
             try:

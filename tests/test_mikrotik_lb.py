@@ -38,6 +38,7 @@ class FakeLBAPI(MikroTikAPI):
         ros_version="7.15.2",
         ip_addresses=None,
         arp=None,
+        leases=None,
     ):
         self.connected = True
         self.commands = []
@@ -47,6 +48,7 @@ class FakeLBAPI(MikroTikAPI):
         self.ros6 = ros_version.startswith("6")
         self.ip_addresses = ip_addresses or []
         self.arp = arp or []
+        self.leases = leases or []
         self.dhcp_clients = dhcp_clients if dhcp_clients is not None else [
             {"interface": "ether1", "status": "bound",
              "gateway": "41.90.1.1", "address": "41.90.1.20/24"},
@@ -103,6 +105,7 @@ class FakeLBAPI(MikroTikAPI):
             "/ip/firewall/nat/print": self.nat_rules,
             "/ip/address/print": self.ip_addresses,
             "/ip/arp/print": self.arp,
+            "/ip/dhcp-server/lease/print": self.leases,
         }
         if self.ros6 and command.startswith(("/routing/table", "/interface/wireguard")):
             return {"error": "no such command prefix"}
