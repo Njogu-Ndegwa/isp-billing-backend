@@ -35,12 +35,18 @@ class FakeLBAPI(MikroTikAPI):
         nat_rules=None,
         dhcp_networks=None,
         fail_commands=None,
+        ros_version="7.15.2",
+        ip_addresses=None,
+        arp=None,
     ):
         self.connected = True
         self.commands = []
         self._id = 0
         self.fail_commands = set(fail_commands or [])
-        self.system_resources = [{"version": "7.15.2", "free-memory": "104857600"}]
+        self.system_resources = [{"version": ros_version, "free-memory": "104857600"}]
+        self.ros6 = ros_version.startswith("6")
+        self.ip_addresses = ip_addresses or []
+        self.arp = arp or []
         self.dhcp_clients = dhcp_clients if dhcp_clients is not None else [
             {"interface": "ether1", "status": "bound",
              "gateway": "41.90.1.1", "address": "41.90.1.20/24"},
@@ -95,7 +101,11 @@ class FakeLBAPI(MikroTikAPI):
             "/ip/hotspot/host/print": self.hotspot_hosts,
             "/interface/list/member/print": self.list_members,
             "/ip/firewall/nat/print": self.nat_rules,
+            "/ip/address/print": self.ip_addresses,
+            "/ip/arp/print": self.arp,
         }
+        if self.ros6 and command.startswith(("/routing/table", "/interface/wireguard")):
+            return {"error": "no such command prefix"}
         if command in mapping:
             return {"success": True, "data": list(mapping[command])}
         return {"error": f"Unexpected print command: {command}"}
@@ -117,6 +127,8 @@ class FakeLBAPI(MikroTikAPI):
         self.commands.append((command, args))
         if command in self.fail_commands:
             return {"error": f"forced failure for {command}"}
+        if self.ros6 and command.startswith(("/routing/table", "/interface/wireguard")):
+            return {"error": "no such command prefix"}
         row = {".id": self._next_id(), **args}
         if command == "/routing/table/add":
             self.routing_tables.append(row)
@@ -139,6 +151,12 @@ class FakeLBAPI(MikroTikAPI):
                     r.update({k: v for k, v in args.items() if k != ".id"})
         elif command == "/ip/firewall/mangle/remove":
             self._remove_by_id(self.mangle_rules, args.get(".id"))
+        elif command == "/interface/bridge/port/add":
+            self.bridge_ports.append(row)
+        elif command == "/interface/bridge/port/remove":
+            self._remove_by_id(self.bridge_ports, args.get(".id"))
+        elif command == "/ip/dhcp-client/remove":
+            self._remove_by_id(self.dhcp_clients, args.get(".id"))
         elif command == "/ip/firewall/filter/set":
             for r in self.filter_rules:
                 if r.get(".id") == args.get(".id"):
