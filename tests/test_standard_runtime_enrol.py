@@ -250,6 +250,34 @@ def test_watchdog_install_is_idempotent_and_swaps_kind():
     assert len(fake.menus["/system/scheduler"]) == 1
 
 
+def test_wg_watchdog_rotates_the_listen_port_only_after_a_failed_reset():
+    src = wd.render_watchdog_source(wd.KIND_WG, "10.0.0.154")
+    assert "bw-mgmt-watchdog-wg v5" in src and "__" not in src
+    assert f":rndnum from={wd.ROTATE_PORT_MIN} to={wd.ROTATE_PORT_MAX}" in src
+    assert "/interface wireguard set $wi listen-port=$np" in src
+    # rotate is armed only inside the "backoff entry already there" branch, and only with working internet
+    backoff = src.index(":if ([:len $b] > 0) do={")
+    arm = src.index(":if ($up) do={ :set rotate true }")
+    assert backoff < arm < src.index(":if ($up = false) do={ :set hold 60 }")
+    # the port moves while the peer is disabled, before it is re-enabled
+    assert src.index("peers disable $p") < src.index(":if ($rotate) do={") < src.index("peers enable $p }")
+    assert "listen-port" not in wd.render_watchdog_source(wd.KIND_SSTP, "10.0.0.154")
+    # the rotation range stays clear of the provisioning ports and the ephemeral range
+    assert 51834 < wd.ROTATE_PORT_MIN or wd.ROTATE_PORT_MAX < 51820
+    assert wd.ROTATE_PORT_MAX < 49152
+
+
+def test_watchdog_version_tag():
+    assert wd.version_tag(wd.KIND_WG) == "wg v5"
+    assert wd.is_current("wg", "installed (wg v5, updated)")
+    assert not wd.is_current("wg", "installed (wg, installed)")        # recorded before versions
+    assert not wd.is_current(None, "installed (wg v5, updated)")
+    assert wd.is_current("sstp", f"installed ({wd.version_tag(wd.KIND_SSTP)}, unchanged)")
+    assert enrol.watchdog_needed(None, None, None)
+    assert enrol.watchdog_needed(datetime.utcnow(), "wg", "installed (wg, installed)")
+    assert not enrol.watchdog_needed(datetime.utcnow(), "wg", "installed (wg v5, unchanged)")
+
+
 def test_watchdog_paused_scheduler_is_not_re_enabled():
     fake = FakeRouterOS("R", **SSTP)
     wd.install_watchdog(fake, wd.KIND_SSTP, "10.0.0.5")
@@ -373,6 +401,32 @@ async def test_wireguard_router_gets_the_wg_watchdog(db, wired):
     assert fake.named("/system/scheduler", wd.SCRIPT_NAME_WG)
     assert not fake.named("/system/script", wd.SCRIPT_NAME_SSTP)
     assert (await _reload(db, r.id)).mgmt_watchdog_kind == "wg"
+
+
+@pytest.mark.asyncio
+async def test_outdated_watchdog_is_upgraded_in_place_once(db, wired):
+    """Routers enrolled with the v4 WG watchdog get v5 from the background job."""
+    old = datetime.utcnow() - timedelta(days=2)
+    r = await _router(db, "10.0.0.154", "Router-0983", mgmt_watchdog_installed_at=old,
+                      mgmt_watchdog_checked_at=old, mgmt_watchdog_kind="wg",
+                      mgmt_watchdog_reason="installed (wg, installed)",
+                      checkin_installed_at=old, checkin_checked_at=old,
+                      checkin_install_reason="installed (installed)")
+    fake = wired["10.0.0.154"] = FakeRouterOS("Router-0983", **WG)
+    wd.install_watchdog(fake, wd.KIND_WG, "10.0.0.154")
+    sched = fake.named("/system/scheduler", wd.SCRIPT_NAME_WG)
+    fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"] = "# bw-mgmt-watchdog-wg v4"
+    fake.commands.clear()
+    [o] = await enrol.standard_runtime_enrol_background()
+    assert o.checkin is None                                   # installed check-in is not touched
+    assert o.watchdog.installed and "wg v5, updated" in o.watchdog.reason
+    assert "v5" in fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"]
+    assert fake.menus["/system/scheduler"] == [sched]           # scheduler left as it was
+    row = await _reload(db, r.id)
+    assert wd.is_current(row.mgmt_watchdog_kind, row.mgmt_watchdog_reason)
+    fake.commands.clear()
+    assert await enrol.standard_runtime_enrol_background(now=datetime.utcnow() + timedelta(days=1)) == []
+    assert fake.commands == []
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,14 @@ What the scripts do (patient, never reboot):
   ``wg-hz`` / ``wg-aws`` whose INTERFACE is enabled. A peer whose handshake is
   older than 5 min is reset (conntrack for its endpoint flow removed, peer
   disabled/enabled), with the same hold-off and backoff.
+  v5: when a reset did not bring the peer back (the backoff entry from the
+  previous reset is still there) and the router's internet works, the
+  interface's ``listen-port`` is also moved to a random port. A reset alone
+  keeps the same source port, so a broken NAT entry on the ISP modem/CGNAT
+  that our 25 s keepalives never let expire keeps eating the replies (router
+  393, 2026-09-30: 5 h dark, fixed at once by a new port). The servers learn
+  the new endpoint from the next handshake; replies are accepted as
+  established traffic, so no new input rule is needed.
 * State lives in RAM-only dynamic address-list entries (``bw-wd-*``, with
   timeouts): script ``:global`` variables do NOT persist between scheduler runs
   of an API-created script (verified on RouterOS 6.48.6).
@@ -49,6 +57,13 @@ SSTP_CLIENT = "sstp-hetzner"
 WG_INTERFACES = ("wg-hz", "wg-aws")
 SPLAY_MOD = {KIND_SSTP: 40, KIND_WG: 20}
 STATE_LIST_PREFIX = "bw-wd"
+# Bump when a template changes: routers whose recorded install reason lacks
+# "<kind> <version>" are picked up again by standard_runtime_enrol and updated.
+VERSIONS = {KIND_SSTP: "v3", KIND_WG: "v5"}
+# Range the WG watchdog picks a new listen-port from (above the 51820-51834
+# ports provisioning uses, below the ephemeral range).
+ROTATE_PORT_MIN = 40000
+ROTATE_PORT_MAX = 48999
 
 _SSTP_TEMPLATE = r'''# bw-mgmt-watchdog v3 (Bitwave): restart the SSTP management tunnel if it stays dead. Never reboots.
 # v3: healthy fast path (tunnel running + 1 ping answered) exits before any address-list scan.
@@ -106,11 +121,13 @@ _SSTP_TEMPLATE = r'''# bw-mgmt-watchdog v3 (Bitwave): restart the SSTP managemen
 }
 '''
 
-_WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v4 (Bitwave, RouterOS 7): reset a WireGuard management peer whose handshake is stale.
+_WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v5 (Bitwave, RouterOS 7): reset a WireGuard management peer whose handshake is stale.
 # Never reboots. State in RAM-only address-list entries (bw-wd-*). Test hook: list bw-wd-test-stale => treat all as stale.
 # v3: healthy fast path (every watched peer enabled with a fresh handshake) exits before pings/address-list scans.
 # v4: only tunnels whose INTERFACE is enabled are watched, so a Hetzner-only router with wg-aws switched off is not
 # treated as stale every minute (and the AWS peer is never touched).
+# v5: a reset that did not help (backoff entry still present) + working internet => also move the interface to a
+# random listen-port, so the ISP NAT has to build a fresh entry (a stuck one outlives every same-port reset).
 :local hzOn ([:len [/interface wireguard find where name="wg-hz" disabled=no]] > 0)
 :local awsOn ([:len [/interface wireguard find where name="wg-aws" disabled=no]] > 0)
 :local fresh true
@@ -155,9 +172,11 @@ _WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v4 (Bitwave, RouterOS 7): reset a WireG
       :if ([:len [/ip firewall address-list find where list=$hl]] = 0) do={
         :local hold 10
         :local b [/ip firewall address-list find where list=$bl]
+        :local rotate false
         :if ([:len $b] > 0) do={
           :local a [:tostr [/ip firewall address-list get [:pick $b 0] address]]
           :set hold [:tonum [:pick $a 6 [:len $a]]]
+          :if ($up) do={ :set rotate true }
         }
         :if ($up = false) do={ :set hold 60 }
         :local ep [/interface wireguard peers get $p endpoint-address]
@@ -177,6 +196,16 @@ _WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v4 (Bitwave, RouterOS 7): reset a WireG
         }
         :do { /ip firewall address-list add list=("bw-wd-busy-" . $ifn) address=0.0.0.1 timeout=5m } on-error={}
         :do { /interface wireguard peers disable $p } on-error={}
+        :if ($rotate) do={
+          :do {
+            :local wi [/interface wireguard find where name=$ifn]
+            :local op [/interface wireguard get $wi listen-port]
+            :local np [:rndnum from=__PORT_MIN__ to=__PORT_MAX__]
+            :if ($np = $op) do={ :set np ($np + 1) }
+            /interface wireguard set $wi listen-port=$np
+            :log warning ("bw-watchdog: " . $ifn . " still stale after a reset, listen-port " . $op . " -> " . $np)
+          } on-error={ :log warning ("bw-watchdog: " . $ifn . " listen-port change failed") }
+        }
         :delay 2s
         :do { /interface wireguard peers enable $p } on-error={}
         :do { /ip firewall address-list remove [find where list=("bw-wd-busy-" . $ifn)] } on-error={}
@@ -208,7 +237,23 @@ def splay_seconds(kind: str, mgmt_ip: Optional[str]) -> int:
 def render_watchdog_source(kind: str, mgmt_ip: Optional[str]) -> str:
     """The ``source`` of the watchdog script for this router."""
     script_name(kind)  # validates kind
-    return _TEMPLATES[kind].replace("__SPLAY__", f"{splay_seconds(kind, mgmt_ip)}s")
+    return (
+        _TEMPLATES[kind]
+        .replace("__SPLAY__", f"{splay_seconds(kind, mgmt_ip)}s")
+        .replace("__PORT_MIN__", str(ROTATE_PORT_MIN))
+        .replace("__PORT_MAX__", str(ROTATE_PORT_MAX))
+    )
+
+
+def version_tag(kind: str) -> str:
+    """``"wg v5"``: recorded in the install reason so outdated installs can be found."""
+    script_name(kind)  # validates kind
+    return f"{kind} {VERSIONS[kind]}"
+
+
+def is_current(kind: Optional[str], reason: Optional[str]) -> bool:
+    """Whether a router's recorded install (kind + reason) has the current template."""
+    return kind in VERSIONS and version_tag(kind) in str(reason or "")
 
 
 def _data(res) -> list:
