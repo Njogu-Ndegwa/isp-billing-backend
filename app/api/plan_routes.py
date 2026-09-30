@@ -106,6 +106,24 @@ def _serialize_plan_routers(plan: Plan) -> dict:
     }
 
 
+def _serialize_plan_trial(plan: Plan) -> dict:
+    return {"trial_once_per_customer": bool(plan.trial_once_per_customer)}
+
+
+def _validate_free_trial_plan(plan: Plan) -> None:
+    """Free trials are claimed from the captive portal at no charge, so the
+    plan must be free, must be a hotspot plan (PPPoE customers have no portal
+    to claim from), and covers only the device that claimed it."""
+    if plan.plan_type != PlanType.FREE_TRIAL:
+        return
+    if plan.price:
+        raise HTTPException(status_code=400, detail="A free trial plan must have a price of 0")
+    if plan.connection_type != ConnectionType.HOTSPOT:
+        raise HTTPException(status_code=400, detail="Free trial plans are only available for hotspot")
+    if int(plan.max_shared_users or 1) > 1:
+        raise HTTPException(status_code=400, detail="A free trial plan is for one device only")
+
+
 async def _validate_router_scope(
     db: AsyncSession,
     user_id: int,
@@ -156,6 +174,9 @@ class PlanCreateRequest(BaseModel):
     max_shared_users: Optional[int] = 1
     # Omit or send null/[] to offer the plan on every router the reseller owns.
     router_ids: Optional[List[int]] = None
+    # Free-trial plans only: True = each device may claim it once,
+    # False = it may claim again once its previous trial has ended.
+    trial_once_per_customer: Optional[bool] = True
 
 
 class PlanUpdateRequest(BaseModel):
@@ -178,6 +199,7 @@ class PlanUpdateRequest(BaseModel):
     # Send null/[] to revert the plan to "all routers". Only applied when the
     # field is actually present in the request body.
     router_ids: Optional[List[int]] = None
+    trial_once_per_customer: Optional[bool] = None
 
 
 @router.post("/api/plans/create")
@@ -268,7 +290,13 @@ async def create_plan_api(
             fup_throttle_profile=request.fup_throttle_profile,
             max_shared_users=max_shared_users,
             router_ids=scoped_router_ids,
+            trial_once_per_customer=(
+                request.trial_once_per_customer
+                if request.trial_once_per_customer is not None
+                else True
+            ),
         )
+        _validate_free_trial_plan(plan)
 
         db.add(plan)
         await db.commit()
@@ -297,6 +325,7 @@ async def create_plan_api(
             **_serialize_plan_fup(plan),
             **_serialize_plan_sharing(plan),
             **_serialize_plan_routers(plan),
+            **_serialize_plan_trial(plan),
         }
     except HTTPException:
         raise
@@ -445,6 +474,9 @@ async def update_plan_api(
             plan.max_shared_users = _validate_max_shared_users(request.max_shared_users)
         if "router_ids" in fields_set:
             plan.router_ids = await _validate_router_scope(db, user.id, request.router_ids)
+        if request.trial_once_per_customer is not None:
+            plan.trial_once_per_customer = request.trial_once_per_customer
+        _validate_free_trial_plan(plan)
 
         await db.commit()
         await db.refresh(plan)
@@ -469,6 +501,7 @@ async def update_plan_api(
             **_serialize_plan_fup(plan),
             **_serialize_plan_sharing(plan),
             **_serialize_plan_routers(plan),
+            **_serialize_plan_trial(plan),
         }
     except HTTPException:
         raise

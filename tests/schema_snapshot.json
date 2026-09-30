@@ -342,6 +342,17 @@
   "user_id",
   "value"
  ],
+ "free_trial_claims": [
+  "claimed_at",
+  "customer_id",
+  "id",
+  "mac_address",
+  "payment_id",
+  "phone",
+  "plan_id",
+  "router_id",
+  "user_id"
+ ],
  "growth_targets": [
   "created_at",
   "id",
@@ -547,6 +558,7 @@
   "router_ids",
   "router_profile",
   "speed",
+  "trial_once_per_customer",
   "user_id",
   "valid_until"
  ],

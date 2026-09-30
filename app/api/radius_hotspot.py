@@ -42,7 +42,7 @@ from pydantic import BaseModel, Field
 from app.db.database import get_db
 from app.core.runtime_mode import require_external_side_effects_enabled
 from app.db.models import (
-    CollectionMode, Customer, Plan, Router, CustomerStatus,
+    CollectionMode, Customer, Plan, PlanType, Router, CustomerStatus,
     MpesaTransaction, MpesaTransactionStatus,
     PaymentMethod, User,
 )
@@ -55,7 +55,7 @@ from app.services.radius_service import (
     parse_speed_to_radius_format
 )
 from app.services.mikrotik_api import normalize_mac_address
-from app.services.plan_cache import plan_model_allows_router
+from app.services.plan_cache import FREE_TRIAL_NOT_PURCHASABLE, plan_model_allows_router
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +290,8 @@ async def radius_register_and_pay(
                 request.router_id,
             )
             raise HTTPException(status_code=400, detail="Selected plan is not available on this router")
+        if plan.plan_type == PlanType.FREE_TRIAL:
+            raise HTTPException(status_code=400, detail=FREE_TRIAL_NOT_PURCHASABLE)
 
         # Validate phone number
         if not request.phone or len(request.phone.strip()) < 10:

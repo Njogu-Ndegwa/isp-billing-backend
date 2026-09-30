@@ -59,6 +59,7 @@ class ProvisioningAttemptEntrypoint(str, enum.Enum):
     MANUAL_TRANSACTION_PROVISION = "manual_transaction_provision"
     SUBSCRIPTION_SHARE = "subscription_share"
     OUTAGE_COMPENSATION = "outage_compensation"
+    FREE_TRIAL = "free_trial"
 
 
 class ProvisioningState(str, enum.Enum):
@@ -110,6 +111,7 @@ class PlanType(str, enum.Enum):
     REGULAR = "regular"
     EMERGENCY = "emergency"
     SPECIAL_OFFER = "special_offer"
+    FREE_TRIAL = "free_trial"
 
 class FupAction(str, enum.Enum):
     THROTTLE = "throttle"
@@ -302,6 +304,31 @@ class Plan(Base):
     # back to NULL on write and read as "all routers": a plan must never silently
     # vanish from every portal and stop earning. See app/services/plan_cache.py.
     router_ids = Column(JSON, nullable=True)
+    # Free-trial plans only (plan_type=free_trial): True lets each device claim
+    # the trial once; False lets it claim again after the previous trial ends.
+    trial_once_per_customer = Column(Boolean, nullable=False, default=True, server_default="true")
+
+class FreeTrialClaim(Base):
+    """One row per free-trial plan claimed from the captive portal.
+
+    The once-per-customer rule is checked against this table rather than
+    customer_payments, because deleting a customer nulls its payments'
+    customer_id and would otherwise make the device eligible again.
+    """
+    __tablename__ = "free_trial_claims"
+    __table_args__ = (
+        Index("ix_free_trial_claims_plan_mac", "plan_id", "mac_address"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="SET NULL"), nullable=True)
+    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
+    payment_id = Column(Integer, ForeignKey("customer_payments.id", ondelete="SET NULL"), nullable=True)
+    mac_address = Column(String(50), nullable=False)
+    # Match key, not a dialable number: the last 9 digits (see free_trial.py).
+    phone = Column(String(32), nullable=True, index=True)
+    claimed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 class Payment(Base):
     __tablename__ = "payments"

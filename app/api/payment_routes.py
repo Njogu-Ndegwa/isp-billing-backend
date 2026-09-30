@@ -7,7 +7,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.db.models import (
-    Router, Customer, Plan, MpesaTransaction, MpesaTransactionStatus,
+    Router, Customer, Plan, PlanType, MpesaTransaction, MpesaTransactionStatus,
     CustomerStatus, CustomerPayment, CollectionMode, ConnectionType, User, PaymentMethod,
     ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
     C2BTransaction, C2BTransactionStatus,
@@ -26,7 +26,7 @@ from app.services.hotspot_provisioning import (
 )
 from app.services.mpesa_transactions import update_mpesa_transaction_status
 from app.services.billing import apply_failed_payment_customer_status, make_payment
-from app.services.plan_cache import plan_model_allows_router
+from app.services.plan_cache import FREE_TRIAL_NOT_PURCHASABLE, plan_model_allows_router
 from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
 import logging
 import json
@@ -828,6 +828,8 @@ async def register_hotspot_and_pay_api(
                 request.router_id,
             )
             raise HTTPException(status_code=400, detail="Selected plan is not available on this router")
+        if plan.plan_type == PlanType.FREE_TRIAL:
+            raise HTTPException(status_code=400, detail=FREE_TRIAL_NOT_PURCHASABLE)
         if plan.connection_type != ConnectionType.HOTSPOT:
             logger.warning(
                 "[HOTSPOT PAY] Rejected non-hotspot plan %s (%s) for router %s",

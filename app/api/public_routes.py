@@ -935,6 +935,63 @@ async def redeem_voucher_public(
     return result
 
 
+@router.get("/api/public/free-trial/{router_id}/{mac_address}")
+async def free_trial_eligibility_public(
+    router_id: int,
+    mac_address: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Free-trial plans offered on this hotspot and whether this device can
+    still claim each one. The portal uses it to show or hide the trial button."""
+    if not validate_mac_address(mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address format")
+
+    from app.services.free_trial import get_trial_eligibility
+
+    result = await get_trial_eligibility(db, router_id, mac_address)
+    if not result.get("success"):
+        raise HTTPException(status_code=404, detail=result.get("error", "Router not found"))
+    return result
+
+
+@router.post("/api/public/free-trial/claim")
+async def claim_free_trial_public(
+    payload: Dict[str, Any],
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Claim a free-trial plan on the captive portal. No auth, no payment.
+
+    Expected payload:
+    {
+        "plan_id": 12,
+        "mac_address": "AA:BB:CC:DD:EE:FF",
+        "router_id": 1,
+        "phone": "0712345678"   # optional; also checked by the once-only rule
+    }
+    """
+    mac_address = payload.get("mac_address", "")
+    if not mac_address:
+        raise HTTPException(status_code=400, detail="MAC address is required")
+    if not validate_mac_address(mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address format")
+    try:
+        plan_id = int(payload.get("plan_id"))
+        rid = int(payload.get("router_id"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="plan_id and router_id are required")
+
+    from app.services.free_trial import claim_free_trial
+
+    result = await claim_free_trial(db, plan_id, mac_address, rid, payload.get("phone"))
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 400),
+            detail=result.get("error", "Could not start the free trial"),
+        )
+    return result
+
+
 @router.post("/api/public/access-login")
 async def access_credential_login_public(
     payload: Dict[str, Any],
