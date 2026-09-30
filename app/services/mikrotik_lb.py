@@ -24,8 +24,16 @@ Domain rules baked in here (breaking these has killed live captive portals):
    seconds (RouterOS max is 35w3d13:13:56 = 21,475,396s). An LB_PAID entry
    outliving its ip-binding breaks the portal for the next holder of that IP.
 7. All router objects are comment-tagged ISP_BILLING_* and idempotent.
+
+RouterOS 6 vs 7: the mangle/PCC/guard/fasttrack rules are identical. v6 has no
+/routing/table — a route joins a policy table via `routing-mark=` (the table
+exists implicitly), where v7 needs the table created first and uses
+`routing-table=`. v6 routers carry their management tunnel as SSTP/L2TP (router-
+originated, never touched by prerouting mangle) instead of WireGuard peers, so
+there are no VPN pins to add there.
 """
 
+import ipaddress
 import logging
 import re
 import time
@@ -65,6 +73,16 @@ LB_APPLY_SETTLE_SECONDS = 6
 LB_CONVERT_SETTLE_SECONDS = 8
 LB_CONVERT_DHCP_BIND_ATTEMPTS = 20
 LB_CONVERT_DHCP_BIND_DELAY_SECONDS = 2
+
+SUPPORTED_ROS_MAJORS = (6, 7)
+# A secondary line plugged into a port that is still a LAN bridge member shows
+# up as learned MAC(s) on that port. We only treat them as the upstream modem
+# when there are at most this many and every one holds an address OUTSIDE the
+# LAN subnets (a modem keeps its own 192.168.100.1-style IP; customer devices
+# lease from the router). Convert still reverts if DHCP then fails to bind.
+UPSTREAM_MAX_MACS = 2
+LB_CLASSIFY_RETRIES = 3
+LB_CLASSIFY_RETRY_DELAY_SECONDS = 3
 
 
 def _mark_comment(index: int) -> str:
@@ -140,6 +158,94 @@ def _wr(api, report: dict, name: str, cmd: str, args: Dict[str, str]) -> bool:
     return ok
 
 
+def ros_major(version: Optional[str]) -> Optional[int]:
+    """'6.49.21 (long-term)' -> 6; unreadable -> None."""
+    m = re.match(r"\s*(\d+)\.", version or "")
+    return int(m.group(1)) if m else None
+
+
+def _read_ros_major(api) -> Optional[int]:
+    res = _rd(api, "/system/resource/print")
+    return ros_major(res[0].get("version")) if res else None
+
+
+def _classify_port_macs(api, macs: List[str], lan_bridge: str) -> dict:
+    """Split MACs learned on a would-be WAN port into upstream-looking vs clients.
+
+    Upstream-looking = every address we know for the MAC (hotspot host / ARP) is
+    outside the LAN bridge's own subnets. A MAC with no known address counts as a
+    client (conservative: PPPoE CPEs and silent devices look like that).
+
+    A modem's hotspot-host entry blinks out while it is idle (router 537 lost it
+    between preflight and convert), so an inconclusive answer is re-read a few
+    times before it counts.
+    """
+    out = _classify_port_macs_once(api, macs, lan_bridge)
+    for _ in range(LB_CLASSIFY_RETRIES):
+        if not out["clients"]:
+            break
+        if LB_CLASSIFY_RETRY_DELAY_SECONDS:
+            time.sleep(LB_CLASSIFY_RETRY_DELAY_SECONDS)
+        out = _classify_port_macs_once(api, macs, lan_bridge)
+    return out
+
+
+def _classify_port_macs_once(api, macs: List[str], lan_bridge: str) -> dict:
+    out: dict = {"upstream": [], "clients": []}
+    if not macs:
+        return out
+    lan_nets = []
+    for a in _rd(api, "/ip/address/print", ["address", "interface"]):
+        if a.get("interface") != lan_bridge:
+            continue
+        try:
+            lan_nets.append(ipaddress.ip_interface(a.get("address") or "").network)
+        except ValueError:
+            continue
+    known: Dict[str, set] = {}
+    # A device with a foreign static IP gets a hotspot 1:1-NAT alias (to-address)
+    # inside the LAN, and an ARP entry for that alias on the bridge. The alias is
+    # the hotspot's doing, not the device's address — ignore it (router 537's
+    # modem: address 192.168.100.1, to-address/ARP 192.168.88.151).
+    nat_alias: Dict[str, set] = {}
+    for h in _rd(api, "/ip/hotspot/host/print", ["mac-address", "address", "to-address"]):
+        mac = (h.get("mac-address") or "").upper()
+        if not mac or not h.get("address"):
+            continue
+        known.setdefault(mac, set()).add(h["address"])
+        if h.get("to-address") and h["to-address"] != h["address"]:
+            nat_alias.setdefault(mac, set()).add(h["to-address"])
+    for row in _rd(api, "/ip/arp/print", ["mac-address", "address"]):
+        mac = (row.get("mac-address") or "").upper()
+        if mac and row.get("address") and row["address"] not in nat_alias.get(mac, set()):
+            known.setdefault(mac, set()).add(row["address"])
+    # Anything leasing from our own DHCP server is a LAN client, full stop.
+    leased = {(x.get("mac-address") or "").upper()
+              for x in _rd(api, "/ip/dhcp-server/lease/print", ["mac-address", "status"])
+              if x.get("status") == "bound"}
+    for mac in macs:
+        if (mac or "").upper() in leased:
+            out["clients"].append(mac)
+            continue
+        ips = set()
+        for raw in known.get((mac or "").upper(), set()):
+            try:
+                ips.add(ipaddress.ip_address(raw))
+            except ValueError:
+                continue
+        foreign = sorted(str(ip) for ip in ips if not any(ip in n for n in lan_nets))
+        if lan_nets and ips and len(foreign) == len(ips):
+            out["upstream"].append({"mac": mac, "addresses": foreign})
+        else:
+            out["clients"].append(mac)
+    return out
+
+
+def _port_macs_block(classified: dict) -> bool:
+    """True when learned MACs mean the port serves devices (never convert it)."""
+    return bool(classified["clients"]) or len(classified["upstream"]) > UPSTREAM_MAX_MACS
+
+
 # --- preflight ---------------------------------------------------------------
 
 def lb_preflight(api, wan_ports: List[str]) -> dict:
@@ -155,8 +261,24 @@ def lb_preflight(api, wan_ports: List[str]) -> dict:
         round(int(res[0].get("free-memory", 0)) / 1048576) if res else None
     )
     _step(report, "read.system_resource", bool(res), {"version": ver})
-    if not ver.startswith("7"):
-        report["blockers"].append(f"RouterOS {ver} is not v7 — this recipe is 7.x only")
+    major = ros_major(ver) if res else None
+    report["ros_major"] = major
+    if major is None:
+        report["blockers"].append(
+            "Could not read the RouterOS version (router slow or unreachable?) — retry"
+        )
+    elif major not in SUPPORTED_ROS_MAJORS:
+        report["blockers"].append(
+            f"RouterOS {ver} is not supported — load balancing needs RouterOS 6 or 7"
+        )
+
+    hs = _rd(api, "/ip/hotspot/print")
+    report["hotspot"] = [{k: h.get(k) for k in ("name", "interface", "profile", "disabled")}
+                         for h in hs]
+    if not hs:
+        report["warnings"].append("no hotspot server found — LB still works, guard is inert")
+    report["lan_bridge"] = hs[0].get("interface") if hs else "bridge"
+    _step(report, "read.hotspot", True, {"lan_bridge": report["lan_bridge"]})
 
     dhcp = _rd(api, "/ip/dhcp-client/print")
     w1 = next((d for d in dhcp if d.get("interface") == wan1), None)
@@ -185,20 +307,23 @@ def lb_preflight(api, wan_ports: List[str]) -> dict:
         }
         report["per_port"][port] = info
         if idx > 0 and in_bridge and macs:
-            report["blockers"].append(
-                f"{len(macs)} client MAC(s) learned on {port} while it is a bridge "
-                "port — that port serves customers/devices; converting it disconnects "
-                "them. Pick another port or move them."
-            )
+            classified = _classify_port_macs(api, macs, report["lan_bridge"])
+            info["upstream_devices"] = classified["upstream"]
+            if _port_macs_block(classified):
+                report["blockers"].append(
+                    f"{len(macs)} client MAC(s) learned on {port} while it is a bridge "
+                    "port — that port serves customers/devices; converting it "
+                    "disconnects them. Pick another port or move them."
+                )
+            else:
+                seen = ", ".join(f"{u['mac']} ({'/'.join(u['addresses'])})"
+                                 for u in classified["upstream"])
+                report["warnings"].append(
+                    f"{port} is still a LAN port but has what looks like the second "
+                    f"line's modem on it: {seen}. Enabling takes {port} out of the "
+                    "LAN and puts it back if the modem does not hand out DHCP."
+                )
     _step(report, "read.ports", True, report["per_port"])
-
-    hs = _rd(api, "/ip/hotspot/print")
-    report["hotspot"] = [{k: h.get(k) for k in ("name", "interface", "profile", "disabled")}
-                         for h in hs]
-    if not hs:
-        report["warnings"].append("no hotspot server found — LB still works, guard is inert")
-    report["lan_bridge"] = hs[0].get("interface") if hs else "bridge"
-    _step(report, "read.hotspot", True, {"lan_bridge": report["lan_bridge"]})
 
     dsn = _rd(api, "/ip/dhcp-server/network/print")
     report["dhcp_dns"] = [{k: n.get(k) for k in ("address", "dns-server")} for n in dsn]
@@ -236,6 +361,218 @@ def lb_preflight(api, wan_ports: List[str]) -> dict:
     return report
 
 
+def _fallback_suffix(step: int) -> str:
+    if step == 0:
+        return ""
+    return "_FALLBACK" if step == 1 else f"_FALLBACK{step}"
+
+
+def _v7_wan_routes(wan_ports: List[str], gateways: Dict[str, Optional[str]],
+                   probes: List[str]) -> List[tuple]:
+    """v7 probe / checked-default / to_wanX routes (bench-certified shape)."""
+    n = len(wan_ports)
+    plan: List[tuple] = []
+    for i, port in enumerate(wan_ports):
+        gw = gateways.get(port)
+        if not gw:
+            continue  # dormant WAN: no probe/checked-default yet (convert adds them)
+        plan.append((
+            {"dst-address": probes[i] + "/32", "gateway": gw + "%" + port, "scope": "10"},
+            _probe_comment(port),
+        ))
+        plan.append((
+            {"dst-address": "0.0.0.0/0", "gateway": probes[i], "distance": str(i + 1),
+             "check-gateway": "ping", "target-scope": "11"},
+            _checked_comment(i),
+        ))
+    for i in range(n):
+        # Own probe first, then every OTHER WAN in rotation at increasing distance.
+        # A single fallback is sufficient for n=2 (it always lands on the live WAN)
+        # but not beyond: with two dormant WANs a 3-WAN table had NO active route,
+        # so every flow PCC-marked into it black-holed. Found live on router 247
+        # (2026-08-13) between apply and the second/third lines being plugged in.
+        for step in range(n):
+            plan.append((
+                {"dst-address": "0.0.0.0/0", "gateway": probes[(i + step) % n],
+                 "routing-table": _table_name(i), "distance": str(step + 1),
+                 "check-gateway": "ping", "target-scope": "11"},
+                _table_route_comment(i) + _fallback_suffix(step),
+            ))
+    return plan
+
+
+# RouterOS 6 routes. Measured on router 537 (6.49.21, 2026-09-30):
+#  * a recursive route can NOT resolve through a probe whose gateway is
+#    interface-qualified (gw%iface) — it stays "unreachable" whatever the
+#    target-scope. Through a plain-gateway probe it resolves at once.
+#  * so v6 uses plain-gateway probes (full upstream failover) when every WAN is
+#    on its own subnet, and falls back to the classic direct gw%iface routes with
+#    check-gateway=ping (failover on modem/cable loss only) when two lines share
+#    a subnet — e.g. two ONTs that both answer on 192.168.100.1, where a plain
+#    gateway would be ambiguous.
+_V6_MANAGED_ROUTE = re.compile(
+    r"ISP_BILLING_(DUAL_WAN_.+_PROBE|DUAL_WAN_.+_CHECKED|PCC_WAN\d+(_FALLBACK\d*)?"
+    r"|MGMT_PIN_[0-9_]+(_FALLBACK\d*)?)"
+)
+_V6_ROUTE_COMPARE = ("dst-address", "gateway", "routing-mark", "distance", "scope",
+                     "target-scope", "check-gateway")
+
+
+def _v6_wan_leases(api, wan_ports: List[str]) -> Dict[str, dict]:
+    leases: Dict[str, dict] = {}
+    for d in _rd(api, "/ip/dhcp-client/print"):
+        port = d.get("interface")
+        if port in wan_ports and d.get("status") == "bound" and d.get("gateway"):
+            leases[port] = {"gateway": d.get("gateway"), "address": d.get("address")}
+    return leases
+
+
+def _v6_mgmt_endpoints(api) -> List[str]:
+    """IP-literal connect-to of enabled SSTP/L2TP management tunnels."""
+    eps: List[str] = []
+    for cmd in ("/interface/sstp-client/print", "/interface/l2tp-client/print"):
+        for row in _rd(api, cmd, ["connect-to", "disabled"]):
+            ep = (row.get("connect-to") or "").strip()
+            # SSTP carries its port: "91.98.238.12:4443" (router 537). Missing
+            # that left the tunnel unpinned and it followed ether2's lease.
+            if ep.count(":") == 1:
+                ep = ep.split(":", 1)[0]
+            if row.get("disabled") == "true" or not ep or ep in eps:
+                continue
+            try:
+                ipaddress.ip_address(ep)
+            except ValueError:
+                continue
+            eps.append(ep)
+    return eps
+
+
+def _v6_pin_plan(wan_ports: List[str], leases: Dict[str, dict],
+                 endpoints: List[str]) -> List[tuple]:
+    """Pin each management tunnel endpoint to WAN1, then every other bound WAN.
+
+    Always direct gw%port routes: they stay put when a second port lands in the
+    same subnet. Without them, the moment ether2 on router 537 got a
+    192.168.100.x lease the unqualified default route flipped to ether2 and took
+    the SSTP tunnel (and our API session) with it, mid-change.
+    """
+    plan: List[tuple] = []
+    for ep in endpoints:
+        tag = "ISP_BILLING_MGMT_PIN_" + ep.replace(".", "_")
+        step = 0
+        for port in wan_ports:
+            lease = leases.get(port)
+            if not lease:
+                continue
+            plan.append((tag + _fallback_suffix(step),
+                         {"dst-address": ep + "/32", "gateway": lease["gateway"] + "%" + port,
+                          "distance": str(step + 1), "check-gateway": "ping"}))
+            step += 1
+    return plan
+
+
+def _v6_route_plan(wan_ports: List[str], leases: Dict[str, dict],
+                   endpoints: Optional[List[str]] = None) -> tuple:
+    """(mode, [(comment, args)]) for a v6 router, from the current WAN leases."""
+    mode, plan = _v6_wan_route_plan(wan_ports, leases)
+    return mode, plan + _v6_pin_plan(wan_ports, leases, list(endpoints or []))
+
+
+def _v6_wan_route_plan(wan_ports: List[str], leases: Dict[str, dict]) -> tuple:
+    n = len(wan_ports)
+    probes = list(PROBE_IPS[:n])
+    nets = {}
+    for port, lease in leases.items():
+        iface = _safe_interface(lease.get("address"))
+        if iface:
+            nets[port] = iface.network
+    bound = list(nets)
+    overlap = any(nets[a].overlaps(nets[b])
+                  for x, a in enumerate(bound) for b in bound[x + 1:])
+    plan: List[tuple] = []
+    if not overlap:
+        for i, port in enumerate(wan_ports):
+            lease = leases.get(port)
+            if not lease:
+                continue
+            plan.append((_probe_comment(port),
+                         {"dst-address": probes[i] + "/32", "gateway": lease["gateway"],
+                          "scope": "10"}))
+            plan.append((_checked_comment(i),
+                         {"dst-address": "0.0.0.0/0", "gateway": probes[i],
+                          "distance": str(i + 1), "check-gateway": "ping",
+                          "target-scope": "10"}))
+        for i in range(n):
+            for step in range(n):
+                plan.append((_table_route_comment(i) + _fallback_suffix(step),
+                             {"dst-address": "0.0.0.0/0", "gateway": probes[(i + step) % n],
+                              "routing-mark": _table_name(i), "distance": str(step + 1),
+                              "check-gateway": "ping", "target-scope": "10"}))
+        return "recursive", plan
+    for i, port in enumerate(wan_ports):
+        lease = leases.get(port)
+        if lease:
+            plan.append((_checked_comment(i),
+                         {"dst-address": "0.0.0.0/0",
+                          "gateway": lease["gateway"] + "%" + port,
+                          "distance": str(i + 1), "check-gateway": "ping"}))
+    for i in range(n):
+        for step in range(n):
+            port = wan_ports[(i + step) % n]
+            lease = leases.get(port)
+            if not lease:
+                continue
+            plan.append((_table_route_comment(i) + _fallback_suffix(step),
+                         {"dst-address": "0.0.0.0/0",
+                          "gateway": lease["gateway"] + "%" + port,
+                          "routing-mark": _table_name(i), "distance": str(step + 1),
+                          "check-gateway": "ping"}))
+    return "direct", plan
+
+
+def _v6_reconcile_routes(api, report: dict, wan_ports: List[str]) -> str:
+    """Make the router's managed v6 routes match the plan for the current leases.
+
+    Wrong/stale managed routes are removed and re-added; matching ones are left
+    alone, so re-running (or converting another port) is cheap and idempotent.
+    """
+    leases = _v6_wan_leases(api, wan_ports)
+    mode, plan = _v6_route_plan(wan_ports, leases, _v6_mgmt_endpoints(api))
+    wanted = dict(plan)
+    existing = _rd(api, "/ip/route/print", [".id", "comment"] + list(_V6_ROUTE_COMPARE))
+    for r in existing:
+        comment = r.get("comment") or ""
+        if not _V6_MANAGED_ROUTE.fullmatch(comment):
+            continue
+        want = wanted.get(comment)
+        if want is not None and all(str(want[k]) == str(r.get(k) or "") for k in want):
+            wanted.pop(comment)  # already correct
+            continue
+        _wr(api, report, f"route.remove.{comment}", "/ip/route/remove", {".id": r[".id"]})
+    for comment, args in plan:
+        if comment in wanted:
+            _wr(api, report, f"route.add.{comment}", "/ip/route/add",
+                {**args, "comment": comment})
+    report["route_mode"] = mode
+    if mode == "direct":
+        report.setdefault("warnings", []).append(
+            "Two lines share one subnet, so RouterOS 6 routes each line directly "
+            "(gw%port). Balancing works; failover reacts to a dead modem or cable but "
+            "not to an upstream outage behind a live modem. Give the second modem its "
+            "own LAN subnet (e.g. 192.168.101.1) and re-apply for full failover."
+        )
+    return mode
+
+
+def _route_proplist(major: Optional[int]) -> List[str]:
+    # RouterOS 6 silently drops every property AFTER an unknown name in a
+    # .proplist (measured on router 537), so never ask v6 for v7-only fields.
+    base = ["dst-address", "gateway", "distance", "active", "comment"]
+    if major == 6:
+        return base + ["routing-mark", "gateway-status"]
+    return base + ["immediate-gw", "routing-table"]
+
+
 # --- apply -------------------------------------------------------------------
 
 def lb_apply(api, wan_ports: List[str]) -> dict:
@@ -261,60 +598,44 @@ def lb_apply(api, wan_ports: List[str]) -> dict:
         return report
     _step(report, "check.wan1_bound", True, gateways[wan_ports[0]])
 
+    major = _read_ros_major(api)
+    report["ros_major"] = major
+    if major not in SUPPORTED_ROS_MAJORS:
+        report["aborted"] = (
+            "could not read the RouterOS version" if major is None
+            else f"RouterOS {major}.x is not supported (needs 6 or 7)"
+        )
+        _step(report, "check.ros_version", False, report["aborted"])
+        return report
+    _step(report, "check.ros_version", True, major)
+
     hs = _rd(api, "/ip/hotspot/print")
     lan_bridge = hs[0].get("interface") if hs else "bridge"
     report["lan_bridge"] = lan_bridge
 
-    # 1. routing tables to_wan1..to_wanN (fib)
-    tables = {t.get("name") for t in _rd(api, "/routing/table/print")}
-    for i in range(n):
-        name = _table_name(i)
-        if name not in tables:
-            _wr(api, report, f"routing_table.add.{name}", "/routing/table/add",
-                {"name": name, "fib": ""})
+    # 1. routing tables to_wan1..to_wanN (fib). v7 only: on v6 a routing-mark
+    #    table exists implicitly as soon as a route carries that mark.
+    if major == 7:
+        tables = {t.get("name") for t in _rd(api, "/routing/table/print")}
+        for i in range(n):
+            name = _table_name(i)
+            if name not in tables:
+                _wr(api, report, f"routing_table.add.{name}", "/routing/table/add",
+                    {"name": name, "fib": ""})
 
-    # 2. routes (idempotent by comment)
+    # 2. routes (idempotent by comment). v6 reconciles its own route set (see
+    #    _v6_reconcile_routes) after the VPN-pin step, which is v7-only.
     have = {r.get("comment") for r in _rd(api, "/ip/route/print", ["comment"])
             if r.get("comment")}
     route_plan: List[tuple] = []
-    for i, port in enumerate(wan_ports):
-        gw = gateways.get(port)
-        if not gw:
-            continue  # dormant WAN: no probe/checked-default yet (convert adds them)
-        route_plan.append((
-            {"dst-address": probes[i] + "/32", "gateway": gw + "%" + port, "scope": "10"},
-            _probe_comment(port),
-        ))
-        route_plan.append((
-            {"dst-address": "0.0.0.0/0", "gateway": probes[i], "distance": str(i + 1),
-             "check-gateway": "ping", "target-scope": "11"},
-            _checked_comment(i),
-        ))
-    for i in range(n):
-        route_plan.append((
-            {"dst-address": "0.0.0.0/0", "gateway": probes[i],
-             "routing-table": _table_name(i), "distance": "1",
-             "check-gateway": "ping", "target-scope": "11"},
-            _table_route_comment(i),
-        ))
-        # Full fallback chain: every OTHER WAN in rotation at increasing distance.
-        # A single fallback is sufficient for n=2 (it always lands on the live WAN)
-        # but not beyond: with two dormant WANs a 3-WAN table had NO active route,
-        # so every flow PCC-marked into it black-holed. Found live on router 247
-        # (2026-08-13) between apply and the second/third lines being plugged in.
-        for step in range(1, n):
-            suffix = "_FALLBACK" if step == 1 else f"_FALLBACK{step}"
-            route_plan.append((
-                {"dst-address": "0.0.0.0/0", "gateway": probes[(i + step) % n],
-                 "routing-table": _table_name(i), "distance": str(step + 1),
-                 "check-gateway": "ping", "target-scope": "11"},
-                _table_route_comment(i) + suffix,
-            ))
+    if major == 7:
+        route_plan.extend(_v7_wan_routes(wan_ports, gateways, probes))
 
     # 3. management VPN pins: wg-aws -> WAN1, wg-aws2 -> WAN2 (when present),
     #    other endpoints round-robin; each gets a fallback via the next WAN.
     peers = _rd(api, "/interface/wireguard/peers/print",
-                ["interface", "endpoint-address", "current-endpoint-address"])
+                ["interface", "endpoint-address", "current-endpoint-address"]) \
+        if major == 7 else []
     seen_eps: List[str] = []
     rr_counter = 0
     for p in peers:
@@ -350,6 +671,8 @@ def lb_apply(api, wan_ports: List[str]) -> dict:
         args = dict(args)
         args["comment"] = comment
         _wr(api, report, f"route.add.{comment}", "/ip/route/add", args)
+    if major == 6:
+        _v6_reconcile_routes(api, report, wan_ports)
 
     # 4. address lists (LB_SRC + LB_BYPASS_DST incl. backends + live wg endpoints)
     al = _rd(api, "/ip/firewall/address-list/print", ["list", "address"])
@@ -405,13 +728,15 @@ def lb_apply(api, wan_ports: List[str]) -> dict:
             continue
         args = dict(args)
         args["comment"] = comment
-        _wr(api, report, f"mangle.add.{comment}", "/ip/firewall/mangle/add", args)
+        ok = _wr(api, report, f"mangle.add.{comment}", "/ip/firewall/mangle/add", args)
+        if comment == GUARD_COMMENT and not ok:
+            # MARK/ROUTE rules without the guard is the portal-killer state.
+            report["aborted"] = "unauth guard rule could not be added — no mark rules added"
+            return report
 
     if LB_APPLY_SETTLE_SECONDS:
         time.sleep(LB_APPLY_SETTLE_SECONDS)
-    after = _rd(api, "/ip/route/print",
-                ["dst-address", "gateway", "immediate-gw", "routing-table",
-                 "distance", "active", "comment"])
+    after = _rd(api, "/ip/route/print", _route_proplist(major))
     report["routes_after"] = [r for r in after
                               if (r.get("comment") or "").startswith(COMMENT_PREFIX)]
     report["mangle_after"] = _rd(api, "/ip/firewall/mangle/print",
@@ -421,10 +746,13 @@ def lb_apply(api, wan_ports: List[str]) -> dict:
 
 # --- convert a bridge port into a secondary WAN ------------------------------
 
-def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1") -> dict:
+def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1",
+                    wan_ports: Optional[List[str]] = None) -> dict:
     """Pull *port* out of the LAN bridge and turn it into WAN<wan_index+1>.
 
     Hard aborts: no link; port is a bridge member with learned client MACs.
+    *wan_ports* (all WANs, WAN1 first) lets RouterOS 6 rebuild its whole route
+    set; without it the WAN list is taken as [wan1_port, ..., port].
     """
     report: dict = {"steps": [], "success": True}
     probe = PROBE_IPS[wan_index]
@@ -440,29 +768,46 @@ def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1") -
     fdb = _rd(api, "/interface/bridge/host/print", ["mac-address", "on-interface", "local"])
     client_macs = [h.get("mac-address") for h in fdb
                    if h.get("on-interface") == port and h.get("local") != "true"]
-    bridge_ports = _rd(api, "/interface/bridge/port/print", [".id", "interface"])
+    bridge_ports = _rd(api, "/interface/bridge/port/print", [".id", "interface", "bridge"])
     in_bridge = any(p.get("interface") == port for p in bridge_ports)
+    upstream_in_lan = False
     if in_bridge and client_macs:
-        report["aborted"] = (
-            f"{len(client_macs)} MAC(s) learned on {port} while it is a bridge "
-            f"port: {client_macs[:5]} — it serves devices; move them to another "
-            "LAN port first"
-        )
-        _step(report, "check.bridge_macs", False, report["aborted"])
-        return report
-    _step(report, "check.bridge_macs", True, {"in_bridge": in_bridge})
+        hs = _rd(api, "/ip/hotspot/print")
+        lan_bridge = hs[0].get("interface") if hs else "bridge"
+        classified = _classify_port_macs(api, client_macs, lan_bridge)
+        if _port_macs_block(classified):
+            report["aborted"] = (
+                f"{len(client_macs)} MAC(s) learned on {port} while it is a bridge "
+                f"port: {client_macs[:5]} — it serves devices; move them to another "
+                "LAN port first"
+            )
+            _step(report, "check.bridge_macs", False, report["aborted"])
+            return report
+        upstream_in_lan = True
+        report["upstream_devices"] = classified["upstream"]
+    _step(report, "check.bridge_macs", True,
+          {"in_bridge": in_bridge, "upstream_in_lan": upstream_in_lan})
 
+    removed_from: List[str] = []
     for p in bridge_ports:
         if p.get("interface") == port:
-            _wr(api, report, f"bridge_port.remove.{port}",
-                "/interface/bridge/port/remove", {".id": p[".id"]})
+            if _wr(api, report, f"bridge_port.remove.{port}",
+                   "/interface/bridge/port/remove", {".id": p[".id"]}):
+                removed_from.append(p.get("bridge") or "bridge")
+
+    # Masquerade coverage BEFORE the port gets an address: once it holds a lease,
+    # traffic may leave through it (on router 537 the unqualified default route
+    # flipped to ether2 the instant it got 192.168.100.3), and un-NATed customer
+    # traffic is an outage.
+    added_nat = _ensure_masquerade(api, report, port, wan_index, wan1_port)
 
     dhc = _rd(api, "/ip/dhcp-client/print", [".id", "interface"])
+    added_dhcp = False
     if not any(d.get("interface") == port for d in dhc):
-        _wr(api, report, f"dhcp_client.add.{port}", "/ip/dhcp-client/add",
-            {"interface": port, "add-default-route": "no",
-             "use-peer-dns": "no", "use-peer-ntp": "no",
-             "comment": _wan_dhcp_comment(wan_index)})
+        added_dhcp = _wr(api, report, f"dhcp_client.add.{port}", "/ip/dhcp-client/add",
+                         {"interface": port, "add-default-route": "no",
+                          "use-peer-dns": "no", "use-peer-ntp": "no", "disabled": "no",
+                          "comment": _wan_dhcp_comment(wan_index)})
 
     gw = None
     for _ in range(LB_CONVERT_DHCP_BIND_ATTEMPTS):
@@ -482,9 +827,54 @@ def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1") -
             "PPPoE instead)"
         )
         _step(report, "check.dhcp_bound", False, report["aborted"])
+        if upstream_in_lan:
+            # We only pulled a port with learned MACs on the strength of the
+            # "looks like a modem" heuristic. No lease = not proven; put it back.
+            _revert_convert(api, report, port, removed_from, added_dhcp, added_nat)
         return report
     _step(report, "check.dhcp_bound", True, report["lease"])
 
+    report["warnings"] = []
+    lease_if = _safe_interface(report["lease"].get("address"))
+    for d in _rd(api, "/ip/dhcp-client/print"):
+        if d.get("interface") == port or d.get("status") != "bound":
+            continue
+        other = _safe_interface(d.get("address"))
+        if not (lease_if and other):
+            continue
+        if lease_if.ip == other.ip:
+            report["warnings"].append(
+                f"{port} got the same address as {d.get('interface')} "
+                f"({lease_if.ip}) — balancing still routes, but change the second "
+                "modem's LAN subnet (e.g. 192.168.101.1) to keep the lines apart"
+            )
+        elif lease_if.network == other.network:
+            report["warnings"].append(
+                f"{port} and {d.get('interface')} share subnet {lease_if.network} "
+                "(both modems use the same LAN range) — works via interface-pinned "
+                "gateways; changing the second modem's LAN subnet is cleaner"
+            )
+
+    major = _read_ros_major(api)
+    if major == 6:
+        wans = list(wan_ports) if wan_ports else (
+            [wan1_port] + [f"_wan{k + 1}" for k in range(1, wan_index)] + [port])
+        _v6_reconcile_routes(api, report, wans)
+    else:
+        _v7_convert_routes(api, report, port, wan_index, gw, probe)
+
+    if LB_CONVERT_SETTLE_SECONDS:
+        time.sleep(LB_CONVERT_SETTLE_SECONDS)
+    after = _rd(api, "/ip/route/print", _route_proplist(major))
+    report["active_managed_routes"] = [
+        r for r in after
+        if (r.get("comment") or "").startswith(COMMENT_PREFIX) and r.get("active") == "true"
+    ]
+    return report
+
+
+def _v7_convert_routes(api, report: dict, port: str, wan_index: int, gw: str,
+                       probe: str) -> None:
     have = {r.get("comment") for r in _rd(api, "/ip/route/print", ["comment"])
             if r.get("comment")}
     if _probe_comment(port) not in have:
@@ -497,32 +887,62 @@ def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1") -
              "distance": str(wan_index + 1), "check-gateway": "ping",
              "target-scope": "11", "comment": _checked_comment(wan_index)})
 
-    # masquerade coverage: mirror WAN1's interface-list membership; else explicit rule
+
+def _safe_interface(addr: Optional[str]):
+    try:
+        return ipaddress.ip_interface(addr or "")
+    except ValueError:
+        return None
+
+
+def _ensure_masquerade(api, report: dict, port: str, wan_index: int,
+                       wan1_port: str) -> List[tuple]:
+    """Mirror WAN1's interface-list membership onto *port* (else an explicit
+    masquerade rule). Returns what was added, for revert."""
+    added: List[tuple] = []
     members = _rd(api, "/interface/list/member/print", [".id", "list", "interface"])
     wan_lists = {m.get("list") for m in members if m.get("interface") == wan1_port}
-    covered = False
-    for wl in wan_lists:
+    for wl in sorted(wan_lists):
         if not any(m.get("list") == wl and m.get("interface") == port for m in members):
-            _wr(api, report, f"interface_list.add.{wl}.{port}",
-                "/interface/list/member/add", {"list": wl, "interface": port})
-        covered = True
-    if not covered:
+            if _wr(api, report, f"interface_list.add.{wl}.{port}",
+                   "/interface/list/member/add", {"list": wl, "interface": port}):
+                added.append(("list", wl))
+    if not wan_lists:
         nat = _rd(api, "/ip/firewall/nat/print", ["out-interface", "action", "dynamic"])
         if not any(x.get("action") == "masquerade" and x.get("out-interface") == port
                    for x in nat if x.get("dynamic") != "true"):
-            _wr(api, report, f"nat.add.masquerade.{port}", "/ip/firewall/nat/add",
-                {"chain": "srcnat", "action": "masquerade", "out-interface": port,
-                 "comment": f"{_wan_dhcp_comment(wan_index)}_MASQ"})
+            comment = f"{_wan_dhcp_comment(wan_index)}_MASQ"
+            if _wr(api, report, f"nat.add.masquerade.{port}", "/ip/firewall/nat/add",
+                   {"chain": "srcnat", "action": "masquerade", "out-interface": port,
+                    "comment": comment}):
+                added.append(("nat", comment))
+    return added
 
-    if LB_CONVERT_SETTLE_SECONDS:
-        time.sleep(LB_CONVERT_SETTLE_SECONDS)
-    after = _rd(api, "/ip/route/print", ["dst-address", "immediate-gw", "routing-table",
-                                         "distance", "active", "comment"])
-    report["active_managed_routes"] = [
-        r for r in after
-        if (r.get("comment") or "").startswith(COMMENT_PREFIX) and r.get("active") == "true"
-    ]
-    return report
+
+def _revert_convert(api, report: dict, port: str, removed_from: List[str],
+                    added_dhcp: bool, added_nat: Optional[List[tuple]] = None) -> None:
+    """Undo a failed convert: drop the DHCP client and NAT coverage we added,
+    rejoin the bridge."""
+    if added_dhcp:
+        for d in _rd(api, "/ip/dhcp-client/print", [".id", "interface", "comment"]):
+            if d.get("interface") == port and (d.get("comment") or "").startswith(COMMENT_PREFIX):
+                _wr(api, report, f"revert.dhcp_client.remove.{port}",
+                    "/ip/dhcp-client/remove", {".id": d[".id"]})
+    for kind, name in added_nat or []:
+        if kind == "list":
+            for m in _rd(api, "/interface/list/member/print", [".id", "list", "interface"]):
+                if m.get("list") == name and m.get("interface") == port:
+                    _wr(api, report, f"revert.interface_list.remove.{name}.{port}",
+                        "/interface/list/member/remove", {".id": m[".id"]})
+        else:
+            for x in _rd(api, "/ip/firewall/nat/print", [".id", "comment"]):
+                if x.get("comment") == name:
+                    _wr(api, report, f"revert.nat.remove.{name}",
+                        "/ip/firewall/nat/remove", {".id": x[".id"]})
+    for bridge in removed_from:
+        _wr(api, report, f"revert.bridge_port.add.{port}",
+            "/interface/bridge/port/add", {"bridge": bridge, "interface": port})
+    report["reverted"] = True
 
 
 # --- verify ------------------------------------------------------------------
@@ -539,21 +959,27 @@ def lb_verify(api) -> dict:
     report["wan_ips"] = wan_ips
     _step(report, "read.dhcp_clients", True, wan_ips)
 
-    # Map WAN index -> interface via the managed probe routes (gateway "gw%iface").
-    routes = _rd(api, "/ip/route/print",
-                 ["dst-address", "gateway", "immediate-gw", "routing-table",
-                  "active", "comment"])
+    # Map WAN index -> interface via the managed routes: probe routes (v7
+    # "gw%iface"; v6 plain gw, matched to its DHCP client) or, in v6 direct mode,
+    # each table's own route ("gw%iface").
+    major = _read_ros_major(api)
+    routes = _rd(api, "/ip/route/print", _route_proplist(major))
+    gw_iface = {d.get("gateway"): d.get("interface") for d in dhcp
+                if d.get("status") == "bound" and d.get("gateway")}
     index_iface: Dict[int, str] = {}
     for r in routes:
         comment = r.get("comment") or ""
-        m = re.fullmatch(r"ISP_BILLING_DUAL_WAN_(.+)_PROBE", comment)
-        if not m:
-            continue
         gw = r.get("gateway") or ""
         iface = gw.split("%", 1)[1] if "%" in gw else None
-        dst = (r.get("dst-address") or "").split("/")[0]
-        if iface and dst in PROBE_IPS:
-            index_iface[PROBE_IPS.index(dst)] = iface
+        if re.fullmatch(r"ISP_BILLING_DUAL_WAN_(.+)_PROBE", comment):
+            dst = (r.get("dst-address") or "").split("/")[0]
+            iface = iface or gw_iface.get(gw)
+            if iface and dst in PROBE_IPS:
+                index_iface[PROBE_IPS.index(dst)] = iface
+            continue
+        m = re.fullmatch(r"ISP_BILLING_PCC_WAN(\d+)", comment)
+        if m and iface:
+            index_iface.setdefault(int(m.group(1)) - 1, iface)
 
     mangle = _rd(api, "/ip/firewall/mangle/print", ["comment", "packets", "disabled"])
     counters = {x.get("comment"): {"packets": x.get("packets"), "disabled": x.get("disabled")}

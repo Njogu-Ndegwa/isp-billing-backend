@@ -42,6 +42,8 @@ LB_OP_TIMEOUT_SECONDS = 120
 # Enable runs preflight + apply (6s settle) + up to 3 port conversions
 # (40s DHCP wait + 8s settle each) + seed + verify on one connection.
 LB_ENABLE_TIMEOUT_SECONDS = 420
+# Max wait for the per-router lock / shared fleet slot before answering 429.
+LB_LOCK_WAIT_SECONDS = 25
 
 
 class LBPreflightRequest(BaseModel):
@@ -116,13 +118,24 @@ async def _run_locked_router_thread(
     from app.services.mikrotik_background import router_locks
 
     router_key = f"{router_obj.ip_address}:{router_obj.port}"
+    # The lock manager's 3 fleet slots are shared with background jobs that can
+    # hold one for minutes. Waiting on them unbounded let a dashboard preflight
+    # sit until Cloudflare cut the request at ~100s ("An error occurred", no log
+    # line) — router 537, 2026-09-30. Give up early with a retryable 429.
+    lock_cm = router_locks.acquire(router_key)
     try:
-        async with router_locks.acquire(router_key):
-            return await asyncio.wait_for(
-                asyncio.to_thread(sync_func, *args), timeout=timeout_seconds
-            )
+        await asyncio.wait_for(lock_cm.__aenter__(), timeout=LB_LOCK_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        return {"error": "busy",
+                "detail": "Router is busy with background maintenance; retry in a minute"}
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(sync_func, *args), timeout=timeout_seconds
+        )
     except asyncio.TimeoutError:
         return {"error": "timeout"}
+    finally:
+        await lock_cm.__aexit__(None, None, None)
 
 
 def _raise_for_router_error(result: dict, router_obj: Router) -> None:
@@ -210,7 +223,7 @@ def _lb_enable_sync(router_info: dict, wan_ports: List[str],
             port_state = (pre.get("per_port") or {}).get(port) or {}
             if port_state.get("link") == "true":
                 conv = mikrotik_lb.lb_convert_port(
-                    api, port, idx, wan1_port=wan_ports[0]
+                    api, port, idx, wan1_port=wan_ports[0], wan_ports=wan_ports
                 )
                 report["convert"][port] = conv
                 if conv.get("success") and not conv.get("aborted"):
@@ -388,6 +401,10 @@ async def enable_load_balancing(
     warnings = list(preflight_report.get("warnings", [])) + list(
         verify_report.get("warnings", [])
     )
+    for conv in (result.get("convert") or {}).values():
+        warnings.extend(conv.get("warnings") or [])
+        if conv.get("reverted"):
+            warnings.append(f"{conv.get('aborted')} — the port was put back into the LAN")
     converted = result.get("converted_ports", [])
     dormant = result.get("dormant_ports", [])
     return {
