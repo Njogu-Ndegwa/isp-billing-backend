@@ -430,6 +430,10 @@ def _v6_mgmt_endpoints(api) -> List[str]:
     for cmd in ("/interface/sstp-client/print", "/interface/l2tp-client/print"):
         for row in _rd(api, cmd, ["connect-to", "disabled"]):
             ep = (row.get("connect-to") or "").strip()
+            # SSTP carries its port: "91.98.238.12:4443" (router 537). Missing
+            # that left the tunnel unpinned and it followed ether2's lease.
+            if ep.count(":") == 1:
+                ep = ep.split(":", 1)[0]
             if row.get("disabled") == "true" or not ep or ep in eps:
                 continue
             try:

@@ -33,7 +33,7 @@ def _router537(**overrides):
         arp=[{"mac-address": MODEM_MAC, "address": "192.168.88.151",
               "interface": "bridge"}],
         list_members=[{".id": "*M1", "list": "WAN", "interface": "ether1"}],
-        sstp_clients=[{"name": "sstp-hetzner", "connect-to": "91.98.238.12",
+        sstp_clients=[{"name": "sstp-hetzner", "connect-to": "91.98.238.12:4443",
                        "disabled": "false"}],
     )
     kwargs.update(overrides)
