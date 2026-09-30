@@ -647,3 +647,42 @@ def test_complete_callback_schedules_the_install():
     from app.api import provisioning as provisioning_api
     src = inspect.getsource(provisioning_api.complete_provision)
     assert "schedule_install_after_registration(router_obj.id)" in src
+
+
+@pytest.mark.asyncio
+async def test_outdated_applier_is_upgraded_in_place(db, wired, monkeypatch):
+    """Router 75, 2026-09-30: installed on 09-28 with applier v1, never looked at
+    again after v2 shipped, so the check-in delivered nothing on a MAC-login
+    router. A router whose reports carry an older v= is re-installed."""
+    old = datetime.utcnow() - timedelta(days=2)
+    stale = await _router(db, "10.0.0.4", "Router-0145", checkin_installed_at=old,
+                          checkin_checked_at=old, checkin_install_reason="installed (updated)",
+                          mgmt_watchdog_installed_at=old)
+    current = await _router(db, "10.0.0.5", "Router-0146", checkin_installed_at=old,
+                            checkin_checked_at=old, checkin_install_reason="installed (updated)",
+                            mgmt_watchdog_installed_at=old)
+    fake = wired["10.0.0.4"] = FakeRouterOS("Router-0145", **SSTP)
+    other = wired["10.0.0.5"] = FakeRouterOS("Router-0146", **SSTP)
+    applier.install_checkin_applier(fake, identity="Router-0145", endpoint_url=settings.CHECKIN_ENDPOINT_URL)
+    script = fake.named("/system/script", applier.SCRIPT_NAME)
+    script["source"] = script["source"].replace('"v=2&id="', '"v=1&id="')
+    fake.commands.clear()
+    monkeypatch.setattr(checkin_delivery, "_stats", {
+        stale.id: checkin_delivery.RouterCheckinStats(checkins=3, last_version=1),
+        current.id: checkin_delivery.RouterCheckinStats(checkins=3, last_version=2),
+    })
+    assert checkin_delivery.outdated_applier_router_ids() == frozenset({stale.id})
+
+    [o] = await enrol.standard_runtime_enrol_background()
+    assert o.router_id == stale.id and o.checkin.installed and "updated" in o.checkin.reason
+    assert o.watchdog is None
+    assert '"v=2&id="' in fake.named("/system/script", applier.SCRIPT_NAME)["source"]
+    assert not fake.did("/system/script/run")
+    assert other.commands == []
+    assert (await _reload(db, stale.id)).checkin_installed_at > old
+
+    # Its next report is v2: nothing left to do.
+    checkin_delivery._stats[stale.id].last_version = 2
+    fake.commands.clear()
+    assert await enrol.standard_runtime_enrol_background() == []
+    assert fake.commands == []
