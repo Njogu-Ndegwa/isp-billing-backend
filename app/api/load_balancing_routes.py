@@ -223,7 +223,7 @@ def _lb_enable_sync(router_info: dict, wan_ports: List[str],
             port_state = (pre.get("per_port") or {}).get(port) or {}
             if port_state.get("link") == "true":
                 conv = mikrotik_lb.lb_convert_port(
-                    api, port, idx, wan1_port=wan_ports[0]
+                    api, port, idx, wan1_port=wan_ports[0], wan_ports=wan_ports
                 )
                 report["convert"][port] = conv
                 if conv.get("success") and not conv.get("aborted"):

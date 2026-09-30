@@ -110,12 +110,25 @@ class FakeLBAPI(MikroTikAPI):
             return {"success": True, "data": list(mapping[command])}
         return {"error": f"Unexpected print command: {command}"}
 
+    V7_ONLY_PROPS = ("immediate-gw", "routing-table")
+
     def send_command_optimized(self, command, proplist=None, query=None):
         if command == "/ip/firewall/filter/print" and query == "?action=fasttrack-connection":
             return {"success": True,
                     "data": [f for f in self.filter_rules
                              if f.get("action") == "fasttrack-connection"]}
-        return self._print(command)
+        result = self._print(command)
+        if self.ros6 and proplist and result.get("success"):
+            # Real RouterOS 6 silently drops every property from the first
+            # unknown name onward (measured on router 537).
+            kept = []
+            for name in proplist:
+                if name in self.V7_ONLY_PROPS:
+                    break
+                kept.append(name)
+            result["data"] = [{k: v for k, v in row.items() if k in kept}
+                              for row in result["data"]]
+        return result
 
     def _remove_by_id(self, rows, rid):
         rows[:] = [r for r in rows if r.get(".id") != rid]
@@ -169,6 +182,7 @@ def _no_settle(monkeypatch):
     monkeypatch.setattr(mikrotik_lb, "LB_APPLY_SETTLE_SECONDS", 0)
     monkeypatch.setattr(mikrotik_lb, "LB_CONVERT_SETTLE_SECONDS", 0)
     monkeypatch.setattr(mikrotik_lb, "LB_CONVERT_DHCP_BIND_DELAY_SECONDS", 0)
+    monkeypatch.setattr(mikrotik_lb, "LB_CLASSIFY_RETRY_DELAY_SECONDS", 0)
 
 
 def _commands(api, command):
