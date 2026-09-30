@@ -33,6 +33,8 @@ def _router537(**overrides):
         arp=[{"mac-address": MODEM_MAC, "address": "192.168.88.151",
               "interface": "bridge"}],
         list_members=[{".id": "*M1", "list": "WAN", "interface": "ether1"}],
+        sstp_clients=[{"name": "sstp-hetzner", "connect-to": "91.98.238.12",
+                       "disabled": "false"}],
     )
     kwargs.update(overrides)
     return FakeLBAPI(**kwargs)
@@ -319,3 +321,72 @@ def test_arp_for_a_real_lan_address_still_counts_as_a_client():
                            "interface": "bridge"}])
     report = mikrotik_lb.lb_preflight(api, ["ether1", "ether2"])
     assert any("serves customers" in b for b in report["blockers"])
+
+
+# --- lessons from the live ether2 DHCP test on router 537 ---------------------------
+
+PIN = "ISP_BILLING_MGMT_PIN_91_98_238_12"
+
+
+def test_v6_dhcp_client_is_created_enabled():
+    """v6 creates /ip dhcp-client entries DISABLED unless told otherwise."""
+    api = _router537()
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
+                       "address": "192.168.100.3/24"})
+    mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
+    assert _commands(api, "/ip/dhcp-client/add")[0]["disabled"] == "no"
+
+
+def test_masquerade_coverage_lands_before_the_port_gets_an_address():
+    api = _router537()
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
+                       "address": "192.168.100.3/24"})
+    mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
+    order = [c for c, _ in api.commands
+             if c in ("/interface/list/member/add", "/ip/dhcp-client/add")]
+    assert order == ["/interface/list/member/add", "/ip/dhcp-client/add"]
+
+
+def test_mgmt_tunnel_pinned_to_wan1_on_apply_then_gets_wan2_fallback():
+    api = _router537()
+    wans = ["ether1", "ether2"]
+    mikrotik_lb.lb_apply(api, wans)
+    routes = _managed_routes(api)
+    assert routes[PIN] == {**routes[PIN], "dst-address": "91.98.238.12/32",
+                           "gateway": "192.168.100.1%ether1", "distance": "1",
+                           "check-gateway": "ping"}
+    assert PIN + "_FALLBACK" not in routes  # WAN2 not bound yet
+
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
+                       "address": "192.168.100.3/24"})
+    mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1", wan_ports=wans)
+    routes = _managed_routes(api)
+    assert routes[PIN]["gateway"] == "192.168.100.1%ether1"
+    assert routes[PIN + "_FALLBACK"]["gateway"] == "192.168.100.1%ether2"
+    assert routes[PIN + "_FALLBACK"]["distance"] == "2"
+
+
+def test_disabled_or_hostname_tunnels_are_not_pinned():
+    api = _router537(sstp_clients=[
+        {"connect-to": "91.98.238.12", "disabled": "true"},
+        {"connect-to": "vpn.example.net", "disabled": "false"},
+    ])
+    mikrotik_lb.lb_apply(api, ["ether1", "ether2"])
+    assert not [c for c in _managed_routes(api) if "MGMT_PIN" in c]
+
+
+def test_revert_also_removes_the_wan_list_membership(monkeypatch):
+    monkeypatch.setattr(mikrotik_lb, "LB_CONVERT_DHCP_BIND_ATTEMPTS", 2)
+    api = _router537()
+    _on_dhcp_add(api, {"status": "searching"})
+    report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
+    assert report["reverted"] is True
+    assert not any(m["interface"] == "ether2" for m in api.list_members)
+
+
+def test_rollback_removes_mgmt_pins():
+    api = _router537()
+    mikrotik_lb.lb_apply(api, ["ether1", "ether2"])
+    assert PIN in _managed_routes(api)
+    mikrotik_lb.lb_rollback(api)
+    assert not _managed_routes(api)

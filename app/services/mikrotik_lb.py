@@ -408,7 +408,8 @@ def _v7_wan_routes(wan_ports: List[str], gateways: Dict[str, Optional[str]],
 #    a subnet — e.g. two ONTs that both answer on 192.168.100.1, where a plain
 #    gateway would be ambiguous.
 _V6_MANAGED_ROUTE = re.compile(
-    r"ISP_BILLING_(DUAL_WAN_.+_PROBE|DUAL_WAN_.+_CHECKED|PCC_WAN\d+(_FALLBACK\d*)?)"
+    r"ISP_BILLING_(DUAL_WAN_.+_PROBE|DUAL_WAN_.+_CHECKED|PCC_WAN\d+(_FALLBACK\d*)?"
+    r"|MGMT_PIN_[0-9_]+(_FALLBACK\d*)?)"
 )
 _V6_ROUTE_COMPARE = ("dst-address", "gateway", "routing-mark", "distance", "scope",
                      "target-scope", "check-gateway")
@@ -423,8 +424,54 @@ def _v6_wan_leases(api, wan_ports: List[str]) -> Dict[str, dict]:
     return leases
 
 
-def _v6_route_plan(wan_ports: List[str], leases: Dict[str, dict]) -> tuple:
+def _v6_mgmt_endpoints(api) -> List[str]:
+    """IP-literal connect-to of enabled SSTP/L2TP management tunnels."""
+    eps: List[str] = []
+    for cmd in ("/interface/sstp-client/print", "/interface/l2tp-client/print"):
+        for row in _rd(api, cmd, ["connect-to", "disabled"]):
+            ep = (row.get("connect-to") or "").strip()
+            if row.get("disabled") == "true" or not ep or ep in eps:
+                continue
+            try:
+                ipaddress.ip_address(ep)
+            except ValueError:
+                continue
+            eps.append(ep)
+    return eps
+
+
+def _v6_pin_plan(wan_ports: List[str], leases: Dict[str, dict],
+                 endpoints: List[str]) -> List[tuple]:
+    """Pin each management tunnel endpoint to WAN1, then every other bound WAN.
+
+    Always direct gw%port routes: they stay put when a second port lands in the
+    same subnet. Without them, the moment ether2 on router 537 got a
+    192.168.100.x lease the unqualified default route flipped to ether2 and took
+    the SSTP tunnel (and our API session) with it, mid-change.
+    """
+    plan: List[tuple] = []
+    for ep in endpoints:
+        tag = "ISP_BILLING_MGMT_PIN_" + ep.replace(".", "_")
+        step = 0
+        for port in wan_ports:
+            lease = leases.get(port)
+            if not lease:
+                continue
+            plan.append((tag + _fallback_suffix(step),
+                         {"dst-address": ep + "/32", "gateway": lease["gateway"] + "%" + port,
+                          "distance": str(step + 1), "check-gateway": "ping"}))
+            step += 1
+    return plan
+
+
+def _v6_route_plan(wan_ports: List[str], leases: Dict[str, dict],
+                   endpoints: Optional[List[str]] = None) -> tuple:
     """(mode, [(comment, args)]) for a v6 router, from the current WAN leases."""
+    mode, plan = _v6_wan_route_plan(wan_ports, leases)
+    return mode, plan + _v6_pin_plan(wan_ports, leases, list(endpoints or []))
+
+
+def _v6_wan_route_plan(wan_ports: List[str], leases: Dict[str, dict]) -> tuple:
     n = len(wan_ports)
     probes = list(PROBE_IPS[:n])
     nets = {}
@@ -483,7 +530,7 @@ def _v6_reconcile_routes(api, report: dict, wan_ports: List[str]) -> str:
     alone, so re-running (or converting another port) is cheap and idempotent.
     """
     leases = _v6_wan_leases(api, wan_ports)
-    mode, plan = _v6_route_plan(wan_ports, leases)
+    mode, plan = _v6_route_plan(wan_ports, leases, _v6_mgmt_endpoints(api))
     wanted = dict(plan)
     existing = _rd(api, "/ip/route/print", [".id", "comment"] + list(_V6_ROUTE_COMPARE))
     for r in existing:
@@ -741,12 +788,18 @@ def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1",
                    "/interface/bridge/port/remove", {".id": p[".id"]}):
                 removed_from.append(p.get("bridge") or "bridge")
 
+    # Masquerade coverage BEFORE the port gets an address: once it holds a lease,
+    # traffic may leave through it (on router 537 the unqualified default route
+    # flipped to ether2 the instant it got 192.168.100.3), and un-NATed customer
+    # traffic is an outage.
+    added_nat = _ensure_masquerade(api, report, port, wan_index, wan1_port)
+
     dhc = _rd(api, "/ip/dhcp-client/print", [".id", "interface"])
     added_dhcp = False
     if not any(d.get("interface") == port for d in dhc):
         added_dhcp = _wr(api, report, f"dhcp_client.add.{port}", "/ip/dhcp-client/add",
                          {"interface": port, "add-default-route": "no",
-                          "use-peer-dns": "no", "use-peer-ntp": "no",
+                          "use-peer-dns": "no", "use-peer-ntp": "no", "disabled": "no",
                           "comment": _wan_dhcp_comment(wan_index)})
 
     gw = None
@@ -770,7 +823,7 @@ def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1",
         if upstream_in_lan:
             # We only pulled a port with learned MACs on the strength of the
             # "looks like a modem" heuristic. No lease = not proven; put it back.
-            _revert_convert(api, report, port, removed_from, added_dhcp)
+            _revert_convert(api, report, port, removed_from, added_dhcp, added_nat)
         return report
     _step(report, "check.dhcp_bound", True, report["lease"])
 
@@ -802,23 +855,6 @@ def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1",
         _v6_reconcile_routes(api, report, wans)
     else:
         _v7_convert_routes(api, report, port, wan_index, gw, probe)
-
-    # masquerade coverage: mirror WAN1's interface-list membership; else explicit rule
-    members = _rd(api, "/interface/list/member/print", [".id", "list", "interface"])
-    wan_lists = {m.get("list") for m in members if m.get("interface") == wan1_port}
-    covered = False
-    for wl in wan_lists:
-        if not any(m.get("list") == wl and m.get("interface") == port for m in members):
-            _wr(api, report, f"interface_list.add.{wl}.{port}",
-                "/interface/list/member/add", {"list": wl, "interface": port})
-        covered = True
-    if not covered:
-        nat = _rd(api, "/ip/firewall/nat/print", ["out-interface", "action", "dynamic"])
-        if not any(x.get("action") == "masquerade" and x.get("out-interface") == port
-                   for x in nat if x.get("dynamic") != "true"):
-            _wr(api, report, f"nat.add.masquerade.{port}", "/ip/firewall/nat/add",
-                {"chain": "srcnat", "action": "masquerade", "out-interface": port,
-                 "comment": f"{_wan_dhcp_comment(wan_index)}_MASQ"})
 
     if LB_CONVERT_SETTLE_SECONDS:
         time.sleep(LB_CONVERT_SETTLE_SECONDS)
@@ -852,14 +888,50 @@ def _safe_interface(addr: Optional[str]):
         return None
 
 
+def _ensure_masquerade(api, report: dict, port: str, wan_index: int,
+                       wan1_port: str) -> List[tuple]:
+    """Mirror WAN1's interface-list membership onto *port* (else an explicit
+    masquerade rule). Returns what was added, for revert."""
+    added: List[tuple] = []
+    members = _rd(api, "/interface/list/member/print", [".id", "list", "interface"])
+    wan_lists = {m.get("list") for m in members if m.get("interface") == wan1_port}
+    for wl in sorted(wan_lists):
+        if not any(m.get("list") == wl and m.get("interface") == port for m in members):
+            if _wr(api, report, f"interface_list.add.{wl}.{port}",
+                   "/interface/list/member/add", {"list": wl, "interface": port}):
+                added.append(("list", wl))
+    if not wan_lists:
+        nat = _rd(api, "/ip/firewall/nat/print", ["out-interface", "action", "dynamic"])
+        if not any(x.get("action") == "masquerade" and x.get("out-interface") == port
+                   for x in nat if x.get("dynamic") != "true"):
+            comment = f"{_wan_dhcp_comment(wan_index)}_MASQ"
+            if _wr(api, report, f"nat.add.masquerade.{port}", "/ip/firewall/nat/add",
+                   {"chain": "srcnat", "action": "masquerade", "out-interface": port,
+                    "comment": comment}):
+                added.append(("nat", comment))
+    return added
+
+
 def _revert_convert(api, report: dict, port: str, removed_from: List[str],
-                    added_dhcp: bool) -> None:
-    """Undo a failed convert: drop the DHCP client we added, rejoin the bridge."""
+                    added_dhcp: bool, added_nat: Optional[List[tuple]] = None) -> None:
+    """Undo a failed convert: drop the DHCP client and NAT coverage we added,
+    rejoin the bridge."""
     if added_dhcp:
         for d in _rd(api, "/ip/dhcp-client/print", [".id", "interface", "comment"]):
             if d.get("interface") == port and (d.get("comment") or "").startswith(COMMENT_PREFIX):
                 _wr(api, report, f"revert.dhcp_client.remove.{port}",
                     "/ip/dhcp-client/remove", {".id": d[".id"]})
+    for kind, name in added_nat or []:
+        if kind == "list":
+            for m in _rd(api, "/interface/list/member/print", [".id", "list", "interface"]):
+                if m.get("list") == name and m.get("interface") == port:
+                    _wr(api, report, f"revert.interface_list.remove.{name}.{port}",
+                        "/interface/list/member/remove", {".id": m[".id"]})
+        else:
+            for x in _rd(api, "/ip/firewall/nat/print", [".id", "comment"]):
+                if x.get("comment") == name:
+                    _wr(api, report, f"revert.nat.remove.{name}",
+                        "/ip/firewall/nat/remove", {".id": x[".id"]})
     for bridge in removed_from:
         _wr(api, report, f"revert.bridge_port.add.{port}",
             "/interface/bridge/port/add", {"bridge": bridge, "interface": port})

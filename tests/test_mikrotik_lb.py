@@ -39,6 +39,7 @@ class FakeLBAPI(MikroTikAPI):
         ip_addresses=None,
         arp=None,
         leases=None,
+        sstp_clients=None,
     ):
         self.connected = True
         self.commands = []
@@ -49,6 +50,7 @@ class FakeLBAPI(MikroTikAPI):
         self.ip_addresses = ip_addresses or []
         self.arp = arp or []
         self.leases = leases or []
+        self.sstp_clients = sstp_clients or []
         self.dhcp_clients = dhcp_clients if dhcp_clients is not None else [
             {"interface": "ether1", "status": "bound",
              "gateway": "41.90.1.1", "address": "41.90.1.20/24"},
@@ -106,6 +108,8 @@ class FakeLBAPI(MikroTikAPI):
             "/ip/address/print": self.ip_addresses,
             "/ip/arp/print": self.arp,
             "/ip/dhcp-server/lease/print": self.leases,
+            "/interface/sstp-client/print": self.sstp_clients,
+            "/interface/l2tp-client/print": [],
         }
         if self.ros6 and command.startswith(("/routing/table", "/interface/wireguard")):
             return {"error": "no such command prefix"}
@@ -171,6 +175,10 @@ class FakeLBAPI(MikroTikAPI):
             self.bridge_ports.append(row)
         elif command == "/interface/bridge/port/remove":
             self._remove_by_id(self.bridge_ports, args.get(".id"))
+        elif command == "/interface/list/member/add":
+            self.list_members.append(row)
+        elif command == "/interface/list/member/remove":
+            self._remove_by_id(self.list_members, args.get(".id"))
         elif command == "/ip/dhcp-client/remove":
             self._remove_by_id(self.dhcp_clients, args.get(".id"))
         elif command == "/ip/firewall/filter/set":
@@ -556,7 +564,7 @@ def test_convert_sets_up_dhcp_probe_and_checked_default():
     dhcp_adds = [a for cmd, a in api.commands if cmd == "/ip/dhcp-client/add"]
     assert dhcp_adds == [{
         "interface": "ether2", "add-default-route": "no",
-        "use-peer-dns": "no", "use-peer-ntp": "no",
+        "use-peer-dns": "no", "use-peer-ntp": "no", "disabled": "no",
         "comment": "ISP_BILLING_WAN2",
     }]
     route_adds = [a for cmd, a in api.commands if cmd == "/ip/route/add"]
