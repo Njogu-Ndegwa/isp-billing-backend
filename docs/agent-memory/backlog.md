@@ -126,6 +126,18 @@ Project-level items that should survive across agent sessions.
 - Why it matters: admin-initiated lead conversions never receive the onboarding welcome/router-setup offer. This was a deliberate scope boundary ("signup" = self-service), but may be desired.
 - Proposed next step: if welcome-on-conversion is wanted, call `reseller_welcome.queue_reseller_welcome` + schedule `sms_dispatch.dispatch_admin_sms_messages` in `convert_lead`, reusing the same non-fatal, commit-before-dispatch pattern as `register_user_api`.
 
+### Customer Lifecycle SMS — Follow-ups
+
+- Status: planned
+- Context: customer payment receipts, the PPPoE welcome, and reseller-editable wording shipped in `app/services/customer_notifications.py` + `customer_sms_templates.py` (receipts come from a 20 s sweep over recent `customer_payments`, not a hook in each payment path).
+- Gaps, roughly in value order:
+  1. No delivery reports: `SmsMessageStatus.DELIVERED` is never set. Africa's Talking and TalkSASA both offer DLR callbacks.
+  2. `activate-pppoe` (`customer_routes.py`) extends expiry without creating a `CustomerPayment`, so a manual activation sends no receipt.
+  3. At-expiry SMS is lost for good if the credit deduction fails at that moment (the customer is already INACTIVE and never re-selected).
+  4. No quiet hours: reminders can go out at 3 a.m. EAT. Receipts should stay immediate.
+  5. No per-customer opt-out and no Swahili/French default wording (resellers can write their own).
+  6. Reseller alert when SMS credits run low, so automatic messages don't stop silently.
+
 ## Admin Dashboard Metrics
 
 ### No Subscription Status History (ARPU / Churn / Active Resellers Denominators)

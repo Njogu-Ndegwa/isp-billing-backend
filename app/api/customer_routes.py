@@ -178,6 +178,13 @@ async def register_customer_api(
             f"by user {user.id}"
         )
 
+        if customer.pppoe_username:
+            # Opt-in login-details SMS; checks the reseller's settings itself
+            # and runs after this request's transaction is committed.
+            from app.services.customer_notifications import spawn_welcome_message
+
+            spawn_welcome_message(customer.id)
+
         return {
             "id": customer.id,
             "name": customer.name,

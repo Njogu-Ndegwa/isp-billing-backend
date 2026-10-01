@@ -192,6 +192,10 @@ from app.services.router_reachability_probe import (
     probe_router_reachability,
 )
 from app.services.customer_expiry_notifications import scan_customer_expiry_reminders
+from app.services.customer_notifications import (
+    RECEIPT_SWEEP_SECONDS,
+    send_payment_receipts_background,
+)
 from app.services.hotspot_provisioning import retry_pending_hotspot_provisioning_background
 from app.services.pppoe_provisioning import retry_pending_pppoe_provisioning_background
 from app.services.mpesa_transactions import reconcile_pending_mpesa_transactions
@@ -2238,6 +2242,15 @@ async def run_messaging_migrations():
             "ALTER TABLE messaging_settings ADD COLUMN IF NOT EXISTS "
             "allow_reseller_gateways BOOLEAN NOT NULL DEFAULT false"
         ))
+        # Customer event SMS (payment receipts, PPPoE welcome) and the
+        # reseller-editable wording for every automatic customer message.
+        await conn.execute(text(
+            "ALTER TABLE customer_expiry_sms_settings "
+            "ADD COLUMN IF NOT EXISTS payment_receipt_enabled BOOLEAN NOT NULL DEFAULT false, "
+            "ADD COLUMN IF NOT EXISTS receipt_include_hotspot BOOLEAN NOT NULL DEFAULT false, "
+            "ADD COLUMN IF NOT EXISTS welcome_enabled BOOLEAN NOT NULL DEFAULT false, "
+            "ADD COLUMN IF NOT EXISTS custom_templates JSON NULL"
+        ))
         # --- Per-tenant gateway accounts -------------------------------
         # A reseller on their own SMS gateway gets a row in
         # messaging_provider_accounts; user_id NULL is the platform default.
@@ -3344,6 +3357,16 @@ async def startup_event():
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=120,
+    )
+    scheduler.add_job(
+        send_payment_receipts_background,
+        trigger=IntervalTrigger(seconds=RECEIPT_SWEEP_SECONDS),
+        id='customer_payment_receipts',
+        name='Send opt-in customer payment receipt SMS',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
     scheduler.add_job(
         attribute_recent_payment_ports_background,
