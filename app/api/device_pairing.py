@@ -31,6 +31,7 @@ from app.db.models import (
     MpesaTransactionStatus,
     PaymentMethod,
     Plan,
+    PlanType,
     ProvisioningAttemptEntrypoint,
     ProvisioningAttemptSource,
     Router,
@@ -50,7 +51,7 @@ from app.services.hotspot_provisioning import (
     serialize_delivery_attempt,
 )
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
-from app.services.plan_cache import plan_model_allows_router
+from app.services.plan_cache import FREE_TRIAL_NOT_PURCHASABLE, plan_model_allows_router
 from app.services.reseller_payments import record_customer_payment
 from app.services.subscription_sharing import (
     active_shared_device_count,
@@ -232,6 +233,8 @@ async def _validate_router_and_plan(db: AsyncSession, router_id: int, plan_id: i
         raise HTTPException(status_code=400, detail="Plan does not belong to this router's owner")
     if not plan_model_allows_router(plan, router_obj.id):
         raise HTTPException(status_code=400, detail="Selected plan is not available on this router")
+    if plan.plan_type == PlanType.FREE_TRIAL:
+        raise HTTPException(status_code=400, detail=FREE_TRIAL_NOT_PURCHASABLE)
     if plan.connection_type != ConnectionType.HOTSPOT:
         raise HTTPException(status_code=400, detail="Selected plan is not a hotspot plan")
 

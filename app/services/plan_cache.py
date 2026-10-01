@@ -60,6 +60,11 @@ def plan_model_allows_router(plan, router_id: Optional[int]) -> bool:
     return plan_allows_router({"router_ids": getattr(plan, "router_ids", None)}, router_id)
 
 
+# Paid purchase endpoints reject free-trial plans with this message; the
+# portal claims them through /api/public/free-trial/claim instead.
+FREE_TRIAL_NOT_PURCHASABLE = "This is a free trial plan. Use the free trial button to claim it."
+
+
 def filter_plans_for_router(plans: List[Dict], router_id: Optional[int]) -> List[Dict]:
     """Drop plans that are scoped away from this router.
 
@@ -234,6 +239,7 @@ def _serialize_plan(plan: Plan) -> Dict:
         "max_shared_users": int(plan.max_shared_users or 1),
         "sharing_enabled": int(plan.max_shared_users or 1) > 1,
         "router_ids": normalize_router_ids(getattr(plan, "router_ids", None)),
+        "trial_once_per_customer": bool(getattr(plan, "trial_once_per_customer", True)),
     }
 
 async def get_plans_cached(

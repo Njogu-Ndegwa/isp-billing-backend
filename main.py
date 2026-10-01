@@ -2396,6 +2396,39 @@ async def run_outage_compensation_migrations():
     logger.info("Outage compensation migrations complete")
 
 
+async def run_free_trial_migrations():
+    """Free-trial plans: the plan_type label, the once-per-customer flag, the
+    claims table the once-only rule reads, and the provisioning entrypoint
+    label. Idempotent: safe to run on every startup."""
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        # Native enums never gain a label implicitly (see 'timeout' on
+        # b2btransactionstatus, 2026-07-18).
+        await conn.execute(sa_text(
+            "ALTER TYPE plantype ADD VALUE IF NOT EXISTS 'free_trial'"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TYPE provisioningattemptentrypoint ADD VALUE IF NOT EXISTS 'free_trial'"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE plans "
+            "ADD COLUMN IF NOT EXISTS trial_once_per_customer BOOLEAN NOT NULL DEFAULT true"
+        ))
+
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+        from app.db.models import FreeTrialClaim
+        if FreeTrialClaim.__tablename__ not in tables:
+            await conn.run_sync(
+                lambda c: Base.metadata.create_all(c, tables=[FreeTrialClaim.__table__])
+            )
+            logger.info("Free trial migration: created free_trial_claims")
+    logger.info("Free trial migrations complete")
+
+
 async def run_payment_port_attribution_migrations():
     """Add customer_payments.port_name (varchar, nullable) so revenue can be
     attributed to the router port the paying customer's device was on around
@@ -3113,6 +3146,12 @@ async def startup_event():
         logger.info("Standard-runtime migration completed successfully")
     except Exception as e:
         logger.error(f"Standard-runtime migration failed (non-fatal): {e}")
+
+    try:
+        await run_free_trial_migrations()
+        logger.info("Free trial migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Free trial migration failed (non-fatal): {e}")
 
     try:
         await run_payment_port_attribution_migrations()
