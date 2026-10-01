@@ -12,6 +12,7 @@ from app.db.models import (
     CustomerPayment,
     CustomerRating,
     CustomerStatus,
+    CustomerUsageBucket,
     DevicePairing,
     MpesaTransaction,
     MtnMomoTransaction,
@@ -210,6 +211,12 @@ async def test_force_delete_router_preserves_customer_money_history_and_cleans_d
             router_id=router.id,
             next_poll_at=datetime.utcnow(),
         ),
+        CustomerUsageBucket(
+            customer_id=customer.id,
+            router_id=router.id,
+            bucket_start=datetime.utcnow(),
+            download_bytes=30,
+        ),
         Payment(customer_id=customer.id, amount=100, days_paid_for=1),
         CustomerPayment(
             customer_id=customer.id,
@@ -288,6 +295,11 @@ async def test_force_delete_router_preserves_customer_money_history_and_cleans_d
     assert preserved_log.customer_id == customer.id
     assert preserved_log.router_id is None
     assert preserved_log.attempt_id is None
+
+    preserved_usage = (await db.execute(select(CustomerUsageBucket))).scalar_one()
+    assert preserved_usage.customer_id == customer.id
+    assert preserved_usage.router_id is None
+    assert preserved_usage.download_bytes == 30
 
     available_after = await db.get(Voucher, available_voucher.id)
     redeemed_after = await db.get(Voucher, redeemed_voucher.id)
