@@ -184,11 +184,15 @@
  ],
  "customer_expiry_sms_settings": [
   "created_at",
+  "custom_templates",
   "enabled",
+  "payment_receipt_enabled",
+  "receipt_include_hotspot",
   "reminder_offsets_minutes",
   "send_at_expiry",
   "updated_at",
-  "user_id"
+  "user_id",
+  "welcome_enabled"
  ],
  "customer_payments": [
   "amount",

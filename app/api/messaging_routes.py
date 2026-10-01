@@ -19,6 +19,8 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import customer_expiry_notifications, sms_credits, sms_dispatch
+from app.services import customer_sms_templates as sms_templates
+from app.services.markets import reseller_market
 from app.services.messaging import accounts as provider_accounts
 from app.services.messaging import count_segments, resolve_sender_id
 from app.services.mpesa import initiate_stk_push_direct
@@ -144,6 +146,117 @@ async def update_expiry_settings(body: ExpirySettingsIn,
     await db.commit()
     await db.refresh(row)
     return _expiry_settings_payload(row)
+
+
+# ---- Customer event messages and message wording --------------------------
+
+class CustomerEventSettingsIn(BaseModel):
+    payment_receipt_enabled: bool
+    receipt_include_hotspot: bool
+    welcome_enabled: bool
+    # {event: text}; null or "" restores the built-in wording.
+    templates: dict[str, Optional[str]] = Field(default_factory=dict)
+
+
+class TemplatePreviewIn(BaseModel):
+    event: str
+    body: Optional[str] = None
+
+
+def _customer_event_payload(row: CustomerExpirySmsSettings) -> dict:
+    saved = row.custom_templates if isinstance(row.custom_templates, dict) else {}
+    return {
+        "payment_receipt_enabled": bool(row.payment_receipt_enabled),
+        "receipt_include_hotspot": bool(row.receipt_include_hotspot),
+        "welcome_enabled": bool(row.welcome_enabled),
+        "templates": {
+            event: sms_templates.custom_template(saved, event)
+            for event in sms_templates.EVENTS
+        },
+        "defaults": dict(sms_templates.DEFAULT_TEMPLATE_TEXT),
+        "placeholders": {
+            event: list(names)
+            for event, names in sms_templates.EVENT_PLACEHOLDERS.items()
+        },
+        "max_length": sms_templates.MAX_TEMPLATE_LENGTH,
+    }
+
+
+@router.get("/api/messaging/customer-events")
+async def get_customer_event_settings(db: AsyncSession = Depends(get_db),
+                                      token: str = Depends(verify_token)):
+    user = await _require_reseller(token, db)
+    row = await db.get(CustomerExpirySmsSettings, user.id)
+    if row is None:
+        # Not persisted: a GET must not create settings rows.
+        row = CustomerExpirySmsSettings(
+            user_id=user.id,
+            payment_receipt_enabled=False,
+            receipt_include_hotspot=False,
+            welcome_enabled=False,
+            custom_templates=None,
+        )
+    return _customer_event_payload(row)
+
+
+@router.put("/api/messaging/customer-events")
+async def update_customer_event_settings(body: CustomerEventSettingsIn,
+                                         db: AsyncSession = Depends(get_db),
+                                         token: str = Depends(verify_token)):
+    user = await _require_reseller(token, db)
+    cleaned: dict[str, str] = {}
+    for event, text in body.templates.items():
+        if event not in sms_templates.EVENT_PLACEHOLDERS:
+            raise HTTPException(status_code=400, detail=f"Unknown message type '{event}'")
+        if text is None or not text.strip():
+            continue
+        error = sms_templates.validate_template(event, text)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+        cleaned[event] = text.strip()
+
+    row = await db.get(CustomerExpirySmsSettings, user.id)
+    if row is None:
+        row = CustomerExpirySmsSettings(
+            user_id=user.id,
+            reminder_offsets_minutes=list(
+                customer_expiry_notifications.DEFAULT_REMINDER_OFFSETS_MINUTES
+            ),
+        )
+        db.add(row)
+    row.payment_receipt_enabled = body.payment_receipt_enabled
+    row.receipt_include_hotspot = body.receipt_include_hotspot
+    row.welcome_enabled = body.welcome_enabled
+    row.custom_templates = cleaned or None
+    await db.commit()
+    await db.refresh(row)
+    return _customer_event_payload(row)
+
+
+@router.post("/api/messaging/customer-events/preview")
+async def preview_customer_event_message(body: TemplatePreviewIn,
+                                         db: AsyncSession = Depends(get_db),
+                                         token: str = Depends(verify_token)):
+    """Render a message with sample customer data, as the customer would see it."""
+    user = await _require_reseller(token, db)
+    if body.event not in sms_templates.EVENT_PLACEHOLDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown message type '{body.event}'")
+    custom = (body.body or "").strip()
+    if custom:
+        error = sms_templates.validate_template(body.event, custom)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+
+    market = reseller_market(user)
+    context = {**sms_templates.SAMPLE_CONTEXT, "brand": sms_templates.brand_name(user)}
+    context["amount"] = sms_templates.format_amount(1500, market.currency)
+    if market.code != "KE":
+        context["paybill"] = ""
+        context["account"] = ""
+    text = sms_templates.render(
+        body.event, context, {body.event: custom} if custom else None
+    )
+    return {"text": text, "characters": len(text), "segments": count_segments(text)}
 
 
 class PurchaseRequest(BaseModel):

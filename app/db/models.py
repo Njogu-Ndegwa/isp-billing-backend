@@ -2149,12 +2149,30 @@ class SmsCreditAccount(Base):
 
 
 class CustomerExpirySmsSettings(Base):
-    """A reseller's opt-in schedule for automatic customer expiry messages."""
+    """A reseller's automatic customer SMS settings.
+
+    Originally only the expiry schedule (`enabled`, `reminder_offsets_minutes`,
+    `send_at_expiry`); it now also holds the event messages. Each event is an
+    independent opt-in because every message spends the reseller's credits.
+    """
     __tablename__ = "customer_expiry_sms_settings"
     user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
     enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     reminder_offsets_minutes = Column(JSON, nullable=False, default=lambda: [1440])
     send_at_expiry = Column(Boolean, nullable=False, default=True, server_default="true")
+    # "Payment received, active until ..." after every recorded payment.
+    payment_receipt_enabled = Column(Boolean, nullable=False, default=False,
+                                     server_default="false")
+    # Hotspot sales are small and frequent, so receipts for them are a second
+    # opt-in; PPPoE and static customers get one whenever receipts are on.
+    receipt_include_hotspot = Column(Boolean, nullable=False, default=False,
+                                     server_default="false")
+    # Login details to a new PPPoE customer created from the dashboard.
+    welcome_enabled = Column(Boolean, nullable=False, default=False,
+                             server_default="false")
+    # {event: text} reseller wording; a missing event uses the built-in default
+    # (app/services/customer_sms_templates.py).
+    custom_templates = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

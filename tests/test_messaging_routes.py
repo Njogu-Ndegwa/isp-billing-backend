@@ -310,3 +310,72 @@ async def test_send_excludes_then_charges_remaining(db, client, monkeypatch):
     assert resp.json()["credits_reserved"] == 1  # 1 segment * 1 recipient
     # The kept customer is the only charged recipient; confirm the binding is used.
     assert keep.id != drop.id
+
+
+@pytest.mark.asyncio
+async def test_customer_event_settings_default_update_and_preview(db, client, monkeypatch):
+    reseller = await make_reseller(db, organization_name="Twork Links")
+    _auth_as(monkeypatch, reseller)
+
+    default = await client.get("/api/messaging/customer-events")
+    assert default.status_code == 200
+    body = default.json()
+    assert body["payment_receipt_enabled"] is False
+    assert body["welcome_enabled"] is False
+    assert body["templates"] == {
+        "payment_receipt": None, "welcome": None, "reminder": None, "expiry": None,
+    }
+    assert "{amount}" in body["defaults"]["payment_receipt"]
+    assert "password" in body["placeholders"]["welcome"]
+    # A GET never creates the settings row.
+    assert await db.get(CustomerExpirySmsSettings, reseller.id) is None
+
+    updated = await client.put("/api/messaging/customer-events", json={
+        "payment_receipt_enabled": True,
+        "receipt_include_hotspot": False,
+        "welcome_enabled": True,
+        "templates": {"payment_receipt": "  Got {amount}, thanks {name}!  ", "expiry": ""},
+    })
+    assert updated.status_code == 200
+    assert updated.json()["templates"]["payment_receipt"] == "Got {amount}, thanks {name}!"
+    assert updated.json()["templates"]["expiry"] is None
+
+    # The expiry schedule endpoint keeps working alongside, untouched.
+    expiry = await client.get("/api/messaging/expiry-settings")
+    assert expiry.json()["enabled"] is False
+
+    preview = await client.post("/api/messaging/customer-events/preview", json={
+        "event": "payment_receipt", "body": "Got {amount}, thanks {name}!",
+    })
+    assert preview.status_code == 200
+    assert preview.json() == {
+        "text": "Got KES 1,500, thanks Jane!", "characters": 27, "segments": 1,
+    }
+
+    default_preview = await client.post("/api/messaging/customer-events/preview", json={
+        "event": "welcome",
+    })
+    assert default_preview.json()["text"].startswith("Welcome to Twork Links!")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("templates", [
+    {"expiry": "Paid {amount}"},       # receipt-only placeholder
+    {"welcome": "Hi {nmae}"},          # typo
+    {"birthday": "Happy birthday"},    # unknown event
+    {"reminder": "x" * 481},           # too long
+])
+async def test_customer_event_settings_reject_bad_templates(
+    db, client, monkeypatch, templates,
+):
+    reseller = await make_reseller(db)
+    _auth_as(monkeypatch, reseller)
+
+    response = await client.put("/api/messaging/customer-events", json={
+        "payment_receipt_enabled": True,
+        "receipt_include_hotspot": False,
+        "welcome_enabled": False,
+        "templates": templates,
+    })
+
+    assert response.status_code == 400

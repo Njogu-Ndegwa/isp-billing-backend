@@ -8,7 +8,11 @@ from app.db.models import (
     ConnectionType,
     CustomerExpirySmsSettings,
     CustomerStatus,
+    DurationUnit,
+    MessagingProviderAccount,
     MessagingSettings,
+    ResellerPaymentMethod,
+    ResellerPaymentMethodType,
     SmsCampaign,
     SmsCreditAccount,
     SmsMessage,
@@ -471,3 +475,120 @@ async def test_pppoe_cleanup_notifies_only_after_router_enforcement(
     assert customer.status == CustomerStatus.INACTIVE
     assert notified == [customer.id]
     assert dispatched == [99]
+
+
+async def _reminder_reseller(db, *, credits=5, offsets=(1440,)):
+    reseller = await make_reseller(db, organization_name="Short Plan ISP")
+    await make_sms_account(db, reseller, balance=credits)
+    if await db.get(MessagingSettings, 1) is None:
+        db.add(MessagingSettings(id=1, enabled=True))
+    db.add(CustomerExpirySmsSettings(
+        user_id=reseller.id,
+        enabled=True,
+        reminder_offsets_minutes=list(offsets),
+        send_at_expiry=True,
+    ))
+    await db.commit()
+    return reseller
+
+
+async def test_reminder_never_fires_in_the_first_half_of_a_short_plan(
+    db, session_factory,
+):
+    """A 1-day reminder on a 1-day plan used to fire the moment it was bought."""
+    now = datetime.utcnow().replace(microsecond=0)
+    reseller = await _reminder_reseller(db, offsets=(1440, 360))
+    plan = await make_plan(
+        db, reseller, connection_type=ConnectionType.HOTSPOT,
+        duration_value=1, duration_unit=DurationUnit.DAYS,
+    )
+    customer = await make_customer(
+        db, reseller, plan, status=CustomerStatus.ACTIVE,
+        expiry=now + timedelta(hours=5), phone="254700000111",
+    )
+
+    groups = await customer_expiry_notifications.collect_due_reminder_groups(
+        session_factory=session_factory, now=now,
+    )
+
+    assert groups == {(reseller.id, 360): [customer.id]}
+
+
+async def test_reminder_fits_plan_rule():
+    fits = customer_expiry_notifications.reminder_fits_plan
+    assert fits(30, 60) is True          # 30 min before a 1-hour plan ends
+    assert fits(1440, 60) is False       # 1 day before a 1-hour plan ends
+    assert fits(1440, 1440) is False     # 1 day before a 1-day plan ends
+    assert fits(10080, 43200) is True    # 7 days before a 30-day plan ends
+    assert fits(1440, None) is True      # unknown plan length
+
+
+async def test_own_gateway_reseller_with_no_credits_still_gets_reminders(
+    db, session_factory,
+):
+    now = datetime.utcnow().replace(microsecond=0)
+    reseller = await _reminder_reseller(db, credits=0, offsets=(120,))
+    db.add(MessagingProviderAccount(
+        user_id=reseller.id, provider="talksasa", label="Own", credentials={},
+        is_default=True, is_active=True,
+    ))
+    await db.commit()
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    customer = await make_customer(
+        db, reseller, plan, status=CustomerStatus.ACTIVE,
+        expiry=now + timedelta(minutes=90), pppoe_username="own-gw",
+        phone="254700000222",
+    )
+
+    groups = await customer_expiry_notifications.collect_due_reminder_groups(
+        session_factory=session_factory, now=now,
+    )
+
+    assert groups == {(reseller.id, 120): [customer.id]}
+
+
+async def test_expiry_uses_reseller_wording_and_their_own_paybill(
+    db, session_factory,
+):
+    reseller, router, customer = await _seed_expired_pppoe(db)
+    method = ResellerPaymentMethod(
+        user_id=reseller.id,
+        method_type=ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
+        label="Own paybill",
+        is_active=True,
+        mpesa_shortcode="555111",
+        c2b_registered_at=datetime.utcnow(),
+    )
+    db.add(method)
+    await db.commit()
+    router.payment_method_id = method.id
+    preferences = await db.get(CustomerExpirySmsSettings, reseller.id)
+    preferences.custom_templates = {
+        "expiry": "{name}, your {plan} ended. Paybill {paybill} acc {account}.",
+    }
+    await db.commit()
+
+    campaign_ids = await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [customer.id], session_factory=session_factory
+    )
+
+    message = (
+        await db.execute(select(SmsMessage).where(SmsMessage.campaign_id == campaign_ids[0]))
+    ).scalar_one()
+    assert message.body == "Joe, your Plan-30DAYS ended. Paybill 555111 acc 12345674."
+
+
+async def test_expiry_outside_kenya_has_no_mpesa_paybill(db, session_factory):
+    reseller, _, customer = await _seed_expired_pppoe(db)
+    reseller.market_code = "UG"
+    await db.commit()
+
+    campaign_ids = await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [customer.id], session_factory=session_factory
+    )
+
+    message = (
+        await db.execute(select(SmsMessage).where(SmsMessage.campaign_id == campaign_ids[0]))
+    ).scalar_one()
+    assert "Paybill" not in message.body
+    assert "Please renew" in message.body
