@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
 
 from app.config import settings
@@ -71,6 +71,13 @@ MAC_LOGIN_SHARED_USERS = "2"
 # Per reconcile run, paid devices stuck at the portal whose host entry is
 # cleared so RouterOS retries their MAC login.
 MAX_UNSTICK_PER_RECONCILE = 20
+# The reconcile works from a customer list read at the start of the sync run,
+# and a router can be reached minutes later. A customer whose expiry falls
+# inside this margin of "now" is never (re)provisioned from that list: router
+# 448, 2026-10-01, re-created a user 90 s after its expiry (the reaper removed
+# it again 30 s later; on a router without the reaper it would have lasted
+# until the next expiry cleanup).
+EXPIRY_SAFETY_MARGIN = timedelta(seconds=60)
 
 _MAC_NAME_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 _T_RE = re.compile(r"\|T:(\d{9,11})")
@@ -592,7 +599,8 @@ def reconcile_router(api, customers_data: List[Dict[str, Any]], now: Optional[fl
     now = time.time() if now is None else now
     summary: Dict[str, Any] = {
         "setup": None, "provisioned": 0, "already_ok": 0, "blocked_skipped": 0,
-        "on_bypass": 0, "orphans_removed": 0, "unstuck": 0, "exp_tagged": 0, "errors": [],
+        "on_bypass": 0, "orphans_removed": 0, "unstuck": 0, "exp_tagged": 0,
+        "expired_skipped": 0, "errors": [],
     }
     setup = ensure_router_setup(api)
     summary["setup"] = setup
@@ -645,6 +653,12 @@ def reconcile_router(api, customers_data: List[Dict[str, Any]], now: Optional[fl
     for mac, cust in wanted.items():
         if str(cust.get("fup_action") or "").lower() == "block":
             summary["blocked_skipped"] += 1
+            continue
+        expiry = cust.get("expiry")
+        if expiry is not None and expiry <= datetime.utcnow() + EXPIRY_SAFETY_MARGIN:
+            # Expired (or about to) since the list was read: leave it to the
+            # expiry cleanup and the reaper; never hand out more time.
+            summary["expired_skipped"] += 1
             continue
         if not cust.get("plan_speed"):
             continue
