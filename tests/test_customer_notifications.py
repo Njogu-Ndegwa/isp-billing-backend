@@ -253,9 +253,8 @@ async def test_welcome_sends_pppoe_login_and_reseller_paybill(db, session_factor
     assert again is None
     assert message.category == customer_notifications.WELCOME_CATEGORY
     assert message.body == (
-        "Welcome to Twork Links! Your internet login: Username jane_home, "
-        "Password x7Kp2mQa. To activate, pay via M-Pesa Paybill 777888, "
-        "Account 12345674."
+        "Welcome to Twork Links! Username: jane_home Password: x7Kp2mQa. "
+        "Pay via M-Pesa Paybill 777888, Account 12345674 to activate."
     )
 
 
@@ -281,7 +280,7 @@ async def test_non_kenyan_reseller_is_never_told_to_use_mpesa(db, session_factor
 
     [message] = await _messages(db)
     assert "M-Pesa" not in message.body
-    assert message.body.endswith("Password x7Kp2mQa.")
+    assert message.body.endswith("Password: x7Kp2mQa.")
 
 
 async def test_customers_with_placeholder_phones_are_skipped(db, session_factory):

@@ -50,9 +50,8 @@ DEFAULT_TEMPLATE_TEXT: dict[str, str] = {
         "Ref {reference}. - {brand}"
     ),
     EVENT_WELCOME: (
-        "Welcome to {brand}! Your internet login: Username {username}, "
-        "Password {password}. To activate, pay via M-Pesa Paybill {paybill}, "
-        "Account {account}."
+        "Welcome to {brand}! Username: {username} Password: {password}. "
+        "Pay via M-Pesa Paybill {paybill}, Account {account} to activate."
     ),
     EVENT_REMINDER: (
         "Reminder: Your internet expires soon. Pay via M-Pesa Paybill {paybill}, "
@@ -147,6 +146,9 @@ def brand_name(reseller) -> str:
     return name.strip()
 
 
+_PLACEHOLDER_NAMES = {"guest", "device", "customer", "user", "unknown"}
+
+
 def friendly_name(raw: str | None) -> str:
     """First name for a greeting, or 'Customer' when the name is a placeholder.
 
@@ -155,6 +157,10 @@ def friendly_name(raw: str | None) -> str:
     """
     first = (raw or "").strip().split(" ")[0] if raw else ""
     if not first or ":" in first or sum(ch.isdigit() for ch in first) >= 4:
+        return "Customer"
+    # The captive portal names self-registered customers "Guest 5364" or
+    # "Device 4A:3F:F1"; those are labels, not names.
+    if first.lower() in _PLACEHOLDER_NAMES:
         return "Customer"
     return first
 
@@ -248,13 +254,14 @@ def default_receipt(context: dict[str, str]) -> str:
 
 
 def default_welcome(context: dict[str, str]) -> str:
+    # Kept to one SMS (160 chars) for typical brand and username lengths.
     text = (
-        f"Welcome to {context['brand']}! Your internet login: "
-        f"Username {context['username']}, Password {context['password']}."
+        f"Welcome to {context['brand']}! Username: {context['username']} "
+        f"Password: {context['password']}."
     )
     payment = _payment_instruction(context)
     if payment:
-        text += f" To activate, {payment[0].lower()}{payment[1:]}."
+        text += f" {payment} to activate."
     return text
 
 
