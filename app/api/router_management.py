@@ -14,6 +14,7 @@ from app.db.models import (
     BandwidthSnapshot,
     Customer,
     CustomerStatus,
+    CustomerUsageBucket,
     DevicePairing,
     ProvisioningAttempt,
     ProvisioningLog,
@@ -2084,6 +2085,14 @@ async def delete_router(
         await db.execute(
             sql_delete(RouterUsageBucket)
             .where(RouterUsageBucket.router_id == router_id)
+        )
+        # Customer usage history outlives the router: unlink it, as the
+        # customers themselves are unlinked above. Its FK has no ON DELETE
+        # action, so leaving it blocked every router that had usage data.
+        await db.execute(
+            update(CustomerUsageBucket)
+            .where(CustomerUsageBucket.router_id == router_id)
+            .values(router_id=None)
         )
         await db.execute(
             sql_delete(UsageCapWatchState)
