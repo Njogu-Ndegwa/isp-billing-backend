@@ -76,3 +76,17 @@ periods that fall back under cap while still open.
 - `usage_counter_delta`'s "any decrease = reset" rule is the amplifier. Any
   future source that can interleave two counters under one key will repeat
   this. Keep one monotonic counter per row.
+
+## Follow-up 2026-10-02: guard misread unit-less plan speeds
+
+The first line-rate guard parsed `plan.speed` itself and read a bare number as
+bit/s, so `5/5`, `10`, `15`, `5mbps` plans got an ~8 MB ceiling per sample.
+From the #159 deploy (2026-09-29 19:05 UTC) it clipped genuine usage on those
+plans (2,664 clamp warnings in 30 h). The guard now reads speeds through
+provisioning's own `_normalize_mikrotik_rate_part` (bare number = Mbps;
+unreadable = guard off). The clipped bytes are not recoverable: the counter
+baselines moved on.
+
+Lesson: never write a second parser for a field the app already interprets.
+Any historic-data repair must use the same parser too. A first SQL dry run with
+the naive parse flagged 7,471 "impossible" hours, most of them false.

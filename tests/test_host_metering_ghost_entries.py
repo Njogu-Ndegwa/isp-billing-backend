@@ -136,11 +136,40 @@ def test_plan_line_rate_parsing():
 
     assert plan_line_rate_bps(P("10M/10M")) == 10_000_000
     assert plan_line_rate_bps(P("5M/20M")) == 20_000_000
-    assert plan_line_rate_bps(P("512k/1M 2M/4M")) == 1_000_000
     assert plan_line_rate_bps(P("1G")) == 1_000_000_000
+    assert plan_line_rate_bps(P("5000000/5000000")) == 5_000_000
+    # Unit-less speeds are Mbps, exactly as provisioning reads them — these
+    # were read as bit/s and clipped real usage (2026-09-29..10-02).
+    assert plan_line_rate_bps(P("5/5")) == 5_000_000
+    assert plan_line_rate_bps(P("10")) == 10_000_000
+    assert plan_line_rate_bps(P("15")) == 15_000_000
+    assert plan_line_rate_bps(P("5mbps")) == 5_000_000
+    assert plan_line_rate_bps(P("12Mbps")) == 12_000_000
+    assert plan_line_rate_bps(P("3m/3m")) == 3_000_000
+    assert plan_line_rate_bps(P("5/2 Mbps")) == 5_000_000
+    assert plan_line_rate_bps(P("10M/10")) == 10_000_000
+    # Unreadable -> guard off, never a guessed-low ceiling.
+    assert plan_line_rate_bps(P("5mps/3mps")) == 0
+    assert plan_line_rate_bps(P("Trial")) == 0
     assert plan_line_rate_bps(P("")) == 0
     assert plan_line_rate_bps(None) == 0
     assert line_rate_ceiling_bytes(P("garbage"), 60) is None
+
+
+@pytest.mark.asyncio
+async def test_genuine_traffic_on_a_unitless_plan_is_not_clamped(db, session_factory):
+    # 15 MB in 61 s on a "5/5" plan is 2 Mbps — real, and was being clipped to 8 MB.
+    _, plan, customer = await _setup(db, speed="5/5")
+    t0 = datetime.utcnow()
+    async with session_factory() as s:
+        await record_queue_usage_sample(s, customer=customer, plan=plan, queue_key="k",
+                                        upload_bytes=0, download_bytes=0, now=t0)
+        update = await record_queue_usage_sample(
+            s, customer=customer, plan=plan, queue_key="k",
+            upload_bytes=546_534, download_bytes=15_327_901, now=t0 + timedelta(seconds=61),
+        )
+        await s.commit()
+    assert update.delta_download_bytes == 15_327_901
 
 
 def test_live_view_shows_the_real_entry_not_the_ghost():
