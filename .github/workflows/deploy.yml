@@ -140,11 +140,14 @@ jobs:
           # event), so this proves dependencies install and resolve and the app
           # imports, without touching the DB, routers or customers.
           # (`timeout` cannot exec the dc shell function, hence the long form.)
+          # </dev/null is load-bearing: this script reaches the host as ssh's
+          # stdin, and `compose run` reads stdin — without it the smoke test
+          # swallows steps 8-9 and the job still reports success.
           if ! timeout 180 docker compose --env-file .env.hetzner -f docker-compose.hetzner.yml run --rm --no-deps -T \
                 -e SHADOW_MODE=true -e RUN_SCHEDULER=false -e SCHEDULER_ENABLED=false \
                 -e SMS_DISPATCH_ENABLED=false -e MPESA_B2B_DAILY_PAYOUT_ENABLED=false \
                 -e FEEDBACK_AI_ENABLED=false \
-                --entrypoint sh web -c 'pip check && python -c "import main; print(\"import OK:\", len(main.app.routes), \"routes\")"'; then
+                --entrypoint sh web -c 'pip check && python -c "import main; print(\"import OK:\", len(main.app.routes), \"routes\")"' </dev/null; then
             echo "ERROR: new image failed the smoke test — the live container was NOT touched"
             if [ "$HAVE_LAST_GOOD" -eq 1 ]; then
               # Point the tag back so a later manual `compose up` cannot pick up the bad build.
