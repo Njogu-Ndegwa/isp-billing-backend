@@ -3,11 +3,7 @@ fastapi
 uvicorn[standard]
 
 # Database and ORM
-# Pinned: SQLAlchemy 2.1 stopped installing greenlet, which the asyncio engine
-# needs; the unpinned --no-cache build pulled 2.1.2 and the app crash-looped on
-# import (2026-10-02). 2.0.54 + greenlet 3.5.6 is what prod ran until then.
-sqlalchemy[asyncio]==2.0.54
-greenlet==3.5.6
+sqlalchemy
 asyncpg
 alembic
 
