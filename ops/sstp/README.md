@@ -53,8 +53,8 @@ Facts behind the config:
   otherwise that address only exists on the L2TP interface.
 - On a router moved by hand, the AWS primary L2TP (`l2tp-aws`) may stay
   configured as a fallback. It can hold the same `10.0.X.Y` as `lo-mgmt`
-  without trouble; this was tested. Routers provisioned new with
-  `PROVISION_MGMT_TO_HETZNER=true` get SSTP only (one management tunnel).
+  without trouble; this was tested. Newly provisioned RouterOS 6 routers get
+  SSTP only (one management tunnel, no L2TP).
 - Only `ca.crt` is public. Never commit or copy `ca.key`, `server.key`,
   chap-secrets, or any `*.password` file. `create-cert.sh` refuses to replace
   an existing CA, because a new CA would break every router that trusts the
@@ -63,11 +63,16 @@ Facts behind the config:
 ## Moving an existing router
 
 Use the Claude Code skill **`migrate-router-to-sstp`** (runbook plus scripts).
-It covers ROS version checks, sta## New routers (provisioning)
+It covers ROS version checks, staging, the switch with automatic revert,
+pinning the loopback, verification, setting `routers.management_tunnel='sstp'`,
+and rollback.
 
-When `PROVISION_MGMT_TO_HETZNER=true`, a new RouterOS 6 token (`vpn_type=l2tp`)
-gets SSTP as its **only** management tunnel (RouterOS 7 tokens get WireGuard
-`wg-hz` to wg2 instead). For a v6 token provisioning:
+## New routers (provisioning)
+
+`PROVISION_MGMT_TO_HETZNER` is **on by default** (since 2026-10-02): a new
+RouterOS 6 token (`vpn_type=l2tp`) gets SSTP as its **only** management tunnel
+(RouterOS 7 tokens get WireGuard `wg-hz` to wg2 instead). Neither touches AWS
+and no RouterOS 6 router gets L2TP. For a v6 token provisioning:
 
 1. Registers `sstp-<identity>` with a random 24-character password and
    `10.251.X.Y` through the insurance manager's `POST /add-sstp-peer`. That
@@ -83,4 +88,7 @@ gets SSTP as its **only** management tunnel (RouterOS 7 tokens get WireGuard
    the filter table.
 3. On `/complete`, sets `routers.management_tunnel='sstp'`.
 
-With the flag off, token creation and the script are byte-for-byte unchanged.
+Setting `PROVISION_MGMT_TO_HETZNER=false` is a rollback lever only: it brings
+back the old layout (AWS primary + Hetzner standby, L2TP/IPsec on v6),
+byte-for-byte as before. Tokens already issued keep the tunnel they were
+issued with whichever way the flag is set.

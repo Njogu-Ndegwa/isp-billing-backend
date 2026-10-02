@@ -1689,7 +1689,10 @@ async def create_provisioning_token(
     is_routerboard: bool = False,
 ) -> ProvisioningToken:
     """
-    Full provisioning flow supporting both WireGuard (v7) and L2TP/IPsec (v6):
+    By default (PROVISION_MGMT_TO_HETZNER) the token gets one management
+    tunnel, to Hetzner: SSTP on v6, WireGuard wg-hz on v7 -- see
+    _create_hetzner_provisioning_token. With the flag off (rollback only),
+    the legacy flow below runs, AWS primary + Hetzner standby, L2TP on v6:
     1. Auto-generate router name and identity
     2. Generate VPN credentials (WG keypair or L2TP user/pass)
     3. Allocate next available VPN IP from the correct range
