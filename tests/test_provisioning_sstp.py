@@ -288,6 +288,18 @@ async def test_flag_off_l2tp_token_has_no_sstp(db, monkeypatch):
     assert [c[0] for c in calls] == ["primary-l2tp", "backup-l2tp"]
 
 
+def test_new_routers_default_to_hetzner_and_sstp_on_ros6():
+    """Hetzner is production; new routers must not default to AWS / L2TP."""
+    from app.config import Settings
+
+    fields = Settings.model_fields
+    assert fields["PROVISION_MGMT_TO_HETZNER"].default is True
+    assert fields["PROVISION_MGMT_TO_HETZNER_ROS7"].default is True
+    assert fields["SSTP_SERVER"].default == "91.98.238.12:4443"
+    assert provisioning.hetzner_mgmt_tunnel_for("l2tp") == "sstp"
+    assert provisioning.hetzner_mgmt_tunnel_for("wireguard") == "wireguard"
+
+
 @pytest.mark.asyncio
 async def test_ros7_opt_out_still_gives_l2tp_tokens_sstp(db, monkeypatch):
     _settings(monkeypatch, enabled=True)

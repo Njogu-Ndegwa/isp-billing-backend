@@ -248,10 +248,12 @@ class Settings(BaseSettings):
     INSURANCE_L2TP_IPSEC_PSK: str = ""
     INSURANCE_MANAGER_TIMEOUT: int = 10
 
-    # Single management tunnel to Hetzner for NEW routers. Off by default: with
-    # the flag off, token creation and the generated .rsc are byte-for-byte
-    # what they were before (AWS primary + Hetzner insurance/standby). When on,
-    # a new token gets exactly ONE management tunnel, to the Hetzner server:
+    # Single management tunnel to Hetzner for NEW routers. On by default since
+    # 2026-10-02: Hetzner has been production since 2026-09-22 and the AWS box
+    # is a fenced standby, so new routers must not depend on it. Setting it to
+    # false brings back the old layout (AWS primary + Hetzner insurance/standby,
+    # L2TP/IPsec on RouterOS 6) -- a rollback lever only. When on, a new token
+    # gets exactly ONE management tunnel, to the Hetzner server:
     #   * RouterOS 7 (vpn_type="wireguard"): WireGuard `wg-hz` to the wg2
     #     manager at INSURANCE_WG_MANAGER_URL (endpoint
     #     INSURANCE_SERVER_PUBLIC_IP:INSURANCE_WG_PORT, address 10.251.X.Y).
@@ -262,7 +264,7 @@ class Settings(BaseSettings):
     # `lo-mgmt`; the host's route-sync steers 10.0.X.Y over the tunnel. The
     # decision is stored on the token (provisioning_tokens.management_tunnel),
     # so flipping the flag never changes a token that was already issued.
-    PROVISION_MGMT_TO_HETZNER: bool = False
+    PROVISION_MGMT_TO_HETZNER: bool = True
     # With the flag on, false keeps NEW RouterOS 7 tokens on AWS primary +
     # Hetzner insurance, so only RouterOS 6 moves (to SSTP). Some ISPs drop
     # Hetzner's replies (Router-1054's, 2026-09-30); a v7 router there would

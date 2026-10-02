@@ -23,6 +23,9 @@ def _token(vpn_type: str) -> ProvisioningToken:
 
 
 def _set_insurance_settings(monkeypatch):
+    # These tests cover the legacy AWS-primary + insurance layout, which is
+    # now only reachable with PROVISION_MGMT_TO_HETZNER turned off.
+    monkeypatch.setattr(provisioning.settings, "PROVISION_MGMT_TO_HETZNER", False)
     monkeypatch.setattr(provisioning.settings, "SERVER_PUBLIC_IP", "203.0.113.10")
     monkeypatch.setattr(provisioning.settings, "INSURANCE_WG_MANAGER_URL", "http://insurance-manager")
     monkeypatch.setattr(provisioning.settings, "INSURANCE_WG_MANAGER_SECRET", "insurance-secret")
