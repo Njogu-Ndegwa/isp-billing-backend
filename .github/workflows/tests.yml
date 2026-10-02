@@ -48,8 +48,11 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      # constraints.txt: test the exact versions the production image runs.
+      # requirements-dev.txt also pulls greenlet, which is how the suite stayed
+      # green on 2026-10-02 while the prod image (no greenlet) could not import.
       - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
+        run: pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
 
       # Database Session Discipline guard (AGENTS.md): fails the build when a
       # DB session opened via async_session()/AsyncSessionLocal() is held
