@@ -263,6 +263,11 @@ class Settings(BaseSettings):
     # decision is stored on the token (provisioning_tokens.management_tunnel),
     # so flipping the flag never changes a token that was already issued.
     PROVISION_MGMT_TO_HETZNER: bool = False
+    # With the flag on, false keeps NEW RouterOS 7 tokens on AWS primary +
+    # Hetzner insurance, so only RouterOS 6 moves (to SSTP). Some ISPs drop
+    # Hetzner's replies (Router-1054's, 2026-09-30); a v7 router there would
+    # have no working tunnel at all with Hetzner as its only one.
+    PROVISION_MGMT_TO_HETZNER_ROS7: bool = True
     # host:port of the SSTP server. RouterOS 6 takes the port INSIDE
     # connect-to (ip:port); RouterOS 7 takes a separate port= (the script
     # picks the right form at import time).

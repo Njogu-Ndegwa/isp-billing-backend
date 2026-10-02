@@ -301,15 +301,35 @@ def _write_sstp_secrets(path: str, lines) -> None:
         raise
 
 
+def _sstp_line_ip(line: str):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    fields = stripped.split()
+    return fields[3] if len(fields) >= 4 else None
+
+
 def upsert_sstp_secret(path: str, username: str, password: str, ip: str) -> str:
-    """Add or replace one accel-ppp chap-secrets line; returns added|updated|unchanged."""
+    """Add or replace one accel-ppp chap-secrets line; returns added|updated|unchanged.
+
+    Any OTHER login on the same ip is dropped: the app only allocates an
+    address no router or pending token owns, so such a line belongs to an
+    expired token or a deleted router, and two logins on one ip collide.
+    """
     line = f"{username}\t*\t{password}\t{ip}\n"
     existing = []
     if os.path.exists(path):
         with open(path) as f:
             existing = f.readlines()
+    stale = [l for l in existing if _sstp_line_ip(l) == ip and _sstp_line_user(l) != username]
+    if stale:
+        logger.warning(
+            f"SSTP peer {username} -> {ip}: evicting stale login(s) on the same ip: "
+            f"{[_sstp_line_user(l) for l in stale]}"
+        )
+        existing = [l for l in existing if l not in stale]
     kept = [l for l in existing if _sstp_line_user(l) != username]
-    if len(kept) == len(existing) - 1 and line in existing:
+    if len(kept) == len(existing) - 1 and line in existing and not stale:
         return "unchanged"
     status = "updated" if len(kept) != len(existing) else "added"
     if kept and not kept[-1].endswith("\n"):
