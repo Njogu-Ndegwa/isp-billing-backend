@@ -20,7 +20,7 @@ from app.db.models import (
 )
 from app.services import realtime_state
 from app.services.auth import verify_token, get_current_user
-from app.services.usage_tracking import get_open_period
+from app.services.usage_tracking import get_open_period, pooled_period_usage_bytes
 
 router = APIRouter(tags=["usage"])
 
@@ -43,6 +43,10 @@ class PeriodOut(BaseModel):
     fup_reverted_at: Optional[datetime]
     fup_active: bool
     closed_at: Optional[datetime]
+    # Shared plans only: usage of all the plan's devices, which is what the cap
+    # is enforced against. None unless other devices on the plan have used data.
+    shared_total_mb: Optional[float] = None
+    shared_percent_used: Optional[float] = None
 
 
 class LiveOut(BaseModel):
@@ -197,7 +201,13 @@ async def get_customer_usage(
     customer = await _load_customer_scoped(db, customer_id, user)
     open_period = await get_open_period(db, customer.id)
 
-    return _serialize_usage(customer, open_period)
+    usage = _serialize_usage(customer, open_period)
+    if open_period is not None and usage.period is not None:
+        pooled = await pooled_period_usage_bytes(db, customer, open_period)
+        if pooled != int(open_period.total_bytes or 0):
+            usage.period.shared_total_mb = _bytes_to_mb(pooled)
+            usage.period.shared_percent_used = _percent(pooled, open_period.cap_mb_snapshot)
+    return usage
 
 
 @router.post("/api/customers/usage/bulk", response_model=list[UsageOut])
