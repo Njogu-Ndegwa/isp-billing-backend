@@ -16,13 +16,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     ConnectionType,
     Customer,
     CustomerUsagePeriod,
+    DevicePairing,
     DurationUnit,
     Plan,
     RouterUsageBucket,
@@ -307,6 +308,93 @@ async def open_new_period(
     now = now or datetime.utcnow()
     await close_open_period(db, customer.id, now=now)
     return await get_or_open_current_period(db, customer, plan=plan, now=now)
+
+
+async def pooled_period_usage_bytes(
+    db: AsyncSession,
+    customer: Customer,
+    period: CustomerUsagePeriod,
+) -> int:
+    """Bytes used by the whole shared subscription ``customer`` belongs to.
+
+    A shared plan's data cap covers every device on it, but each device meters
+    into its own period row (each carrying a copy of the plan cap). This sums
+    the owner's and every shared device's usage over the owner's current
+    period, so a 110 GB plan on 11 devices is capped at 110 GB in total, not
+    110 GB each.
+
+    Devices removed from the plan this cycle still count up to their removal,
+    otherwise removing and re-adding devices would reset the allowance.
+
+    Returns ``period.total_bytes`` unchanged for a customer that is not part of
+    a shared subscription. Read-only; never flushes or commits.
+    """
+    own_bytes = int(period.total_bytes or 0)
+    owner_id = customer.subscription_owner_id or customer.id
+
+    current_ids = set(
+        (
+            await db.execute(
+                select(Customer.id).where(
+                    or_(Customer.id == owner_id, Customer.subscription_owner_id == owner_id)
+                )
+            )
+        ).scalars().all()
+    )
+    current_ids.add(customer.id)
+    removed = (
+        await db.execute(
+            select(DevicePairing.customer_id, func.max(DevicePairing.expires_at))
+            .where(
+                DevicePairing.subscription_owner_customer_id == owner_id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+                DevicePairing.customer_id.notin_(current_ids),
+            )
+            .group_by(DevicePairing.customer_id)
+        )
+    ).all()
+    if current_ids == {customer.id} and not removed:
+        return own_bytes
+
+    # Anchor on the owner's open period; a shared device's own period is the
+    # fallback when the owner has none (e.g. mid-renewal).
+    window = period
+    if owner_id != customer.id:
+        owner_period = await get_open_period(db, owner_id)
+        if owner_period is not None:
+            window = owner_period
+
+    overlaps_window = and_(
+        CustomerUsagePeriod.period_end > window.period_start,
+        CustomerUsagePeriod.period_start < window.period_end,
+        CustomerUsagePeriod.id != period.id,
+    )
+    # Renewal closes every member's period and opens a fresh one, so for
+    # current members only open rows belong to this cycle.
+    member_filters = [
+        and_(
+            CustomerUsagePeriod.customer_id.in_(current_ids),
+            CustomerUsagePeriod.closed_at.is_(None),
+        )
+    ]
+    for removed_customer_id, removed_at in removed:
+        # Only the period that was running while the device was on the plan.
+        member_filters.append(
+            and_(
+                CustomerUsagePeriod.customer_id == removed_customer_id,
+                CustomerUsagePeriod.period_start <= (removed_at or window.period_end),
+            )
+        )
+
+    others = (
+        await db.execute(
+            select(func.coalesce(func.sum(CustomerUsagePeriod.total_bytes), 0)).where(
+                overlaps_window, or_(*member_filters)
+            )
+        )
+    ).scalar_one()
+    # The caller's period is added from memory: it may hold deltas not yet flushed.
+    return own_bytes + int(others or 0)
 
 
 async def on_renewal(

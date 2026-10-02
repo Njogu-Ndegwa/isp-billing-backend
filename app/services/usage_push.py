@@ -62,6 +62,7 @@ from app.db.models import (
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
+from app.services.usage_tracking import pooled_period_usage_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -524,11 +525,15 @@ async def ingest_usage_reports(
             if (
                 period is not None
                 and cap_bytes > 0
-                and int(period.total_bytes or 0) >= cap_bytes
                 and period.fup_triggered_at is None
                 and customer.id not in result.over_cap_customer_ids
             ):
-                result.over_cap_customer_ids.append(customer.id)
+                used_bytes = int(period.total_bytes or 0)
+                if used_bytes < cap_bytes:
+                    # A shared plan's cap covers all its devices together.
+                    used_bytes = await pooled_period_usage_bytes(db, customer, period)
+                if used_bytes >= cap_bytes:
+                    result.over_cap_customer_ids.append(customer.id)
 
             if pending >= PUSH_COMMIT_CHUNK:
                 await db.commit()

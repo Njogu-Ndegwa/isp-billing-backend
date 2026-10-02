@@ -36,6 +36,7 @@ from app.db.models import (
     Router,
 )
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, parse_speed_to_mikrotik
+from app.services.usage_tracking import pooled_period_usage_bytes
 from app.services.hotspot_mac_login import (
     block_customer as mac_login_block_customer,
     mac_login_enabled,
@@ -619,14 +620,18 @@ async def evaluate_and_enforce(
         return None
 
     now = now or datetime.utcnow()
-    over_cap = (period.total_bytes or 0) >= cap_bytes
+    used_bytes = int(period.total_bytes or 0)
+    if used_bytes < cap_bytes:
+        # A shared plan's cap covers all its devices together.
+        used_bytes = await pooled_period_usage_bytes(db, customer, period)
+    over_cap = used_bytes >= cap_bytes
 
     if over_cap and period.fup_triggered_at is None:
         action = _effective_action(period, plan)
         identifier = customer.pppoe_username or customer.mac_address or f"customer:{customer.id}"
         logger.info(
             f"[FUP] Trigger {action.value} for customer={customer.id} "
-            f"({identifier}) used={period.total_bytes} cap={cap_bytes}"
+            f"({identifier}) used={used_bytes} own={period.total_bytes} cap={cap_bytes}"
         )
         if action == FupAction.THROTTLE:
             res = await apply_throttle(db, customer, plan)
@@ -651,7 +656,7 @@ async def evaluate_and_enforce(
         identifier = customer.pppoe_username or customer.mac_address or f"customer:{customer.id}"
         logger.info(
             f"[FUP] Auto-revert for customer={customer.id} ({identifier}) "
-            f"used={period.total_bytes} < cap={cap_bytes}"
+            f"used={used_bytes} < cap={cap_bytes}"
         )
         if period.fup_action_taken in (FupAction.THROTTLE, FupAction.BLOCK):
             await restore_normal_profile(db, customer, plan)

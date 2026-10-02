@@ -42,6 +42,7 @@ from app.services.fup import evaluate_and_enforce
 from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI, normalize_mac_address
 from app.services.realtime_state import host_metered_router_ids
 from app.services.usage_counters import parse_queue_bytes, record_queue_usage_sample
+from app.services.usage_tracking import pooled_period_usage_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -417,11 +418,23 @@ async def _poll_due_routers(items: list[WatchItem]) -> list[QueueSample]:
     return samples
 
 
-def _poll_schedule_for(period: Optional[CustomerUsagePeriod], plan: Plan) -> tuple[int, str]:
+def _poll_schedule_for(
+    period: Optional[CustomerUsagePeriod],
+    plan: Plan,
+    used_bytes: Optional[int] = None,
+) -> tuple[int, str]:
+    """Poll tier from usage against the cap.
+
+    ``used_bytes`` overrides the period's own total; callers pass the pooled
+    figure so every device on a shared plan speeds up as the group nears its cap.
+    """
     cap_mb = period.cap_mb_snapshot if (period and period.cap_mb_snapshot is not None) else plan.data_cap_mb
     if not cap_mb or cap_mb <= 0:
         return 300, "uncapped"
-    total_bytes = int(period.total_bytes or 0) if period else 0
+    if used_bytes is not None:
+        total_bytes = int(used_bytes)
+    else:
+        total_bytes = int(period.total_bytes or 0) if period else 0
     cap_bytes = int(cap_mb) * 1024 * 1024
     pct = total_bytes / cap_bytes if cap_bytes > 0 else 0
 
@@ -532,7 +545,16 @@ async def _persist_samples(samples: list[QueueSample], now: datetime) -> list[in
                     download_bytes,
                 )
 
-            interval, tier = _poll_schedule_for(update.period, plan)
+            cap_mb = update.period.cap_mb_snapshot if (update.period and update.period.cap_mb_snapshot is not None) else plan.data_cap_mb
+            cap_bytes = int(cap_mb or 0) * 1024 * 1024
+            used_bytes: Optional[int] = None
+            if update.period:
+                used_bytes = int(update.period.total_bytes or 0)
+                if 0 < cap_bytes and used_bytes < cap_bytes:
+                    # A shared plan's cap covers all its devices together.
+                    used_bytes = await pooled_period_usage_bytes(db, customer, update.period)
+
+            interval, tier = _poll_schedule_for(update.period, plan, used_bytes=used_bytes)
             state.consecutive_errors = 0
             state.backoff_until = None
             state.last_polled_at = now
@@ -541,10 +563,8 @@ async def _persist_samples(samples: list[QueueSample], now: datetime) -> list[in
             state.next_poll_at = now + timedelta(seconds=interval)
             state.last_error = None
 
-            cap_mb = update.period.cap_mb_snapshot if (update.period and update.period.cap_mb_snapshot is not None) else plan.data_cap_mb
-            cap_bytes = int(cap_mb or 0) * 1024 * 1024
             if update.period:
-                over_cap = cap_bytes > 0 and int(update.period.total_bytes or 0) >= cap_bytes
+                over_cap = cap_bytes > 0 and used_bytes >= cap_bytes
                 triggered = update.period.fup_triggered_at is not None
                 reverted = update.period.fup_reverted_at is not None
                 if over_cap and not triggered:
