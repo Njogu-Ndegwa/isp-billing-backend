@@ -50,7 +50,7 @@ from app.services.router_availability import (
     prune_router_availability_history,
 )
 from app.services.usage_tracking import record_usage
-from app.services.usage_counters import clamp_to_line_rate
+from app.services.usage_counters import clamp_to_line_rate, record_queue_usage_sample
 from app.services.fup import hotspot_throttle_rate_for_plan
 from app.services import customer_expiry_notifications
 from app.core.protected_devices import is_protected_device
@@ -67,6 +67,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import functools
 import logging
+import re
 import time
 
 logger = logging.getLogger(__name__)
@@ -3304,6 +3305,25 @@ def _parse_queue_bytes(bytes_str: str) -> tuple[int, int]:
     return upload, download
 
 
+# RouterOS names the queue a hotspot user's rate-limit creates after the user:
+# ``<hotspot-AA:BB:CC:DD:EE:FF>``, with ``-2``... for a second concurrent session.
+_MAC_LOGIN_QUEUE_RE = re.compile(r"^<hotspot-((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})(-\d+)?>$")
+
+
+def mac_login_queue_identity(qname: str) -> tuple[str, str] | None:
+    """``(MAC, usage key)`` for a MAC-login dynamic hotspot queue, else None.
+
+    The key is per QUEUE (``hsq:<MAC>`` / ``hsq:<MAC>-2``): two sessions of one
+    device are two counters, and diffing them against one row re-books whole
+    counters (the 2026-09-29 ghost-host incident).
+    """
+    match = _MAC_LOGIN_QUEUE_RE.match(str(qname or "").strip())
+    if not match:
+        return None
+    mac = normalize_mac_address(match.group(1)).upper()
+    return mac, f"hsq:{mac}{match.group(2) or ''}"
+
+
 def _find_hotspot_customer(
     customers: list[Customer], mac_variants: list[str]
 ) -> Customer | None:
@@ -3747,9 +3767,67 @@ async def collect_bandwidth_snapshot():
                                 .where(Customer.router_id == router_id)
                             )
                         ).scalars().all()
+                        # MACs the router still meters through an app-made
+                        # plan_ queue; their MAC-login queue (if both exist
+                        # mid-migration) must not be counted a second time.
+                        commented_macs = set()
+                        for q in queues["data"]:
+                            c = q.get("comment", "") or ""
+                            if "MAC:" in c:
+                                try:
+                                    commented_macs.add(normalize_mac_address(
+                                        c.split("MAC:")[1].split("|")[0].strip()).upper())
+                                except Exception:
+                                    pass
+                        mac_login = mac_login_enabled(router_id)
                         for q in queues["data"]:
                             qname = q.get("name", "")
                             comment = q.get("comment", "")
+
+                            # --- MAC-login dynamic hotspot queues (<hotspot-MAC>) ---
+                            # On MAC-login routers there is no plan_ queue: the
+                            # customer's rate-limit lives in a router-managed
+                            # dynamic queue with no comment, which the branch
+                            # below never matched — every poll-only MAC-login
+                            # router booked 0 MB (router 131 from 2026-09-29).
+                            ml = mac_login_queue_identity(qname) if mac_login and "MAC:" not in comment else None
+                            if ml is not None:
+                                ml_mac, ml_key = ml
+                                if ml_mac in commented_macs:
+                                    continue
+                                customer = _find_hotspot_customer(router_customers, [ml_mac])
+                                if not (customer and customer.plan
+                                        and customer.plan.connection_type == ConnectionType.HOTSPOT):
+                                    continue
+                                upload_bytes, download_bytes = _parse_queue_bytes(q.get("bytes", "0/0"))
+                                try:
+                                    update = await record_queue_usage_sample(
+                                        db,
+                                        customer=customer,
+                                        plan=customer.plan,
+                                        queue_key=ml_key,
+                                        upload_bytes=upload_bytes,
+                                        download_bytes=download_bytes,
+                                        queue_name=qname,
+                                        target_ip=q.get("target", ""),
+                                        max_limit=q.get("max-limit", ""),
+                                        now=now,
+                                        # The queue is born with the session, so
+                                        # its first reading is the session's usage.
+                                        first_sample_is_total=True,
+                                        sampled_at=fetched_at,
+                                    )
+                                    if update.period is not None:
+                                        from app.services.fup import evaluate_and_enforce
+                                        await evaluate_and_enforce(
+                                            db, customer, update.period, plan=customer.plan, now=now
+                                        )
+                                except Exception as usage_err:
+                                    logger.error(
+                                        "[FUP] Failed to record MAC-login usage for %s: %s",
+                                        ml_key, usage_err,
+                                    )
+                                continue
 
                             # --- Hotspot queues (MAC-based) ---
                             mac = ""
