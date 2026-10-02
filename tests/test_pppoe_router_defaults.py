@@ -791,3 +791,18 @@ def test_heal_dual_mode_sync_uses_db_and_legacy_dual_ports(monkeypatch):
     assert result["legacy_bridge_dual_ports"] == ["ether2"]
     assert result["mode"] == "shared_hotspot_bridge"
     assert created[0].setup_ports == ["ether3", "ether2"]
+
+
+def test_parse_speed_to_mikrotik_makes_fractional_rates_whole():
+    # RouterOS answers "invalid rate-limit" to "0.5M"; FUP throttles on plans
+    # like "0.5M/0.5M" failed on every poll until 2026-10-02.
+    assert parse_speed_to_mikrotik("0.5M/0.5M") == "500k/500k"
+    assert parse_speed_to_mikrotik("2M/0.5M") == "500k/2M"
+    assert parse_speed_to_mikrotik("1.5M/1.5M") == "1500k/1500k"
+    assert parse_speed_to_mikrotik("0.4M/0.4") == "400k/400k"
+    assert parse_speed_to_mikrotik("2.5/1.5") == "1500k/2500k"
+    assert parse_speed_to_mikrotik("1.25G") == "1250M/1250M"
+    assert parse_speed_to_mikrotik("0.5K") == "500/500"
+    # Whole values are left exactly as before.
+    assert parse_speed_to_mikrotik("512Kbps") == "512K/512K"
+    assert parse_speed_to_mikrotik("5000000/5000000") == "5000000/5000000"

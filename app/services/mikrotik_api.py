@@ -7,6 +7,7 @@ import time
 import ipaddress
 from typing import Dict, Any, Optional, List
 from datetime import datetime
+from decimal import Decimal
 import json  # Ensure you import json for serializing logs
 from urllib.parse import urlsplit
 
@@ -57,6 +58,24 @@ def is_hotspot_parent_queue_name(name: Any) -> bool:
     return queue_name.startswith("hs-")
 
 
+_SMALLER_RATE_UNIT = {"G": "M", "M": "k", "K": ""}
+
+
+def _whole_rate(number: str, unit: str) -> str:
+    """RouterOS rejects fractional rates ("0.5M" -> invalid rate-limit).
+
+    Step a fractional value down one unit (1 unit = 1000 of the next) until it
+    is whole: "0.5M" -> "500k", "1.5G" -> "1500M", "0.5K" -> "500" (bps).
+    """
+    if "." not in number:
+        return f"{number}{unit}"
+    value = Decimal(number)
+    while unit and value != value.to_integral_value():
+        value *= 1000
+        unit = _SMALLER_RATE_UNIT[unit]
+    return f"{int(value.to_integral_value())}{unit}"
+
+
 def _normalize_mikrotik_rate_part(part: str, *, slash_context: bool = False) -> Optional[str]:
     value = str(part or "").strip().upper().replace(" ", "")
     if not value:
@@ -69,17 +88,17 @@ def _normalize_mikrotik_rate_part(part: str, *, slash_context: bool = False) -> 
     number = match.group(1)
     unit = match.group(2)
     if unit:
-        return f"{number}{unit}"
+        return _whole_rate(number, unit)
 
     # In "5/5" plan strings, users generally mean Mbps. In existing RouterOS
     # strings such as "5000000/5000000", values are already raw bps.
     if slash_context:
         try:
             if float(number) >= 1000:
-                return number
+                return _whole_rate(number, "")
         except ValueError:
             pass
-    return f"{number}M"
+    return _whole_rate(number, "M")
 
 
 def parse_speed_to_mikrotik(speed: str) -> str:
