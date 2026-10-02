@@ -6,8 +6,8 @@ on:
     # Skip the deploy when a push touches ONLY files that cannot reach the
     # running container. Every deploy rebuilds the image and restarts the app
     # for ~40s of refused requests — customers mid-payment feel that — and
-    # because requirements.txt is unpinned and the build is --no-cache, it also
-    # re-resolves the whole dependency stack. On 2026-07-28 three merges
+    # the build is --no-cache (versions are held by constraints.txt since
+    # 2026-10-02). On 2026-07-28 three merges
     # deployed production and only one contained app code.
     #
     # Anything that CAN reach the container is deliberately absent from this
@@ -33,7 +33,15 @@ jobs:
   # the revived AWS scheduler ran against the stale AWS DB and its safety-net
   # deleted 1,062 paid-client router bindings in 90 minutes. CI must never
   # start the AWS app again — this job only touches the Hetzner `web` service.
+
+  # Build the production image in CI and boot it (live-mode startup,
+  # scheduler, prod hardening) before anything reaches the box. A failure
+  # here means nothing is deployed. See prod-boot.yml for the why.
+  prod-boot:
+    uses: ./.github/workflows/prod-boot.yml
+
   build-and-deploy:
+    needs: prod-boot
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -67,11 +75,11 @@ jobs:
           echo "Starting Hetzner deployment at $(date -u)"
           echo "=========================================="
 
-          echo "[1/7] Entering the production checkout..."
+          echo "[1/9] Entering the production checkout..."
           cd /opt/isp-billing-shadow/repo || { echo "ERROR: /opt/isp-billing-shadow/repo not found"; exit 1; }
           echo "Current directory: $(pwd)"
 
-          echo "[2/7] Refusing to deploy onto a shadow stack..."
+          echo "[2/9] Refusing to deploy onto a shadow stack..."
           if [ ! -f .env.hetzner ]; then
             echo "ERROR: .env.hetzner missing — cannot tell whether this stack is live"; exit 1
           fi
@@ -83,7 +91,7 @@ jobs:
           fi
           echo "SHADOW_MODE is not true — live stack confirmed"
 
-          echo "[3/7] Fetching origin/main..."
+          echo "[3/9] Fetching origin/main..."
           git config --global --add safe.directory /opt/isp-billing-shadow/repo
           git fetch origin main || { echo "ERROR: Git fetch failed"; exit 1; }
           # Reset to FETCH_HEAD, never to origin/main: a single-branch clone
@@ -97,36 +105,90 @@ jobs:
             exit 1
           fi
 
-          echo "[4/7] Disk and memory headroom..."
+          echo "[4/9] Disk and memory headroom..."
           df -h / | tail -1
           free -h | head -2
 
-          echo "[5/7] Building the web image on the host..."
-          docker compose --env-file .env.hetzner -f docker-compose.hetzner.yml build web \
-            || { echo "ERROR: web image build failed"; exit 1; }
+          dc() { docker compose --env-file .env.hetzner -f docker-compose.hetzner.yml "$@"; }
+          app_healthy() {
+            docker exec isp_billing_hetzner_app python -c "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/health',timeout=5).read()[:200])" 2>/dev/null
+          }
+          wait_healthy() {
+            for i in $(seq 1 18); do
+              app_healthy && { echo "/health OK after ~$((i * 5))s"; return 0; }
+              sleep 5
+            done
+            return 1
+          }
+          WEB_IMAGE=$(dc config --format json | python3 -c 'import json,sys;print(json.load(sys.stdin)["services"]["web"]["image"])')
+          LAST_GOOD=isp-billing-hetzner:last-good
 
-          echo "[6/7] Recreating ONLY the web service (db/radius untouched, no compose down)..."
-          docker compose --env-file .env.hetzner -f docker-compose.hetzner.yml up -d --no-deps web \
-            || { echo "ERROR: web service start failed"; exit 1; }
+          # 2026-10-02: the build retagged the web image in place, the swap
+          # happened before any check, the image could not even import
+          # (SQLAlchemy 2.1.2 without greenlet), and the prune below had already
+          # deleted the previous image on an earlier run — prod stayed down
+          # until it was patched by hand. Steps 5, 7 and 9 exist so a bad build
+          # never reaches customers and a bad start rolls itself back.
+          echo "[5/9] Saving the running image as the rollback point..."
+          if app_healthy >/dev/null; then
+            docker tag "$(docker inspect --format '{{.Image}}' isp_billing_hetzner_app)" "$LAST_GOOD"
+            echo "Running image tagged $LAST_GOOD"
+          else
+            # Never bless a crash-looping image; keep whatever was last proven.
+            echo "WARNING: live app is not healthy right now; keeping the existing $LAST_GOOD"
+          fi
+          if docker image inspect "$LAST_GOOD" >/dev/null 2>&1; then HAVE_LAST_GOOD=1; else HAVE_LAST_GOOD=0; fi
 
-          echo "[7/7] Post-deploy checks..."
+          echo "[6/9] Building the web image on the host ($WEB_IMAGE)..."
+          dc build web || { echo "ERROR: web image build failed"; exit 1; }
+
+          echo "[7/9] Smoke-testing the new image BEFORE it replaces the live container..."
+          # Throwaway container from the new image with every live side effect
+          # off. Importing main never starts the scheduler (that is the startup
+          # event), so this proves dependencies install and resolve and the app
+          # imports, without touching the DB, routers or customers.
+          # (`timeout` cannot exec the dc shell function, hence the long form.)
+          # </dev/null is load-bearing: this script reaches the host as ssh's
+          # stdin, and `compose run` reads stdin — without it the smoke test
+          # swallows steps 8-9 and the job still reports success.
+          if ! timeout 180 docker compose --env-file .env.hetzner -f docker-compose.hetzner.yml run --rm --no-deps -T \
+                -e SHADOW_MODE=true -e RUN_SCHEDULER=false -e SCHEDULER_ENABLED=false \
+                -e SMS_DISPATCH_ENABLED=false -e MPESA_B2B_DAILY_PAYOUT_ENABLED=false \
+                -e FEEDBACK_AI_ENABLED=false \
+                --entrypoint sh web -c 'pip check && python -c "import main; print(\"import OK:\", len(main.app.routes), \"routes\")"' </dev/null; then
+            echo "ERROR: new image failed the smoke test — the live container was NOT touched"
+            if [ "$HAVE_LAST_GOOD" -eq 1 ]; then
+              # Point the tag back so a later manual `compose up` cannot pick up the bad build.
+              docker tag "$LAST_GOOD" "$WEB_IMAGE"
+              echo "$WEB_IMAGE re-pointed at $LAST_GOOD"
+            fi
+            exit 1
+          fi
+
+          echo "[8/9] Recreating ONLY the web service (db/radius untouched, no compose down)..."
+          dc up -d --no-deps --no-build web || { echo "ERROR: web service start failed"; exit 1; }
+
+          echo "[9/9] Post-deploy checks..."
           docker ps --filter name=isp_billing_hetzner_app --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
 
           echo "Waiting up to 90s for /health inside the container..."
-          healthy=0
-          for i in $(seq 1 18); do
-            if docker exec isp_billing_hetzner_app python -c "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/health',timeout=5).read()[:200])" 2>/dev/null; then
-              healthy=1
-              break
-            fi
-            sleep 5
-          done
-          if [ "$healthy" -ne 1 ]; then
+          if ! wait_healthy; then
             echo "ERROR: isp_billing_hetzner_app never answered /health within 90s"
             docker logs --since 3m isp_billing_hetzner_app 2>&1 | tail -40 || true
+            if [ "$HAVE_LAST_GOOD" -eq 1 ]; then
+              echo "ROLLING BACK web to $LAST_GOOD..."
+              docker tag "$LAST_GOOD" "$WEB_IMAGE"
+              dc up -d --no-deps --no-build web || true
+              if wait_healthy; then
+                echo "Rollback healthy — production is on the previous image. This deploy FAILED."
+              else
+                echo "ERROR: rollback did not come up healthy either — needs a human NOW"
+              fi
+            else
+              echo "ERROR: no $LAST_GOOD image to roll back to — needs a human NOW"
+            fi
             exit 1
           fi
-          echo "/health OK after ~$((i * 5))s"
 
           echo "Startup / error lines from the last 3 minutes:"
           docker logs --since 3m isp_billing_hetzner_app 2>&1 \

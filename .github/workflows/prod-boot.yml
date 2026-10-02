@@ -1,0 +1,145 @@
+# Production boot test: build the production Dockerfile and start the app the
+# way docker-compose.hetzner.yml runs it, then require it to stay healthy.
+#
+# Why: on 2026-10-02 the unit suite was green while the production image could
+# not even import (SQLAlchemy 2.1.2 without greenlet — requirements-dev.txt
+# installed greenlet for the tests, the image never got it). Only booting the
+# real image catches that class of failure: missing/broken packages, import
+# errors, startup-migration crashes, a read-only-filesystem write, a lazy
+# import inside a scheduler job.
+#
+# Runs on every PR, and deploy.yml calls it as a required job before it
+# touches the Hetzner box.
+name: Production boot test
+
+on:
+  pull_request:
+  workflow_call:
+
+jobs:
+  boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Pinned to 15-alpine to match isp_billing_hetzner_db.
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: isp_billing_boot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the production image
+        # Same Dockerfile and --no-cache as the deploy, so dependency
+        # resolution is exercised exactly as production will see it.
+        run: docker build --no-cache -t isp-billing:boot-test .
+
+      - name: Write the boot environment
+        # Live-mode flags, so the startup event runs every migration and the
+        # scheduler starts — SHADOW_MODE=true would skip all of that. Anything
+        # that reaches a real outside party (SMS, M-Pesa payouts, AI) is off,
+        # every credential is a dummy, and the database is empty.
+        run: |
+          cat > boot.env <<'EOF'
+          DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/isp_billing_boot
+          SECRET_KEY=ci-boot-test-not-a-secret
+          SHADOW_MODE=false
+          RUN_SCHEDULER=true
+          SCHEDULER_ENABLED=true
+          SMS_DISPATCH_ENABLED=false
+          MPESA_B2B_DAILY_PAYOUT_ENABLED=false
+          FEEDBACK_AI_ENABLED=false
+          MPESA_CONSUMER_KEY=ci-dummy
+          MPESA_CONSUMER_SECRET=ci-dummy
+          MPESA_SHORTCODE=000000
+          MPESA_PASSKEY=ci-dummy
+          MPESA_CALLBACK_URL=http://127.0.0.1:9/ci-dummy
+          MPESA_ENVIRONMENT=sandbox
+          PYTHONDONTWRITEBYTECODE=1
+          EOF
+
+      - name: pip check inside the image
+        run: docker run --rm --entrypoint pip isp-billing:boot-test check
+
+      - name: Create the schema (production already has one)
+        # Startup migrations ALTER existing tables; they assume the schema
+        # exists, as it does on the live database. Build it the way
+        # tests/conftest.py does, from the models inside the image.
+        run: |
+          docker run --rm -i --network host --env-file boot.env --entrypoint python isp-billing:boot-test - <<'PY'
+          import asyncio
+          from app.db import database as db_module
+          from app.db import models as _models  # noqa: F401  registers tables
+
+          async def main():
+              async with db_module.async_engine.begin() as conn:
+                  await conn.run_sync(db_module.Base.metadata.create_all)
+              await db_module.async_engine.dispose()
+              print("schema created:", len(db_module.Base.metadata.sorted_tables), "tables")
+
+          asyncio.run(main())
+          PY
+
+      - name: Boot the app with production hardening
+        # Mirrors docker-compose.hetzner.yml: read-only root, 128 MB /tmp,
+        # all capabilities dropped, no-new-privileges, the image's own CMD.
+        run: |
+          docker run -d --name boot-app --network host --env-file boot.env \
+            --read-only --tmpfs /tmp:size=128m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            isp-billing:boot-test
+
+      - name: Require /health, then a soak with no crash
+        run: |
+          health() { curl -fsS -m 5 http://127.0.0.1:8000/health; }
+          running() { [ "$(docker inspect -f '{{.State.Running}}' boot-app)" = true ]; }
+
+          for i in $(seq 1 36); do
+            running || { echo "::error::app container exited during startup"; exit 1; }
+            health && { echo; echo "/health OK after ~$((i * 5))s"; break; }
+            sleep 5
+          done
+          health >/dev/null || { echo "::error::app never answered /health within 180s"; exit 1; }
+
+          # 90s covers the first ticks of the frequent scheduler jobs
+          # (cleanup 67s); a job that crashes the process or hits a lazy
+          # import shows up here, not at the first customer request.
+          for i in $(seq 1 18); do
+            sleep 5
+            running || { echo "::error::app container died during the soak"; exit 1; }
+            health >/dev/null || { echo "::error::/health failed during the soak"; exit 1; }
+          done
+          echo "Still healthy after a 90s soak"
+
+      - name: Check the logs
+        if: always()
+        run: |
+          docker logs boot-app > boot.log 2>&1 || true
+          echo "---- startup lines ----"
+          grep -E "Application startup complete|migrations completed|scheduler started|SHADOW_MODE" boot.log | head -40 || true
+          echo "---- error lines (non-fatal ones are expected with an empty DB and no routers) ----"
+          grep -nE "ERROR|Traceback" boot.log | head -60 || true
+          fail=0
+          grep -q "Application startup complete" boot.log \
+            || { echo "::error::uvicorn never logged 'Application startup complete'"; fail=1; }
+          # Missing packages surface as import errors, often lazily inside a
+          # function or scheduler job — never acceptable, even "non-fatal".
+          if grep -nE "ModuleNotFoundError|ImportError" boot.log; then
+            echo "::error::import error in the app logs"; fail=1
+          fi
+          exit $fail
+
+      - name: Full app log
+        if: failure()
+        run: cat boot.log 2>/dev/null || docker logs boot-app 2>&1 | tail -300
