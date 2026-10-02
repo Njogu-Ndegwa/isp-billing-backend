@@ -30,6 +30,11 @@ services:
     build: .
     image: isp-billing-hetzner:${HETZNER_IMAGE_TAG:-candidate}
     container_name: isp_billing_hetzner_app
+    # Ceiling for floods: past 100 open connections/tasks uvicorn answers a
+    # cheap 503 instead of queueing until the box falls over. Normal evening
+    # peak is ~10 (Caddy keeps idle upstream connections, which count too).
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000",
+              "--limit-concurrency", "100", "--backlog", "128", "--timeout-keep-alive", "5"]
     env_file:
       - ${HETZNER_ENV_FILE:-.env.hetzner}
     environment:
