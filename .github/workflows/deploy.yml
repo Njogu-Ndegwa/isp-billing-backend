@@ -33,7 +33,15 @@ jobs:
   # the revived AWS scheduler ran against the stale AWS DB and its safety-net
   # deleted 1,062 paid-client router bindings in 90 minutes. CI must never
   # start the AWS app again — this job only touches the Hetzner `web` service.
+
+  # Build the production image in CI and boot it (live-mode startup,
+  # scheduler, prod hardening) before anything reaches the box. A failure
+  # here means nothing is deployed. See prod-boot.yml for the why.
+  prod-boot:
+    uses: ./.github/workflows/prod-boot.yml
+
   build-and-deploy:
+    needs: prod-boot
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
