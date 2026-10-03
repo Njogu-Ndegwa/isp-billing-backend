@@ -7,6 +7,7 @@ refunded in their own short transaction.
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -24,6 +25,31 @@ from app.services import sms_credits
 from app.services.messaging import accounts as provider_accounts
 
 logger = logging.getLogger(__name__)
+
+# Calling codes for the markets we serve (KE, TZ, UG, CM).
+_COUNTRY_CODES = ("254", "255", "256", "237")
+_PHONE_LIKE = re.compile(r"^[\d\s+\-().]+$")
+
+
+def _local_phone_digits(query: str) -> Optional[str]:
+    """Subscriber digits of a phone-number search, or None for non-phone text.
+
+    Strips formatting plus any country code or trunk 0, so 0714737687,
+    +254 714 737687 and 254714737687 all search as 714737687 and match the
+    customer however their phone was stored.
+    """
+    query = (query or "").strip()
+    if not _PHONE_LIKE.match(query):
+        return None
+    digits = re.sub(r"\D", "", query)
+    for code in _COUNTRY_CODES:
+        if digits.startswith(code) and len(digits) > len(code) + 6:
+            digits = digits[len(code):]
+            break
+    else:
+        if digits.startswith("0"):
+            digits = digits[1:]
+    return digits if len(digits) >= 4 else None
 
 
 async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
@@ -48,7 +74,11 @@ async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
         stmt = stmt.where(Customer.id.notin_(exclude_customer_ids))
     if search:
         like = f"%{search.strip()}%"
-        stmt = stmt.where((Customer.name.ilike(like)) | (Customer.phone.ilike(like)))
+        match = (Customer.name.ilike(like)) | (Customer.phone.ilike(like))
+        local = _local_phone_digits(search)
+        if local:
+            match = match | Customer.phone.ilike(f"%{local}%")
+        stmt = stmt.where(match)
     stmt = stmt.order_by(Customer.id)
     rows = (await db.execute(stmt)).all()
     seen, out = set(), []

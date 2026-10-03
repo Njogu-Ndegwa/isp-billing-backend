@@ -49,6 +49,48 @@ async def test_resolve_search_matches_name_or_phone(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("query", [
+    "0711222333", "0711 222 333", "+254 711 222 333", "254711222333", "+254-711-222333",
+])
+async def test_resolve_search_matches_phone_in_any_format(db, query):
+    r = await make_reseller(db)
+    p = await make_plan(db, r)
+    await make_customer(db, r, p, name="Alice", phone="254700000010")
+    await make_customer(db, r, p, name="Bob", phone="254711222333")
+    out = await sms_dispatch.resolve_recipients(db, r.id, search=query)
+    assert [c["name"] for c in out] == ["Bob"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_search_254_query_matches_phone_stored_local(db):
+    r = await make_reseller(db)
+    p = await make_plan(db, r)
+    await make_customer(db, r, p, name="Carol", phone="0722779894")
+    out = await sms_dispatch.resolve_recipients(db, r.id, search="254722779894")
+    assert [c["name"] for c in out] == ["Carol"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_search_phone_does_not_match_other_numbers(db):
+    r = await make_reseller(db)
+    p = await make_plan(db, r)
+    await make_customer(db, r, p, name="Bob", phone="254711222333")
+    assert await sms_dispatch.resolve_recipients(db, r.id, search="0711222334") == []
+    # A bare "07" must not widen into "every number containing 7".
+    assert await sms_dispatch.resolve_recipients(db, r.id, search="07") == []
+
+
+def test_local_phone_digits():
+    f = sms_dispatch._local_phone_digits
+    assert f("0714737687") == "714737687"
+    assert f("+254 714 737687") == "714737687"
+    assert f("256772123456") == "772123456"
+    assert f("737687") == "737687"
+    assert f("Guest 7687") is None
+    assert f("07") is None
+
+
+@pytest.mark.asyncio
 async def test_resolve_exclude_customer_ids(db):
     r = await make_reseller(db)
     p = await make_plan(db, r)
