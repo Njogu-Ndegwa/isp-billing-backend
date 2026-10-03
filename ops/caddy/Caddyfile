@@ -1,0 +1,97 @@
+# Bitwave frontend origins on Hetzner (egress-nbg1).
+#
+# Parallel deployment alongside Vercel. Ports 8081/8082 are the pre-DNS test
+# endpoints; the portal-hz./admin-hz. hostname blocks (80/443) get added once
+# Cloudflare DNS points here and an Origin CA cert is installed.
+#
+# Do not add anything that touches iptables FORWARD/NAT - the wg-egress
+# WireGuard role and the software factory (8080/8090) share this box.
+{
+}
+
+# ---- captive portal (static) ----
+:8081 {
+	root * /srv/portal/current
+	header X-Served-By "hetzner"
+	encode gzip
+	file_server
+}
+
+# ---- admin dashboard (Next.js) ----
+:8082 {
+	header X-Served-By "hetzner"
+	encode gzip
+	reverse_proxy 127.0.0.1:3001
+}
+
+# ---- DNS slots (Cloudflare proxied, zone SSL mode = Flexible => CF fetches
+# ---- origin over plain HTTP :80). Explicit http:// scheme so Caddy neither
+# ---- redirects to https nor tries to provision certs.
+http://admin-hz.bitwavetechnologies.com:80 {
+	header X-Served-By "hetzner"
+	encode gzip
+	reverse_proxy 127.0.0.1:3001
+}
+
+http://portal-hz.bitwavetechnologies.com:80 {
+	root * /srv/portal/current
+	header X-Served-By "hetzner"
+	encode gzip
+	file_server
+}
+
+# ---- LIVE apex + www (cut over from Vercel 2026-08-13). Same admin app
+# ---- container; also serves marketing site + blog. Rollback = DNS only.
+http://bitwavetechnologies.com:80, http://www.bitwavetechnologies.com:80 {
+	header X-Served-By "hetzner"
+	encode gzip
+	reverse_proxy 127.0.0.1:3001
+}
+
+# ---- default portal slot (unused until routers are re-pushed to it) ----
+http://portal.bitwavetechnologies.com:80 {
+	root * /srv/portal/current
+	header X-Served-By "hetzner"
+	encode gzip
+	file_server
+}
+
+# ---- ISP billing API (passive Hetzner migration target) ----
+# Cloudflare Flexible mode reaches the origin over HTTP. DNS remains on AWS
+# until the final cutover; direct Host-header probes can validate this route.
+http://isp.bitwavetechnologies.net:80, http://www.isp.bitwavetechnologies.net:80, http://isp.bitwavetechnologies.com:80, http://www.isp.bitwavetechnologies.com:80, http://ispp.bitwavetechnologies.com:80 {
+    header X-Served-By "hetzner-api"
+    encode gzip
+    reverse_proxy 127.0.0.1:8000
+}
+
+# Cloudflare uses Full (strict) for bitwavetechnologies.net. The private key
+# stays on this host; the certificate is scoped to the live API hostname only.
+https://isp.bitwavetechnologies.net:443 {
+    tls /etc/caddy/origin/isp.bitwavetechnologies.net.pem /etc/caddy/origin/isp.bitwavetechnologies.net.key
+    header X-Served-By "hetzner-api"
+    encode gzip
+    reverse_proxy 127.0.0.1:8000
+}
+
+# ---- Router usage push over the management tunnels (2026-09-25). -----------
+# Routers post usage as plain HTTP INSIDE their encrypted WireGuard / L2TP-IPsec
+# tunnel to this box: no TLS handshake on the router (a hAP lite spent ~5-7 s
+# at 100% CPU per HTTPS report). Port 8088, not 80: routers carry
+# ISP_BILLING_PROXY_RELAY_BLOCK (output tcp 80/3128/8080 reject), which must
+# stay. Bound to the tunnel address only; only the push endpoint, only from
+# tunnel source addresses; everything else 404s. Auth is the router push token.
+http://10.251.0.1:8088 {
+	bind 10.251.0.1
+	@push {
+		path /api/router/usage-push /api/router/expiry-check
+		remote_ip 10.0.0.0/8
+	}
+	handle @push {
+		header X-Served-By "hetzner-api-tunnel"
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Bitwave-Push-Channel tunnel
+		}
+	}
+	respond 404
+}
