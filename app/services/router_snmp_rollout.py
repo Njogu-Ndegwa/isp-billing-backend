@@ -9,7 +9,11 @@ app. Dry-run by default. Per router, with --apply:
    restrict it to 127.0.0.1/32 so enabling SNMP never exposes the router to its
    LAN/WAN.
 3. Add our read-only community restricted to the same sources as the API.
-4. ``/snmp set enabled=yes``.
+4. Allow UDP/161 from exactly those sources at the top of the firewall input
+   chain (tagged with ``FIREWALL_COMMENT``). Provisioned routers drop all input
+   not coming from the LAN except the API port, so without this SNMP is
+   silently dropped (found on the 2026-09-24 pilot routers 371 and 10).
+5. ``/snmp set enabled=yes``.
 5. Verify with one real SNMP CPU read from this host. Success marks
    ``routers.snmp_enabled`` (the poller only reads enrolled routers); failure
    rolls that router back to exactly what was saved.
@@ -38,6 +42,7 @@ from app.services.mikrotik_api import LANE_DEFAULT, MikroTikAPI
 logger = logging.getLogger(__name__)
 
 OPEN_ADDRESSES = {"0.0.0.0/0", "::/0", ""}
+FIREWALL_COMMENT = "Bitwave: SNMP monitoring"
 FALLBACK_SOURCES = "10.0.0.1/32,10.251.0.1/32"
 MAX_BATCH = 10
 
@@ -52,6 +57,8 @@ class RouterPlan:
     default_community_id: Optional[str] = None
     default_community_prev_addresses: Optional[str] = None
     ours_exists: bool = False
+    firewall_rule_exists: bool = False
+    first_input_rule_id: Optional[str] = None
     actions: list[str] = field(default_factory=list)
     error: Optional[str] = None
 
@@ -85,6 +92,13 @@ def build_plan(api, router_id: int, name: str, ip: str, community: str) -> Route
         plan.actions.append("restrict default community to 127.0.0.1/32")
     if not plan.ours_exists:
         plan.actions.append(f"add read-only community limited to {plan.sources}")
+
+    input_rules = [r for r in _rows(api.send_command("/ip/firewall/filter/print", {}))
+                   if r.get("chain") == "input"]
+    plan.firewall_rule_exists = any(r.get("comment") == FIREWALL_COMMENT for r in input_rules)
+    plan.first_input_rule_id = input_rules[0].get(".id") if input_rules else None
+    if not plan.firewall_rule_exists and input_rules:
+        plan.actions.append(f"allow SNMP (udp/161) from {plan.sources} in firewall input")
     if plan.snmp_was_enabled != "true":
         plan.actions.append("enable SNMP")
     return plan
@@ -99,6 +113,13 @@ def apply_plan(api, plan: RouterPlan, community: str) -> None:
             _rows(api.send_command("/snmp/community/add", {
                 "name": community, "addresses": plan.sources,
                 "read-access": "yes", "write-access": "no"}))
+        elif action.startswith("allow SNMP"):
+            for source in [s.strip() for s in plan.sources.split(",") if s.strip()]:
+                args = {"chain": "input", "action": "accept", "protocol": "udp",
+                        "dst-port": "161", "src-address": source, "comment": FIREWALL_COMMENT}
+                if plan.first_input_rule_id:
+                    args["place-before"] = plan.first_input_rule_id
+                _rows(api.send_command("/ip/firewall/filter/add", args))
         elif action == "enable SNMP":
             _rows(api.send_command("/snmp/set", {"enabled": "yes"}))
 
@@ -111,6 +132,10 @@ def rollback_plan(api, saved: dict, community: str) -> None:
         for row in _rows(api.send_command("/snmp/community/print", {})):
             if row.get("name") == community and row.get(".id"):
                 api.send_command("/snmp/community/remove", {"numbers": row[".id"]})
+    if not saved.get("firewall_rule_exists"):
+        for row in _rows(api.send_command("/ip/firewall/filter/print", {})):
+            if row.get("comment") == FIREWALL_COMMENT and row.get(".id"):
+                api.send_command("/ip/firewall/filter/remove", {"numbers": row[".id"]})
     if saved.get("default_community_id") is not None:
         api.send_command("/snmp/community/set", {
             "numbers": saved["default_community_id"],
