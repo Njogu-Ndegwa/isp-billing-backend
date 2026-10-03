@@ -295,17 +295,20 @@ def _remove_pppoe_sync(payload: dict) -> dict:
         return {"error": "Failed to connect to router"}
 
     try:
-        disconnect_result = api.disconnect_pppoe_session(pppoe_username)
-        if disconnect_result.get("error"):
-            return {
-                "error": f"Session disconnect failed: {disconnect_result['error']}",
-                "disconnect_result": disconnect_result,
-            }
-
+        # Secret first, then the session: disconnecting first lets the client's
+        # instant redial authenticate before the secret is gone, and that
+        # session survives the removal (2026-10-02, routers 407/255).
         remove_result = api.remove_pppoe_secret(pppoe_username)
         if remove_result.get("error"):
             return {
                 "error": f"Secret removal failed: {remove_result['error']}",
+                "remove_result": remove_result,
+            }
+
+        disconnect_result = api.disconnect_pppoe_session(pppoe_username)
+        if disconnect_result.get("error"):
+            return {
+                "error": f"Session disconnect failed: {disconnect_result['error']}",
                 "disconnect_result": disconnect_result,
                 "remove_result": remove_result,
             }

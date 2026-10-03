@@ -1173,8 +1173,18 @@ def _cleanup_single_router_pppoe_sync(router_info: dict, customers_data: list) -
                 pppoe_user = cust["pppoe_username"]
                 logger.info(f"[CRON-PPPoE] Removing expired PPPoE user: {pppoe_user} (customer {cust['id']})")
 
-                disconnect_result = api.disconnect_pppoe_session(pppoe_user)
+                # Secret FIRST, then the session. The other way round, the
+                # client's PPPoE redials within a second, lands while the secret
+                # still exists, and the new session outlives the secret's removal
+                # - expired customers stayed online for hours (Mutheu, router
+                # 407, and A25 on 255, 2026-10-02). With the secret gone first
+                # the redial is refused.
                 remove_result = api.remove_pppoe_secret(pppoe_user)
+                if remove_result.get("error"):
+                    # Kicking now would only let them straight back in; retry next run.
+                    disconnect_result = {"skipped": "secret removal failed"}
+                else:
+                    disconnect_result = api.disconnect_pppoe_session(pppoe_user)
 
                 if remove_result.get("error"):
                     results["failed"].append({"id": cust["id"], "error": remove_result["error"]})
