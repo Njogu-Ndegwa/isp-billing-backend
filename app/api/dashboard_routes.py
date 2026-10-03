@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract, case, distinct
 from sqlalchemy.orm import selectinload
@@ -22,6 +23,7 @@ from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, valida
 
 import logging
 import asyncio
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -734,6 +736,22 @@ def health_check():
         "runtime_mode": runtime_mode_name(),
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+# Zero-downtime deploys (docs/zero-downtime-deploys.md). Caddy probes this on
+# both API upstream slots (127.0.0.1:8000 and the deploy bridge on :8001) and
+# only routes to a slot that answers 200. The deploy touches DRAIN_FLAG to take
+# a container out of rotation BEFORE stopping it, so no request lands on a
+# socket that is closing. /tmp is the container's tmpfs: the flag dies with it.
+# Deliberately no DB work — Caddy calls this every 2 s per site block.
+DRAIN_FLAG = "/tmp/isp-billing-draining"
+
+
+@router.get("/health/ready")
+async def readiness_check():
+    if os.path.exists(DRAIN_FLAG):
+        return JSONResponse(status_code=503, content={"status": "draining"})
+    return {"status": "ready"}
 
 
 @router.get("/api/dashboard/revenue-over-time")
