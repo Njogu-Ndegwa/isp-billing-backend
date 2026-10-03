@@ -21,7 +21,9 @@ at most ``STANDARD_RUNTIME_BATCH`` routers per run, never-looked-at routers
 first. What happened is recorded per router and per component
 (``routers.checkin_*`` / ``routers.mgmt_watchdog_*``), so:
 
-* installed components are never looked at again;
+* installed components are never looked at again, except a watchdog whose
+  recorded version (``mgmt_watchdog_script.VERSIONS``, kept in the reason) is
+  older than the current template: that one is updated in place;
 * hardware/setup reasons (small board, no watched tunnel, a scheduler someone
   disabled on purpose) are looked at again after a week;
 * passing conditions (unreachable, busy, an API error) after 30 minutes, so a
@@ -56,6 +58,7 @@ from app.services import checkin_delivery
 from app.services.checkin_applier_script import install_checkin_applier
 from app.services.expiry_reaper_enrol import routeros_version_ok
 from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI
+from app.services import mgmt_watchdog_script as wd
 from app.services.mgmt_watchdog_script import detect_kind, install_watchdog
 
 logger = logging.getLogger(__name__)
@@ -110,6 +113,11 @@ def in_scope(router_id: int) -> bool:
     return router_id >= floor
 
 
+def watchdog_needed(installed_at: Optional[datetime], kind: Optional[str], reason: Optional[str]) -> bool:
+    """Never installed, or installed from an older template (upgraded in place)."""
+    return installed_at is None or not wd.is_current(kind, reason)
+
+
 def checkin_wanted(router_id: int) -> bool:
     """The server side would actually answer this router's check-ins."""
     return (
@@ -159,7 +167,7 @@ async def load_candidates(now: datetime, limit: int) -> list[Candidate]:
                    Router.password, Router.port, Router.auth_method, Router.last_status,
                    Router.checkin_installed_at, Router.checkin_install_reason, Router.checkin_checked_at,
                    Router.mgmt_watchdog_installed_at, Router.mgmt_watchdog_reason,
-                   Router.mgmt_watchdog_checked_at, User.subscription_status)
+                   Router.mgmt_watchdog_checked_at, Router.mgmt_watchdog_kind, User.subscription_status)
             .outerjoin(User, User.id == Router.user_id)
             .where(Router.identity.isnot(None), Router.ip_address.isnot(None))
             .order_by(Router.id)
@@ -183,7 +191,7 @@ async def load_candidates(now: datetime, limit: int) -> list[Candidate]:
         )
         want_watchdog = (
             bool(settings.STANDARD_RUNTIME_INSTALL_WATCHDOG)
-            and r.mgmt_watchdog_installed_at is None
+            and watchdog_needed(r.mgmt_watchdog_installed_at, r.mgmt_watchdog_kind, r.mgmt_watchdog_reason)
             and _due(r.mgmt_watchdog_checked_at, r.mgmt_watchdog_reason, now)
         )
         if not (want_checkin or want_watchdog):
@@ -245,7 +253,7 @@ def _watchdog_sync(api, c: Candidate, version: str) -> Component:
         return Component(False, f"no watched tunnel: {why}")
     res = install_watchdog(api, kind, c.ip_address)
     if res.ok:
-        return Component(True, f"installed ({kind}, {res.status})", kind)
+        return Component(True, f"installed ({wd.version_tag(kind)}, {res.status})", kind)
     if res.status == "scheduler_disabled":
         return Component(False, f"scheduler disabled on router ({kind}), left alone", kind)
     return Component(False, f"{res.status}: {res.error}", kind)
@@ -382,7 +390,7 @@ async def _load_setup_candidate(router_id: int) -> Optional[Candidate]:
             select(Router.id, Router.name, Router.identity, Router.ip_address, Router.username,
                    Router.password, Router.port, Router.auth_method,
                    Router.checkin_installed_at, Router.mgmt_watchdog_installed_at,
-                   User.subscription_status)
+                   Router.mgmt_watchdog_kind, Router.mgmt_watchdog_reason, User.subscription_status)
             .outerjoin(User, User.id == Router.user_id)
             .where(Router.id == router_id)
         )).first()
@@ -397,7 +405,8 @@ async def _load_setup_candidate(router_id: int) -> Optional[Candidate]:
         and row.auth_method != RouterAuthMethod.RADIUS
         and checkin_wanted(row.id)
     )
-    want_watchdog = bool(settings.STANDARD_RUNTIME_INSTALL_WATCHDOG) and row.mgmt_watchdog_installed_at is None
+    want_watchdog = bool(settings.STANDARD_RUNTIME_INSTALL_WATCHDOG) and watchdog_needed(
+        row.mgmt_watchdog_installed_at, row.mgmt_watchdog_kind, row.mgmt_watchdog_reason)
     return Candidate(row.id, row.name, row.identity, row.ip_address, row.username, row.password,
                      int(row.port or 8728), want_checkin, want_watchdog)
 
