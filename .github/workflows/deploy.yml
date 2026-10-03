@@ -165,7 +165,91 @@ jobs:
             exit 1
           fi
 
-          echo "[8/9] Recreating ONLY the web service (db/radius untouched, no compose down)..."
+          # Zero-downtime swap (docs/zero-downtime-deploys.md). Caddy load-balances
+          # the API over two slots, 127.0.0.1:8000 (this compose service) and
+          # 127.0.0.1:8001 (a short-lived "bridge"), and health-checks
+          # /health/ready on each every 2 s. The bridge runs the NEW image with
+          # the scheduler off and carries customers while the canonical
+          # container is replaced, so exactly one scheduler ever runs.
+          # Each container is drained (out of Caddy's rotation) before SIGTERM:
+          # docker-proxy accepts connections even when nothing listens behind
+          # it, so Caddy cannot retry a request that hit a closing app — that
+          # is what failed the captive-portal payment on 2026-10-02 22:02.
+          APP=isp_billing_hetzner_app
+          BRIDGE=isp_billing_hetzner_app_bridge
+          BRIDGE_PORT=8001
+          DRAIN_FLAG=/tmp/isp-billing-draining
+          CADDY_SETTLE=6   # > two Caddy health intervals
+          BRIDGE_MIN_MEM_MB=800
+          ready_in() {
+            docker exec "$1" python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health/ready',timeout=3)" >/dev/null 2>&1
+          }
+          wait_ready() {
+            for i in $(seq 1 18); do
+              ready_in "$1" && { echo "$1 ready after ~$((i * 5))s"; return 0; }
+              sleep 5
+            done
+            return 1
+          }
+          drain() {
+            docker exec "$1" touch "$DRAIN_FLAG" && echo "$1 draining; waiting ${CADDY_SETTLE}s for Caddy" && sleep "$CADDY_SETTLE"
+          }
+          stop_timed() {
+            t0=$(date +%s)
+            docker stop -t "$2" "$1" >/dev/null || true
+            echo "$1 stopped in $(( $(date +%s) - t0 ))s"
+          }
+          retire_bridge() {
+            drain "$BRIDGE" || true
+            stop_timed "$BRIDGE" 30
+            docker rm -f "$BRIDGE" >/dev/null 2>&1 || true
+          }
+
+          echo "[8/9] Swapping the web container..."
+          if docker container inspect "$BRIDGE" >/dev/null 2>&1; then
+            # Left by an interrupted deploy. Only safe to remove if the
+            # canonical app is serving; otherwise it may be the only thing up.
+            if app_healthy >/dev/null; then
+              echo "Retiring a bridge left by an earlier deploy..."
+              retire_bridge
+            else
+              echo "ERROR: $BRIDGE exists and $APP is not healthy — the bridge may be carrying traffic. Needs a human."
+              exit 1
+            fi
+          fi
+          AVAIL_MB=$(awk '/MemAvailable/ {print int($2 / 1024)}' /proc/meminfo)
+          ZERO_DOWNTIME=0
+          if ! curl -fsS --max-time 3 http://127.0.0.1:2019/reverse_proxy/upstreams 2>/dev/null | grep -q "\"127.0.0.1:$BRIDGE_PORT\""; then
+            echo "WARNING: Caddy has no 127.0.0.1:$BRIDGE_PORT upstream (ops/caddy/README.md) — stop/start swap, ~15s of failed requests"
+          elif [ "$AVAIL_MB" -lt "$BRIDGE_MIN_MEM_MB" ]; then
+            echo "WARNING: only ${AVAIL_MB} MiB available (< ${BRIDGE_MIN_MEM_MB}) — no room for a bridge; stop/start swap"
+          else
+            ZERO_DOWNTIME=1
+          fi
+
+          if [ "$ZERO_DOWNTIME" -eq 1 ]; then
+            echo "Starting $BRIDGE on 127.0.0.1:$BRIDGE_PORT from the new image (scheduler off)..."
+            # One-off container of the same service: same env file, network,
+            # read-only fs and caps. compose run never publishes the service's
+            # own port, so it cannot collide with 8000.
+            if ! docker compose --env-file .env.hetzner -f docker-compose.hetzner.yml run -d --no-deps \
+                  --name "$BRIDGE" -p "127.0.0.1:$BRIDGE_PORT:8000" \
+                  -e RUN_SCHEDULER=false -e SCHEDULER_ENABLED=false web </dev/null \
+               || ! wait_ready "$BRIDGE"; then
+              echo "ERROR: bridge never became ready — the live container was NOT touched"
+              docker logs --since 3m "$BRIDGE" 2>&1 | tail -40 || true
+              docker rm -f "$BRIDGE" >/dev/null 2>&1 || true
+              if [ "$HAVE_LAST_GOOD" -eq 1 ]; then docker tag "$LAST_GOOD" "$WEB_IMAGE"; fi
+              exit 1
+            fi
+            sleep "$CADDY_SETTLE"   # let Caddy see the bridge healthy
+            drain "$APP" || true
+            stop_timed "$APP" 30
+          else
+            # Old behaviour: uvicorn closes its listener at SIGTERM, so every
+            # second of grace is a second of failed requests. Keep it at 10 s.
+            stop_timed "$APP" 10
+          fi
           dc up -d --no-deps --no-build web || { echo "ERROR: web service start failed"; exit 1; }
 
           echo "[9/9] Post-deploy checks..."
@@ -173,21 +257,32 @@ jobs:
 
           echo "Waiting up to 90s for /health inside the container..."
           if ! wait_healthy; then
-            echo "ERROR: isp_billing_hetzner_app never answered /health within 90s"
-            docker logs --since 3m isp_billing_hetzner_app 2>&1 | tail -40 || true
+            echo "ERROR: $APP never answered /health within 90s"
+            docker logs --since 3m "$APP" 2>&1 | tail -40 || true
+            if [ "$ZERO_DOWNTIME" -eq 1 ]; then
+              echo "Customers are on $BRIDGE meanwhile."
+            fi
             if [ "$HAVE_LAST_GOOD" -eq 1 ]; then
               echo "ROLLING BACK web to $LAST_GOOD..."
               docker tag "$LAST_GOOD" "$WEB_IMAGE"
               dc up -d --no-deps --no-build web || true
               if wait_healthy; then
                 echo "Rollback healthy — production is on the previous image. This deploy FAILED."
+                if [ "$ZERO_DOWNTIME" -eq 1 ]; then sleep "$CADDY_SETTLE"; retire_bridge; fi
               else
+                # Leave any bridge running: it may be the only thing serving.
                 echo "ERROR: rollback did not come up healthy either — needs a human NOW"
               fi
             else
               echo "ERROR: no $LAST_GOOD image to roll back to — needs a human NOW"
             fi
             exit 1
+          fi
+
+          if [ "$ZERO_DOWNTIME" -eq 1 ]; then
+            sleep "$CADDY_SETTLE"   # let Caddy see the new canonical container healthy
+            echo "Retiring $BRIDGE..."
+            retire_bridge
           fi
 
           echo "Startup / error lines from the last 3 minutes:"

@@ -20,6 +20,16 @@ from app.core.runtime_mode import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+class _ReadinessProbeAccessFilter(logging.Filter):
+    # Caddy probes /health/ready on every API upstream slot every 2 s (one
+    # prober per site block); keep that out of the uvicorn access log.
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/health/ready" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_ReadinessProbeAccessFilter())
+
 app = FastAPI(title="ISP Billing SaaS API", version="1.0.0")
 
 

@@ -7,6 +7,52 @@
 # Do not add anything that touches iptables FORWARD/NAT - the wg-egress
 # WireGuard role and the software factory (8080/8090) share this box.
 {
+	# Zero-downtime deploys: the API upstreams below are health-checked every
+	# 2 s per site block, and slot :8001 is down except during a deploy. Keep
+	# that probe chatter out of the journal; it goes to a small rotated file.
+	log default {
+		output stderr
+		exclude http.handlers.reverse_proxy.health_checker.active
+	}
+	log upstream_health {
+		output file /var/lib/caddy/upstream-health.log {
+			roll_size 5MiB
+			roll_keep 2
+		}
+		include http.handlers.reverse_proxy.health_checker.active
+	}
+}
+
+# ---- ISP billing API upstream (zero-downtime deploys, 2026-10) ----
+# Two slots: 127.0.0.1:8000 is the canonical app container; 127.0.0.1:8001 is
+# the deploy "bridge" that only exists while .github/workflows/deploy.yml swaps
+# the canonical one. Caddy only routes to a slot whose /health/ready answers 200;
+# the deploy makes a container answer 503 (drain) before it stops it.
+# See docs/zero-downtime-deploys.md.
+(isp_api_upstream) {
+	lb_policy first
+	health_uri /health/ready
+	health_interval 2s
+	# Generous: Caddy 2.6 marks a slot down on ONE failed probe, and a slow
+	# probe under load must not take the only live slot out of rotation.
+	health_timeout 5s
+	health_status 200
+	# No healthy slot (mid-swap, or a crash)? Hold the request up to 30 s
+	# instead of failing it. A refused dial is always retried.
+	lb_try_duration 30s
+	lb_try_interval 250ms
+	# After a connection was made, only retry methods that are safe to repeat.
+	# docker-proxy accepts on :8000/:8001 even with no app behind it, so a POST
+	# can never be retried safely here — the drain is what protects it.
+	lb_retry_match {
+		method GET HEAD OPTIONS
+	}
+	transport http {
+		# Below uvicorn's --timeout-keep-alive 5: Caddy retires an idle
+		# connection before uvicorn closes it under the next request (the
+		# steady-state POST "EOF"/"connection reset" 502s, ~12/day).
+		keepalive 4s
+	}
 }
 
 # ---- captive portal (static) ----
@@ -62,7 +108,9 @@ http://portal.bitwavetechnologies.com:80 {
 http://isp.bitwavetechnologies.net:80, http://www.isp.bitwavetechnologies.net:80, http://isp.bitwavetechnologies.com:80, http://www.isp.bitwavetechnologies.com:80, http://ispp.bitwavetechnologies.com:80 {
     header X-Served-By "hetzner-api"
     encode gzip
-    reverse_proxy 127.0.0.1:8000
+    reverse_proxy 127.0.0.1:8000 127.0.0.1:8001 {
+        import isp_api_upstream
+    }
 }
 
 # Cloudflare uses Full (strict) for bitwavetechnologies.net. The private key
@@ -71,7 +119,9 @@ https://isp.bitwavetechnologies.net:443 {
     tls /etc/caddy/origin/isp.bitwavetechnologies.net.pem /etc/caddy/origin/isp.bitwavetechnologies.net.key
     header X-Served-By "hetzner-api"
     encode gzip
-    reverse_proxy 127.0.0.1:8000
+    reverse_proxy 127.0.0.1:8000 127.0.0.1:8001 {
+        import isp_api_upstream
+    }
 }
 
 # ---- Router usage push over the management tunnels (2026-09-25). -----------
@@ -89,7 +139,8 @@ http://10.251.0.1:8088 {
 	}
 	handle @push {
 		header X-Served-By "hetzner-api-tunnel"
-		reverse_proxy 127.0.0.1:8000 {
+		reverse_proxy 127.0.0.1:8000 127.0.0.1:8001 {
+			import isp_api_upstream
 			header_up X-Bitwave-Push-Channel tunnel
 		}
 	}
