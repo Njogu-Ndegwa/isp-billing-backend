@@ -225,6 +225,9 @@ _USER_LINE_RE = re.compile(
 # Applier versions: 1 = bypass bindings only; 2 = also reports MAC-login users
 # and applies U lines.
 APPLIER_VERSION_MAC_LOGIN = 2
+# What checkin_applier_script renders today. A router reporting less gets the
+# applier re-installed by standard_runtime_enrol (outdated_applier_router_ids).
+CURRENT_APPLIER_VERSION = APPLIER_VERSION_MAC_LOGIN
 _QUEUE_LINE_RE = re.compile(
     r"^Q,(?:[0-9A-F]{2}:){5}[0-9A-F]{2}," + _RATE_PART + "/" + _RATE_PART
     + r",[0-9A-F]{12}$"
@@ -750,6 +753,8 @@ class RouterCheckinStats:
     renewal_handoffs_total: int = 0
     count_mismatch_total: int = 0
     invalid_macs_total: int = 0
+    # ``v=`` of the latest report (0 = none yet this process).
+    last_version: int = 0
     last_unknown_log_at: float = 0.0
     # (mac, seconds missing, how it resolved) for the last few resolutions —
     # the shadow-mode evidence of how long push misses last.
@@ -771,6 +776,22 @@ class RouterRef:
 
 
 _stats: dict[int, RouterCheckinStats] = {}
+
+
+def outdated_applier_router_ids() -> frozenset[int]:
+    """Routers whose latest check-in came from an applier older than today's.
+
+    The installer only ever looked at routers with no applier, so a template
+    change never reached routers already enrolled: six MAC-login routers kept
+    applier v1 after v2 shipped (2026-09-29), and on those the check-in
+    silently delivered nothing (``decide``'s forced push_only) while their
+    pushes were failing (router 75, 2026-09-30). Only this process's reports
+    count; after a restart a router shows up again with its next check-in.
+    """
+    return frozenset(
+        rid for rid, s in _stats.items()
+        if s.checkins and s.last_version < CURRENT_APPLIER_VERSION
+    )
 _missing_since: dict[tuple[int, str], float] = {}
 _offers: dict[tuple[int, str], _Offer] = {}
 _queue_offers: dict[tuple[int, str], _Offer] = {}
@@ -1198,6 +1219,7 @@ def decide(
     stats = _stats.setdefault(rid, RouterCheckinStats())
     stats.checkins += 1
     stats.last_checkin_at = now
+    stats.last_version = report.version
     stats.last_reported = len(report.macs)
     stats.last_others = len(report.others)
     stats.last_desired = len(desired)
