@@ -181,19 +181,30 @@ platform gateway, so a reseller can never lock themselves out of sending.
 `allow_reseller_gateways`) controls reseller self-service. It defaults to
 **false**, and writes return 403 until an admin turns it on.
 
-It defaults off because of an open commercial question, not a technical one:
+### Portal credits on an own gateway
 
-> **A reseller sending on their own gateway is still charged portal SMS
-> credits.** Credits are reserved at queue time regardless of which gateway
-> carries the message. So a reseller who brings their own vendor currently
-> pays twice — their vendor, and the platform.
+**A reseller sending on their own gateway is not charged portal SMS
+credits.** Portal credits are resale of the platform's own SMS; a reseller on
+their own gateway already pays their vendor, so charging both would bill the
+same message twice. Their balance does not gate their sends either, so an
+empty credit balance cannot stop their campaigns, expiry reminders or router
+alerts.
 
-That may be exactly right (the platform's margin is on the software, not the
-SMS) or exactly wrong (the credit price is priced as resale of platform SMS).
-It is a pricing decision, so this change does not touch billing. Whichever way
-it goes, the lever is in `app/api/messaging_routes.py` where `try_deduct`
-reserves credits — resolution already knows whether the sending account is the
-reseller's own (`resolved.source == "reseller"`).
+`accounts.bills_platform_credits(db, user_id)` makes the call, at queue time,
+in every place credits are reserved: compose sends
+(`app/api/messaging_routes.py`), automatic expiry SMS
+(`app/services/customer_expiry_notifications.py`) and router status alerts
+(`app/services/router_status_alerts.py`). Each message row stores the
+`credits_charged` it actually cost, and refunds for failed recipients return
+exactly that amount, so a failed own-gateway message refunds nothing because
+it was charged nothing. A vendor-side failure such as TextSMS's `low_credits`
+is the reseller's vendor balance, not portal credits.
+
+Deactivating the own gateway puts the reseller back on the platform gateway,
+and billing resumes from the next send.
+
+End-to-end proof through a real TextSMS campaign: `tests/test_textsms_billing.py`;
+the decision itself: `tests/test_own_gateway_billing.py`.
 
 ### Credentials
 
@@ -263,8 +274,6 @@ reseller switches vendors.
 
 ## Not built yet
 
-* A decision on whether own-gateway sends should still cost portal credits —
-  see [Who may add a gateway](#who-may-add-a-gateway).
 * Delivery-report webhooks per provider. `SmsMessageStatus.DELIVERED` exists
   but nothing sets it; a `ProviderSpec` hook for inbound DLRs is the natural
   place.
