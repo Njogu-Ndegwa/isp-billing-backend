@@ -449,6 +449,7 @@
   "price_per_sms_kes",
   "provider",
   "sender_id",
+  "subscription_reminders_enabled",
   "updated_at",
   "welcome_enabled",
   "welcome_message_body",
@@ -979,6 +980,16 @@
   "segments",
   "status",
   "updated_at",
+  "user_id"
+ ],
+ "subscription_expiry_reminders": [
+  "created_at",
+  "expires_at",
+  "id",
+  "inbox_sent",
+  "phone",
+  "sms_message_id",
+  "stage",
   "user_id"
  ],
  "subscription_invoices": [

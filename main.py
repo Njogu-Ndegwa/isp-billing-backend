@@ -114,6 +114,7 @@ from app.api.portal_routes import router as portal_router
 from app.api.messaging_routes import router as messaging_router
 from app.api.admin_messaging_routes import router as admin_messaging_router
 from app.api.messaging_provider_routes import router as messaging_provider_router
+from app.api.admin_subscription_reminder_routes import router as admin_subscription_reminder_router
 from app.api.feedback_routes import router as feedback_router
 from app.api.admin_feedback_routes import router as admin_feedback_router
 from app.api.agent_board_routes import router as agent_board_router
@@ -163,6 +164,7 @@ app.include_router(portal_router)
 app.include_router(messaging_router)
 app.include_router(admin_messaging_router)
 app.include_router(messaging_provider_router)
+app.include_router(admin_subscription_reminder_router)
 app.include_router(feedback_router)
 app.include_router(admin_feedback_router)
 app.include_router(agent_board_router)
@@ -2232,7 +2234,9 @@ async def run_messaging_migrations():
             "ADD COLUMN IF NOT EXISTS welcome_enabled BOOLEAN NOT NULL DEFAULT true, "
             "ADD COLUMN IF NOT EXISTS welcome_subject VARCHAR(200) NULL, "
             "ADD COLUMN IF NOT EXISTS welcome_message_body VARCHAR(2000) NULL, "
-            "ADD COLUMN IF NOT EXISTS welcome_support_phone VARCHAR(20) NULL"
+            "ADD COLUMN IF NOT EXISTS welcome_support_phone VARCHAR(20) NULL, "
+            "ADD COLUMN IF NOT EXISTS subscription_reminders_enabled BOOLEAN NOT NULL "
+            "DEFAULT true"
         ))
         await conn.execute(text(
             "ALTER TABLE sms_messages "
@@ -2724,6 +2728,17 @@ async def run_router_overload_alert_migrations():
     logger.info("Router overload-alert migrations complete")
 
 
+async def run_subscription_reminder_migrations():
+    """Create the reseller subscription reminder log / dedupe table. Idempotent."""
+    from app.db.models import SubscriptionExpiryReminder
+
+    async with async_engine.begin() as conn:
+        await conn.run_sync(
+            lambda c: SubscriptionExpiryReminder.__table__.create(c, checkfirst=True)
+        )
+    logger.info("Migration: subscription_expiry_reminders table ready")
+
+
 async def run_feedback_migrations():
     """Create feedback board (Ideas + Bugs) enums, tables, indexes. Idempotent."""
     from sqlalchemy import text, inspect
@@ -3195,6 +3210,12 @@ async def startup_event():
         logger.error(f"Feedback board migration failed (non-fatal): {e}")
 
     try:
+        await run_subscription_reminder_migrations()
+        logger.info("Subscription reminder migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Subscription reminder migration failed (non-fatal): {e}")
+
+    try:
         await run_hot_path_index_migrations()
         logger.info("Hot-path index migrations completed successfully")
     except Exception as e:
@@ -3462,7 +3483,29 @@ async def startup_event():
         misfire_grace_time=900,
     )
 
-    logger.info("Subscription jobs scheduled: per-user invoices daily at 06:00, overdue/suspension check daily at 08:00")
+    async def _subscription_reminders_background():
+        from app.services.subscription_reminders import send_due_subscription_reminders
+        try:
+            result = await send_due_subscription_reminders()
+            if result.get("sent"):
+                logger.info(f"[SUBSCRIPTION] Expiry reminders: {result}")
+        except Exception as e:
+            logger.error(f"[SUBSCRIPTION] Expiry reminder job failed: {e}")
+
+    # Every 10 min so a reminder lands close to its T-3d / T-24h / T-2h target and
+    # a load-shed tick just retries shortly after. The send itself is deduped by
+    # the subscription_expiry_reminders unique constraint.
+    scheduler.add_job(
+        _subscription_reminders_background,
+        trigger=IntervalTrigger(minutes=10),
+        id='subscription_expiry_reminders',
+        name='Text resellers before their subscription expires (T-3d, T-24h, T-2h)',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+
+    logger.info("Subscription jobs scheduled: per-user invoices daily at 06:00, overdue/suspension check daily at 08:00, expiry reminders every 10 minutes")
 
     # --- Provisioning token cleanup (3:00 AM EAT / 0:00 UTC) ---
     async def _expire_stale_provisioning_tokens():

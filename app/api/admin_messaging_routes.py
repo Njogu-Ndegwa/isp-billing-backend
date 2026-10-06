@@ -42,6 +42,7 @@ class SettingsIn(BaseModel):
     welcome_subject: Optional[str] = None
     welcome_message_body: Optional[str] = None
     welcome_support_phone: Optional[str] = None
+    subscription_reminders_enabled: Optional[bool] = None
 
 
 @router.get("/api/admin/messaging/settings")
@@ -67,6 +68,7 @@ async def get_settings(db: AsyncSession = Depends(get_db),
         "welcome_subject": cfg["subject"],
         "welcome_message_body": cfg["body"],
         "welcome_support_phone": cfg["support_phone"],
+        "subscription_reminders_enabled": s.subscription_reminders_enabled,
     }
 
 
@@ -100,6 +102,8 @@ async def update_settings(body: SettingsIn, db: AsyncSession = Depends(get_db),
         s.welcome_message_body = body.welcome_message_body or None
     if body.welcome_support_phone is not None:
         s.welcome_support_phone = body.welcome_support_phone or None
+    if body.subscription_reminders_enabled is not None:
+        s.subscription_reminders_enabled = body.subscription_reminders_enabled
     await db.commit()
     return {"message": "Settings updated"}
 
