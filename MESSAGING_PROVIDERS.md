@@ -217,6 +217,16 @@ garbage credential.
 | `talksasa` | TalkSASA | bearer token |
 | `africastalking` | Africa's Talking | username + API key header |
 | `hostpinnacle` | HostPinnacle Kenya | portal username + password in the form body |
+| `textsms` | TextSMS Kenya (textsms.co.ke) | API key + partner ID inside each message |
+
+### A note on TextSMS
+
+TextSMS's bulk endpoint takes at most 20 messages per request, so larger sends
+are split into chunks. Each message gets a `clientsmsid` and results are
+matched back on it (falling back to the phone number), so delivery status is
+per-recipient. The vendor spells the code key `respose-code`; both spellings
+are accepted. Code `1004` (low bulk credits) is stored as `low_credits`, which
+makes an empty TextSMS balance easy to spot in the message log.
 
 ### A note on HostPinnacle
 
