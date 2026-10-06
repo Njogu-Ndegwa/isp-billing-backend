@@ -21,6 +21,7 @@ from app.db.models import (
     MpesaTransaction,
     MpesaTransactionStatus,
     PaymentMethod,
+    PlanType,
     Voucher,
     VoucherStatus,
 )
@@ -136,6 +137,34 @@ async def test_same_voucher_starts_plan_then_adds_second_device(db, stub_provisi
     owner_id = voucher.redeemed_by
 
     second = await _redeem(db, router, "48392910", PHONE_2, device_name="Tablet")
+    await stub_provisioning.drain()
+    assert second["outcome"] == "device_added"
+    assert second["owner_customer_id"] == owner_id
+
+    shared = (await db.execute(select(Customer).where(Customer.mac_address == PHONE_2))).scalar_one()
+    owner = await db.get(Customer, owner_id)
+    assert shared.subscription_owner_id == owner_id
+    assert shared.expiry == owner.expiry
+
+
+async def test_multi_device_free_trial_shares_its_access_code(db, stub_provisioning):
+    from app.services.free_trial import claim_free_trial
+
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    plan = await make_plan(
+        db, reseller, price=0, plan_type=PlanType.FREE_TRIAL, max_shared_users=3,
+    )
+
+    claimed = await claim_free_trial(db, plan.id, OWNER_MAC, router.id)
+    await stub_provisioning.drain()
+    assert claimed["success"] is True, claimed
+    assert claimed["outcome"] == "plan_started"
+    assert claimed["sharing_enabled"] is True
+    assert claimed["max_devices"] == 3
+    owner_id = claimed["customer_id"]
+
+    second = await _redeem(db, router, claimed["access_code"], PHONE_2)
     await stub_provisioning.drain()
     assert second["outcome"] == "device_added"
     assert second["owner_customer_id"] == owner_id
