@@ -33,6 +33,7 @@ from app.db.models import (
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.plan_cache import plan_model_allows_router
 from app.services.reseller_payments import record_customer_payment
+from app.services.subscription_sharing import max_shared_users_for_plan, sharing_enabled_for_plan
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +253,22 @@ async def claim_free_trial(
         phone=phone_key,
         claimed_at=now,
     ))
+
+    # A trial that covers several devices gets the same multi-use access code
+    # a paid plan shows, so the claimer can bring their other devices online
+    # by typing it in. Created here, before the commit and any router I/O.
+    sharing: Dict[str, Any] = {}
+    if sharing_enabled_for_plan(plan):
+        from app.api.device_pairing import _format_share_code, get_or_create_access_code
+
+        code_row = await get_or_create_access_code(db, customer)
+        sharing = {
+            "outcome": "plan_started",
+            "sharing_enabled": True,
+            "max_devices": max_shared_users_for_plan(plan),
+            "access_code": _format_share_code(code_row.code),
+        }
+
     await db.commit()
     await db.refresh(customer)
 
@@ -264,17 +281,21 @@ async def claim_free_trial(
 
     use_radius = getattr(router, "auth_method", None) == RouterAuthMethod.RADIUS
     if use_radius:
-        return await _provision_radius(
+        result = await _provision_radius(
             db, customer, plan, router,
             fixed_expiry=customer.expiry,
             message="Free trial started. Use credentials to login.",
         )
-    return await _provision_direct_api(
-        db, customer, plan, router,
-        code=f"TRIAL-{plan.id}",
-        payment_id=payment.id,
-        entrypoint=ProvisioningAttemptEntrypoint.FREE_TRIAL,
-        comment=f"Free trial {plan.name} for {normalized_mac}",
-        event_label=f"free trial {plan.name}",
-        message="Free trial started. Internet access is being provisioned.",
-    )
+    else:
+        result = await _provision_direct_api(
+            db, customer, plan, router,
+            code=f"TRIAL-{plan.id}",
+            payment_id=payment.id,
+            entrypoint=ProvisioningAttemptEntrypoint.FREE_TRIAL,
+            comment=f"Free trial {plan.name} for {normalized_mac}",
+            event_label=f"free trial {plan.name}",
+            message="Free trial started. Internet access is being provisioned.",
+        )
+    if result.get("success"):
+        result.update(sharing)
+    return result

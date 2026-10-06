@@ -81,6 +81,8 @@ async def test_claim_grants_access_without_revenue(db, no_background_provisionin
 
     claim = (await db.execute(select(FreeTrialClaim))).scalar_one()
     assert (claim.plan_id, claim.customer_id, claim.payment_id) == (plan.id, customer.id, payment.id)
+    # A one-device trial has nothing to share.
+    assert "access_code" not in result
 
 
 async def test_once_only_trial_cannot_be_claimed_twice(db, no_background_provisioning):
@@ -261,10 +263,10 @@ async def test_plan_validation_forces_free_hotspot_trials():
         _validate_free_trial_plan(Plan(plan_type=PlanType.FREE_TRIAL, price=20, connection_type=ConnectionType.HOTSPOT))
     with pytest.raises(HTTPException):
         _validate_free_trial_plan(Plan(plan_type=PlanType.FREE_TRIAL, price=0, connection_type=ConnectionType.PPPOE))
-    with pytest.raises(HTTPException):
-        _validate_free_trial_plan(Plan(
-            plan_type=PlanType.FREE_TRIAL, price=0, connection_type=ConnectionType.HOTSPOT, max_shared_users=3,
-        ))
+    # A trial may cover several devices, like any hotspot plan.
+    _validate_free_trial_plan(Plan(
+        plan_type=PlanType.FREE_TRIAL, price=0, connection_type=ConnectionType.HOTSPOT, max_shared_users=3,
+    ))
 
 
 async def test_new_plans_default_to_once_per_customer(db):

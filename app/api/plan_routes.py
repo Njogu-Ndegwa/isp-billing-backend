@@ -112,16 +112,15 @@ def _serialize_plan_trial(plan: Plan) -> dict:
 
 def _validate_free_trial_plan(plan: Plan) -> None:
     """Free trials are claimed from the captive portal at no charge, so the
-    plan must be free, must be a hotspot plan (PPPoE customers have no portal
-    to claim from), and covers only the device that claimed it."""
+    plan must be free and must be a hotspot plan (PPPoE customers have no
+    portal to claim from). Like any hotspot plan, ``max_shared_users`` sets how
+    many devices the claimed trial covers."""
     if plan.plan_type != PlanType.FREE_TRIAL:
         return
     if plan.price:
         raise HTTPException(status_code=400, detail="A free trial plan must have a price of 0")
     if plan.connection_type != ConnectionType.HOTSPOT:
         raise HTTPException(status_code=400, detail="Free trial plans are only available for hotspot")
-    if int(plan.max_shared_users or 1) > 1:
-        raise HTTPException(status_code=400, detail="A free trial plan is for one device only")
 
 
 async def _validate_router_scope(
