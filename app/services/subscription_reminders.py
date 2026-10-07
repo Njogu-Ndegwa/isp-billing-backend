@@ -23,7 +23,12 @@ is held until 07:00 there instead of being burned on a sleeping reseller.
 Send deadline: suspension does not happen at the expiry instant — it happens on
 the next ``check_overdue_invoices`` run (daily 08:00 UTC). So a reminder stays
 worth sending slightly past nominal expiry, and the copy switches to "has
-expired" rather than lying about time remaining. Past that run we go quiet.
+expired" rather than lying about time remaining.
+
+After that run, one last ``expired`` notice goes to a reseller the run actually
+suspended: "your account is suspended, pay X to reopen it". It is only sent in
+the 24 hours after the suspension run, so a reseller suspended weeks ago is
+never texted out of the blue, and it is also held through quiet hours.
 
 Session discipline (AGENTS.md): this module is DB-only. Rows are created and
 committed in short sessions; the provider call happens afterwards in
@@ -85,7 +90,11 @@ STAGES: tuple[tuple[str, timedelta], ...] = (
     ("t24", timedelta(hours=24)),
     ("t2", timedelta(hours=2)),
 )
-STAGE_LABELS = {"t72": "3 days before", "t24": "24 hours before", "t2": "2 hours before"}
+# Sent once after the suspension run, to resellers it suspended.
+EXPIRED_STAGE = "expired"
+SUSPENDED_NOTICE_WINDOW = timedelta(hours=24)
+STAGE_LABELS = {"t72": "3 days before", "t24": "24 hours before", "t2": "2 hours before",
+                EXPIRED_STAGE: "after suspension"}
 
 # Deliberately terse: these are billed per 160-char GSM-7 segment on our own
 # account. tests/test_subscription_reminders.py asserts they stay at 1 segment.
@@ -108,6 +117,14 @@ _SMS = {
                         "the app now - " + _SUSPENDED_TAIL,
     (True, True, False): "Bitwave: your free trial has ended. Subscribe in the "
                          "app now - " + _SUSPENDED_TAIL,
+}
+# After suspension. Trial and paid share the wording: a suspended account no
+# longer records whether it was on trial.
+_SUSPENDED_SMS = {
+    True: "Bitwave: your account is suspended because your subscription expired. "
+          "Pay {amount} in the app to reopen it - customers cannot buy internet until then.",
+    False: "Bitwave: your account is suspended because your subscription expired. "
+           "Renew in the app to reopen it - customers cannot buy internet until then.",
 }
 
 
@@ -186,6 +203,20 @@ def due_stage(expires_at: datetime, now: datetime, already_sent: set[str],
     was down through an earlier window doesn't fire stages back to back — the
     reseller just gets the one accurate text.
     """
+    stage = _due_ignoring_quiet_hours(expires_at, now, already_sent, tz_name)
+    if stage is None:
+        return None
+    # A stage can come due during quiet hours when its planned time was missed
+    # (first deploy, downtime, a skipped scan). Hold it to 07:00 like any other.
+    release = shift_out_of_quiet_hours(now, tz_name)
+    if release != now and release < next_suspension_run_at(expires_at):
+        return None
+    return stage
+
+
+def _due_ignoring_quiet_hours(expires_at: datetime, now: datetime,
+                              already_sent: set[str],
+                              tz_name: Optional[str]) -> Optional[str]:
     if now >= next_suspension_run_at(expires_at):
         return None
     for stage, offset in reversed(_open_stages(already_sent)):
@@ -207,11 +238,28 @@ def next_planned(expires_at: datetime, now: datetime, already_sent: set[str],
     due = due_stage(expires_at, now, already_sent, tz_name)
     if due is not None:
         return due, now
+    held = _due_ignoring_quiet_hours(expires_at, now, already_sent, tz_name)
+    if held is not None:
+        return held, shift_out_of_quiet_hours(now, tz_name)
     for stage, offset in _open_stages(already_sent):
         send_at = reminder_send_at(expires_at, offset, tz_name)
         if send_at > now:
             return stage, send_at
     return None
+
+
+def suspended_notice_due(expires_at: datetime, now: datetime, already_sent: set[str],
+                         tz_name: Optional[str] = DEFAULT_TIMEZONE) -> bool:
+    """Whether a suspended reseller should get the one ``expired`` notice now.
+
+    Only within SUSPENDED_NOTICE_WINDOW of the suspension run, and never in
+    quiet hours (the next 10-minute scan after 07:00 picks it up instead).
+    """
+    if EXPIRED_STAGE in already_sent or now < expires_at:
+        return False
+    if now >= next_suspension_run_at(expires_at) + SUSPENDED_NOTICE_WINDOW:
+        return False
+    return shift_out_of_quiet_hours(now, tz_name) == now
 
 
 def humanize_lead(delta: timedelta) -> str:
@@ -246,6 +294,30 @@ def render_reminder_sms(expires_at: datetime, now: datetime,
     template = _SMS[(trial, expired, amt is not None)]
     when = None if expired else humanize_lead(expires_at - now)
     return template.format(when=when, amount=amt)
+
+
+def render_suspended_sms(amount: Optional[float], currency: Optional[str] = "KES") -> str:
+    """The post-suspension SMS body (one segment, tested)."""
+    amt = _format_amount(amount, currency)
+    return _SUSPENDED_SMS[amt is not None].format(amount=amt)
+
+
+def render_suspended_inbox(expires_at: datetime, amount: Optional[float],
+                           currency: Optional[str] = "KES",
+                           tz_name: Optional[str] = DEFAULT_TIMEZONE) -> tuple[str, str]:
+    """(subject, body) for the post-suspension inbox message."""
+    local = to_local(expires_at, tz_name).strftime("%a %d %b at %I:%M%p").replace(" 0", " ")
+    zone = zone_abbreviation(tz_name)
+    charge = _format_amount(amount, currency) or "your outstanding balance"
+    subject = "Your account is suspended"
+    body = (
+        f"Your Bitwave subscription expired on {local} {zone} and the account "
+        f"has been suspended. Pay {charge} from the Subscription page to reopen "
+        "it straight away.\n\n"
+        "While the account is suspended your hotspot customers cannot buy "
+        "internet, so every hour it stays closed is lost sales."
+    )
+    return subject, body
 
 
 def render_reminder_inbox(expires_at: datetime, now: datetime,
@@ -350,8 +422,13 @@ async def send_expiry_reminder(user_id: int, stage: str, expires_at: datetime,
             # Re-check under the session: they may have paid since the scan.
             if user.subscription_expires_at != expires_at:
                 return None
-            if user.subscription_status not in (SubscriptionStatus.ACTIVE,
-                                                SubscriptionStatus.TRIAL):
+            suspended_notice = stage == EXPIRED_STAGE
+            if suspended_notice:
+                if (user.subscription_status != SubscriptionStatus.SUSPENDED
+                        or now < expires_at):
+                    return None
+            elif user.subscription_status not in (SubscriptionStatus.ACTIVE,
+                                                  SubscriptionStatus.TRIAL):
                 return None
 
             phone = (user.support_phone or "").strip() or None
@@ -377,7 +454,9 @@ async def send_expiry_reminder(user_id: int, stage: str, expires_at: datetime,
 
             sms_id = None
             if send_sms:
-                body = render_reminder_sms(expires_at, now, amount, currency, trial=trial)
+                body = (render_suspended_sms(amount, currency) if suspended_notice
+                        else render_reminder_sms(expires_at, now, amount, currency,
+                                                 trial=trial))
                 segments = count_segments(body)
                 sms = SmsMessage(
                     user_id=user_id,
@@ -396,8 +475,12 @@ async def send_expiry_reminder(user_id: int, stage: str, expires_at: datetime,
 
             sender_admin_id = await _resolve_sender_admin_id(db, user)
             if sender_admin_id is not None:
-                subject, inbox_body = render_reminder_inbox(
-                    expires_at, now, amount, currency, trial=trial, tz_name=tz_name)
+                if suspended_notice:
+                    subject, inbox_body = render_suspended_inbox(
+                        expires_at, amount, currency, tz_name=tz_name)
+                else:
+                    subject, inbox_body = render_reminder_inbox(
+                        expires_at, now, amount, currency, trial=trial, tz_name=tz_name)
                 db.add(ResellerInboxMessage(
                     recipient_user_id=user_id,
                     sender_user_id=sender_admin_id,
@@ -435,8 +518,21 @@ def _candidates_query(now: datetime, horizon: timedelta):
     )
 
 
+def _suspended_candidates_query(now: datetime):
+    """Resellers suspended at most a day ago for an expiry in the last two days."""
+    return select(User.id, User.subscription_expires_at, User.market_code).where(
+        User.role == UserRole.RESELLER,
+        User.subscription_status == SubscriptionStatus.SUSPENDED,
+        User.subscription_expires_at.isnot(None),
+        User.subscription_expires_at <= now,
+        # Suspension runs < 1 day after expiry, the notice window is 1 day more.
+        User.subscription_expires_at >= now - timedelta(days=1) - SUSPENDED_NOTICE_WINDOW,
+    )
+
+
 async def send_due_subscription_reminders(now: Optional[datetime] = None) -> dict:
-    """Scheduler entry: text every reseller whose subscription is about to lapse.
+    """Scheduler entry: text every reseller whose subscription is about to lapse,
+    and once more to those the last suspension run just suspended.
 
     Candidates are read in one short session; each reminder then claims, writes
     and commits in its own short session, and the provider send happens after
@@ -468,6 +564,15 @@ async def send_due_subscription_reminders(now: Optional[datetime] = None) -> dic
                 stage = due_stage(expires_at, now, set(sent[(user_id, expires_at)]), tz_name)
                 if stage is not None:
                     due.append((user_id, stage, expires_at))
+
+            suspended_rows = (await db.execute(_suspended_candidates_query(now))).all()
+            suspended_sent = await _sent_stages_by_user(
+                db, [(user_id, expires_at) for user_id, expires_at, _ in suspended_rows])
+            for user_id, expires_at, market_code in suspended_rows:
+                tz_name = reseller_market(_MarketOnly(market_code)).timezone
+                if suspended_notice_due(expires_at, now,
+                                        set(suspended_sent[(user_id, expires_at)]), tz_name):
+                    due.append((user_id, EXPIRED_STAGE, expires_at))
     except Exception:
         logger.exception("Subscription reminder scan could not list candidates")
         return result

@@ -17,10 +17,11 @@ from app.db.models import (
 )
 from app.services.messaging import count_segments
 from app.services.subscription_reminders import (
-    REMINDER_CATEGORY, STAGES,
-    due_stage, humanize_lead, next_suspension_run_at, reminder_send_at,
-    render_reminder_inbox, render_reminder_sms, send_due_subscription_reminders,
-    send_expiry_reminder, shift_out_of_quiet_hours,
+    EXPIRED_STAGE, REMINDER_CATEGORY, STAGES,
+    due_stage, humanize_lead, next_planned, next_suspension_run_at, reminder_send_at,
+    render_reminder_inbox, render_reminder_sms, render_suspended_sms,
+    send_due_subscription_reminders, send_expiry_reminder,
+    shift_out_of_quiet_hours, suspended_notice_due,
 )
 from tests.factories import make_reseller
 
@@ -135,6 +136,15 @@ def test_no_reminder_once_the_suspension_run_has_passed():
     assert due_stage(expires, eat(2026, 7, 27, 11, 30), {"t24"}) is None
 
 
+def test_overdue_stage_found_at_night_waits_for_morning():
+    """First deploy / downtime at 23:00 EAT: hold the text until 07:00, don't send now."""
+    expires = datetime(2026, 10, 8, 10, 0)         # 13:00 EAT
+    night = datetime(2026, 10, 7, 20, 0)           # 23:00 EAT, T-24h already passed
+    assert due_stage(expires, night, set()) is None
+    assert next_planned(expires, night, set()) == ("t24", eat(2026, 10, 8, 7))
+    assert due_stage(expires, eat(2026, 10, 8, 7), set()) == "t24"
+
+
 def test_stage_keys_are_stable():
     # Stage keys are persisted in subscription_expiry_reminders.stage.
     assert [s for s, _ in STAGES] == ["t72", "t24", "t2"]
@@ -209,8 +219,9 @@ def no_provider_calls(monkeypatch):
 
 
 async def _reseller_expiring(db, *, hours: float, phone="254700111222",
-                             status=SubscriptionStatus.ACTIVE, invoice=1200.0):
-    expires = datetime.utcnow() + timedelta(hours=hours)
+                             status=SubscriptionStatus.ACTIVE, invoice=1200.0,
+                             now: datetime | None = None):
+    expires = (now or datetime.utcnow()) + timedelta(hours=hours)
     reseller = await make_reseller(db, support_phone=phone,
                                    subscription_status=status,
                                    subscription_expires_at=expires)
@@ -328,12 +339,17 @@ async def test_messaging_globally_disabled_skips_the_sms(db):
     assert (await db.execute(select(SmsMessage))).scalars().all() == []
 
 
+# A fixed daytime clock for scan tests: with the real clock, a run during EAT
+# quiet hours holds the reminder and the test fails depending on time of day.
+MIDDAY = eat(2026, 7, 26, 12)
+
+
 @pytest.mark.asyncio
 async def test_scan_sends_and_dispatches(db, no_provider_calls):
     await make_reseller(db, role=UserRole.ADMIN)
-    reseller, _ = await _reseller_expiring(db, hours=1.5)
+    reseller, _ = await _reseller_expiring(db, hours=1.5, now=MIDDAY)
 
-    result = await send_due_subscription_reminders()
+    result = await send_due_subscription_reminders(now=MIDDAY)
     assert result["sent"] == 1
     assert result["sms_queued"] == 1
 
@@ -346,10 +362,10 @@ async def test_scan_sends_and_dispatches(db, no_provider_calls):
 @pytest.mark.asyncio
 async def test_scan_is_idempotent_across_ticks(db, no_provider_calls):
     await make_reseller(db, role=UserRole.ADMIN)
-    await _reseller_expiring(db, hours=1.5)
+    await _reseller_expiring(db, hours=1.5, now=MIDDAY)
 
-    assert (await send_due_subscription_reminders())["sent"] == 1
-    assert (await send_due_subscription_reminders())["sent"] == 0
+    assert (await send_due_subscription_reminders(now=MIDDAY))["sent"] == 1
+    assert (await send_due_subscription_reminders(now=MIDDAY))["sent"] == 0
     assert len((await db.execute(select(SmsMessage))).scalars().all()) == 1
     assert len(no_provider_calls) == 1
 
@@ -400,3 +416,129 @@ async def test_settings_default_leaves_reminders_on(db):
     await db.commit()
     s = await db.get(MessagingSettings, 1)
     assert s.subscription_reminders_enabled is True
+
+
+# --------------------------------------------------------------------------
+# After suspension: the one "your account is suspended" notice
+# --------------------------------------------------------------------------
+
+def test_suspended_notice_due_after_the_suspension_run():
+    expires = datetime(2026, 7, 26, 14, 0)          # suspended 27 Jul 08:00 UTC
+    assert suspended_notice_due(expires, datetime(2026, 7, 27, 8, 10), set())
+
+
+def test_suspended_notice_not_before_expiry():
+    expires = datetime(2026, 7, 26, 14, 0)
+    assert not suspended_notice_due(expires, datetime(2026, 7, 26, 13, 0), set())
+
+
+def test_suspended_notice_stops_a_day_after_the_suspension_run():
+    expires = datetime(2026, 7, 26, 14, 0)
+    assert suspended_notice_due(expires, datetime(2026, 7, 28, 7, 50), set())
+    assert not suspended_notice_due(expires, datetime(2026, 7, 28, 8, 0), set())
+
+
+def test_suspended_notice_is_sent_once():
+    expires = datetime(2026, 7, 26, 14, 0)
+    assert not suspended_notice_due(expires, datetime(2026, 7, 27, 8, 10),
+                                    {EXPIRED_STAGE})
+
+
+def test_suspended_notice_waits_out_quiet_hours():
+    expires = datetime(2026, 7, 26, 14, 0)
+    assert not suspended_notice_due(expires, eat(2026, 7, 27, 23, 30), set())
+    assert suspended_notice_due(expires, eat(2026, 7, 28, 7, 0), set())
+
+
+def test_expired_stage_key_fits_the_column():
+    assert len(EXPIRED_STAGE) <= 8
+
+
+@pytest.mark.parametrize("amount,currency", [(None, "KES"), (1200.0, "KES"),
+                                             (125000.0, "KES"), (1250.0, "USD"),
+                                             (125000.0, "USD")])
+def test_suspended_sms_never_costs_more_than_one_segment(amount, currency):
+    assert count_segments(render_suspended_sms(amount, currency)) == 1
+
+
+def test_suspended_sms_names_the_amount():
+    assert "Pay KES 1,200" in render_suspended_sms(1200.0)
+    assert "Renew in the app" in render_suspended_sms(None)
+
+
+async def _reseller_suspended(db, *, expired_hours_ago: float, now: datetime,
+                              phone="254700111222", invoice=1200.0):
+    expires = now - timedelta(hours=expired_hours_ago)
+    reseller = await make_reseller(db, support_phone=phone,
+                                   subscription_status=SubscriptionStatus.SUSPENDED,
+                                   subscription_expires_at=expires)
+    if invoice is not None:
+        db.add(SubscriptionInvoice(
+            user_id=reseller.id,
+            period_start=expires - timedelta(days=30),
+            period_end=expires,
+            hotspot_revenue=0, hotspot_charge=0, pppoe_user_count=0,
+            pppoe_charge=0, gross_charge=invoice, final_charge=invoice,
+            status=InvoiceStatus.OVERDUE, due_date=expires,
+        ))
+        await db.commit()
+    return reseller, expires
+
+
+# 09:00 UTC = 12:00 EAT: just after the 08:00 UTC suspension run, outside quiet hours.
+AFTER_RUN = datetime(2026, 7, 27, 9, 0)
+
+
+@pytest.mark.asyncio
+async def test_scan_tells_a_just_suspended_reseller(db, no_provider_calls):
+    await make_reseller(db, role=UserRole.ADMIN)
+    reseller, expires = await _reseller_suspended(db, expired_hours_ago=10, now=AFTER_RUN)
+
+    result = await send_due_subscription_reminders(now=AFTER_RUN)
+    assert result["sent"] == 1
+
+    sms = (await db.execute(select(SmsMessage))).scalars().all()
+    assert len(sms) == 1
+    assert sms[0].kind == SmsMessageKind.ADMIN_TO_RESELLER
+    assert "suspended" in sms[0].body and "KES 1,200" in sms[0].body
+    inbox = (await db.execute(select(ResellerInboxMessage))).scalars().all()
+    assert [m.subject for m in inbox] == ["Your account is suspended"]
+    claim = (await db.execute(select(SubscriptionExpiryReminder))).scalar_one()
+    assert (claim.stage, claim.expires_at) == (EXPIRED_STAGE, expires)
+
+    # Next tick: nothing more.
+    assert (await send_due_subscription_reminders(now=AFTER_RUN + timedelta(minutes=10)))["sent"] == 0
+    assert len(no_provider_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_leaves_long_suspended_resellers_alone(db, no_provider_calls):
+    await make_reseller(db, role=UserRole.ADMIN)
+    await _reseller_suspended(db, expired_hours_ago=24 * 5, now=AFTER_RUN)
+
+    result = await send_due_subscription_reminders(now=AFTER_RUN)
+    assert result["sent"] == 0
+    assert no_provider_calls == []
+
+
+@pytest.mark.asyncio
+async def test_suspended_notice_skipped_once_they_have_paid(db):
+    await make_reseller(db, role=UserRole.ADMIN)
+    reseller, expires = await _reseller_suspended(db, expired_hours_ago=10, now=AFTER_RUN)
+    reseller.subscription_status = SubscriptionStatus.ACTIVE
+    reseller.subscription_expires_at = expires + timedelta(days=30)
+    await db.commit()
+
+    assert await send_expiry_reminder(reseller.id, EXPIRED_STAGE, expires,
+                                      now=AFTER_RUN) is None
+    assert (await db.execute(select(SmsMessage))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_suspended_notice_not_sent_to_an_active_reseller(db):
+    """The expired stage is only for accounts the run actually suspended."""
+    await make_reseller(db, role=UserRole.ADMIN)
+    reseller, expires = await _reseller_expiring(db, hours=-1)
+
+    assert await send_expiry_reminder(reseller.id, EXPIRED_STAGE, expires) is None
+    assert (await db.execute(select(SmsMessage))).scalars().all() == []

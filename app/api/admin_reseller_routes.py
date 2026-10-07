@@ -13,6 +13,7 @@ from app.db.models import (
     ResellerTransactionCharge,
     PaymentMethod, Payment, ProvisioningToken, Voucher,
     Subscription, SubscriptionStatus, SubscriptionInvoice, SubscriptionPayment,
+    SubscriptionExpiryReminder,
     CustomerRating, UserBandwidthUsage, FreeTrialClaim,
     MpesaTransaction, ProvisioningLog, BandwidthSnapshot,
     RouterLogEntry, RouterAvailabilityCheck,
@@ -2183,6 +2184,10 @@ async def delete_reseller(
 
     # 21d. Subscription invoices
     await db.execute(delete(SubscriptionInvoice).where(SubscriptionInvoice.user_id == reseller_id))
+
+    # 21d2. Subscription expiry reminder log (FK to users)
+    await db.execute(delete(SubscriptionExpiryReminder).where(
+        SubscriptionExpiryReminder.user_id == reseller_id))
 
     # 21e. Subscriptions
     await db.execute(delete(Subscription).where(Subscription.user_id == reseller_id))
