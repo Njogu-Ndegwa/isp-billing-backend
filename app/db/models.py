@@ -2094,6 +2094,10 @@ class MessagingSettings(Base):
     welcome_subject = Column(String(200), nullable=True)
     welcome_message_body = Column(String(2000), nullable=True)
     welcome_support_phone = Column(String(20), nullable=True)
+    # Texts + inbox messages to resellers before their Bitwave subscription
+    # expires (app/services/subscription_reminders.py). Platform-funded.
+    subscription_reminders_enabled = Column(Boolean, nullable=False, default=True,
+                                            server_default="true")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -2285,6 +2289,32 @@ class ResellerInboxMessage(Base):
     sent_sms = Column(Boolean, nullable=False, default=False, server_default="false")
     broadcast_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SubscriptionExpiryReminder(Base):
+    """One row per subscription reminder sent to a reseller.
+
+    The unique constraint IS the dedupe: a reseller gets each stage at most once
+    per ``subscription_expires_at`` value. When they pay, ``activate_subscription``
+    moves the expiry forward, which naturally makes the next cycle eligible again
+    without any cleanup. Also the admin dashboard's reminder log.
+
+    ``sms_message_id`` is deliberately not a foreign key: sent SMS rows are pruned
+    after ``messaging_settings.message_retention_days`` and must stay deletable.
+    """
+    __tablename__ = "subscription_expiry_reminders"
+    __table_args__ = (
+        UniqueConstraint("user_id", "stage", "expires_at",
+                         name="uq_subscription_expiry_reminder"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    stage = Column(String(8), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    sms_message_id = Column(Integer, nullable=True)
+    phone = Column(String(20), nullable=True)
+    inbox_sent = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 class FeedbackKind(str, enum.Enum):

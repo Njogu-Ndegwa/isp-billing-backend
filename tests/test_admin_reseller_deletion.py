@@ -22,6 +22,7 @@ from app.db.models import (
     SmsCreditTxnKind,
     SmsMessage,
     SmsMessageKind,
+    SubscriptionExpiryReminder,
     SubscriptionShareCode,
     UnmatchedC2BPayment,
     UnmatchedC2BReason,
@@ -152,6 +153,11 @@ async def test_delete_reseller_cleans_messaging_and_related_fk_rows(db, monkeypa
             username="guest",
             password="secret",
         ),
+        SubscriptionExpiryReminder(
+            user_id=reseller.id,
+            stage="t24",
+            expires_at=datetime.utcnow() + timedelta(hours=24),
+        ),
         unmatched,
     ])
     await db.commit()
@@ -176,6 +182,7 @@ async def test_delete_reseller_cleans_messaging_and_related_fk_rows(db, monkeypa
         ShopProduct,
         SubscriptionShareCode,
         AccessCredential,
+        SubscriptionExpiryReminder,
     ):
         assert await _count(db, model) == 0
 
