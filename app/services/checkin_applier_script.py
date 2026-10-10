@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import re
 
+from app.services.router_script_gate import with_gate
 from app.services.usage_push_auth import derive_checkin_token
 
 SCRIPT_NAME = "bitwave-checkin"
@@ -446,7 +447,7 @@ def render_checkin_applier_source(
     if check_certificate not in CHECK_CERTIFICATE_VALUES:
         raise ValueError(f"checkin applier: check_certificate must be one of {CHECK_CERTIFICATE_VALUES}")
     token = derive_checkin_token(identity)
-    return (
+    return with_gate(SCRIPT_NAME, (
         _TEMPLATE
         .replace("__URL__", endpoint_url)
         .replace("__TOKEN__", token)
@@ -455,7 +456,7 @@ def render_checkin_applier_source(
         .replace("__SCHED__", SCHEDULER_NAME)
         .replace("__CHECKCERT__", check_certificate)
         .replace("__OCAP__", str(int(MAX_OTHER_MACS)))
-    )
+    ))
 
 
 def scheduler_on_event() -> str:

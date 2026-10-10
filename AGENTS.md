@@ -145,6 +145,12 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   [`docs/agent-memory/realtime-push-rollout.md`](docs/agent-memory/realtime-push-rollout.md)
   and use `scripts/realtime_push_install.py`. Never copy a script off a live
   router: token and identity are per router.
+- Every Bitwave router script starts with the one-at-a-time gate
+  (`app/services/router_script_gate.py`): all schedulers use `start-time=startup`,
+  so without it the watchdog, reaper and push fire in the same second (RB951 at
+  100% CPU for ~4 s every minute, router 585, 2026-10-10). A new router script
+  must render through `with_gate`/`gate_rsc_body` and be added to
+  `GATED_SCRIPTS`. Existing routers: `scripts/router_script_gate_rollout.py`.
 
 ## Router Provisioning Gotchas
 
