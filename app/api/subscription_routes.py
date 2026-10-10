@@ -1,3 +1,5 @@
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -277,6 +279,25 @@ async def request_my_invoice(
     return {"current_invoice": enrich_invoice(invoice, 0.0), "generated": True}
 
 
+def normalize_kenyan_msisdn(raw: str) -> Optional[str]:
+    """``2547XXXXXXXX`` / ``2541XXXXXXXX`` for M-Pesa, or None if it can't be one.
+
+    Accepts 07.., 7.., +2547.., 2547.. with spaces or dashes, and the
+    "+2540712..." form resellers type (country code AND the leading 0), which
+    Daraja rejects as "Invalid PhoneNumber".
+    """
+    digits = re.sub(r"[\s\-()]", "", raw or "").lstrip("+")
+    if not digits.isdigit():
+        return None
+    if digits.startswith("2540"):
+        digits = "254" + digits[4:]
+    elif digits.startswith("0"):
+        digits = "254" + digits[1:]
+    elif len(digits) == 9:
+        digits = "254" + digits
+    return digits if re.fullmatch(r"254[17]\d{8}", digits) else None
+
+
 class SubscriptionPayRequest(BaseModel):
     invoice_id: int
     phone_number: str
@@ -325,11 +346,12 @@ async def pay_subscription(
     if amount < 1:
         raise HTTPException(status_code=400, detail="Amount must be at least KES 1")
 
-    phone = request.phone_number.strip()
-    if phone.startswith("0"):
-        phone = "254" + phone[1:]
-    elif phone.startswith("+"):
-        phone = phone[1:]
+    phone = normalize_kenyan_msisdn(request.phone_number)
+    if phone is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid Safaricom M-Pesa number, e.g. 0712345678.",
+        )
 
     reference = f"SUB-{invoice.id}"
 
@@ -362,7 +384,11 @@ async def pay_subscription(
         pending_payment.status = SubscriptionPaymentStatus.FAILED
         await db.commit()
         logger.error(f"[SUBSCRIPTION] STK push failed for reseller {user.id}: {e}")
-        raise HTTPException(status_code=502, detail=f"M-Pesa STK push failed: {str(e)}")
+        # 4xx, not 502: Cloudflare replaces a 502 body with its own page, which
+        # the browser can't read (CORS), so the reseller only saw "Failed to fetch".
+        if "Invalid PhoneNumber" in str(e):
+            raise HTTPException(status_code=400, detail="M-Pesa rejected this phone number. Use your Safaricom number, e.g. 0712345678.")
+        raise HTTPException(status_code=424, detail=f"M-Pesa STK push failed: {str(e)}")
 
     if stk_response:
         pending_payment.mpesa_checkout_request_id = stk_response.checkout_request_id
