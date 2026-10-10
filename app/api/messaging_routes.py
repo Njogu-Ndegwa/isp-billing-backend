@@ -22,7 +22,8 @@ from app.services import customer_expiry_notifications, sms_credits, sms_dispatc
 from app.services import customer_sms_templates as sms_templates
 from app.services.markets import reseller_market
 from app.services.messaging import accounts as provider_accounts
-from app.services.messaging import count_segments, resolve_sender_id
+from app.services.messaging import count_segments, gateway_health, resolve_sender_id
+from app.services.messaging.failure_reasons import describe as describe_failure
 from app.services.mpesa import initiate_stk_push_direct
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,18 @@ async def get_credits(db: AsyncSession = Depends(get_db),
         "gateway": gateway,
         "bills_platform_credits": gateway["bills_platform_credits"],
     }
+
+
+@router.get("/api/messaging/gateway/status")
+async def get_gateway_status(refresh: bool = Query(False),
+                             db: AsyncSession = Depends(get_db),
+                             token: str = Depends(verify_token)):
+    """Is SMS going out, and if not, why — plus the own gateway's live balance.
+
+    `refresh=true` skips the ~60 s balance cache (the "check now" button).
+    """
+    user = await _require_reseller(token, db)
+    return await gateway_health.status(db, user.id, force_balance=refresh)
 
 
 # ---- Automatic expiry reminders -----------------------------------------
@@ -569,18 +582,37 @@ async def campaign_detail(campaign_id: int, db: AsyncSession = Depends(get_db),
         .outerjoin(Customer, (SmsMessage.customer_id == Customer.id) & (Customer.user_id == user.id))
         .where(SmsMessage.campaign_id == campaign_id).limit(2000)
     )).all()
+    # Which of these rows went out on the reseller's own gateway decides who a
+    # failure reason addresses: them (fix your key) or us (platform problem).
+    own_accounts = {
+        a.id: a.provider
+        for a in await provider_accounts.list_accounts(db, user.id)
+    }
     counts = {"total": 0, "sent": 0, "failed": 0, "queued": 0, "delivered": 0}
     messages = []
+    by_reason: dict[str, dict] = {}
     for m, name in rows:
         st = m.status.value if hasattr(m.status, "value") else m.status
         counts["total"] += 1
         if st in counts:
             counts[st] += 1
+        reason = None
+        if st == "failed":
+            own_provider = own_accounts.get(m.provider_account_id)
+            reason = describe_failure(
+                m.error, own_gateway=own_provider is not None,
+                provider_label=gateway_health.provider_label(own_provider),
+            )
+            summary = by_reason.setdefault(reason["code"], {
+                k: reason[k] for k in ("code", "title", "explanation", "action", "severity")
+            } | {"count": 0})
+            summary["count"] += 1
         messages.append({"phone": m.recipient_phone, "name": name,
-                         "status": st, "error": m.error})
+                         "status": st, "error": m.error, "reason": reason})
     return {"id": camp.id,
             "status": camp.status.value if hasattr(camp.status, "value") else camp.status,
-            "counts": counts, "messages": messages}
+            "counts": counts, "messages": messages,
+            "failure_reasons": sorted(by_reason.values(), key=lambda r: -r["count"])}
 
 
 # ---- Inbox (admin -> reseller) --------------------------------------------
