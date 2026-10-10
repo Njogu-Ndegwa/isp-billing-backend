@@ -17,6 +17,7 @@ from app.db.models import (
     ProvisioningAttempt, ProvisioningAttemptEntrypoint,
     ProvisioningAttemptSource, DevicePairing, ReconnectionAttempt,
     FapshiTransaction, ZenoPayTransaction, MtnMomoTransaction,
+    CustomerUsageBucket, C2BTransaction, UnmatchedC2BPayment, SmsMessage,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -503,11 +504,26 @@ async def delete_customer(
         await db.execute(delete(CustomerRating).where(CustomerRating.customer_id == customer_id))
         await db.execute(delete(UserBandwidthUsage).where(UserBandwidthUsage.customer_id == customer_id))
         await db.execute(delete(CustomerUsagePeriod).where(CustomerUsagePeriod.customer_id == customer_id))
+        await db.execute(delete(CustomerUsageBucket).where(CustomerUsageBucket.customer_id == customer_id))
         await db.execute(delete(UsageCapWatchState).where(UsageCapWatchState.customer_id == customer_id))
         await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id == customer_id))
         await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.customer_id == customer_id))
         await db.execute(delete(DevicePairing).where(DevicePairing.customer_id == customer_id))
         await db.execute(delete(ReconnectionAttempt).where(ReconnectionAttempt.customer_id == customer_id))
+
+        # Reseller-scoped records (matched_reseller_id / assigned_reseller_id /
+        # user_id): keep them, drop only the link to the deleted customer.
+        await db.execute(
+            update(C2BTransaction)
+            .where(C2BTransaction.matched_customer_id == customer_id)
+            .values(matched_customer_id=None)
+        )
+        await db.execute(
+            update(UnmatchedC2BPayment)
+            .where(UnmatchedC2BPayment.resolution_customer_id == customer_id)
+            .values(resolution_customer_id=None)
+        )
+        await db.execute(update(SmsMessage).where(SmsMessage.customer_id == customer_id).values(customer_id=None))
 
         # CustomerPayment: NULL out customer FK to preserve revenue history.
         # Balance calculations read CustomerPayment, so this keeps all totals intact.
