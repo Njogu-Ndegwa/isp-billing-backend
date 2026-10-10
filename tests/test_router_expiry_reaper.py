@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from app.db.models import ConnectionType, CustomerStatus, ProvisioningLog
 from app.services import mikrotik_background
-from app.services.expiry_reaper_script import render_expiry_reaper_script, script_source
+from app.services.expiry_reaper_script import SCRIPT_NAME, render_expiry_reaper_script, script_source
 from app.services.router_expiry import (
     CustomerRow,
     binding_comment,
@@ -24,6 +24,7 @@ from app.services.router_expiry import (
     render_reply,
     with_exp_tag,
 )
+from app.services.router_script_gate import render_gate, strip_gate
 from app.services.usage_push_auth import derive_router_token
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
@@ -131,7 +132,8 @@ def test_script_rejects_unsafe_inputs():
 
 def test_script_source_is_the_body_only():
     src = script_source(_script())
-    assert src.lstrip().startswith(":global bwExpNext")
+    assert src.startswith(render_gate(SCRIPT_NAME))
+    assert strip_gate(src).lstrip().startswith(":global bwExpNext")
     assert "/system scheduler add" not in src
     assert src.count("{") == src.count("}")
 

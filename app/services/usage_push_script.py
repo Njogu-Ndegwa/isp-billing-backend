@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 
+from app.services.router_script_gate import gate_rsc_body
 from app.services.usage_push_auth import derive_router_token
 
 # Identities we generate look like ``Router-0721``; refuse anything else rather
@@ -498,7 +499,7 @@ def render_realtime_push_script(
         raise ValueError("usage-push script: interval must be 5..3600 seconds")
     if not (2 <= int(lists_every) <= 15):
         raise ValueError("usage-push script: lists_every must be 2..15")
-    return (
+    return gate_rsc_body(SCRIPT_NAME, (
         _REALTIME_TEMPLATE
         .replace("__SCRIPT__", SCRIPT_NAME)
         .replace("__LOGOUT__", LOGOUT_SCRIPT_NAME)
@@ -509,4 +510,4 @@ def render_realtime_push_script(
         .replace("__WAN__", wan)
         .replace("__INTERVAL__", str(int(interval_seconds)))
         .replace("__LISTS_EVERY__", str(int(lists_every)))
-    )
+    ))

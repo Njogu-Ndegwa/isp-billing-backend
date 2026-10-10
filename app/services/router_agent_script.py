@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from app.services.router_agent_auth import derive_router_agent_token
+from app.services.router_script_gate import with_gate
 
 
 SCRIPT_NAME = "bitwave-command-agent"
@@ -58,7 +59,7 @@ def render_router_agent_source(
         else f':if ([/ping {probe_ip} count=1 interval=500ms] > 0) do={{ :set tunnel "up" }}'
     )
 
-    return f""":global bitwaveAgentRuntimeVersion
+    return with_gate(SCRIPT_NAME, f""":global bitwaveAgentRuntimeVersion
 :global bitwaveAgentRunning
 :global bitwaveAgentLockTicks
 :global bitwaveAgentFailures
@@ -130,7 +131,7 @@ def render_router_agent_source(
 :do {{ /file remove [find name=$fileName] }} on-error={{}}
 :set bitwaveAgentRunning false
 :set bitwaveAgentLockTicks 0
-"""
+""")
 
 
 def rollback_router_agent_rsc() -> str:

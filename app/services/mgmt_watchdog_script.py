@@ -36,6 +36,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from app.services.router_script_gate import with_gate
+
 KIND_SSTP = "sstp"
 KIND_WG = "wg"
 
@@ -207,8 +209,8 @@ def splay_seconds(kind: str, mgmt_ip: Optional[str]) -> int:
 
 def render_watchdog_source(kind: str, mgmt_ip: Optional[str]) -> str:
     """The ``source`` of the watchdog script for this router."""
-    script_name(kind)  # validates kind
-    return _TEMPLATES[kind].replace("__SPLAY__", f"{splay_seconds(kind, mgmt_ip)}s")
+    name = script_name(kind)  # validates kind
+    return with_gate(name, _TEMPLATES[kind].replace("__SPLAY__", f"{splay_seconds(kind, mgmt_ip)}s"))
 
 
 def _data(res) -> list:

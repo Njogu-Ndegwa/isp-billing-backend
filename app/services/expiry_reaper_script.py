@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 
+from app.services.router_script_gate import gate_rsc_body
 from app.services.usage_push_auth import derive_router_token
 
 SCRIPT_VERSION = 2
@@ -341,7 +342,7 @@ def render_expiry_reaper_script(*, identity: str, tunnel_url: str, public_url: s
     identity = _require(identity, _IDENTITY_RE, "identity")
     tunnel_url = _require(tunnel_url, _URL_RE, "tunnel_url")
     public_url = _require(public_url, _URL_RE, "public_url")
-    return (
+    return gate_rsc_body(SCRIPT_NAME, (
         _TEMPLATE
         .replace("__SCRIPT__", SCRIPT_NAME)
         .replace("__SCHED__", SCHEDULER_NAME)
@@ -352,7 +353,7 @@ def render_expiry_reaper_script(*, identity: str, tunnel_url: str, public_url: s
         .replace("__TOKEN__", derive_router_token(identity))
         .replace("__IDENT__", identity)
         .replace("__VERSION__", str(SCRIPT_VERSION))
-    )
+    ))
 
 
 def script_source(rendered: str) -> str:
