@@ -562,3 +562,29 @@ async def test_reset_session_is_pppoe_only(db):
     with pytest.raises(HTTPException) as exc:
         await customer_audit_routes.reset_customer_session(customer.id, db, _token(reseller))
     assert exc.value.status_code == 400
+
+
+def test_outage_already_in_progress_is_measured_from_its_start():
+    t = datetime(2026, 10, 11, 12, 0, 0)
+    # Window starts at 12:00; the router went down at 09:00, last good at 08:55.
+    checks = [(t + timedelta(minutes=10), False), (t + timedelta(minutes=25), True)]
+    items = customer_audit_routes._router_status_items(
+        checks, 7, seed_online=False, seed_went_down=t - timedelta(hours=3))
+    assert [i["event_type"] for i in items] == ["router_online"]
+    assert "after 3h 25m" in items[0]["message"]
+    # Start unknown: no made-up duration.
+    items = customer_audit_routes._router_status_items(checks, 7, seed_online=False, seed_went_down=None)
+    assert items[0]["message"] == "Router answering again"
+
+
+def test_custom_welcome_wording_still_hides_the_password():
+    body = "Karibu! Nenosiri lako ni Xy9z8w7v. Lipa kupitia Paybill 4699342"
+    shown = customer_audit_routes.redact_sms(body, "Xy9z8w7v")
+    assert "Xy9z8w7v" not in shown and "Paybill 4699342" in shown
+
+
+def test_offset_times_are_converted_not_dropped():
+    from datetime import timezone as tz
+    eat = tz(timedelta(hours=3))
+    assert customer_audit_routes._naive_utc(datetime(2026, 10, 11, 15, 0, tzinfo=eat)) == datetime(2026, 10, 11, 12, 0)
+    assert customer_audit_routes._naive_utc(datetime(2026, 10, 11, 15, 0)) == datetime(2026, 10, 11, 15, 0)

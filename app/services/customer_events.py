@@ -29,6 +29,7 @@ from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from app.db import database as db_module
 from app.db.database import db_pool_snapshot
@@ -211,9 +212,18 @@ async def flush_customer_events() -> int:
     except Exception as exc:
         logger.warning("[AUDIT] flush of %d customer events failed, retrying one by one: %s", len(batch), exc)
     written = 0
-    for row in batch:
+    for index, row in enumerate(batch):
+        if _pool_busy():
+            # The database is the problem, not a row: keep the rest for later.
+            _buffer.extendleft(reversed(batch[index:]))
+            break
         try:
             written += await store_event_rows([row])
+        except (OperationalError, InterfaceError, TimeoutError, OSError) as exc:
+            _buffer.extendleft(reversed(batch[index:]))
+            logger.warning("[AUDIT] database unavailable, keeping %d events for later: %s",
+                           len(batch) - index, exc)
+            break
         except Exception as exc:
             logger.warning("[AUDIT] dropped customer event %s for customer %s: %s",
                            row.get("event_type"), row.get("customer_id"), exc)

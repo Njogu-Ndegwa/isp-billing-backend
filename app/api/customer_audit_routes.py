@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -62,6 +62,13 @@ ROUTER_LOG_PULL_ROUTER_COOLDOWN_SECONDS = 10
 _last_pull: dict[int, datetime] = {}
 _last_router_pull: dict[int, datetime] = {}
 
+
+def _trim(store: dict, now: datetime, keep_seconds: int = 300) -> None:
+    """Forget cooldowns long expired, so the maps never grow with the fleet."""
+    if len(store) > 1000:
+        for key in [k for k, at in store.items() if (now - at).total_seconds() > keep_seconds]:
+            store.pop(key, None)
+
 # Router reachability is folded into the timeline for at most this far back.
 ROUTER_STATUS_WINDOW = timedelta(days=14)
 ROUTER_STATUS_MAX_CHECKS = 5000
@@ -71,9 +78,17 @@ ROUTER_STATUS_MAX_CHECKS = 5000
 _RE_SECRET_IN_SMS = re.compile(r"(?i)(\bpass(?:word|wd)?\b\s*[:=]?\s*)([^\s.,;]+)")
 
 
-def redact_sms(body: Optional[str]) -> Optional[str]:
+def redact_sms(body: Optional[str], secret: Optional[str] = None) -> Optional[str]:
+    """Mask passwords in an SMS body.
+
+    The pattern catches the built-in wording; a reseller's own template may say
+    it any way ("Nenosiri: ..."), so the customer's actual password is blanked
+    wherever it appears too.
+    """
     if not body:
         return body
+    if secret and len(secret) >= 4:
+        body = body.replace(secret, "\u2022" * 6)
     return _RE_SECRET_IN_SMS.sub(lambda m: m.group(1) + "\u2022" * 6, body)
 
 
@@ -124,6 +139,13 @@ def _bounded(stmt, column, before, after, inclusive=False):
     return stmt
 
 
+def _naive_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Stored times are naive UTC; an offset like +03:00 is converted, not dropped."""
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _in_window(at, before, after, inclusive=False) -> bool:
     if at is None:
         return False
@@ -132,16 +154,19 @@ def _in_window(at, before, after, inclusive=False) -> bool:
     return after is None or at >= after
 
 
-def _router_status_items(checks, router_id, window_start) -> list[dict]:
-    """Turn reachability polls into "went offline" / "back online" entries."""
+def _router_status_items(checks, router_id, seed_online=None, seed_went_down=None) -> list[dict]:
+    """Turn reachability polls into "went offline" / "back online" entries.
+
+    ``seed_online`` is the router's state just before the first check (None if
+    unknown) and ``seed_went_down`` when an outage already in progress began,
+    so an outage that started before the window is measured from its start.
+    """
     out: list[dict] = []
-    went_down = None
-    previous = None
+    went_down = seed_went_down if seed_online is False else None
+    previous = seed_online
     for checked_at, is_online in checks:
         if previous is None:
             previous = is_online
-            if not is_online:
-                went_down = checked_at
             continue
         if previous and not is_online:
             went_down = checked_at
@@ -152,10 +177,11 @@ def _router_status_items(checks, router_id, window_start) -> list[dict]:
                 severity="warning", router_id=router_id, ref=f"rt-down:{router_id}:{checked_at.isoformat()}",
             ))
         elif not previous and is_online:
+            # Only a duration we actually saw start is stated.
             down_for = (checked_at - went_down) if went_down else None
             from app.services.customer_events import format_duration
             text = "Router answering again"
-            if down_for is not None and went_down >= window_start:
+            if down_for is not None:
                 text += f" after {format_duration(int(down_for.total_seconds()))}"
             out.append(_item(
                 checked_at, "router", "router_online", text,
@@ -214,6 +240,24 @@ async def _summary(db: AsyncSession, customer: Customer) -> dict:
     }
 
 
+_ENTRYPOINT_WORDS = {
+    "hotspot_payment": "a payment",
+    "hotspot_reconciliation": "a payment check",
+    "voucher_direct_api": "a voucher",
+    "manual_transaction_provision": "a manual activation",
+    "subscription_share": "a shared subscription",
+    "outage_compensation": "outage compensation",
+    "free_trial": "a free trial",
+}
+_STATE_WORDS = {
+    "scheduled": "queued",
+    "in_progress": "in progress",
+    "retry_pending": "router not reached yet, will retry",
+    "router_updated": "done",
+    "failed": "failed",
+}
+
+
 @router.get("/api/customers/{customer_id}/audit-log")
 async def customer_audit_log(
     customer_id: int,
@@ -231,11 +275,11 @@ async def customer_audit_log(
     token: str = Depends(verify_token),
 ):
     customer, _user = await _load_customer(db, customer_id, token)
-    before = before.replace(tzinfo=None) if before else None
-    after = after.replace(tzinfo=None) if after else None
+    before = _naive_utc(before)
+    after = _naive_utc(after)
     inclusive = cursor is not None
     if cursor is not None:
-        before = cursor.replace(tzinfo=None)
+        before = _naive_utc(cursor)
     wanted = set(CATEGORIES)
     if categories:
         wanted = {c.strip() for c in categories.split(",") if c.strip()}
@@ -327,7 +371,9 @@ async def customer_audit_log(
         ).order_by(ProvisioningAttempt.created_at.desc()).limit(limit)
         for att in _note((await db.execute(stmt)).scalars().all(), lambda r: r.created_at):
             state = att.provisioning_state.value if att.provisioning_state else "scheduled"
-            text = f"Putting customer on the router after {att.entrypoint.value.replace('_', ' ')}: {state.replace('_', ' ')}"
+            entry = att.entrypoint.value if att.entrypoint else ""
+            text = (f"Giving internet access after {_ENTRYPOINT_WORDS.get(entry, entry.replace('_', ' '))}: "
+                    f"{_STATE_WORDS.get(state, state.replace('_', ' '))}")
             if att.attempt_count and att.attempt_count > 1:
                 text += f" after {att.attempt_count} tries"
             if att.last_error and state != "router_updated":
@@ -342,12 +388,22 @@ async def customer_audit_log(
                          "reference": att.external_reference},
                 ref=f"att:{att.id}",
             ))
-            if _in_window(att.access_seen_at, before, after, inclusive):
-                items.append(_item(
-                    att.access_seen_at, "provisioning", "access_confirmed",
-                    f"Access confirmed on the router{' via ' + att.delivered_via if att.delivered_via else ''}",
-                    router_id=att.router_id, ref=f"att-ok:{att.id}",
-                ))
+
+        # Read by their own time, so a confirmation is shown even when the
+        # attempt it belongs to falls on another page.
+        stmt = _bounded(
+            select(ProvisioningAttempt).where(
+                ProvisioningAttempt.customer_id == customer_id,
+                ProvisioningAttempt.access_seen_at.isnot(None),
+            ),
+            ProvisioningAttempt.access_seen_at, before, after, inclusive,
+        ).order_by(ProvisioningAttempt.access_seen_at.desc()).limit(limit)
+        for att in _note((await db.execute(stmt)).scalars().all(), lambda r: r.access_seen_at):
+            items.append(_item(
+                att.access_seen_at, "provisioning", "access_confirmed",
+                "Internet access confirmed on the router",
+                router_id=att.router_id, ref=f"att-ok:{att.id}",
+            ))
 
         stmt = _bounded(
             select(ProvisioningLog).where(ProvisioningLog.customer_id == customer_id),
@@ -400,7 +456,7 @@ async def customer_audit_log(
             items.append(_item(
                 sms.created_at, "messages", f"sms_{status}", text,
                 severity="warning" if status == "failed" else "info",
-                details={"body": redact_sms(sms.body), "provider": sms.provider, "category": sms.category,
+                details={"body": redact_sms(sms.body, customer.pppoe_password), "provider": sms.provider, "category": sms.category,
                          "segments": sms.segments},
                 ref=f"sms:{sms.id}",
             ))
@@ -445,7 +501,33 @@ async def customer_audit_log(
             .order_by(RouterAvailabilityCheck.checked_at.desc())
             .limit(ROUTER_STATUS_MAX_CHECKS)
         )).all()
-        status_items = _router_status_items(list(reversed(checks)), customer.router_id, window_start)
+        seed = (await db.execute(
+            select(RouterAvailabilityCheck.checked_at, RouterAvailabilityCheck.is_online)
+            .where(RouterAvailabilityCheck.router_id == customer.router_id,
+                   RouterAvailabilityCheck.checked_at < window_start)
+            .order_by(RouterAvailabilityCheck.checked_at.desc()).limit(1)
+        )).first()
+        seed_online = seed.is_online if seed else None
+        seed_went_down = None
+        if seed is not None and not seed.is_online:
+            # The outage began at the first check after the last good one.
+            last_up = (await db.execute(
+                select(func.max(RouterAvailabilityCheck.checked_at)).where(
+                    RouterAvailabilityCheck.router_id == customer.router_id,
+                    RouterAvailabilityCheck.checked_at < window_start,
+                    RouterAvailabilityCheck.is_online.is_(True),
+                )
+            )).scalar_one_or_none()
+            if last_up is not None:
+                seed_went_down = (await db.execute(
+                    select(func.min(RouterAvailabilityCheck.checked_at)).where(
+                        RouterAvailabilityCheck.router_id == customer.router_id,
+                        RouterAvailabilityCheck.checked_at > last_up,
+                    )
+                )).scalar_one_or_none()
+        status_items = _router_status_items(
+            list(reversed(checks)), customer.router_id, seed_online, seed_went_down,
+        )
         if status_items:
             page = sorted(page + status_items, key=lambda i: i["occurred_at"] or "", reverse=True)
 
@@ -549,6 +631,8 @@ async def pull_customer_router_logs(
     info = router_info_of(router_obj)
     await db.commit()  # nothing held across the router read
 
+    _trim(_last_pull, now)
+    _trim(_last_router_pull, now)
     _last_pull[customer_id] = now
     _last_router_pull[router_id] = now
     ppp_customer = (customer.id, customer.user_id, customer.pppoe_username) if customer.pppoe_username else None
@@ -633,6 +717,7 @@ async def reset_customer_session(
     owner_id = customer.user_id
     await db.commit()  # nothing held across the router call
 
+    _trim(_last_reset, now)
     _last_reset[customer_id] = now
     from app.services.router_concurrency import run_with_guard
 
