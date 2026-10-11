@@ -2989,6 +2989,36 @@ async def run_customer_event_migrations():
     logger.info("Customer event migrations complete")
 
 
+async def run_customer_audit_index_migrations():
+    """Indexes for the per-customer audit log's reads (Postgres only).
+
+    GET /api/customers/{id}/audit-log reads provisioning_logs and
+    reconnection_attempts by customer_id, newest first; neither had an index
+    on it. Same pattern as run_hot_path_index_migrations: CONCURRENTLY,
+    outside a transaction, invalid leftovers dropped and rebuilt.
+    """
+    if async_engine.dialect.name != "postgresql":
+        return
+    indexes = (
+        ("ix_provisioning_logs_customer_date", "provisioning_logs", "(customer_id, log_date DESC)"),
+        ("ix_reconnection_attempts_customer_created", "reconnection_attempts", "(customer_id, created_at DESC)"),
+    )
+    async with async_engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(sa_text("SET maintenance_work_mem = '16MB'"))
+        await conn.execute(sa_text("SET max_parallel_maintenance_workers = 0"))
+        for name, table, columns in indexes:
+            valid = (await conn.execute(sa_text(
+                f"SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('public.{name}')"
+            ))).scalar_one_or_none()
+            if valid is False:
+                await conn.execute(sa_text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{name}"))
+            await conn.execute(sa_text(
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON public.{table} {columns}"
+            ))
+    logger.info("Customer audit index migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     if shadow_mode_enabled():
@@ -3259,6 +3289,11 @@ async def startup_event():
         await run_customer_event_migrations()
     except Exception as e:
         logger.error(f"Customer event migration failed (non-fatal): {e}")
+
+    try:
+        await run_customer_audit_index_migrations()
+    except Exception as e:
+        logger.error(f"Customer audit index migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
     if not scheduler_enabled():

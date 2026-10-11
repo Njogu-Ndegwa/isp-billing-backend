@@ -154,7 +154,10 @@ class IngestResult:
     live_hotspot_customers: dict[str, int] = field(default_factory=dict)
     # "pppoe:<username>" -> customer id, for PPPoE customers live on this router.
     live_pppoe_customers: dict[str, int] = field(default_factory=dict)
-    # True once the two maps above were built from this router's customers.
+    # "pppoe:<username>" -> customer id for EVERY PPPoE customer on the router,
+    # live or not: the audit log must see the session that expiry cuts.
+    known_pppoe_customers: dict[str, int] = field(default_factory=dict)
+    # True once the maps above were built from this router's customers.
     # Empty maps on an early return mean "not looked at", not "nobody live".
     customers_resolved: bool = False
     errors: list[str] = field(default_factory=list)
@@ -402,6 +405,8 @@ async def ingest_usage_reports(
         ).scalars().all()
         index = _index_customers(owned, now)
         for key, customer in index.items():
+            if key.startswith("pppoe:"):
+                result.known_pppoe_customers[key] = customer.id
             if (
                 not key.startswith("pppoe:")
                 and customer.plan is not None

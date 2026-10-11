@@ -96,6 +96,10 @@ class RouterClock:
     local_now: datetime
     offset_minutes: int
     trusted: bool  # False when the router clock is unset (no RTC, no NTP yet)
+    # Our UTC clock when the router's clock was read. Stamps are converted by
+    # their distance from local_now, so neither the router's time zone setting
+    # nor its drift leaks into the stored time.
+    fetched_utc: Optional[datetime] = None
 
     @classmethod
     def from_clock_print(cls, row: Optional[dict], fallback_utc: datetime) -> "RouterClock":
@@ -113,9 +117,11 @@ class RouterClock:
         expected = fallback_utc + timedelta(minutes=offset)
         # A clock more than a day off is unset or wrong; its stamps are useless.
         trusted = abs((local_now - expected).total_seconds()) < 86400
-        return cls(local_now=local_now, offset_minutes=offset, trusted=trusted)
+        return cls(local_now=local_now, offset_minutes=offset, trusted=trusted, fetched_utc=fallback_utc)
 
     def to_utc(self, local: datetime) -> datetime:
+        if self.fetched_utc is not None:
+            return self.fetched_utc - (self.local_now - local)
         return local - timedelta(minutes=self.offset_minutes)
 
 
@@ -175,6 +181,12 @@ _RE_MAC_IN_TEXT = re.compile(r"(?<![0-9A-Fa-f:])[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}
 _RE_TOKEN = re.compile(r"[A-Za-z0-9._@-]+")
 # A 1-3 character username would match half the log.
 MIN_USERNAME_LENGTH = 4
+# Stamps before this year come from a router whose clock was not yet set.
+MIN_PLAUSIBLE_YEAR = 2020
+# A username is only looked for in lines from the services that log in users;
+# a DHCP or Wi-Fi line names devices by MAC, and a common-word username
+# ("home") would otherwise match unrelated text there.
+USERNAME_TOPICS = ("ppp", "hotspot", "radius")
 
 
 @dataclass
@@ -188,8 +200,9 @@ class CustomerIndex:
 
     Lookups are by token, so a router with thousands of customers costs the
     same per line as one with a single customer. A username matches only as a
-    whole token, so "john" never matches "john2" or "john.doe"; RouterOS
-    writes the interface as "<pppoe-john>", so a "pppoe-" prefix is peeled off.
+    whole token and only in PPP/hotspot lines, so "john" never matches "john2"
+    or "john.doe". RouterOS writes the interface as "<pppoe-john>", so a
+    "pppoe-" prefix is peeled off.
     """
 
     def __init__(self) -> None:
@@ -204,7 +217,9 @@ class CustomerIndex:
         macs: Iterable[Optional[str]] = (),
     ) -> None:
         ref = CustomerRef(customer_id, user_id)
-        username = (pppoe_username or "").strip().lower()
+        # RouterOS user names are case-sensitive: "John" and "john" are two
+        # accounts, so they are matched exactly.
+        username = (pppoe_username or "").strip()
         if len(username) >= MIN_USERNAME_LENGTH:
             self.by_username.setdefault(username, ref)
         for mac in macs:
@@ -215,10 +230,11 @@ class CustomerIndex:
     def __len__(self) -> int:
         return len(self.by_username) + len(self.by_mac)
 
-    def match(self, message: str) -> Optional[tuple[CustomerRef, str]]:
-        if self.by_username:
+    def match(self, message: str, topics: str = "ppp") -> Optional[tuple[CustomerRef, str]]:
+        lowered_topics = (topics or "").lower()
+        if self.by_username and any(t in lowered_topics for t in USERNAME_TOPICS):
             for token in _RE_TOKEN.findall(message):
-                token = token.lower().rstrip(".-")
+                token = token.rstrip(".-")
                 ref = self.by_username.get(token)
                 if ref is None and token.startswith("pppoe-"):
                     ref = self.by_username.get(token[len("pppoe-"):])
@@ -279,11 +295,17 @@ def match_log_entries(
         if not message or not _topic_allowed(topics):
             continue
         local = parse_log_time(raw_time, clock) if clock.trusted else None
-        stamp = local.isoformat() if local else raw_time
+        if local is not None and local.year < MIN_PLAUSIBLE_YEAR:
+            # Written before the router's clock was set (hAP lite after a
+            # reboot: "jan/02/1970"). The time is meaningless; skip the line.
+            continue
+        # Without a usable clock the raw stamp repeats after every reboot, so
+        # the read date is part of the key: same day, same line = duplicate.
+        stamp = local.isoformat() if local else f"{fetched_at:%Y-%m-%d}|{raw_time}"
         occurrence = seen.get((stamp, message), 0)
         seen[(stamp, message)] = occurrence + 1
 
-        found = index.match(message)
+        found = index.match(message, topics)
         if found is None:
             continue
         ref, matched_on = found
@@ -315,8 +337,9 @@ def match_log_entries(
 # RouterOS read (sync, runs in the router guard's thread)
 # ---------------------------------------------------------------------------
 
-def fetch_router_log_sync(router_info: dict) -> dict:
-    """One connection: the router clock and the whole in-memory log."""
+def fetch_router_log_sync(router_info: dict, ppp_username: Optional[str] = None) -> dict:
+    """One connection: the router clock, the whole in-memory log and, for one
+    PPPoE user, the secret's record of its last disconnect (RouterOS 7)."""
     from app.services.mikrotik_api import MikroTikAPI
 
     api = MikroTikAPI(
@@ -337,12 +360,67 @@ def fetch_router_log_sync(router_info: dict) -> dict:
         logs = api.send_command_optimized("/log/print", proplist=["time", "topics", "message"])
         if not logs.get("success"):
             return {"error": logs.get("error") or "log_read_failed"}
-        return {"success": True, "clock": clock_row, "entries": logs.get("data", [])}
+        secret_row = None
+        if ppp_username:
+            try:
+                secret = api.send_command_optimized(
+                    "/ppp/secret/print",
+                    proplist=["name", "last-logged-out", "last-caller-id", "last-disconnect-reason"],
+                    query=f"?name={ppp_username}",
+                )
+                if secret.get("success") and secret.get("data"):
+                    secret_row = secret["data"][0]
+            except Exception as exc:  # RouterOS 6 has no such fields; not fatal
+                logger.debug("ppp secret read failed: %s", exc)
+        return {"success": True, "clock": clock_row, "entries": logs.get("data", []), "secret": secret_row}
     except Exception as exc:
         logger.warning("router log read failed: %s", exc)
         return {"error": str(exc)}
     finally:
         api.disconnect()
+
+
+# RouterOS 7 /ppp secret last-disconnect-reason values, in a reseller's words.
+DISCONNECT_REASONS = {
+    "peer-request": "the customer's router asked to disconnect (restart or reconfiguration)",
+    "hung-up": "the customer's router hung up",
+    "idle-timeout": "the session was idle too long",
+    "session-timeout": "the session reached its time limit",
+    "reset": "the session was reset",
+    "reboot": "the MikroTik rebooted",
+    "port-error": "the link to the customer failed (power, cable or radio)",
+    "nas-error": "the MikroTik had an internal error",
+    "nas-request": "the MikroTik or billing system disconnected it (for example on expiry)",
+}
+
+
+def last_disconnect_row(router_id: int, secret: Optional[dict], clock: RouterClock,
+                        customer_id: int, user_id: Optional[int], fetched_at: datetime) -> Optional[dict]:
+    """The secret's own record of the last disconnect, as one router_log row."""
+    if not secret:
+        return None
+    reason = (secret.get("last-disconnect-reason") or "").strip()
+    logged_out = (secret.get("last-logged-out") or "").strip()
+    if not reason or not logged_out or logged_out.startswith("1970") or logged_out.lower().startswith("jan/01/1970"):
+        return None
+    local = parse_log_time(logged_out, clock) if clock.trusted else None
+    if local is not None and local.year < MIN_PLAUSIBLE_YEAR:
+        return None
+    caller = (secret.get("last-caller-id") or "").strip()
+    plain = DISCONNECT_REASONS.get(reason, reason.replace("-", " "))
+    severity = "warning" if reason in ("port-error", "nas-error", "hung-up") else "info"
+    return {
+        "customer_id": customer_id, "user_id": user_id, "router_id": router_id,
+        "occurred_at": clock.to_utc(local) if local else fetched_at,
+        "category": "router_log", "event_type": "last_disconnect", "severity": severity,
+        "source": "router_log",
+        "message": f"Router's record of the last disconnect: {reason} ({plain})"
+                   + (f", device {caller}" if caller else ""),
+        "details": {"router_time": logged_out[:40], "reason": reason, "caller_id": caller,
+                    "time_estimated": local is None},
+        "dedup_key": hashlib.sha256(
+            f"ld|{router_id}|{customer_id}|{logged_out}|{reason}".encode()).hexdigest(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -362,10 +440,13 @@ async def capture_router_logs(
     index: CustomerIndex,
     *,
     acquire_timeout_seconds: Optional[float] = None,
+    ppp_customer: Optional[tuple[int, Optional[int], str]] = None,
 ) -> dict:
     """Read one router's log, keep the lines that name a customer in ``index``.
 
-    RouterOS I/O first, then one short write session — never both at once.
+    ``ppp_customer`` = (customer_id, owner id, PPPoE username) also reads that
+    user's last-disconnect record. RouterOS I/O first, then one short write
+    session — never both at once.
     """
     from app.services.customer_events import store_event_rows
     from app.services.router_concurrency import run_with_guard
@@ -373,6 +454,7 @@ async def capture_router_logs(
     fetched_at = datetime.utcnow()
     raw = await run_with_guard(
         router_id, fetch_router_log_sync, router_info,
+        ppp_customer[2] if ppp_customer else None,
         acquire_timeout_seconds=acquire_timeout_seconds,
     )
     if raw.get("error"):
@@ -380,6 +462,12 @@ async def capture_router_logs(
     entries = raw.get("entries") or []
     clock = RouterClock.from_clock_print(raw.get("clock"), fetched_at)
     rows = match_log_entries(router_id, entries, clock, index, fetched_at)
+    matched = len(rows)
+    if ppp_customer:
+        last = last_disconnect_row(router_id, raw.get("secret"), clock,
+                                   ppp_customer[0], ppp_customer[1], fetched_at)
+        if last:
+            rows.append(last)
     stored = await store_event_rows(rows) if rows else 0
     oldest = None
     for entry in entries[:1]:
@@ -388,7 +476,7 @@ async def capture_router_logs(
     return {
         "success": True,
         "lines_read": len(entries),
-        "matched": len(rows),
+        "matched": matched,
         "stored": stored,
         # How far back the router's log reaches right now; anything older
         # is only here if it was captured earlier.
@@ -399,7 +487,9 @@ async def capture_router_logs(
 
 
 _last_visit: dict[int, datetime] = {}
-COLLECTOR_TIME_BUDGET_SECONDS = 90
+# Kept well under the 120 s tick so a slow router read cannot push the job
+# into its next run.
+COLLECTOR_TIME_BUDGET_SECONDS = 60
 # Hotspot customers whose time ran out longer ago than this are left out of
 # the collector's index; their devices are not ours to follow any more.
 HOTSPOT_LOOKBACK = timedelta(days=7)
@@ -418,7 +508,9 @@ async def collect_router_logs_background() -> dict:
 
     from app.config import settings
     from app.db import database as db_module
-    from app.db.models import Customer, Router
+    from app.db.models import Customer, Router, SubscriptionStatus, User, UserRole
+
+    PAYING_STATUSES = (SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL)
     from app.services.customer_events import _pool_busy
     from app.services.router_availability import router_recently_offline
 
@@ -434,7 +526,15 @@ async def collect_router_logs_background() -> dict:
             .where(Customer.pppoe_username.isnot(None), Customer.router_id.isnot(None))
             .distinct()
         )
-        routers = (await db.execute(select(Router).where(Router.id.in_(pppoe_router_ids)))).scalars().all()
+        # Like the push path, do no router work for resellers who stopped paying.
+        routers = (await db.execute(
+            select(Router)
+            .join(User, Router.user_id == User.id)
+            .where(
+                Router.id.in_(pppoe_router_ids),
+                or_(User.role == UserRole.ADMIN, User.subscription_status.in_(PAYING_STATUSES)),
+            )
+        )).scalars().all()
         due = [
             r for r in routers
             if not router_recently_offline(r, now)

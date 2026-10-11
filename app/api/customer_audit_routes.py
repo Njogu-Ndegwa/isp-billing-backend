@@ -23,11 +23,12 @@ next. Each source is read with the same bound and limit, then merged.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -35,10 +36,11 @@ from app.db.database import get_db
 from app.db.models import (
     Customer, CustomerEvent, CustomerPayment, MpesaTransaction,
     MpesaTransactionStatus, Plan, ProvisioningAttempt, ProvisioningLog,
-    ReconnectionAttempt, Router, SmsMessage,
+    ReconnectionAttempt, Router, RouterAvailabilityCheck, SmsMessage,
 )
 from app.services import realtime_state
 from app.services.auth import get_current_user, verify_token
+from app.services.subscription import enforce_active_subscription
 from app.services.customer_router_logs import CustomerIndex, capture_router_logs, router_info_of
 from app.services.router_availability import record_router_availability
 
@@ -46,13 +48,31 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["customer-audit"])
 
-CATEGORIES = ("session", "router_log", "change", "billing", "provisioning", "messages")
+CATEGORIES = ("session", "router_log", "router", "change", "billing", "provisioning", "messages")
 DEFAULT_LIMIT = 150
 MAX_LIMIT = 500
 
-# One live router read per customer per this many seconds, whoever asks.
+# One live router read per customer per this many seconds, whoever asks, and
+# per router across all its customers (a reseller looping over customers must
+# not keep one router's diagnostic slots busy).
 ROUTER_LOG_PULL_COOLDOWN_SECONDS = 20
+ROUTER_LOG_PULL_ROUTER_COOLDOWN_SECONDS = 10
 _last_pull: dict[int, datetime] = {}
+_last_router_pull: dict[int, datetime] = {}
+
+# Router reachability is folded into the timeline for at most this far back.
+ROUTER_STATUS_WINDOW = timedelta(days=14)
+ROUTER_STATUS_MAX_CHECKS = 5000
+
+# "Password: abc123" in a stored SMS (the welcome template sends it). The
+# timeline never shows it: viewing credentials is an audited action of its own.
+_RE_SECRET_IN_SMS = re.compile(r"(?i)(\bpass(?:word|wd)?\b\s*[:=]?\s*)([^\s.,;]+)")
+
+
+def redact_sms(body: Optional[str]) -> Optional[str]:
+    if not body:
+        return body
+    return _RE_SECRET_IN_SMS.sub(lambda m: m.group(1) + "\u2022" * 6, body)
 
 
 async def _load_customer(db: AsyncSession, customer_id: int, token) -> tuple[Customer, object]:
@@ -94,12 +114,102 @@ def _money(amount) -> str:
     return f"{value:,.0f}" if value == int(value) else f"{value:,.2f}"
 
 
-def _bounded(stmt, column, before, after):
+def _bounded(stmt, column, before, after, inclusive=False):
     if before is not None:
-        stmt = stmt.where(column < before)
+        stmt = stmt.where(column <= before if inclusive else column < before)
     if after is not None:
         stmt = stmt.where(column >= after)
     return stmt
+
+
+def _in_window(at, before, after, inclusive=False) -> bool:
+    if at is None:
+        return False
+    if before is not None and (at > before if inclusive else at >= before):
+        return False
+    return after is None or at >= after
+
+
+def _router_status_items(checks, router_id, window_start) -> list[dict]:
+    """Turn reachability polls into "went offline" / "back online" entries."""
+    out: list[dict] = []
+    went_down = None
+    previous = None
+    for checked_at, is_online in checks:
+        if previous is None:
+            previous = is_online
+            if not is_online:
+                went_down = checked_at
+            continue
+        if previous and not is_online:
+            went_down = checked_at
+            out.append(_item(
+                checked_at, "router", "router_offline",
+                "Router stopped answering Bitwave: the site may have lost power or internet. "
+                "Customers on it may be offline too.",
+                severity="warning", router_id=router_id, ref=f"rt-down:{router_id}:{checked_at.isoformat()}",
+            ))
+        elif not previous and is_online:
+            down_for = (checked_at - went_down) if went_down else None
+            from app.services.customer_events import format_duration
+            text = "Router answering again"
+            if down_for is not None and went_down >= window_start:
+                text += f" after {format_duration(int(down_for.total_seconds()))}"
+            out.append(_item(
+                checked_at, "router", "router_online", text,
+                router_id=router_id, ref=f"rt-up:{router_id}:{checked_at.isoformat()}",
+            ))
+            went_down = None
+        previous = is_online
+    return out
+
+
+async def _summary(db: AsyncSession, customer: Customer) -> dict:
+    """The few facts a technician asks first, so they need not scroll for them."""
+    now = datetime.utcnow()
+
+    async def latest(stmt):
+        return (await db.execute(stmt.limit(1))).scalars().first()
+
+    last_drop = await latest(
+        select(CustomerEvent).where(
+            CustomerEvent.customer_id == customer.id,
+            CustomerEvent.event_type.in_(("session_disconnected", "session_reconnected", "device_offline")),
+        ).order_by(CustomerEvent.occurred_at.desc())
+    )
+    last_problem = await latest(
+        select(CustomerEvent).where(
+            CustomerEvent.customer_id == customer.id,
+            CustomerEvent.category == "router_log",
+            CustomerEvent.severity.in_(("warning", "error")),
+        ).order_by(CustomerEvent.occurred_at.desc())
+    )
+    drops_24h = (await db.execute(
+        select(func.count()).select_from(CustomerEvent).where(
+            CustomerEvent.customer_id == customer.id,
+            CustomerEvent.event_type.in_(("session_disconnected", "session_reconnected")),
+            CustomerEvent.occurred_at >= now - timedelta(hours=24),
+        )
+    )).scalar_one()
+    last_payment = (await db.execute(
+        select(CustomerPayment.created_at, CustomerPayment.amount)
+        .where(CustomerPayment.customer_id == customer.id)
+        .order_by(CustomerPayment.created_at.desc())
+        .limit(1)
+    )).first()
+
+    def ev(e):
+        return {"at": e.occurred_at.isoformat(), "message": e.message} if e else None
+
+    return {
+        "last_drop": ev(last_drop),
+        "last_problem": ev(last_problem),
+        "drops_24h": int(drops_24h or 0),
+        "last_payment": {
+            "at": last_payment.created_at.isoformat() if last_payment.created_at else None,
+            "amount": last_payment.amount,
+        } if last_payment else None,
+    }
 
 
 @router.get("/api/customers/{customer_id}/audit-log")
@@ -107,6 +217,12 @@ async def customer_audit_log(
     customer_id: int,
     before: Optional[datetime] = Query(None, description="Only entries strictly older than this (UTC)"),
     after: Optional[datetime] = Query(None, description="Only entries at or after this (UTC)"),
+    cursor: Optional[datetime] = Query(
+        None,
+        description="Paging: entries at or older than this (UTC) — the next_before of the previous "
+                    "page. Inclusive so entries sharing that second are not skipped; the client "
+                    "drops the ones it already has by id.",
+    ),
     categories: Optional[str] = Query(None, description=f"Comma list of {', '.join(CATEGORIES)}"),
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
     db: AsyncSession = Depends(get_db),
@@ -115,6 +231,9 @@ async def customer_audit_log(
     customer, _user = await _load_customer(db, customer_id, token)
     before = before.replace(tzinfo=None) if before else None
     after = after.replace(tzinfo=None) if after else None
+    inclusive = cursor is not None
+    if cursor is not None:
+        before = cursor.replace(tzinfo=None)
     wanted = set(CATEGORIES)
     if categories:
         wanted = {c.strip() for c in categories.split(",") if c.strip()}
@@ -139,7 +258,7 @@ async def customer_audit_log(
                 CustomerEvent.customer_id == customer_id,
                 CustomerEvent.category.in_(event_categories),
             ),
-            CustomerEvent.occurred_at, before, after,
+            CustomerEvent.occurred_at, before, after, inclusive,
         ).order_by(CustomerEvent.occurred_at.desc(), CustomerEvent.id.desc()).limit(limit)
         for ev in _note((await db.execute(stmt)).scalars().all(), lambda r: r.occurred_at):
             items.append(_item(
@@ -153,7 +272,7 @@ async def customer_audit_log(
             select(CustomerPayment, Plan.name)
             .outerjoin(Plan, CustomerPayment.plan_id == Plan.id)
             .where(CustomerPayment.customer_id == customer_id),
-            CustomerPayment.created_at, before, after,
+            CustomerPayment.created_at, before, after, inclusive,
         ).order_by(CustomerPayment.created_at.desc()).limit(limit)
         for pay, plan_name in _note((await db.execute(stmt)).all(), lambda r: r[0].created_at):
             method = pay.payment_method.value.replace("_", " ") if pay.payment_method else "payment"
@@ -177,7 +296,7 @@ async def customer_audit_log(
                 MpesaTransaction.customer_id == customer_id,
                 MpesaTransaction.status != MpesaTransactionStatus.completed,
             ),
-            MpesaTransaction.created_at, before, after,
+            MpesaTransaction.created_at, before, after, inclusive,
         ).order_by(MpesaTransaction.created_at.desc()).limit(limit)
         for tx in _note((await db.execute(stmt)).scalars().all(), lambda r: r.created_at):
             status = tx.status.value if tx.status else "pending"
@@ -202,7 +321,7 @@ async def customer_audit_log(
     if "provisioning" in wanted:
         stmt = _bounded(
             select(ProvisioningAttempt).where(ProvisioningAttempt.customer_id == customer_id),
-            ProvisioningAttempt.created_at, before, after,
+            ProvisioningAttempt.created_at, before, after, inclusive,
         ).order_by(ProvisioningAttempt.created_at.desc()).limit(limit)
         for att in _note((await db.execute(stmt)).scalars().all(), lambda r: r.created_at):
             state = att.provisioning_state.value if att.provisioning_state else "scheduled"
@@ -221,8 +340,7 @@ async def customer_audit_log(
                          "reference": att.external_reference},
                 ref=f"att:{att.id}",
             ))
-            if att.access_seen_at and (before is None or att.access_seen_at < before) and (
-                    after is None or att.access_seen_at >= after):
+            if _in_window(att.access_seen_at, before, after, inclusive):
                 items.append(_item(
                     att.access_seen_at, "provisioning", "access_confirmed",
                     f"Access confirmed on the router{' via ' + att.delivered_via if att.delivered_via else ''}",
@@ -231,7 +349,7 @@ async def customer_audit_log(
 
         stmt = _bounded(
             select(ProvisioningLog).where(ProvisioningLog.customer_id == customer_id),
-            ProvisioningLog.log_date, before, after,
+            ProvisioningLog.log_date, before, after, inclusive,
         ).order_by(ProvisioningLog.log_date.desc()).limit(limit)
         for log in _note((await db.execute(stmt)).scalars().all(), lambda r: r.log_date):
             text = f"{(log.action or '').replace('_', ' ').capitalize()}: {log.status}"
@@ -250,7 +368,7 @@ async def customer_audit_log(
 
         stmt = _bounded(
             select(ReconnectionAttempt).where(ReconnectionAttempt.customer_id == customer_id),
-            ReconnectionAttempt.created_at, before, after,
+            ReconnectionAttempt.created_at, before, after, inclusive,
         ).order_by(ReconnectionAttempt.created_at.desc()).limit(limit)
         for rc in _note((await db.execute(stmt)).scalars().all(), lambda r: r.created_at):
             text = ("Customer reconnected a device from the portal" if rc.success
@@ -268,7 +386,7 @@ async def customer_audit_log(
     if "messages" in wanted:
         stmt = _bounded(
             select(SmsMessage).where(SmsMessage.customer_id == customer_id),
-            SmsMessage.created_at, before, after,
+            SmsMessage.created_at, before, after, inclusive,
         ).order_by(SmsMessage.created_at.desc()).limit(limit)
         for sms in _note((await db.execute(stmt)).scalars().all(), lambda r: r.created_at):
             status = sms.status.value if sms.status else "queued"
@@ -280,15 +398,13 @@ async def customer_audit_log(
             items.append(_item(
                 sms.created_at, "messages", f"sms_{status}", text,
                 severity="warning" if status == "failed" else "info",
-                details={"body": sms.body, "provider": sms.provider, "category": sms.category,
+                details={"body": redact_sms(sms.body), "provider": sms.provider, "category": sms.category,
                          "segments": sms.segments},
                 ref=f"sms:{sms.id}",
             ))
 
     registered = any(i["event_type"] == "customer_created" for i in items)
-    if "change" in wanted and not registered and customer.created_at and (
-            before is None or customer.created_at < before) and (
-            after is None or customer.created_at >= after):
+    if "change" in wanted and not registered and _in_window(customer.created_at, before, after, inclusive):
         items.append(_item(
             customer.created_at, "change", "customer_created", "Customer record created",
             ref="created",
@@ -301,8 +417,40 @@ async def customer_audit_log(
     has_more = bool(saturated) or len(items) > limit
     page = items[:limit]
     next_before = page[-1]["occurred_at"] if page and has_more else None
+    if inclusive and next_before is not None and next_before == before.isoformat():
+        # More rows share this exact second than fit on a page; step past it
+        # rather than serve the same page forever.
+        next_before = (before - timedelta(microseconds=1)).isoformat()
+
+    # Router reachability over the span this page covers: a quiet stretch in
+    # the timeline means something different when the whole site was down.
+    if "router" in wanted and customer.router_id:
+        window_end = before or datetime.utcnow()
+        oldest_on_page = page[-1]["occurred_at"] if page and has_more else None
+        window_start = max(
+            datetime.fromisoformat(oldest_on_page) if oldest_on_page else window_end - ROUTER_STATUS_WINDOW,
+            window_end - ROUTER_STATUS_WINDOW,
+            after or datetime.min,
+        )
+        checks = (await db.execute(
+            select(RouterAvailabilityCheck.checked_at, RouterAvailabilityCheck.is_online)
+            .where(
+                RouterAvailabilityCheck.router_id == customer.router_id,
+                RouterAvailabilityCheck.checked_at >= window_start,
+                RouterAvailabilityCheck.checked_at <= window_end if inclusive
+                else RouterAvailabilityCheck.checked_at < window_end,
+            )
+            .order_by(RouterAvailabilityCheck.checked_at.desc())
+            .limit(ROUTER_STATUS_MAX_CHECKS)
+        )).all()
+        status_items = _router_status_items(list(reversed(checks)), customer.router_id, window_start)
+        if status_items:
+            page = sorted(page + status_items, key=lambda i: i["occurred_at"] or "", reverse=True)
+
+    summary = await _summary(db, customer)
 
     router_name = customer.router.name if customer.router else None
+    router_live = realtime_state.get_router_live(customer.router_id) if customer.router_id else None
     connection_type = (
         customer.plan.connection_type.value
         if customer.plan and customer.plan.connection_type else None
@@ -335,6 +483,9 @@ async def customer_audit_log(
             "router_name": router_name,
         },
         "live": live,
+        # How fresh the session entries can be: they come from these reports.
+        "router_reported_at": router_live.received_at.isoformat() if router_live else None,
+        "summary": summary,
         "items": page,
         "count": len(page),
         "has_more": next_before is not None,
@@ -355,16 +506,21 @@ async def pull_customer_router_logs(
     is saved, so the answer to "what did the router say at 3 pm" survives the
     next reboot. Safe to press repeatedly: stored lines are not duplicated.
     """
-    customer, _user = await _load_customer(db, customer_id, token)
+    customer, user = await _load_customer(db, customer_id, token)
+    enforce_active_subscription(user)
     router_obj: Optional[Router] = customer.router
     if router_obj is None:
         raise HTTPException(status_code=400, detail="Customer has no router assigned")
 
     now = datetime.utcnow()
-    last = _last_pull.get(customer_id)
-    if last is not None and (now - last).total_seconds() < ROUTER_LOG_PULL_COOLDOWN_SECONDS:
-        wait = int(ROUTER_LOG_PULL_COOLDOWN_SECONDS - (now - last).total_seconds()) + 1
-        raise HTTPException(status_code=429, detail=f"Router logs were just read; try again in {wait}s")
+    for key, store, cooldown in (
+        (customer_id, _last_pull, ROUTER_LOG_PULL_COOLDOWN_SECONDS),
+        (router_obj.id, _last_router_pull, ROUTER_LOG_PULL_ROUTER_COOLDOWN_SECONDS),
+    ):
+        last = store.get(key)
+        if last is not None and (now - last).total_seconds() < cooldown:
+            wait = int(cooldown - (now - last).total_seconds()) + 1
+            raise HTTPException(status_code=429, detail=f"This router's log was just read; try again in {wait}s")
 
     # Caller-ids seen in this customer's PPPoE sessions are the MACs the router
     # names before authentication ("<pppoe-AA:BB:..>: waiting for call").
@@ -392,16 +548,27 @@ async def pull_customer_router_logs(
     await db.commit()  # nothing held across the router read
 
     _last_pull[customer_id] = now
-    result = await capture_router_logs(router_id, info, index, acquire_timeout_seconds=2.0)
+    _last_router_pull[router_id] = now
+    ppp_customer = (customer.id, customer.user_id, customer.pppoe_username) if customer.pppoe_username else None
+    result = await capture_router_logs(
+        router_id, info, index, acquire_timeout_seconds=2.0, ppp_customer=ppp_customer,
+    )
     error = result.get("error")
     if error == "busy":
         _last_pull.pop(customer_id, None)
+        _last_router_pull.pop(router_id, None)
         raise HTTPException(status_code=429, detail="Router is busy with other diagnostics; try again shortly")
-    if error in ("connect_failed", "timeout"):
+    if error == "connect_failed":
         await record_router_availability(db, router_id, False, "customer_audit_router_logs")
         raise HTTPException(
-            status_code=503 if error == "connect_failed" else 504,
+            status_code=503,
             detail="Could not reach the router; only previously saved log lines are shown",
+        )
+    if error == "timeout":
+        # A slow log read is not proof the router is down; do not record it as such.
+        raise HTTPException(
+            status_code=504,
+            detail="The router took too long to send its log; try again in a minute",
         )
     if error:
         raise HTTPException(status_code=502, detail=f"Router log read failed: {error}")

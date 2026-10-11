@@ -386,17 +386,24 @@ async def receive_usage_push(
         # against the previous report, queued and written by a scheduler job,
         # so this request path gains no DB work.
         try:
+            ppp_present = "ppp" in payload.model_fields_set
             customer_events.observe_push(
                 router_row.id,
                 datetime.utcnow(),
-                ppp=([p.model_dump() for p in payload.ppp]
-                     if "ppp" in payload.model_fields_set else None),
-                live_pppoe_customers=result.live_pppoe_customers,
+                ppp=[p.model_dump() for p in payload.ppp] if ppp_present else None,
+                pppoe_customers=result.known_pppoe_customers,
                 pppoe_queue_bytes={
                     key: (item.upload_bytes, item.download_bytes)
                     for item in payload.reports
                     if (key := _canonical_key(item.queue_key)) and key.startswith("pppoe:")
                 },
+                # The RouterOS 6 script can stop its /ppp active walk early;
+                # when the router counted more sessions than it listed, the
+                # missing ones are not evidence of a drop.
+                ppp_complete=not (
+                    payload.router is not None
+                    and payload.router.pppoe_active > len(payload.ppp)
+                ),
                 hosts=([h.model_dump() for h in payload.hosts]
                        if "hosts" in payload.model_fields_set else None),
                 live_hotspot_customers=result.live_hotspot_customers,

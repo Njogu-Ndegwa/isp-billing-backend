@@ -65,7 +65,9 @@ def _audit_changes(before: dict, after: dict, names: dict) -> tuple[list[str], d
         if field in ("plan_id", "router_id"):
             return names.get((field, value)) or f"#{value}"
         if isinstance(value, datetime):
-            return value.strftime("%Y-%m-%d %H:%M UTC")
+            # Shown to resellers, who read every other time in EAT.
+            from app.core.local_time import to_local
+            return to_local(value).strftime("%Y-%m-%d %H:%M EAT")
         return str(value)
 
     parts, changes = [], {}
