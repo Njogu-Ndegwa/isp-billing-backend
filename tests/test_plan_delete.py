@@ -168,7 +168,7 @@ async def test_startup_migration_upgrades_live_schema_and_is_idempotent(engine, 
 
     async with engine.connect() as conn:
         rules = dict((await conn.execute(text("""
-            SELECT conname, confdeltype FROM pg_constraint
+            SELECT conname, confdeltype::text FROM pg_constraint
             WHERE confrelid = 'plans'::regclass
         """))).all())
         nullable = (await conn.execute(text("""
