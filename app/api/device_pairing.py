@@ -1734,6 +1734,8 @@ async def pair_device_with_voucher(
             raise HTTPException(status_code=404, detail="Router not found")
 
         plan = voucher.plan
+        if not plan:
+            raise HTTPException(status_code=400, detail="Voucher plan is no longer available")
 
         customer = await _get_or_create_device_customer(
             db, normalized_mac, voucher.user_id, request.router_id,

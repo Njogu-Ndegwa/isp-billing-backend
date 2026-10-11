@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router, FupAction, CustomerUsagePeriod
+from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router, FupAction, CustomerUsagePeriod, Voucher, VoucherStatus, DevicePairing
 from app.services.auth import verify_token, get_current_user
 from app.services.plan_cache import (
     get_plans_cached,
@@ -543,10 +543,29 @@ async def delete_plan(
                 detail=f"Cannot delete plan. {active_count} active customer(s) are using this plan"
             )
         
-        # Set plan_id to NULL for inactive/expired customers
-        await db.execute(
-            update(Customer).where(Customer.plan_id == plan_id).values(plan_id=None)
+        # Unused vouchers may already be printed and sold; deleting the plan
+        # would make them unredeemable, so the reseller must disable them first.
+        unused_stmt = select(func.count(Voucher.id)).where(
+            Voucher.plan_id == plan_id,
+            Voucher.status == VoucherStatus.AVAILABLE
         )
+        unused_count = (await db.execute(unused_stmt)).scalar()
+
+        if unused_count > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot delete plan. {unused_count} unused voucher(s) still exist for this plan. "
+                    "Disable them first, or hide the plan instead"
+                )
+            )
+
+        # Detach history rows (inactive/expired customers, used vouchers, paired
+        # devices) so they survive the plan instead of blocking the delete
+        for model in (Customer, Voucher, DevicePairing):
+            await db.execute(
+                update(model).where(model.plan_id == plan_id).values(plan_id=None)
+            )
         
         await db.delete(plan)
         await db.commit()
