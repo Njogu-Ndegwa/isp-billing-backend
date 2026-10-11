@@ -53,6 +53,12 @@ from app.services.usage_tracking import record_usage
 from app.services.usage_counters import clamp_to_line_rate, record_queue_usage_sample
 from app.services.fup import hotspot_throttle_rate_for_plan
 from app.services import customer_expiry_notifications
+from app.services.customer_grace import (
+    access_floor,
+    effective_expiry,
+    effective_expiry_of,
+    has_access_time,
+)
 from app.core.protected_devices import is_protected_device
 from app.config import settings
 from app.services.realtime_state import host_metering_active, is_pilot_router, pushed_bindings, reports_metrics
@@ -1464,8 +1470,7 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
                             customer.status == CustomerStatus.ACTIVE
                             or (
                                 customer.status == CustomerStatus.PENDING
-                                and customer.expiry
-                                and customer.expiry > datetime.utcnow()
+                                and has_access_time(customer, datetime.utcnow())
                             )
                         )
                     ):
@@ -1522,9 +1527,9 @@ async def _deactivate_expired_identityless_customers(db: AsyncSession, now: date
     binding follows the MAC, and the safety net drops unowned bindings), so the
     status change is DB-only.
     """
-    ids = (
+    rows = (
         await db.execute(
-            select(Customer.id).where(
+            select(Customer.id, Customer.expiry, Customer.grace_period_minutes).where(
                 Customer.status == CustomerStatus.ACTIVE,
                 Customer.expiry.isnot(None),
                 Customer.expiry <= now,
@@ -1532,7 +1537,11 @@ async def _deactivate_expired_identityless_customers(db: AsyncSession, now: date
                 Customer.pppoe_username.is_(None),
             )
         )
-    ).scalars().all()
+    ).all()
+    ids = [
+        customer_id for customer_id, expiry, grace in rows
+        if effective_expiry_of(expiry, grace) <= now
+    ]
     if ids:
         await db.execute(
             update(Customer)
@@ -1577,7 +1586,12 @@ async def cleanup_expired_users_background():
                 )
             )
             result = await db.execute(stmt)
-            expired_customers = result.scalars().all()
+            # The SQL filter is on the paid expiry; customers still inside
+            # their reseller-set grace window keep access until it closes.
+            expired_customers = [
+                c for c in result.scalars().all()
+                if effective_expiry(c) <= now
+            ]
             if not expired_customers:
                 return
             logger.info(f"[CRON] Found {len(expired_customers)} expired ACTIVE customers to cleanup")
@@ -1590,15 +1604,21 @@ async def cleanup_expired_users_background():
 
             candidate_ids = [customer.id for customer in expired_customers]
             current_state = await db.execute(
-                select(Customer.id, Customer.status, Customer.expiry).where(
+                select(
+                    Customer.id, Customer.status, Customer.expiry, Customer.grace_period_minutes
+                ).where(
                     Customer.id.in_(candidate_ids)
                 )
             )
             now_before_router_cleanup = datetime.utcnow()
             still_expired_ids: set[int] = set()
             renewed_ids: list[int] = []
-            for customer_id, status, expiry in current_state.all():
-                if status == CustomerStatus.ACTIVE and expiry and expiry <= now_before_router_cleanup:
+            for customer_id, status, expiry, grace in current_state.all():
+                if (
+                    status == CustomerStatus.ACTIVE
+                    and expiry
+                    and effective_expiry_of(expiry, grace) <= now_before_router_cleanup
+                ):
                     still_expired_ids.add(customer_id)
                 else:
                     renewed_ids.append(customer_id)
@@ -1614,7 +1634,7 @@ async def cleanup_expired_users_background():
                 customer for customer in expired_customers
                 if customer.id in still_expired_ids
             ]
-            expiry_by_id = {c.id: c.expiry for c in expired_customers}
+            expiry_by_id = {c.id: effective_expiry(c) for c in expired_customers}
 
             await db.commit()
 
@@ -1711,7 +1731,7 @@ async def cleanup_expired_users_background():
                     long_offline_quarantined.append(c.id)
                     continue
                 if (c.router and getattr(c.router, "expiry_reaper_enabled", False)
-                        and c.expiry and now - c.expiry < EXPIRY_REAPER_GRACE
+                        and c.expiry and now - effective_expiry(c) < EXPIRY_REAPER_GRACE
                         and _reaper_sees_customer(c.router)):
                     reaper_deferred.append(c.id)
                     continue
@@ -1943,7 +1963,7 @@ async def cleanup_expired_users_background():
             for customer in expired_customers:
                 if customer.id in all_successful_ids:
                     await db.refresh(customer)
-                    if customer.expiry and customer.expiry > now_after_cleanup:
+                    if customer.expiry and effective_expiry(customer) > now_after_cleanup:
                         logger.warning(
                             "[CRON] Customer %s received new payment during cleanup "
                             "(expiry=%s > now=%s), skipping deactivation",
@@ -2427,8 +2447,10 @@ def _queue_sync_customer_item(c, fup_period) -> dict:
         "fup_active": bool(fup_period),
         "fup_action": fup_action.value if fup_action else None,
         # MAC-login users carry EXP:<second>; the reconcile writes it from here
-        # so the router expiry reaper can enforce users it (re)creates.
-        "expiry": c.expiry,
+        # so the router expiry reaper can enforce users it (re)creates. The
+        # tag carries the effective expiry so grace survives a router that
+        # cannot reach the server.
+        "expiry": effective_expiry(c),
     }
 
 
@@ -2464,12 +2486,13 @@ async def repair_router_queues_now(router_id: int) -> dict:
                     Customer.router_id == router_id,
                     Customer.status == CustomerStatus.ACTIVE,
                     Customer.mac_address.isnot(None),
-                    Customer.expiry > now,
+                    Customer.expiry > access_floor(now),
                     Plan.connection_type == ConnectionType.HOTSPOT,
                 )
                 .options(selectinload(Customer.plan))
             )
         ).scalars().all()
+        customers = [c for c in customers if has_access_time(c, now)]
         fup_periods = {
             p.customer_id: p
             for p in (
@@ -3131,14 +3154,14 @@ async def sync_active_user_queues():
                 .where(
                     Customer.status == CustomerStatus.ACTIVE,
                     Customer.mac_address.isnot(None),
-                    Customer.expiry > now,
+                    Customer.expiry > access_floor(now),
                     Plan.connection_type == ConnectionType.HOTSPOT,
                     Router.auth_method == RouterAuthMethod.DIRECT_API,
                 )
                 .options(selectinload(Customer.plan), selectinload(Customer.router))
             )
             result = await db.execute(stmt)
-            active_customers = result.scalars().all()
+            active_customers = [c for c in result.scalars().all() if has_access_time(c, now)]
             if not active_customers:
                 logger.info("[SYNC] No active customers to sync")
                 return

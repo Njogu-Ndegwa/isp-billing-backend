@@ -2622,6 +2622,17 @@ async def run_expiry_reaper_migrations():
         """))
 
 
+async def run_customer_grace_migrations():
+    """Add customers.grace_period_minutes: the reseller-set grace period that
+    keeps a customer connected past expiry without moving the expiry.
+    Idempotent; a constant DEFAULT makes this a metadata-only change."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE customers
+            ADD COLUMN IF NOT EXISTS grace_period_minutes INTEGER NOT NULL DEFAULT 0
+        """))
+
+
 async def run_standard_runtime_migrations():
     """Add the routers columns the standard-runtime installer records its work
     in (app/services/standard_runtime_enrol.py): check-in applier and
@@ -3168,6 +3179,12 @@ async def startup_event():
         logger.info("Expiry-reaper migration completed successfully")
     except Exception as e:
         logger.error(f"Expiry-reaper migration failed (non-fatal): {e}")
+
+    try:
+        await run_customer_grace_migrations()
+        logger.info("Customer grace-period migration completed successfully")
+    except Exception as e:
+        logger.error(f"Customer grace-period migration failed (non-fatal): {e}")
 
     try:
         await run_standard_runtime_migrations()

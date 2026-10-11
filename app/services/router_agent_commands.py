@@ -25,6 +25,7 @@ from app.db.models import (
     RouterCommand,
 )
 from app.services.mikrotik_api import normalize_mac_address, parse_speed_to_mikrotik
+from app.services.customer_grace import effective_expiry, has_access_time
 from app.services.pull_provisioning import render_hotspot_provision_rsc
 
 
@@ -269,11 +270,11 @@ async def queue_hotspot_provision_command(
             customer is None
             or customer.status != CustomerStatus.ACTIVE
             or customer.router_id != router_id
-            or customer.expiry is None
-            or customer.expiry <= now
+            or not has_access_time(customer, now)
         ):
             return None
         original_expiry = customer.expiry
+        access_until = effective_expiry(customer)
 
     duration = _duration_seconds(hotspot_payload.get("time_limit"))
     service_start = (
@@ -291,7 +292,7 @@ async def queue_hotspot_provision_command(
         comment=hotspot_payload.get("comment", ""),
         expires_at=None,
         lb_enabled=bool(hotspot_payload.get("lb_enabled")),
-        binding_expiry=original_expiry,
+        binding_expiry=access_until,
     )
     entitlement_key = (
         f"attempt:{attempt_id}"
@@ -313,7 +314,7 @@ async def queue_hotspot_provision_command(
             "username": hotspot_payload.get("username"),
             "lb_enabled": bool(hotspot_payload.get("lb_enabled")),
         },
-        expires_at=min(now + COMMAND_MAX_AGE, original_expiry),
+        expires_at=min(now + COMMAND_MAX_AGE, access_until),
     )
 
 
@@ -335,11 +336,11 @@ async def queue_pppoe_provision_command(
             customer is None
             or customer.status != CustomerStatus.ACTIVE
             or customer.router_id != router_id
-            or customer.expiry is None
-            or customer.expiry <= now
+            or not has_access_time(customer, now)
         ):
             return None
         original_expiry = customer.expiry
+        access_until = effective_expiry(customer)
         plan = await db.get(Plan, customer.plan_id) if customer.plan_id else None
     duration = _plan_duration_seconds(plan)
     service_start = (
@@ -371,7 +372,7 @@ async def queue_pppoe_provision_command(
             "entitlement_seconds": duration,
             "username": pppoe_payload.get("pppoe_username"),
         },
-        expires_at=min(now + COMMAND_MAX_AGE, original_expiry),
+        expires_at=min(now + COMMAND_MAX_AGE, access_until),
     )
 
 
@@ -508,8 +509,7 @@ async def next_command_for_router(router_id: int) -> RouterCommand | None:
             if customer is not None:
                 customer_is_live = (
                     customer.status == CustomerStatus.ACTIVE
-                    and customer.expiry is not None
-                    and customer.expiry > now
+                    and has_access_time(customer, now)
                 )
                 generation = (command.metadata_json or {}).get("expiry_generation")
                 current_generation = customer.expiry.isoformat() if customer.expiry else "none"
@@ -599,8 +599,7 @@ async def expire_active_commands(now: datetime | None = None) -> int:
                 customer_is_live_here = bool(
                     customer is not None
                     and customer.status == CustomerStatus.ACTIVE
-                    and customer.expiry is not None
-                    and customer.expiry > now
+                    and has_access_time(customer, now)
                     and customer.router_id == command.router_id
                 )
                 if not customer_is_live_here:
@@ -727,7 +726,8 @@ async def _queue_hotspot_repair_after_stale_remove(
 
     mac = normalize_mac_address(customer.mac_address)
     username = mac.replace(":", "")
-    remaining_seconds = max(60, int((customer.expiry - now).total_seconds()))
+    access_until = effective_expiry(customer)
+    remaining_seconds = max(60, int((access_until - now).total_seconds()))
     rate = parse_speed_to_mikrotik(plan.speed)
     script = render_hotspot_provision_rsc(
         username=username,
@@ -738,7 +738,7 @@ async def _queue_hotspot_repair_after_stale_remove(
         comment=f"CID:{customer.id}|stale-removal-repair",
         expires_at=None,
         lb_enabled=bool(router.lb_enabled),
-        binding_expiry=customer.expiry,
+        binding_expiry=access_until,
     )
     db.add(
         RouterCommand(
@@ -758,7 +758,7 @@ async def _queue_hotspot_repair_after_stale_remove(
             },
             state="pending",
             available_at=now,
-            expires_at=min(now + COMMAND_MAX_AGE, customer.expiry),
+            expires_at=min(now + COMMAND_MAX_AGE, access_until),
         )
     )
     return True
@@ -854,8 +854,7 @@ async def acknowledge_command(
         customer_is_live_here = bool(
             customer is not None
             and customer.status == CustomerStatus.ACTIVE
-            and customer.expiry is not None
-            and customer.expiry > now
+            and has_access_time(customer, now)
             and customer.router_id == command.router_id
         )
 
@@ -902,7 +901,7 @@ async def acknowledge_command(
             attempt.updated_at = now
 
         if customer is not None and is_remove and not customer_is_live_here:
-            if customer.expiry is None or customer.expiry <= now:
+            if not has_access_time(customer, now):
                 customer.status = CustomerStatus.INACTIVE
 
         # Restore paid time lost while a newly-paid customer waited for the

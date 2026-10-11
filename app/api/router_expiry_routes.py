@@ -25,6 +25,7 @@ from sqlalchemy.orm import selectinload
 from app.db.database import async_session, db_pool_snapshot
 from app.db.models import Customer, CustomerStatus, ProvisioningLog, Router as RouterModel
 from app.services import customer_expiry_notifications
+from app.services.customer_grace import effective_expiry
 from app.services.router_expiry import (
     DONE_MINUTE_MAX_SKEW,
     done_time_to_datetime,
@@ -145,7 +146,8 @@ async def expiry_check(request: Request, authorization: Optional[str] = Header(d
                        func.upper(Customer.mac_address).in_(macs))
             )).scalars().all())
         rows = [CustomerRow(c.id, (c.mac_address or "").upper(),
-                            c.status == CustomerStatus.ACTIVE, c.expiry) for c in customers]
+                            c.status == CustomerStatus.ACTIVE, effective_expiry(c))
+                for c in customers]
         remove, keep, forget = decide(req.due, rows, now)
 
         # Confirmed removals. The router removed these MACs on its own, after we
@@ -164,7 +166,7 @@ async def expiry_check(request: Request, authorization: Optional[str] = Header(d
             for c in by_mac.get(mac, []):
                 if c.status != CustomerStatus.ACTIVE or c.expiry is None:
                     continue
-                if c.expiry > now:
+                if effective_expiry(c) > now:
                     if c.plan is not None:
                         from app.services.hotspot_provisioning import build_hotspot_payload
                         repairs.append((c.id, router_row.id, build_hotspot_payload(

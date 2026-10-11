@@ -10,6 +10,7 @@ from app.db.models import Router, Customer, Plan, CustomerStatus
 from app.services.auth import verify_token, get_current_user
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.hotspot_mac_login import hotspot_user_is_for_mac
+from app.services.customer_grace import has_access_time
 from app.config import settings
 
 import logging
@@ -500,7 +501,10 @@ async def cleanup_recently_expired_users(
             Customer.user_id == user.id
         )
         result = await db.execute(stmt)
-        expired_customers = result.scalars().all()
+        # Customers inside their reseller-set grace window keep access.
+        expired_customers = [
+            c for c in result.scalars().all() if not has_access_time(c, now)
+        ]
         
         if not expired_customers:
             return {

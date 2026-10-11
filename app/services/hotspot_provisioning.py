@@ -31,6 +31,7 @@ from app.db.models import (
     RouterAuthMethod,
 )
 from app.services.mikrotik_api import LANE_PAYMENT, MikroTikAPI, normalize_mac_address
+from app.services.customer_grace import effective_expiry, has_access_time
 from app.services.hotspot_mac_login import (
     mac_login_enabled,
     provision_customer as provision_mac_login_customer,
@@ -84,7 +85,7 @@ def _retry_db_pool_is_busy() -> bool:
 
 def _hotspot_time_limit_for_customer(customer: Customer, plan: Plan) -> str:
     if customer.subscription_owner_id and customer.expiry:
-        remaining_seconds = int((customer.expiry - datetime.utcnow()).total_seconds())
+        remaining_seconds = int((effective_expiry(customer) - datetime.utcnow()).total_seconds())
         remaining_minutes = max(1, (remaining_seconds + 59) // 60)
         return f"{remaining_minutes}m"
 
@@ -118,7 +119,9 @@ def build_hotspot_payload(customer: Customer, plan: Plan, router: Router, commen
         # Multi-WAN load balancing: bypassed customers only balance while
         # listed in LB_PAID, so provisioning adds the entry when LB is on.
         "lb_enabled": bool(getattr(router, "lb_enabled", False)),
-        "customer_expiry": customer.expiry,
+        # Router-side deadline (reaper EXP tag, LB_PAID timeout): the
+        # effective expiry, so a reseller-set grace period is honoured.
+        "customer_expiry": effective_expiry(customer),
         "router_id": router.id,
         # MAC-login pilot routers: a hotspot user logged in by MAC with a
         # rate-limited profile instead of a bypassed binding + static queue.
@@ -1039,8 +1042,7 @@ async def _load_waiting_push_context(
                 and attempt.router_id == router.id
                 and _enum_value(customer.status) == CustomerStatus.ACTIVE.value
                 and customer.mac_address
-                and customer.expiry is not None
-                and customer.expiry > now
+                and has_access_time(customer, now)
                 and _enum_value(plan.connection_type) == ConnectionType.HOTSPOT.value
                 and _enum_value(router.auth_method) == RouterAuthMethod.DIRECT_API.value
             ):
