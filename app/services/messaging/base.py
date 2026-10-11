@@ -142,10 +142,19 @@ class ProviderSpec:
         return {f.key for f in self.fields if f.secret}
 
     def apply_defaults(self, config: dict) -> dict:
-        """Return config with declared defaults filled in and unknown keys dropped."""
+        """Return config with declared defaults filled in and unknown keys dropped.
+
+        Values are trimmed: a key pasted with a trailing space or newline is
+        rejected by the vendor as "Invalid credentials", and in a masked field
+        the reseller cannot see why (2026-10-11, a TextSMS key saved as 33
+        chars). This runs on save and on every build, so values stored before
+        the trim existed are cleaned at send time too.
+        """
         out: dict[str, str] = {}
         for f in self.fields:
             value = config.get(f.key)
+            if isinstance(value, str):
+                value = value.strip()
             if value is None or value == "":
                 value = f.default
             out[f.key] = value

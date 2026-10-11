@@ -123,6 +123,53 @@ def test_update_without_resending_a_secret_keeps_it():
     assert accounts.decrypt_config(spec, merged)["password"] == "rotated"
 
 
+# A key pasted with a trailing space or newline is rejected by the vendor as
+# "Invalid credentials", and the reseller can't see it in a masked field.
+# Real case 2026-10-11: a 32-char TextSMS key saved as 33 chars.
+PASTED_KEY = "  0f1e2d3c4b5a69788796a5b4c3d2e1f0\n"
+CLEAN_KEY = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
+
+def test_credentials_are_trimmed_on_create():
+    spec = registry.get_spec("textsms")
+    stored = accounts.encrypt_config(spec, {"api_key": PASTED_KEY, "partner_id": " 11476 "})
+    plain = accounts.decrypt_config(spec, stored)
+    assert plain["api_key"] == CLEAN_KEY
+    assert plain["partner_id"] == "11476"
+    assert stored["partner_id"] == "11476"  # non-secret stored trimmed too
+
+
+def test_credentials_are_trimmed_on_update():
+    spec = registry.get_spec("textsms")
+    stored = accounts.encrypt_config(spec, {"api_key": "old", "partner_id": "1"})
+    merged = accounts.merge_config(
+        spec, stored, {"api_key": PASTED_KEY, "partner_id": "11476\t"})
+    plain = accounts.decrypt_config(spec, merged)
+    assert plain["api_key"] == CLEAN_KEY
+    assert merged["partner_id"] == "11476"
+    # Whitespace alone is not a new secret: the stored one is kept.
+    merged = accounts.merge_config(spec, stored, {"api_key": "   "})
+    assert accounts.decrypt_config(spec, merged)["api_key"] == "old"
+
+
+def test_values_stored_before_the_trim_are_cleaned_at_send_time():
+    """Accounts saved untrimmed before this fix must work without a re-save."""
+    from app.services.payment_gateway import encrypt_credential
+
+    spec = registry.get_spec("textsms")
+    legacy = {"api_key": encrypt_credential(PASTED_KEY), "partner_id": "11476 ",
+              "base_url": "https://sms.textsms.co.ke "}
+    provider = spec.build(accounts.decrypt_config(spec, legacy))
+    assert provider.api_key == CLEAN_KEY
+    assert provider.partner_id == "11476"
+    assert provider.base_url == "https://sms.textsms.co.ke"
+
+
+def test_whitespace_only_value_falls_back_to_the_default():
+    spec = registry.get_spec("textsms")
+    assert spec.apply_defaults({"base_url": "  "})["base_url"] == "https://sms.textsms.co.ke"
+
+
 # ---------------------------------------------------------------------------
 # Resolution
 # ---------------------------------------------------------------------------
