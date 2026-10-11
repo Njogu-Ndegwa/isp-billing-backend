@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, func
+from sqlalchemy import select, or_, and_, func
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
@@ -11,6 +11,7 @@ from app.db.models import (
     CustomerStatus, CustomerPayment, CollectionMode, ConnectionType, User, PaymentMethod,
     ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
     C2BTransaction, C2BTransactionStatus,
+    OutageCompensation, OutageCompensationItem, PaymentStatus,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -1165,9 +1166,56 @@ async def get_payment_status(
         raise HTTPException(status_code=500, detail=f"Failed to get payment status: {str(e)}")
 
 
+# ZenoPay, MTN MoMo and Fapshi only write a customer_payments row (method
+# mobile_money). M-Pesa STK and C2B also write one, but keep their own tables,
+# which the ledger lists instead. The gateway references carry these prefixes.
+GATEWAY_REFERENCE_PREFIXES = ("ZENO-", "MTN-", "FAPSHI-")
+
+_CP_SOURCE_BY_PREFIX = (
+    ("VOUCHER-", "voucher"),
+    ("FREE-TRIAL-", "free_trial"),
+    ("ZENO-", "zenopay"),
+    ("MTN-", "mtn_momo"),
+    ("FAPSHI-", "fapshi"),
+)
+
+
+def _gateway_payment_condition():
+    return or_(*[
+        CustomerPayment.payment_reference.like(f"{prefix}%")
+        for prefix in GATEWAY_REFERENCE_PREFIXES
+    ])
+
+
+def _cp_ledger_condition(payment_method: Optional[str] = None):
+    """customer_payments rows that belong in the transaction ledger.
+
+    mobile_money rows are skipped as twins of an mpesa_transactions / C2B row,
+    except gateway rows, which have no twin.
+    """
+    if payment_method == "mobile_money":
+        return and_(
+            CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY,
+            _gateway_payment_condition(),
+        )
+    return or_(
+        CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
+        _gateway_payment_condition(),
+    )
+
+
+def _cp_source(reference: Optional[str]) -> Optional[str]:
+    """Where a customer_payments row came from, read off its reference."""
+    for prefix, source in _CP_SOURCE_BY_PREFIX:
+        if reference and reference.startswith(prefix):
+            return source
+    return None
+
+
 @router.get("/api/mpesa/transactions")
 async def get_mpesa_transactions(
     router_id: Optional[int] = None,
+    customer_id: Optional[int] = None,
     payment_method: Optional[str] = None,
     date: Optional[str] = None,
     start_date: Optional[str] = None,
@@ -1186,12 +1234,14 @@ async def get_mpesa_transactions(
     straight to the reseller's own account vs. collected by the platform;
     every M-Pesa row carries the same ``settlement`` field.
 
-    Merges two sources:
+    Merges three sources:
     - mpesa_transactions (includes pending/failed M-Pesa)
-    - customer_payments where payment_method != mobile_money (voucher, cash, etc.)
+    - customer_payments outside M-Pesa (voucher, cash, ZenoPay/MTN/Fapshi, etc.)
+    - c2b_transactions (paybill)
 
     Query Parameters:
     - router_id: Filter by specific router (optional)
+    - customer_id: Only this customer's payments -- their account history (optional)
     - payment_method: Filter by type -- mobile_money, voucher, cash, card, etc. (optional)
     - date: Exact date filter (YYYY-MM-DD) -- returns transactions for that day only (optional)
     - start_date: Range start (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) (optional)
@@ -1241,7 +1291,9 @@ async def get_mpesa_transactions(
             raise HTTPException(status_code=400, detail="settlement must be direct or platform")
         want_mpesa = payment_method in (None, "mobile_money")
         # Settlement only describes M-Pesa money; cash/vouchers have none.
-        want_other = payment_method != "mobile_money" and settlement is None
+        # With payment_method=mobile_money this still runs for the gateway
+        # rows (see _cp_ledger_condition).
+        want_other = settlement is None
 
         # --- Query 1: M-Pesa transactions (preserves pending/failed/expired) ---
         if want_mpesa:
@@ -1256,6 +1308,8 @@ async def get_mpesa_transactions(
             )
             if router_id:
                 mpesa_stmt = mpesa_stmt.where(Router.id == router_id)
+            if customer_id:
+                mpesa_stmt = mpesa_stmt.where(MpesaTransaction.customer_id == customer_id)
             if date_start:
                 mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at >= date_start)
             if date_end:
@@ -1331,6 +1385,7 @@ async def get_mpesa_transactions(
                     "manual_provision_supported": manual_supported,
                     "manual_provision_reason": manual_reason,
                     "counts_as_revenue": True,
+                    "source": "mpesa_stk",
                     "_delivery_source_table": ProvisioningAttemptSource.MPESA_TRANSACTION.value,
                     "_delivery_source_pk": tx.id,
                 })
@@ -1349,7 +1404,7 @@ async def get_mpesa_transactions(
                 .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(
                     CustomerPayment.reseller_id == user.id,
-                    CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
+                    _cp_ledger_condition(payment_method),
                 )
             )
             if payment_method and payment_method != "mobile_money":
@@ -1364,6 +1419,8 @@ async def get_mpesa_transactions(
                     )
             if router_id:
                 cp_stmt = cp_stmt.where(Customer.router_id == router_id)
+            if customer_id:
+                cp_stmt = cp_stmt.where(CustomerPayment.customer_id == customer_id)
             if date_start:
                 cp_stmt = cp_stmt.where(CustomerPayment.created_at >= date_start)
             if date_end:
@@ -1445,6 +1502,9 @@ async def get_mpesa_transactions(
                     "manual_provision_supported": manual_supported,
                     "manual_provision_reason": manual_reason,
                     "counts_as_revenue": bool(pay.counts_as_revenue),
+                    "source": _cp_source(pay.payment_reference),
+                    "days_paid_for": pay.days_paid_for,
+                    "notes": pay.notes,
                     "_delivery_source_table": ProvisioningAttemptSource.CUSTOMER_PAYMENT.value,
                     "_delivery_source_pk": pay.id,
                 })
@@ -1453,14 +1513,22 @@ async def get_mpesa_transactions(
         # --- Query 3: C2B Paybill transactions (customer pays via paybill) ---
         if want_mpesa:
             c2b_stmt = (
-                select(C2BTransaction, Customer, Router, Plan)
+                select(C2BTransaction, Customer, Router, Plan, CustomerPayment.days_paid_for)
                 .outerjoin(Customer, C2BTransaction.matched_customer_id == Customer.id)
                 .outerjoin(Router, Customer.router_id == Router.id)
-                .outerjoin(Plan, Customer.plan_id == Plan.id)
+                # A processed paybill payment wrote a customer_payments twin
+                # (reference = TransID) that snapshots the plan it bought.
+                .outerjoin(CustomerPayment, and_(
+                    CustomerPayment.payment_reference == C2BTransaction.trans_id,
+                    CustomerPayment.customer_id == C2BTransaction.matched_customer_id,
+                ))
+                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(C2BTransaction.matched_reseller_id == user.id)
             )
             if router_id:
                 c2b_stmt = c2b_stmt.where(Router.id == router_id)
+            if customer_id:
+                c2b_stmt = c2b_stmt.where(C2BTransaction.matched_customer_id == customer_id)
             if date_start:
                 c2b_stmt = c2b_stmt.where(C2BTransaction.received_at >= date_start)
             if date_end:
@@ -1493,7 +1561,7 @@ async def get_mpesa_transactions(
 
             c2b_rows = (await db.execute(c2b_stmt)).all()
 
-            for tx, customer, rtr, plan in c2b_rows:
+            for tx, customer, rtr, plan, c2b_days_paid_for in c2b_rows:
                 results.append({
                     "transaction_id": tx.id,
                     "checkout_request_id": None,
@@ -1512,6 +1580,7 @@ async def get_mpesa_transactions(
                     "transaction_date": tx.received_at.isoformat() if tx.received_at else None,
                     "created_at": tx.received_at.isoformat() if tx.received_at else None,
                     "source": "c2b_paybill",
+                    "days_paid_for": c2b_days_paid_for,
                     "customer": {
                         "id": customer.id,
                         "name": customer.name,
@@ -1713,6 +1782,129 @@ async def manual_provision_transaction(
         raise HTTPException(status_code=500, detail=f"Failed to manually provision transaction: {str(e)}")
 
 
+@router.get("/api/customers/{customer_id}/payment-summary")
+async def get_customer_payment_summary(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Lifetime payment totals for one customer, plus outage compensation.
+
+    Totals are aggregated in SQL over the same three ledgers as
+    /api/mpesa/transactions?customer_id=, so they stay exact past that
+    endpoint's 500-row page. Outage compensation adds time without writing a
+    payment row, so it is listed here to explain expiry moving with no payment.
+    """
+    try:
+        user = await get_current_user(token, db)
+        owned = (await db.execute(
+            select(Customer.id).where(Customer.id == customer_id, Customer.user_id == user.id)
+        )).scalar_one_or_none()
+        if owned is None:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        total_paid = 0.0
+        paid_count = 0
+        not_charged_total = 0.0
+        not_charged_count = 0
+        last_paid_at = None
+
+        def _later(a, b):
+            return b if a is None or (b is not None and b > a) else a
+
+        mpesa_count, mpesa_sum, mpesa_last = (await db.execute(
+            select(
+                func.count(MpesaTransaction.id),
+                func.coalesce(func.sum(MpesaTransaction.amount), 0),
+                func.max(MpesaTransaction.created_at),
+            ).where(
+                MpesaTransaction.customer_id == customer_id,
+                MpesaTransaction.status == MpesaTransactionStatus.completed,
+            )
+        )).one()
+        total_paid += float(mpesa_sum)
+        paid_count += mpesa_count
+        last_paid_at = _later(last_paid_at, mpesa_last)
+
+        cp_rows = (await db.execute(
+            select(
+                CustomerPayment.counts_as_revenue,
+                func.count(CustomerPayment.id),
+                func.coalesce(func.sum(CustomerPayment.amount), 0),
+                func.max(func.coalesce(CustomerPayment.payment_date, CustomerPayment.created_at)),
+            ).where(
+                CustomerPayment.customer_id == customer_id,
+                CustomerPayment.reseller_id == user.id,
+                _cp_ledger_condition(),
+                or_(
+                    CustomerPayment.status == PaymentStatus.COMPLETED,
+                    CustomerPayment.status.is_(None),
+                ),
+            ).group_by(CustomerPayment.counts_as_revenue)
+        )).all()
+        for counts_as_revenue, count, amount, last in cp_rows:
+            if counts_as_revenue:
+                total_paid += float(amount)
+                paid_count += count
+                last_paid_at = _later(last_paid_at, last)
+            else:
+                not_charged_total += float(amount)
+                not_charged_count += count
+
+        c2b_count, c2b_sum, c2b_last = (await db.execute(
+            select(
+                func.count(C2BTransaction.id),
+                func.coalesce(func.sum(C2BTransaction.trans_amount), 0),
+                func.max(C2BTransaction.received_at),
+            ).where(
+                C2BTransaction.matched_customer_id == customer_id,
+                C2BTransaction.matched_reseller_id == user.id,
+                C2BTransaction.status == C2BTransactionStatus.PROCESSED,
+            )
+        )).one()
+        total_paid += float(c2b_sum)
+        paid_count += c2b_count
+        last_paid_at = _later(last_paid_at, c2b_last)
+
+        comp_rows = (await db.execute(
+            select(OutageCompensationItem, OutageCompensation.created_at, OutageCompensation.note)
+            .join(OutageCompensation, OutageCompensationItem.compensation_id == OutageCompensation.id)
+            .where(
+                OutageCompensationItem.customer_id == customer_id,
+                OutageCompensation.user_id == user.id,
+            )
+            .order_by(OutageCompensation.created_at.desc())
+            .limit(100)
+        )).all()
+
+        return {
+            "customer_id": customer_id,
+            "total_paid": round(total_paid, 2),
+            "paid_count": paid_count,
+            "last_paid_at": last_paid_at.isoformat() if last_paid_at else None,
+            "not_charged_total": round(not_charged_total, 2),
+            "not_charged_count": not_charged_count,
+            "outage_credits": [
+                {
+                    "id": item.id,
+                    "credited_at": credited_at.isoformat() if credited_at else None,
+                    "seconds_credited": item.seconds_credited,
+                    "expiry_before": item.expiry_before.isoformat() if item.expiry_before else None,
+                    "expiry_after": item.expiry_after.isoformat() if item.expiry_after else None,
+                    "reprovision_state": item.reprovision_state,
+                    "reprovision_error": item.reprovision_error,
+                    "note": note,
+                }
+                for item, credited_at, note in comp_rows
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching payment summary for customer {customer_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch payment summary")
+
+
 @router.get("/api/mpesa/transactions/summary")
 async def get_mpesa_transactions_summary(
     router_id: Optional[int] = None,
@@ -1759,7 +1951,7 @@ async def get_mpesa_transactions_summary(
 
         rows = []
         want_mpesa = payment_method in (None, "mobile_money")
-        want_other = payment_method != "mobile_money"
+        want_other = True  # mobile_money still has gateway rows here
 
         if want_mpesa:
             mpesa_stmt = (
@@ -1813,7 +2005,7 @@ async def get_mpesa_transactions_summary(
                 .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(
                     CustomerPayment.reseller_id == user.id,
-                    CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
+                    _cp_ledger_condition(payment_method),
                 )
             )
             if payment_method and payment_method != "mobile_money":
