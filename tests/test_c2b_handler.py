@@ -184,6 +184,9 @@ async def test_confirmation_overpayment_credits_wallet(db, session_factory):
         assert refreshed.status == CustomerStatus.ACTIVE
         assert refreshed.wallet_credit_kes == 250  # 750 paid - 500 plan = 250 overage
 
+        txn = (await s.execute(select(C2BTransaction).where(C2BTransaction.trans_id == "RJ002"))).scalar_one()
+        assert (txn.wallet_before_kes, txn.wallet_after_kes) == (0, 250)
+
 
 # ---------------------------------------------------------------------------
 # Confirmation: underpayment but wallet covers it → activated, wallet drained
@@ -206,6 +209,7 @@ async def test_confirmation_underpayment_drains_wallet(db, session_factory):
 
         txn = (await s.execute(select(C2BTransaction).where(C2BTransaction.trans_id == "RJ003"))).scalar_one()
         assert txn.status == C2BTransactionStatus.PROCESSED
+        assert (txn.wallet_before_kes, txn.wallet_after_kes) == (200, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +232,7 @@ async def test_confirmation_underpayment_with_insufficient_wallet_unmatched(db, 
 
         txn = (await s.execute(select(C2BTransaction).where(C2BTransaction.trans_id == "RJ004"))).scalar_one()
         assert txn.status == C2BTransactionStatus.UNMATCHED
+        assert (txn.wallet_before_kes, txn.wallet_after_kes) == (None, None)  # never applied
 
         um = (
             await s.execute(select(UnmatchedC2BPayment).where(UnmatchedC2BPayment.c2b_transaction_id == txn.id))

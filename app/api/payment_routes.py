@@ -1212,6 +1212,52 @@ def _cp_source(reference: Optional[str]) -> Optional[str]:
     return None
 
 
+async def _customer_wallet_trail(db: AsyncSession, customer_id: int, reseller_id: int) -> dict:
+    """Wallet credit before/after each applied paybill payment of one customer.
+
+    Only paybill payments move the wallet (c2b_handler and manual
+    attribution), so the trail can be replayed oldest first from 0. Payments
+    recorded since c2b_transactions kept the balances are exact; older ones
+    are replayed with the handler's formula and the price of the plan the
+    payment bought, which may have changed since, so they are marked
+    estimated. Returns {c2b_transaction_id: (before, after, estimated)}.
+    """
+    rows = (await db.execute(
+        select(
+            C2BTransaction.id,
+            C2BTransaction.trans_amount,
+            C2BTransaction.wallet_before_kes,
+            C2BTransaction.wallet_after_kes,
+            Plan.price,
+        )
+        .outerjoin(Customer, Customer.id == C2BTransaction.matched_customer_id)
+        .outerjoin(CustomerPayment, and_(
+            CustomerPayment.payment_reference == C2BTransaction.trans_id,
+            CustomerPayment.customer_id == C2BTransaction.matched_customer_id,
+        ))
+        .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
+        .where(
+            C2BTransaction.matched_customer_id == customer_id,
+            C2BTransaction.matched_reseller_id == reseller_id,
+            C2BTransaction.status == C2BTransactionStatus.PROCESSED,
+        )
+        .order_by(C2BTransaction.received_at.asc(), C2BTransaction.id.asc())
+    )).all()
+
+    trail = {}
+    wallet = 0
+    for tx_id, amount, before, after, plan_price in rows:
+        if before is not None and after is not None:
+            trail[tx_id] = (before, after, False)
+            wallet = after
+            continue
+        price = float(plan_price or 0)
+        new_wallet = max(0, int(round(float(amount) + wallet - price))) if price > 0 else 0
+        trail[tx_id] = (wallet, new_wallet, True)
+        wallet = new_wallet
+    return trail
+
+
 @router.get("/api/mpesa/transactions")
 async def get_mpesa_transactions(
     router_id: Optional[int] = None,
@@ -1560,8 +1606,12 @@ async def get_mpesa_transactions(
             )
 
             c2b_rows = (await db.execute(c2b_stmt)).all()
+            wallet_trail = (
+                await _customer_wallet_trail(db, customer_id, user.id) if customer_id else {}
+            )
 
             for tx, customer, rtr, plan, c2b_days_paid_for in c2b_rows:
+                wallet = wallet_trail.get(tx.id)
                 results.append({
                     "transaction_id": tx.id,
                     "checkout_request_id": None,
@@ -1581,6 +1631,9 @@ async def get_mpesa_transactions(
                     "created_at": tx.received_at.isoformat() if tx.received_at else None,
                     "source": "c2b_paybill",
                     "days_paid_for": c2b_days_paid_for,
+                    "wallet_before_kes": wallet[0] if wallet else tx.wallet_before_kes,
+                    "wallet_after_kes": wallet[1] if wallet else tx.wallet_after_kes,
+                    "wallet_estimated": wallet[2] if wallet else False,
                     "customer": {
                         "id": customer.id,
                         "name": customer.name,

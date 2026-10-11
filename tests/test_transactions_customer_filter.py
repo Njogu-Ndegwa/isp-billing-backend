@@ -258,3 +258,92 @@ async def test_customer_payment_summary_hides_other_resellers_customers(db, monk
             customer_id=customer.id, db=db, token="test-token",
         )
     assert exc.value.status_code == 404
+
+
+async def test_wallet_trail_on_paybill_rows_exact_and_estimated(db, monkeypatch):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, price=1000)
+    router = await make_router(db, reseller)
+    customer = await make_customer(db, reseller, plan, router)
+    t0 = datetime.utcnow() - timedelta(days=60)
+
+    def paybill(trans_id, amount, days_ago, before=None, after=None):
+        return [
+            C2BTransaction(
+                trans_id=trans_id, trans_amount=amount, status=C2BTransactionStatus.PROCESSED,
+                matched_customer_id=customer.id, matched_reseller_id=reseller.id,
+                received_at=t0 + timedelta(days=days_ago),
+                wallet_before_kes=before, wallet_after_kes=after,
+            ),
+            CustomerPayment(
+                customer_id=customer.id, reseller_id=reseller.id, amount=amount,
+                payment_method=PaymentMethod.MOBILE_MONEY, payment_reference=trans_id,
+                days_paid_for=30, plan_id=plan.id,
+            ),
+        ]
+
+    # Two payments from before the balances were stored, then one stored.
+    db.add_all([
+        *paybill("OLD1", 1300, 0),           # 0 + 1300 - 1000 -> 300
+        *paybill("OLD2", 700, 30),           # 300 + 700 - 1000 -> 0
+        *paybill("NEW1", 1050, 59, 0, 50),   # recorded by the handler
+    ])
+    await db.commit()
+    _as(monkeypatch, reseller)
+
+    rows = await _list(db, customer_id=customer.id)
+    wallet = {
+        row["payment_reference"]: (row["wallet_before_kes"], row["wallet_after_kes"], row["wallet_estimated"])
+        for row in rows
+    }
+    assert wallet == {
+        "OLD1": (0, 300, True),
+        "OLD2": (300, 0, True),
+        "NEW1": (0, 50, False),
+    }
+
+    # Without a customer filter only stored balances are returned.
+    everyone = {row["payment_reference"]: row for row in await _list(db)}
+    assert everyone["OLD1"]["wallet_after_kes"] is None
+    assert everyone["NEW1"]["wallet_after_kes"] == 50
+
+
+async def test_manual_attribution_records_wallet_balances(db, monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from app.api import c2b_routes
+    from app.db.models import UnmatchedC2BPayment, UnmatchedC2BReason
+
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, price=500)
+    router = await make_router(db, reseller)
+    customer = await make_customer(db, reseller, plan, router, wallet_credit_kes=100)
+    txn = C2BTransaction(
+        trans_id="MAN1", trans_amount=600, status=C2BTransactionStatus.UNMATCHED,
+        matched_reseller_id=reseller.id,
+    )
+    db.add(txn)
+    await db.flush()
+    unmatched = UnmatchedC2BPayment(
+        c2b_transaction_id=txn.id, reason=UnmatchedC2BReason.UNKNOWN_ACCOUNT,
+        assigned_reseller_id=reseller.id,
+    )
+    db.add(unmatched)
+    await db.commit()
+
+    async def _current_user(_token, _db):
+        return SimpleNamespace(id=reseller.id, role=UserRole.RESELLER)
+
+    monkeypatch.setattr(c2b_routes, "get_current_user", _current_user)
+
+    result = await c2b_routes.attribute_unmatched_c2b(
+        unmatched_id=unmatched.id,
+        request=c2b_routes.AttributeUnmatchedRequest(customer_id=customer.id),
+        background_tasks=BackgroundTasks(),
+        db=db,
+        token="test-token",
+    )
+
+    assert result["new_wallet_credit_kes"] == 200  # 600 + 100 - 500
+    await db.refresh(txn)
+    assert (txn.wallet_before_kes, txn.wallet_after_kes) == (100, 200)
