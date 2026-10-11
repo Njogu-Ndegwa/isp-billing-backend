@@ -134,6 +134,16 @@ def _manual_provision_support(
         return False, "Only direct hotspot transactions are supported"
     if not customer.mac_address:
         return False, "Customer has no MAC address"
+    # A pending payment is finalized (and the expiry extended) before the push;
+    # a completed one only replays access. Replaying it after the paid time ran
+    # out put the customer back online for free, and expiry cleanup, which only
+    # looks at ACTIVE customers, never removed them again (2026-10-10, TDK).
+    is_pending = (
+        payment_method == PaymentMethod.MOBILE_MONEY.value
+        and status == MpesaTransactionStatus.pending.value
+    )
+    if not is_pending and (customer.expiry is None or customer.expiry <= datetime.utcnow()):
+        return False, "This customer's paid time has ended. Record a new payment to reconnect them."
 
     return True, None
 
