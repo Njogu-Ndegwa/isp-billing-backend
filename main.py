@@ -1156,8 +1156,9 @@ async def run_plan_delete_migrations():
         for table, constraint in PLAN_DELETE_SET_NULL_FKS:
             already_set_null = (await conn.execute(sa_text("""
                 SELECT 1 FROM pg_constraint
-                WHERE conname = :name AND confdeltype = 'n'
-            """), {"name": constraint})).first()
+                WHERE conrelid = CAST(:table AS regclass)
+                  AND conname = :name AND confdeltype = 'n'
+            """), {"table": table, "name": constraint})).first()
             if already_set_null:
                 continue
             await conn.execute(sa_text(
