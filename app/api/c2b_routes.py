@@ -49,6 +49,7 @@ from app.services.auth import verify_token, get_current_user
 from app.services.account_numbers import is_valid_account_number
 from app.services.c2b_handler import (
     SUCCESS_RESPONSE,
+    claim_unmatched_payment,
     handle_confirmation,
     handle_validation,
 )
@@ -287,6 +288,15 @@ async def attribute_unmatched_c2b(
                 f"is below plan price {plan_price}; cannot activate."
             ),
         )
+
+    # The resolved_at check above is not enough on its own: two requests (a
+    # double-click, or an admin activation consuming this hold) can both pass
+    # it before either commits. Claim the row atomically before crediting.
+    if not await claim_unmatched_payment(
+        db, unmatched.id, resolved_by_user_id=user.id, customer_id=customer.id,
+    ):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Already resolved")
 
     plan_duration_value = customer.plan.duration_value
     plan_duration_unit = customer.plan.duration_unit.value.upper()

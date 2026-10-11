@@ -956,7 +956,7 @@ async def activate_pppoe_customer(
             mac_address=None,
             source_table=ProvisioningAttemptSource.CUSTOMER_PAYMENT,
             source_pk=payment.id,
-            external_reference=request.payment_reference,
+            external_reference=payment.payment_reference,
             entrypoint=ProvisioningAttemptEntrypoint.MANUAL_TRANSACTION_PROVISION,
         )
         await schedule_provisioning_attempt(db, attempt)

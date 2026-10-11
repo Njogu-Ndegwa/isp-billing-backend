@@ -18,11 +18,11 @@ on network errors and we must never double-credit a customer.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
 from fastapi import BackgroundTasks
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
@@ -443,20 +443,33 @@ async def handle_validation(payload: dict, db: AsyncSession) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# Holds older than about one billing cycle are not applied automatically: by
+# then the reseller has usually settled them some other way (cash, refund),
+# and there is no path to dismiss a stale hold.
+HELD_UNDERPAYMENT_MAX_AGE = timedelta(days=35)
+
+
 async def find_held_underpayment(
     db: AsyncSession,
     customer: Customer,
     plan_price: float,
+    *,
+    now: Optional[datetime] = None,
 ) -> Optional[Tuple[UnmatchedC2BPayment, C2BTransaction]]:
-    """Oldest open AMOUNT_TOO_LOW hold for this customer that now covers
-    plan_price (with wallet credit).
+    """Oldest recent open AMOUNT_TOO_LOW hold for this customer that now
+    covers plan_price (with wallet credit).
 
     A hold happens when the customer paid less than their plan at the time.
     If the reseller then moves them to a cheaper plan and activates them by
     hand, the activation must consume this M-Pesa payment instead of writing a
     CASH row, or the money never reaches the reseller's payout balance.
-    The row is locked so two concurrent activations can't both claim it.
+    The row is locked so two concurrent activations can't both claim it;
+    the attribute endpoint claims via claim_unmatched_payment, which waits on
+    this lock and then sees the row resolved.
     """
+    if plan_price <= 0:
+        return None
+    cutoff = (now or datetime.utcnow()) - HELD_UNDERPAYMENT_MAX_AGE
     wallet = float(customer.wallet_credit_kes or 0)
     stmt = (
         select(UnmatchedC2BPayment, C2BTransaction)
@@ -464,8 +477,10 @@ async def find_held_underpayment(
         .where(
             UnmatchedC2BPayment.reason == UnmatchedC2BReason.AMOUNT_TOO_LOW,
             UnmatchedC2BPayment.resolved_at.is_(None),
+            UnmatchedC2BPayment.assigned_reseller_id == customer.user_id,
             C2BTransaction.status == C2BTransactionStatus.UNMATCHED,
             C2BTransaction.matched_customer_id == customer.id,
+            C2BTransaction.received_at >= cutoff,
             C2BTransaction.trans_amount + wallet >= plan_price,
         )
         .order_by(C2BTransaction.received_at.asc(), C2BTransaction.id.asc())
@@ -474,6 +489,32 @@ async def find_held_underpayment(
     )
     row = (await db.execute(stmt)).first()
     return (row[0], row[1]) if row else None
+
+
+async def claim_unmatched_payment(
+    db: AsyncSession,
+    unmatched_id: int,
+    *,
+    resolved_by_user_id: Optional[int],
+    customer_id: int,
+) -> bool:
+    """Atomically mark an unmatched row resolved. Returns False if another
+    request resolved it first, so the same M-Pesa payment is never credited
+    twice (double-click on Attribute, or Attribute racing an activation)."""
+    result = await db.execute(
+        update(UnmatchedC2BPayment)
+        .where(
+            UnmatchedC2BPayment.id == unmatched_id,
+            UnmatchedC2BPayment.resolved_at.is_(None),
+        )
+        .values(
+            resolved_at=datetime.utcnow(),
+            resolved_by_user_id=resolved_by_user_id,
+            resolution_customer_id=customer_id,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
 
 
 def held_payment_collection_mode(txn: C2BTransaction) -> CollectionMode:
@@ -507,7 +548,7 @@ def resolve_held_underpayment(
     unmatched.resolved_at = now
     unmatched.resolved_by_user_id = resolved_by_user_id
     unmatched.resolution_customer_id = customer.id
-    unmatched.notes = notes
+    unmatched.notes = f"{unmatched.notes} | {notes}" if unmatched.notes else notes
 
 
 async def _archive(

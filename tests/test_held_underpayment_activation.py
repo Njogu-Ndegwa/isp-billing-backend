@@ -13,10 +13,11 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 
-from app.api import customer_routes
+from app.api import c2b_routes, customer_routes
 from app.config import settings
 from app.db.models import (
     C2BTransaction,
@@ -28,12 +29,19 @@ from app.db.models import (
     CustomerStatus,
     DurationUnit,
     PaymentMethod,
+    ResellerPaymentMethod,
+    ResellerPaymentMethodType,
     UnmatchedC2BPayment,
     UnmatchedC2BReason,
 )
 from app.services import pppoe_provisioning
 from app.services.account_numbers import luhn_check_digit
-from app.services.c2b_handler import handle_confirmation
+from app.services.c2b_handler import (
+    HELD_UNDERPAYMENT_MAX_AGE,
+    claim_unmatched_payment,
+    find_held_underpayment,
+    handle_confirmation,
+)
 from app.services.mpesa_b2b import get_unpaid_balance
 from tests.factories import make_customer, make_plan, make_reseller, make_router
 
@@ -79,13 +87,13 @@ async def _seed(db, *, wallet=0):
     return reseller, pricey, cheap, customer
 
 
-async def _pay(db, customer, trans_id, amount):
+async def _pay(db, customer, trans_id, amount, *, shortcode=None):
     payload = {
         "TransactionType": "Pay Bill",
         "TransID": trans_id,
         "TransTime": "20261011062855",
         "TransAmount": str(amount),
-        "BusinessShortCode": settings.MPESA_SHORTCODE,
+        "BusinessShortCode": shortcode or settings.MPESA_SHORTCODE,
         "BillRefNumber": customer.account_number,
         "MSISDN": "254700000000",
     }
@@ -220,3 +228,132 @@ async def test_explicit_reference_or_opt_out_skips_held_payment(db, session_fact
     async with session_factory() as s:
         um = (await s.execute(select(UnmatchedC2BPayment))).scalar_one()
         assert um.resolved_at is None
+
+
+async def test_overpaying_hold_records_full_amount_and_credits_wallet(db, session_factory, monkeypatch):
+    reseller, _, cheap, customer = await _seed(db)
+    await _pay(db, customer, "UJHELD0005", 1200)
+    await _move_to_plan(db, customer, cheap)
+
+    await _activate(db, monkeypatch, reseller, customer)
+
+    (p,) = await _payments(session_factory, customer.id)
+    assert float(p.amount) == 1200
+    async with session_factory() as s:
+        refreshed = (await s.execute(select(Customer).where(Customer.id == customer.id))).scalar_one()
+        assert refreshed.wallet_credit_kes == 200
+    assert await get_unpaid_balance(db, reseller.id) == 1200
+
+
+async def test_hold_on_resellers_own_paybill_is_direct(db, session_factory, monkeypatch):
+    reseller, _, cheap, customer = await _seed(db)
+    db.add(ResellerPaymentMethod(
+        user_id=reseller.id,
+        method_type=ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
+        label="Own paybill",
+        is_active=True,
+        mpesa_shortcode="987654",
+    ))
+    await db.commit()
+    await _pay(db, customer, "UJHELD0006", 1000, shortcode="987654")
+    await _move_to_plan(db, customer, cheap)
+
+    response = await _activate(db, monkeypatch, reseller, customer)
+
+    assert response["held_mpesa_applied"] == "UJHELD0006"
+    (p,) = await _payments(session_factory, customer.id)
+    assert p.collection_mode == CollectionMode.DIRECT
+    # The reseller already holds this money; the platform owes them nothing.
+    assert await get_unpaid_balance(db, reseller.id) == 0
+
+
+async def test_oldest_covering_hold_is_used_first(db, session_factory, monkeypatch):
+    reseller, _, cheap, customer = await _seed(db)
+    await _pay(db, customer, "UJHELD0007", 1000)
+    await _pay(db, customer, "UJHELD0008", 1000)
+    await _move_to_plan(db, customer, cheap)
+
+    response = await _activate(db, monkeypatch, reseller, customer)
+
+    assert response["held_mpesa_applied"] == "UJHELD0007"
+
+
+async def test_stale_hold_is_not_applied(db, session_factory, monkeypatch):
+    reseller, _, cheap, customer = await _seed(db)
+    await _pay(db, customer, "UJHELD0009", 1000)
+    txn = (await db.execute(select(C2BTransaction))).scalar_one()
+    txn.received_at = datetime.utcnow() - HELD_UNDERPAYMENT_MAX_AGE - timedelta(days=1)
+    await db.commit()
+    await _move_to_plan(db, customer, cheap)
+
+    response = await _activate(db, monkeypatch, reseller, customer)
+
+    assert response["held_mpesa_applied"] is None
+    assert [p.payment_method for p in await _payments(session_factory, customer.id)] == [PaymentMethod.CASH]
+
+
+async def test_free_plan_does_not_consume_hold(db, session_factory, monkeypatch):
+    reseller, _, _, customer = await _seed(db)
+    await _pay(db, customer, "UJHELD0010", 1000)
+    free = await make_plan(
+        db, reseller, price=0, duration_value=1,
+        duration_unit=DurationUnit.DAYS, connection_type=ConnectionType.PPPOE,
+    )
+    await _move_to_plan(db, customer, free)
+
+    response = await _activate(db, monkeypatch, reseller, customer)
+
+    assert response["held_mpesa_applied"] is None
+
+
+async def test_attribute_after_activation_is_rejected(db, session_factory, monkeypatch):
+    reseller, _, cheap, customer = await _seed(db)
+    await _pay(db, customer, "UJHELD0011", 1000)
+    await _move_to_plan(db, customer, cheap)
+    await _activate(db, monkeypatch, reseller, customer)
+    um = (await db.execute(select(UnmatchedC2BPayment))).scalar_one()
+
+    async def fake_current_user(_token, _db):
+        return reseller
+
+    monkeypatch.setattr(c2b_routes, "get_current_user", fake_current_user)
+    with pytest.raises(HTTPException) as exc:
+        await c2b_routes.attribute_unmatched_c2b(
+            um.id,
+            c2b_routes.AttributeUnmatchedRequest(customer_id=customer.id),
+            BackgroundTasks(),
+            db,
+            "token",
+        )
+
+    assert exc.value.status_code == 409
+    assert len(await _payments(session_factory, customer.id)) == 1
+
+
+async def test_unmatched_row_can_only_be_claimed_once(db, session_factory):
+    reseller, _, _, customer = await _seed(db)
+    await _pay(db, customer, "UJHELD0012", 1000)
+    um = (await db.execute(select(UnmatchedC2BPayment))).scalar_one()
+
+    async with session_factory() as a, session_factory() as b:
+        first = await claim_unmatched_payment(a, um.id, resolved_by_user_id=reseller.id, customer_id=customer.id)
+        await a.commit()
+        second = await claim_unmatched_payment(b, um.id, resolved_by_user_id=reseller.id, customer_id=customer.id)
+        await b.commit()
+
+    assert (first, second) == (True, False)
+
+
+async def test_hold_lookup_locks_row_on_postgres(db):
+    reseller, _, _, customer = await _seed(db)
+    captured = []
+    original_execute = db.execute
+
+    async def spy(stmt, *args, **kwargs):
+        captured.append(stmt)
+        return await original_execute(stmt, *args, **kwargs)
+
+    db.execute = spy
+    await find_held_underpayment(db, customer, 1000)
+    sql = str(captured[0].compile(dialect=postgresql.dialect()))
+    assert "FOR UPDATE OF unmatched_c2b_payments SKIP LOCKED" in sql
