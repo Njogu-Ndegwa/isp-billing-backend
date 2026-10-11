@@ -1,6 +1,6 @@
 """Customer usage / FUP read endpoints (frontend-facing)."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -9,10 +9,13 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import settings
+from app.core.local_time import calendar_day_window, to_local, to_utc
 from app.db.database import get_db
 from app.db.models import (
     ConnectionType,
     Customer,
+    CustomerUsageBucket,
     CustomerUsagePeriod,
     Plan,
     Router,
@@ -20,7 +23,12 @@ from app.db.models import (
 )
 from app.services import realtime_state
 from app.services.auth import verify_token, get_current_user
-from app.services.usage_tracking import get_open_period, pooled_period_usage_bytes
+from app.services.usage_tracking import (
+    CUSTOMER_USAGE_BUCKET_RETENTION_DAYS,
+    customer_bucket_start_for,
+    get_open_period,
+    pooled_period_usage_bytes,
+)
 
 router = APIRouter(tags=["usage"])
 
@@ -90,6 +98,31 @@ class TopUsageItem(BaseModel):
     total_mb: float
     percent_used: Optional[float]
     fup_active: bool
+
+
+class UsageTimelinePoint(BaseModel):
+    start: datetime          # UTC start of the slot (an hour, or a local day)
+    upload_mb: float
+    download_mb: float
+    total_mb: float
+
+
+class UsageTimelineOut(BaseModel):
+    customer_id: int
+    granularity: str         # "hour" | "day"
+    days: int
+    window_start: datetime   # UTC, inclusive
+    window_end: datetime     # UTC, exclusive
+    timezone_offset_hours: int
+    # Earliest hour on record for this customer. Charts use it to tell
+    # "used nothing" apart from "not tracked yet" (ledger began 2026-09-26).
+    history_since: Optional[datetime]
+    retention_days: int
+    upload_mb: float
+    download_mb: float
+    total_mb: float
+    peak: Optional[UsageTimelinePoint]
+    points: list[UsageTimelinePoint]
 
 
 # ------------------------------ Helpers ------------------------------
@@ -288,6 +321,105 @@ async def get_customer_usage_history(
         .limit(limit)
     )
     return [_serialize_period(p) for p in result.scalars().all()]
+
+
+@router.get(
+    "/api/customers/{customer_id}/usage/timeline",
+    response_model=UsageTimelineOut,
+)
+async def get_customer_usage_timeline(
+    customer_id: int,
+    days: int = Query(7, ge=1, le=CUSTOMER_USAGE_BUCKET_RETENTION_DAYS),
+    granularity: Optional[str] = Query(None, pattern="^(hour|day)$"),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Data used by one customer over time, from the hourly usage ledger.
+
+    ``granularity=hour`` gives a rolling ``days * 24`` hours ending with the
+    current hour; ``granularity=day`` gives the last ``days`` local (EAT)
+    calendar days, today included. Defaults to hourly for 1-2 days, daily
+    beyond. Every slot is present (zero-filled), oldest first.
+    """
+    user = await get_current_user(token, db)
+    customer = await _load_customer_scoped(db, customer_id, user)
+    granularity = granularity or ("hour" if days <= 2 else "day")
+    now_utc = datetime.utcnow()
+
+    if granularity == "hour":
+        end = customer_bucket_start_for(now_utc) + timedelta(hours=1)
+        start = end - timedelta(hours=days * 24)
+        step = timedelta(hours=1)
+    else:
+        start, end = calendar_day_window(days, now_utc)
+        step = timedelta(days=1)
+
+    rows = (
+        await db.execute(
+            select(
+                CustomerUsageBucket.bucket_start,
+                CustomerUsageBucket.upload_bytes,
+                CustomerUsageBucket.download_bytes,
+            ).where(
+                CustomerUsageBucket.customer_id == customer.id,
+                CustomerUsageBucket.bucket_start >= start,
+                CustomerUsageBucket.bucket_start < end,
+            )
+        )
+    ).all()
+    history_since = (
+        await db.execute(
+            select(func.min(CustomerUsageBucket.bucket_start)).where(
+                CustomerUsageBucket.customer_id == customer.id
+            )
+        )
+    ).scalar()
+
+    # Slots are keyed by their UTC start. Daily slots start at local midnight,
+    # and the offset is whole hours, so every hourly bucket falls in exactly one.
+    slots: dict[datetime, list[int]] = {}
+    slot = start
+    while slot < end:
+        slots[slot] = [0, 0]
+        slot += step
+    for bucket_start, upload_bytes, download_bytes in rows:
+        if granularity == "hour":
+            key = bucket_start
+        else:
+            local = to_local(bucket_start)
+            key = to_utc(datetime(local.year, local.month, local.day))
+        if key in slots:
+            slots[key][0] += int(upload_bytes or 0)
+            slots[key][1] += int(download_bytes or 0)
+
+    points = [
+        UsageTimelinePoint(
+            start=slot_start,
+            upload_mb=_bytes_to_mb(up),
+            download_mb=_bytes_to_mb(down),
+            total_mb=_bytes_to_mb(up + down),
+        )
+        for slot_start, (up, down) in slots.items()
+    ]
+    total_up = sum(up for up, _ in slots.values())
+    total_down = sum(down for _, down in slots.values())
+    peak = max(points, key=lambda p: p.total_mb, default=None)
+
+    return UsageTimelineOut(
+        customer_id=customer.id,
+        granularity=granularity,
+        days=days,
+        window_start=start,
+        window_end=end,
+        timezone_offset_hours=settings.LOCAL_UTC_OFFSET_HOURS,
+        history_since=history_since,
+        retention_days=CUSTOMER_USAGE_BUCKET_RETENTION_DAYS,
+        upload_mb=_bytes_to_mb(total_up),
+        download_mb=_bytes_to_mb(total_down),
+        total_mb=_bytes_to_mb(total_up + total_down),
+        peak=peak if peak is not None and peak.total_mb > 0 else None,
+        points=points,
+    )
 
 
 @router.get(
