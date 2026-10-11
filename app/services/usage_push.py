@@ -154,6 +154,9 @@ class IngestResult:
     live_hotspot_customers: dict[str, int] = field(default_factory=dict)
     # "pppoe:<username>" -> customer id, for PPPoE customers live on this router.
     live_pppoe_customers: dict[str, int] = field(default_factory=dict)
+    # True once the two maps above were built from this router's customers.
+    # Empty maps on an early return mean "not looked at", not "nobody live".
+    customers_resolved: bool = False
     errors: list[str] = field(default_factory=list)
     snapshot_written: bool = False
 
@@ -413,6 +416,7 @@ async def ingest_usage_reports(
                 and _customer_is_live(customer, now)
             ):
                 result.live_pppoe_customers[key] = customer.id
+        result.customers_resolved = True
 
         # RouterOS can list one host entry twice (its script walks the bypassed
         # and the authorized lists); crediting both would double-count it.

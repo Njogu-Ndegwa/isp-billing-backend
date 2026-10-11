@@ -81,6 +81,7 @@ from app.api.router_operations import router as router_ops_router
 from app.api.admin_routes import router as admin_router
 from app.api.plan_routes import router as plan_router
 from app.api.customer_routes import router as customer_router
+from app.api.customer_audit_routes import router as customer_audit_router
 from app.api.payment_routes import router as payment_router
 from app.api.dashboard_routes import router as dashboard_router
 from app.api.mikrotik_routes import router as mikrotik_router
@@ -131,6 +132,7 @@ app.include_router(router_ops_router)
 app.include_router(admin_router)
 app.include_router(plan_router)
 app.include_router(customer_router)
+app.include_router(customer_audit_router)
 app.include_router(payment_router)
 app.include_router(dashboard_router)
 app.include_router(mikrotik_router)
@@ -2966,6 +2968,27 @@ async def run_ops_health_migrations():
     logger.info("Ops health migrations complete")
 
 
+async def run_customer_event_migrations():
+    """Customer audit log (app/services/customer_events.py): one NEW table,
+    customer_events, via the checkfirst create_all pattern. Its indexes are
+    created with it. Safe to run on every startup.
+    """
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+
+        from app.db.models import CustomerEvent
+        # Explicit startup create_all target: customer_events.
+        if CustomerEvent.__tablename__ not in tables:
+            await conn.run_sync(
+                lambda c: Base.metadata.create_all(c, tables=[CustomerEvent.__table__])
+            )
+            logger.info("Customer event migration: created customer_events")
+
+    logger.info("Customer event migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     if shadow_mode_enabled():
@@ -3231,6 +3254,11 @@ async def startup_event():
         await run_checkin_delivery_migrations()
     except Exception as e:
         logger.error(f"CRITICAL: check-in delivery migration failed: {e}")
+
+    try:
+        await run_customer_event_migrations()
+    except Exception as e:
+        logger.error(f"Customer event migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
     if not scheduler_enabled():
@@ -3619,6 +3647,65 @@ async def startup_event():
         trigger=IntervalTrigger(minutes=5),
         id='router_diagnosis',
         name='Problem-router diagnosis probes',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+    )
+
+    # Customer audit log. The push path only queues session events in memory;
+    # this writes them in one batch (and skips a tick when the pool is busy).
+    async def _flush_customer_events_background():
+        from app.services.customer_events import flush_customer_events
+        try:
+            await flush_customer_events()
+        except Exception as e:
+            logger.error(f"[AUDIT] customer event flush failed: {e}")
+
+    scheduler.add_job(
+        _flush_customer_events_background,
+        trigger=IntervalTrigger(seconds=30),
+        id='flush_customer_events',
+        name='Write queued customer session events',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+
+    async def _prune_customer_events_background():
+        from app.services.customer_events import prune_customer_events
+        try:
+            removed = await prune_customer_events(app_settings.CUSTOMER_EVENT_RETENTION_DAYS)
+            if removed:
+                logger.info(f"[AUDIT] pruned {removed} old customer session/log events")
+        except Exception as e:
+            logger.error(f"[AUDIT] customer event prune failed: {e}")
+
+    scheduler.add_job(
+        _prune_customer_events_background,
+        trigger=CronTrigger(hour=1, minute=40),
+        id='prune_customer_events',
+        name='Prune old customer session and router-log events',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Off unless CUSTOMER_LOG_COLLECTOR_ENABLED; the job itself checks, so the
+    # flag can be flipped with a restart and no code change.
+    async def _collect_customer_router_logs_background():
+        from app.services.customer_router_logs import collect_router_logs_background
+        try:
+            await collect_router_logs_background()
+        except Exception as e:
+            logger.error(f"[AUDIT] router log collector failed: {e}")
+
+    scheduler.add_job(
+        _collect_customer_router_logs_background,
+        trigger=IntervalTrigger(seconds=120),
+        id='collect_customer_router_logs',
+        name='Keep router log lines that name a customer',
         replace_existing=True,
         max_instances=1,
         coalesce=True,

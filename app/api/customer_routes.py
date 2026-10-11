@@ -30,6 +30,7 @@ from app.services.hotspot_provisioning import (
     schedule_provisioning_attempt,
 )
 from app.services.account_numbers import generate_account_number
+from app.services.customer_events import record_customer_event
 
 import logging
 
@@ -39,6 +40,44 @@ logger = logging.getLogger(__name__)
 def _generate_pppoe_password(length: int = 12) -> str:
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+# Fields an edit can change, as shown in the customer audit log. Passwords are
+# never written to the log, only the fact that one changed.
+_AUDITED_FIELDS = (
+    ("name", "name"), ("phone", "phone"), ("plan_id", "plan"), ("router_id", "router"),
+    ("mac_address", "MAC"), ("pppoe_username", "PPPoE username"),
+    ("static_ip", "static IP"), ("expiry", "expiry"),
+)
+
+
+def _audit_snapshot(customer) -> dict:
+    snap = {field: getattr(customer, field) for field, _ in _AUDITED_FIELDS}
+    snap["pppoe_password"] = customer.pppoe_password
+    return snap
+
+
+def _audit_changes(before: dict, after: dict, names: dict) -> tuple[list[str], dict]:
+    """Human summary plus a {field: [old, new]} map of what an edit changed."""
+    def show(field, value):
+        if value is None or value == "":
+            return "(none)"
+        if field in ("plan_id", "router_id"):
+            return names.get((field, value)) or f"#{value}"
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M UTC")
+        return str(value)
+
+    parts, changes = [], {}
+    for field, label in _AUDITED_FIELDS:
+        old, new = before.get(field), after.get(field)
+        if old != new:
+            parts.append(f"{label} {show(field, old)} -> {show(field, new)}")
+            changes[field] = [show(field, old), show(field, new)]
+    if before.get("pppoe_password") != after.get("pppoe_password"):
+        parts.append("PPPoE password changed")
+        changes["pppoe_password"] = ["***", "***"]
+    return parts, changes
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +217,11 @@ async def register_customer_api(
             f"Customer registered: {customer.id} (account_number={customer.account_number}) "
             f"by user {user.id}"
         )
+        await record_customer_event(
+            customer.id, "customer_created",
+            f"Customer registered on plan {plan.name}, router {router_obj.name}",
+            actor=user, user_id=user.id, router_id=customer.router_id,
+        )
 
         if customer.pppoe_username:
             # Opt-in login-details SMS; checks the reseller's settings itself
@@ -302,6 +346,7 @@ async def edit_customer(
                     detail=f"PPPoE username '{normalized_pppoe_username}' already exists",
                 )
 
+        audit_before = _audit_snapshot(customer)
         old_pppoe_username = customer.pppoe_username
         old_pppoe_password = customer.pppoe_password
         old_router_id = customer.router_id
@@ -333,6 +378,25 @@ async def edit_customer(
 
         await db.commit()
         await db.refresh(customer, attribute_names=["plan", "router"])
+
+        audit_after = _audit_snapshot(customer)
+        names = {}
+        if audit_before["plan_id"] != audit_after["plan_id"]:
+            for plan_row in (await db.execute(select(Plan.id, Plan.name).where(
+                    Plan.id.in_([audit_before["plan_id"], audit_after["plan_id"]])))).all():
+                names[("plan_id", plan_row.id)] = plan_row.name
+        if audit_before["router_id"] != audit_after["router_id"]:
+            for router_row in (await db.execute(select(Router.id, Router.name).where(
+                    Router.id.in_([audit_before["router_id"], audit_after["router_id"]])))).all():
+                names[("router_id", router_row.id)] = router_row.name
+        await db.commit()
+        audit_parts, audit_diff = _audit_changes(audit_before, audit_after, names)
+        if audit_parts:
+            await record_customer_event(
+                customer.id, "customer_updated", "Edited: " + "; ".join(audit_parts),
+                actor=user, user_id=customer.user_id, router_id=customer.router_id,
+                details={"changes": audit_diff},
+            )
 
         if "expiry" in update_fields and not customer.pppoe_username:
             # A router that removes its own expired customers holds the
@@ -557,6 +621,11 @@ async def delete_customer(
         await db.commit()
 
         logger.info(f"Customer {customer_id} ({customer_name}) deleted by user {user.id}")
+        await record_customer_event(
+            customer_id, "customer_deleted", f"Customer '{customer_name}' deleted",
+            actor=user, user_id=user.id,
+            details={"pppoe_deprovisioned": deprovision_result},
+        )
 
         return {
             "success": True,
@@ -932,6 +1001,17 @@ async def activate_pppoe_customer(
         )
         provision_succeeded = bool(provision_result and provision_result.get("success"))
         delivery = provision_result.get("delivery") if provision_result else None
+        await record_customer_event(
+            customer.id, "pppoe_activated",
+            f"PPPoE activated on {plan.name} until {customer.expiry:%Y-%m-%d %H:%M} UTC "
+            f"({request.payment_method}); router "
+            + ("updated" if provision_succeeded else
+               f"not updated yet: {(provision_result or {}).get('error') or 'will retry'}"),
+            severity="info" if provision_succeeded else "warning",
+            actor=user, user_id=user.id, router_id=customer.router_id,
+            details={"payment_id": payment.id, "reference": request.payment_reference,
+                     "provision_result": "ok" if provision_succeeded else "retry_pending"},
+        )
 
         return {
             "success": True,
@@ -1015,6 +1095,11 @@ async def deactivate_pppoe_customer(
                 details="Manual deactivation confirmed session and secret absent",
             ))
         await db.commit()
+        await record_customer_event(
+            customer.id, "pppoe_deactivated",
+            "PPPoE deactivated: session disconnected and secret removed from the router",
+            actor=user, user_id=user.id, router_id=customer.router_id,
+        )
 
         return {
             "success": True,
@@ -1108,6 +1193,15 @@ async def regenerate_pppoe_password(
             await db.commit()
             provision_result = await call_pppoe_provision(pppoe_payload)
             router_updated = bool(provision_result and provision_result.get("success"))
+
+        await record_customer_event(
+            customer.id, "pppoe_password_regenerated",
+            "New PPPoE password generated"
+            + ("; router updated" if router_updated else
+               "; router not updated (customer inactive or router unreachable)"),
+            severity="info" if router_updated or customer.status != CustomerStatus.ACTIVE else "warning",
+            actor=user, user_id=user.id, router_id=customer.router_id,
+        )
 
         return {
             "success": True,

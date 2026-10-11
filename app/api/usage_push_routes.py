@@ -46,7 +46,7 @@ from app.services.usage_push import (
     ingest_usage_reports,
 )
 from app.services.usage_push_auth import verify_router_token
-from app.services import realtime_state
+from app.services import customer_events, realtime_state
 from app.services.hotspot_mac_login import mac_login_enabled
 from app.services.realtime_state import (
     HostSample,
@@ -380,6 +380,24 @@ async def receive_usage_push(
             router_metrics=metrics,
             meter_hotspot_by_host=pilot and "hosts" in payload.model_fields_set,
         )
+
+    if result.customers_resolved:
+        # Session transitions for the customer audit log: an in-memory diff
+        # against the previous report, queued and written by a scheduler job,
+        # so this request path gains no DB work.
+        try:
+            customer_events.observe_push(
+                router_row.id,
+                datetime.utcnow(),
+                ppp=([p.model_dump() for p in payload.ppp]
+                     if "ppp" in payload.model_fields_set else None),
+                live_pppoe_customers=result.live_pppoe_customers,
+                hosts=([h.model_dump() for h in payload.hosts]
+                       if "hosts" in payload.model_fields_set else None),
+                live_hotspot_customers=result.live_hotspot_customers,
+            )
+        except Exception:
+            logger.exception("[USAGE-PUSH] session audit diff failed for %s", identity)
 
     if payload.router is not None:
         # Health goes to its own table in its own short session, after the

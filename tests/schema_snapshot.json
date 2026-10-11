@@ -182,6 +182,23 @@
   "trans_amount",
   "trans_id"
  ],
+ "customer_events": [
+  "actor_label",
+  "actor_user_id",
+  "category",
+  "created_at",
+  "customer_id",
+  "dedup_key",
+  "details",
+  "event_type",
+  "id",
+  "message",
+  "occurred_at",
+  "router_id",
+  "severity",
+  "source",
+  "user_id"
+ ],
  "customer_expiry_sms_settings": [
   "created_at",
   "custom_templates",
