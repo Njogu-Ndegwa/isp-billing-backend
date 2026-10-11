@@ -180,7 +180,9 @@
   "received_at",
   "status",
   "trans_amount",
-  "trans_id"
+  "trans_id",
+  "wallet_after_kes",
+  "wallet_before_kes"
  ],
  "customer_expiry_sms_settings": [
   "created_at",

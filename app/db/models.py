@@ -1991,6 +1991,12 @@ class C2BTransaction(Base):
     matched_reseller_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     received_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     processed_at = Column(DateTime, nullable=True)
+    # The customer's wallet credit just before and after this payment was
+    # applied. Paybill payments are the only thing that moves the wallet, so
+    # these rows are its history. NULL on rows from before October 2026 and
+    # on payments that were never applied.
+    wallet_before_kes = Column(Integer, nullable=True)
+    wallet_after_kes = Column(Integer, nullable=True)
 
     matched_customer = relationship("Customer")
     matched_reseller = relationship("User")

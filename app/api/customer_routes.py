@@ -789,6 +789,7 @@ async def get_customers_api(
                 "account_number": c.account_number,
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
+                "subscription_owner_id": c.subscription_owner_id,
                 "has_paid": bool(c_has_paid),
                 "tier": "customer" if c_has_paid else "visitor",
                 "plan": {
@@ -919,6 +920,7 @@ async def get_customer_detail(
             "account_number": customer.account_number,
             "wallet_credit_kes": customer.wallet_credit_kes,
             **grace_fields(customer, datetime.utcnow()),
+            "subscription_owner_id": customer.subscription_owner_id,
             "plan": {
                 "id": customer.plan.id,
                 "name": customer.plan.name,
