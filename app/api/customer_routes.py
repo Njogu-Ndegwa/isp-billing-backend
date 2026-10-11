@@ -1138,6 +1138,12 @@ async def get_pppoe_credentials(
         if not customer.pppoe_username:
             raise HTTPException(status_code=400, detail="Customer does not have PPPoE credentials")
 
+        await db.commit()
+        await record_customer_event(
+            customer.id, "credentials_viewed", "PPPoE username and password viewed",
+            actor=user, user_id=user.id, router_id=customer.router_id,
+        )
+
         return {
             "customer_id": customer.id,
             "name": customer.name,

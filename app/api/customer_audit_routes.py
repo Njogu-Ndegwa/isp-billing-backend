@@ -13,7 +13,8 @@ The timeline merges, at read time:
   (completed ones already appear as payments);
 * ``provisioning_attempts`` / ``provisioning_logs`` — the system putting the
   customer on, or taking them off, the router;
-* ``reconnection_attempts`` — self-service reconnects from the portal.
+* ``reconnection_attempts`` — self-service reconnects from the portal;
+* ``sms_messages`` — every SMS sent to the customer, with its delivery result.
 
 Paging is by time: pass the ``next_before`` of one page as ``before`` for the
 next. Each source is read with the same bound and limit, then merged.
@@ -34,7 +35,7 @@ from app.db.database import get_db
 from app.db.models import (
     Customer, CustomerEvent, CustomerPayment, MpesaTransaction,
     MpesaTransactionStatus, Plan, ProvisioningAttempt, ProvisioningLog,
-    ReconnectionAttempt, Router,
+    ReconnectionAttempt, Router, SmsMessage,
 )
 from app.services import realtime_state
 from app.services.auth import get_current_user, verify_token
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["customer-audit"])
 
-CATEGORIES = ("session", "router_log", "change", "billing", "provisioning")
+CATEGORIES = ("session", "router_log", "change", "billing", "provisioning", "messages")
 DEFAULT_LIMIT = 150
 MAX_LIMIT = 500
 
@@ -262,6 +263,26 @@ async def customer_audit_log(
                 router_id=rc.router_id, source="customer",
                 details={"mac": rc.mac_address, "old_mac": rc.old_mac_address},
                 ref=f"rc:{rc.id}",
+            ))
+
+    if "messages" in wanted:
+        stmt = _bounded(
+            select(SmsMessage).where(SmsMessage.customer_id == customer_id),
+            SmsMessage.created_at, before, after,
+        ).order_by(SmsMessage.created_at.desc()).limit(limit)
+        for sms in _note((await db.execute(stmt)).scalars().all(), lambda r: r.created_at):
+            status = sms.status.value if sms.status else "queued"
+            label = {"failed": "SMS failed", "delivered": "SMS delivered",
+                     "sent": "SMS sent", "queued": "SMS queued"}.get(status, f"SMS {status}")
+            text = f"{label} to {sms.recipient_phone}"
+            if sms.error:
+                text += f": {sms.error}"
+            items.append(_item(
+                sms.created_at, "messages", f"sms_{status}", text,
+                severity="warning" if status == "failed" else "info",
+                details={"body": sms.body, "provider": sms.provider, "category": sms.category,
+                         "segments": sms.segments},
+                ref=f"sms:{sms.id}",
             ))
 
     registered = any(i["event_type"] == "customer_created" for i in items)

@@ -227,6 +227,33 @@ def parse_uptime(value: Optional[str]) -> Optional[int]:
     return total
 
 
+def format_bytes(value: Optional[int]) -> str:
+    if value is None:
+        return "?"
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit in ("B", "KB") else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"  # pragma: no cover
+
+
+def _usage_text(seen: "_Seen") -> str:
+    if seen.down_bytes is None and seen.up_bytes is None:
+        return ""
+    return f", used {format_bytes(seen.down_bytes)} down / {format_bytes(seen.up_bytes)} up"
+
+
+def _session_summary(seen: "_Seen") -> dict:
+    return {
+        "ip": seen.ip, "caller_id": seen.caller_id, "uptime_seconds": seen.uptime_s,
+        "download_bytes": seen.down_bytes, "upload_bytes": seen.up_bytes,
+        "last_seen_at": _iso(seen.seen_at),
+        "started_at": _iso(seen.seen_at - timedelta(seconds=seen.uptime_s))
+        if seen.seen_at and seen.uptime_s is not None else None,
+    }
+
+
 def format_duration(seconds: Optional[int]) -> str:
     if seconds is None:
         return "unknown time"
@@ -252,6 +279,8 @@ class _Seen:
     caller_id: str = ""
     seen_at: Optional[datetime] = None
     misses: int = 0
+    up_bytes: Optional[int] = None    # session counters at the last report
+    down_bytes: Optional[int] = None
 
 
 # router_id -> key ("pppoe:<user>" or MAC) -> last known state
@@ -277,6 +306,7 @@ def observe_push(
     *,
     ppp: Optional[list[dict]] = None,
     live_pppoe_customers: Optional[dict[str, int]] = None,
+    pppoe_queue_bytes: Optional[dict[str, tuple[int, int]]] = None,
     hosts: Optional[list[dict]] = None,
     live_hotspot_customers: Optional[dict[str, int]] = None,
 ) -> list[dict]:
@@ -286,6 +316,10 @@ def observe_push(
     nothing is concluded about those customers (absence of a list is not
     absence of the sessions). The first report a router sends after a restart
     only seeds the state, because there is nothing to compare it with.
+
+    ``pppoe_queue_bytes`` maps "pppoe:<user>" to the (upload, download) counters
+    of the session's dynamic queue, which RouterOS creates with the session and
+    removes with it — so the last value seen is that session's usage.
     """
     known = _sessions.get(router_id)
     first_report = known is None
@@ -301,9 +335,9 @@ def observe_push(
                 if before is not None and before.online and not first_report:
                     events.append(_session_event(
                         router_id, customer_id, now, "session_disconnected", "warning",
-                        f"PPPoE session ended (was up {format_duration(before.uptime_s)}, IP {before.ip or '-'})",
-                        {"kind": "pppoe", "ip": before.ip, "caller_id": before.caller_id,
-                         "uptime_seconds": before.uptime_s, "last_seen_at": _iso(before.seen_at)},
+                        f"PPPoE session ended after {format_duration(before.uptime_s)}"
+                        f"{_usage_text(before)} (IP {before.ip or '-'})",
+                        {"kind": "pppoe", **_session_summary(before)},
                     ))
                 current[key] = _Seen(customer_id, False, before.ip if before else "",
                                      None, before.caller_id if before else "",
@@ -312,28 +346,32 @@ def observe_push(
             uptime_s = parse_uptime(session.get("uptime"))
             ip = session.get("address", "") or ""
             caller_id = session.get("caller_id", "") or ""
+            up, down = (pppoe_queue_bytes or {}).get(key, (None, None))
+            seen = _Seen(customer_id, True, ip, uptime_s, caller_id, now, 0, up, down)
             details = {"kind": "pppoe", "ip": ip, "caller_id": caller_id, "uptime_seconds": uptime_s}
+            # The session began uptime seconds ago, not when we noticed it.
+            started = now - timedelta(seconds=uptime_s) if uptime_s is not None else now
             if not first_report:
                 if before is None or not before.online:
                     events.append(_session_event(
-                        router_id, customer_id, now, "session_connected", "info",
+                        router_id, customer_id, started, "session_connected", "info",
                         f"PPPoE session connected (IP {ip or '-'}{', from ' + caller_id if caller_id else ''})",
                         details,
                     ))
                 elif _restarted(before, uptime_s, now):
                     events.append(_session_event(
-                        router_id, customer_id, now, "session_reconnected", "warning",
-                        f"PPPoE session dropped and reconnected between reports "
-                        f"(previous session was up at least {format_duration(before.uptime_s)}, "
-                        f"new session up {format_duration(uptime_s)}, IP {ip or '-'})",
-                        {**details, "previous_ip": before.ip, "previous_uptime_seconds": before.uptime_s},
+                        router_id, customer_id, started, "session_reconnected", "warning",
+                        f"PPPoE session dropped and came back between two reports; the previous session "
+                        f"lasted at least {format_duration(before.uptime_s)}{_usage_text(before)}. "
+                        f"New IP {ip or '-'}",
+                        {**details, "previous": _session_summary(before)},
                     ))
                 elif before.ip and ip and before.ip != ip:
                     events.append(_session_event(
                         router_id, customer_id, now, "session_ip_changed", "info",
                         f"PPPoE address changed {before.ip} -> {ip}", details,
                     ))
-            current[key] = _Seen(customer_id, True, ip, uptime_s, caller_id, now)
+            current[key] = seen
 
     if hosts is not None:
         best: dict[str, dict] = {}
@@ -350,9 +388,9 @@ def observe_push(
                     if misses >= HOTSPOT_OFFLINE_AFTER_MISSES and not first_report:
                         events.append(_session_event(
                             router_id, customer_id, before.seen_at or now, "device_offline", "info",
-                            f"Device left the hotspot (was online {format_duration(before.uptime_s)}, IP {before.ip or '-'})",
-                            {"kind": "hotspot", "mac": mac, "ip": before.ip,
-                             "uptime_seconds": before.uptime_s, "last_seen_at": _iso(before.seen_at)},
+                            f"Device left the hotspot after {format_duration(before.uptime_s)}"
+                            f"{_usage_text(before)} (IP {before.ip or '-'})",
+                            {"kind": "hotspot", "mac": mac, **_session_summary(before)},
                         ))
                         current[mac] = _Seen(customer_id, False, before.ip, None, "", before.seen_at)
                     else:
@@ -369,7 +407,8 @@ def observe_push(
                     f"Device came online on the hotspot (IP {ip or '-'})",
                     {"kind": "hotspot", "mac": mac, "ip": ip, "bypassed": bool(host.get("bypassed"))},
                 ))
-            current[mac] = _Seen(customer_id, True, ip, uptime_s, "", now)
+            current[mac] = _Seen(customer_id, True, ip, uptime_s, "", now, 0,
+                                 int(host.get("bytes_in") or 0), int(host.get("bytes_out") or 0))
 
     # Customers who stopped being "live" (expired, moved) drop out of the
     # maps; forget them so a renewal later reads as a fresh connect.

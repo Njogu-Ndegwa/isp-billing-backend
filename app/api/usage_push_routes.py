@@ -392,6 +392,11 @@ async def receive_usage_push(
                 ppp=([p.model_dump() for p in payload.ppp]
                      if "ppp" in payload.model_fields_set else None),
                 live_pppoe_customers=result.live_pppoe_customers,
+                pppoe_queue_bytes={
+                    key: (item.upload_bytes, item.download_bytes)
+                    for item in payload.reports
+                    if (key := _canonical_key(item.queue_key)) and key.startswith("pppoe:")
+                },
                 hosts=([h.model_dump() for h in payload.hosts]
                        if "hosts" in payload.model_fields_set else None),
                 live_hotspot_customers=result.live_hotspot_customers,

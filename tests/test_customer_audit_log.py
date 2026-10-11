@@ -10,6 +10,7 @@ from app.api import customer_audit_routes, customer_routes
 from app.db.models import (
     ConnectionType, CustomerEvent, CustomerPayment, CustomerStatus,
     MpesaTransaction, MpesaTransactionStatus, PaymentMethod, PaymentStatus,
+    SmsMessage, SmsMessageKind, SmsMessageStatus,
 )
 from app.services import customer_events, customer_router_logs
 from app.services.customer_events import observe_push, parse_uptime
@@ -150,6 +151,8 @@ def test_pppoe_connect_drop_and_silent_reconnect():
 
     ev = observe_push(1, t0 + timedelta(seconds=20), ppp=[_ppp("john", "5s")], live_pppoe_customers=live)
     assert [e["event_type"] for e in ev] == ["session_connected"]
+    # Stamped when the session began, not when the report noticed it.
+    assert ev[0]["occurred_at"] == t0 + timedelta(seconds=15)
 
     # Online in both reports, but the uptime says it restarted in between.
     ev = observe_push(1, t0 + timedelta(seconds=80), ppp=[_ppp("john", "20s")], live_pppoe_customers=live)
@@ -159,6 +162,19 @@ def test_pppoe_connect_drop_and_silent_reconnect():
     ev = observe_push(1, t0 + timedelta(seconds=140), ppp=[_ppp("john", "1m20s")], live_pppoe_customers=live)
     assert ev == []
     assert customer_events.buffered_count() == 3
+
+
+def test_session_end_reports_duration_and_data_used():
+    live = {"pppoe:john": 11}
+    t0 = UTC_NOW
+    observe_push(1, t0, ppp=[_ppp("john", "1h")], live_pppoe_customers=live,
+                 pppoe_queue_bytes={"pppoe:john": (10, 20)})
+    observe_push(1, t0 + timedelta(seconds=60), ppp=[_ppp("john", "1h1m")], live_pppoe_customers=live,
+                 pppoe_queue_bytes={"pppoe:john": (50 * 1024 ** 2, 2 * 1024 ** 3)})
+    ev = observe_push(1, t0 + timedelta(seconds=120), ppp=[], live_pppoe_customers=live)
+    assert ev[0]["message"] == "PPPoE session ended after 1h 1m, used 2.0 GB down / 50.0 MB up (IP 10.0.0.5)"
+    assert ev[0]["details"]["download_bytes"] == 2 * 1024 ** 3
+    assert ev[0]["details"]["started_at"] == (t0 - timedelta(hours=1)).isoformat()
 
 
 def test_report_without_ppp_list_concludes_nothing():
@@ -240,6 +256,11 @@ async def test_audit_log_merges_sources_and_is_scoped_to_owner(db):
         checkout_request_id="ws_CO_2", phone_number="254712345678", amount=1500,
         reference="y", status=MpesaTransactionStatus.completed, customer_id=customer.id,
         created_at=now - timedelta(hours=3)))
+    db.add(SmsMessage(
+        user_id=reseller.id, customer_id=customer.id, recipient_phone="254712345678",
+        body="Your internet is due tomorrow", segments=1, credits_charged=1,
+        kind=SmsMessageKind.RESELLER_TO_CUSTOMER, status=SmsMessageStatus.FAILED,
+        error="Error sending via TextSms", created_at=now - timedelta(hours=2)))
     db.add(CustomerEvent(
         customer_id=customer.id, user_id=reseller.id, router_id=router.id,
         occurred_at=now - timedelta(hours=1), category="router_log", event_type="router_log",
@@ -250,8 +271,9 @@ async def test_audit_log_merges_sources_and_is_scoped_to_owner(db):
     out = await customer_audit_routes.customer_audit_log(
         customer.id, None, None, None, 150, db, _token(reseller))
     kinds = [i["event_type"] for i in out["items"]]
-    assert kinds == ["router_log", "payment_completed", "mpesa_failed", "customer_created"]
-    assert "Request cancelled by user" in out["items"][2]["message"]
+    assert kinds == ["router_log", "sms_failed", "payment_completed", "mpesa_failed", "customer_created"]
+    assert "Request cancelled by user" in out["items"][3]["message"]
+    assert out["items"][1]["details"]["body"] == "Your internet is due tomorrow"
     assert out["customer"]["connection_type"] == "pppoe"
     assert out["has_more"] is False
 
@@ -340,3 +362,17 @@ async def test_pull_router_logs_saves_matching_lines(db, monkeypatch):
     with pytest.raises(HTTPException) as exc:  # cooldown
         await customer_audit_routes.pull_customer_router_logs(customer.id, db, _token(reseller))
     assert exc.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_viewing_pppoe_credentials_is_logged(db):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    router = await make_router(db, reseller)
+    customer = await make_customer(db, reseller, plan, router, pppoe_username="ann_k", pppoe_password="pw")
+
+    await customer_routes.get_pppoe_credentials(customer.id, db, _token(reseller))
+
+    event = (await db.execute(select(CustomerEvent))).scalar_one()
+    assert (event.event_type, event.actor_user_id) == ("credentials_viewed", reseller.id)
+    assert "pw" not in event.message
