@@ -30,10 +30,12 @@ import httpx
 
 from app.core.runtime_mode import require_external_side_effects_enabled
 from app.services.messaging.base import (
+    BalanceResult,
     MessagingProvider,
     ProviderField,
     ProviderSpec,
     SendResult,
+    parse_amount,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,7 @@ _client_ids = itertools.count(int(time.time() * 1000) % 1_000_000_000)
 
 class TextSmsProvider(MessagingProvider):
     name = "textsms"
+    supports_balance = True
 
     def __init__(
         self,
@@ -78,6 +81,52 @@ class TextSmsProvider(MessagingProvider):
         self.api_key = api_key
         self.partner_id = partner_id
         self.base_url = (base_url or "").rstrip("/")
+
+    async def get_balance(self) -> BalanceResult:
+        """POST /api/services/getbalance/ — read-only, sends no message.
+
+        The vendor (an Advanta-platform white label) answers
+        {"response-code": 200, "credit": "800.00", "partner-id": "..."} on
+        success and the usual bare code + description on refusal. The credit
+        key is read loosely in case this deployment names it differently.
+        """
+        missing = self._missing_config()
+        if missing:
+            return BalanceResult(ok=False, error=missing)
+        url = f"{self.base_url}/api/services/getbalance/"
+        payload = {"apikey": self.api_key, "partnerID": self.partner_id}
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    url, json=payload,
+                    headers={"Content-Type": "application/json",
+                             "Accept": "application/json"},
+                )
+        except Exception as exc:
+            return BalanceResult(ok=False, error=f"network_error: {exc}"[:255])
+        try:
+            data = resp.json()
+        except ValueError:
+            return BalanceResult(ok=False, raw=(resp.text or "")[:255],
+                                 error=f"bad_response (HTTP {resp.status_code})")
+        raw = str(data)[:255]
+        if isinstance(data, dict) and isinstance(data.get("responses"), list) and data["responses"]:
+            data = data["responses"][0]
+        if not isinstance(data, dict):
+            return BalanceResult(ok=False, raw=raw, error="bad_response")
+
+        code = self._code(data)
+        if resp.status_code >= 400 or (code is not None and code != _SUCCESS_CODE):
+            status = _CODE_STATUS.get(code, f"error_{code}") if code is not None else f"http_{resp.status_code}"
+            return BalanceResult(ok=False, raw=raw,
+                                 error=(self._description(data) or status)[:255])
+
+        for key in ("credit", "credits", "balance", "credit-balance", "account-balance"):
+            if key in data:
+                amount, unit = parse_amount(data[key])
+                if amount is not None:
+                    return BalanceResult(ok=True, balance=amount, unit=unit, raw=raw)
+        return BalanceResult(ok=False, raw=raw, error="bad_response: no balance field")
 
     async def send_bulk(
         self, recipients: list[str], body: str, sender_id: str

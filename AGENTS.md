@@ -396,5 +396,7 @@ Keep backlog items concrete. Prefer:
 ## Testing Notes
 
 - Prefer focused tests for the area touched.
+- `pytest` runs in parallel by default (`-n auto` in `pytest.ini`, pytest-xdist): the full
+  suite takes ~3 min this way versus 40+ min serially. Pass `-n 0` to debug a test serially.
 - If tests cannot run because dependencies are missing, say that explicitly in the final handoff.
 - For router/MikroTik work, distinguish DB-only behavior from live-router behavior.

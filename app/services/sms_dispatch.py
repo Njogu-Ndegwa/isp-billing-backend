@@ -22,6 +22,7 @@ from app.db.models import (
 )
 from app.services import sms_credits
 from app.services.messaging import accounts as provider_accounts
+from app.services.messaging import gateway_health
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,7 @@ async def dispatch_campaign(campaign_id: int) -> None:
     for message in msgs:
         messages_by_body.setdefault(message.body, []).append(message)
 
+    any_failed = False
     for body, body_messages in messages_by_body.items():
         for chunk in _chunks(body_messages, chunk_size):
             phones = [m.recipient_phone for m in chunk]
@@ -176,6 +178,7 @@ async def dispatch_campaign(campaign_id: int) -> None:
                 "sent=%s failed=%s",
                 campaign_id, provider.name, len(chunk), sent_count, failed_count,
             )
+            any_failed = any_failed or failed_count > 0
 
             if failed_credits:
                 # --- Short DB session: refund failed credits ---
@@ -189,6 +192,9 @@ async def dispatch_campaign(campaign_id: int) -> None:
                 # --- DB session closed ---
 
     await _finalize(campaign_id)
+    if any_failed and resolved.source == "reseller":
+        # Their own gateway is refusing messages: tell them why, once per outage.
+        await gateway_health.alert_if_failing(user_id)
 
 
 async def _fail_all(campaign_id: int, user_id: int, error: str) -> None:
@@ -362,6 +368,8 @@ async def dispatch_admin_sms_messages(
         "Admin SMS dispatch complete: messages=%s sent=%s failed=%s",
         len(rows), total_sent, total_failed,
     )
+    if total_failed and owner_user_id is not None and resolved.source == "reseller":
+        await gateway_health.alert_if_failing(owner_user_id)
 
 
 async def prune_old_messages() -> int:

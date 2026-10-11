@@ -24,7 +24,9 @@ _specs: Optional[dict[str, ProviderSpec]] = None
 # skipped anyway; naming them keeps discovery from importing the heavier ones
 # (accounts pulls in the ORM and the crypto helpers) just to look for an
 # attribute that isn't there.
-_NOT_PROVIDERS = {"accounts", "base", "registry", "segments"}
+_NOT_PROVIDERS = {
+    "accounts", "base", "failure_reasons", "gateway_health", "registry", "segments",
+}
 
 
 def _discover() -> dict[str, ProviderSpec]:

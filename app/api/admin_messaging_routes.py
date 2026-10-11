@@ -17,7 +17,7 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user
 from app.services import sms_credits, sms_dispatch
 from app.services.messaging import accounts as provider_accounts
-from app.services.messaging import count_segments, registry, resolve_sender_id
+from app.services.messaging import count_segments, gateway_health, registry, resolve_sender_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin-messaging"])
@@ -164,6 +164,19 @@ async def reseller_ledger(reseller_id: int,
         "reference": t.reference, "note": t.note,
         "created_at": t.created_at.isoformat() if t.created_at else None,
     } for t in rows]}
+
+
+@router.get("/api/admin/messaging/resellers/{reseller_id}/gateway-status")
+async def reseller_gateway_status(reseller_id: int,
+                                  refresh: bool = Query(False),
+                                  db: AsyncSession = Depends(get_db),
+                                  token: str = Depends(verify_token)):
+    """The reseller's own gateway status card, seen from support."""
+    await _require_admin(token, db)
+    reseller = await db.get(User, reseller_id)
+    if reseller is None or reseller.role != UserRole.RESELLER:
+        raise HTTPException(status_code=404, detail="Reseller not found")
+    return await gateway_health.status(db, reseller_id, force_balance=refresh)
 
 
 class InboxSendIn(BaseModel):

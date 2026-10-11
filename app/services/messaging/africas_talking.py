@@ -5,10 +5,12 @@ import logging
 import httpx
 
 from app.services.messaging.base import (
+    BalanceResult,
     MessagingProvider,
     ProviderField,
     ProviderSpec,
     SendResult,
+    parse_amount,
 )
 from app.core.runtime_mode import require_external_side_effects_enabled
 
@@ -17,11 +19,37 @@ logger = logging.getLogger(__name__)
 
 class AfricasTalkingProvider(MessagingProvider):
     name = "africastalking"
+    supports_balance = True
 
     def __init__(self, username: str, api_key: str, base_url: str):
         self.username = username
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+
+    async def get_balance(self) -> BalanceResult:
+        """GET /version1/user — {"UserData": {"balance": "KES 1785.50"}}. Read-only."""
+        url = f"{self.base_url}/version1/user"
+        headers = {"apiKey": self.api_key, "Accept": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(url, params={"username": self.username},
+                                        headers=headers)
+        except Exception as exc:
+            return BalanceResult(ok=False, error=f"network_error: {exc}"[:255])
+        raw = (resp.text or "")[:255]
+        if resp.status_code >= 400:
+            # AT answers a bad key with 401 and a plain-text explanation.
+            return BalanceResult(ok=False, raw=raw,
+                                 error=(raw or f"http_{resp.status_code}")[:255])
+        try:
+            data = resp.json()
+        except ValueError:
+            return BalanceResult(ok=False, raw=raw, error="bad_response")
+        user_data = data.get("UserData") if isinstance(data, dict) else None
+        amount, unit = parse_amount((user_data or {}).get("balance"))
+        if amount is None:
+            return BalanceResult(ok=False, raw=raw, error="bad_response: no balance field")
+        return BalanceResult(ok=True, balance=amount, unit=unit, raw=raw)
 
     async def send_bulk(
         self, recipients: list[str], body: str, sender_id: str
