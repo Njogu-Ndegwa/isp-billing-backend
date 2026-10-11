@@ -254,6 +254,18 @@ async def _enqueue_command(
     return command_id
 
 
+def _entitlement_generation(original_expiry, access_until) -> str:
+    """Idempotency generation for a grant: the paid expiry, plus the grace
+    deadline when one applies, so a grace reconnect after removal is not
+    deduplicated against the grant already delivered for that expiry."""
+    if not original_expiry:
+        return "none"
+    generation = original_expiry.isoformat()
+    if access_until and access_until != original_expiry:
+        generation += f"+grace:{access_until.isoformat()}"
+    return generation
+
+
 async def queue_hotspot_provision_command(
     *,
     router_id: int | None,
@@ -297,7 +309,7 @@ async def queue_hotspot_provision_command(
     entitlement_key = (
         f"attempt:{attempt_id}"
         if attempt_id is not None
-        else f"hotspot:{router_id}:{customer_id}:{original_expiry.isoformat() if original_expiry else 'none'}"
+        else f"hotspot:{router_id}:{customer_id}:{_entitlement_generation(original_expiry, access_until)}"
     )
     return await _enqueue_command(
         router_id=router_id,
@@ -357,7 +369,7 @@ async def queue_pppoe_provision_command(
     entitlement_key = (
         f"attempt:{attempt_id}"
         if attempt_id is not None
-        else f"pppoe:{router_id}:{customer_id}:{original_expiry.isoformat() if original_expiry else 'none'}"
+        else f"pppoe:{router_id}:{customer_id}:{_entitlement_generation(original_expiry, access_until)}"
     )
     return await _enqueue_command(
         router_id=router_id,
