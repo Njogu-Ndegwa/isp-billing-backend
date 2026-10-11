@@ -350,6 +350,9 @@ async def test_customer_event_settings_default_update_and_preview(db, client, mo
     assert preview.status_code == 200
     assert preview.json() == {
         "text": "Got KES 1,500, thanks Jane!", "characters": 27, "segments": 1,
+        # No routers or payment methods: platform-collected, so the platform
+        # paybill (600980 in tests) is what customers would be told.
+        "paybill": "600980", "paybill_note": None,
     }
 
     default_preview = await client.post("/api/messaging/customer-events/preview", json={
@@ -379,3 +382,33 @@ async def test_customer_event_settings_reject_bad_templates(
     })
 
     assert response.status_code == 400
+
+
+async def test_preview_shows_no_platform_paybill_for_direct_settlement(db, client, monkeypatch):
+    """The preview must show what customers really get. A direct-settlement
+    reseller whose own paybill isn't C2B-registered gets no paybill line,
+    and is told why — never the platform paybill."""
+    from app.db.models import ResellerPaymentMethod, ResellerPaymentMethodType
+    from tests.factories import make_router
+
+    reseller = await make_reseller(db, organization_name="Direct ISP")
+    reseller.settlement_mode = "direct"
+    method = ResellerPaymentMethod(
+        user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
+        label="Own", is_active=True, mpesa_shortcode="4699342",
+    )
+    db.add(method)
+    await db.commit()
+    router = await make_router(db, reseller)
+    router.payment_method_id = method.id
+    await db.commit()
+    _auth_as(monkeypatch, reseller)
+
+    resp = await client.post("/api/messaging/customer-events/preview",
+                             json={"event": "reminder"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "600980" not in body["text"]
+    assert "Paybill" not in body["text"]
+    assert body["paybill"] is None
+    assert "Register C2B" in body["paybill_note"]

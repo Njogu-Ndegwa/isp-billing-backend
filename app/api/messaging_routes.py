@@ -15,7 +15,7 @@ from app.db.models import (
     MessagingSettings, MessageTemplate, CustomerExpirySmsSettings,
     SmsCreditOrder, SmsCreditOrderStatus, SmsCreditTxnKind, SmsCreditTransaction,
     SmsCampaign, SmsCampaignStatus, SmsMessage, SmsMessageStatus, SmsMessageKind,
-    ResellerInboxMessage, Customer,
+    ResellerInboxMessage, Customer, Router,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import customer_expiry_notifications, sms_credits, sms_dispatch
@@ -263,13 +263,34 @@ async def preview_customer_event_message(body: TemplatePreviewIn,
     market = reseller_market(user)
     context = {**sms_templates.SAMPLE_CONTEXT, "brand": sms_templates.brand_name(user)}
     context["amount"] = sms_templates.format_amount(1500, market.currency)
-    if market.code != "KE":
+    # Show the paybill this reseller's customers will really be told, not a
+    # sample: the same resolver the real messages use.
+    router_ids = set((await db.execute(
+        select(Router.id).where(Router.user_id == user.id)
+    )).scalars().all()) or {None}
+    paybills = await customer_expiry_notifications.resolve_paybills(db, user, router_ids)
+    advertised = sorted({p for p in paybills.values() if p})
+    paybill_note = None
+    if advertised:
+        context["paybill"] = advertised[0]
+        if len(advertised) > 1 or None in paybills.values():
+            paybill_note = ("The paybill shown differs by router; some customers "
+                            "get no paybill line.")
+    else:
         context["paybill"] = ""
         context["account"] = ""
+        if market.code == "KE":
+            paybill_note = (
+                "Customers are paid straight into your own M-Pesa account, which "
+                "is not registered with us for account-number (C2B) payments, so "
+                "messages leave out the \"Pay via Paybill\" line. Register C2B "
+                "for your paybill under Payment methods to include it."
+            )
     text = sms_templates.render(
         body.event, context, {body.event: custom} if custom else None
     )
-    return {"text": text, "characters": len(text), "segments": count_segments(text)}
+    return {"text": text, "characters": len(text), "segments": count_segments(text),
+            "paybill": context["paybill"] or None, "paybill_note": paybill_note}
 
 
 class PurchaseRequest(BaseModel):
