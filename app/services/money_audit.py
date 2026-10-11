@@ -123,8 +123,9 @@ async def find_phantom_customer_payments(db: AsyncSession) -> list[dict]:
 
     Match keys — derived from how each recorder actually writes rows:
       * C2B paths (app/services/c2b_handler.py, manual attribution in
-        app/api/c2b_routes.py) are the ONLY writers that stamp
-        ``collection_mode=SYSTEM_COLLECTED``; both set
+        app/api/c2b_routes.py, and admin PPPoE activation consuming a held
+        underpayment in app/api/customer_routes.py) are the ONLY writers that
+        stamp ``collection_mode=SYSTEM_COLLECTED``; all set
         ``payment_reference = C2BTransaction.trans_id``.
       * Defensively, an STK-shaped reference is also accepted:
         ``MpesaTransaction.mpesa_receipt_number`` or
