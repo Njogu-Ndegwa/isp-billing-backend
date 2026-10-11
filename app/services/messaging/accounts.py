@@ -116,7 +116,9 @@ def merge_config(spec: ProviderSpec, stored: dict, incoming: dict) -> dict:
         if f.key not in incoming:
             continue
         value = incoming.get(f.key)
-        value = "" if value is None else str(value)
+        # Trimmed for the same reason as ProviderSpec.apply_defaults: pasted
+        # keys often carry a trailing space the vendor rejects.
+        value = "" if value is None else str(value).strip()
         if f.key in secrets:
             unchanged = (
                 value == ""
