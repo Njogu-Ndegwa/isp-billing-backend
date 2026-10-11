@@ -1127,6 +1127,53 @@ async def run_plan_router_scope_migrations():
 
 
 # ============================================================================
+# Plan Deletion FK Migration (runs on startup, idempotent)
+# ============================================================================
+# Child tables whose plan_id must not block a plan delete. Each is detached
+# (SET NULL) rather than cascaded so the history row survives the plan.
+PLAN_DELETE_SET_NULL_FKS = (
+    ("customers", "customers_plan_id_fkey"),
+    ("vouchers", "vouchers_plan_id_fkey"),
+    ("device_pairings", "device_pairings_plan_id_fkey"),
+)
+
+
+async def run_plan_delete_migrations():
+    """Let a plan be deleted once it has redeemed vouchers or paired devices.
+
+    vouchers.plan_id was NOT NULL and these three FKs had no ON DELETE rule, so
+    deleting any plan that ever sold a voucher or paired a TV failed with a
+    ForeignKeyViolation (a 500 in the dashboard). Same pattern as the payment
+    tables: ON DELETE SET NULL keeps the row and drops only the link.
+
+    The FK is only recreated when it is not already SET NULL, so a normal boot
+    takes no lock on these tables.
+    """
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "ALTER TABLE vouchers ALTER COLUMN plan_id DROP NOT NULL"
+        ))
+        for table, constraint in PLAN_DELETE_SET_NULL_FKS:
+            already_set_null = (await conn.execute(sa_text("""
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = CAST(:table AS regclass)
+                  AND conname = :name AND confdeltype = 'n'
+            """), {"table": table, "name": constraint})).first()
+            if already_set_null:
+                continue
+            await conn.execute(sa_text(
+                f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}"
+            ))
+            await conn.execute(sa_text(
+                f"ALTER TABLE {table} ADD CONSTRAINT {constraint} "
+                f"FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE SET NULL"
+            ))
+            logger.info("Migration: %s.plan_id now ON DELETE SET NULL", table)
+
+    logger.info("Migration: plan deletion no longer blocked by voucher/pairing history")
+
+
+# ============================================================================
 # Per-Router Payout Attribution Migration (runs on startup, idempotent)
 # ============================================================================
 async def run_router_payout_attribution_migrations():
@@ -3040,6 +3087,12 @@ async def startup_event():
         logger.info("Plan router scope migrations completed successfully")
     except Exception as e:
         logger.error(f"Plan router scope migration failed (non-fatal): {e}")
+
+    try:
+        await run_plan_delete_migrations()
+        logger.info("Plan delete migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Plan delete migration failed (non-fatal): {e}")
 
     try:
         await run_router_payout_attribution_migrations()
