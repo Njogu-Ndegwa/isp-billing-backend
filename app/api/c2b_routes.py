@@ -318,10 +318,13 @@ async def attribute_unmatched_c2b(
         collection_mode=collection,
     )
 
+    wallet_before = int(customer.wallet_credit_kes or 0)
     new_wallet = int(round(effective_amount - plan_price)) if plan_price > 0 else 0
     customer.wallet_credit_kes = max(0, new_wallet)
 
     # Update the C2B row + mark unmatched as resolved
+    txn.wallet_before_kes = wallet_before
+    txn.wallet_after_kes = customer.wallet_credit_kes
     txn.status = C2BTransactionStatus.PROCESSED
     txn.matched_customer_id = customer.id
     txn.matched_reseller_id = customer.user_id

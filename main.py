@@ -2189,6 +2189,13 @@ async def run_c2b_migrations():
             ))
             logger.info("C2B migration: widened msisdn column to VARCHAR(128)")
 
+        # -- Wallet balance before/after each applied payment (wallet history)
+        await conn.execute(sa_text(
+            "ALTER TABLE c2b_transactions "
+            "ADD COLUMN IF NOT EXISTS wallet_before_kes INTEGER NULL, "
+            "ADD COLUMN IF NOT EXISTS wallet_after_kes INTEGER NULL"
+        ))
+
     logger.info("C2B Paybill migrations complete")
 
 

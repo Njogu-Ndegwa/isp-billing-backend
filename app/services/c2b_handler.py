@@ -356,6 +356,7 @@ async def handle_confirmation(
 
     # Wallet replacement: effective_amount was made up of (paid + old_wallet).
     # We applied plan_price to grant the period; the remainder is the new wallet.
+    wallet_before = int(customer.wallet_credit_kes or 0)
     new_wallet = int(round(effective_amount - plan_price)) if plan_price > 0 else 0
     customer.wallet_credit_kes = max(0, new_wallet)
 
@@ -364,6 +365,8 @@ async def handle_confirmation(
         status=C2BTransactionStatus.PROCESSED,
         matched_customer=customer,
         matched_reseller_id=customer.user_id,
+        wallet_before_kes=wallet_before,
+        wallet_after_kes=customer.wallet_credit_kes,
     )
     await db.commit()
 
@@ -450,6 +453,8 @@ async def _archive(
     status: C2BTransactionStatus,
     matched_customer: Optional[Customer],
     matched_reseller_id: Optional[int],
+    wallet_before_kes: Optional[int] = None,
+    wallet_after_kes: Optional[int] = None,
 ) -> C2BTransaction:
     txn = C2BTransaction(
         trans_id=fields.trans_id,
@@ -463,6 +468,8 @@ async def _archive(
         matched_reseller_id=matched_reseller_id,
         received_at=datetime.utcnow(),
         processed_at=datetime.utcnow() if status != C2BTransactionStatus.UNMATCHED else None,
+        wallet_before_kes=wallet_before_kes,
+        wallet_after_kes=wallet_after_kes,
     )
     db.add(txn)
     await db.flush()  # need txn.id for UnmatchedC2BPayment FK
