@@ -521,3 +521,44 @@ def test_stamps_follow_the_router_clock_not_its_time_zone():
         {"time": "09:00:00", "date": "2026-10-11", "gmt-offset": "+00:00"}, UTC_NOW)
     local = parse_log_time("08:30:00", clock)
     assert clock.to_utc(local) == UTC_NOW - timedelta(minutes=30)
+
+
+@pytest.mark.asyncio
+async def test_reset_session_drops_the_pppoe_session_and_logs_who(db, monkeypatch):
+    reseller = await make_reseller(db)
+    other = await make_reseller(db)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    router = await make_router(db, reseller)
+    customer = await make_customer(db, reseller, plan, router, pppoe_username="ruth_m")
+    calls = []
+
+    async def fake_guard(router_id, func, *args, **kwargs):
+        calls.append((router_id, args[1]))
+        return {"success": True, "disconnected": 1}
+
+    monkeypatch.setattr("app.services.router_concurrency.run_with_guard", fake_guard)
+    customer_audit_routes._last_reset.clear()
+
+    with pytest.raises(HTTPException) as exc:
+        await customer_audit_routes.reset_customer_session(customer.id, db, _token(other))
+    assert exc.value.status_code == 404 and calls == []
+
+    out = await customer_audit_routes.reset_customer_session(customer.id, db, _token(reseller))
+    assert out["disconnected"] == 1 and calls == [(router.id, "ruth_m")]
+    event = (await db.execute(select(CustomerEvent))).scalar_one()
+    assert (event.event_type, event.actor_user_id) == ("session_reset", reseller.id)
+
+    with pytest.raises(HTTPException) as exc:  # cooldown
+        await customer_audit_routes.reset_customer_session(customer.id, db, _token(reseller))
+    assert exc.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_reset_session_is_pppoe_only(db):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    router = await make_router(db, reseller)
+    customer = await make_customer(db, reseller, plan, router)
+    with pytest.raises(HTTPException) as exc:
+        await customer_audit_routes.reset_customer_session(customer.id, db, _token(reseller))
+    assert exc.value.status_code == 400

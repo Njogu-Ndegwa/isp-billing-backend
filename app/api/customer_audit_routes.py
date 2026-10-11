@@ -3,6 +3,7 @@
 GET  /api/customers/{id}/audit-log              the merged timeline (newest first)
 POST /api/customers/{id}/audit-log/router-logs  read the router's log now and keep
                                                  the lines about this customer
+POST /api/customers/{id}/reset-session          drop the live PPPoE session (logged)
 
 The timeline merges, at read time:
 
@@ -41,6 +42,7 @@ from app.db.models import (
 from app.services import realtime_state
 from app.services.auth import get_current_user, verify_token
 from app.services.subscription import enforce_active_subscription
+from app.services.customer_events import record_customer_event
 from app.services.customer_router_logs import CustomerIndex, capture_router_logs, router_info_of
 from app.services.router_availability import record_router_availability
 
@@ -574,3 +576,87 @@ async def pull_customer_router_logs(
         raise HTTPException(status_code=502, detail=f"Router log read failed: {error}")
     await record_router_availability(db, router_id, True, "customer_audit_router_logs")
     return {"customer_id": customer_id, "router_id": router_id, **result}
+
+
+# ---------------------------------------------------------------------------
+# Reset session
+# ---------------------------------------------------------------------------
+
+RESET_SESSION_COOLDOWN_SECONDS = 15
+_last_reset: dict[int, datetime] = {}
+
+
+def _reset_pppoe_session_sync(router_info: dict, username: str) -> dict:
+    from app.services.mikrotik_api import MikroTikAPI
+
+    api = MikroTikAPI(
+        router_info["ip"], router_info["username"],
+        router_info["password"], router_info["port"],
+        timeout=15, connect_timeout=5,
+    )
+    if not api.connect():
+        return {"error": "connect_failed"}
+    try:
+        return api.disconnect_pppoe_session(username)
+    finally:
+        api.disconnect()
+
+
+@router.post("/api/customers/{customer_id}/reset-session")
+async def reset_customer_session(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Drop the customer's live PPPoE session so their router dials again.
+
+    The PPP secret is untouched: a paid customer is back online within
+    seconds, with a fresh session (new IP, current plan speed). The usual
+    first step when a customer says "connected but no internet".
+    """
+    customer, user = await _load_customer(db, customer_id, token)
+    enforce_active_subscription(user)
+    if not customer.pppoe_username:
+        raise HTTPException(status_code=400, detail="Only PPPoE customers have a session to reset")
+    router_obj: Optional[Router] = customer.router
+    if router_obj is None:
+        raise HTTPException(status_code=400, detail="Customer has no router assigned")
+
+    now = datetime.utcnow()
+    last = _last_reset.get(customer_id)
+    if last is not None and (now - last).total_seconds() < RESET_SESSION_COOLDOWN_SECONDS:
+        raise HTTPException(status_code=429, detail="The session was just reset; give it a few seconds")
+
+    router_id = router_obj.id
+    info = router_info_of(router_obj)
+    username = customer.pppoe_username
+    owner_id = customer.user_id
+    await db.commit()  # nothing held across the router call
+
+    _last_reset[customer_id] = now
+    from app.services.router_concurrency import run_with_guard
+
+    result = await run_with_guard(router_id, _reset_pppoe_session_sync, info, username,
+                                  acquire_timeout_seconds=2.0)
+    error = result.get("error")
+    if error == "busy":
+        _last_reset.pop(customer_id, None)
+        raise HTTPException(status_code=429, detail="Router is busy with other diagnostics; try again shortly")
+    if error == "connect_failed":
+        _last_reset.pop(customer_id, None)
+        await record_router_availability(db, router_id, False, "customer_reset_session")
+        raise HTTPException(status_code=503, detail="Could not reach the router")
+    if error:
+        _last_reset.pop(customer_id, None)
+        raise HTTPException(status_code=502, detail=f"Router refused the reset: {error}")
+
+    disconnected = int(result.get("disconnected") or 0)
+    await record_router_availability(db, router_id, True, "customer_reset_session")
+    await record_customer_event(
+        customer_id, "session_reset",
+        "Session reset from the dashboard; the customer's router will reconnect"
+        if disconnected else "Session reset requested, but the customer had no active session",
+        actor=user, user_id=owner_id, router_id=router_id,
+        details={"disconnected": disconnected},
+    )
+    return {"customer_id": customer_id, "router_id": router_id, "disconnected": disconnected}
