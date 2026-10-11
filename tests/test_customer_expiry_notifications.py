@@ -592,3 +592,122 @@ async def test_expiry_outside_kenya_has_no_mpesa_paybill(db, session_factory):
     ).scalar_one()
     assert "Paybill" not in message.body
     assert "Please renew" in message.body
+
+
+# ---------------------------------------------------------------------------
+# Never send a customer to a paybill their money doesn't belong in
+#
+# 2026-10-11: a direct-settlement reseller's own paybill had no C2B
+# registration, so reminders fell back to the platform paybill and told his
+# customers to pay us. The paybill must come from where a payment on that
+# router actually lands (payment_gateway.resolve_collection_payment_method).
+# ---------------------------------------------------------------------------
+
+PLATFORM_PAYBILL = "600980"  # settings.MPESA_SHORTCODE under tests
+
+
+async def _expiry_body(db, session_factory, customer):
+    campaign_ids = await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [customer.id], session_factory=session_factory
+    )
+    return (
+        await db.execute(select(SmsMessage).where(SmsMessage.campaign_id == campaign_ids[0]))
+    ).scalar_one().body
+
+
+async def _add_method(db, reseller, method_type, **fields):
+    method = ResellerPaymentMethod(
+        user_id=reseller.id, method_type=method_type, label="Own", is_active=True, **fields,
+    )
+    db.add(method)
+    await db.commit()
+    return method
+
+
+async def test_own_paybill_without_c2b_never_advertises_the_platform_paybill(
+    db, session_factory,
+):
+    reseller, router, customer = await _seed_expired_pppoe(db)
+    reseller.settlement_mode = "direct"
+    method = await _add_method(
+        db, reseller, ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
+        mpesa_shortcode="4699342", c2b_registered_at=None,
+    )
+    router.payment_method_id = method.id
+    await db.commit()
+
+    body = await _expiry_body(db, session_factory, customer)
+
+    assert PLATFORM_PAYBILL not in body
+    assert "Paybill" not in body  # unregistered own paybill: can't match the account
+    assert "Please renew" in body
+
+
+async def test_direct_settlement_router_without_a_method_uses_no_platform_paybill(
+    db, session_factory,
+):
+    """The second router in the incident had no method linked at all; its
+    payments go to the owner's default direct paybill, so must its reminders."""
+    reseller, router, customer = await _seed_expired_pppoe(db)
+    reseller.settlement_mode = "direct"
+    await _add_method(
+        db, reseller, ResellerPaymentMethodType.MPESA_PAYBILL,
+        mpesa_paybill_number="4699342",
+    )
+    assert router.payment_method_id is None
+
+    body = await _expiry_body(db, session_factory, customer)
+
+    assert PLATFORM_PAYBILL not in body
+    assert "Paybill" not in body
+
+
+async def test_platform_settlement_paybill_method_keeps_the_platform_paybill(
+    db, session_factory,
+):
+    """System-collected: the customer pays us and B2B pays the reseller out,
+    so the platform paybill is the right one to advertise."""
+    reseller, router, customer = await _seed_expired_pppoe(db)
+    reseller.settlement_mode = "platform"
+    method = await _add_method(
+        db, reseller, ResellerPaymentMethodType.MPESA_PAYBILL,
+        mpesa_paybill_number="4699342",
+    )
+    router.payment_method_id = method.id
+    await db.commit()
+
+    body = await _expiry_body(db, session_factory, customer)
+
+    assert f"Paybill {PLATFORM_PAYBILL}" in body
+
+
+async def test_legacy_router_with_no_methods_keeps_the_platform_paybill(
+    db, session_factory,
+):
+    reseller, _, customer = await _seed_expired_pppoe(db)
+    reseller.settlement_mode = "platform"
+    await db.commit()
+
+    body = await _expiry_body(db, session_factory, customer)
+
+    assert f"Paybill {PLATFORM_PAYBILL}, Account 12345674" in body
+
+
+async def test_campaign_summary_names_the_paybill_customers_were_told(
+    db, session_factory,
+):
+    reseller, router, customer = await _seed_expired_pppoe(db)
+    method = await _add_method(
+        db, reseller, ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
+        mpesa_shortcode="555111", c2b_registered_at=datetime.utcnow(),
+    )
+    router.payment_method_id = method.id
+    await db.commit()
+
+    campaign_ids = await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [customer.id], session_factory=session_factory
+    )
+    campaign = await db.get(SmsCampaign, campaign_ids[0])
+
+    assert "555111" in campaign.body
+    assert PLATFORM_PAYBILL not in campaign.body

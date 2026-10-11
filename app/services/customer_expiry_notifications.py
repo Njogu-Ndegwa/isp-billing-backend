@@ -123,43 +123,73 @@ async def reseller_support_phone(db, reseller: User) -> str | None:
 async def resolve_paybills(
     db, reseller: User, router_ids
 ) -> dict[int | None, str | None]:
-    """Which paybill a customer on each router should pay into.
+    """Which paybill a customer on each router should pay into, or None.
+
+    The rule: advertise a paybill only where a payment would actually land
+    and be matched to the customer. It asks the same resolver the M-Pesa
+    prompt uses (``resolve_collection_payment_method``), so the reminder and
+    the payment can never disagree about whose account the money goes to.
+
+      * Reseller's own Daraja paybill with C2B registered with us -> that
+        shortcode (we receive the confirmation and match the account number).
+      * Money collected on the platform paybill (legacy/platform settlement)
+        -> the platform shortcode, which routes by account number.
+      * Money settled straight to the reseller without a C2B registration we
+        can see (own paybill not registered, direct-settlement paybill, till
+        or bank) -> None: the reminder drops the "Pay via Paybill" clause.
+
+    The last case used to fall back to the platform paybill, so customers of
+    resellers who settle directly were told to pay us (2026-10-11).
 
     The account-number paybill flow is M-Pesa C2B, so outside Kenya there is
-    none to advertise. A reseller who registered their own paybill for C2B is
-    paid there; everyone else is paid on the platform paybill, which routes
-    the payment by the customer's account number.
+    none to advertise.
     """
+    from app.services.direct_settlement import resolve_direct_destination
+    from app.services.payment_gateway import resolve_collection_payment_method
+
     router_ids = set(router_ids)
     if reseller_market(reseller).code != "KE":
         return {router_id: None for router_id in router_ids}
 
-    own: dict[int, str] = {}
-    known = [router_id for router_id in router_ids if router_id]
-    if known:
-        rows = (
-            await db.execute(
-                select(Router.id, ResellerPaymentMethod.mpesa_shortcode)
-                .join(
-                    ResellerPaymentMethod,
-                    Router.payment_method_id == ResellerPaymentMethod.id,
-                )
-                .where(
-                    Router.id.in_(known),
-                    Router.user_id == reseller.id,
-                    ResellerPaymentMethod.is_active.is_(True),
-                    ResellerPaymentMethod.method_type
-                    == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
-                    ResellerPaymentMethod.c2b_registered_at.isnot(None),
-                    ResellerPaymentMethod.mpesa_shortcode.isnot(None),
-                )
-            )
-        ).all()
-        own = {router_id: shortcode for router_id, shortcode in rows if shortcode}
-    return {
-        router_id: own.get(router_id) or settings.MPESA_SHORTCODE
-        for router_id in router_ids
-    }
+    out: dict[int | None, str | None] = {}
+    for router_id in router_ids:
+        pm = (
+            await resolve_collection_payment_method(db, router_id)
+            if router_id else None
+        )
+        if pm is None and router_id is None:
+            # No router: decide from the reseller's default collection path.
+            from app.services.direct_settlement import default_direct_method
+
+            pm = await default_direct_method(db, reseller.id)
+        out[router_id] = await _paybill_for_method(
+            db, pm, resolve_direct_destination
+        )
+    return out
+
+
+async def _paybill_for_method(db, pm, resolve_direct_destination) -> str | None:
+    if pm is None:
+        return settings.MPESA_SHORTCODE  # platform-collected, routed by account
+    method_type = pm.method_type
+    if isinstance(method_type, str):
+        method_type = ResellerPaymentMethodType(method_type)
+    if method_type == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS:
+        # Paid into the reseller's own shortcode; only advertise it when C2B
+        # confirmations reach us, or the payment can't renew the customer.
+        if pm.c2b_registered_at is not None and pm.mpesa_shortcode:
+            return pm.mpesa_shortcode.strip()
+        return None
+    if method_type in (
+        ResellerPaymentMethodType.MPESA_PAYBILL,
+        ResellerPaymentMethodType.BANK_ACCOUNT,
+        ResellerPaymentMethodType.MPESA_TILL,
+    ):
+        if await resolve_direct_destination(db, pm) is not None:
+            return None  # settles straight to the reseller; not ours to advertise
+        return settings.MPESA_SHORTCODE  # system-collected, paid out by B2B
+    # ZenoPay, MTN MoMo, ... have no account-number paybill.
+    return None
 
 
 async def create_customer_campaign(
@@ -296,6 +326,7 @@ async def _queue_expiry_style_campaign(
     recipients: list[tuple[int, str, str, str]] = []
     seen_phones: set[str] = set()
     uses_paybill = False
+    summary_paybill: str | None = None
     for row in rows:
         phone = (row.phone or "").strip()
         phone_key = _phone_key(phone)
@@ -314,6 +345,7 @@ async def _queue_expiry_style_campaign(
         )
         paybill = paybills.get(row.router_id) if payment_account else None
         uses_paybill = uses_paybill or bool(payment_account and paybill)
+        summary_paybill = summary_paybill or paybill
         context = templates.build_context(
             reseller=reseller,
             tz_name=tz_name,
@@ -342,7 +374,8 @@ async def _queue_expiry_style_campaign(
             reseller=reseller,
             tz_name=tz_name,
             account_number="[customer account]" if uses_paybill else None,
-            paybill=settings.MPESA_SHORTCODE if uses_paybill else None,
+            # The paybill customers were actually told, never a hardcoded one.
+            paybill=summary_paybill if uses_paybill else None,
         ))
 
     return await create_customer_campaign(
