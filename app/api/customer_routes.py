@@ -30,6 +30,11 @@ from app.services.hotspot_provisioning import (
     schedule_provisioning_attempt,
 )
 from app.services.account_numbers import generate_account_number
+from app.services.c2b_handler import (
+    find_held_underpayment,
+    held_payment_collection_mode,
+    resolve_held_underpayment,
+)
 
 import logging
 
@@ -820,6 +825,9 @@ class ActivatePPPoERequest(BaseModel):
     payment_method: str = "cash"
     payment_reference: Optional[str] = None
     notes: Optional[str] = None
+    # Consume an M-Pesa payment held as "amount too low" if it now covers the
+    # plan (e.g. after a downgrade), instead of recording a new CASH payment.
+    use_held_mpesa: bool = True
 
 
 @router.post("/api/customers/{customer_id}/activate-pppoe")
@@ -870,6 +878,10 @@ async def activate_pppoe_customer(
             expiry_delta = timedelta(days=duration_value)
             days_paid_for = duration_value
 
+        held = None
+        if request.use_held_mpesa and not request.payment_reference:
+            held = await find_held_underpayment(db, customer, float(plan.price))
+
         now = datetime.utcnow()
         if customer.status == CustomerStatus.ACTIVE and customer.expiry and customer.expiry > now:
             customer.expiry = customer.expiry + expiry_delta
@@ -878,23 +890,51 @@ async def activate_pppoe_customer(
 
         customer.status = CustomerStatus.ACTIVE
 
-        try:
-            pm_enum = PaymentMethod(request.payment_method.lower())
-        except ValueError:
-            pm_enum = PaymentMethod.CASH
+        if held:
+            unmatched, c2b_txn = held
+            notes = request.notes or f"PPPoE activation via admin using held M-Pesa {c2b_txn.trans_id}"
+            payment = CustomerPayment(
+                customer_id=customer.id,
+                reseller_id=user.id,
+                plan_id=plan.id,
+                router_id=customer.router_id,
+                amount=float(c2b_txn.trans_amount),
+                payment_method=PaymentMethod.MOBILE_MONEY,
+                payment_reference=c2b_txn.trans_id,
+                collection_mode=held_payment_collection_mode(c2b_txn),
+                days_paid_for=days_paid_for,
+                status=PaymentStatus.COMPLETED,
+                notes=notes,
+                customer_name=customer.name,
+            )
+            resolve_held_underpayment(
+                unmatched, c2b_txn, customer,
+                plan_price=float(plan.price),
+                resolved_by_user_id=user.id,
+                notes=f"Applied on admin PPPoE activation (plan {plan.id} @ {plan.price})",
+            )
+            logger.info(
+                "[C2B] Admin activation of customer %s consumed held payment %s (%.2f)",
+                customer.id, c2b_txn.trans_id, float(c2b_txn.trans_amount),
+            )
+        else:
+            try:
+                pm_enum = PaymentMethod(request.payment_method.lower())
+            except ValueError:
+                pm_enum = PaymentMethod.CASH
 
-        payment = CustomerPayment(
-            customer_id=customer.id,
-            reseller_id=user.id,
-            plan_id=plan.id,
-            amount=float(plan.price),
-            payment_method=pm_enum,
-            payment_reference=request.payment_reference,
-            days_paid_for=days_paid_for,
-            status=PaymentStatus.COMPLETED,
-            notes=request.notes or f"PPPoE activation via admin",
-            customer_name=customer.name,
-        )
+            payment = CustomerPayment(
+                customer_id=customer.id,
+                reseller_id=user.id,
+                plan_id=plan.id,
+                amount=float(plan.price),
+                payment_method=pm_enum,
+                payment_reference=request.payment_reference,
+                days_paid_for=days_paid_for,
+                status=PaymentStatus.COMPLETED,
+                notes=request.notes or f"PPPoE activation via admin",
+                customer_name=customer.name,
+            )
         db.add(payment)
 
         try:
@@ -940,6 +980,7 @@ async def activate_pppoe_customer(
             "status": customer.status.value,
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
             "plan_name": plan.name,
+            "held_mpesa_applied": held[1].trans_id if held else None,
             "provision_result": "ok" if provision_succeeded else "retry_pending",
             "provision_error": provision_result.get("error") if provision_result else None,
             "delivery": delivery,

@@ -443,6 +443,73 @@ async def handle_validation(payload: dict, db: AsyncSession) -> dict:
 # ---------------------------------------------------------------------------
 
 
+async def find_held_underpayment(
+    db: AsyncSession,
+    customer: Customer,
+    plan_price: float,
+) -> Optional[Tuple[UnmatchedC2BPayment, C2BTransaction]]:
+    """Oldest open AMOUNT_TOO_LOW hold for this customer that now covers
+    plan_price (with wallet credit).
+
+    A hold happens when the customer paid less than their plan at the time.
+    If the reseller then moves them to a cheaper plan and activates them by
+    hand, the activation must consume this M-Pesa payment instead of writing a
+    CASH row, or the money never reaches the reseller's payout balance.
+    The row is locked so two concurrent activations can't both claim it.
+    """
+    wallet = float(customer.wallet_credit_kes or 0)
+    stmt = (
+        select(UnmatchedC2BPayment, C2BTransaction)
+        .join(C2BTransaction, C2BTransaction.id == UnmatchedC2BPayment.c2b_transaction_id)
+        .where(
+            UnmatchedC2BPayment.reason == UnmatchedC2BReason.AMOUNT_TOO_LOW,
+            UnmatchedC2BPayment.resolved_at.is_(None),
+            C2BTransaction.status == C2BTransactionStatus.UNMATCHED,
+            C2BTransaction.matched_customer_id == customer.id,
+            C2BTransaction.trans_amount + wallet >= plan_price,
+        )
+        .order_by(C2BTransaction.received_at.asc(), C2BTransaction.id.asc())
+        .limit(1)
+        .with_for_update(of=UnmatchedC2BPayment, skip_locked=True)
+    )
+    row = (await db.execute(stmt)).first()
+    return (row[0], row[1]) if row else None
+
+
+def held_payment_collection_mode(txn: C2BTransaction) -> CollectionMode:
+    return (
+        CollectionMode.SYSTEM_COLLECTED
+        if txn.business_shortcode == settings.MPESA_SHORTCODE
+        else CollectionMode.DIRECT
+    )
+
+
+def resolve_held_underpayment(
+    unmatched: UnmatchedC2BPayment,
+    txn: C2BTransaction,
+    customer: Customer,
+    *,
+    plan_price: float,
+    resolved_by_user_id: Optional[int],
+    notes: str,
+) -> None:
+    """Mark a held payment as applied to `customer` and replace the wallet the
+    same way the confirmation handler does (paid + old wallet - plan price).
+    The caller records the CustomerPayment and grants the period."""
+    effective_amount = float(txn.trans_amount) + float(customer.wallet_credit_kes or 0)
+    customer.wallet_credit_kes = max(0, int(round(effective_amount - plan_price)))
+
+    now = datetime.utcnow()
+    txn.status = C2BTransactionStatus.PROCESSED
+    txn.matched_customer_id = customer.id
+    txn.matched_reseller_id = customer.user_id
+    txn.processed_at = now
+    unmatched.resolved_at = now
+    unmatched.resolved_by_user_id = resolved_by_user_id
+    unmatched.resolution_customer_id = customer.id
+    unmatched.notes = notes
+
+
 async def _archive(
     db: AsyncSession,
     fields: C2BPayloadFields,
