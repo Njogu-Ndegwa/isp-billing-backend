@@ -162,9 +162,11 @@ async def voucher_stats(
     revenue = (await db.execute(revenue_stmt)).scalar() or 0
 
     # Breakdown by plan
+    # Outer join so vouchers of a deleted plan still add up to the totals above
     plan_breakdown_stmt = (
         select(Plan.name, Plan.price, Voucher.status, func.count(Voucher.id))
-        .join(Plan, Voucher.plan_id == Plan.id)
+        .select_from(Voucher)
+        .outerjoin(Plan, Voucher.plan_id == Plan.id)
         .where(Voucher.user_id == user.id)
         .group_by(Plan.name, Plan.price, Voucher.status)
     )
@@ -172,6 +174,7 @@ async def voucher_stats(
 
     plans_summary: dict = {}
     for plan_name, price, v_status, count in plan_rows:
+        plan_name = plan_name or "Deleted plan"
         if plan_name not in plans_summary:
             plans_summary[plan_name] = {"price": price, "available": 0, "redeemed": 0, "expired": 0, "disabled": 0, "total": 0}
         plans_summary[plan_name][v_status.value] = count

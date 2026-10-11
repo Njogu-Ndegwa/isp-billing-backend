@@ -217,7 +217,7 @@ class Customer(Base):
     static_ip = Column(String)
     status = Column(Enum(CustomerStatus), nullable=False, default=CustomerStatus.INACTIVE)
     expiry = Column(DateTime)
-    plan_id = Column(Integer, ForeignKey("plans.id"))
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"))
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     plan = relationship("Plan")
@@ -1006,7 +1006,7 @@ class Voucher(Base):
     __tablename__ = "vouchers"
     id = Column(Integer, primary_key=True, autoincrement=True)
     code = Column(String(9), unique=True, nullable=False, index=True)  # 8 digits (new) or legacy "XXXX-XXXX"
-    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)  # NULL once the plan is deleted
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     status = Column(
@@ -1516,7 +1516,7 @@ class DevicePairing(Base):
         default=DeviceType.TV,
     )
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=False)
-    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=True)
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
     subscription_owner_customer_id = Column(
         Integer,
         ForeignKey("customers.id", ondelete="SET NULL"),
