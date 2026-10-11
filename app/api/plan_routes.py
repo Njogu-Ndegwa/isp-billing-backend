@@ -1,12 +1,18 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update, case
+from sqlalchemy import select, func, update, case, or_
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
+import json
 
 from app.db.database import get_db
-from app.db.models import Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router, FupAction, CustomerUsagePeriod, Voucher, VoucherStatus, DevicePairing
+from app.db.models import (
+    Plan, Customer, CustomerStatus, ConnectionType, DurationUnit, CustomerPayment, PlanType, Router, FupAction,
+    CustomerUsagePeriod, Voucher, VoucherStatus, DevicePairing,
+    MpesaTransaction, MpesaTransactionStatus, ZenoPayTransaction, ZenoPayTransactionStatus,
+    MtnMomoTransaction, MtnMomoTransactionStatus, FapshiTransaction, FapshiTransactionStatus,
+)
 from app.services.auth import verify_token, get_current_user
 from app.services.plan_cache import (
     get_plans_cached,
@@ -510,6 +516,66 @@ async def update_plan_api(
         raise HTTPException(status_code=500, detail=f"Failed to update plan: {str(e)}")
 
 
+# A pending M-Pesa payment is still reconciled (and can complete) for this long
+# before it is expired — see reconcile_pending_transactions in mpesa_transactions.
+IN_FLIGHT_PAYMENT_WINDOW = timedelta(hours=2)
+
+# (transaction model, statuses that mean "customer may still be charged")
+_IN_FLIGHT_PAYMENT_SOURCES = (
+    (MpesaTransaction, (MpesaTransactionStatus.pending,)),
+    (ZenoPayTransaction, (ZenoPayTransactionStatus.PENDING,)),
+    (MtnMomoTransaction, (MtnMomoTransactionStatus.PENDING,)),
+    (FapshiTransaction, (FapshiTransactionStatus.CREATED, FapshiTransactionStatus.PENDING)),
+)
+
+
+def _pending_plan_id(data) -> Optional[int]:
+    """Plan an existing customer is switching to while their payment is pending."""
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if isinstance(data, dict):
+        try:
+            return int(data["plan_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
+async def _count_in_flight_payments(db: AsyncSession, plan_id: int, owner_id: int) -> int:
+    """Payments for this plan that the provider may still confirm.
+
+    On confirmation the plan is read from the customer's pending_update_data or
+    plan_id (M-Pesa also snapshots it on the transaction). If the plan is
+    deleted in between, the customer is charged but never provisioned.
+    """
+    cutoff = datetime.utcnow() - IN_FLIGHT_PAYMENT_WINDOW
+    count = 0
+
+    for model, statuses in _IN_FLIGHT_PAYMENT_SOURCES:
+        snapshot = getattr(model, "plan_id", None)
+        owned = Customer.user_id == owner_id
+        stmt = (
+            select(Customer.plan_id, Customer.pending_update_data, snapshot if snapshot is not None else model.id)
+            .select_from(model)
+            .outerjoin(Customer, Customer.id == model.customer_id)
+            .where(
+                model.status.in_(statuses),
+                model.created_at > cutoff,
+                or_(owned, snapshot == plan_id) if snapshot is not None else owned,
+            )
+        )
+        for customer_plan_id, pending_data, snapshot_plan_id in (await db.execute(stmt)).all():
+            # Mirrors the confirmation: the pending plan wins, else the current one
+            pending_plan_id = _pending_plan_id(pending_data)
+            charged_plan_id = pending_plan_id if pending_plan_id is not None else customer_plan_id
+            if charged_plan_id == plan_id or (snapshot is not None and snapshot_plan_id == plan_id):
+                count += 1
+
+    return count
+
 @router.delete("/api/plans/{plan_id}")
 async def delete_plan(
     plan_id: int,
@@ -543,6 +609,16 @@ async def delete_plan(
                 detail=f"Cannot delete plan. {active_count} active customer(s) are using this plan"
             )
         
+        in_flight = await _count_in_flight_payments(db, plan_id, user.id)
+        if in_flight > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot delete plan. {in_flight} customer payment(s) for this plan are still being confirmed. "
+                    "Hide the plan now and try deleting it again later"
+                )
+            )
+
         # Unused vouchers may already be printed and sold; deleting the plan
         # would make them unredeemable, so the reseller must disable them first.
         unused_stmt = select(func.count(Voucher.id)).where(

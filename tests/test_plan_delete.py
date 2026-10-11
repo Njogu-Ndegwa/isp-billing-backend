@@ -11,7 +11,8 @@ Fix: used vouchers, paired devices and inactive customers are detached
 a clear 400, because they may already be printed and sold.
 """
 
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -21,10 +22,14 @@ from sqlalchemy import select, text
 from app.db.models import (
     CustomerStatus,
     DevicePairing,
+    MpesaTransaction,
+    MpesaTransactionStatus,
     Plan,
     UserRole,
     Voucher,
     VoucherStatus,
+    ZenoPayTransaction,
+    ZenoPayTransactionStatus,
 )
 from tests.conftest import running_on_postgres
 from tests.factories import make_customer, make_plan, make_reseller, make_router
@@ -132,6 +137,87 @@ async def test_active_customers_still_block_delete(db, monkeypatch):
 
     assert exc.value.status_code == 400
     assert "active customer" in exc.value.detail
+
+
+def _stk(customer, plan_id=None, status=MpesaTransactionStatus.pending, age=timedelta(minutes=1)):
+    return MpesaTransaction(
+        checkout_request_id=f"ws_CO_{customer.id}_{status.value}_{int(age.total_seconds())}",
+        phone_number=customer.phone,
+        amount=500,
+        reference="hotspot",
+        status=status,
+        customer_id=customer.id,
+        plan_id=plan_id,
+        created_at=datetime.utcnow() - age,
+    )
+
+
+async def _assert_blocked_by_payment(db, monkeypatch, reseller, plan):
+    with pytest.raises(HTTPException) as exc:
+        await _delete_plan(db, monkeypatch, reseller, plan.id)
+    assert exc.value.status_code == 400
+    assert "still being confirmed" in exc.value.detail
+    assert (await db.execute(select(Plan).where(Plan.id == plan.id))).scalar_one_or_none() is not None
+
+
+async def test_pending_mpesa_payment_blocks_delete(db, monkeypatch):
+    """Customer is mid-STK-push for this plan: the callback would find no plan."""
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    customer = await make_customer(db, reseller, plan, status=CustomerStatus.PENDING)
+    db.add(_stk(customer, plan_id=plan.id))
+    await db.commit()
+
+    await _assert_blocked_by_payment(db, monkeypatch, reseller, plan)
+
+
+async def test_pending_plan_switch_payment_blocks_delete(db, monkeypatch):
+    """Existing customer paying to switch onto this plan (pending_update_data)."""
+    reseller = await make_reseller(db)
+    old_plan = await make_plan(db, reseller, name="Old")
+    new_plan = await make_plan(db, reseller, name="New")
+    customer = await make_customer(
+        db, reseller, old_plan, status=CustomerStatus.INACTIVE,
+        pending_update_data=json.dumps({"plan_id": new_plan.id}),
+    )
+    db.add(_stk(customer))
+    await db.commit()
+
+    await _assert_blocked_by_payment(db, monkeypatch, reseller, new_plan)
+
+    # The customer is leaving old_plan, so deleting it cannot strand the payment
+    result = await _delete_plan(db, monkeypatch, reseller, old_plan.id)
+    assert result["success"] is True
+
+
+async def test_pending_payment_from_other_provider_blocks_delete(db, monkeypatch):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    customer = await make_customer(db, reseller, plan, status=CustomerStatus.PENDING)
+    db.add(ZenoPayTransaction(
+        order_id="zp-2079", reseller_id=reseller.id, customer_id=customer.id,
+        amount=500, status=ZenoPayTransactionStatus.PENDING, buyer_phone=customer.phone,
+    ))
+    await db.commit()
+
+    await _assert_blocked_by_payment(db, monkeypatch, reseller, plan)
+
+
+@pytest.mark.parametrize("status, age", [
+    (MpesaTransactionStatus.completed, timedelta(minutes=1)),
+    (MpesaTransactionStatus.failed, timedelta(minutes=1)),
+    (MpesaTransactionStatus.pending, timedelta(hours=3)),  # past reconciliation, will expire
+])
+async def test_settled_or_stale_payments_do_not_block_delete(db, monkeypatch, status, age):
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    customer = await make_customer(db, reseller, plan, status=CustomerStatus.INACTIVE)
+    db.add(_stk(customer, plan_id=plan.id, status=status, age=age))
+    await db.commit()
+
+    result = await _delete_plan(db, monkeypatch, reseller, plan.id)
+
+    assert result["success"] is True
 
 
 async def test_voucher_stats_keep_deleted_plan_vouchers(db, monkeypatch):
