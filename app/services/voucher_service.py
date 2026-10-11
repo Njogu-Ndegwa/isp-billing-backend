@@ -210,6 +210,8 @@ async def verify_voucher(db: AsyncSession, code: str) -> Dict[str, Any]:
         return {"valid": False, "error": "Voucher has expired"}
 
     plan = voucher.plan
+    if not plan:
+        return {"valid": False, "error": "Voucher plan is no longer available"}
     return {
         "valid": True,
         "code": voucher.code,
@@ -274,6 +276,8 @@ async def redeem_voucher(
         return {"success": False, "error": "Router not found"}
 
     plan = voucher.plan
+    if not plan:
+        return {"success": False, "error": "Voucher plan is no longer available"}
     normalized_mac = normalize_mac_address(mac_address)
 
     # Find or create customer (scoped to reseller to match unique constraint)

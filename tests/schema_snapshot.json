@@ -180,7 +180,9 @@
   "received_at",
   "status",
   "trans_amount",
-  "trans_id"
+  "trans_id",
+  "wallet_after_kes",
+  "wallet_before_kes"
  ],
  "customer_events": [
   "actor_label",

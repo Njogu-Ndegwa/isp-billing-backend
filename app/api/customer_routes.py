@@ -697,6 +697,7 @@ async def get_customers_api(
                 "router_id": c.router_id,
                 "account_number": c.account_number,
                 "wallet_credit_kes": c.wallet_credit_kes,
+                "subscription_owner_id": c.subscription_owner_id,
                 "has_paid": bool(c_has_paid),
                 "tier": "customer" if c_has_paid else "visitor",
                 "plan": {
@@ -825,6 +826,7 @@ async def get_customer_detail(
             "router_id": customer.router_id,
             "account_number": customer.account_number,
             "wallet_credit_kes": customer.wallet_credit_kes,
+            "subscription_owner_id": customer.subscription_owner_id,
             "plan": {
                 "id": customer.plan.id,
                 "name": customer.plan.name,

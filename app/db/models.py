@@ -217,7 +217,7 @@ class Customer(Base):
     static_ip = Column(String)
     status = Column(Enum(CustomerStatus), nullable=False, default=CustomerStatus.INACTIVE)
     expiry = Column(DateTime)
-    plan_id = Column(Integer, ForeignKey("plans.id"))
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"))
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     plan = relationship("Plan")
@@ -1002,7 +1002,7 @@ class Voucher(Base):
     __tablename__ = "vouchers"
     id = Column(Integer, primary_key=True, autoincrement=True)
     code = Column(String(9), unique=True, nullable=False, index=True)  # 8 digits (new) or legacy "XXXX-XXXX"
-    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)  # NULL once the plan is deleted
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     status = Column(
@@ -1512,7 +1512,7 @@ class DevicePairing(Base):
         default=DeviceType.TV,
     )
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=False)
-    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=True)
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
     subscription_owner_customer_id = Column(
         Integer,
         ForeignKey("customers.id", ondelete="SET NULL"),
@@ -1987,6 +1987,12 @@ class C2BTransaction(Base):
     matched_reseller_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     received_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     processed_at = Column(DateTime, nullable=True)
+    # The customer's wallet credit just before and after this payment was
+    # applied. Paybill payments are the only thing that moves the wallet, so
+    # these rows are its history. NULL on rows from before October 2026 and
+    # on payments that were never applied.
+    wallet_before_kes = Column(Integer, nullable=True)
+    wallet_after_kes = Column(Integer, nullable=True)
 
     matched_customer = relationship("Customer")
     matched_reseller = relationship("User")

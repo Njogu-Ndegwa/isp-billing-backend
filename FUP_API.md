@@ -110,6 +110,50 @@ GET /api/customers/{customer_id}/usage/history?limit=6
 Returns up to `limit` recent periods (most recent first), same item shape as
 the `period` object above. Closed periods have `closed_at` set.
 
+### 3a. Usage over time (chart)
+
+```http
+GET /api/customers/{customer_id}/usage/timeline?days=7&granularity=day
+```
+
+Data used per hour or per day, read from the hourly `customer_usage_buckets`
+ledger (kept 35 days; started 2026-09-26). Same scoping as above: a reseller
+sees only their own customers, an admin sees all.
+
+| Param | Default | Notes |
+|---|---|---|
+| `days` | `7` | 1–35 |
+| `granularity` | `hour` if `days` ≤ 2, else `day` | `hour`: rolling `days × 24` hours ending with the current hour. `day`: the last `days` EAT calendar days, today included. |
+
+```json
+{
+  "customer_id": 42,
+  "granularity": "day",
+  "days": 7,
+  "window_start": "2026-10-04T21:00:00",
+  "window_end": "2026-10-11T21:00:00",
+  "timezone_offset_hours": 3,
+  "history_since": "2026-09-26T10:00:00",
+  "retention_days": 35,
+  "upload_mb": 1597.4,
+  "download_mb": 8867.9,
+  "total_mb": 10465.3,
+  "peak": { "start": "2026-10-04T21:00:00", "upload_mb": 450.1, "download_mb": 2540.2, "total_mb": 2990.3 },
+  "points": [
+    { "start": "2026-10-04T21:00:00", "upload_mb": 450.1, "download_mb": 2540.2, "total_mb": 2990.3 }
+  ]
+}
+```
+
+- `points` is zero-filled and oldest first, one per slot. `start` is the slot's
+  UTC start; a daily slot starts at EAT midnight (21:00 UTC).
+- `history_since` is the earliest hour on record for the customer (`null` if
+  none). When it is later than `window_start`, the earlier zeros mean "not
+  tracked yet" rather than "used nothing".
+- `peak` is the busiest slot, or `null` when nothing was used.
+- The bandwidth poller skips RADIUS routers, so customers on a RADIUS router
+  that doesn't push usage get an all-zero series.
+
 ---
 
 ## 4. Top-N current usage (reseller dashboard)
