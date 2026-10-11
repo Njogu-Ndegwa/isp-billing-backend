@@ -2805,6 +2805,7 @@ async def run_hot_path_index_migrations():
         "ix_mpesa_txn_status_created",
         "ix_mpesa_txn_customer_created",
         "ix_customer_payments_customer_status",
+        "ix_customer_payments_payment_reference",
     )
     async with async_engine.connect() as conn:
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -2890,6 +2891,29 @@ async def run_hot_path_index_migrations():
                 CREATE INDEX CONCURRENTLY IF NOT EXISTS
                     ix_customer_payments_customer_status
                 ON public.customer_payments (customer_id, status)
+            """))
+
+            # Every C2B confirmation (~2k/day, one per prompt payment as well)
+            # checks whether its M-Pesa receipt is already a recorded payment
+            # (c2b_handler._receipt_already_recorded). 257k rows on 2026-10-11.
+            result = await conn.execute(sa_text("""
+                SELECT indisvalid
+                FROM pg_index
+                WHERE indexrelid = to_regclass(
+                    'public.ix_customer_payments_payment_reference'
+                )
+            """))
+            is_valid = result.scalar_one_or_none()
+            if is_valid is False:
+                await conn.execute(sa_text(
+                    "DROP INDEX CONCURRENTLY IF EXISTS "
+                    "public.ix_customer_payments_payment_reference"
+                ))
+
+            await conn.execute(sa_text("""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    ix_customer_payments_payment_reference
+                ON public.customer_payments (payment_reference)
             """))
         finally:
             await conn.execute(sa_text("RESET max_parallel_maintenance_workers"))

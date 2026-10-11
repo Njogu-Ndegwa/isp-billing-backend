@@ -10,6 +10,7 @@ Two flavors of endpoint live here:
 2. Authenticated admin/reseller endpoints for operating the integration:
    - POST /api/admin/c2b/register-platform-paybill
    - POST /api/payment-methods/{id}/register-c2b
+   - POST /api/admin/payment-methods/{id}/register-c2b  (on a reseller's behalf)
    - GET  /api/c2b/unmatched
    - POST /api/c2b/unmatched/{id}/attribute
 
@@ -25,7 +26,7 @@ from typing import Optional
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
@@ -38,6 +39,7 @@ from app.db.models import (
     C2BTransactionStatus,
     ConnectionType,
     Customer,
+    CustomerPayment,
     PaymentMethod,
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
@@ -158,14 +160,43 @@ async def register_reseller_c2b(
     """Register a reseller's own paybill with Safaricom using credentials
     stored on the ResellerPaymentMethod row."""
     user = await get_current_user(token, db)
-    pm = (
-        await db.execute(
-            select(ResellerPaymentMethod).where(
-                ResellerPaymentMethod.id == method_id,
-                ResellerPaymentMethod.user_id == user.id,
-            )
-        )
-    ).scalar_one_or_none()
+    return await _register_method_c2b(db, method_id, request, owner_id=user.id)
+
+
+@router.post("/api/admin/payment-methods/{method_id}/register-c2b")
+async def admin_register_reseller_c2b(
+    method_id: int,
+    request: RegisterResellerC2BRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+) -> dict:
+    """Register a reseller's own paybill on their behalf (support), with the
+    credentials stored on their payment method."""
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return await _register_method_c2b(db, method_id, request, owner_id=None)
+
+
+async def _register_method_c2b(
+    db: AsyncSession,
+    method_id: int,
+    request: RegisterResellerC2BRequest,
+    *,
+    owner_id: Optional[int],
+) -> dict:
+    """Shared by the reseller and admin endpoints.
+
+    Only marks the method registered when Safaricom says ResponseCode "0":
+    `c2b_registered_at` is what makes reminder SMS advertise this paybill
+    (customer_expiry_notifications.resolve_paybills), so setting it on a
+    failed registration would send customers to a paybill whose payments we
+    never hear about. The DB session is released before the Safaricom call.
+    """
+    stmt = select(ResellerPaymentMethod).where(ResellerPaymentMethod.id == method_id)
+    if owner_id is not None:
+        stmt = stmt.where(ResellerPaymentMethod.user_id == owner_id)
+    pm = (await db.execute(stmt)).scalar_one_or_none()
     if pm is None:
         raise HTTPException(status_code=404, detail="Payment method not found")
     if pm.method_type != ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS:
@@ -178,21 +209,32 @@ async def register_reseller_c2b(
             status_code=400,
             detail="Payment method is missing mpesa_shortcode / consumer_key / consumer_secret",
         )
+    shortcode = pm.mpesa_shortcode.strip()
+    consumer_key = decrypt_credential(pm.mpesa_consumer_key_encrypted).strip()
+    consumer_secret = decrypt_credential(pm.mpesa_consumer_secret_encrypted).strip()
+    await db.commit()  # release the connection before calling Safaricom
 
     result = await _call_daraja_registerurl(
-        shortcode=pm.mpesa_shortcode,
-        consumer_key=decrypt_credential(pm.mpesa_consumer_key_encrypted),
-        consumer_secret=decrypt_credential(pm.mpesa_consumer_secret_encrypted),
+        shortcode=shortcode,
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
         confirmation_url=request.confirmation_url,
         validation_url=request.validation_url,
         response_type=request.response_type,
     )
+    if str((result or {}).get("ResponseCode", "")).strip() != "0":
+        logger.warning("[C2B] registerurl for method %s not accepted: %r", method_id, result)
+        raise HTTPException(
+            status_code=502,
+            detail={"message": "Safaricom did not accept the registration", "body": result},
+        )
 
+    pm = await db.get(ResellerPaymentMethod, method_id)
     pm.c2b_validation_url = request.validation_url
     pm.c2b_confirmation_url = request.confirmation_url
     pm.c2b_registered_at = datetime.utcnow()
     await db.commit()
-
+    logger.info("[C2B] Registered paybill %s (method %s) with Safaricom", shortcode, method_id)
     return result
 
 
@@ -221,6 +263,12 @@ async def list_unmatched_c2b(
         stmt = stmt.where(UnmatchedC2BPayment.assigned_reseller_id == user.id)
     if not resolved:
         stmt = stmt.where(UnmatchedC2BPayment.resolved_at.is_(None))
+    # A prompt (STK) payment's C2B echo can beat its own callback and land
+    # here; once the callback records the receipt it is paid, not unmatched.
+    stmt = stmt.where(~exists().where(
+        CustomerPayment.payment_reference == C2BTransaction.trans_id,
+        C2BTransaction.id == UnmatchedC2BPayment.c2b_transaction_id,
+    ))
 
     rows = (await db.execute(stmt)).scalars().all()
     return [_serialize_unmatched(r) for r in rows]
