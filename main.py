@@ -2672,12 +2672,27 @@ async def run_expiry_reaper_migrations():
 async def run_customer_grace_migrations():
     """Add customers.grace_period_minutes: the reseller-set grace period that
     keeps a customer connected past expiry without moving the expiry.
-    Idempotent; a constant DEFAULT makes this a metadata-only change."""
-    async with async_engine.begin() as conn:
-        await conn.execute(sa_text("""
-            ALTER TABLE customers
-            ADD COLUMN IF NOT EXISTS grace_period_minutes INTEGER NOT NULL DEFAULT 0
-        """))
+    Idempotent; a constant DEFAULT makes this a metadata-only change.
+
+    The ORM selects every mapped column, so if this ALTER never lands every
+    customer query fails. customers is the hottest table and app connections
+    carry lock_timeout, so retry a few times with a fresh connection each time
+    (nothing is held across the sleep), as run_checkin_delivery_migrations does.
+    """
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(sa_text("""
+                    ALTER TABLE customers
+                    ADD COLUMN IF NOT EXISTS grace_period_minutes INTEGER NOT NULL DEFAULT 0
+                """))
+            return
+        except Exception as exc:  # lock_timeout under a busy table: try again
+            last_exc = exc
+            logger.warning("Customer grace-period migration attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise last_exc
 
 
 async def run_standard_runtime_migrations():
