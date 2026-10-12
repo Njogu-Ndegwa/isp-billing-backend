@@ -195,12 +195,27 @@ def evaluate_cluster(name: str, cl: dict, degraded_streaks: dict[str, int]) -> l
 
 
 def evaluate_traffic(traffic_5m: dict[str, dict]) -> list[dict]:
+    """5xx from real clients only. Scanner / crawler hits on dead URLs (e.g.
+    `GET /.env` on shadow-api, ~99 % of its 5xx on 2026-10-12) are shown in the
+    Errors tab but never alert. The message names the failing endpoint and the
+    error the service itself logged."""
     out = []
     for svc, t in traffic_5m.items():
-        if t["requests"] >= 20 and t["status_5xx"] / t["requests"] > 0.05:
-            out.append(_alert(f"oves.ingress.{svc}", "warning", f"{svc} returning 5xx",
-                              f"{t['status_5xx']}/{t['requests']} requests failed in 5 min",
-                              "cluster.prod"))
+        real_req = t.get("real_requests", t["requests"])
+        real_5xx = t.get("real_5xx", t["status_5xx"])
+        if real_req < 20 or real_5xx / real_req <= 0.05:
+            continue
+        top = next((f for f in t.get("top_failures") or [] if not f.get("bots")), None)
+        log = (t.get("log_errors") or [{}])[0].get("message")
+        detail = f"{real_5xx}/{real_req} real requests failed in 5 min"
+        if top:
+            detail += f"; top: {top['method']} {top['route']} -> {top['status']} ({top['count']}x)"
+        if log:
+            detail += f"; service logged: {log[:140]}"
+        if t.get("bot_5xx"):
+            detail += f" (+{t['bot_5xx']} bot/scanner 5xx ignored)"
+        out.append(_alert(f"oves.ingress.{svc}", "warning", f"{svc} returning 5xx",
+                          detail, f"http.{svc}"))
     return out
 
 

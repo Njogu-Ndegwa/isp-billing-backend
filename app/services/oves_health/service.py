@@ -76,7 +76,9 @@ def build_metrics(codes: parsers.CodeStats, db_errors: int, probe_results: list[
         "p": {r["id"]: [{"up": 1, "slow": 1, "down": 0}.get(r["status"]), r["latency_ms"]]
               for r in probe_results},
         "k": k,
-        "t": {svc: [t["requests"], t["status_5xx"], t["p95_ms"]] for svc, t in traffic.items()},
+        "t": {svc: [t["requests"], t["status_5xx"], t["p95_ms"],
+                    t.get("real_requests", t["requests"]), t.get("real_5xx", t["status_5xx"])]
+              for svc, t in traffic.items()},
         "h": {h["name"]: [h.get("cpu_pct"), h.get("cpu_credits")] for h in hosts},
     }
 
@@ -109,12 +111,20 @@ def traffic_window(rows: list[tuple[datetime, dict]], since: datetime) -> dict[s
         if at < since or not m:
             continue
         for svc, vals in (m.get("t") or {}).items():
-            a = acc.setdefault(svc, {"requests": 0, "status_5xx": 0, "p95": []})
+            a = acc.setdefault(svc, {"requests": 0, "status_5xx": 0, "real_requests": 0,
+                                     "real_5xx": 0, "p95": []})
             a["requests"] += int(vals[0] or 0)
             a["status_5xx"] += int(vals[1] or 0)
+            # rows written before bot filtering have 3 fields: treat all as real
+            a["real_requests"] += int((vals[3] if len(vals) > 3 else vals[0]) or 0)
+            a["real_5xx"] += int((vals[4] if len(vals) > 4 else vals[1]) or 0)
             if vals[2] is not None:
                 a["p95"].append(float(vals[2]))
     return {svc: {"requests": a["requests"], "status_5xx": a["status_5xx"],
+                  "real_requests": a["real_requests"], "real_5xx": a["real_5xx"],
+                  "bot_5xx": a["status_5xx"] - a["real_5xx"],
+                  "real_error_rate": (round(a["real_5xx"] / a["real_requests"], 4)
+                                      if a["real_requests"] else None),
                   "p95_ms": max(a["p95"]) if a["p95"] else None}
             for svc, a in acc.items()}
 
@@ -529,6 +539,11 @@ def assemble(now: datetime, collected: dict, recent: list[tuple[datetime, dict]]
     for cname, cl in collected["clusters"].items():
         if "error" not in cl:
             alerts += rules.evaluate_cluster(cname, cl, st["degraded_streaks"])
+    failures5 = (logs or {}).get("failures_5m") or {}
+    log_errors5 = (logs or {}).get("log_errors_5m") or {}
+    for svc, t in traffic5.items():
+        t["top_failures"] = failures5.get(svc, [])
+        t["log_errors"] = log_errors5.get(svc, [])
     alerts += rules.evaluate_traffic(traffic5)
     alerts += rules.evaluate_collectors(collected["sources"], st["source_streaks"])
     graphql = collected.get("graphql")
