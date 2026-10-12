@@ -20,6 +20,11 @@ snapshot plus rolling windows built from stored per-minute metrics.
 | oves.k8s.<c>.oom            | OOMKilled containers in the last hour                   | warning  |
 | oves.ingress.<svc>          | 5xx > 5 % of >= 20 requests in 5 min                    | warning  |
 | oves.collector.<source>     | a configured source failed 3 cycles running (blind)     | warning  |
+| oves.gql.<graph>            | platform (not caller) errors on >= 2 % / 10 % of >= 50  | warn/crit|
+|                             | requests in 15 min (Apollo GraphOS)                     |          |
+| oves.gql.codes              | code mutations failing on the platform side >= 2 %      | crit     |
+| oves.gql.database           | MongoDB timeouts / "not primary" returned to clients    | critical |
+| oves.gql.duplicate_code     | E11000 duplicate code-event collisions                  | warning  |
 """
 
 from __future__ import annotations
@@ -42,6 +47,8 @@ REPEAT_MINUTES = {
     "oves.db.credits.": 6 * 60,
     "oves.codes.index_failures": 12 * 60,
     "oves.collector.": 6 * 60,
+    "oves.gql.duplicate_code": 6 * 60,
+    "oves.gql.": 2 * 60,
 }
 DEFAULT_REPEAT_MINUTES = 30
 
@@ -203,4 +210,51 @@ def evaluate_collectors(sources: dict[str, dict], streaks: dict[str, int]) -> li
         if info.get("state") == "error" and streaks.get(src, 0) >= COLLECTOR_STREAK:
             out.append(_alert(f"oves.collector.{src}", "warning", f"Monitoring blind: {src}",
                               f"{info.get('error', 'failing')} ({streaks[src]} cycles)", "collector"))
+    return out
+
+
+GQL_MIN_REQUESTS = 50
+
+
+def evaluate_graphql(summary: dict) -> list[dict]:
+    """Rules over the Apollo 15-minute summary. Only PLATFORM errors count
+    (schema mismatches, DB timeouts, duplicate keys, upstream failures);
+    callers' own mistakes (bad credentials, rate limit, not found) never alert."""
+    out = []
+    db_hits, dup_hits = [], []
+    for g in summary.get("graphs") or []:
+        for e in g.get("top_errors") or []:
+            if e.get("reason") == "database":
+                db_hits.append((g["label"], e))
+            elif e.get("reason") == "duplicate_code":
+                dup_hits.append((g["label"], e))
+        req, sys_err = g.get("requests") or 0, g.get("system_errors") or 0
+        if req < GQL_MIN_REQUESTS or not sys_err:
+            continue
+        rate = sys_err / req
+        if rate < 0.02:
+            continue
+        worst_err = next((e for e in g.get("top_errors") or [] if e.get("kind") == "system"), {})
+        out.append(_alert(
+            f"oves.gql.{g['graph']}", "critical" if rate >= 0.10 else "warning",
+            f"{g['label']}: {rate * 100:.0f} % of requests failing",
+            f"{sys_err}/{req} requests hit platform errors in 15 min; top: "
+            f"{worst_err.get('operation_label', '?')}: {str(worst_err.get('message', ''))[:140]}",
+            f"graphql.{g['graph']}"))
+    code = summary.get("codes_15m") or {}
+    if (code.get("requests") or 0) >= 20 and (code.get("system_errors") or 0) / code["requests"] >= 0.02:
+        out.append(_alert("oves.gql.codes", "critical", "Code generation failing (GraphQL)",
+                          f"{code['system_errors']}/{code['requests']} code requests failed on the "
+                          "platform side in 15 min", "graphql.codes"))
+    if db_hits:
+        n = sum(e["count"] for _l, e in db_hits)
+        label, e = db_hits[0]
+        out.append(_alert("oves.gql.database", "critical", "MongoDB errors reaching API clients",
+                          f"{n} in 15 min, e.g. {label} {e.get('operation_label')}: "
+                          f"{str(e.get('message', ''))[:120]}", "graphql.database"))
+    if dup_hits:
+        n = sum(e["count"] for _l, e in dup_hits)
+        out.append(_alert("oves.gql.duplicate_code", "warning", "Duplicate code collisions",
+                          f"{n} E11000 duplicate code-event error(s) in 15 min: two generations "
+                          "raced for the same code", "graphql.codes"))
     return out

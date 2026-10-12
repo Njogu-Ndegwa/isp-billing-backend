@@ -18,7 +18,7 @@ from sqlalchemy import delete, select, update
 from app.config import settings
 from app.db import database
 from app.db.models import OvesHealthSnapshot, ResellerInboxMessage, User, UserRole
-from app.services.oves_health import collectors, parsers, probes, rules
+from app.services.oves_health import apollo, collectors, parsers, probes, rules
 from app.services.oves_health.cloud import AwsReadOnly
 from app.services.oves_health.k8s import K8sClient, cluster_configs
 
@@ -366,8 +366,84 @@ async def collect(now: datetime) -> dict:
             hosts = res
             sources["aws_db_hosts"] = {"state": "ok"}
     sources["probes"] = {"state": "ok" if probe_results else "error"}
+
+    graphql = None
+    apollo_keys = apollo.parse_graph_keys(getattr(settings, "OVES_APOLLO_GRAPH_KEYS", ""))
+    if not apollo_keys:
+        sources["apollo"] = {"state": "not_configured"}
+    else:
+        try:
+            graphql = await apollo.cycle_summary(apollo_keys, now)   # refreshed every 5 min
+            failed = (graphql or {}).get("failures") or {}
+            sources["apollo"] = ({"state": "ok"} if not failed else
+                                 {"state": "partial" if len(failed) < len(apollo_keys) else "error",
+                                  "error": f"{len(failed)} graph(s): " + next(iter(failed.values()))})
+        except Exception as exc:  # noqa: BLE001
+            sources["apollo"] = {"state": "error", "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     return {"clusters": clusters, "logs": logs, "probes": probe_results, "hosts": hosts,
-            "sources": sources}
+            "graphql": graphql, "sources": sources}
+
+
+# The services a code passes through, in order, for the panel's first view.
+# (id, label, role, probe id, prod deployment, Apollo graph)
+CODE_PATH = [
+    ("shadow_api", "Shadow API", "Device OTP / code routes", "shadow_api", "shadow-api", None),
+    ("thing_make", "Thing (make)", "Generates codes for shadow + devices", "thing_make_db",
+     "thing-microservice-make", "Thing-Microservice-Shadow-A"),
+    ("thing", "Thing", "Codes for ERM admin + ble-app", "thing_prod_gql", "thing-microservice",
+     "Thing-Microservice-Use"),
+    ("opentoken", "OpenToken", "OpenPAYGO algorithm", "opentoken_algo", "oves-open-token", None),
+    ("auth", "Auth", "Login + MQTT auth", "login", "auth-microservice", "Auth-Microservice-Prod"),
+    ("account", "Account", "Accounts + PAYG", "account_db", "account-microservice",
+     "Account-Microservice-Prod"),
+    ("mqtt", "MQTT broker", "Delivers codes to devices", "mqtt_broker", None, None),
+]
+_PROBE_SEV = {"up": "ok", "slow": "warning", "down": "critical", "unknown": "unknown"}
+_SERVICE_SEV = {"ok": "ok", "restarting": "warning", "degraded": "warning", "down": "critical"}
+
+
+def build_code_path(probe_by_id: dict, prod: Optional[dict], graphql: Optional[dict],
+                    db_errors_5m: int) -> list[dict]:
+    services = {s["name"]: s for s in ((prod or {}).get("services") or [])}
+    graphs = {g["graph"]: g for g in ((graphql or {}).get("graphs") or [])}
+    out = []
+    for sid, label, role, probe_id, deploy, graph in CODE_PATH:
+        probe = probe_by_id.get(probe_id) or {}
+        svc = services.get(deploy) if deploy else None
+        g = graphs.get(graph) if graph else None
+        statuses, notes = [], []
+        if probe:
+            statuses.append(_PROBE_SEV.get(probe.get("status"), "unknown"))
+            if probe.get("status") != "up":
+                notes.append(probe.get("detail") or probe.get("status"))
+        if svc:
+            statuses.append(_SERVICE_SEV.get(svc["state"], "unknown"))
+            if svc["state"] != "ok":
+                notes.append(f"{svc['ready']}/{svc['desired']} pods ready")
+        rate = None
+        if g and g.get("requests"):
+            rate = g.get("system_error_rate") or 0
+            statuses.append("critical" if rate >= 0.10 else "warning" if rate >= 0.02 else "ok")
+            if rate >= 0.02:
+                top = next((e for e in g.get("top_errors") or [] if e.get("kind") == "system"), None)
+                if top:
+                    notes.append(str(top.get("message", ""))[:100])
+        if sid == "auth" and db_errors_5m >= 5:
+            statuses.append("critical")
+            notes.append(f"{db_errors_5m} MongoDB errors in app logs (5 min)")
+        out.append({
+            "id": sid, "label": label, "role": role,
+            "status": rules.worst(statuses) if statuses else "unknown",
+            "pods": f"{svc['ready']}/{svc['desired']}" if svc else None,
+            "restarts": svc["restarts"] if svc else None,
+            "latency_ms": probe.get("latency_ms"),
+            "requests_15m": g.get("requests") if g else None,
+            "errors_15m": g.get("errors") if g else None,
+            "error_rate": g.get("error_rate") if g else None,
+            "platform_error_rate": rate,
+            "note": "; ".join(n for n in notes if n)[:200] or None,
+        })
+    return out
 
 
 def _bump(streaks: dict, key: str, firing: bool) -> None:
@@ -419,6 +495,9 @@ def assemble(now: datetime, collected: dict, recent: list[tuple[datetime, dict]]
             alerts += rules.evaluate_cluster(cname, cl, st["degraded_streaks"])
     alerts += rules.evaluate_traffic(traffic5)
     alerts += rules.evaluate_collectors(collected["sources"], st["source_streaks"])
+    graphql = collected.get("graphql")
+    if graphql:
+        alerts += rules.evaluate_graphql(graphql)
     alerts.sort(key=lambda a: -rules.SEVERITY_ORDER[a["severity"]])
 
     def sev_for(prefix: str) -> str:
@@ -433,7 +512,17 @@ def assemble(now: datetime, collected: dict, recent: list[tuple[datetime, dict]]
 
     sections = {
         "codes": {
-            "status": sev_for("codes") if logs else "unknown",
+            "status": rules.worst([sev_for("codes") if logs else "unknown",
+                                   sev_for("graphql.codes")]),
+            # Apollo GraphOS counts every code request (all pods, errors inside
+            # HTTP 200 included); preferred over the log-derived numbers.
+            "apollo_15m": (graphql or {}).get("codes_15m"),
+            "apollo_operations": (graphql or {}).get("code_operations") or [],
+            "apollo_errors": (graphql or {}).get("code_errors") or [],
+            "apollo_window": {"from": (graphql or {}).get("from"), "to": (graphql or {}).get("to")}
+            if graphql else None,
+            "path": build_code_path(probe_by_id, collected["clusters"].get("prod"), graphql,
+                                    win5["db_errors"]),
             "available": logs is not None,
             "last_5m": win5, "last_15m": win15, "last_60m": win60,
             "baseline_per_hour": round(baseline, 1) if baseline is not None else None,
@@ -467,6 +556,10 @@ def assemble(now: datetime, collected: dict, recent: list[tuple[datetime, dict]]
             for name, cl in collected["clusters"].items()
         },
         "traffic": {"last_5m": traffic5},
+        "graphql": (
+            {"available": True, "status": sev_for("graphql"), **graphql}
+            if graphql else {"available": False, "status": "unknown"}
+        ),
         "dependencies": {
             "status": rules.worst(a["severity"] for a in alerts if a["section"] == "dependencies"),
             "groups": [{"id": g, "label": probes.GROUP_LABELS.get(g, g),

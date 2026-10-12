@@ -20,6 +20,7 @@ Scheduler job `oves_health_snapshot` (main.py), table `oves_health_snapshots`
 | Ingress | prod ingress-nginx access logs | per-service requests, 5xx, p95 |
 | Dependencies | black-box probes from Hetzner | OVES prod, AWS dev services prod relies on, Tencent (MQTT CONNECT, wvapp, ABS, DIRAC, Mongo hello), third parties, Bitwave's own (M-Pesa, AWS transit) |
 | Exposure | TCP connect | database ports that must NOT answer from the internet |
+| GraphQL errors (Apollo) | GraphOS Platform API, every subgraph's own key | Studio's Insights numbers: requests, errors, error rate per operation, error groups with messages. Catches errors returned inside HTTP 200 that never reach the logs (E11000 duplicate codes, 30 s MongoDB server-selection timeouts, schema mismatches). Code values in messages are masked. |
 
 Alerts go to every admin's inbox (deduped, with a RECOVERED notice when they
 clear); critical ones also SMS `OPS_ALERT_SMS_PHONE`. Rules: `rules.py`.
@@ -40,7 +41,11 @@ clear); critical ones also SMS `OPS_ALERT_SMS_PHONE`. Rules: `rules.py`.
    ```
 3. Optional: a read-only IAM user in 734862689453 for the MongoDB hosts (`cloudwatch:GetMetricStatistics`,
    `ec2:DescribeInstanceStatus`, `ec2:DescribeInstanceCreditSpecifications`).
-4. Set `OVES_HEALTH_ENABLED=true` and redeploy. The first snapshot appears within a minute.
+4. Optional: `OVES_APOLLO_GRAPH_KEYS=Graph-Id=service:Graph-Id:...,...` (each subgraph's
+   `APOLLO_KEY` from its deployment-charts values) for the code-generation numbers and the Errors
+   tab. Only platform errors alert; callers' own mistakes (bad credentials, rate limit, unknown
+   item) are shown but never alert.
+5. Set `OVES_HEALTH_ENABLED=true` and redeploy. The first snapshot appears within a minute.
 
 ## Known findings when this was built (2026-10-12)
 
@@ -51,3 +56,7 @@ clear); critical ones also SMS `OPS_ALERT_SMS_PHONE`. Rules: `rules.py`.
 - All three rs0 members are T2 Unlimited now; 10.0.1.129 runs ~61 % CPU at 0 banked credits
   (not throttled, billed surplus).
 - Self-hosted dev Odoo (`odoo.omnivoltaic.com`) returns 502.
+- Apollo, 24 h: Event-Microservice-Prod fails 99 % of requests with `Cannot query field
+  "microserviceEvents_2024" on type "Mutation"` (a client still calls a removed mutation);
+  GenerateDaysCode has E11000 duplicate-code collisions; GenerateFreeCodeSafe hit 30 s MongoDB
+  server-selection timeouts in the past week. The log-based count misses ~1/3 of code requests.
