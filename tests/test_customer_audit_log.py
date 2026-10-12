@@ -387,16 +387,23 @@ async def test_pull_router_logs_saves_matching_lines(db, monkeypatch):
     router = await make_router(db, reseller)
     customer = await make_customer(db, reseller, plan, router, pppoe_username="peter_w")
 
+    # The router's clock must be close to real time or its stamps are (rightly)
+    # distrusted, so build it from now rather than a fixed date.
+    local_now = (datetime.utcnow() + timedelta(hours=3)).replace(microsecond=0)
+    stamp = lambda minutes_ago: (local_now - timedelta(minutes=minutes_ago))  # noqa: E731
+
     def fake_fetch(router_info, ppp_username=None):
         return {
             "success": True,
-            "clock": {"time": "12:00:00", "date": "2026-10-11", "gmt-offset": "+03:00"},
+            "clock": {"time": local_now.strftime("%H:%M:%S"), "date": local_now.strftime("%Y-%m-%d"),
+                      "gmt-offset": "+03:00"},
             "entries": [
-                {"time": "11:58:00", "topics": "pppoe,ppp,error",
+                {"time": stamp(2).strftime("%Y-%m-%d %H:%M:%S"), "topics": "pppoe,ppp,error",
                  "message": "<pppoe-peter_w>: user peter_w authentication failed"},
-                {"time": "11:59:00", "topics": "pppoe,ppp,info", "message": "<pppoe-someone>: authenticated"},
+                {"time": stamp(1).strftime("%Y-%m-%d %H:%M:%S"), "topics": "pppoe,ppp,info",
+                 "message": "<pppoe-someone>: authenticated"},
             ],
-            "secret": {"name": "peter_w", "last-logged-out": "2026-10-11 11:57:30",
+            "secret": {"name": "peter_w", "last-logged-out": stamp(3).strftime("%Y-%m-%d %H:%M:%S"),
                        "last-caller-id": "3C:52:82:AA:BB:CC", "last-disconnect-reason": "port-error"},
         }
 
@@ -472,7 +479,8 @@ async def test_summary_and_router_outages(db):
     db.add(CustomerEvent(customer_id=customer.id, occurred_at=now - timedelta(hours=3), category="router_log",
                          event_type="router_log", source="router_log", severity="warning",
                          message="<pppoe-sam_k>: terminating... - peer is not responding"))
-    for minutes, up in ((300, True), (240, False), (200, False), (150, True)):
+    # A router without usage reports: down from the first failed check to the next success.
+    for minutes, up in ((300, True), (241, False), (240, False), (200, False), (150, True)):
         db.add(RouterAvailabilityCheck(router_id=router.id, checked_at=now - timedelta(minutes=minutes),
                                        is_online=up, source="test"))
     await db.commit()
@@ -484,7 +492,8 @@ async def test_summary_and_router_outages(db):
     assert "peer is not responding" in out["summary"]["last_problem"]["message"]
     kinds = [i["event_type"] for i in out["items"] if i["category"] == "router"]
     assert kinds == ["router_online", "router_offline"]
-    assert "after 1h 30m" in next(i for i in out["items"] if i["event_type"] == "router_online")["message"]
+    assert "Site back online after 1h 31m" in next(
+        i for i in out["items"] if i["event_type"] == "router_online")["message"]
 
 
 def test_sms_passwords_are_never_shown():
@@ -566,15 +575,38 @@ async def test_reset_session_is_pppoe_only(db):
 
 def test_outage_already_in_progress_is_measured_from_its_start():
     t = datetime(2026, 10, 11, 12, 0, 0)
-    # Window starts at 12:00; the router went down at 09:00, last good at 08:55.
-    checks = [(t + timedelta(minutes=10), False), (t + timedelta(minutes=25), True)]
+
+    def c(at, up):
+        return {"checked_at": at, "is_online": up, "source": "reachability_probe"}
+
+    # Window starts at 12:00; the site went down at about 09:00 (checks are
+    # read from a day before the window, so that start is known).
+    checks = [
+        c(t - timedelta(hours=3, minutes=5), True),
+        c(t - timedelta(hours=3), False),
+        c(t - timedelta(hours=2, minutes=58), False),
+        c(t + timedelta(minutes=10), False),
+        c(t + timedelta(minutes=25), True),
+    ]
     items = customer_audit_routes._router_status_items(
-        checks, 7, seed_online=False, seed_went_down=t - timedelta(hours=3))
+        checks, 7, window_start=t, window_end=t + timedelta(hours=1))
     assert [i["event_type"] for i in items] == ["router_online"]
-    assert "after 3h 25m" in items[0]["message"]
-    # Start unknown: no made-up duration.
-    items = customer_audit_routes._router_status_items(checks, 7, seed_online=False, seed_went_down=None)
-    assert items[0]["message"] == "Router answering again"
+    assert "after 3h 25m" in items[0]["message"]  # from the first failed check
+
+
+def test_failed_checks_while_the_router_reports_are_not_site_outages():
+    # Router 564's pattern: reports every 5 min, our connection fails between.
+    t = datetime(2026, 10, 11, 12, 0, 0)
+    checks = []
+    for m in range(0, 120, 5):
+        checks.append({"checked_at": t + timedelta(minutes=m), "is_online": True, "source": "usage_push"})
+        checks.append({"checked_at": t + timedelta(minutes=m, seconds=90), "is_online": False,
+                       "source": "reachability_probe"})
+        checks.append({"checked_at": t + timedelta(minutes=m, seconds=100), "is_online": False,
+                       "source": "provisioning"})
+    items = customer_audit_routes._router_status_items(
+        checks, 7, window_start=t, window_end=t + timedelta(hours=2))
+    assert items == []
 
 
 def test_custom_welcome_wording_still_hides_the_password():
