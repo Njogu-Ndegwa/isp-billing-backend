@@ -393,8 +393,11 @@ def _pppoe_diagnose_sync(router_info: dict, username: str, db_pppoe_ports: list)
 
         active_data = api.get_active_pppoe_sessions()
         sessions = active_data.get("data", []) if active_data.get("success") else []
-        user_session = next((s for s in sessions if s.get("user") == username), None)
+        user_sessions = [s for s in sessions if s.get("user") == username]
+        user_session = user_sessions[0] if user_sessions else None
         info["active_session"] = user_session
+        info["active_sessions"] = user_sessions
+        info["session_count"] = len(user_sessions)
 
         if user_session:
             info["status"] = "online"
@@ -468,19 +471,23 @@ def _pppoe_secrets_sync(router_info: dict) -> dict:
         secrets = secrets_data.get("data", []) if secrets_data.get("success") else []
 
         active_data = api.get_active_pppoe_sessions()
-        active = {s["user"]: s for s in active_data.get("data", [])} if active_data.get("success") else {}
+        active = _group_sessions_by_user(
+            active_data.get("data", []) if active_data.get("success") else []
+        )
 
         profiles_data = api.get_ppp_profiles()
         profiles = {p["name"]: p for p in profiles_data.get("data", [])} if profiles_data.get("success") else {}
 
         enriched = []
         for s in secrets:
-            session = active.get(s["name"])
+            user_sessions = active.get(s["name"], [])
             profile = profiles.get(s.get("profile", ""))
             enriched.append({
                 **s,
-                "online": session is not None,
-                "session": session,
+                "online": bool(user_sessions),
+                "session": user_sessions[0] if user_sessions else None,
+                "sessions": user_sessions,
+                "session_count": len(user_sessions),
                 "profile_detail": profile,
             })
         return {"success": True, "data": enriched, "count": len(enriched)}
@@ -489,6 +496,65 @@ def _pppoe_secrets_sync(router_info: dict) -> dict:
         return {"error": str(e)}
     finally:
         api.disconnect()
+
+
+def _group_sessions_by_user(sessions: list) -> dict[str, list]:
+    """``/ppp/active`` rows grouped by username, oldest login first.
+
+    A username can be logged in on several devices at once when its profile
+    has ``only-one=no``, so this is a list per user, never a single row.
+    """
+    grouped: dict[str, list] = {}
+    for s in sessions:
+        grouped.setdefault(s.get("user", ""), []).append(s)
+    for user_sessions in grouped.values():
+        user_sessions.sort(key=lambda s: _uptime_seconds(s.get("uptime", "")), reverse=True)
+    return grouped
+
+
+def _uptime_seconds(uptime: str) -> int:
+    """Parse a RouterOS duration like ``1w2d03:04:05`` or ``3h4m5s`` to seconds."""
+    if not uptime:
+        return 0
+    units = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}
+    total = 0
+    number = ""
+    clock = ""
+    for ch in uptime:
+        if ch.isdigit():
+            number += ch
+        elif ch in units and number:
+            total += int(number) * units[ch]
+            number = ""
+        elif ch == ":":
+            clock += number + ":"
+            number = ""
+        else:
+            number = ""
+    if clock:
+        parts = (clock + number).split(":")
+        for value, unit in zip(reversed(parts), (1, 60, 3600)):
+            if value.isdigit():
+                total += int(value) * unit
+    elif number:
+        total += int(number)
+    return total
+
+
+def _session_device(session: dict) -> dict:
+    """One connected device for the monitor's per-user ``sessions`` list."""
+    return {
+        "id": session.get("id", ""),
+        "address": session.get("address", ""),
+        "caller_id": session.get("caller_id", ""),
+        "uptime": session.get("uptime", ""),
+        "upload_bytes": session.get("upload_bytes", 0),
+        "download_bytes": session.get("download_bytes", 0),
+        "upload_rate": session.get("upload_rate", "0"),
+        "download_rate": session.get("download_rate", "0"),
+        "max_limit": session.get("max_limit", ""),
+        "has_queue": session.get("has_queue", False),
+    }
 
 
 def _pppoe_users_sync(router_info: dict) -> dict:
@@ -505,10 +571,9 @@ def _pppoe_users_sync(router_info: dict) -> dict:
         secrets = secrets_data.get("data", []) if secrets_data.get("success") else []
 
         sessions_data = api.get_pppoe_sessions_with_bandwidth()
-        active_map = {
-            s["user"]: s
-            for s in sessions_data.get("data", [])
-        } if sessions_data.get("success") else {}
+        sessions_by_user = _group_sessions_by_user(
+            sessions_data.get("data", []) if sessions_data.get("success") else []
+        )
 
         profiles_data = api.get_ppp_profiles()
         profiles = {
@@ -521,19 +586,25 @@ def _pppoe_users_sync(router_info: dict) -> dict:
         total_download_rate = 0
         online_count = 0
         offline_count = 0
+        online_sessions = 0
+        multi_device_users = 0
 
         for secret in secrets:
             username = secret["name"]
-            session = active_map.get(username)
+            user_sessions = sessions_by_user.get(username, [])
+            session = user_sessions[0] if user_sessions else None
             profile = profiles.get(secret.get("profile", ""))
             is_online = session is not None
+            upload_rate_bps = sum(_parse_rate_to_bps(s.get("upload_rate", "0")) for s in user_sessions)
+            download_rate_bps = sum(_parse_rate_to_bps(s.get("download_rate", "0")) for s in user_sessions)
 
             if is_online:
                 online_count += 1
-                upload_rate_raw = _parse_rate_to_bps(session.get("upload_rate", "0"))
-                download_rate_raw = _parse_rate_to_bps(session.get("download_rate", "0"))
-                total_upload_rate += upload_rate_raw
-                total_download_rate += download_rate_raw
+                online_sessions += len(user_sessions)
+                if len(user_sessions) > 1:
+                    multi_device_users += 1
+                total_upload_rate += upload_rate_bps
+                total_download_rate += download_rate_bps
             else:
                 offline_count += 1
 
@@ -544,16 +615,21 @@ def _pppoe_users_sync(router_info: dict) -> dict:
                 "disabled": secret.get("disabled", False),
                 "comment": secret.get("comment", ""),
                 "online": is_online,
+                # Scalar session fields describe the first device; totals
+                # (bytes, rates) cover every device on this username.
                 "address": session.get("address", "") if session else None,
                 "uptime": session.get("uptime", "") if session else None,
                 "caller_id": session.get("caller_id", "") if session else None,
-                "upload_bytes": session.get("upload_bytes", 0) if session else 0,
-                "download_bytes": session.get("download_bytes", 0) if session else 0,
-                "upload_rate": session.get("upload_rate", "0") if session else "0",
-                "download_rate": session.get("download_rate", "0") if session else "0",
+                "upload_bytes": sum(s.get("upload_bytes", 0) for s in user_sessions),
+                "download_bytes": sum(s.get("download_bytes", 0) for s in user_sessions),
+                "upload_rate": str(upload_rate_bps),
+                "download_rate": str(download_rate_bps),
                 "max_limit": session.get("max_limit", "") if session else (
                     profile.get("rate_limit", "") if profile else ""
                 ),
+                "profile_only_one": profile.get("only_one", "") if profile else "",
+                "session_count": len(user_sessions),
+                "sessions": [_session_device(s) for s in user_sessions],
                 "last_logged_out": secret.get("last_logged_out", ""),
                 "last_disconnect_reason": secret.get("last_disconnect_reason", ""),
                 "last_caller_id": secret.get("last_caller_id", ""),
@@ -567,6 +643,8 @@ def _pppoe_users_sync(router_info: dict) -> dict:
                 "online": online_count,
                 "offline": offline_count,
                 "disabled": sum(1 for u in users if u["disabled"]),
+                "online_sessions": online_sessions,
+                "multi_device_users": multi_device_users,
                 "total_upload_rate_bps": total_upload_rate,
                 "total_download_rate_bps": total_download_rate,
             },
@@ -602,6 +680,8 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "state": "missing",
                 "secret": None,
                 "active_session": None,
+                "active_sessions": [],
+                "session_count": 0,
                 "profile_detail": None,
                 "profile_lookup_success": None,
                 "profile_lookup_error": None,
@@ -619,6 +699,8 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "state": "disabled",
                 "secret": secret,
                 "active_session": None,
+                "active_sessions": [],
+                "session_count": 0,
                 "profile_detail": None,
                 "profile_lookup_success": None,
                 "profile_lookup_error": None,
@@ -630,6 +712,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
         session_lookup = api.get_pppoe_session_with_bandwidth(username)
         session_lookup_success = bool(session_lookup.get("success"))
         active_session = session_lookup.get("data") if session_lookup.get("found") else None
+        active_sessions = session_lookup.get("sessions") or ([active_session] if active_session else [])
 
         profile_data = api.get_ppp_profile_detail(secret.get("profile", ""))
         profile_lookup_success = bool(profile_data.get("success"))
@@ -651,6 +734,8 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
             "state": state,
             "secret": secret,
             "active_session": active_session,
+            "active_sessions": active_sessions,
+            "session_count": len(active_sessions),
             "profile_detail": profile_detail,
             "profile_lookup_success": profile_lookup_success,
             "profile_lookup_error": profile_lookup_error,
@@ -1353,6 +1438,8 @@ async def _build_pppoe_users_db_fallback(
             "address": None,
             "uptime": None,
             "caller_id": None,
+            "session_count": 0,
+            "sessions": [],
             "upload_bytes": int(usage.upload_bytes or 0) if usage else 0,
             "download_bytes": int(usage.download_bytes or 0) if usage else 0,
             "upload_rate": "0",
@@ -1396,6 +1483,8 @@ async def _build_pppoe_users_db_fallback(
             "online": 0,
             "offline": len(users),
             "disabled": sum(1 for u in users if u["disabled"]),
+            "online_sessions": 0,
+            "multi_device_users": 0,
             "total_upload_rate_bps": 0,
             "total_download_rate_bps": 0,
         },
