@@ -184,6 +184,18 @@ class Settings(BaseSettings):
     MIKROTIK_USERNAME: str = "admin"
     MIKROTIK_PASSWORD: str = "mvnm"  # Set in .env file
     PPPOE_RATE_LIMIT_HEADROOM: float = 1.08
+    # Customer audit log (app/services/customer_router_logs.py): a background
+    # job reads the in-memory log of routers that have PPPoE customers, a few
+    # routers per tick, and keeps the lines that name a customer. Off by
+    # default: it is router I/O across the fleet. The per-customer "pull router
+    # logs" button works either way.
+    CUSTOMER_LOG_COLLECTOR_ENABLED: bool = False
+    CUSTOMER_LOG_COLLECTOR_ROUTERS_PER_TICK: int = 4
+    # A router is read at most this often by the collector.
+    CUSTOMER_LOG_COLLECTOR_MIN_REVISIT_SECONDS: int = 900
+    # Session and router-log entries older than this are pruned daily;
+    # record changes are kept.
+    CUSTOMER_EVENT_RETENTION_DAYS: int = 60
     # Max compensation (zero-revenue) vouchers a reseller may issue per UTC day.
     COMPENSATION_DAILY_LIMIT: int = 10
     # Longest power-outage window a single bulk compensation run may credit.

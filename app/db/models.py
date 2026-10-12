@@ -2654,3 +2654,46 @@ class AppInstanceHeartbeat(Base):
     app_version = Column(String(64), nullable=True)
     started_at = Column(DateTime, nullable=True)
     last_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+# ========================================
+# CUSTOMER AUDIT LOG
+# ========================================
+
+class CustomerEvent(Base):
+    """One entry in a customer's audit log (``GET /api/customers/{id}/audit-log``).
+
+    Holds the facts that no other table keeps: session transitions seen in the
+    router's push reports, the router's own log lines that name the customer,
+    and who changed what on the customer record. Payments, M-Pesa attempts and
+    provisioning actions already have tables and are merged in at read time.
+
+    ``customer_id``/``router_id`` are plain ints, not FKs: the history must
+    outlive a deleted customer or router, and must never block either delete.
+    ``dedup_key`` makes re-reading the same router log lines a no-op.
+    Startup migration: run_customer_event_migrations() in main.py.
+    """
+    __tablename__ = "customer_events"
+    __table_args__ = (
+        Index("ix_customer_events_customer_occurred", "customer_id", "occurred_at"),
+        Index("ix_customer_events_category_occurred", "category", "occurred_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, nullable=True)
+    user_id = Column(Integer, nullable=True, index=True)  # owning reseller
+    router_id = Column(Integer, nullable=True)
+    occurred_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # session | router_log | change
+    category = Column(String(20), nullable=False)
+    event_type = Column(String(40), nullable=False)
+    # info | warning | error
+    severity = Column(String(10), nullable=False, default="info", server_default="info")
+    # router_push | router_log | admin | system
+    source = Column(String(20), nullable=False)
+    actor_user_id = Column(Integer, nullable=True)
+    actor_label = Column(String(120), nullable=True)
+    message = Column(String(1000), nullable=False)
+    details = Column(JSON, nullable=True)
+    dedup_key = Column(String(64), nullable=True, unique=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

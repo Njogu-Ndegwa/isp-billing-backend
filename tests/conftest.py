@@ -245,7 +245,9 @@ def reset_expiry_cleanup_router_memo():
 @pytest.fixture(autouse=True)
 def _reset_realtime_state():
     """Live push state is process memory; no test may inherit another's."""
-    from app.services import realtime_state
+    from app.services import customer_events, realtime_state
     realtime_state.reset_realtime_state()
+    customer_events.reset_session_tracker()
     yield
     realtime_state.reset_realtime_state()
+    customer_events.reset_session_tracker()
