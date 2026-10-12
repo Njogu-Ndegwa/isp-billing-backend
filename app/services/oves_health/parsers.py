@@ -30,18 +30,22 @@ _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z\s?")
 
 
 def split_timestamp(line: str) -> tuple[Optional[datetime], str]:
-    """``2026-10-12T14:22:44.123456789Z rest`` -> (naive UTC datetime, rest)."""
-    m = _TS_RE.match(line)
-    if not m:
+    """``2026-10-12T14:22:44.123456789Z rest`` -> (naive UTC datetime, rest).
+
+    Hand-sliced instead of strptime: this runs once per log line (thousands
+    per cycle) and strptime was the most expensive call in the profile.
+    """
+    if len(line) < 20 or line[4] != "-" or line[10] != "T" or line[19] not in ".Z":
         return None, line
-    frac = (m.group(2) or ".0")[1:7].ljust(6, "0")
     try:
-        ts = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(
-            microsecond=int(frac)
-        )
+        end = line.index("Z", 19)
+        frac = line[20:end][:6] if line[19] == "." else ""
+        ts = datetime(int(line[0:4]), int(line[5:7]), int(line[8:10]), int(line[11:13]),
+                      int(line[14:16]), int(line[17:19]), int(frac.ljust(6, "0")) if frac else 0)
     except ValueError:
         return None, line
-    return ts, line[m.end():]
+    rest = line[end + 1:]
+    return ts, rest[1:] if rest.startswith(" ") else rest
 
 
 def lines_after(text: str, cursor: Optional[datetime]) -> tuple[list[tuple[datetime, str]], Optional[datetime]]:
@@ -260,21 +264,25 @@ def parse_code_lines(lines: Iterable[tuple[datetime, str]], service: str = "") -
     stats = CodeStats()
     last_failure_at: Optional[datetime] = None
     for ts, line in lines:
-        m = _SUCCESS_RE.search(line)
-        if m:
-            kind = CODE_OPERATIONS.get(m.group("op"))
-            if kind:
-                stats.ok += 1
-                stats.by_type[kind] = stats.by_type.get(kind, 0) + 1
-                stats.latencies_ms.append(float(m.group("ms")))
-            continue
-        if _DB_ERROR_RE.search(line):
+        # Cheap substring tests first: most lines are ORM query logs and match nothing.
+        if "Request to " in line:
+            m = _SUCCESS_RE.search(line)
+            if m:
+                kind = CODE_OPERATIONS.get(m.group("op"))
+                if kind:
+                    stats.ok += 1
+                    stats.by_type[kind] = stats.by_type.get(kind, 0) + 1
+                    stats.latencies_ms.append(float(m.group("ms")))
+                continue
+        if _maybe_db_error(line) and _DB_ERROR_RE.search(line):
             stats.db_errors += 1
-        if _INTEGRITY_RE.search(line):
+        if "_failed" in line and _INTEGRITY_RE.search(line):
             stats.integrity_warnings += 1
             continue
-        if _OPENTOKEN_RETRY_RE.search(line):
+        if "Error on attempt" in line:
             stats.opentoken_retries += 1
+            continue
+        if "ERROR" not in line:
             continue
         m = _ERROR_RE.search(line)
         if not m:
@@ -303,5 +311,10 @@ def parse_code_lines(lines: Iterable[tuple[datetime, str]], service: str = "") -
     return stats
 
 
+def _maybe_db_error(line: str) -> bool:
+    return ("rimary" in line or "Mongo" in line or "mongo" in line or "election" in line
+            or "connection " in line)
+
+
 def count_db_errors(lines: Iterable[tuple[datetime, str]]) -> int:
-    return sum(1 for _ts, line in lines if _DB_ERROR_RE.search(line))
+    return sum(1 for _ts, line in lines if _maybe_db_error(line) and _DB_ERROR_RE.search(line))

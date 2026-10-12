@@ -29,6 +29,8 @@ def _fresh_state(monkeypatch):
     service._state.update(probe_streaks={}, source_streaks={}, degraded_streaks={},
                           alert_memory={}, baseline={"hour": None, "value": None}, cycles=0)
     collectors._cursors.clear()
+    service._history_cache.clear()
+    service._cluster_cache.clear()
     monkeypatch.setattr(service.settings, "OVES_HEALTH_ENABLED", True, raising=False)
     monkeypatch.setattr(service.settings, "OPS_ALERT_SMS_PHONE", "", raising=False)
     import app.services.ops_health as ops_health

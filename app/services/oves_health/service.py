@@ -9,11 +9,13 @@ only after the inbox session closes. The job sheds when the DB pool is busy.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import Text, cast, delete, func, select, update
 
 from app.config import settings
 from app.db import database
@@ -163,8 +165,12 @@ async def load_baseline(now: datetime) -> Optional[float]:
 
 async def store(now: datetime, status: str, payload: dict, metrics: dict) -> int:
     async with database.async_session() as db:
-        row = OvesHealthSnapshot(generated_at=now, overall_status=status[:16],
-                                 payload=payload, metrics=metrics)
+        row = OvesHealthSnapshot(
+            generated_at=now, overall_status=status[:16], payload=payload, metrics=metrics,
+            codes_ok=int(metrics.get("c_ok") or 0), codes_failed=int(metrics.get("c_fail") or 0),
+            codes_failed_system=int(metrics.get("c_fail_sys") or 0),
+            index_failures=int(metrics.get("c_idx") or 0), db_errors=int(metrics.get("db_err") or 0),
+        )
         db.add(row)
         await db.commit()
         return row.id
@@ -294,6 +300,31 @@ async def deliver(alerts: list[dict], previous: list[dict], now: datetime) -> di
 # collection (NO DB session open anywhere in here)
 # ---------------------------------------------------------------------------
 
+# AWS dev and Tencent are dependencies, not where codes are made: refreshing
+# their full pod/deployment lists every 3 minutes instead of every minute cuts
+# most of the bytes and CPU (dev alone is ~1.9 MB of pods per list).
+SECONDARY_CLUSTER_REFRESH = timedelta(seconds=170)
+_cluster_cache: dict[str, tuple[datetime, dict]] = {}
+
+
+def _collect_blocking(now: datetime) -> dict:
+    return asyncio.run(collect(now))
+
+
+async def collect_off_loop(now: datetime) -> dict:
+    """Run the whole collection on a worker thread with its OWN event loop.
+
+    The app is a single uvicorn worker: anything the collector does on the
+    request loop (TLS handshakes, JSON decoding of multi-MB Kubernetes lists,
+    regexes over every log line) delays every reseller request. Measured on
+    production 2026-10-12: /health p95 went 9 ms -> 162 ms (max 610 ms) during
+    the cycle. Here the request loop only awaits a future; the GIL is handed
+    back every few ms, so requests keep flowing. No DB session is touched in
+    collect(), so nothing async-DB crosses loops.
+    """
+    return await asyncio.to_thread(_collect_blocking, now)
+
+
 async def collect(now: datetime) -> dict:
     sources: dict[str, dict] = {}
     clusters: dict[str, dict] = {}
@@ -301,6 +332,9 @@ async def collect(now: datetime) -> dict:
     timeout = float(getattr(settings, "OVES_HEALTH_PROBE_TIMEOUT_SECONDS", 10.0))
 
     async def one_cluster(cfg):
+        cached = _cluster_cache.get(cfg.name)
+        if cfg.name != "prod" and cached and now - cached[0] < SECONDARY_CLUSTER_REFRESH:
+            return cfg.name, cached[1], None
         client = K8sClient(cfg)
         try:
             cl = await collectors.collect_cluster(client, now, cfg.name)
@@ -308,6 +342,8 @@ async def collect(now: datetime) -> dict:
             lg = None
             if cfg.name == "prod":
                 lg = await collectors.collect_logs(client, cfg.name, pod_items, now)
+            else:
+                _cluster_cache[cfg.name] = (now, cl)
             return cfg.name, cl, lg
         finally:
             await client.aclose()
@@ -593,7 +629,7 @@ async def run_cycle(now: Optional[datetime] = None) -> dict:
     except Exception:  # noqa: BLE001
         logger.exception("[OVES-HEALTH] baseline failed")
         baseline = None
-    collected = await collect(now)                       # no session open
+    collected = await collect_off_loop(now)              # no session open
     payload, metrics, alerts = assemble(now, collected, recent, baseline)
     try:
         delivery = await deliver(alerts, previous_alerts, now)
@@ -641,7 +677,9 @@ def bucket_minutes(hours: int) -> int:
 
 
 SCALAR_KEYS = ("c_ok", "c_fail", "c_fail_sys", "c_idx", "db_err")
-MAX_HEAVY_ROWS = 3000
+MAX_HEAVY_ROWS = 480
+HISTORY_CACHE_SECONDS = 60
+_history_cache: dict[tuple, tuple[float, dict]] = {}
 
 
 def aggregate_history(scalar_rows: list[tuple[datetime, dict]],
@@ -727,19 +765,55 @@ def aggregate_history(scalar_rows: list[tuple[datetime, dict]],
 
 async def load_history(now: datetime, hours: int, probe_id: Optional[str] = None) -> dict:
     hours = max(1, min(int(hours), int(RETENTION.total_seconds() // 3600)))
+    key = (hours, probe_id)
+    hit = _history_cache.get(key)
+    if hit and time.monotonic() - hit[0] < HISTORY_CACHE_SECONDS:
+        return hit[1]
     start = now - timedelta(hours=hours)
     stride = max(1, (hours * 60) // MAX_HEAVY_ROWS)
     m = OvesHealthSnapshot.metrics
+    T = OvesHealthSnapshot
+    # Columns first; the JSON path is only evaluated for rows written before
+    # the columns existed (COALESCE stops at the first non-null).
+    cols = [func.coalesce(T.codes_ok, m["c_ok"].as_integer()),
+            func.coalesce(T.codes_failed, m["c_fail"].as_integer()),
+            func.coalesce(T.codes_failed_system, m["c_fail_sys"].as_integer()),
+            func.coalesce(T.index_failures, m["c_idx"].as_integer()),
+            func.coalesce(T.db_errors, m["db_err"].as_integer())]
     async with database.async_session() as db:
         scalar = (await db.execute(
-            select(OvesHealthSnapshot.generated_at, *(m[k].as_integer() for k in SCALAR_KEYS))
-            .where(OvesHealthSnapshot.generated_at >= start)
+            select(T.generated_at, *cols).where(T.generated_at >= start)
         )).all()
-        heavy_q = (select(OvesHealthSnapshot.generated_at, OvesHealthSnapshot.metrics)
-                   .where(OvesHealthSnapshot.generated_at >= start))
+        # Fetched as TEXT so the JSON is decoded on the worker thread below, not
+        # by the driver on the request loop.
+        heavy_q = (select(T.generated_at, cast(T.metrics, Text))
+                   .where(T.generated_at >= start))
         if stride > 1:
-            heavy_q = heavy_q.where(OvesHealthSnapshot.id % stride == 0)
+            heavy_q = heavy_q.where(T.id % stride == 0)
         heavy = (await db.execute(heavy_q)).all()
         await db.commit()
-    scalar_rows = [(r[0], dict(zip(SCALAR_KEYS, r[1:]))) for r in scalar]
-    return aggregate_history(scalar_rows, [(g, mm) for g, mm in heavy], start, hours, probe_id)
+
+    def build() -> dict:
+        # Pre-sum the counters per chart bucket (14 days = 20k rows -> ~84 sums)
+        # instead of handing aggregate_history one dict per minute.
+        size_s = bucket_minutes(hours) * 60
+        sums: dict[int, list[int]] = {}
+        for r in scalar:
+            idx = int((r[0] - start).total_seconds() // size_s)
+            acc = sums.get(idx)
+            if acc is None:
+                acc = sums[idx] = [0] * len(SCALAR_KEYS)
+            for i, v in enumerate(r[1:]):
+                if v:
+                    acc[i] += v
+        scalar_rows = [(start + timedelta(seconds=idx * size_s), dict(zip(SCALAR_KEYS, acc)))
+                       for idx, acc in sums.items()]
+        heavy_rows = [(g, json.loads(txt) if txt else {}) for g, txt in heavy]
+        return aggregate_history(scalar_rows, heavy_rows, start, hours, probe_id)
+
+    # 80-145 ms of pure Python for 1-14 days (benchmarked): keep it off the loop.
+    out = await asyncio.to_thread(build)
+    _history_cache[key] = (time.monotonic(), out)
+    if len(_history_cache) > 64:
+        _history_cache.clear()
+    return out

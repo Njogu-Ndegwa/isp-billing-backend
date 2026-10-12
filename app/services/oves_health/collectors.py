@@ -296,11 +296,12 @@ async def node_usage(client: K8sClient) -> dict[str, dict]:
 
 async def collect_cluster(client: K8sClient, now: datetime, cluster: str = "") -> dict:
     deps, sts, pods, nodes = await asyncio.gather(
-        client.get_json("/apis/apps/v1/deployments"),
-        client.get_json("/apis/apps/v1/statefulsets"),
-        client.get_json("/api/v1/pods"),
-        client.nodes(),
+        client.list_cached("/apis/apps/v1/deployments"),
+        client.list_cached("/apis/apps/v1/statefulsets"),
+        client.list_cached("/api/v1/pods"),
+        client.list_cached("/api/v1/nodes"),
     )
+    nodes = nodes.get("items", [])
     node_list = summarize_nodes(nodes)
     try:
         usage = await node_usage(client)

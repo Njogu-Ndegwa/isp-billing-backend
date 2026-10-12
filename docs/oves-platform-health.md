@@ -60,3 +60,25 @@ clear); critical ones also SMS `OPS_ALERT_SMS_PHONE`. Rules: `rules.py`.
   "microserviceEvents_2024" on type "Mutation"` (a client still calls a removed mutation);
   GenerateDaysCode has E11000 duplicate-code collisions; GenerateFreeCodeSafe hit 30 s MongoDB
   server-selection timeouts in the past week. The log-based count misses ~1/3 of code requests.
+
+## Cost on the billing box (measured on production, 2026-10-12)
+
+The collector shares the single uvicorn worker with every reseller request, so
+the number that matters is how long it holds the request event loop.
+
+| | first version | now |
+|---|---|---|
+| `/health` p95 / max while a cycle runs | 162 ms / 610 ms (9 ms otherwise) | collection runs on its own thread + loop |
+| worst request-loop stall per cycle | 89 ms (in-loop) | 13.7 ms (steady state) |
+| CPU per cycle | ~0.8 s | ~0.46 s (dev/Tencent lists every 3 min, cached TLS, no `strptime`, substring pre-checks) |
+| timing vs ops-health job | same second | 30 s apart |
+| history, 14 days | ~6 s of JSON extraction in Postgres | integer columns; built off-loop in 86 ms, cached 60 s, 31 KB |
+
+Other numbers:
+
+- Latest-snapshot read: 0.08 ms (index scan). Table: ~25 MB for 14 days; full payload kept 3 h.
+- Panel JSON: 36 KB per 60 s poll while the tab is visible, gzip'd by Cloudflare to ~7 KB.
+  Panel code: ~14 KB gzip, lazy-loaded for admins only.
+- Apollo: 9 calls every 5 min for the summary; the Errors tab calls on demand, cached 60 s.
+- Traffic out of AWS: ~2 GB/day (cluster lists gzip'd; pod logs are not compressed by the API).
+  Most of it is `thing-microservice-make` logging every ORM query (`NODE_ENV=debug`).

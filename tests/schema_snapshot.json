@@ -549,8 +549,13 @@
   "user_id"
  ],
  "oves_health_snapshots": [
+  "codes_failed",
+  "codes_failed_system",
+  "codes_ok",
+  "db_errors",
   "generated_at",
   "id",
+  "index_failures",
   "metrics",
   "overall_status",
   "payload"

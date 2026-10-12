@@ -347,9 +347,21 @@ async def run_probe(client: httpx.AsyncClient, probe: Probe, timeout: float) -> 
         return _result(probe, "down", None, f"{type(exc).__name__}: {exc}"[:200])
 
 
+_TLS = None
+
+
+def shared_tls():
+    """One verified TLS context for every outbound probe / API call: building
+    one loads the CA bundle (~20-40 ms of CPU) and they are thread-safe."""
+    global _TLS
+    if _TLS is None:
+        _TLS = httpx.create_ssl_context()
+    return _TLS
+
+
 async def run_all(probes: list[Probe], timeout: float, concurrency: int = 12) -> list[dict]:
     sem = asyncio.Semaphore(concurrency)
-    async with httpx.AsyncClient(follow_redirects=False,
+    async with httpx.AsyncClient(follow_redirects=False, verify=shared_tls(),
                                  headers={"User-Agent": "bitwave-oves-health/1"}) as client:
         async def one(p: Probe) -> dict:
             async with sem:

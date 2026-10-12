@@ -150,6 +150,11 @@ query OvesInsights($graph: ID!, $from: Timestamp!, $to: Timestamp!, $resolution:
 """
 
 
+def _tls():
+    from app.services.oves_health.probes import shared_tls
+    return shared_tls()
+
+
 class ApolloError(RuntimeError):
     pass
 
@@ -270,7 +275,7 @@ async def insights(keys: dict[str, str], graph: str, hours: int,
             return hit[1]
         end = (now or datetime.utcnow()).replace(second=0, microsecond=0)
         start = end - timedelta(hours=hours)
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, verify=_tls()) as client:
             variant = await fetch_raw(client, graph, keys[graph], start, end, resolution)
         out = summarize(graph, variant, start, end, bucket, operation)
         _cache[cache_key] = (time.monotonic(), out)
@@ -298,7 +303,7 @@ async def cycle_summary(keys: dict[str, str], now: datetime) -> Optional[dict]:
     start = end - timedelta(minutes=15)
     graphs = ordered_graphs(keys)
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, verify=_tls()) as client:
         async def one(g: str):
             try:
                 raw = await fetch_raw(client, g, keys[g], start, end, "R5M")

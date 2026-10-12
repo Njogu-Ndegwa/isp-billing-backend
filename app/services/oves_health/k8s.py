@@ -39,13 +39,19 @@ class ClusterConfig:
         return bool(self.server and self.token)
 
 
+_SSL_CONTEXTS: dict[str, ssl.SSLContext] = {}
+
+
 def _ssl_context(ca_b64: str) -> ssl.SSLContext | bool:
+    """Built once per CA and reused: a new context re-reads the system CA
+    bundle (tens of ms of CPU) and the collector makes clients every cycle."""
     if not ca_b64:
         return True
-    pem = base64.b64decode(ca_b64).decode("ascii")
-    ctx = ssl.create_default_context()
-    # load_verify_locations(cadata=) accepts PEM text directly; no temp file.
-    ctx.load_verify_locations(cadata=pem)
+    ctx = _SSL_CONTEXTS.get(ca_b64)
+    if ctx is None:
+        pem = base64.b64decode(ca_b64).decode("ascii")
+        ctx = ssl.create_default_context(cadata=pem)
+        _SSL_CONTEXTS[ca_b64] = ctx
     return ctx
 
 
@@ -73,6 +79,11 @@ class K8sClient:
         return resp.text
 
     # --- typed helpers ----------------------------------------------------
+
+    async def list_cached(self, path: str) -> dict:
+        """List from the apiserver watch cache (resourceVersion=0): no etcd
+        read, much cheaper for the cluster; at most a second or two stale."""
+        return await self.get_json(path, {"resourceVersion": "0"})
 
     async def deployments(self, namespace: str) -> list[dict]:
         data = await self.get_json(f"/apis/apps/v1/namespaces/{namespace}/deployments")
