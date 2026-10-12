@@ -346,6 +346,13 @@ async def attribute_unmatched_c2b(
     ):
         background_tasks.add_task(call_pppoe_provision, build_pppoe_payload(customer, customer.router))
 
+    if customer.plan and customer.plan.connection_type == ConnectionType.STATIC_IP and customer.router:
+        # Static IP: re-enable the binding/queue (fire-and-forget after commit;
+        # the static-IP enforcement job re-applies if the router was unreachable).
+        from app.services.static_ip import schedule_static_provision
+
+        schedule_static_provision(customer.id)
+
     return {
         "ok": True,
         "customer_id": customer.id,

@@ -5,6 +5,7 @@ from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
+import re
 import secrets
 import string
 
@@ -31,6 +32,14 @@ from app.services.hotspot_provisioning import (
 )
 from app.services.account_numbers import generate_account_number
 from app.services.customer_events import record_customer_event
+from app.services.mikrotik_api import normalize_mac_address
+from app.services.static_ip import (
+    customer_should_have_access,
+    inspect_static_customer,
+    normalize_static_ip,
+    provision_static_customer,
+    remove_static_customer_from_router,
+)
 
 import logging
 
@@ -40,6 +49,48 @@ logger = logging.getLogger(__name__)
 def _generate_pppoe_password(length: int = 12) -> str:
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+_MAC_SHAPE = re.compile(r"^[0-9A-Fa-f]{2}([:-]?[0-9A-Fa-f]{2}){5}$")
+
+
+def _normalize_pin_mac(value: Optional[str]) -> Optional[str]:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if not _MAC_SHAPE.match(text):
+        raise HTTPException(status_code=400, detail=f"'{text}' is not a valid MAC address")
+    return normalize_mac_address(text).upper()
+
+
+async def _validate_static_ip(
+    db: AsyncSession, raw_ip: Optional[str], router_id: Optional[int], exclude_customer_id: Optional[int] = None,
+) -> str:
+    """A static-IP plan needs a valid, unused IPv4 on its router."""
+    ip = normalize_static_ip(raw_ip)
+    if not ip:
+        raise HTTPException(
+            status_code=400,
+            detail="Static IP plans need a valid IPv4 address for the customer, e.g. 192.168.2.24",
+        )
+    stmt = (
+        select(Customer.id, Customer.name, Customer.static_ip)
+        .join(Plan, Plan.id == Customer.plan_id)
+        .where(
+            Customer.router_id == router_id,
+            Plan.connection_type == ConnectionType.STATIC_IP,
+            Customer.static_ip.isnot(None),
+        )
+    )
+    if exclude_customer_id is not None:
+        stmt = stmt.where(Customer.id != exclude_customer_id)
+    for row in (await db.execute(stmt)).all():
+        if normalize_static_ip(row.static_ip) == ip:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{ip} is already assigned to {row.name or 'another customer'} on this router",
+            )
+    return ip
 
 
 # Fields an edit can change, as shown in the customer audit log. Passwords are
@@ -137,6 +188,9 @@ class CustomerRegisterRequest(BaseModel):
     pppoe_username: Optional[str] = None
     pppoe_password: Optional[str] = None
     static_ip: Optional[str] = None
+    # Static-IP plans: the device MAC to pin the IP to (optional; learned
+    # automatically the first time the device is seen while paid up).
+    static_mac: Optional[str] = None
 
 
 class UpdateLocationRequest(BaseModel):
@@ -169,9 +223,19 @@ async def register_customer_api(
         if not router_obj:
             raise HTTPException(status_code=404, detail="Router not found")
         
+        static_ip = request.static_ip
+        static_mac = None
+        mac_address = request.mac_address
+        if plan.connection_type == ConnectionType.STATIC_IP:
+            static_ip = await _validate_static_ip(db, request.static_ip, request.router_id)
+            # A static customer must never carry the hotspot identity column:
+            # every hotspot payment/cleanup path keys on it.
+            static_mac = _normalize_pin_mac(request.static_mac or request.mac_address)
+            mac_address = None
+
         # Check if customer with MAC already exists
-        if request.mac_address:
-            existing_customer_stmt = select(Customer).where(Customer.mac_address == request.mac_address)
+        if mac_address:
+            existing_customer_stmt = select(Customer).where(Customer.mac_address == mac_address)
             existing_result = await db.execute(existing_customer_stmt)
             if existing_result.scalar_one_or_none():
                 raise HTTPException(status_code=409, detail="Customer with this MAC address already exists")
@@ -200,10 +264,11 @@ async def register_customer_api(
         customer = Customer(
             name=request.name,
             phone=request.phone,
-            mac_address=request.mac_address,
+            mac_address=mac_address,
             pppoe_username=pppoe_username,
             pppoe_password=pppoe_password,
-            static_ip=request.static_ip,
+            static_ip=static_ip,
+            static_mac=static_mac,
             status=CustomerStatus.INACTIVE,
             plan_id=request.plan_id,
             user_id=user.id,
@@ -239,6 +304,7 @@ async def register_customer_api(
             "mac_address": customer.mac_address,
             "pppoe_username": customer.pppoe_username,
             "static_ip": customer.static_ip,
+            "static_mac": customer.static_mac,
             "status": customer.status.value,
             "plan_id": customer.plan_id,
             "router_id": customer.router_id,
@@ -264,6 +330,7 @@ class CustomerEditRequest(BaseModel):
     pppoe_username: Optional[str] = None
     pppoe_password: Optional[str] = None
     static_ip: Optional[str] = None
+    static_mac: Optional[str] = None
     expiry: Optional[datetime] = None
 
 
@@ -348,6 +415,29 @@ async def edit_customer(
                     detail=f"PPPoE username '{normalized_pppoe_username}' already exists",
                 )
 
+        was_static = bool(customer.plan and customer.plan.connection_type == ConnectionType.STATIC_IP)
+        target_is_static = bool(target_plan and target_plan.connection_type == ConnectionType.STATIC_IP)
+        old_static_ip = normalize_static_ip(customer.static_ip)
+        old_static_mac = customer.static_mac
+        old_static_router = customer.router
+        if target_is_static:
+            target_router_id = request.router_id if request.router_id is not None else customer.router_id
+            if (
+                request.static_ip is not None
+                or not was_static
+                or target_router_id != customer.router_id
+            ):
+                request.static_ip = await _validate_static_ip(
+                    db, request.static_ip if request.static_ip is not None else customer.static_ip,
+                    target_router_id, exclude_customer_id=customer.id,
+                )
+            if request.mac_address is not None:
+                # The form's MAC field means "pin to this device" for statics.
+                request.static_mac = request.mac_address
+                request.mac_address = None
+            if request.static_mac is not None:
+                request.static_mac = _normalize_pin_mac(request.static_mac) or ""
+
         audit_before = _audit_snapshot(customer)
         old_pppoe_username = customer.pppoe_username
         old_pppoe_password = customer.pppoe_password
@@ -363,8 +453,12 @@ async def edit_customer(
             update_fields["pppoe_password"] = normalized_pppoe_password or None
         if "expiry" in update_fields and update_fields["expiry"] is not None:
             update_fields["expiry"] = update_fields["expiry"].replace(tzinfo=None)
+        if update_fields.get("static_mac") == "":
+            update_fields["static_mac"] = None  # cleared: re-learn on next sighting
         for field, value in update_fields.items():
             setattr(customer, field, value)
+        if target_is_static and not was_static:
+            customer.mac_address = None
 
         if customer.pppoe_username and customer.status == CustomerStatus.ACTIVE:
             pppoe_changed = (
@@ -400,7 +494,7 @@ async def edit_customer(
                 details={"changes": audit_diff},
             )
 
-        if "expiry" in update_fields and not customer.pppoe_username:
+        if "expiry" in update_fields and not customer.pppoe_username and not target_is_static:
             # A router that removes its own expired customers holds the
             # deadline in the binding: move it later if the edit extended it.
             from app.services.expiry_tag_sync import schedule_expiry_tag_sync
@@ -436,6 +530,15 @@ async def edit_customer(
             provision_result = await call_pppoe_provision(pppoe_payload)
             provision_status = "ok" if provision_result and provision_result.get("success") else "failed"
 
+        static_status = None
+        if was_static or target_is_static:
+            await db.commit()
+            static_status = await _sync_static_after_edit(
+                customer, was_static, target_is_static,
+                old_ip=old_static_ip, old_router=old_static_router,
+                pin_cleared=bool(old_static_mac) and not customer.static_mac,
+            )
+
         return {
             "success": True,
             "customer": {
@@ -446,6 +549,7 @@ async def edit_customer(
                 "pppoe_username": customer.pppoe_username,
                 "pppoe_password": customer.pppoe_password,
                 "static_ip": customer.static_ip,
+                "static_mac": customer.static_mac,
                 "status": customer.status.value,
                 "plan_id": customer.plan_id,
                 "router_id": customer.router_id,
@@ -463,6 +567,7 @@ async def edit_customer(
                 } if customer.router else None,
             },
             "pppoe_reprovisioned": provision_status,
+            "static_reprovisioned": static_status,
         }
     except HTTPException:
         raise
@@ -470,6 +575,48 @@ async def edit_customer(
         logger.error(f"Error editing customer {customer_id}: {e}")
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to edit customer: {str(e)}")
+
+
+def _router_creds(router_obj: Optional[Router]) -> Optional[dict]:
+    if router_obj is None:
+        return None
+    return {
+        "id": router_obj.id, "name": router_obj.name, "ip": router_obj.ip_address,
+        "username": router_obj.username, "password": router_obj.password,
+        "port": router_obj.port or 8728,
+    }
+
+
+async def _sync_static_after_edit(
+    customer: Customer,
+    was_static: bool,
+    target_is_static: bool,
+    *,
+    old_ip: Optional[str],
+    old_router: Optional[Router],
+    pin_cleared: bool,
+) -> Optional[str]:
+    """Push a static customer's edit to the router (no DB session is held here)."""
+    try:
+        if was_static and not target_is_static:
+            if old_ip and old_router is not None:
+                result = await remove_static_customer_from_router(_router_creds(old_router), old_ip)
+                return "ok" if result.get("success") else "failed"
+            return None
+        if customer.router is None:
+            return None
+        moved = old_router is not None and old_router.id != customer.router_id
+        result = await provision_static_customer(
+            customer.id,
+            action="static_ip_edit",
+            clear_pin=pin_cleared,
+            old_ip=old_ip if (was_static and old_ip) else None,
+            old_router=_router_creds(old_router) if (was_static and moved) else None,
+        )
+        return "ok" if result.get("success") else "failed"
+    except Exception as exc:
+        logger.warning("Static-IP re-sync after editing customer %s failed: %s", customer.id, exc)
+        return "failed"
 
 
 @router.delete("/api/customers/{customer_id}")
@@ -526,6 +673,27 @@ async def delete_customer(
                 raise HTTPException(
                     status_code=status_code,
                     detail=f"Failed to remove PPPoE user from MikroTik; customer was not deleted: {error}",
+                )
+            deprovision_result = "ok"
+
+        static_ip = normalize_static_ip(customer.static_ip)
+        if (
+            customer.plan
+            and customer.plan.connection_type == ConnectionType.STATIC_IP
+            and static_ip
+            and customer.router
+        ):
+            # Same rule as PPPoE: never delete the row while the router still
+            # gives this IP free internet.
+            creds = _router_creds(customer.router)
+            await db.commit()
+            remove_result = await remove_static_customer_from_router(creds, static_ip)
+            if not remove_result or remove_result.get("error"):
+                error = (remove_result or {}).get("error") or "Unknown router cleanup error"
+                status_code = 503 if "connect" in error.lower() else 502
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"Failed to remove the static IP from MikroTik; customer was not deleted: {error}",
                 )
             deprovision_result = "ok"
 
@@ -690,6 +858,7 @@ async def get_customers_api(
                 "pppoe_username": c.pppoe_username,
                 "pppoe_password": c.pppoe_password,
                 "static_ip": c.static_ip,
+                "static_mac": c.static_mac,
                 "status": c.status.value,
                 "expiry": c.expiry.isoformat() if c.expiry else None,
                 "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -763,6 +932,7 @@ async def get_active_customers(
                 "pppoe_username": c.pppoe_username,
                 "pppoe_password": c.pppoe_password,
                 "static_ip": c.static_ip,
+                "static_mac": c.static_mac,
                 "status": c.status.value,
                 "expiry": c.expiry.isoformat() if c.expiry else None,
                 "hours_remaining": (c.expiry - now).total_seconds() / 3600 if c.expiry and c.expiry > now else 0,
@@ -819,6 +989,7 @@ async def get_customer_detail(
             "pppoe_username": customer.pppoe_username,
             "pppoe_password": customer.pppoe_password,
             "static_ip": customer.static_ip,
+            "static_mac": customer.static_mac,
             "status": customer.status.value,
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
             "created_at": customer.created_at.isoformat() if customer.created_at else None,
@@ -1117,6 +1288,263 @@ async def deactivate_pppoe_customer(
     except Exception as e:
         logger.error(f"Error deactivating PPPoE customer {customer_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to deactivate PPPoE customer: {str(e)}")
+
+
+# =========================================================================
+# STATIC-IP MANAGEMENT ENDPOINTS
+# =========================================================================
+
+class StaticPinRequest(BaseModel):
+    # A MAC pins the IP to that device; null/empty clears the pin so the next
+    # device seen while the customer is paid up is learned instead.
+    mac: Optional[str] = None
+
+
+async def _load_static_customer(db: AsyncSession, customer_id: int, user) -> Customer:
+    stmt = (
+        select(Customer)
+        .options(selectinload(Customer.plan), selectinload(Customer.router))
+        .where(Customer.id == customer_id, Customer.user_id == user.id)
+    )
+    customer = (await db.execute(stmt)).scalar_one_or_none()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if not customer.plan or customer.plan.connection_type != ConnectionType.STATIC_IP:
+        raise HTTPException(status_code=400, detail="Customer is not on a static-IP plan")
+    if not normalize_static_ip(customer.static_ip):
+        raise HTTPException(status_code=400, detail="Customer has no valid static IP")
+    if not customer.router:
+        raise HTTPException(status_code=400, detail="Customer has no router assigned")
+    return customer
+
+
+def _static_result(result: dict) -> dict:
+    return {
+        "router_result": "ok" if result.get("success") else "failed",
+        "router_error": result.get("error"),
+        "changes": result.get("changes") or [],
+        "gateway_ok": result.get("gateway_ok"),
+        "pinned_mac": result.get("pinned_mac"),
+        "observed_mac": result.get("observed_mac"),
+        "mac_mismatch": bool(result.get("mac_mismatch")),
+    }
+
+
+@router.post("/api/customers/{customer_id}/activate-static")
+async def activate_static_customer(
+    customer_id: int,
+    request: ActivatePPPoERequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Record a payment for a static-IP customer and open their access on the router."""
+    try:
+        user = await get_current_user(token, db)
+        enforce_active_subscription(user)
+        customer = await _load_static_customer(db, customer_id, user)
+        plan = customer.plan
+
+        duration_unit = plan.duration_unit.value.upper()
+        duration_value = plan.duration_value
+        if duration_unit == "MINUTES":
+            expiry_delta = timedelta(minutes=duration_value)
+            days_paid_for = max(1, duration_value // (24 * 60))
+        elif duration_unit == "HOURS":
+            expiry_delta = timedelta(hours=duration_value)
+            days_paid_for = max(1, duration_value // 24)
+        else:
+            expiry_delta = timedelta(days=duration_value)
+            days_paid_for = duration_value
+
+        now = datetime.utcnow()
+        if customer.status == CustomerStatus.ACTIVE and customer.expiry and customer.expiry > now:
+            customer.expiry = customer.expiry + expiry_delta
+        else:
+            customer.expiry = now + expiry_delta
+        customer.status = CustomerStatus.ACTIVE
+
+        try:
+            pm_enum = PaymentMethod(request.payment_method.lower())
+        except ValueError:
+            pm_enum = PaymentMethod.CASH
+
+        payment = CustomerPayment(
+            customer_id=customer.id,
+            reseller_id=user.id,
+            plan_id=plan.id,
+            amount=float(plan.price),
+            payment_method=pm_enum,
+            payment_reference=request.payment_reference,
+            days_paid_for=days_paid_for,
+            status=PaymentStatus.COMPLETED,
+            notes=request.notes or "Static IP activation via admin",
+            customer_name=customer.name,
+        )
+        db.add(payment)
+        try:
+            from app.services.usage_tracking import on_renewal
+
+            await on_renewal(db, customer, plan=plan, now=now)
+        except Exception as renew_err:
+            logger.error(
+                f"[USAGE] on_renewal failed in static activation for customer {customer.id}: {renew_err}"
+            )
+        await db.commit()
+        expiry = customer.expiry
+
+        result = await provision_static_customer(customer.id, action="static_ip_activation")
+        ok = bool(result.get("success"))
+        await record_customer_event(
+            customer.id, "static_ip_activated",
+            f"Static IP {customer.static_ip} activated on {plan.name} until {expiry:%Y-%m-%d %H:%M} UTC "
+            f"({request.payment_method}); router "
+            + ("updated" if ok else f"not updated yet: {result.get('error') or 'will retry'}"),
+            severity="info" if ok else "warning",
+            actor=user, user_id=user.id, router_id=customer.router_id,
+            details={"payment_id": payment.id, "reference": request.payment_reference},
+        )
+        return {
+            "success": True,
+            "customer_id": customer.id,
+            "status": CustomerStatus.ACTIVE.value,
+            "expiry": expiry.isoformat() if expiry else None,
+            "plan_name": plan.name,
+            # The enforcement job re-applies within minutes if this failed.
+            "provision_result": "ok" if ok else "retry_pending",
+            "provision_error": result.get("error"),
+            **_static_result(result),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error activating static-IP customer {customer_id}: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to activate static-IP customer: {str(e)}")
+
+
+@router.post("/api/customers/{customer_id}/suspend-static")
+async def suspend_static_customer(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Cut a static-IP customer's access now (router first; status only after it confirms)."""
+    try:
+        user = await get_current_user(token, db)
+        enforce_active_subscription(user)
+        customer = await _load_static_customer(db, customer_id, user)
+        await db.commit()
+
+        result = await provision_static_customer(
+            customer.id, action="static_ip_suspend", force_enabled=False,
+        )
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Failed to suspend this customer on the router; status was not changed. "
+                    f"Please retry. Router error: {result.get('error')}"
+                ),
+            )
+        customer.status = CustomerStatus.INACTIVE
+        db.add(ProvisioningLog(
+            customer_id=customer.id, router_id=customer.router_id, action="static_ip_deactivation",
+            status="success", details="Manual suspension: static-IP binding disabled on the router",
+        ))
+        await db.commit()
+        await record_customer_event(
+            customer.id, "static_ip_suspended",
+            f"Static IP {customer.static_ip} suspended: the device now sees the payment page",
+            actor=user, user_id=user.id, router_id=customer.router_id,
+        )
+        return {"success": True, "customer_id": customer.id, "status": customer.status.value,
+                **_static_result(result)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error suspending static-IP customer {customer_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to suspend static-IP customer: {str(e)}")
+
+
+@router.post("/api/customers/{customer_id}/static/sync")
+async def sync_static_customer(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Re-apply this customer's static-IP setup (access, speed, pin) to the router now."""
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    customer = await _load_static_customer(db, customer_id, user)
+    await db.commit()
+    result = await provision_static_customer(customer.id, action="static_ip_sync")
+    return {"success": bool(result.get("success")), "customer_id": customer.id,
+            "access": result.get("access"), **_static_result(result)}
+
+
+@router.post("/api/customers/{customer_id}/static/pin")
+async def pin_static_customer(
+    customer_id: int,
+    request: StaticPinRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Pin the static IP to a device MAC, or clear the pin to re-learn it."""
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    customer = await _load_static_customer(db, customer_id, user)
+    new_mac = _normalize_pin_mac(request.mac)
+    old_mac = customer.static_mac
+    customer.static_mac = new_mac
+    await db.commit()
+    result = await provision_static_customer(
+        customer.id, action="static_ip_pin", clear_pin=new_mac is None,
+    )
+    await record_customer_event(
+        customer.id, "static_mac_pinned" if new_mac else "static_mac_cleared",
+        (f"Static IP {customer.static_ip} pinned to {new_mac}" if new_mac else
+         f"MAC pin cleared for {customer.static_ip}; the next device seen while paid up will be pinned"),
+        actor=user, user_id=user.id, router_id=customer.router_id,
+        details={"old_mac": old_mac, "new_mac": new_mac},
+    )
+    return {"success": bool(result.get("success")), "customer_id": customer.id,
+            "static_mac": new_mac, **_static_result(result)}
+
+
+@router.get("/api/customers/{customer_id}/static/status")
+async def static_customer_status(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Live router view of a static-IP customer: access, speed queue, pin, device."""
+    user = await get_current_user(token, db)
+    customer = await _load_static_customer(db, customer_id, user)
+    expected_access = customer_should_have_access(customer)
+    info = {
+        "customer_id": customer.id,
+        "static_ip": normalize_static_ip(customer.static_ip),
+        "static_mac": customer.static_mac,
+        "status": customer.status.value,
+        "expiry": customer.expiry.isoformat() if customer.expiry else None,
+        "expected_access": "enabled" if expected_access else "suspended",
+        "plan_speed": customer.plan.speed,
+        "router_id": customer.router_id,
+        "router_name": customer.router.name,
+    }
+    await db.commit()
+    router_state = await inspect_static_customer(customer.id)
+    binding = router_state.get("binding") or {}
+    actual_access = (
+        None if router_state.get("error")
+        else "enabled" if binding.get("enabled") else "suspended"
+    )
+    return {
+        **info,
+        "router": router_state,
+        "actual_access": actual_access,
+        "in_sync": actual_access == info["expected_access"] and bool(router_state.get("queue")),
+    }
 
 
 @router.get("/api/customers/{customer_id}/pppoe-credentials")

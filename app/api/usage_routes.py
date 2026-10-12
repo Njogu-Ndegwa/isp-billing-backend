@@ -22,6 +22,7 @@ from app.db.models import (
     UserRole,
 )
 from app.services import realtime_state
+from app.services.static_ip import normalize_static_ip
 from app.services.auth import verify_token, get_current_user
 from app.services.usage_tracking import (
     CUSTOMER_USAGE_BUCKET_RETENTION_DAYS,
@@ -165,10 +166,22 @@ def _serialize_period(p: CustomerUsagePeriod) -> PeriodOut:
 
 def _live_for(customer: Customer) -> Optional[LiveOut]:
     router_live = realtime_state.get_router_live(customer.router_id) if customer.router_id else None
-    device = (
-        realtime_state.get_device_live(customer.router_id, customer.mac_address)
-        or realtime_state.get_pppoe_live(customer.router_id, customer.pppoe_username)
+    # static_ip alone is not enough (PPPoE uses it as the remote address), and
+    # the plan is only touched when it can matter so it is never lazy-loaded.
+    is_static = (
+        customer.static_ip
+        and not customer.mac_address
+        and not customer.pppoe_username
+        and customer.plan is not None
+        and customer.plan.connection_type == ConnectionType.STATIC_IP
     )
+    if is_static:
+        device = realtime_state.get_static_live(customer.router_id, normalize_static_ip(customer.static_ip))
+    else:
+        device = (
+            realtime_state.get_device_live(customer.router_id, customer.mac_address)
+            or realtime_state.get_pppoe_live(customer.router_id, customer.pppoe_username)
+        )
     if router_live is None or device is None:
         return None
     return LiveOut(
@@ -431,10 +444,12 @@ async def get_top_usage_for_reseller(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Top customers by current-period bandwidth (hotspot + PPPoE)."""
+    """Top customers by current-period bandwidth (hotspot, PPPoE and static IP)."""
     user = await get_current_user(token, db)
 
-    customer_filter = [Plan.connection_type.in_([ConnectionType.HOTSPOT, ConnectionType.PPPOE])]
+    customer_filter = [Plan.connection_type.in_(
+        [ConnectionType.HOTSPOT, ConnectionType.PPPOE, ConnectionType.STATIC_IP]
+    )]
     if user.role != UserRole.ADMIN:
         customer_filter.append(Customer.user_id == user.id)
 
@@ -444,6 +459,7 @@ async def get_top_usage_for_reseller(
             Customer.name.label("customer_name"),
             Customer.mac_address.label("mac_address"),
             Customer.pppoe_username.label("pppoe_username"),
+            Customer.static_ip.label("static_ip"),
             Plan.connection_type.label("connection_type"),
             Plan.name.label("plan_name"),
             CustomerUsagePeriod.cap_mb_snapshot.label("cap_mb"),
@@ -471,7 +487,11 @@ async def get_top_usage_for_reseller(
             if hasattr(r.connection_type, "value")
             else r.connection_type
         )
-        identifier = r.pppoe_username if connection_type == "pppoe" else r.mac_address
+        identifier = (
+            r.pppoe_username if connection_type == "pppoe"
+            else r.static_ip if connection_type == "static_ip"
+            else r.mac_address
+        )
         out.append(
             TopUsageItem(
                 customer_id=r.customer_id,

@@ -183,7 +183,7 @@ class DeviceLive:
     queue_status: str
     limited_by: Optional[str]       # key of the queue that actually matches
     max_limit: Optional[str]        # max-limit of that queue
-    kind: str = "hotspot"           # "hotspot" | "pppoe"
+    kind: str = "hotspot"           # "hotspot" | "pppoe" | "static"
 
 
 @dataclass
@@ -280,6 +280,13 @@ def get_pppoe_live(router_id: Optional[int], username: Optional[str]) -> Optiona
     return state.devices.get(f"pppoe:{username}") if state else None
 
 
+def get_static_live(router_id: Optional[int], ip: Optional[str]) -> Optional[DeviceLive]:
+    if router_id is None or not ip:
+        return None
+    state = _routers.get(router_id)
+    return state.devices.get(f"static:{ip}") if state else None
+
+
 def _rate(prev: Optional[int], cur: int, seconds: float) -> Optional[float]:
     if prev is None or seconds <= 0 or cur < prev:
         # First sighting, or the counter reset (host re-created, reboot):
@@ -323,6 +330,7 @@ def record_push(
     metrics: Optional[dict] = None,
     ppp_sessions: Iterable[PppSample] = (),
     live_pppoe_customers: Optional[dict[str, int]] = None,
+    live_static_customers: Optional[dict[str, int]] = None,
     has_hosts: bool = False,
     ports: Optional[list] = None,
     bridge_hosts: Optional[list] = None,
@@ -340,6 +348,8 @@ def record_push(
     """
     prev = _routers.get(router_id)
     elapsed = (now - prev.received_at).total_seconds() if prev else 0.0
+    hosts = list(hosts)
+    hosts_for_static = hosts
     state = RouterLive(router_id=router_id, received_at=now, interval_seconds=interval_seconds)
     state.has_hosts = has_hosts
     _fold_v3_lists(state, prev, now, ports, bridge_hosts, bindings)
@@ -478,8 +488,55 @@ def record_push(
             kind="pppoe",
         )
 
+    # Static IP: the device has a fixed address, so its host entry (bypassed)
+    # is found by IP; its plan_static:<ip> queue carries counters and limit.
+    # Without a host list (non-v3 report) a moving counter means online.
+    host_by_ip: dict[str, HostSample] = {}
+    for host in hosts_for_static:
+        host_by_ip.setdefault(host.ip, host)
+    for key, customer_id in (live_static_customers or {}).items():
+        ip = key.split(":", 1)[1]
+        queue = queue_by_key.get(key)
+        host = host_by_ip.get(ip)
+        before = prev.devices.get(key) if prev else None
+        up = queue.upload_bytes if queue else 0
+        down = queue.download_bytes if queue else 0
+        moved = bool(before and queue and (up, down) != (before.bytes_in, before.bytes_out))
+        online = host is not None or (not has_hosts and moved)
+        continuous = before is not None and queue is not None
+        effective = _effective_queue(queues, ip)
+        if not online:
+            status = QUEUE_OFFLINE
+        elif queue is None or queue.disabled or effective is None:
+            status = QUEUE_NO_LIMIT
+        elif effective.key != key:
+            status = QUEUE_SHADOWED
+        else:
+            status = QUEUE_OK
+        state.devices[key] = DeviceLive(
+            mac=key,
+            customer_id=customer_id,
+            ip=ip,
+            online=online,
+            # Keep the queue counters even while offline so the next window
+            # has an honest baseline (static queues are never re-created).
+            bytes_in=up,
+            bytes_out=down,
+            rate_up_bps=_rate(before.bytes_in if continuous else None, up, elapsed) if online else None,
+            rate_down_bps=_rate(before.bytes_out if continuous else None, down, elapsed) if online else None,
+            seen_at=now if online else (before.seen_at if before else now),
+            idle_time=host.idle_time if host else "",
+            uptime=host.uptime if host else "",
+            queue_status=status,
+            limited_by=effective.key if (online and effective) else None,
+            max_limit=queue.max_limit if queue else None,
+            kind="static",
+        )
+
     state.orphan_queues = sum(
-        1 for q in queues if not q.key.startswith("pppoe:") and q.key not in live_customers
+        1 for q in queues
+        if not q.key.startswith("pppoe:") and not q.key.startswith("static:")
+        and q.key not in live_customers
     )
     state.shadowed = sum(1 for d in state.devices.values() if d.queue_status == QUEUE_SHADOWED)
     state.no_limit = sum(1 for d in state.devices.values() if d.queue_status == QUEUE_NO_LIMIT)
