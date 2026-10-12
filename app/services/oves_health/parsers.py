@@ -93,9 +93,36 @@ def percentile(values: Iterable[float], pct: float) -> Optional[float]:
 # [$proxy_upstream_name] [$proxy_alternative_upstream_name] ...
 _INGRESS_RE = re.compile(
     r'^\S+ - \S+ \[[^\]]*\] "(?P<method>[A-Z]+) (?P<path>\S+)[^"]*" '
-    r'(?P<status>\d{3}) \d+ "[^"]*" "[^"]*" \d+ (?P<rt>[\d.]+) '
+    r'(?P<status>\d{3}) \d+ "[^"]*" "(?P<ua>[^"]*)" \d+ (?P<rt>[\d.]+) '
     r'\[(?P<upstream>[^\]]*)\]'
 )
+# Vulnerability scanners and AI/search crawlers. Their requests to legacy or
+# non-existent URLs fail by design (shadow-api answers every legacy URL with a
+# 500 "Legacy API is no longer available"); they are shown, never alerted on.
+_BOT_UA_RE = re.compile(
+    r"bot\b|crawl|spider|slurp|GPTBot|ChatGPT|Claude|Perplexity|Hunyuan|Bytespider|"
+    r"Amazonbot|PetalBot|SemrushBot|AhrefsBot|zgrab|masscan|Nuclei|nikto|sqlmap|"
+    r"CensysInspect|Expanse|python-httpx|Go-http-client|curl/|"
+    # our own health probes (probes.py): e.g. open-token-microservice answers
+    # its GET / with a 500 by design and must not count as a client failure
+    r"bitwave-oves-health", re.I)
+_SCANNER_PATH_RE = re.compile(
+    r"^/(?:\.env|\.git|\.aws|\.ssh|\.vscode|@fs/|__vite|wp-|wordpress|phpmyadmin|"
+    r"cgi-bin|userfiles|vendor/|actuator|server-status|config\.json|admin/config)|"
+    r"\.(?:php|asp|aspx|jsp|bak|sql|env)(?:$|\?)|/\.env", re.I)
+_ROUTE_ID_RE = re.compile(r"/(?:[0-9a-f]{24}|[0-9a-f-]{32,36}|\d{3,}|[A-Z0-9]{10,})(?=/|$)")
+
+
+def is_bot(user_agent: str, path: str) -> bool:
+    return bool(_BOT_UA_RE.search(user_agent or "") or _SCANNER_PATH_RE.search(path or ""))
+
+
+def normalize_route(path: str) -> str:
+    """``/otp/daysCode?x=1`` -> ``/otp/daysCode``; ids become ``:id``; 4 segments max."""
+    route = (path or "/").split("?", 1)[0][:200]
+    route = _ROUTE_ID_RE.sub("/:id", route)
+    parts = route.split("/")
+    return "/".join(parts[:5]) + ("/..." if len(parts) > 5 else "")
 _UPSTREAM_PORT_RE = re.compile(r"-\d+$")
 
 
@@ -114,7 +141,12 @@ class ServiceTraffic:
     requests: int = 0
     status_4xx: int = 0
     status_5xx: int = 0
+    real_requests: int = 0          # excluding bots / scanners
+    real_5xx: int = 0
+    bot_5xx: int = 0
     latencies_ms: list[float] = field(default_factory=list)
+    # (method, route, status, is_bot) -> count, for 5xx responses only
+    failures: dict[tuple, int] = field(default_factory=dict)
 
     def summary(self) -> dict:
         return {
@@ -122,9 +154,27 @@ class ServiceTraffic:
             "status_4xx": self.status_4xx,
             "status_5xx": self.status_5xx,
             "error_rate": round(self.status_5xx / self.requests, 4) if self.requests else None,
+            "real_requests": self.real_requests,
+            "real_5xx": self.real_5xx,
+            "bot_5xx": self.bot_5xx,
+            "real_error_rate": (round(self.real_5xx / self.real_requests, 4)
+                                if self.real_requests else None),
             "p50_ms": percentile(self.latencies_ms, 50),
             "p95_ms": percentile(self.latencies_ms, 95),
+            "top_failures": top_failures(self.failures),
         }
+
+
+def top_failures(failures: dict[tuple, int], limit: int = 8) -> list[dict]:
+    """Real (non-bot) failing endpoints first, then the bots' biggest."""
+    rows = sorted(failures.items(), key=lambda kv: (kv[0][3], -kv[1]))
+    out = [{"method": m, "route": r, "status": s, "count": n, "bots": b}
+           for (m, r, s, b), n in rows[:limit]]
+    hidden = sum(n for (_m, _r, _s, b), n in rows[limit:] if b)
+    if hidden:
+        out.append({"method": "*", "route": "(other bot / scanner URLs)", "status": 0,
+                    "count": hidden, "bots": True})
+    return out
 
 
 def parse_ingress_lines(lines: Iterable[tuple[datetime, str]],
@@ -140,8 +190,17 @@ def parse_ingress_lines(lines: Iterable[tuple[datetime, str]],
         t = traffic.setdefault(svc, ServiceTraffic())
         t.requests += 1
         status = int(m.group("status"))
+        bot = is_bot(m.group("ua"), m.group("path"))
+        if not bot:
+            t.real_requests += 1
         if 500 <= status < 600:
             t.status_5xx += 1
+            if bot:
+                t.bot_5xx += 1
+            else:
+                t.real_5xx += 1
+            key = (m.group("method"), normalize_route(m.group("path")), status, bot)
+            t.failures[key] = t.failures.get(key, 0) + 1
         elif 400 <= status < 500:
             t.status_4xx += 1
         try:
@@ -199,7 +258,8 @@ def classify_failure(message: str) -> tuple[str, str]:
     return "other", "system"
 
 
-_NUM_RE = re.compile(r"\b[0-9a-f]{24}\b|\"\d+\"|\b\d{3,}\b")
+# ObjectIds, quoted numbers, device serials like B0724524100822, long numbers
+_NUM_RE = re.compile(r"\b[0-9a-f]{24}\b|\"\d+\"|\b[A-Za-z]{0,4}\d{6,}[A-Za-z0-9]*\b|\b\d{3,}\b")
 
 
 def normalize_message(message: str) -> str:
@@ -309,6 +369,26 @@ def parse_code_lines(lines: Iterable[tuple[datetime, str]], service: str = "") -
         })
     stats.samples = stats.samples[-10:]
     return stats
+
+
+_ERROR_LINE_RE = re.compile(r"\b(?:ERROR|Error|error)\b[:\]\s]|Exception|\[LEGACY_|Unhandled|FATAL")
+_LOG_PREFIX_RE = re.compile(
+    r"^(?:\[Nest\]\s+\d+\s+-\s+[\d/, :]+(?:AM|PM)?\s+)?(?:ERROR|WARN|error|warn)?:?\s*")
+
+
+def error_messages(lines: Iterable[tuple[datetime, str]]) -> dict[str, int]:
+    """Normalized error lines from a service's own logs -> count. These are
+    the "which error" behind an HTTP 5xx the ingress can only count."""
+    out: dict[str, int] = {}
+    for _ts, line in lines:
+        if not _ERROR_LINE_RE.search(line):
+            continue
+        msg = _LOG_PREFIX_RE.sub("", line.strip())
+        msg = normalize_message(msg)
+        if len(msg) < 6 or msg in ("{}", "error undefined"):
+            continue
+        out[msg] = out.get(msg, 0) + 1
+    return out
 
 
 def _maybe_db_error(line: str) -> bool:
