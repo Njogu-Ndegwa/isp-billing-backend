@@ -70,7 +70,8 @@ class FakeRouterOS:
             before = args.pop("place-before", None)
             self.add(table, args, before)
         elif verb == "set":
-            row = next(r for r in rows if r[".id"] == args.pop(".id"))
+            target = args.pop(".id")
+            row = next(r for r in rows if r[".id"] == target)
             row.update(args)
         elif verb == "remove":
             target = args.get("numbers") or args.get(".id")
@@ -514,3 +515,95 @@ async def test_learned_pin_is_saved(db, monkeypatch):
     ], "static_ip_reconcile")
     await db.refresh(customer)
     assert customer.static_mac == MAC
+
+
+@pytest.mark.parametrize("command", ["/ip/hotspot/ip-binding/remove", "/ip/hotspot/host/remove"])
+def test_router_rejection_prevents_successful_deletion(fake, monkeypatch, command):
+    apply_static_items_sync(ROUTER, [_item()])
+    fake.add("/ip/hotspot/host", {"address": IP, "mac-address": MAC})
+    original = fake.send_command
+    monkeypatch.setattr(fake, "send_command", lambda cmd, args=None:
+                        {"success": False, "error": "router rejected removal"} if cmd == command else original(cmd, args))
+    result = static_ip.remove_static_ip_sync(ROUTER, IP)
+    assert not result.get("success") and "rejected" in result["error"]
+
+
+def test_repairs_disabled_and_misordered_firewall_rules(fake):
+    apply_static_items_sync(ROUTER, [_item(mac=MAC)])
+    rules = fake.tables["/ip/firewall/filter"]
+    for rule in list(rules):
+        if "FastTrack" in rule.get("comment", "") or rule.get("comment", "").startswith("STATIC-PIN:"):
+            rules.remove(rule)
+            rules.append(rule)
+            if "FastTrack" in rule.get("comment", ""):
+                rule["disabled"] = "true"
+    result = apply_static_items_sync(ROUTER, [_item(mac=MAC)])["results"][0]
+    assert result["success"]
+    rules = fake.tables["/ip/firewall/filter"]
+    ft = next(i for i, r in enumerate(rules) if r["action"] == "fasttrack-connection")
+    for i, rule in enumerate(rules):
+        if "FastTrack" in rule.get("comment", "") or rule.get("comment", "").startswith("STATIC-PIN:"):
+            assert i < ft and rule.get("disabled") != "true"
+
+
+async def test_resume_preserves_expiry_and_creates_no_payment(db, monkeypatch):
+    reseller, _, _, customer = await _seed_static(db, status=CustomerStatus.INACTIVE)
+    expiry = customer.expiry
+    monkeypatch.setattr(customer_routes, "get_current_user", _user_getter(reseller))
+    async def provision(*args, **kwargs):
+        return {"success": True}
+    monkeypatch.setattr(customer_routes, "provision_static_customer", provision)
+    result = await customer_routes.resume_static_customer(customer.id, db, "t")
+    await db.refresh(customer)
+    assert result["router_result"] == "ok"
+    assert customer.status == CustomerStatus.ACTIVE and customer.expiry == expiry
+    assert not (await db.execute(select(CustomerPayment).where(CustomerPayment.customer_id == customer.id))).scalars().all()
+    customer.expiry = datetime.utcnow() - timedelta(seconds=1)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await customer_routes.resume_static_customer(customer.id, db, "t")
+    assert exc.value.status_code == 400
+
+
+async def test_failed_move_keeps_old_ip_in_billing(db, monkeypatch):
+    reseller, _, _, customer = await _seed_static(db)
+    monkeypatch.setattr(customer_routes, "get_current_user", _user_getter(reseller))
+    async def fail(*args):
+        return {"error": "router offline"}
+    monkeypatch.setattr(customer_routes, "remove_static_customer_from_router", fail)
+    with pytest.raises(HTTPException) as exc:
+        await customer_routes.edit_customer(customer.id, customer_routes.CustomerEditRequest(static_ip="192.168.2.99"), db, "t")
+    assert exc.value.status_code == 503
+    await db.refresh(customer)
+    assert customer.static_ip == IP
+
+
+async def test_failed_pin_reset_keeps_saved_pin(db, monkeypatch):
+    reseller, _, _, customer = await _seed_static(db)
+    customer.static_mac = MAC
+    await db.commit()
+    monkeypatch.setattr(customer_routes, "get_current_user", _user_getter(reseller))
+    async def fail(*args, **kwargs):
+        return {"error": "router offline"}
+    monkeypatch.setattr(customer_routes, "provision_static_customer", fail)
+    with pytest.raises(HTTPException) as exc:
+        await customer_routes.pin_static_customer(customer.id, customer_routes.StaticPinRequest(mac=None), db, "t")
+    assert exc.value.status_code == 503
+    await db.refresh(customer)
+    assert customer.static_mac == MAC
+    with pytest.raises(HTTPException) as edit_exc:
+        await customer_routes.edit_customer(customer.id, customer_routes.CustomerEditRequest(static_mac=""), db, "t")
+    assert edit_exc.value.status_code == 503
+    await db.refresh(customer)
+    assert customer.static_mac == MAC
+
+
+async def test_renewal_during_expiry_is_repaired_immediately(db, monkeypatch):
+    _, _, router, customer = await _seed_static(db)
+    repaired = []
+    async def provision(cid, **kwargs):
+        repaired.append(cid)
+        return {"success": True}
+    monkeypatch.setattr(static_ip, "provision_static_customer", provision)
+    assert await static_ip._mark_suspended([customer.id], router.id, datetime.utcnow()) == []
+    assert repaired == [customer.id]

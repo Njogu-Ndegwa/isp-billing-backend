@@ -420,6 +420,8 @@ async def edit_customer(
         old_static_ip = normalize_static_ip(customer.static_ip)
         old_static_mac = customer.static_mac
         old_static_router = customer.router
+        if was_static != target_is_static:
+            raise HTTPException(status_code=400, detail="Changing to or from Static IP requires deleting the old customer first, so the old router access is removed safely.")
         if target_is_static:
             target_router_id = request.router_id if request.router_id is not None else customer.router_id
             if (
@@ -438,7 +440,22 @@ async def edit_customer(
             if request.static_mac is not None:
                 request.static_mac = _normalize_pin_mac(request.static_mac) or ""
 
+        if target_is_static and request.static_mac == "":
+            await db.commit()
+            cleared = await provision_static_customer(customer.id, action="static_ip_pin", clear_pin=True)
+            if not cleared.get("success"):
+                raise HTTPException(status_code=503, detail="Could not reset the device pin on the router; the saved pin was kept.")
+
         audit_before = _audit_snapshot(customer)
+        if was_static and old_static_ip and old_static_router is not None and (
+            (request.router_id is not None and request.router_id != customer.router_id)
+            or (request.static_ip is not None and request.static_ip != old_static_ip)
+        ):
+            old_creds = _router_creds(old_static_router)
+            await db.commit()
+            cleanup = await remove_static_customer_from_router(old_creds, old_static_ip)
+            if not cleanup.get("success"):
+                raise HTTPException(status_code=503, detail="Could not remove the old static-IP access; the customer was not moved. " + str(cleanup.get("error")))
         old_pppoe_username = customer.pppoe_username
         old_pppoe_password = customer.pppoe_password
         old_router_id = customer.router_id
@@ -1466,6 +1483,27 @@ async def suspend_static_customer(
         raise HTTPException(status_code=500, detail=f"Failed to suspend static-IP customer: {str(e)}")
 
 
+@router.post("/api/customers/{customer_id}/resume-static")
+async def resume_static_customer(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Restore a suspended, unexpired subscription without recording a payment."""
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    customer = await _load_static_customer(db, customer_id, user)
+    if customer.expiry is None or customer.expiry <= datetime.utcnow():
+        raise HTTPException(status_code=400, detail="The subscription has expired. Record a payment or set the correct expiry before resuming.")
+    customer.status = CustomerStatus.ACTIVE
+    await db.commit()
+    result = await provision_static_customer(customer.id, action="static_ip_resume")
+    await record_customer_event(customer.id, "static_ip_resumed", "Static-IP subscription resumed; expiry unchanged and no payment recorded.",
+                                actor=user, user_id=user.id, router_id=customer.router_id)
+    return {"success": bool(result.get("success")), "customer_id": customer.id,
+            "status": customer.status.value, **_static_result(result)}
+
+
 @router.post("/api/customers/{customer_id}/static/sync")
 async def sync_static_customer(
     customer_id: int,
@@ -1495,11 +1533,17 @@ async def pin_static_customer(
     customer = await _load_static_customer(db, customer_id, user)
     new_mac = _normalize_pin_mac(request.mac)
     old_mac = customer.static_mac
-    customer.static_mac = new_mac
+    if new_mac is not None:
+        customer.static_mac = new_mac
     await db.commit()
     result = await provision_static_customer(
         customer.id, action="static_ip_pin", clear_pin=new_mac is None,
     )
+    if new_mac is None:
+        if not result.get("success"):
+            raise HTTPException(status_code=503, detail="Could not clear the device pin on the router. The saved pin was kept; retry when the router is reachable.")
+        customer.static_mac = None
+        await db.commit()
     await record_customer_event(
         customer.id, "static_mac_pinned" if new_mac else "static_mac_cleared",
         (f"Static IP {customer.static_ip} pinned to {new_mac}" if new_mac else

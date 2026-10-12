@@ -225,7 +225,9 @@ def _read_tables(api: MikroTikAPI) -> _RouterTables:
 
 
 def _ok(result: Dict[str, Any]) -> bool:
-    return "error" not in result
+    if not result.get("success") or result.get("error"):
+        raise RuntimeError(result.get("error") or "Router rejected the operation")
+    return True
 
 
 def _gateway_ok(tables: _RouterTables, ip: str) -> bool:
@@ -313,18 +315,28 @@ def _ensure_shared_rules(api: MikroTikAPI, tables: _RouterTables, changes: list)
     fasttrack_id = _active_fasttrack_id(tables)
     if not fasttrack_id:
         return
-    have = {str(f.get("comment") or "") for f in tables.filters}
     for comment, match in zip(FASTTRACK_BYPASS_COMMENTS, ("src-address-list", "dst-address-list")):
-        if comment in have:
-            continue
-        result = api.send_command("/ip/firewall/filter/add", {
+        wanted = {
             "chain": "forward",
             match: STATIC_ADDRESS_LIST,
             "connection-state": "established,related",
             "action": "accept",
             "comment": comment,
-            "place-before": fasttrack_id,
-        })
+        }
+        existing = [f for f in tables.filters if f.get("comment") == comment]
+        if existing:
+            rule = existing[0]
+            if _is_true(rule.get("disabled")) or any(rule.get(k) != v for k, v in wanted.items()):
+                _ok(api.send_command("/ip/firewall/filter/set", {".id": rule[".id"], **wanted, "disabled": "no"}))
+                changes.append(f"fasttrack bypass repaired ({match})")
+            order = [f.get(".id") for f in tables.filters]
+            if order.index(rule[".id"]) > order.index(fasttrack_id):
+                _ok(api.send_command("/ip/firewall/filter/move", {"numbers": rule[".id"], "destination": fasttrack_id}))
+                changes.append(f"fasttrack bypass moved ({match})")
+            for extra in existing[1:]:
+                _ok(api.send_command("/ip/firewall/filter/remove", {"numbers": extra[".id"]}))
+            continue
+        result = api.send_command("/ip/firewall/filter/add", {**wanted, "place-before": fasttrack_id})
         if _ok(result):
             changes.append(f"fasttrack bypass rule added ({match})")
 
@@ -380,7 +392,7 @@ def _apply_item(api: MikroTikAPI, tables: _RouterTables, item: StaticItem) -> Di
         # Drop the bypassed host so its next packet is judged as unpaid.
         for host in tables.hosts:
             if str(host.get("address") or "") == ip and host.get(".id"):
-                api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
+                _ok(api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]}))
 
     # --- queue: the speed ----------------------------------------------
     queues = _queues_for(tables, ip)
@@ -433,7 +445,7 @@ def _apply_item(api: MikroTikAPI, tables: _RouterTables, item: StaticItem) -> Di
     pin_mac = normalize_mac_address(item.mac).upper() if item.mac else None
     if item.clear_pin:
         for rule in pins:
-            api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]})
+            _ok(api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]}))
         if pins:
             changes.append("MAC pin cleared")
         pins, router_pin = [], None
@@ -450,7 +462,7 @@ def _apply_item(api: MikroTikAPI, tables: _RouterTables, item: StaticItem) -> Di
             if keep is None and _pin_mac(rule) == pin_mac and rule.get("action") == "drop" and not _is_true(rule.get("disabled")):
                 keep = rule
                 continue
-            api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]})
+            _ok(api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]}))
             changes.append("stale MAC pin removed")
         if keep is None:
             args = {
@@ -464,6 +476,14 @@ def _apply_item(api: MikroTikAPI, tables: _RouterTables, item: StaticItem) -> Di
             if not _ok(result):
                 raise RuntimeError(f"MAC pin add failed: {result.get('error')}")
             changes.append(f"MAC pinned to {pin_mac}")
+        else:
+            order = [f.get(".id") for f in tables.filters]
+            first = next((f.get(".id") for f in tables.filters if f.get("chain") == "forward"
+                          and not _is_true(f.get("dynamic"))
+                          and not str(f.get("comment") or "").startswith(STATIC_PIN_COMMENT_PREFIX)), None)
+            if first and order.index(keep[".id"]) > order.index(first):
+                _ok(api.send_command("/ip/firewall/filter/move", {"numbers": keep[".id"], "destination": first}))
+                changes.append("MAC pin moved before accept rules")
     out["pinned_mac"] = pin_mac
     out["mac_mismatch"] = bool(pin_mac and observed and observed != pin_mac)
     return out
@@ -512,10 +532,10 @@ def _remove_item(api: MikroTikAPI, tables: _RouterTables, ip: str, changes: list
             changes.append(f"MAC pin for {ip} removed")
     for row in tables.address_list:
         if str(row.get("address") or "") == ip:
-            api.send_command("/ip/firewall/address-list/remove", {"numbers": row[".id"]})
+            _ok(api.send_command("/ip/firewall/address-list/remove", {"numbers": row[".id"]}))
     for host in tables.hosts:
         if str(host.get("address") or "") == ip and host.get(".id"):
-            api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
+            _ok(api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]}))
 
 
 def _connect(router: dict, lane: str) -> MikroTikAPI:
@@ -750,7 +770,9 @@ async def provision_static_customer(
 
     if old_router and old_ip:
         # Moved to another router: clean the old one first.
-        await _run(remove_static_ip_sync, old_router, old_ip)
+        removed = await _run(remove_static_ip_sync, old_router, old_ip)
+        if not removed.get("success"):
+            return {"error": "Old router cleanup failed: " + str(removed.get("error"))}
     elif old_ip and old_ip != item.ip:
         item.old_ip = old_ip
 
@@ -831,13 +853,15 @@ async def _mark_suspended(customer_ids: list[int], router_id: int, now: datetime
     from app.services.customer_events import record_customer_event
 
     done: list[int] = []
+    renewed: list[int] = []
     async with db_module.async_session() as db:
         for cid in customer_ids:
             customer = await db.get(Customer, cid)
             if customer is None:
                 continue
             if customer.status == CustomerStatus.ACTIVE and customer.expiry and customer.expiry > datetime.utcnow():
-                continue  # paid while we were on the router; next pass re-enables
+                renewed.append(cid)
+                continue
             if customer.status == CustomerStatus.ACTIVE:
                 customer.status = CustomerStatus.INACTIVE
                 db.add(ProvisioningLog(
@@ -846,6 +870,10 @@ async def _mark_suspended(customer_ids: list[int], router_id: int, now: datetime
                 ))
                 done.append(cid)
         await db.commit()
+    for cid in renewed:
+        # A payment raced the router suspension. Repair it now, rather than
+        # leaving a paid customer offline until the next full reconciliation.
+        await provision_static_customer(cid, action="static_ip_renewal_repair", lane=LANE_PAYMENT)
     for cid in done:
         await record_customer_event(
             cid, "static_ip_expired",
@@ -897,7 +925,7 @@ async def enforce_static_ip_customers_background() -> dict:
                 summary["failed"] += len(items)
                 logger.warning("[STATIC-IP] router %s unreachable: %s", router.name, outcome["error"])
                 return
-            if full:
+            if full and all(r.get("success") for r in results) and len(results) == len(items):
                 _last_full_reconcile[router_id] = now
             summary["routers"] += 1
             summary["applied"] += sum(1 for r in results if r.get("success"))
