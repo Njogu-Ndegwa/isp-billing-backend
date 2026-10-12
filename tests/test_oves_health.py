@@ -389,3 +389,79 @@ def test_key_services_lead_with_the_shadow_path_and_report_pod_state():
     assert auth["pods"][0]["state"] == "CrashLoopBackOff"          # problems sort first
     assert auth["pods"][0]["last_restart_reason"] == "OOMKilled"
     assert auth["pods"][0]["last_restart_ago_s"] == 120
+
+
+# ---------------------------------------------------------------------------
+# "which error": endpoints, bots vs real clients, the service's own messages
+# ---------------------------------------------------------------------------
+
+def _ing(method, path, status, ua="okhttp/4.9.2", up="erm-shadow-api-3001"):
+    return (datetime.utcnow(),
+            f'10.1.0.1 - - [12/Oct/2026:19:00:00 +0000] "{method} {path} HTTP/1.1" {status} 10 "-" '
+            f'"{ua}" 300 0.010 [{up}] [] 10.1.2.3:3001 10 0.010 {status} abc')
+
+
+def test_ingress_separates_bots_and_names_failing_endpoints():
+    lines = ([_ing("POST", "/otp/daysCode", 200)] * 40
+             + [_ing("POST", "/otp/daysCode", 500)] * 3
+             + [_ing("GET", "/.env", 500, ua="Mozilla/5.0 (compatible; Hunyuan/1.0)")] * 30
+             + [_ing("GET", "/userfiles/x", 500, ua="Mozilla/5.0 Chrome")] * 5
+             + [_ing("GET", "/item/650f1c2e9a1b2c3d4e5f6a7b", 500)])
+    s = parsers.parse_ingress_lines(lines)["shadow-api"].summary()
+    assert (s["status_5xx"], s["real_5xx"], s["bot_5xx"]) == (39, 4, 35)
+    assert s["real_requests"] == 44 and s["real_error_rate"] == pytest.approx(4 / 44, rel=1e-3)
+    top = s["top_failures"]
+    assert top[0] == {"method": "POST", "route": "/otp/daysCode", "status": 500, "count": 3, "bots": False}
+    assert {"method": "GET", "route": "/item/:id", "status": 500, "count": 1, "bots": False} in top
+    assert top[-1]["bots"] and top[-1]["route"] in ("/.env", "/userfiles/x")
+
+
+def test_traffic_alert_ignores_bots_and_says_which_endpoint_and_error():
+    bots_only = {"shadow-api": {"requests": 484, "status_5xx": 340, "real_requests": 146, "real_5xx": 4,
+                                "bot_5xx": 336, "top_failures": [], "log_errors": []}}
+    assert rules.evaluate_traffic(bots_only) == []          # 2.7 % real: no alert (was 70 % before)
+    real = {"shadow-api": {"requests": 200, "status_5xx": 60, "real_requests": 150, "real_5xx": 30,
+                           "bot_5xx": 30,
+                           "top_failures": [{"method": "GET", "route": "/.env", "status": 500, "count": 30, "bots": True},
+                                            {"method": "POST", "route": "/otp/daysCode", "status": 502, "count": 30, "bots": False}],
+                           "log_errors": [{"message": "Error: connect ECONNREFUSED thing-microservice-make", "count": 30}]}}
+    a = rules.evaluate_traffic(real)[0]
+    assert a["key"] == "oves.ingress.shadow-api" and a["section"] == "http.shadow-api"
+    assert "POST /otp/daysCode -> 502 (30x)" in a["message"]
+    assert "ECONNREFUSED" in a["message"] and "+30 bot/scanner 5xx ignored" in a["message"]
+
+
+def test_service_error_messages_are_extracted_and_grouped():
+    lines = [_l(0, "[LEGACY_API_DISABLED] The legacy system has been permanently closed. No request was made."),
+             _l(1, "error:   Error: Legacy API is no longer available. The system has been permanently closed."),
+             _l(2, "[Nest] 18  - 10/12/2026, 9:01:02 PM   ERROR [GraphQLLoggingInterceptor] Failed to post log to "
+                   "microserviceEvents_2024: Request failed with status code 400"),
+             _l(3, "[Nest] 18  - 10/12/2026, 9:01:03 PM   ERROR [GraphQLLoggingInterceptor] Failed to post log to "
+                   "microserviceEvents_2024: Request failed with status code 400"),
+             _l(4, "[query] db.getCollection('item').find({})  [took 4 ms]"),
+             _l(5, "WARN [AvatarMessenger] Failed to process MQTT message. Topic: dt/V01/GPRSV2/x/BATT/B0724524100822. Error: Unexpected token ."),
+             _l(6, "WARN [AvatarMessenger] Failed to process MQTT message. Topic: dt/V01/GPRSV2/x/BATT/B0724524100464. Error: Unexpected token .")]
+    msgs = parsers.error_messages(lines)
+    assert msgs["[GraphQLLoggingInterceptor] Failed to post log to microserviceEvents_2024: Request failed with status code #"] == 2
+    assert any("Legacy API is no longer available" in m for m in msgs)
+    assert sum(1 for m in msgs if "AvatarMessenger" in m) == 1          # device serials collapse to one row
+    assert not any("getCollection" in m for m in msgs)
+
+
+def test_recent_detail_keeps_five_minutes():
+    collectors._detail_history.clear()
+    t0 = datetime(2026, 10, 12, 19, 0)
+    key = ("POST", "/otp/daysCode", 500, False)
+    collectors.recent_detail(t0, {"shadow-api": {key: 2}}, {"shadow-api": {"boom": 1}})
+    f, e = collectors.recent_detail(t0 + timedelta(minutes=3), {"shadow-api": {key: 1}}, {})
+    assert f["shadow-api"][key] == 3 and e["shadow-api"]["boom"] == 1
+    f, e = collectors.recent_detail(t0 + timedelta(minutes=7), {}, {})
+    assert "shadow-api" not in f or f["shadow-api"][key] == 1
+    assert "shadow-api" not in e
+    collectors._detail_history.clear()
+
+
+def test_own_probe_traffic_is_not_a_client_failure():
+    lines = [_ing("GET", "/", 500, ua="bitwave-oves-health/1", up="erm-open-token-microservice-3101")] * 25
+    s = parsers.parse_ingress_lines(lines)["open-token-microservice"].summary()
+    assert (s["real_5xx"], s["bot_5xx"], s["real_requests"]) == (0, 25, 0)

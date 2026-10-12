@@ -44,7 +44,7 @@ from app.services.auth import get_current_user, verify_token
 from app.services.subscription import enforce_active_subscription
 from app.services.customer_events import record_customer_event
 from app.services.customer_router_logs import CustomerIndex, capture_router_logs, router_info_of
-from app.services.router_availability import record_router_availability
+from app.services.router_availability import public_contact_times, record_router_availability
 
 logger = logging.getLogger(__name__)
 
@@ -155,26 +155,48 @@ def _in_window(at, before, after, inclusive=False) -> bool:
     return after is None or at >= after
 
 
-def _router_status_items(checks, router_id, *, window_start, window_end, inclusive=False) -> list[dict]:
-    """Site offline / back online entries, from the same outage rules as uptime.
+def _router_status_items(
+    checks, router_id, *, window_start, window_end, inclusive=False, public_contacts=(),
+) -> list[dict]:
+    """Site offline / back online and management-tunnel entries, from the
+    same outage rules as uptime.
 
     ``uptime_outages`` decides what an outage is: for a router that sends
     usage reports, a gap of more than 15 minutes in them; otherwise from a
     failed check to the next success. Anything under five minutes, and any
     failed connection made while the router was still reporting, is never
-    shown as the site going offline.
+    shown as the site going offline. ``split_tunnel_outages`` then moves an
+    outage during which the router kept calling us over the public internet
+    to "management tunnel down": the site was online, we just could not
+    reach it.
     """
     from app.services.customer_events import format_duration
-    from app.services.router_availability import uptime_outages
+    from app.services.router_availability import split_tunnel_outages, uptime_outages
 
     if not checks:
         return []
-    judged = uptime_outages(checks, now=window_end)
+    judged = split_tunnel_outages(
+        uptime_outages(checks, now=window_end), public_contacts, now=window_end,
+    )
     reporting = judged["judged_by"] == "router_reports"
+
+    def span(o):
+        return (datetime.fromisoformat(o["started_at"]),
+                datetime.fromisoformat(o["ended_at"]) if o.get("ended_at") else None)
+
+    tunnels = [span(o) for o in judged["tunnel_outages"]]
+
+    def tunnel_at(at):
+        """The tunnel outage ``at`` falls in (its end excluded), if any."""
+        return next((t for t in tunnels if t[0] <= at and (t[1] is None or at < t[1])), None)
+
     out: list[dict] = []
+    site_starts, site_ends = set(), set()
     for outage in judged["outages"]:
-        started = datetime.fromisoformat(outage["started_at"])
-        ended = datetime.fromisoformat(outage["ended_at"]) if outage.get("ended_at") else None
+        started, ended = span(outage)
+        site_starts.add(started)
+        if ended is not None:
+            site_ends.add(ended)
         if _in_window(started, window_end, window_start, inclusive):
             out.append(_item(
                 started, "router", "router_offline",
@@ -185,10 +207,31 @@ def _router_status_items(checks, router_id, *, window_start, window_end, inclusi
                 ref=f"rt-down:{router_id}:{started.isoformat()}",
             ))
         if ended is not None and _in_window(ended, window_end, window_start, inclusive):
+            message = f"Site back online after {format_duration(int((ended - started).total_seconds()))}"
+            if tunnel_at(ended):
+                message += (". The router is reaching Bitwave over the internet, but its "
+                            "management tunnel is still down.")
             out.append(_item(
-                ended, "router", "router_online",
-                f"Site back online after {format_duration(int((ended - started).total_seconds()))}",
+                ended, "router", "router_online", message,
                 router_id=router_id, ref=f"rt-up:{router_id}:{ended.isoformat()}",
+            ))
+    for started, ended in tunnels:
+        # A site outage that opens the tunnel outage already says so.
+        if started not in site_starts and _in_window(started, window_end, window_start, inclusive):
+            out.append(_item(
+                started, "router", "tunnel_down",
+                "Management tunnel down, site still online: the router kept reaching Bitwave "
+                "over the internet, but Bitwave could not reach the router. Payments, "
+                "reconnects and changes for its customers wait until the tunnel is back.",
+                severity="warning", router_id=router_id,
+                ref=f"tun-down:{router_id}:{started.isoformat()}",
+            ))
+        if ended is not None and ended not in site_ends and _in_window(ended, window_end, window_start, inclusive):
+            out.append(_item(
+                ended, "router", "tunnel_up",
+                f"Management tunnel back after {format_duration(int((ended - started).total_seconds()))}: "
+                "Bitwave can reach the router again, and waiting payments and changes go through.",
+                router_id=router_id, ref=f"tun-up:{router_id}:{ended.isoformat()}",
             ))
     return out
 
@@ -507,12 +550,17 @@ async def customer_audit_log(
             .order_by(RouterAvailabilityCheck.checked_at.desc())
             .limit(ROUTER_STATUS_MAX_CHECKS)
         )).all()
+        contacts = await public_contact_times(
+            db, customer.router_id,
+            since=window_start - ROUTER_STATUS_LOOKBACK, until=window_end,
+        )
         status_items = _router_status_items(
             [{"checked_at": c.checked_at, "is_online": c.is_online, "source": c.source} for c in reversed(checks)],
             customer.router_id,
             window_start=window_start,
             window_end=window_end,
             inclusive=inclusive,
+            public_contacts=contacts,
         )
         if status_items:
             page = sorted(page + status_items, key=lambda i: i["occurred_at"] or "", reverse=True)

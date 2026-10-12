@@ -6,7 +6,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import database
-from app.db.models import Router, RouterAvailabilityCheck
+from app.db.models import Router, RouterAvailabilityCheck, RouterPublicContact
 from app.services.router_status_alerts import (
     send_router_recovery_notification,
     should_consider_recovery_notification,
@@ -379,6 +379,76 @@ def uptime_outages(checks: Iterable[Any], *, now: datetime) -> Dict[str, Any]:
     }
 
 
+# A router whose tunnel is down still calls us over public HTTPS: its expiry
+# reaper at least hourly (the heartbeat) and every minute or two while
+# customers are due. Inside a tunnel outage, a longer stretch than this with
+# no call still counts as the site being down.
+PUBLIC_CONTACT_SILENCE = timedelta(minutes=65)
+
+
+def split_tunnel_outages(
+    judged: Dict[str, Any], contacts: Iterable[datetime], *, now: datetime
+) -> Dict[str, Any]:
+    """Tell "site offline" apart from "site online, management tunnel down".
+
+    ``judged`` is uptime_outages' result. Everything it is built from reaches
+    us through the management tunnel (reports, RouterOS connections), so a
+    dead tunnel looks exactly like a dead site. ``contacts`` are times the
+    router called us over the public internet (RouterPublicContact): an
+    outage with any inside it was the tunnel, and only stretches of more than
+    PUBLIC_CONTACT_SILENCE without a call stay site downtime. Returns
+    ``judged`` with ``outages`` narrowed to site downtime and
+    ``tunnel_outages`` added.
+    """
+    times = sorted(contacts)
+    site: list[Dict[str, Any]] = []
+    tunnel: list[Dict[str, Any]] = []
+
+    def piece(a: datetime, b: Optional[datetime]) -> Dict[str, Any]:
+        return {
+            "started_at": a.isoformat(),
+            "ended_at": b.isoformat() if b else None,
+            "duration_seconds": max(0, round(((b or now) - a).total_seconds())),
+        }
+
+    for outage in judged["outages"]:
+        start, end = _parse_outage(outage, now)
+        ongoing = outage.get("ended_at") is None
+        inside = times[bisect_left(times, start):bisect_right(times, end)]
+        if not inside:
+            site.append(outage)
+            continue
+        tunnel.append({
+            **piece(start, None if ongoing else end),
+            "public_contacts": len(inside),
+            "first_contact_at": inside[0].isoformat(),
+            "last_contact_at": inside[-1].isoformat(),
+        })
+        bounds = [start, *inside, end]
+        for a, b in zip(bounds, bounds[1:]):
+            if b - a > PUBLIC_CONTACT_SILENCE:
+                last = b is end
+                site.append(piece(a, None if (last and ongoing) else b))
+    site.sort(key=lambda o: o["started_at"])
+    return {**judged, "outages": significant_outages(site, now), "tunnel_outages": tunnel}
+
+
+async def public_contact_times(
+    db: AsyncSession, router_id: int, *, since: datetime, until: datetime
+) -> list[datetime]:
+    """When the router called us over the public internet, oldest first."""
+    rows = await db.execute(
+        select(RouterPublicContact.contacted_at)
+        .where(
+            RouterPublicContact.router_id == router_id,
+            RouterPublicContact.contacted_at >= since,
+            RouterPublicContact.contacted_at <= until,
+        )
+        .order_by(RouterPublicContact.contacted_at)
+    )
+    return list(rows.scalars().all())
+
+
 def downtime_seconds(outages: Iterable[Dict[str, Any]], start: datetime, end: datetime, now: datetime) -> int:
     """Seconds of the outages that fall inside [start, end)."""
     total = 0.0
@@ -640,4 +710,7 @@ async def prune_router_availability_history(
     cutoff = now - timedelta(days=retention_days)
     await db.execute(
         delete(RouterAvailabilityCheck).where(RouterAvailabilityCheck.checked_at < cutoff)
+    )
+    await db.execute(
+        delete(RouterPublicContact).where(RouterPublicContact.contacted_at < cutoff)
     )

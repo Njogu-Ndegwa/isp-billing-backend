@@ -929,6 +929,12 @@ async def run_monitoring_migrations():
             "CREATE INDEX IF NOT EXISTS idx_router_availability_router_checked "
             "ON router_availability_checks(router_id, checked_at)"
         ))
+        # router_public_contacts: routers calling over the internet while
+        # their tunnel is down (app/services/router_availability.py).
+        from app.db.models import RouterPublicContact  # noqa: F401
+        await conn.run_sync(
+            lambda c: RouterPublicContact.__table__.create(c, checkfirst=True)
+        )
 
 
 async def run_reconnection_migrations():
