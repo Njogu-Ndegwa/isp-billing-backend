@@ -71,7 +71,8 @@ def _trim(store: dict, now: datetime, keep_seconds: int = 300) -> None:
 
 # Router reachability is folded into the timeline for at most this far back.
 ROUTER_STATUS_WINDOW = timedelta(days=14)
-ROUTER_STATUS_MAX_CHECKS = 5000
+ROUTER_STATUS_LOOKBACK = timedelta(days=1)
+ROUTER_STATUS_MAX_CHECKS = 20000
 
 # "Password: abc123" in a stored SMS (the welcome template sends it). The
 # timeline never shows it: viewing credentials is an audited action of its own.
@@ -154,41 +155,41 @@ def _in_window(at, before, after, inclusive=False) -> bool:
     return after is None or at >= after
 
 
-def _router_status_items(checks, router_id, seed_online=None, seed_went_down=None) -> list[dict]:
-    """Turn reachability polls into "went offline" / "back online" entries.
+def _router_status_items(checks, router_id, *, window_start, window_end, inclusive=False) -> list[dict]:
+    """Site offline / back online entries, from the same outage rules as uptime.
 
-    ``seed_online`` is the router's state just before the first check (None if
-    unknown) and ``seed_went_down`` when an outage already in progress began,
-    so an outage that started before the window is measured from its start.
+    ``summarize_router_flaps`` decides what an outage is: for a router that
+    sends usage reports, a gap of more than 15 minutes in them; otherwise two
+    failed checks close together. A single failed connection, or one made
+    while the router was still reporting, is never shown as the site going
+    offline.
     """
+    from app.services.customer_events import format_duration
+    from app.services.router_availability import summarize_router_flaps
+
+    if not checks:
+        return []
+    summary = summarize_router_flaps(checks, now=window_end, limit=None)
+    reporting = summary.get("judged_by") == "router_reports"
     out: list[dict] = []
-    went_down = seed_went_down if seed_online is False else None
-    previous = seed_online
-    for checked_at, is_online in checks:
-        if previous is None:
-            previous = is_online
-            continue
-        if previous and not is_online:
-            went_down = checked_at
+    for outage in summary["outages"]:
+        started = datetime.fromisoformat(outage["started_at"])
+        ended = datetime.fromisoformat(outage["ended_at"]) if outage.get("ended_at") else None
+        if _in_window(started, window_end, window_start, inclusive):
             out.append(_item(
-                checked_at, "router", "router_offline",
-                "Router stopped answering Bitwave: the site may have lost power or internet. "
-                "Customers on it may be offline too.",
-                severity="warning", router_id=router_id, ref=f"rt-down:{router_id}:{checked_at.isoformat()}",
+                started, "router", "router_offline",
+                ("Site went offline: the router stopped reporting to Bitwave. "
+                 if reporting else "Site went offline: the router stopped answering Bitwave. ")
+                + "Power or the site's internet may be down, so customers on it may be offline too.",
+                severity="warning", router_id=router_id,
+                ref=f"rt-down:{router_id}:{started.isoformat()}",
             ))
-        elif not previous and is_online:
-            # Only a duration we actually saw start is stated.
-            down_for = (checked_at - went_down) if went_down else None
-            from app.services.customer_events import format_duration
-            text = "Router answering again"
-            if down_for is not None:
-                text += f" after {format_duration(int(down_for.total_seconds()))}"
+        if ended is not None and _in_window(ended, window_end, window_start, inclusive):
             out.append(_item(
-                checked_at, "router", "router_online", text,
-                router_id=router_id, ref=f"rt-up:{router_id}:{checked_at.isoformat()}",
+                ended, "router", "router_online",
+                f"Site back online after {format_duration(int((ended - started).total_seconds()))}",
+                router_id=router_id, ref=f"rt-up:{router_id}:{ended.isoformat()}",
             ))
-            went_down = None
-        previous = is_online
     return out
 
 
@@ -490,43 +491,28 @@ async def customer_audit_log(
             window_end - ROUTER_STATUS_WINDOW,
             after or datetime.min,
         )
+        # Read from a day before the window so an outage already in progress
+        # when it starts is measured from its real start.
         checks = (await db.execute(
-            select(RouterAvailabilityCheck.checked_at, RouterAvailabilityCheck.is_online)
+            select(
+                RouterAvailabilityCheck.checked_at,
+                RouterAvailabilityCheck.is_online,
+                RouterAvailabilityCheck.source,
+            )
             .where(
                 RouterAvailabilityCheck.router_id == customer.router_id,
-                RouterAvailabilityCheck.checked_at >= window_start,
-                RouterAvailabilityCheck.checked_at <= window_end if inclusive
-                else RouterAvailabilityCheck.checked_at < window_end,
+                RouterAvailabilityCheck.checked_at >= window_start - ROUTER_STATUS_LOOKBACK,
+                RouterAvailabilityCheck.checked_at <= window_end,
             )
             .order_by(RouterAvailabilityCheck.checked_at.desc())
             .limit(ROUTER_STATUS_MAX_CHECKS)
         )).all()
-        seed = (await db.execute(
-            select(RouterAvailabilityCheck.checked_at, RouterAvailabilityCheck.is_online)
-            .where(RouterAvailabilityCheck.router_id == customer.router_id,
-                   RouterAvailabilityCheck.checked_at < window_start)
-            .order_by(RouterAvailabilityCheck.checked_at.desc()).limit(1)
-        )).first()
-        seed_online = seed.is_online if seed else None
-        seed_went_down = None
-        if seed is not None and not seed.is_online:
-            # The outage began at the first check after the last good one.
-            last_up = (await db.execute(
-                select(func.max(RouterAvailabilityCheck.checked_at)).where(
-                    RouterAvailabilityCheck.router_id == customer.router_id,
-                    RouterAvailabilityCheck.checked_at < window_start,
-                    RouterAvailabilityCheck.is_online.is_(True),
-                )
-            )).scalar_one_or_none()
-            if last_up is not None:
-                seed_went_down = (await db.execute(
-                    select(func.min(RouterAvailabilityCheck.checked_at)).where(
-                        RouterAvailabilityCheck.router_id == customer.router_id,
-                        RouterAvailabilityCheck.checked_at > last_up,
-                    )
-                )).scalar_one_or_none()
         status_items = _router_status_items(
-            list(reversed(checks)), customer.router_id, seed_online, seed_went_down,
+            [{"checked_at": c.checked_at, "is_online": c.is_online, "source": c.source} for c in reversed(checks)],
+            customer.router_id,
+            window_start=window_start,
+            window_end=window_end,
+            inclusive=inclusive,
         )
         if status_items:
             page = sorted(page + status_items, key=lambda i: i["occurred_at"] or "", reverse=True)
