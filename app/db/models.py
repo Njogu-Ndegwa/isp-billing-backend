@@ -2636,6 +2636,23 @@ class OpsHealthSnapshot(Base):
     metrics = Column(JSON, nullable=True)
 
 
+class OvesHealthSnapshot(Base):
+    """One OVES platform health cycle (app/services/oves_health/service.py).
+
+    ``metrics`` is the small per-minute record (code counts and latencies,
+    probe up/latency, cluster gauges, per-service ingress traffic) that the
+    history charts, rolling alert windows and baselines read; kept 14 days.
+    ``payload`` is the full panel object, kept only for recent rows (the prune
+    step nulls it after a few hours) so the table stays small.
+    """
+    __tablename__ = "oves_health_snapshots"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    generated_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    overall_status = Column(String(16), nullable=False, default="unknown")
+    payload = Column(JSON, nullable=True)
+    metrics = Column(JSON, nullable=True)
+
+
 class AppInstanceHeartbeat(Base):
     """Liveness row per running app process.
 
