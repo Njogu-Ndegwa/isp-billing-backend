@@ -783,3 +783,34 @@ async def test_ops_health_endpoint_serves_latest_snapshot_and_history(db, client
     history = (await client.get("/api/admin/ops-health/history?hours=1")).json()
     assert len(history["points"]) == 1
     assert (await client.get("/api/admin/ops-health/history?hours=0")).status_code == 422
+
+
+# --- problem routers: site online, tunnel down -------------------------------
+
+def _tunnel_down_site(name, waiting, oldest_minutes, now):
+    oldest = now - timedelta(minutes=oldest_minutes)
+    return {"router_id": 1, "router_name": name, "reseller": "Kennice Networks", "tunnel": "wireguard",
+            "waiting": waiting, "oldest_waiting_at": oldest.isoformat() + "Z", "last_online_at": None,
+            "evidence": {"portal_attempts_15m": 3, "public_contact_at": None}}
+
+
+def test_site_online_tunnel_down_alert_thresholds():
+    now = datetime(2026, 10, 12, 14, 30)
+
+    def alert(*sites):
+        found = [a for a in rules.evaluate({"problem_routers": {"tunnel_down_sites": list(sites)}}, now)
+                 if a["key"] == "problem_routers.site_online_tunnel_down"]
+        return found[0] if found else None
+
+    assert alert() is None
+    assert alert(_tunnel_down_site("RONGAI", 2, 8, now)) is None              # under 10 min: not yet
+    a = alert(_tunnel_down_site("RONGAI", 4, 15, now))
+    assert a["severity"] == "warning" and a["value"] == 4
+    assert "RONGAI (Kennice Networks): 4 waiting, oldest 15 min" in a["message"]
+    assert alert(_tunnel_down_site("RONGAI", 4, 31, now))["severity"] == "critical"     # waited too long
+    assert alert(_tunnel_down_site("RONGAI", 6, 15, now),
+                 _tunnel_down_site("HOME951", 4, 12, now))["severity"] == "critical"   # 10 waiting in all
+    # the section's status follows the alert, but the overall status still ignores it
+    sections = {"problem_routers": {"tunnel_down_sites": [_tunnel_down_site("RONGAI", 4, 31, now)]}}
+    alerts = rules.evaluate(sections, now)
+    assert rules.section_status("problem_routers", sections["problem_routers"], alerts) == "critical"
