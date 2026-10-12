@@ -1039,6 +1039,18 @@ async def pppoe_customer_presence(
         "billing_active": billing_active,
         "speed_enforcement": speed_enforcement,
         "mikrotik": presence,
+        # Plain-language reading of the router's last-disconnect-reason, so
+        # the customer page can say why nobody is connected.
+        "last_disconnect": (
+            {
+                "reason": secret.get("last_disconnect_reason", ""),
+                "at": secret.get("last_logged_out", ""),
+                "caller_id": secret.get("last_caller_id", ""),
+                **_infer_disconnect_cause(secret.get("last_disconnect_reason", "")),
+            }
+            if present and online is not True and secret.get("last_disconnect_reason")
+            else None
+        ),
         "verdict": verdict,
     }
 
