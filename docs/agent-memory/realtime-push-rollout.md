@@ -21,13 +21,44 @@ Owner: the "Real-time customer metrics" session (handed over 2026-09-25 from
   `X-Bitwave-Push-Channel: tunnel`). Port 8088 because routers carry
   `ISP_BILLING_PROXY_RELAY_BLOCK` (rejects the router's own outbound tcp
   80/3128/8080) — that rule stays. No encrypted tunnel → public HTTPS.
+  Tunnel down on a tunnel install → public HTTPS, at most every 15 min (v4,
+  see below).
 - Cadence is set by the server in each reply (`next_push_seconds`) and the
   script retunes its own scheduler: **60 s** for everyone; small boards that
   fall back to HTTPS 120 s; any router reporting CPU ≥ 80% backs off to 120 s
   for 10 min.
-- While a tunnel is down no live data arrives; counters are cumulative, so the
-  next report catches up. (The old internet push reported through tunnel
-  outages — known trade-off, accepted by Dennis.)
+- ~~While a tunnel is down no live data arrives~~ — superseded 2026-10-12 by the
+  v4 public fallback below. Counters are cumulative, so whichever report gets
+  through next catches up.
+
+### 2026-10-12: v4 — public HTTPS fallback for tunnel installs
+
+- Why: when a router's management tunnel died, a tunnel-push router stopped
+  reporting entirely and the server treated the site as offline (448 RONGAI,
+  351 HOME951; ~10 routers had a dead Hetzner tunnel that day).
+- A tunnel install now tries the tunnel URL first. If that fetch fails **and**
+  `10.251.0.1` does not answer one ping (tunnel down, not the server
+  answering 503/429), it sends the same report once to the public URL
+  (`realtime_push_installer.PUBLIC_URL`, the same host as before). Same
+  pattern as the expiry reaper's `turl`/`purl`.
+- Rate limit: at most **one public report per 15 min** while on the fallback
+  (TLS is heavy on RB951 / hAP lite). The state is a RAM-only dynamic
+  address-list entry `bw-push-fb` (`timeout=15m`), the watchdog's pattern —
+  not a `:global`. A healthy tunnel never touches the address list.
+- The router never sends `X-Bitwave-Push-Channel`; Caddy's tunnel site adds it.
+  A fallback report therefore registers as public (HTTPS cadence overrides
+  apply; it still enrols the router as real-time).
+- HTTPS installs (no tunnel, `FORCE_HTTPS=1`) render the one-URL script exactly
+  as before. Only the report version changes.
+- Version marker: reports now carry `"v":4` (`REALTIME_SCRIPT_VERSION`). The
+  installer reads it off the router: `had_script` shows `v3`/`v4` and
+  `outdated: true` means it is older than the current script. An outdated
+  v3 script is rewritten in place and the original `-prev` backup is kept.
+  Server checks are `v >= 3`, so v3 and v4 routers are handled the same.
+- Rollout: the existing installer (`scripts/realtime_push_install.py`) in
+  small staged batches over routers on v3 (dry run first, look for
+  `outdated: true`). A router whose tunnel is dead cannot be updated (the API
+  goes over that tunnel); it gets v4 on the first run after its tunnel is back.
 
 ## Which routers are on it
 
@@ -55,6 +86,8 @@ the old script is the opt-out. No redeploy per batch.
 - No bare `:return` in any router script (RouterOS 7.19+ rejects the whole
   script — that killed `bitwave-command-agent`).
 - The endpoint's `now` is `time.monotonic()` (rate limiter) — never a DB time.
+- The router script never sets `X-Bitwave-Push-Channel` itself (only Caddy's
+  tunnel site does), so the server's channel reading stays truthful.
 
 ## New routers (automatic, no cron)
 

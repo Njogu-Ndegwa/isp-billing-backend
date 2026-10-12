@@ -12,11 +12,15 @@ Rules learnt in the 2026-09-26 fleet rollout (docs/agent-memory/realtime-push-ro
   with no working encrypted tunnel is skipped: over public HTTPS an RB951 sat at
   80-90% CPU (351) and a hAP lite paid ~5-7 s at 100% CPU per report.
   ``force_https`` overrides.
+* A tunnel install falls back to PUBLIC_URL when the tunnel is down (script v4,
+  2026-10-12): at most one public report per 15 min, so the server keeps live
+  data without paying the TLS cost every minute. HTTPS installs are unchanged.
 * hAP lite / hAP mini (smips, 32 MB) are skipped: Dennis's decision, they stay on
   server polling. ``allow_small`` overrides.
 * WAN is the interface of the active default route; ether1 is only the fallback.
-* The router's previous script is kept as ``bitwave-usage-push-prev`` so
-  ``rollback`` restores it.
+* The router's previous (pre-real-time) script is kept as
+  ``bitwave-usage-push-prev`` so ``rollback`` restores it. Updating an older
+  real-time reporter (v3 -> v4) rewrites it in place and keeps that backup.
 
 The functions here do RouterOS I/O only; callers load the router row in a short
 DB session and release it first (``install_after_provisioning`` does).
@@ -37,7 +41,13 @@ from app.config import settings
 from app.db import database
 from app.db.models import Router, RouterHealth, User
 from app.services.mikrotik_api import MikroTikAPI
-from app.services.usage_push_script import SCHEDULER_NAME, SCRIPT_NAME, render_realtime_push_script
+from app.services.usage_push_script import (
+    REALTIME_SCRIPT_VERSION,
+    SCHEDULER_NAME,
+    SCRIPT_NAME,
+    push_script_version,
+    render_realtime_push_script,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +190,10 @@ def install_router(
                       free_hdd=int(res.get("free-hdd-space") or 0))
         current = find_one(api, "/system/script", SCRIPT_NAME)
         current_src = (current or {}).get("source") or ""
-        result["had_script"] = "v3" if '\\"v\\":3' in current_src else ("v1/v2" if current else "none")
+        had_version = push_script_version(current_src)
+        result["had_script"] = f"v{had_version}" if had_version >= 3 else ("v1/v2" if current else "none")
+        # An older real-time reporter (e.g. v3, no public fallback) is replaced in place.
+        result["outdated"] = bool(current) and had_version < REALTIME_SCRIPT_VERSION
 
         if rollback:
             return _rollback(api, result, current)
@@ -205,10 +218,11 @@ def install_router(
             return {**result, "status": "would_install"}
 
         rendered = render_realtime_push_script(identity=ident, endpoint_url=url, interval_seconds=60,
-                                               wan_interface=wan, lists_every=lists_every)
+                                               wan_interface=wan, lists_every=lists_every,
+                                               fallback_url=PUBLIC_URL if via_tunnel else None)
         source = rendered[rendered.index("source={\n") + len("source={\n"):
                           rendered.index("\n}\n\n/system scheduler add")]
-        if current and result["had_script"] != "v3":
+        if current and had_version < 3:
             backup = find_one(api, "/system/script", BACKUP_NAME)
             res_b = (c("/system/script/set", {".id": backup[".id"], "source": current_src}) if backup
                      else c("/system/script/add", {"name": BACKUP_NAME, "policy": POLICY, "source": current_src}))

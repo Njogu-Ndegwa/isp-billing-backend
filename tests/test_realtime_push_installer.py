@@ -80,9 +80,38 @@ def test_installs_over_the_tunnel_and_adds_the_scheduler():
     out = rpi.install_router(ROUTER, skip_run=True, api_factory=api)
     assert out["status"] == "installed"
     assert out["url"] == settings.REALTIME_TUNNEL_PUSH_URL
-    assert '\\"v\\":3' in api.scripts["bitwave-usage-push"]
+    assert '\\"v\\":4' in api.scripts["bitwave-usage-push"]
     assert api.schedulers["bitwave-usage-push"]["interval"] == "60s"
     assert not any(p == "/system/script/run" for p, _ in api.writes)       # skip_run honoured
+
+
+def test_tunnel_install_falls_back_to_public_https_and_https_install_does_not():
+    # 2026-10-12 (448 / 351): a dead tunnel silenced tunnel-push routers entirely.
+    api = FakeRouterOS()
+    rpi.install_router(ROUTER, skip_run=True, api_factory=api)
+    src = api.scripts["bitwave-usage-push"]
+    assert f'/tool fetch url="{rpi.PUBLIC_URL}"' in src and "list=bw-push-fb" in src
+    assert rpi.PUBLIC_URL.startswith("https://isp.bitwavetechnologies.net/")
+    forced = FakeRouterOS(tunnel=None)
+    out = rpi.install_router(ROUTER, skip_run=True, force_https=True, api_factory=forced)
+    assert out["url"] == rpi.PUBLIC_URL
+    https_src = forced.scripts["bitwave-usage-push"]
+    assert https_src.count("/tool fetch") == 1 and "bw-push-fb" not in https_src and "/ping" not in https_src
+
+
+def test_v3_reporter_is_outdated_and_updated_in_place_keeping_the_original_backup():
+    v3 = '# bw-gate v1\n:local body "{\\"identity\\":\\"$ident\\",\\"v\\":3,\\"reports\\":["'
+    api = FakeRouterOS(existing_script=v3)
+    api.scripts["bitwave-usage-push-prev"] = "original v1 push"
+    dry = rpi.install_router(ROUTER, apply=False, api_factory=api)
+    assert dry["status"] == "would_install" and dry["had_script"] == "v3" and dry["outdated"] is True
+    out = rpi.install_router(ROUTER, skip_run=True, api_factory=api)
+    assert out["status"] == "installed" and out["outdated"] is True
+    assert '\\"v\\":4' in api.scripts["bitwave-usage-push"]
+    assert api.scripts["bitwave-usage-push-prev"] == "original v1 push"       # rollback target kept
+    assert not any(p == "/system/script/add" for p, _ in api.writes)          # set in place
+    again = rpi.install_router(ROUTER, apply=False, api_factory=api)
+    assert again["had_script"] == "v4" and again["outdated"] is False
 
 
 def test_hap_lite_is_skipped_and_nothing_is_written():
