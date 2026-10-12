@@ -119,3 +119,32 @@ async def test_uptime_endpoint_reports_time_based_uptime(db):
     assert any(c["counted_as_outage"] for c in failed)
     assert any(not c["counted_as_outage"] for c in failed)
     assert {b["status"] for b in out["timeline"]} >= {"up", "no_data"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hours, slices", [(24, 24), (72, 72), (168, 84), (720, 84)])
+async def test_each_window_the_panel_offers(db, hours, slices):
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    now = datetime.utcnow()
+    # Reports every 5 min for the last 2 days, with a 1-hour silence 30 h ago:
+    # inside the 72 h / 7 d / 30 d windows, outside the 24 h one.
+    t = now - timedelta(hours=48)
+    while t < now:
+        silent = now - timedelta(hours=31) <= t < now - timedelta(hours=30)
+        if not silent:
+            await record_router_availability(None, router.id, True, "usage_push", checked_at=t)
+        t += timedelta(minutes=5)
+
+    out = await router_management.get_router_uptime(
+        router.id, hours=hours, recent_checks=50, db=db,
+        token={"user_id": reseller.id, "role": reseller.role.value})
+    assert out["window"]["hours"] == hours
+    assert len(out["timeline"]) == slices
+    if hours == 24:
+        assert out["window"]["outage_count"] == 0 and out["window"]["uptime_percentage"] == 100.0
+    else:
+        assert out["window"]["outage_count"] == 1
+        assert out["window"]["uptime_percentage"] < 100.0
+    # 30-day figure is the same whichever window is picked.
+    assert out["overall"]["outage_count"] == 1
