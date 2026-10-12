@@ -396,6 +396,10 @@ class Settings(BaseSettings):
         "mongo0 (10.0.1.129)=i-0dd1b03899e0bb058"
     )
     OVES_HEALTH_PROBE_TIMEOUT_SECONDS: float = 10.0
+    # Apollo GraphOS insights (errors + error rate per operation, like Studio):
+    # comma-separated "Graph-Id=service:Graph-Id:..." -- each subgraph's own
+    # key, as in its deployment-charts APOLLO_KEY. Empty = GraphQL tab off.
+    OVES_APOLLO_GRAPH_KEYS: str = ""
 
     class Config:
         env_file = ".env"

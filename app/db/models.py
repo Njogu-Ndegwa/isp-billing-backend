@@ -2651,6 +2651,13 @@ class OvesHealthSnapshot(Base):
     overall_status = Column(String(16), nullable=False, default="unknown")
     payload = Column(JSON, nullable=True)
     metrics = Column(JSON, nullable=True)
+    # The counters history charts SUM over every row, as plain columns: pulling
+    # them out of the JSON blob cost ~0.3 ms/row (about 6 s for 14 days).
+    codes_ok = Column(Integer, nullable=True)
+    codes_failed = Column(Integer, nullable=True)
+    codes_failed_system = Column(Integer, nullable=True)
+    index_failures = Column(Integer, nullable=True)
+    db_errors = Column(Integer, nullable=True)
 
 
 class AppInstanceHeartbeat(Base):

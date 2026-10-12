@@ -3046,6 +3046,13 @@ async def run_oves_health_migrations():
                 ", ".join(t.name for t in to_create),
             )
 
+        # Counter columns (history sums read these instead of the JSON blob).
+        for column in ("codes_ok", "codes_failed", "codes_failed_system",
+                       "index_failures", "db_errors"):
+            await conn.execute(sa_text(
+                f"ALTER TABLE oves_health_snapshots ADD COLUMN IF NOT EXISTS {column} INTEGER"
+            ))
+
     logger.info("OVES health migrations complete")
 
 
@@ -3764,6 +3771,7 @@ async def startup_event():
         except Exception as e:
             logger.error(f"[OVES-HEALTH] Cycle failed: {e}")
 
+    from datetime import datetime as _oves_dt, timedelta as _oves_td, timezone as _oves_tz
     scheduler.add_job(
         _oves_health_background,
         trigger=IntervalTrigger(seconds=60),
@@ -3773,6 +3781,10 @@ async def startup_event():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=30,
+        # Half a minute out of phase with ops_health_snapshot (also 60 s):
+        # measured 2026-10-12, both firing in the same second stacked their
+        # CPU on the request loop.
+        next_run_time=_oves_dt.now(_oves_tz.utc) + _oves_td(seconds=30),
     )
 
     # "What is ailing this router" for the Problem routers card
