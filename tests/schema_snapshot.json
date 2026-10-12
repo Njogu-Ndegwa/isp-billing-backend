@@ -829,6 +829,12 @@
   "topic",
   "username"
  ],
+ "router_public_contacts": [
+  "contacted_at",
+  "id",
+  "router_id",
+  "source"
+ ],
  "router_usage_buckets": [
   "bucket_start",
   "created_at",
