@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -23,7 +23,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.db.database import async_session, db_pool_snapshot
-from app.db.models import Customer, CustomerStatus, ProvisioningLog, Router as RouterModel
+from app.db.models import (
+    Customer, CustomerStatus, ProvisioningLog, Router as RouterModel, RouterPublicContact,
+)
 from app.services import customer_expiry_notifications
 from app.services.router_expiry import (
     DONE_MINUTE_MAX_SKEW,
@@ -53,11 +55,21 @@ _background_tasks: set = set()
 # identity -> (last call, router clock trusted?) for diagnostics; process state.
 last_seen: dict[str, tuple[datetime, bool]] = {}
 
+# The reaper calls through the management tunnel first and over public HTTPS
+# only when that fails; Caddy's tunnel listener marks the first kind with this
+# header. A public call proves the site is online while its tunnel is down
+# (router_availability.split_tunnel_outages), so it is kept, at most one row
+# per router per PUBLIC_CONTACT_EVERY.
+TUNNEL_CHANNEL = "tunnel"
+PUBLIC_CONTACT_EVERY = timedelta(minutes=2)
+_last_public_contact: dict[int, datetime] = {}
+
 
 def reset_rate_limiter() -> None:
     """Test hook: the limiter is process state."""
     _last_call_at.clear()
     last_seen.clear()
+    _last_public_contact.clear()
 
 
 def _pool_under_pressure() -> bool:
@@ -100,7 +112,11 @@ async def _notify(customer_ids: list[int], now: datetime) -> None:
 
 
 @router.post("/api/router/expiry-check", response_class=PlainTextResponse)
-async def expiry_check(request: Request, authorization: Optional[str] = Header(default=None)):
+async def expiry_check(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_bitwave_push_channel: Optional[str] = Header(default=None),
+):
     raw = (await request.body()).decode("utf-8", errors="replace")
     try:
         req = parse_request(raw)
@@ -135,6 +151,12 @@ async def expiry_check(request: Request, authorization: Optional[str] = Header(d
         if router_row is None:
             await db.commit()
             raise HTTPException(status_code=401, detail="Unauthorized")
+
+        if (x_bitwave_push_channel or "").strip().lower() != TUNNEL_CHANNEL:
+            previous = _last_public_contact.get(router_row.id)
+            if previous is None or now - previous >= PUBLIC_CONTACT_EVERY:
+                _last_public_contact[router_row.id] = now
+                db.add(RouterPublicContact(router_id=router_row.id, contacted_at=now, source="expiry_check"))
 
         customers: list[Customer] = []
         if macs:

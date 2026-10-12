@@ -1180,6 +1180,29 @@ class RouterAvailabilityCheck(Base):
     router = relationship("Router")
 
 
+class RouterPublicContact(Base):
+    """A router reaching us over the public internet instead of its tunnel.
+
+    Router scripts call through the management tunnel first and fall back to
+    public HTTPS only when it fails, so a call here proves the site was online
+    while its tunnel was not (2026-10-12: routers 448 and 351 kept calling for
+    75 minutes while every tunnel check failed). Kept apart from
+    router_availability_checks on purpose: those rows mean "we could manage
+    the router", and a dozen readers treat a success there that way.
+    """
+    __tablename__ = "router_public_contacts"
+    __table_args__ = (
+        Index("idx_router_public_contacts_router_at", "router_id", "contacted_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # No FK: rows are pruned with availability history and must never block
+    # deleting a router.
+    router_id = Column(Integer, nullable=False)
+    contacted_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    source = Column(String(30), nullable=False)
+
+
 # ========================================
 # RESELLER PAYMENT METHODS
 # ========================================
