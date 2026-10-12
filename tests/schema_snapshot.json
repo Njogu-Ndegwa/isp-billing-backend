@@ -548,6 +548,13 @@
   "total_seconds_credited",
   "user_id"
  ],
+ "oves_health_snapshots": [
+  "generated_at",
+  "id",
+  "metrics",
+  "overall_status",
+  "payload"
+ ],
  "password_reset_tokens": [
   "created_at",
   "expires_at",

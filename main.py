@@ -3022,6 +3022,33 @@ async def run_ops_health_migrations():
     logger.info("Ops health migrations complete")
 
 
+async def run_oves_health_migrations():
+    """OVES platform health (app/services/oves_health/): one NEW table,
+    oves_health_snapshots, via the checkfirst create_all pattern. Safe to run
+    on every startup.
+    """
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+
+        from app.db.models import OvesHealthSnapshot
+        # Explicit startup create_all targets: oves_health_snapshots.
+        targets = [OvesHealthSnapshot]
+        to_create = [m.__table__ for m in targets if m.__tablename__ not in tables]
+        if to_create:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
+            logger.info(
+                "OVES health migration: created %s",
+                ", ".join(t.name for t in to_create),
+            )
+
+    logger.info("OVES health migrations complete")
+
+
 async def run_customer_event_migrations():
     """Customer audit log (app/services/customer_events.py): one NEW table,
     customer_events, via the checkfirst create_all pattern. Its indexes are
@@ -3339,6 +3366,11 @@ async def startup_event():
         logger.info("Ops health migrations completed successfully")
     except Exception as e:
         logger.error(f"Ops health migration failed (non-fatal): {e}")
+
+    try:
+        await run_oves_health_migrations()
+    except Exception as e:
+        logger.error(f"OVES health migration failed (non-fatal): {e}")
 
     try:
         await run_checkin_delivery_migrations()
@@ -3715,6 +3747,28 @@ async def startup_event():
         trigger=IntervalTrigger(seconds=60),
         id='ops_health_snapshot',
         name='Operations health snapshot + alerting',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
+    )
+
+    # OVES platform health (app/services/oves_health/): code generation,
+    # MongoDB, the three Kubernetes clusters and every external dependency.
+    # Off unless OVES_HEALTH_ENABLED. All network I/O runs with no DB session
+    # open; sheds when the pool is busy, like ops health.
+    async def _oves_health_background():
+        from app.services.oves_health.service import run_cycle
+        try:
+            await run_cycle()
+        except Exception as e:
+            logger.error(f"[OVES-HEALTH] Cycle failed: {e}")
+
+    scheduler.add_job(
+        _oves_health_background,
+        trigger=IntervalTrigger(seconds=60),
+        id='oves_health_snapshot',
+        name='OVES platform health snapshot + alerting',
         replace_existing=True,
         max_instances=1,
         coalesce=True,

@@ -415,6 +415,48 @@ async def admin_ops_health_history(
 
 
 # ---------------------------------------------------------------------------
+# OVES platform health (read-only: serves stored snapshots, never probes)
+# ---------------------------------------------------------------------------
+
+@router.get("/api/admin/oves-health")
+async def admin_oves_health(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Latest OVES platform snapshot: code generation, database, clusters,
+    dependencies (OVES prod, AWS dev, Tencent, third party), alerts."""
+    await _require_admin(token, db)
+    await db.commit()
+    from app.services.oves_health import service as oves
+
+    latest = await oves.load_latest()
+    now = datetime.utcnow()
+    if latest is None:
+        return {"enabled": oves.enabled(), "generated_at": None, "snapshot_age_seconds": None,
+                "overall_status": "unknown", "alerts": [], "sections": {}, "sources": {}}
+    generated = datetime.fromisoformat(latest["generated_at"].replace("Z", ""))
+    return {"enabled": oves.enabled(),
+            "snapshot_age_seconds": max(0, int((now - generated).total_seconds())),
+            **latest}
+
+
+@router.get("/api/admin/oves-health/history")
+async def admin_oves_health_history(
+    hours: int = Query(24, ge=1, le=336, description="Look back N hours (max 14 days)"),
+    probe: Optional[str] = Query(None, max_length=64, description="Probe id for a latency series"),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Bucketed history: codes ok/failed, success rate, code p50/p95, DB log
+    errors, cluster gauges, per-probe uptime and p95 over the window."""
+    await _require_admin(token, db)
+    await db.commit()
+    from app.services.oves_health import service as oves
+
+    return await oves.load_history(datetime.utcnow(), hours, probe)
+
+
+# ---------------------------------------------------------------------------
 # 1. MRR
 # ---------------------------------------------------------------------------
 
