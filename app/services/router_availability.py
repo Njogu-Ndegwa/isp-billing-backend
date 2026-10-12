@@ -68,11 +68,51 @@ def summarize_router_flaps(
         ),
         key=lambda check: _check_value(check, "checked_at"),
     )
-    if any(
-        _check_value(check, "source") == PUSH_SOURCE and _check_value(check, "is_online")
-        for check in ordered
-    ):
-        return _summarize_pushing_router(ordered, now=now, limit=limit)
+    first_report = next(
+        (
+            _check_value(check, "checked_at") for check in ordered
+            if _check_value(check, "source") == PUSH_SOURCE and _check_value(check, "is_online")
+        ),
+        None,
+    )
+    if first_report is not None:
+        # Reports are only evidence from the day the router started sending
+        # them; before that it is judged by our checks as before. (Router 316
+        # started reporting on 2026-09-26: applying the silence rule to the two
+        # weeks before turned sparse sampling into 300 phantom outages.)
+        before = [c for c in ordered if _check_value(c, "checked_at") < first_report]
+        after = [c for c in ordered if _check_value(c, "checked_at") >= first_report]
+        reported = _summarize_pushing_router(after, now=now, limit=None)
+        if not before:
+            return _limit_summary(reported, limit)
+        earlier = summarize_router_flaps(
+            before, now=first_report, confirmation_window=confirmation_window, limit=None,
+        )
+        earlier_outages = [
+            {**o, "ended_at": o["ended_at"] or first_report.isoformat(),
+             "duration_seconds": o["duration_seconds"] if o["ended_at"] else max(
+                 0, round((first_report - datetime.fromisoformat(o["started_at"])).total_seconds()))}
+            for o in earlier["outages"]
+        ]
+        earlier_transitions = list(earlier["transitions"])
+        if earlier["status"] == "offline":
+            earlier_transitions.append({
+                "at": first_report.isoformat(), "from": "offline", "to": "online", "source": PUSH_SOURCE,
+            })
+        transitions = earlier_transitions + reported["transitions"]
+        outage_count = sum(1 for t in transitions if t["to"] == "offline")
+        merged = {
+            **reported,
+            "sample_count": len(ordered),
+            "transition_count": len(transitions),
+            "outage_count": outage_count,
+            "recovery_count": sum(1 for t in transitions if t["to"] == "online"),
+            "is_flapping": len(transitions) >= 4 or outage_count >= 2,
+            "last_transition_at": transitions[-1]["at"] if transitions else None,
+            "transitions": transitions,
+            "outages": earlier_outages + reported["outages"],
+        }
+        return _limit_summary(merged, limit)
 
     state: Optional[bool] = None
     pending_offline_at: Optional[datetime] = None
@@ -161,6 +201,12 @@ def summarize_router_flaps(
     }
 
 
+def _limit_summary(summary: Dict[str, Any], limit: Optional[int]) -> Dict[str, Any]:
+    if not limit:
+        return summary
+    return {**summary, "transitions": summary["transitions"][-limit:], "outages": summary["outages"][-limit:]}
+
+
 def _summarize_pushing_router(ordered: list, *, now: datetime, limit: Optional[int] = 20) -> Dict[str, Any]:
     """Outages of a router that reports to us, from its reports.
 
@@ -243,6 +289,94 @@ def _parse_outage(outage: Dict[str, Any], now: datetime) -> tuple[datetime, date
     start = datetime.fromisoformat(outage["started_at"])
     end = datetime.fromisoformat(outage["ended_at"]) if outage.get("ended_at") else now
     return start, end
+
+
+# What a reseller sees as an outage. Shorter "outages" are a failed
+# connection followed straight away by a successful one (2026-10-12, router
+# 316 before it sent reports: 376 of them, 13 hours in all, while provisioning
+# connections alternately failed and succeeded). Flap detection still sees them.
+MIN_REPORTED_OUTAGE = timedelta(minutes=5)
+
+
+def significant_outages(outages: Iterable[Dict[str, Any]], now: datetime) -> list[Dict[str, Any]]:
+    """Outages long enough to show a reseller (an ongoing one always counts)."""
+    out = []
+    for outage in outages:
+        if outage.get("ended_at") is None:
+            out.append(outage)
+            continue
+        start, end = _parse_outage(outage, now)
+        if end - start >= MIN_REPORTED_OUTAGE:
+            out.append(outage)
+    return out
+
+
+def _failure_run_outages(ordered: list, *, close_at: Optional[datetime]) -> list[Dict[str, Any]]:
+    """Down from the first failed check after a success until the next success.
+
+    The confirmation rule in summarize_router_flaps (two failures within five
+    minutes) suits flap detection but never confirms a router that is simply
+    dead and checked less often than that: 202 routers on 2026-10-12, never
+    reached all week, read as 100% up.
+    """
+    outages = []
+    started: Optional[datetime] = None
+    for check in ordered:
+        at = _check_value(check, "checked_at")
+        if _check_value(check, "is_online"):
+            if started is not None:
+                outages.append({
+                    "started_at": started.isoformat(),
+                    "ended_at": at.isoformat(),
+                    "duration_seconds": max(0, round((at - started).total_seconds())),
+                })
+                started = None
+        elif started is None:
+            started = at
+    if started is not None:
+        outages.append({
+            "started_at": started.isoformat(),
+            "ended_at": close_at.isoformat() if close_at else None,
+            "duration_seconds": max(0, round(((close_at or datetime.utcnow()) - started).total_seconds())),
+        })
+    return outages
+
+
+def uptime_outages(checks: Iterable[Any], *, now: datetime) -> Dict[str, Any]:
+    """The outages a reseller sees in uptime figures, outage lists and the
+    activity log.
+
+    From the router's first usage report onward, the report rule of
+    summarize_router_flaps; before it (or for a router that never reports),
+    down from a failed check to the next success. Advisory samples are
+    ignored, and anything shorter than MIN_REPORTED_OUTAGE is dropped.
+    Returns the outages plus when usable data starts and how it was judged.
+    """
+    ordered = sorted(
+        (
+            c for c in checks
+            if _check_value(c, "checked_at") is not None
+            and _check_value(c, "source") not in ADVISORY_OFFLINE_SOURCES
+        ),
+        key=lambda c: _check_value(c, "checked_at"),
+    )
+    first_report = next(
+        (
+            _check_value(c, "checked_at") for c in ordered
+            if _check_value(c, "source") == PUSH_SOURCE and _check_value(c, "is_online")
+        ),
+        None,
+    )
+    before = [c for c in ordered if first_report is None or _check_value(c, "checked_at") < first_report]
+    outages = _failure_run_outages(before, close_at=first_report)
+    if first_report is not None:
+        after = [c for c in ordered if _check_value(c, "checked_at") >= first_report]
+        outages += _summarize_pushing_router(after, now=now, limit=None)["outages"]
+    return {
+        "outages": significant_outages(outages, now),
+        "first_data_at": _check_value(ordered[0], "checked_at") if ordered else None,
+        "judged_by": "router_reports" if first_report is not None else "server_checks",
+    }
 
 
 def downtime_seconds(outages: Iterable[Dict[str, Any]], start: datetime, end: datetime, now: datetime) -> int:

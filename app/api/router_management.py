@@ -36,6 +36,7 @@ from app.services.router_availability import (
     build_router_status,
     record_router_availability,
     summarize_router_flaps,
+    uptime_outages,
     time_based_uptime,
     uptime_timeline,
     ROUTER_AVAILABILITY_RETENTION_DAYS,
@@ -1667,9 +1668,9 @@ async def get_router_uptime(
     ]
     window_checks = [c for c in all_checks if c["checked_at"] >= since]
 
-    full_summary = summarize_router_flaps(all_checks, now=now, limit=None)
-    outages = full_summary["outages"]
-    first_any = all_checks[0]["checked_at"] if all_checks else None
+    judged = uptime_outages(all_checks, now=now)
+    outages = judged["outages"]
+    first_any = judged["first_data_at"]
     first_window = window_checks[0]["checked_at"] if window_checks else None
 
     window_stats = time_based_uptime(outages, start=since, end=now, first_data_at=first_any, now=now)
@@ -1695,7 +1696,7 @@ async def get_router_uptime(
         "generated_at": now.isoformat(),
         "current_status": build_router_status(router_obj, now=now),
         "method": "time",
-        "judged_by": full_summary.get("judged_by"),
+        "judged_by": judged["judged_by"],
         "overall": {
             "days": ROUTER_AVAILABILITY_RETENTION_DAYS,
             "total_checks": len(all_checks),

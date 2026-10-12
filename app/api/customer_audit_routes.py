@@ -158,21 +158,21 @@ def _in_window(at, before, after, inclusive=False) -> bool:
 def _router_status_items(checks, router_id, *, window_start, window_end, inclusive=False) -> list[dict]:
     """Site offline / back online entries, from the same outage rules as uptime.
 
-    ``summarize_router_flaps`` decides what an outage is: for a router that
-    sends usage reports, a gap of more than 15 minutes in them; otherwise two
-    failed checks close together. A single failed connection, or one made
-    while the router was still reporting, is never shown as the site going
-    offline.
+    ``uptime_outages`` decides what an outage is: for a router that sends
+    usage reports, a gap of more than 15 minutes in them; otherwise from a
+    failed check to the next success. Anything under five minutes, and any
+    failed connection made while the router was still reporting, is never
+    shown as the site going offline.
     """
     from app.services.customer_events import format_duration
-    from app.services.router_availability import summarize_router_flaps
+    from app.services.router_availability import uptime_outages
 
     if not checks:
         return []
-    summary = summarize_router_flaps(checks, now=window_end, limit=None)
-    reporting = summary.get("judged_by") == "router_reports"
+    judged = uptime_outages(checks, now=window_end)
+    reporting = judged["judged_by"] == "router_reports"
     out: list[dict] = []
-    for outage in summary["outages"]:
+    for outage in judged["outages"]:
         started = datetime.fromisoformat(outage["started_at"])
         ended = datetime.fromisoformat(outage["ended_at"]) if outage.get("ended_at") else None
         if _in_window(started, window_end, window_start, inclusive):

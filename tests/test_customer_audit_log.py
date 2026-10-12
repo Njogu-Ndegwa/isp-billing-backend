@@ -479,7 +479,7 @@ async def test_summary_and_router_outages(db):
     db.add(CustomerEvent(customer_id=customer.id, occurred_at=now - timedelta(hours=3), category="router_log",
                          event_type="router_log", source="router_log", severity="warning",
                          message="<pppoe-sam_k>: terminating... - peer is not responding"))
-    # A router without usage reports: an outage needs two failed checks close together.
+    # A router without usage reports: down from the first failed check to the next success.
     for minutes, up in ((300, True), (241, False), (240, False), (200, False), (150, True)):
         db.add(RouterAvailabilityCheck(router_id=router.id, checked_at=now - timedelta(minutes=minutes),
                                        is_online=up, source="test"))
@@ -492,7 +492,7 @@ async def test_summary_and_router_outages(db):
     assert "peer is not responding" in out["summary"]["last_problem"]["message"]
     kinds = [i["event_type"] for i in out["items"] if i["category"] == "router"]
     assert kinds == ["router_online", "router_offline"]
-    assert "Site back online after 1h 30m" in next(
+    assert "Site back online after 1h 31m" in next(
         i for i in out["items"] if i["event_type"] == "router_online")["message"]
 
 
@@ -591,7 +591,7 @@ def test_outage_already_in_progress_is_measured_from_its_start():
     items = customer_audit_routes._router_status_items(
         checks, 7, window_start=t, window_end=t + timedelta(hours=1))
     assert [i["event_type"] for i in items] == ["router_online"]
-    assert "after 3h 23m" in items[0]["message"]
+    assert "after 3h 25m" in items[0]["message"]  # from the first failed check
 
 
 def test_failed_checks_while_the_router_reports_are_not_site_outages():

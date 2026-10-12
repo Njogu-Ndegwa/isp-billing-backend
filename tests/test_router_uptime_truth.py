@@ -148,3 +148,53 @@ async def test_each_window_the_panel_offers(db, hours, slices):
         assert out["window"]["uptime_percentage"] < 100.0
     # 30-day figure is the same whichever window is picked.
     assert out["overall"]["outage_count"] == 1
+
+
+def test_the_weeks_before_a_router_started_reporting_use_the_old_rule():
+    # Router 316: no reports until it was upgraded, sparse checks before that.
+    checks = [_c(m, True, "bandwidth_snapshot") for m in range(-600, 0, 40)]  # one success every 40 min
+    checks += [_c(m, True, "usage_push") for m in range(0, 120, 5)]
+    s = summarize_router_flaps(checks, now=T + timedelta(minutes=120), limit=None)
+    assert s["outage_count"] == 0, s["outages"]
+
+    # A confirmed outage in the earlier period is still counted, and closed
+    # at the first report at the latest.
+    checks = [_c(-60, True, "bandwidth_snapshot"), _c(-50, False, "bandwidth_snapshot"),
+              _c(-48, False, "bandwidth_snapshot")]
+    checks += [_c(m, True, "usage_push") for m in range(0, 30, 5)]
+    s = summarize_router_flaps(checks, now=T + timedelta(minutes=30), limit=None)
+    assert s["outage_count"] == 1
+    assert s["outages"][0]["ended_at"] == T.isoformat()
+    assert s["status"] == "online"
+
+
+def test_blips_under_five_minutes_are_not_reported_outages():
+    from app.services.router_availability import significant_outages
+    now = T + timedelta(hours=1)
+    outages = [
+        {"started_at": T.isoformat(), "ended_at": (T + timedelta(minutes=1)).isoformat(), "duration_seconds": 60},
+        {"started_at": (T + timedelta(minutes=10)).isoformat(),
+         "ended_at": (T + timedelta(minutes=18)).isoformat(), "duration_seconds": 480},
+        {"started_at": (T + timedelta(minutes=55)).isoformat(), "ended_at": None, "duration_seconds": 300},
+    ]
+    kept = significant_outages(outages, now)
+    assert [o["duration_seconds"] for o in kept] == [480, 300]  # the ongoing one always counts
+
+
+def test_a_dead_router_checked_rarely_is_down_not_up():
+    # Never reached all week, failures 10 minutes apart: the flap rule never
+    # confirms that (two failures within 5 min), but uptime must say down.
+    from app.services.router_availability import uptime_outages
+    checks = [_c(-30, True, "mikrotik_health")] + [_c(m, False, "reachability_probe") for m in range(0, 600, 10)]
+    now = T + timedelta(minutes=600)
+    judged = uptime_outages(checks, now=now)
+    u = time_based_uptime(judged["outages"], start=T - timedelta(minutes=30), end=now,
+                          first_data_at=judged["first_data_at"], now=now)
+    assert judged["judged_by"] == "server_checks"
+    assert u["uptime_percentage"] < 10
+
+
+def test_cleanup_only_failures_say_nothing():
+    from app.services.router_availability import uptime_outages
+    judged = uptime_outages([_c(m, False, "expired_cleanup") for m in range(0, 60, 5)], now=T + timedelta(hours=1))
+    assert judged["outages"] == [] and judged["first_data_at"] is None
