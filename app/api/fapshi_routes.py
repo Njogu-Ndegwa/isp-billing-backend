@@ -265,6 +265,13 @@ async def _record_successful_payment(
                 "trans_id": txn.trans_id,
             }
 
+    if customer.router and plan.connection_type == ConnectionType.STATIC_IP:
+        # Static IP: re-enable the binding/queue (fire-and-forget after commit;
+        # the static-IP enforcement job re-applies if the router was unreachable).
+        from app.services.static_ip import schedule_static_provision
+
+        schedule_static_provision(customer.id)
+
     if pppoe_payload:
         from app.services.pppoe_provisioning import call_pppoe_provision
 

@@ -2648,6 +2648,15 @@ async def run_load_balancing_migrations():
     logger.info("Load-balancing migrations complete")
 
 
+async def run_static_ip_migrations():
+    """Static-IP customers: the pinned device MAC (anti IP-spoofing)."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE customers
+            ADD COLUMN IF NOT EXISTS static_mac VARCHAR(50) NULL
+        """))
+
+
 async def run_management_tunnel_migrations():
     """Add routers.management_tunnel (e.g. "sstp") so ops health can show routers
     whose management tunnel differs from what their ip_address range implies.
@@ -3311,6 +3320,12 @@ async def startup_event():
         logger.error(f"Router status-alert migration failed (non-fatal): {e}")
 
     try:
+        await run_static_ip_migrations()
+        logger.info("Static-IP migration completed successfully")
+    except Exception as e:
+        logger.error(f"Static-IP migration failed (non-fatal): {e}")
+
+    try:
         await run_management_tunnel_migrations()
         logger.info("Management-tunnel migration completed successfully")
     except Exception as e:
@@ -3478,6 +3493,19 @@ async def startup_event():
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=120,
+    )
+    from app.services.static_ip import (
+        ENFORCE_INTERVAL_SECONDS as STATIC_IP_ENFORCE_SECONDS,
+        enforce_static_ip_customers_background,
+    )
+    scheduler.add_job(
+        enforce_static_ip_customers_background,
+        trigger=IntervalTrigger(seconds=STATIC_IP_ENFORCE_SECONDS),
+        id='enforce_static_ip_customers',
+        name='Static-IP customers: suspend expired, repair drift, pin MACs',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,
     )
     scheduler.add_job(
         reconcile_lb_paid_background,

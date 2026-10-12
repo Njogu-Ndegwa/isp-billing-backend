@@ -289,6 +289,7 @@
   "pppoe_username",
   "router_id",
   "static_ip",
+  "static_mac",
   "status",
   "subscription_owner_id",
   "user_id",

@@ -215,6 +215,12 @@ class Customer(Base):
     pppoe_username = Column(String)
     pppoe_password = Column(String)
     static_ip = Column(String)
+    # Static-IP customers only: the device MAC the static IP is pinned to. The
+    # router drops forwarded traffic from the IP with any other MAC, so a
+    # neighbour who types in a paying customer's IP gets nothing. Deliberately
+    # NOT mac_address — that column is the hotspot identity and drives hotspot
+    # bindings, the bypass safety net and expiry cleanup.
+    static_mac = Column(String(50), nullable=True)
     status = Column(Enum(CustomerStatus), nullable=False, default=CustomerStatus.INACTIVE)
     expiry = Column(DateTime)
     plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"))
