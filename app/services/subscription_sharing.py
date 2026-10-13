@@ -48,6 +48,33 @@ def shared_device_limit_for_plan(plan: Plan | None) -> int:
     return max(0, max_shared_users - 1)
 
 
+def max_devices_for_customer(customer: Customer | None, plan: Plan | None = None) -> int:
+    """Total devices this customer may use, including their own.
+
+    The reseller's per-customer ``max_devices_override`` wins over the plan's
+    ``max_shared_users``. Pass ``plan`` whenever the customer's plan relation
+    may not be loaded, so it is never lazy-loaded in async code.
+    """
+    override = getattr(customer, "max_devices_override", None) if customer is not None else None
+    if override is not None:
+        try:
+            return max(1, int(override))
+        except (TypeError, ValueError):
+            pass
+    if plan is None and customer is not None:
+        plan = customer.__dict__.get("plan")
+    return max_shared_users_for_plan(plan)
+
+
+def sharing_enabled_for_customer(customer: Customer | None, plan: Plan | None = None) -> bool:
+    return max_devices_for_customer(customer, plan) > 1
+
+
+def shared_device_limit_for_customer(customer: Customer | None, plan: Plan | None = None) -> int:
+    """Extra devices allowed beyond the customer's own."""
+    return max(0, max_devices_for_customer(customer, plan) - 1)
+
+
 async def active_shared_device_count(
     db: AsyncSession,
     owner_customer_id: int,
@@ -168,7 +195,7 @@ async def sync_shared_subscription_devices_after_owner_renewal(
         )
     ).all()
 
-    limit = shared_device_limit_for_plan(plan)
+    limit = shared_device_limit_for_customer(owner_customer, plan)
     now = datetime.utcnow()
     for pairing, shared_customer, _router in rows[limit:]:
         pairing.is_active = False

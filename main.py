@@ -137,6 +137,7 @@ from app.api.load_balancing_routes import router as load_balancing_router
 from app.api.outage_compensation_routes import router as outage_compensation_router
 from app.api.impersonation_routes import router as impersonation_router
 from app.api.static_ip_import_routes import router as static_ip_import_router
+from app.api.customer_device_routes import router as customer_device_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -190,6 +191,7 @@ app.include_router(load_balancing_router)
 app.include_router(outage_compensation_router)
 app.include_router(impersonation_router)
 app.include_router(static_ip_import_router)
+app.include_router(customer_device_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -2743,6 +2745,30 @@ async def run_customer_grace_migrations():
     raise last_exc
 
 
+async def run_customer_device_limit_migrations():
+    """Add customers.max_devices_override: a reseller-set number of devices for
+    one customer that overrides the plan's max_shared_users. Idempotent and
+    nullable with no default, so this is a metadata-only change.
+
+    Same retry loop as run_customer_grace_migrations: customers is the hottest
+    table and app connections carry lock_timeout.
+    """
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(sa_text("""
+                    ALTER TABLE customers
+                    ADD COLUMN IF NOT EXISTS max_devices_override INTEGER NULL
+                """))
+            return
+        except Exception as exc:  # lock_timeout under a busy table: try again
+            last_exc = exc
+            logger.warning("Customer device-limit migration attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise last_exc
+
+
 async def run_standard_runtime_migrations():
     """Add the routers columns the standard-runtime installer records its work
     in (app/services/standard_runtime_enrol.py): check-in applier and
@@ -3392,6 +3418,12 @@ async def startup_event():
         logger.info("Customer grace-period migration completed successfully")
     except Exception as e:
         logger.error(f"Customer grace-period migration failed (non-fatal): {e}")
+
+    try:
+        await run_customer_device_limit_migrations()
+        logger.info("Customer device-limit migration completed successfully")
+    except Exception as e:
+        logger.error(f"Customer device-limit migration failed (non-fatal): {e}")
 
     try:
         await run_standard_runtime_migrations()

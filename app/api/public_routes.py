@@ -1518,6 +1518,40 @@ async def reconnect_self_service(
             detail="No active subscription found for this phone number on this network",
         )
 
+    # On a plan that covers several devices, a new device reconnecting by phone
+    # is added alongside the customer's other devices instead of taking the
+    # plan away from them (the one-slot swap that dropped TVs). At the limit
+    # the portal gets 409 device_limit_reached with the device list. Only for
+    # paid time: sharing requires an unexpired plan, so a customer in grace
+    # keeps the old move-the-device behaviour.
+    from app.services.subscription_sharing import sharing_enabled_for_customer
+
+    owner_mac = normalize_mac_address(customer.mac_address) if customer.mac_address else None
+    if (
+        owner_mac
+        and owner_mac != normalized_mac
+        and customer.plan
+        and customer.plan.connection_type == ConnectionType.HOTSPOT
+        and customer.expiry > now
+        and sharing_enabled_for_customer(customer, customer.plan)
+    ):
+        from app.api.access_code_routes import add_device_to_owner_plan
+
+        customer_id = customer.id
+        result = await add_device_to_owner_plan(
+            db,
+            owner=customer,
+            router_id=request.router_id,
+            normalized_mac=normalized_mac,
+        )
+        db.add(ReconnectionAttempt(
+            phone=phone_raw, mac_address=normalized_mac,
+            router_id=request.router_id, customer_id=customer_id,
+            success=True, created_at=datetime.utcnow(),
+        ))
+        await db.commit()
+        return result
+
     return await restore_customer_on_device(
         db,
         customer=customer,

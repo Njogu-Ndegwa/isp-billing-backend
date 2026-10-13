@@ -42,8 +42,8 @@ from app.services.code_attempt_limiter import check_code_attempts, record_code_f
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.router_helpers import get_router_by_id
 from app.services.subscription_sharing import (
-    max_shared_users_for_plan,
-    sharing_enabled_for_plan,
+    max_devices_for_customer,
+    sharing_enabled_for_customer,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,8 +82,8 @@ def _plan_summary(owner: Customer) -> dict:
     return {
         "plan_name": plan.name if plan else None,
         "expires_at": owner.expiry.isoformat() if owner.expiry else None,
-        "sharing_enabled": sharing_enabled_for_plan(plan),
-        "max_devices": max_shared_users_for_plan(plan),
+        "sharing_enabled": sharing_enabled_for_customer(owner, plan),
+        "max_devices": max_devices_for_customer(owner, plan),
     }
 
 
@@ -169,6 +169,34 @@ async def redeem_code_on_device(
         )
         return {**result, **summary, "outcome": "main_device"}
 
+    return await add_device_to_owner_plan(
+        db,
+        owner=owner,
+        router_id=router_id,
+        normalized_mac=normalized_mac,
+        device_type=device_type,
+        device_name=device_name,
+        summary=summary,
+    )
+
+
+async def add_device_to_owner_plan(
+    db: AsyncSession,
+    *,
+    owner: Customer,
+    router_id: int,
+    normalized_mac: str,
+    device_type: str = "other",
+    device_name: Optional[str] = None,
+    summary: Optional[dict] = None,
+) -> dict:
+    """Add ``normalized_mac`` as another device on ``owner``'s plan.
+
+    Shared by the code path above and phone-number reconnect. When every slot
+    is taken this raises 409 ``device_limit_reached`` with the plan's devices,
+    which the captive portal shows so the customer can remove one.
+    """
+    summary = summary if summary is not None else _plan_summary(owner)
     owner_id = owner.id
     try:
         result = await _share_subscription_for_owner(

@@ -55,10 +55,10 @@ from app.services.plan_cache import FREE_TRIAL_NOT_PURCHASABLE, plan_model_allow
 from app.services.reseller_payments import record_customer_payment
 from app.services.subscription_sharing import (
     active_shared_device_count,
-    max_shared_users_for_plan,
+    max_devices_for_customer,
     schedule_shared_device_delivery,
-    shared_device_limit_for_plan,
-    sharing_enabled_for_plan,
+    shared_device_limit_for_customer,
+    sharing_enabled_for_customer,
 )
 
 logger = logging.getLogger(__name__)
@@ -408,11 +408,11 @@ async def _load_active_share_owner_stats(
         raise HTTPException(status_code=400, detail="Subscription does not belong to this router")
     if not owner.expiry or owner.expiry <= datetime.utcnow() or owner.status != CustomerStatus.ACTIVE:
         raise HTTPException(status_code=404, detail="No active hotspot subscription found for this phone on this router")
-    if not sharing_enabled_for_plan(plan):
+    if not sharing_enabled_for_customer(owner, plan):
         raise HTTPException(status_code=403, detail="This plan does not allow subscription sharing")
 
-    max_shared_users = max_shared_users_for_plan(plan)
-    max_companion_devices = shared_device_limit_for_plan(plan)
+    max_shared_users = max_devices_for_customer(owner, plan)
+    max_companion_devices = shared_device_limit_for_customer(owner, plan)
     active_shared_count = await active_shared_device_count(db, owner.id)
     return plan, router_obj, max_shared_users, max_companion_devices, active_shared_count
 
@@ -1408,7 +1408,7 @@ async def get_share_subscription_owner_status(
         ]
         shareable_owners = [
             owner for owner in hotspot_owners
-            if sharing_enabled_for_plan(owner.plan)
+            if sharing_enabled_for_customer(owner, owner.plan)
         ]
         owner = shareable_owners[0] if shareable_owners else (hotspot_owners[0] if hotspot_owners else None)
 
@@ -1421,12 +1421,12 @@ async def get_share_subscription_owner_status(
             }
 
         plan = owner.plan
-        sharing_enabled = sharing_enabled_for_plan(plan)
+        sharing_enabled = sharing_enabled_for_customer(owner, plan)
         return {
             "router_id": router_id,
             "has_active_subscription": True,
             "sharing_enabled": sharing_enabled,
-            "max_shared_users": max_shared_users_for_plan(plan),
+            "max_shared_users": max_devices_for_customer(owner, plan),
             "requires_access_code": True,
             "message": (
                 "Enter your access code or voucher to manage devices on this plan."

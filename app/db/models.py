@@ -246,6 +246,10 @@ class Customer(Base):
     # expiry + grace instead of at expiry, without moving the paid expiry.
     # See app/services/customer_grace.py.
     grace_period_minutes = Column(Integer, nullable=False, default=0, server_default="0")
+    # Per-customer override of the plan's device allowance (Plan.max_shared_users,
+    # total devices including the owner's). NULL = use the plan's value.
+    # See app/services/subscription_sharing.py max_devices_for_customer.
+    max_devices_override = Column(Integer, nullable=True)
     # Nullable self-reference used by managed companion devices that share the
     # paying customer's subscription/expiry instead of buying their own plan.
     subscription_owner_id = Column(
