@@ -17,6 +17,7 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user
 from app.services.markets import REPORTING_CURRENCY, reseller_market, sql_kes_by_market
 from app.services.subscription import get_invoice_alert_for_user
+from app.services.payment_plan import payment_plan_id
 from app.services.router_helpers import get_router_by_id
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, validate_mac_address
 
@@ -235,17 +236,18 @@ async def get_dashboard_overview(
             for row in router_revenue_result
         ]
         
-        # Revenue by plan (filtered by router if specified)
+        # Revenue by plan (filtered by router if specified), credited to the
+        # plan each payment bought, not the customer's current plan
         plan_revenue_stmt = select(
             Plan.id,
             Plan.name,
             Plan.price,
             func.count(CustomerPayment.id).label('sales_count'),
             func.sum(case((CustomerPayment.counts_as_revenue == True, CustomerPayment.amount), else_=0)).label('revenue')
+        ).select_from(CustomerPayment).outerjoin(
+            Customer, CustomerPayment.customer_id == Customer.id
         ).join(
-            Customer, Customer.plan_id == Plan.id
-        ).join(
-            CustomerPayment, CustomerPayment.customer_id == Customer.id
+            Plan, Plan.id == payment_plan_id()
         ).where(
             Plan.user_id == user_id
         )
@@ -269,7 +271,7 @@ async def get_dashboard_overview(
         recent_txn_stmt = select(CustomerPayment, Customer, Plan).join(
             Customer, CustomerPayment.customer_id == Customer.id
         ).join(
-            Plan, Customer.plan_id == Plan.id, isouter=True
+            Plan, Plan.id == payment_plan_id(), isouter=True
         ).where(
             CustomerPayment.reseller_id == user_id
         )
@@ -456,7 +458,7 @@ async def get_dashboard_analytics(
         ).join(
             Customer, CustomerPayment.customer_id == Customer.id
         ).outerjoin(
-            Plan, Customer.plan_id == Plan.id
+            Plan, Plan.id == payment_plan_id()
         ).where(
             CustomerPayment.reseller_id == user_id,
             CustomerPayment.created_at >= filter_start,

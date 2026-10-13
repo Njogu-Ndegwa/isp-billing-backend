@@ -22,6 +22,7 @@ from app.services.plan_cache import (
     plan_allows_router,
 )
 from app.services.subscription import enforce_active_subscription
+from app.services.payment_plan import payment_plan_id
 import logging
 
 logger = logging.getLogger(__name__)
@@ -689,7 +690,7 @@ async def get_plan_performance(
     Get performance metrics for each plan
     
     Shows:
-    - Total sales per plan
+    - Total sales per plan, and how many customers made them
     - Revenue per plan
     - Average revenue per sale
     - Current active customers per plan
@@ -697,43 +698,55 @@ async def get_plan_performance(
     try:
         user = await get_current_user(token, db)
         
-        # Base query for plan performance
+        # The period's payments, each tagged with the plan it bought (not the
+        # customer's current plan). Filtering here rather than on the outer
+        # query keeps plans with no sales in the period in the result.
+        payments = select(
+            CustomerPayment.id,
+            CustomerPayment.customer_id,
+            CustomerPayment.amount,
+            CustomerPayment.counts_as_revenue,
+            payment_plan_id().label('plan_id'),
+        ).outerjoin(
+            Customer, CustomerPayment.customer_id == Customer.id
+        ).where(
+            CustomerPayment.reseller_id == user.id
+        )
+
+        # Apply date filters if provided
+        if start_date:
+            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            payments = payments.where(CustomerPayment.created_at >= start_dt)
+
+        if end_date:
+            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+            if 'T' not in end_date:
+                end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            payments = payments.where(CustomerPayment.created_at <= end_dt)
+
+        payments = payments.subquery()
+
         stmt = select(
             Plan.id,
             Plan.name,
             Plan.price,
             Plan.duration_value,
             Plan.duration_unit,
-            func.count(Customer.id.distinct()).label('total_customers'),
-            func.count(CustomerPayment.id).label('total_sales'),
+            func.count(payments.c.customer_id.distinct()).label('total_customers'),
+            func.count(payments.c.id).label('total_sales'),
             # Count every sale, but exclude compensation vouchers
             # (counts_as_revenue=False) from the revenue amount.
             func.sum(
                 case(
-                    (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
+                    (payments.c.counts_as_revenue == True, payments.c.amount),
                     else_=0,
                 )
             ).label('total_revenue')
         ).outerjoin(
-            Customer, Customer.plan_id == Plan.id
-        ).outerjoin(
-            CustomerPayment, CustomerPayment.customer_id == Customer.id
+            payments, payments.c.plan_id == Plan.id
         ).where(
             Plan.user_id == user.id
-        )
-        
-        # Apply date filters if provided
-        if start_date:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            stmt = stmt.where(CustomerPayment.created_at >= start_dt)
-        
-        if end_date:
-            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            if 'T' not in end_date:
-                end_dt = end_dt.replace(hour=23, minute=59, second=59)
-            stmt = stmt.where(CustomerPayment.created_at <= end_dt)
-        
-        stmt = stmt.group_by(Plan.id, Plan.name, Plan.price, Plan.duration_value, Plan.duration_unit)
+        ).group_by(Plan.id, Plan.name, Plan.price, Plan.duration_value, Plan.duration_unit)
         
         result = await db.execute(stmt)
         
