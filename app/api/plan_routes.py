@@ -4,6 +4,7 @@ from sqlalchemy import select, func, update, case, or_
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
+import asyncio
 import json
 
 from app.db.database import get_db
@@ -475,8 +476,13 @@ async def update_plan_api(
             plan.fup_action = _parse_fup_action(request.fup_action)
         if "fup_throttle_profile" in fields_set:
             plan.fup_throttle_profile = request.fup_throttle_profile if request.fup_throttle_profile else None
+        previous_max_devices = int(plan.max_shared_users or 1)
         if request.max_shared_users is not None:
             plan.max_shared_users = _validate_max_shared_users(request.max_shared_users)
+        pppoe_devices_changed = (
+            plan.connection_type == ConnectionType.PPPOE
+            and int(plan.max_shared_users or 1) != previous_max_devices
+        )
         if "router_ids" in fields_set:
             plan.router_ids = await _validate_router_scope(db, user.id, request.router_ids)
         if request.trial_once_per_customer is not None:
@@ -486,7 +492,14 @@ async def update_plan_api(
         await db.commit()
         await db.refresh(plan)
         await invalidate_plan_cache()
-        
+
+        if pppoe_devices_changed:
+            # The device count lives on each customer's router (their PPP
+            # profile); push it in the background, never on this request.
+            from app.services.pppoe_provisioning import reprovision_plan_pppoe_customers
+
+            asyncio.create_task(reprovision_plan_pppoe_customers(plan.id))
+
         logger.info(f"Plan {plan_id} updated: type={plan.plan_type.value}, hidden={plan.is_hidden}")
         
         return {

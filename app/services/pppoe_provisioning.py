@@ -785,3 +785,86 @@ def build_pppoe_remove_payload(customer, router) -> dict:
         "router_password": router.password,
         "router_port": router.port,
     }
+
+
+# --------------------------------------------------------------------------
+# Device-limit changes
+# --------------------------------------------------------------------------
+
+
+async def active_fup_restriction(db, customer_id: int):
+    """The FUP action currently holding the customer down, or None.
+
+    Re-provisioning puts a secret back on its normal profile, which would
+    silently lift a throttle or block that FUP applied this period.
+    """
+    from app.db.models import FupAction
+    from app.services.usage_tracking import get_open_period
+
+    period = await get_open_period(db, customer_id)
+    if (
+        period is not None
+        and period.fup_triggered_at is not None
+        and period.fup_reverted_at is None
+        and period.fup_action_taken in (FupAction.THROTTLE, FupAction.BLOCK)
+    ):
+        return period.fup_action_taken
+    return None
+
+
+async def reprovision_plan_pppoe_customers(plan_id: int) -> dict:
+    """Push a PPPoE plan's device allowance to its active customers' routers.
+
+    Runs in the background after a reseller changes the plan's device count.
+    Customers with their own device limit (``max_devices_override``) are not
+    affected by the plan's number and are skipped, as are customers FUP is
+    holding down this period (they pick the change up at renewal). Each
+    re-provision reconnects that customer's devices once.
+
+    The customer list is read in one short session that is closed before any
+    router I/O; routers are then updated one customer at a time.
+    """
+    from sqlalchemy.orm import selectinload
+
+    from app.db.database import async_session
+
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(Customer)
+                .options(selectinload(Customer.plan), selectinload(Customer.router))
+                .where(
+                    Customer.plan_id == plan_id,
+                    Customer.status == CustomerStatus.ACTIVE,
+                    Customer.pppoe_username.isnot(None),
+                    Customer.pppoe_password.isnot(None),
+                    Customer.router_id.isnot(None),
+                    Customer.max_devices_override.is_(None),
+                )
+            )
+        ).scalars().all()
+        payloads = []
+        skipped_fup = 0
+        for customer in rows:
+            if not customer.plan or customer.plan.connection_type != ConnectionType.PPPOE or not customer.router:
+                continue
+            if await active_fup_restriction(db, customer.id):
+                skipped_fup += 1
+                continue
+            payloads.append((customer.id, build_pppoe_payload(customer, customer.router)))
+        await db.commit()
+
+    applied = failed = 0
+    for customer_id, payload in payloads:
+        result = await call_pppoe_provision(payload)
+        if result and result.get("success"):
+            applied += 1
+        else:
+            failed += 1
+            logger.warning(
+                "[PPPoE] Plan %s device-limit update failed for customer %s: %s",
+                plan_id, customer_id, (result or {}).get("error"),
+            )
+    summary = {"plan_id": plan_id, "applied": applied, "failed": failed, "skipped_fup": skipped_fup}
+    logger.info("[PPPoE] Plan device-limit update: %s", summary)
+    return summary

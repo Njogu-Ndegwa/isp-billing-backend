@@ -129,20 +129,28 @@ async def test_phone_reconnect_adds_device_when_a_slot_is_free(db, stub_router):
     assert stub_router["provisioned"] == [TV_MAC]
 
 
-async def test_phone_reconnect_at_the_limit_lists_devices_and_moves_nothing(db, stub_router):
+async def test_phone_reconnect_at_the_limit_moves_the_main_device(db, stub_router):
     _reseller, _plan, router, owner = await _owner(db, max_shared_users=2)
     await _reconnect_by_phone(db, router, TV_MAC)
     await stub_router["drain"]()
 
-    with pytest.raises(HTTPException) as exc:
-        await _reconnect_by_phone(db, router, LAPTOP_MAC)
+    # Full plan: the customer's own phone with a new MAC must not be locked
+    # out. The main slot moves; the TV keeps its slot.
+    result = await _reconnect_by_phone(db, router, LAPTOP_MAC)
 
-    assert exc.value.status_code == 409
-    detail = exc.value.detail
-    assert detail["error"] == "device_limit_reached"
-    assert [d["device_mac"] for d in detail["devices"]] == [OWNER_MAC, TV_MAC]
+    assert result["success"] is True
     await db.refresh(owner)
-    assert owner.mac_address == OWNER_MAC
+    assert owner.mac_address == LAPTOP_MAC
+    assert [p.device_mac for p in await _active_pairings(db, owner)] == [TV_MAC]
+
+
+async def test_device_added_by_phone_is_labelled(db, stub_router):
+    _reseller, _plan, router, owner = await _owner(db, max_shared_users=3)
+    await _reconnect_by_phone(db, router, TV_MAC)
+    await stub_router["drain"]()
+
+    pairing = (await _active_pairings(db, owner))[0]
+    assert pairing.device_name == public_routes.PHONE_ADDED_DEVICE_NAME
 
 
 async def test_single_device_plan_still_moves_the_plan(db, stub_router):

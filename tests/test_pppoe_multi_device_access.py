@@ -7,13 +7,14 @@ credited to the customer, so the plan's data cap stays one shared total.
 """
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
 from app.api import customer_device_routes
 from app.api.customer_device_routes import DeviceLimitRequest
-from app.db.models import ConnectionType, CustomerStatus, CustomerUsagePeriod, UserBandwidthUsage
+from app.db.models import ConnectionType, CustomerStatus, CustomerUsagePeriod, FupAction, UserBandwidthUsage
 from app.services import fup, pppoe_provisioning, usage_push
 from app.services.mikrotik_api import (
     MikroTikAPI,
@@ -63,7 +64,7 @@ def test_multi_device_profile_allows_n_sessions():
     assert result["profile"] == name == "pppoe_10M_10M_d3"
     assert kwargs["only_one"] == "no"
     assert "> 3" in kwargs["on_up"]
-    assert '/ppp active remove [find where name=$user and caller-id=$"caller-id"]' in kwargs["on_up"]
+    assert "/ppp active remove $newest" in kwargs["on_up"]
     assert is_multi_device_profile(name)
     assert not is_multi_device_profile("pppoe_10M_10M")
     assert not is_multi_device_profile("default-pppoe")
@@ -100,8 +101,13 @@ def test_access_defaults_leave_multi_device_profiles_alone():
     assert sets == ["*pppoe_10M_10M"]
 
 
+def _stub(username, override=None):
+    return SimpleNamespace(pppoe_username=username, max_devices_override=override)
+
+
 def test_extra_session_queue_resolves_to_its_owner():
-    index = {"pppoe:alice": object(), "pppoe:al-2": object()}
+    alice = _stub("alice", override=3)
+    index = {"pppoe:alice": alice, "pppoe:al-2": _stub("al-2")}
 
     # By the session IP from /ppp active.
     assert resolve_pppoe_queue_owner(
@@ -113,6 +119,21 @@ def test_extra_session_queue_resolves_to_its_owner():
     assert resolve_pppoe_queue_owner("pppoe:al-2", "", index, None) is None
     # Unknown base: nothing to credit.
     assert resolve_pppoe_queue_owner("pppoe:carol-1", "", index, None) is None
+
+
+def test_leftover_login_is_never_billed_to_a_lookalike_customer():
+    john = _stub("john")  # single device
+    index = {"pppoe:john": john}
+
+    # A router-only secret "john-2" must not be credited to john.
+    assert resolve_pppoe_queue_owner("pppoe:john-2", "", index, None) is None
+
+    # Even for a multi-device customer, the router's session list wins: this
+    # IP belongs to the login "john-2", not to john.
+    john.max_devices_override = 3
+    assert resolve_pppoe_queue_owner(
+        "pppoe:john-2", "192.168.89.40/32", index, {"192.168.89.40": "john-2"},
+    ) is None
 
 
 async def _pppoe_customer(db, *, max_shared_users=1, override=None, cap_mb=None):
@@ -216,9 +237,13 @@ async def test_fup_throttle_keeps_the_device_allowance(db, monkeypatch):
     assert profile_name.startswith("fup-") and profile_name.endswith("_d3")
 
 
-def test_on_up_script_counts_against_the_limit():
+def test_on_up_script_drops_only_the_newest_session_over_the_limit():
     script = multi_device_on_up_script(2)
-    assert script.startswith(":if ([:len [/ppp active find where name=$user]] > 2) do={")
+    assert script.startswith(":local ids [/ppp active find where name=$user]; :if ([:len $ids] > 2) do={")
+    # The lowest-uptime session is the one removed, so simultaneous dials
+    # agree on one victim instead of each removing itself.
+    assert "($up < $best)" in script
+    assert script.count("/ppp active remove") == 1
 
 
 @pytest.mark.asyncio
@@ -241,3 +266,62 @@ async def test_device_limit_change_reprovisions_an_active_pppoe_customer(db, mon
     assert result["router_update"] == "applied"
     assert [p["max_devices"] for p in pushed] == [3]
     assert pushed[0]["pppoe_username"] == "alice"
+
+
+@pytest.mark.asyncio
+async def test_device_limit_change_keeps_an_active_fup_throttle(db, monkeypatch):
+    reseller, _router, plan, customer = await _pppoe_customer(db, max_shared_users=1, cap_mb=100)
+    token = {"user_id": reseller.id, "role": reseller.role.value}
+    db.add(CustomerUsagePeriod(
+        customer_id=customer.id,
+        period_start=datetime.utcnow() - timedelta(days=1),
+        period_end=datetime.utcnow() + timedelta(days=29),
+        fup_triggered_at=datetime.utcnow(),
+        fup_action_taken=FupAction.THROTTLE,
+    ))
+    await db.commit()
+    throttled, provisioned = [], []
+
+    async def fake_throttle(_db, c, _plan):
+        throttled.append(c.id)
+        return {"success": True}
+
+    async def fake_provision(payload):
+        provisioned.append(payload)
+        return {"success": True}
+
+    monkeypatch.setattr(customer_device_routes, "apply_throttle", fake_throttle)
+    monkeypatch.setattr(customer_device_routes, "call_pppoe_provision", fake_provision)
+
+    result = await customer_device_routes.set_customer_device_limit(
+        customer.id, DeviceLimitRequest(max_devices=3), db, token,
+    )
+
+    assert result["router_update"] == "applied"
+    assert throttled == [customer.id]  # throttle re-applied with the new limit
+    assert provisioned == []  # never moved back to the full-speed profile
+
+
+@pytest.mark.asyncio
+async def test_plan_device_change_reaches_active_customers(db, session_factory, monkeypatch):
+    _reseller, _router, plan, customer = await _pppoe_customer(db, max_shared_users=3)
+    await make_customer(
+        db, _reseller, plan, _router,
+        pppoe_username="bob", pppoe_password="pw", mac_address=None,
+        status=CustomerStatus.ACTIVE, expiry=datetime.utcnow() + timedelta(days=5),
+        max_devices_override=1,  # has their own limit: left alone
+    )
+    pushed = []
+
+    async def fake_provision(payload):
+        pushed.append((payload["pppoe_username"], payload["max_devices"]))
+        return {"success": True}
+
+    monkeypatch.setattr(pppoe_provisioning, "call_pppoe_provision", fake_provision)
+    import app.db.database as database
+    monkeypatch.setattr(database, "async_session", session_factory)
+
+    summary = await pppoe_provisioning.reprovision_plan_pppoe_customers(plan.id)
+
+    assert pushed == [("alice", 3)]
+    assert summary["applied"] == 1 and summary["failed"] == 0

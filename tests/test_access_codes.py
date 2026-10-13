@@ -446,19 +446,17 @@ async def test_phone_reconnect_never_takes_over_a_shared_device(db, stub_provisi
     ))
     await db.commit()
 
-    # Both slots of the 2-device plan are taken, so a third device reconnecting
-    # by phone is refused with the device list instead of taking a slot.
-    with pytest.raises(HTTPException) as exc:
-        await public_routes.reconnect_self_service(
-            public_routes.ReconnectRequest(phone="0700000900", mac_address=PHONE_3, router_id=router.id),
-            BackgroundTasks(),
-            db,
-        )
-    assert exc.value.status_code == 409
-    assert exc.value.detail["error"] == "device_limit_reached"
+    # Both slots of the 2-device plan are taken, so the reconnecting device
+    # takes over the plan's main slot; the shared device keeps its own.
+    result = await public_routes.reconnect_self_service(
+        public_routes.ReconnectRequest(phone="0700000900", mac_address=PHONE_3, router_id=router.id),
+        BackgroundTasks(),
+        db,
+    )
+    assert result["success"] is True
     await db.refresh(owner)
     await db.refresh(shared)
-    assert owner.mac_address == OWNER_MAC
+    assert owner.mac_address == PHONE_3
     assert shared.mac_address == PHONE_2
 
 

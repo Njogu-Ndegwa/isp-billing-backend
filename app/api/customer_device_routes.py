@@ -33,19 +33,26 @@ from app.db.models import (
     ConnectionType,
     Customer,
     CustomerStatus,
+    CustomerUsagePeriod,
+    FupAction,
     RouterAuthMethod,
     UserRole,
 )
 from app.services.auth import get_current_user, verify_token
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services import realtime_state
-from app.services.pppoe_provisioning import build_pppoe_payload, call_pppoe_provision
+from app.services.fup import apply_throttle
+from app.services.pppoe_provisioning import (
+    active_fup_restriction,
+    build_pppoe_payload,
+    call_pppoe_provision,
+)
 from app.services.router_concurrency import run_with_guard
 from app.services.subscription_sharing import (
     max_devices_for_customer,
     max_shared_users_for_plan,
 )
-from app.services.usage_tracking import get_open_period, pooled_period_usage_bytes
+from app.services.usage_tracking import pooled_period_usage_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -186,14 +193,29 @@ async def _devices_payload(db: AsyncSession, owner: Customer, *, live: bool = Tr
         ).scalars().all()
         customer_by_mac = {normalize_mac_address(c.mac_address): c for c in rows if c.mac_address}
 
+    # Every device's open usage period in one query (latest wins per customer).
+    device_ids = {c.id for c in customer_by_mac.values()} | {owner.id}
+    open_periods: dict[int, CustomerUsagePeriod] = {}
+    for period in (
+        await db.execute(
+            select(CustomerUsagePeriod)
+            .where(
+                CustomerUsagePeriod.customer_id.in_(device_ids),
+                CustomerUsagePeriod.closed_at.is_(None),
+            )
+            .order_by(CustomerUsagePeriod.period_start.asc())
+        )
+    ).scalars().all():
+        open_periods[period.customer_id] = period
+
     for device in devices:
         device_customer = customer_by_mac.get(device["device_mac"])
         device["customer_id"] = device_customer.id if device_customer else None
-        period = await get_open_period(db, device_customer.id) if device_customer else None
+        period = open_periods.get(device_customer.id) if device_customer else None
         device["period_usage_mb"] = _mb(period.total_bytes) if period else None
         device["live"] = None
 
-    owner_period = await get_open_period(db, owner.id)
+    owner_period = open_periods.get(owner.id)
     pooled_mb = _mb(await pooled_period_usage_bytes(db, owner, owner_period)) if owner_period else None
 
     router_obj = owner.router
@@ -361,6 +383,7 @@ async def set_customer_device_limit(
     # PPPoE: the limit lives on the router (the secret's profile), so apply it
     # now for a paying customer. Their devices reconnect once to pick it up.
     pppoe_payload = None
+    fup_hold = None
     if (
         owner.plan
         and owner.plan.connection_type == ConnectionType.PPPOE
@@ -369,10 +392,21 @@ async def set_customer_device_limit(
         and owner.router is not None
         and owner.status == CustomerStatus.ACTIVE
     ):
-        pppoe_payload = build_pppoe_payload(owner, owner.router)
+        # Re-provisioning would put the secret back on its normal profile and
+        # quietly lift a FUP throttle or block applied this period.
+        fup_hold = await active_fup_restriction(db, owner.id)
+        if fup_hold is None:
+            pppoe_payload = build_pppoe_payload(owner, owner.router)
     await db.commit()
 
-    if pppoe_payload is not None:
+    if fup_hold == FupAction.THROTTLE:
+        # Re-apply the throttle: its profile carries the new device limit.
+        result = await apply_throttle(db, owner, owner.plan)
+        response["router_update"] = "failed" if result.get("error") else "applied"
+    elif fup_hold == FupAction.BLOCK:
+        # Blocked over the cap: leave the router alone; renewal applies it.
+        response["router_update"] = "deferred"
+    elif pppoe_payload is not None:
         result = await call_pppoe_provision(pppoe_payload)
         response["router_update"] = "applied" if result and result.get("success") else "failed"
     return response

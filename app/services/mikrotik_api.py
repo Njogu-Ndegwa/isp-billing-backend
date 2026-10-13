@@ -72,16 +72,24 @@ def multi_device_on_up_script(max_devices: int) -> str:
     """RouterOS on-up script that keeps a username to ``max_devices`` sessions.
 
     Runs when a session comes up. If the username now has more sessions than
-    allowed, the session that just came up (identified by its caller-id, the
-    device MAC) is removed, so devices already online keep working. The extra
+    allowed, the newest one (lowest uptime) is removed, so devices already
+    online keep working. Picking the newest rather than "my own session"
+    means two devices finishing login in the same second both choose the
+    same session to drop, instead of both kicking themselves. The refused
     device sees its dial fail and retries.
     """
     n = int(max_devices)
     return (
-        f':if ([:len [/ppp active find where name=$user]] > {n}) do={{ '
-        f':log info ("bitwave: " . $user . " is at its {n}-device limit, dropping " . $"caller-id"); '
-        f'/ppp active remove [find where name=$user and caller-id=$"caller-id"] }}'
+        ':local ids [/ppp active find where name=$user]; '
+        f':if ([:len $ids] > {n}) do={{ '
+        ':local newest; :local best; '
+        ':foreach i in=$ids do={ :local up [/ppp active get $i uptime]; '
+        ':if (([:typeof $best] = "nothing") || ($up < $best)) do={ :set best $up; :set newest $i } }; '
+        f':log info ("bitwave: " . $user . " is at its {n}-device limit, dropping its newest session"); '
+        ':do { /ppp active remove $newest } on-error={} }'
     )
+
+
 DEFAULT_HOTSPOT_KEEPALIVE_TIMEOUT = "2m"
 
 

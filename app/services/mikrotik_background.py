@@ -50,6 +50,7 @@ from app.services.router_availability import (
     prune_router_availability_history,
 )
 from app.services.usage_tracking import record_usage
+from app.services.pppoe_sessions import resolve_extra_session_customer
 from app.services.usage_counters import clamp_to_line_rate, record_queue_usage_sample
 from app.services.fup import hotspot_throttle_rate_for_plan
 from app.services import customer_expiry_notifications
@@ -3373,10 +3374,6 @@ def _find_hotspot_customer(
     return None
 
 
-# Extra sessions of one PPPoE username (profile only-one=no): <pppoe-alice-1>.
-_EXTRA_PPPOE_SESSION_RE = re.compile(r"^(?P<base>.+)-(?P<n>\d{1,3})$")
-
-
 def _find_pppoe_customer(
     customers: list[Customer], pppoe_username: str
 ) -> Customer | None:
@@ -4019,13 +4016,13 @@ async def collect_bandwidth_snapshot():
                                 # keeps its own counter baseline.
                                 extra_session = None
                                 if customer is None:
-                                    extra_match = _EXTRA_PPPOE_SESSION_RE.match(pppoe_user)
-                                    if extra_match:
-                                        customer = _find_pppoe_customer(
-                                            router_customers, extra_match.group("base")
-                                        )
-                                        if customer is not None:
-                                            extra_session = extra_match.group("n")
+                                    customer = resolve_extra_session_customer(
+                                        pppoe_user,
+                                        q.get("target", ""),
+                                        lambda username: _find_pppoe_customer(router_customers, username),
+                                    )
+                                    if customer is not None:
+                                        extra_session = pppoe_user
 
                                 # Canonical usage-row key comes from the DB username
                                 # when the customer is known so the cap sampler and
@@ -4034,7 +4031,8 @@ async def collect_bandwidth_snapshot():
                                 if customer and customer.pppoe_username:
                                     pppoe_key = f"pppoe:{customer.pppoe_username}"
                                     if extra_session:
-                                        pppoe_key = f"{pppoe_key}-{extra_session}"
+                                        # Its own row: every session keeps its own baseline.
+                                        pppoe_key = f"pppoe:{extra_session}"
                                 else:
                                     pppoe_key = f"pppoe:{pppoe_user}"
                                 lookup_keys = list({pppoe_key, f"pppoe:{pppoe_user}"})

@@ -60,6 +60,7 @@ from app.db.models import (
     User,
 )
 from app.services.mikrotik_api import normalize_mac_address
+from app.services.pppoe_sessions import resolve_extra_session_customer
 from app.services.static_ip import STATIC_KEY_PREFIX, normalize_static_ip
 from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
@@ -243,9 +244,6 @@ def _index_customers(customers: Iterable[Customer], now: Optional[datetime] = No
     return index
 
 
-_EXTRA_SESSION_SUFFIX_RE = re.compile(r"^(?P<base>.+)-(?P<n>\d{1,3})$")
-
-
 def resolve_pppoe_queue_owner(
     key: str,
     target_ip: str,
@@ -254,24 +252,20 @@ def resolve_pppoe_queue_owner(
 ) -> Optional[str]:
     """The ``pppoe:<username>`` that owns a PPPoE queue the index does not know.
 
-    A username logged in on several devices (profile ``only-one=no``) gets one
-    dynamic queue per session; RouterOS names the extras ``<pppoe-alice-1>``,
-    ``<pppoe-alice-2>``, so their key matches no customer. The session's IP
-    (the queue target) names the user exactly when the router reported its
-    ``/ppp active`` list; otherwise a numeric ``-N`` suffix is stripped, but
-    only when the full name is not a customer of its own.
+    Extra sessions of a multi-device login (``<pppoe-alice-1>``); the rules
+    live in ``pppoe_sessions.resolve_extra_session_customer``.
     """
     if not key.startswith("pppoe:") or key in index:
         return None
-    ip = str(target_ip or "").split(",", 1)[0].strip().split("/", 1)[0]
-    if ip and session_users:
-        user = session_users.get(ip)
-        if user and f"pppoe:{user}" in index:
-            return f"pppoe:{user}"
-    match = _EXTRA_SESSION_SUFFIX_RE.match(key[len("pppoe:"):])
-    if match and f"pppoe:{match.group('base')}" in index:
-        return f"pppoe:{match.group('base')}"
-    return None
+    customer = resolve_extra_session_customer(
+        key[len("pppoe:"):],
+        target_ip,
+        lambda username: index.get(f"pppoe:{username}"),
+        session_users,
+    )
+    if customer is None or not customer.pppoe_username:
+        return None
+    return f"pppoe:{customer.pppoe_username}"
 
 
 def _customer_is_live(customer: Customer, now: datetime) -> bool:
