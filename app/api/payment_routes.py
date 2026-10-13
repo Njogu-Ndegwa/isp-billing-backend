@@ -501,6 +501,11 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                         customer.router_id,
                         customer.pppoe_username,
                     )
+            elif customer.plan and customer.plan.connection_type == ConnectionType.STATIC_IP:
+                from app.services.static_ip import schedule_static_provision
+
+                await db.commit()
+                schedule_static_provision(customer.id)
             elif customer.mac_address and customer.router:
                 router_obj = customer.router
                 hotspot_payload = build_hotspot_payload(

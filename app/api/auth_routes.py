@@ -132,6 +132,41 @@ async def register_user_api(
         raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
 
 
+def login_token_claims(user) -> dict:
+    """JWT claims a normal login issues for ``user``.
+
+    Shared with admin "View as reseller" (impersonation_routes), which adds its
+    own imp_* claims on top, so both tokens authenticate identically.
+    """
+    return {
+        "sub": str(user.id),
+        "user_code": user.user_code,
+        "user_id": user.id,
+        "role": user.role.value,
+        "organization_name": user.organization_name
+    }
+
+
+def login_user_payload(user) -> dict:
+    """The ``user`` object returned by /api/auth/login (and by View-as)."""
+    sub_status = getattr(user, 'subscription_status', None)
+    if sub_status and hasattr(sub_status, 'value'):
+        sub_status = sub_status.value
+    return {
+        "id": user.id,
+        "email": user.email,
+        "role": user.role.value,
+        "organization_name": user.organization_name,
+        "business_name": getattr(user, 'business_name', None),
+        "support_phone": getattr(user, 'support_phone', None),
+        "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None),
+        "subscription_status": sub_status,
+        "subscription_expires_at": user.subscription_expires_at.isoformat() if getattr(user, 'subscription_expires_at', None) else None,
+        "preferred_language": getattr(user, 'preferred_language', None),
+        "market": market_summary(user),
+    }
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -155,21 +190,11 @@ async def login_api(
             db.add(user)
             await db.flush()
 
-        token_data = {
-            "sub": str(user.id),
-            "user_code": user.user_code,
-            "user_id": user.id,
-            "role": user.role.value,
-            "organization_name": user.organization_name
-        }
+        token_data = login_token_claims(user)
         access_token = create_access_token(
             data=token_data,
             expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         )
-
-        sub_status = getattr(user, 'subscription_status', None)
-        if sub_status and hasattr(sub_status, 'value'):
-            sub_status = sub_status.value
 
         subscription_alert = None
         try:
@@ -180,19 +205,7 @@ async def login_api(
         response = {
             "access_token": access_token,
             "token_type": "bearer",
-            "user": {
-                "id": user.id,
-                "email": user.email,
-                "role": user.role.value,
-                "organization_name": user.organization_name,
-                "business_name": getattr(user, 'business_name', None),
-                "support_phone": getattr(user, 'support_phone', None),
-                "mpesa_shortcode": getattr(user, 'mpesa_shortcode', None),
-                "subscription_status": sub_status,
-                "subscription_expires_at": user.subscription_expires_at.isoformat() if getattr(user, 'subscription_expires_at', None) else None,
-                "preferred_language": getattr(user, 'preferred_language', None),
-                "market": market_summary(user),
-            },
+            "user": login_user_payload(user),
         }
 
         if subscription_alert:

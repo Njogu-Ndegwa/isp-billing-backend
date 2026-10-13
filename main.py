@@ -37,6 +37,20 @@ async def _validation_error_handler(request: Request, exc: RequestValidationErro
     await log_rejected_push(request, exc)
     return await request_validation_exception_handler(request, exc)
 
+# Admin "View as reseller" guard: View-as tokens are read-only and revocable.
+# Registered BEFORE CORSMiddleware so CORS wraps it -- the browser can then
+# read its 401/403 bodies (codes impersonation_ended / impersonation_read_only).
+# Every other request passes straight through. See app/services/impersonation.py.
+from app.services.impersonation import (  # noqa: E402
+    enforce_impersonation_read_only as _enforce_impersonation_read_only,
+)
+
+
+@app.middleware("http")
+async def enforce_impersonation_read_only(request: Request, call_next):
+    return await _enforce_impersonation_read_only(request, call_next)
+
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -121,6 +135,8 @@ from app.api.admin_feedback_routes import router as admin_feedback_router
 from app.api.agent_board_routes import router as agent_board_router
 from app.api.load_balancing_routes import router as load_balancing_router
 from app.api.outage_compensation_routes import router as outage_compensation_router
+from app.api.impersonation_routes import router as impersonation_router
+from app.api.static_ip_import_routes import router as static_ip_import_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -172,6 +188,8 @@ app.include_router(admin_feedback_router)
 app.include_router(agent_board_router)
 app.include_router(load_balancing_router)
 app.include_router(outage_compensation_router)
+app.include_router(impersonation_router)
+app.include_router(static_ip_import_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -389,6 +407,12 @@ async def run_radius_migrations():
             logger.info("Migration: Created provisioning_tokens table")
         else:
             logger.info("Migration: provisioning_tokens table already exists, skipping")
+
+        # --- Admin "View as reseller" audit sessions ---
+        from app.db.models import ImpersonationSession
+        await conn.run_sync(
+            lambda c: ImpersonationSession.__table__.create(c, checkfirst=True)
+        )
 
         # --- Provisioning attempts table / provisioning_logs correlation ---
         from app.db.models import ProvisioningAttempt, RouterCommand
@@ -929,6 +953,12 @@ async def run_monitoring_migrations():
             "CREATE INDEX IF NOT EXISTS idx_router_availability_router_checked "
             "ON router_availability_checks(router_id, checked_at)"
         ))
+        # router_public_contacts: routers calling over the internet while
+        # their tunnel is down (app/services/router_availability.py).
+        from app.db.models import RouterPublicContact  # noqa: F401
+        await conn.run_sync(
+            lambda c: RouterPublicContact.__table__.create(c, checkfirst=True)
+        )
 
 
 async def run_reconnection_migrations():
@@ -2642,6 +2672,15 @@ async def run_load_balancing_migrations():
     logger.info("Load-balancing migrations complete")
 
 
+async def run_static_ip_migrations():
+    """Static-IP customers: the pinned device MAC (anti IP-spoofing)."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE customers
+            ADD COLUMN IF NOT EXISTS static_mac VARCHAR(50) NULL
+        """))
+
+
 async def run_management_tunnel_migrations():
     """Add routers.management_tunnel (e.g. "sstp") so ops health can show routers
     whose management tunnel differs from what their ip_address range implies.
@@ -3305,6 +3344,12 @@ async def startup_event():
         logger.error(f"Router status-alert migration failed (non-fatal): {e}")
 
     try:
+        await run_static_ip_migrations()
+        logger.info("Static-IP migration completed successfully")
+    except Exception as e:
+        logger.error(f"Static-IP migration failed (non-fatal): {e}")
+
+    try:
         await run_management_tunnel_migrations()
         logger.info("Management-tunnel migration completed successfully")
     except Exception as e:
@@ -3472,6 +3517,19 @@ async def startup_event():
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=120,
+    )
+    from app.services.static_ip import (
+        ENFORCE_INTERVAL_SECONDS as STATIC_IP_ENFORCE_SECONDS,
+        enforce_static_ip_customers_background,
+    )
+    scheduler.add_job(
+        enforce_static_ip_customers_background,
+        trigger=IntervalTrigger(seconds=STATIC_IP_ENFORCE_SECONDS),
+        id='enforce_static_ip_customers',
+        name='Static-IP customers: suspend expired, repair drift, pin MACs',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,
     )
     scheduler.add_job(
         reconcile_lb_paid_background,

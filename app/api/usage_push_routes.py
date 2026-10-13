@@ -504,6 +504,7 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
             for p in payload.ppp
         ],
         live_pppoe_customers=result.live_pppoe_customers,
+        live_static_customers=result.live_static_customers,
         has_hosts="hosts" in payload.model_fields_set,
         ports=[p.model_dump() for p in payload.ports] if payload.ports is not None else None,
         bridge_hosts=[b.model_dump() for b in payload.bridge_hosts] if payload.bridge_hosts is not None else None,

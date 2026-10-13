@@ -1530,6 +1530,10 @@ async def _deactivate_expired_identityless_customers(db: AsyncSession, now: date
                 Customer.expiry <= now,
                 Customer.mac_address.is_(None),
                 Customer.pppoe_username.is_(None),
+                # Static-IP customers have neither identity either, but they DO
+                # have router access to remove: static_ip.enforce job owns them
+                # and flips status only after the router confirms suspension.
+                Customer.static_ip.is_(None),
             )
         )
     ).scalars().all()

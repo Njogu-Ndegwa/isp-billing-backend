@@ -31,7 +31,34 @@ CODE_DEPLOYMENTS = {
     "thing-microservice": "ERM admin + ble-app",
     "thing-use-microservice": "thing-use",
 }
-DB_WATCH_DEPLOYMENTS = ("auth-microservice", "client-microservice", "account-microservice")
+# Services whose own logs are read for MongoDB errors and for the error
+# messages behind their HTTP 5xx (the ingress only knows the status code).
+DB_WATCH_DEPLOYMENTS = ("auth-microservice", "client-microservice", "account-microservice",
+                        "shadow-api")
+DETAIL_WINDOW = timedelta(minutes=5)
+# (at, {svc: {failure key: n}}, {svc: {log message: n}}) per cycle, last 5 min
+_detail_history: list[tuple[datetime, dict, dict]] = []
+
+
+def _merge_counts(target: dict, source: dict) -> None:
+    for k, v in source.items():
+        target[k] = target.get(k, 0) + v
+
+
+def recent_detail(now: datetime, failures: dict[str, dict], log_errors: dict[str, dict]) -> tuple[dict, dict]:
+    """Add this cycle's per-service failures / log errors and return the
+    5-minute totals (what the alert and the Errors tab describe)."""
+    _detail_history.append((now, failures, log_errors))
+    while _detail_history and now - _detail_history[0][0] > DETAIL_WINDOW:
+        _detail_history.pop(0)
+    f5: dict[str, dict] = {}
+    e5: dict[str, dict] = {}
+    for _at, f, e in _detail_history:
+        for svc, counts in f.items():
+            _merge_counts(f5.setdefault(svc, {}), counts)
+        for svc, counts in e.items():
+            _merge_counts(e5.setdefault(svc, {}), counts)
+    return f5, e5
 INGRESS_SELECTOR = "app.kubernetes.io/component=controller"
 
 _cursors: dict[tuple, datetime] = {}
@@ -346,11 +373,11 @@ async def collect_logs(client: K8sClient, cluster: str, pod_items: list[dict],
 
     async def code_pod(app: str, pod: dict):
         lines = await read_new_lines(client, cluster, pod, now, live)
-        return app, parsers.parse_code_lines(lines, service=app)
+        return app, parsers.parse_code_lines(lines, service=app), parsers.error_messages(lines)
 
     async def db_pod(app: str, pod: dict):
         lines = await read_new_lines(client, cluster, pod, now, live)
-        return app, parsers.count_db_errors(lines)
+        return app, parsers.count_db_errors(lines), parsers.error_messages(lines)
 
     async def ingress_pod(pod: dict):
         return await read_new_lines(client, cluster, pod, now, live)
@@ -368,17 +395,20 @@ async def collect_logs(client: K8sClient, cluster: str, pod_items: list[dict],
                                    return_exceptions=True)
     n_code, n_db = len(code_tasks), len(db_tasks)
     traffic: dict[str, parsers.ServiceTraffic] = {}
+    log_errors: dict[str, dict] = {}
     for i, res in enumerate(results):
         if isinstance(res, Exception):
             errors.append(f"{type(res).__name__}: {str(res)[:120]}")
             continue
         if i < n_code:
-            app, stats = res
+            app, stats, msgs = res
             per_service.setdefault(app, parsers.CodeStats()).merge(stats)
             db_errors[app] = db_errors.get(app, 0) + stats.db_errors
+            _merge_counts(log_errors.setdefault(app, {}), msgs)
         elif i < n_code + n_db:
-            app, n = res
+            app, n, msgs = res
             db_errors[app] = db_errors.get(app, 0) + n
+            _merge_counts(log_errors.setdefault(app, {}), msgs)
         else:
             parsers.parse_ingress_lines(res, traffic)
     _prune_cursors(live, cluster)
@@ -386,11 +416,18 @@ async def collect_logs(client: K8sClient, cluster: str, pod_items: list[dict],
     total = parsers.CodeStats()
     for stats in per_service.values():
         total.merge(stats)
+    failures5, log_errors5 = recent_detail(
+        now, {svc: dict(t.failures) for svc, t in traffic.items() if t.failures},
+        {svc: m for svc, m in log_errors.items() if m})
     return {
         "codes": total,
         "codes_by_service": per_service,
         "db_errors": db_errors,
         "traffic": {svc: t.summary() for svc, t in sorted(traffic.items())},
+        "failures_5m": {svc: parsers.top_failures(f) for svc, f in failures5.items()},
+        "log_errors_5m": {svc: [{"message": m, "count": n} for m, n in
+                                sorted(e.items(), key=lambda kv: -kv[1])[:6]]
+                          for svc, e in log_errors5.items()},
         "errors": errors[:5],
         "code_pods": n_code,
     }

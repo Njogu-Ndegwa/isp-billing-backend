@@ -215,6 +215,12 @@ class Customer(Base):
     pppoe_username = Column(String)
     pppoe_password = Column(String)
     static_ip = Column(String)
+    # Static-IP customers only: the device MAC the static IP is pinned to. The
+    # router drops forwarded traffic from the IP with any other MAC, so a
+    # neighbour who types in a paying customer's IP gets nothing. Deliberately
+    # NOT mac_address — that column is the hotspot identity and drives hotspot
+    # bindings, the bypass safety net and expiry cleanup.
+    static_mac = Column(String(50), nullable=True)
     status = Column(Enum(CustomerStatus), nullable=False, default=CustomerStatus.INACTIVE)
     expiry = Column(DateTime)
     plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"))
@@ -1178,6 +1184,29 @@ class RouterAvailabilityCheck(Base):
     source = Column(String(50), nullable=False, default="unknown")
 
     router = relationship("Router")
+
+
+class RouterPublicContact(Base):
+    """A router reaching us over the public internet instead of its tunnel.
+
+    Router scripts call through the management tunnel first and fall back to
+    public HTTPS only when it fails, so a call here proves the site was online
+    while its tunnel was not (2026-10-12: routers 448 and 351 kept calling for
+    75 minutes while every tunnel check failed). Kept apart from
+    router_availability_checks on purpose: those rows mean "we could manage
+    the router", and a dozen readers treat a success there that way.
+    """
+    __tablename__ = "router_public_contacts"
+    __table_args__ = (
+        Index("idx_router_public_contacts_router_at", "router_id", "contacted_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # No FK: rows are pruned with availability history and must never block
+    # deleting a router.
+    router_id = Column(Integer, nullable=False)
+    contacted_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    source = Column(String(30), nullable=False)
 
 
 # ========================================
@@ -2721,3 +2750,33 @@ class CustomerEvent(Base):
     details = Column(JSON, nullable=True)
     dedup_key = Column(String(64), nullable=True, unique=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ImpersonationSession(Base):
+    """Audit row for one admin "View as reseller" session.
+
+    The admin gets a short-lived, read-only token carrying ``imp_sid`` (this
+    row's id). ``enforce_impersonation_read_only`` in main.py checks the row on
+    every request that carries such a token, so ending the session here
+    (``ended_at``) revokes the token before it expires.
+
+    end_reason: "exit" (admin pressed exit) | "expired" (TTL ran out).
+    Startup migration: ImpersonationSession.__table__.create in main.py.
+    """
+    __tablename__ = "impersonation_sessions"
+    __table_args__ = (
+        Index("ix_impersonation_sessions_admin_started", "admin_id", "started_at"),
+        Index("ix_impersonation_sessions_reseller_started", "reseller_id", "started_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reason = Column(Text, nullable=False)
+    started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    ended_at = Column(DateTime, nullable=True)
+    end_reason = Column(String(20), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(300), nullable=True)
+    request_count = Column(Integer, nullable=False, default=0, server_default="0")
