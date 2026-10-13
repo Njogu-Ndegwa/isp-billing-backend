@@ -50,6 +50,7 @@ from app.services.router_availability import (
     prune_router_availability_history,
 )
 from app.services.usage_tracking import record_usage
+from app.services.pppoe_sessions import resolve_extra_session_customer
 from app.services.usage_counters import clamp_to_line_rate, record_queue_usage_sample
 from app.services.fup import hotspot_throttle_rate_for_plan
 from app.services import customer_expiry_notifications
@@ -4008,12 +4009,30 @@ async def collect_bandwidth_snapshot():
                                     if len(fallback_matches) == 1:
                                         customer = fallback_matches[0]
 
+                                # A username logged in on several devices gets one
+                                # queue per session; RouterOS names the extras
+                                # <pppoe-alice-1>, <pppoe-alice-2>. Credit them to
+                                # alice, each on its own usage row so every session
+                                # keeps its own counter baseline.
+                                extra_session = None
+                                if customer is None:
+                                    customer = resolve_extra_session_customer(
+                                        pppoe_user,
+                                        q.get("target", ""),
+                                        lambda username: _find_pppoe_customer(router_customers, username),
+                                    )
+                                    if customer is not None:
+                                        extra_session = pppoe_user
+
                                 # Canonical usage-row key comes from the DB username
                                 # when the customer is known so the cap sampler and
                                 # the snapshot job share one row even when the
                                 # router-side secret drifted in case.
                                 if customer and customer.pppoe_username:
                                     pppoe_key = f"pppoe:{customer.pppoe_username}"
+                                    if extra_session:
+                                        # Its own row: every session keeps its own baseline.
+                                        pppoe_key = f"pppoe:{extra_session}"
                                 else:
                                     pppoe_key = f"pppoe:{pppoe_user}"
                                 lookup_keys = list({pppoe_key, f"pppoe:{pppoe_user}"})

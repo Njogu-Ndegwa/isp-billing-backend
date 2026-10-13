@@ -282,6 +282,7 @@
   "location_captured_at",
   "longitude",
   "mac_address",
+  "max_devices_override",
   "name",
   "pending_update_data",
   "phone",

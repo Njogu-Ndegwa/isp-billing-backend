@@ -439,6 +439,15 @@ async def test_phone_reconnect_never_takes_over_a_shared_device(db, stub_provisi
         subscription_owner_id=owner.id,
     )
 
+    db.add(DevicePairing(
+        customer_id=shared.id, device_mac=PHONE_2, router_id=router.id, plan_id=plan.id,
+        device_type=DeviceType.OTHER, is_active=True, is_subscription_share=True,
+        subscription_owner_customer_id=owner.id, expires_at=shared.expiry,
+    ))
+    await db.commit()
+
+    # Both slots of the 2-device plan are taken, so the reconnecting device
+    # takes over the plan's main slot; the shared device keeps its own.
     result = await public_routes.reconnect_self_service(
         public_routes.ReconnectRequest(phone="0700000900", mac_address=PHONE_3, router_id=router.id),
         BackgroundTasks(),

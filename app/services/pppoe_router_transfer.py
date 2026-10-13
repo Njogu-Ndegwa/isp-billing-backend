@@ -18,7 +18,12 @@ from app.db.models import (
     UsageCapWatchState,
 )
 from app.config import settings
-from app.services.mikrotik_api import MikroTikAPI
+from app.services.mikrotik_api import (
+    MikroTikAPI,
+    multi_device_profile_kwargs,
+    multi_device_profile_suffix,
+)
+from app.services.subscription_sharing import max_devices_for_customer
 from app.services.pppoe_provisioning import (
     PPPOE_DEFAULT_LOCAL_ADDRESS,
     PPPOE_DEFAULT_POOL_NAME,
@@ -105,6 +110,7 @@ def _target_provision_item(customer: Customer, target_router: Router) -> dict[st
         "pppoe_username": customer.pppoe_username,
         "pppoe_password": customer.pppoe_password,
         "bandwidth_limit": plan.speed if plan else "10Mbps",
+        "max_devices": max_devices_for_customer(customer, plan),
         "comment": f"CID:{customer.id}|{customer.name or customer.phone}|{datetime.utcnow().strftime('%Y-%m-%d')}",
         "router_id": target_router.id,
     }
@@ -178,7 +184,11 @@ def _provision_target_router_sync(router_info: dict[str, Any], items: list[dict[
             try:
                 base_rate_limit = api._parse_speed_to_mikrotik(item["bandwidth_limit"])
                 rate_limit = _apply_pppoe_headroom(base_rate_limit, headroom_factor)
-                profile_name = f"pppoe_{base_rate_limit.replace('/', '_')}"
+                max_devices = max(1, int(item.get("max_devices") or 1))
+                profile_name = (
+                    f"pppoe_{base_rate_limit.replace('/', '_')}"
+                    f"{multi_device_profile_suffix(max_devices)}"
+                )
 
                 if not ensured_profiles.get(profile_name):
                     profile_result = api.ensure_pppoe_profile(
@@ -188,6 +198,7 @@ def _provision_target_router_sync(router_info: dict[str, Any], items: list[dict[
                         pool_name=pool_name,
                         dns_server=base_profile_data.get("dns_server", ""),
                         change_tcp_mss=base_profile_data.get("change_tcp_mss", ""),
+                        **multi_device_profile_kwargs(max_devices),
                     )
                     if profile_result.get("error"):
                         failed.append(

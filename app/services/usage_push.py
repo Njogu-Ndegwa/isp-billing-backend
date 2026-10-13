@@ -60,6 +60,7 @@ from app.db.models import (
     User,
 )
 from app.services.mikrotik_api import normalize_mac_address
+from app.services.pppoe_sessions import resolve_extra_session_customer
 from app.services.static_ip import STATIC_KEY_PREFIX, normalize_static_ip
 from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
@@ -243,6 +244,30 @@ def _index_customers(customers: Iterable[Customer], now: Optional[datetime] = No
     return index
 
 
+def resolve_pppoe_queue_owner(
+    key: str,
+    target_ip: str,
+    index: dict[str, "Customer"],
+    session_users: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    """The ``pppoe:<username>`` that owns a PPPoE queue the index does not know.
+
+    Extra sessions of a multi-device login (``<pppoe-alice-1>``); the rules
+    live in ``pppoe_sessions.resolve_extra_session_customer``.
+    """
+    if not key.startswith("pppoe:") or key in index:
+        return None
+    customer = resolve_extra_session_customer(
+        key[len("pppoe:"):],
+        target_ip,
+        lambda username: index.get(f"pppoe:{username}"),
+        session_users,
+    )
+    if customer is None or not customer.pppoe_username:
+        return None
+    return f"pppoe:{customer.pppoe_username}"
+
+
 def _customer_is_live(customer: Customer, now: datetime) -> bool:
     """Whether this customer should still have usage banked against them.
 
@@ -366,6 +391,7 @@ async def ingest_usage_reports(
     session_factory=None,
     router_metrics: Optional[RouterMetrics] = None,
     meter_hotspot_by_host: bool = False,
+    pppoe_session_users: Optional[dict[str, str]] = None,
 ) -> IngestResult:
     """Apply one router's batch of usage reports.
 
@@ -377,6 +403,11 @@ async def ingest_usage_reports(
     ``source="host"`` reports — the device's own counters, which no stale or
     duplicate queue can steal — and hotspot queue reports are not credited.
     PPPoE is always metered from its queue.
+
+    ``pppoe_session_users`` maps a session IP to its PPPoE username (from the
+    router's ``/ppp active`` list), so the queue of a second session on the
+    same username is credited to that customer. Each session queue keeps its
+    own usage row and counter baseline; they are summed through the customer.
     """
     now = now or datetime.utcnow()
     factory = session_factory or async_session
@@ -461,6 +492,10 @@ async def ingest_usage_reports(
                 continue
 
             customer = index.get(key)
+            if customer is None and not is_host:
+                owner_key = resolve_pppoe_queue_owner(key, report.target_ip, index, pppoe_session_users)
+                if owner_key:
+                    customer = index[owner_key]
             if customer is None:
                 if is_host:
                     continue  # any device on the LAN appears here; only customers count

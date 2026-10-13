@@ -1144,14 +1144,14 @@ async def get_payment_status(
         ):
             from app.api.device_pairing import _format_share_code, get_or_create_access_code
             from app.services.subscription_sharing import (
-                max_shared_users_for_plan,
-                sharing_enabled_for_plan,
+                max_devices_for_customer,
+                sharing_enabled_for_customer,
             )
 
-            if sharing_enabled_for_plan(customer.plan):
+            if sharing_enabled_for_customer(customer, customer.plan):
                 code_row = await get_or_create_access_code(db, customer)
                 access_code = _format_share_code(code_row.code)
-                max_devices = max_shared_users_for_plan(customer.plan)
+                max_devices = max_devices_for_customer(customer, customer.plan)
                 await db.commit()
 
         return {

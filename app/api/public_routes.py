@@ -1426,6 +1426,11 @@ async def _provision_reconnected_mac_if_current(
             )
 
 
+# Shown on the reseller's Devices card for a device a customer added by typing
+# a phone number on the portal (no code), so a stranger can be spotted.
+PHONE_ADDED_DEVICE_NAME = "Added by phone"
+
+
 @router.post("/api/public/reconnect")
 async def reconnect_self_service(
     request: ReconnectRequest,
@@ -1517,6 +1522,55 @@ async def reconnect_self_service(
             status_code=404,
             detail="No active subscription found for this phone number on this network",
         )
+
+    # On a plan that covers several devices, a new device reconnecting by phone
+    # is added alongside the customer's other devices instead of taking the
+    # plan away from them (the one-slot swap that dropped TVs). It is labelled
+    # "Added by phone" so the reseller can spot a stranger using a known phone
+    # number. When every slot is taken this falls through to moving the plan's
+    # main device, exactly as before: the customer's own phone with a changed
+    # MAC must never be locked out, and the extra devices keep their slots.
+    # Only for paid time: sharing requires an unexpired plan, so a customer in
+    # grace keeps the move behaviour too.
+    from app.services.subscription_sharing import sharing_enabled_for_customer
+
+    owner_mac = normalize_mac_address(customer.mac_address) if customer.mac_address else None
+    customer_id = customer.id
+    if (
+        owner_mac
+        and owner_mac != normalized_mac
+        and customer.plan
+        and customer.plan.connection_type == ConnectionType.HOTSPOT
+        and customer.expiry > now
+        and sharing_enabled_for_customer(customer, customer.plan)
+    ):
+        from app.api.access_code_routes import add_device_to_owner_plan
+
+        try:
+            result = await add_device_to_owner_plan(
+                db,
+                owner=customer,
+                router_id=request.router_id,
+                normalized_mac=normalized_mac,
+                device_name=PHONE_ADDED_DEVICE_NAME,
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if exc.status_code != 409 or detail.get("error") != "device_limit_reached":
+                raise
+            # Full: move the main device below. The failed add rolled back, so
+            # reload the row rather than touch an expired instance.
+            customer = await db.get(Customer, customer_id)
+            if customer is None:
+                raise HTTPException(status_code=404, detail="Active subscription not found")
+        else:
+            db.add(ReconnectionAttempt(
+                phone=phone_raw, mac_address=normalized_mac,
+                router_id=request.router_id, customer_id=customer_id,
+                success=True, created_at=datetime.utcnow(),
+            ))
+            await db.commit()
+            return result
 
     return await restore_customer_on_device(
         db,
