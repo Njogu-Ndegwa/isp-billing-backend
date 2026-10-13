@@ -64,6 +64,10 @@ def offline_user(user: Dict[str, Any]) -> Dict[str, Any]:
     # PPPoE shapes each keep their own contract with the frontend.
     if "online_source" in entry:
         entry["online_source"] = None
+    if "sessions" in entry:
+        # PPPoE: every connected device under this username.
+        entry["sessions"] = []
+        entry["session_count"] = 0
     if "idle_time" in entry:
         entry["idle_time"] = None
     if "login_by" in entry:
@@ -81,6 +85,9 @@ def offline_summary(summary: Optional[Dict[str, Any]], total: int) -> Dict[str, 
     result["total"] = total
     result["online"] = 0
     result["offline"] = total
+    if "online_sessions" in result:
+        result["online_sessions"] = 0
+        result["multi_device_users"] = 0
     result["total_upload_rate_bps"] = 0
     result["total_download_rate_bps"] = 0
     return result
