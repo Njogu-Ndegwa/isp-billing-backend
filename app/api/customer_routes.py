@@ -38,6 +38,7 @@ from app.services.customer_grace import (
     grace_fields,
     has_access_time,
     normalize_grace_minutes,
+    renewal_expiry,
 )
 from app.services.customer_events import record_customer_event
 from app.services.mikrotik_api import normalize_mac_address
@@ -1280,8 +1281,9 @@ async def activate_pppoe_customer(
             days_paid_for = duration_value
 
         now = datetime.utcnow()
-        if customer.status == CustomerStatus.ACTIVE and customer.expiry and customer.expiry > now:
-            customer.expiry = customer.expiry + expiry_delta
+        # An active customer (paid time or grace) keeps their billing date.
+        if customer.status == CustomerStatus.ACTIVE:
+            customer.expiry = renewal_expiry(customer, now, expiry_delta)
         else:
             customer.expiry = now + expiry_delta
 
@@ -1522,8 +1524,9 @@ async def activate_static_customer(
             days_paid_for = duration_value
 
         now = datetime.utcnow()
-        if customer.status == CustomerStatus.ACTIVE and customer.expiry and customer.expiry > now:
-            customer.expiry = customer.expiry + expiry_delta
+        # An active customer (paid time or grace) keeps their billing date.
+        if customer.status == CustomerStatus.ACTIVE:
+            customer.expiry = renewal_expiry(customer, now, expiry_delta)
         else:
             customer.expiry = now + expiry_delta
         customer.status = CustomerStatus.ACTIVE

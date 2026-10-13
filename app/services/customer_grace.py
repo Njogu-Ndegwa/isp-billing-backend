@@ -3,9 +3,12 @@
 A reseller can let a customer stay connected for a while after their paid
 ``expiry`` without changing that expiry: the customer's access is cut at
 ``expiry + grace`` (the "effective expiry") instead of at ``expiry``. The paid
-expiry stays the source of truth for renewals, reminders and reporting, so a
-renewal during grace starts from payment time, the same as any other expired
-customer.
+expiry stays the source of truth for renewals, reminders and reporting.
+
+Grace never moves the billing date. A payment made during grace extends from
+the paid expiry, not from payment time (see :func:`renewal_expiry`): expiry
+Oct 1, 3-day grace, a 30-day plan paid on Oct 3 runs to Oct 31. Only a
+customer whose access has fully ended restarts from payment time.
 
 Grace is a standing setting (``Customer.grace_period_minutes``): it applies
 after every expiry until the reseller changes it. Every code path that decides
@@ -110,3 +113,20 @@ def grace_fields(customer: Any, now: datetime) -> dict:
         "effective_expiry": eff.isoformat() if eff else None,
         "in_grace": is_in_grace(customer, now),
     }
+
+
+def renewal_expiry(customer: Any, now: datetime, period: timedelta) -> datetime:
+    """New paid expiry when ``period`` is bought at ``now``.
+
+    Extends from the paid expiry while the customer still has access, paid
+    time or grace, so grace never shifts the billing date. Restarts from
+    ``now`` once access has ended, or when the purchase would not even reach
+    ``now`` (a plan shorter than the grace already used), since a paid period
+    that ends in the past is no use to anyone.
+    """
+    expiry = getattr(customer, "expiry", None)
+    if expiry is not None and has_access_time(customer, now):
+        extended = expiry + period
+        if extended > now:
+            return extended
+    return now + period
