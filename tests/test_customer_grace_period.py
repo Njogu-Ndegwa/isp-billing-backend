@@ -272,3 +272,17 @@ def test_grace_request_bounds():
         customer_routes.CustomerGraceRequest(
             grace_period_minutes=customer_grace.MAX_GRACE_MINUTES + 1
         )
+
+
+def test_static_ip_access_honours_grace():
+    from app.services.static_ip import customer_should_have_access
+
+    now = datetime(2026, 10, 13, 12, 0)
+    in_grace = Customer(
+        status=CustomerStatus.ACTIVE, expiry=now - timedelta(hours=2), grace_period_minutes=180,
+    )
+    past_grace = Customer(
+        status=CustomerStatus.ACTIVE, expiry=now - timedelta(hours=4), grace_period_minutes=180,
+    )
+    assert customer_should_have_access(in_grace, now)
+    assert not customer_should_have_access(past_grace, now)

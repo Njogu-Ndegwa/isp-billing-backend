@@ -184,6 +184,18 @@ class Settings(BaseSettings):
     MIKROTIK_USERNAME: str = "admin"
     MIKROTIK_PASSWORD: str = "mvnm"  # Set in .env file
     PPPOE_RATE_LIMIT_HEADROOM: float = 1.08
+    # Customer audit log (app/services/customer_router_logs.py): a background
+    # job reads the in-memory log of routers that have PPPoE customers, a few
+    # routers per tick, and keeps the lines that name a customer. Off by
+    # default: it is router I/O across the fleet. The per-customer "pull router
+    # logs" button works either way.
+    CUSTOMER_LOG_COLLECTOR_ENABLED: bool = False
+    CUSTOMER_LOG_COLLECTOR_ROUTERS_PER_TICK: int = 4
+    # A router is read at most this often by the collector.
+    CUSTOMER_LOG_COLLECTOR_MIN_REVISIT_SECONDS: int = 900
+    # Session and router-log entries older than this are pruned daily;
+    # record changes are kept.
+    CUSTOMER_EVENT_RETENTION_DAYS: int = 60
     # Max compensation (zero-revenue) vouchers a reseller may issue per UTC day.
     COMPENSATION_DAILY_LIMIT: int = 10
     # Longest power-outage window a single bulk compensation run may credit.
@@ -351,6 +363,43 @@ class Settings(BaseSettings):
     OPS_ROUTE_STATE_FILE: str = ""
     # Critical-only SMS destination for ops alerts. Empty = inbox alerts only.
     OPS_ALERT_SMS_PHONE: str = ""
+
+    # --- OVES platform health (app/services/oves_health/) -------------------
+    # A 60 s collector that watches the OVES EKS clusters, code generation,
+    # MongoDB, and the external services OVES and this app depend on. Off
+    # until enabled; every source below is optional and reports
+    # "not configured" rather than failing when its credentials are absent.
+    OVES_HEALTH_ENABLED: bool = False
+    # Kubernetes API access per cluster: a read-only ServiceAccount token
+    # (deploy/oves-health/rbac.yaml) plus the cluster CA (base64 PEM, exactly
+    # as it appears in kubeconfig certificate-authority-data).
+    OVES_K8S_PROD_SERVER: str = ""
+    OVES_K8S_PROD_TOKEN: str = ""
+    OVES_K8S_PROD_CA_B64: str = ""
+    OVES_K8S_DEV_SERVER: str = ""
+    OVES_K8S_DEV_TOKEN: str = ""
+    OVES_K8S_DEV_CA_B64: str = ""
+    # Tencent TKE oves-dev (ap-singapore) -- since 2026-10-08 it serves the
+    # production MQTT broker, wvapp, ABS and the DIRAC portal API.
+    OVES_K8S_TENCENT_SERVER: str = ""
+    OVES_K8S_TENCENT_TOKEN: str = ""
+    OVES_K8S_TENCENT_CA_B64: str = ""
+    # Read-only IAM key (CloudWatch GetMetricData + EC2 DescribeInstanceStatus)
+    # for the MongoDB EC2 members in eu-central-1. Empty = DB host tile off.
+    OVES_AWS_ACCESS_KEY_ID: str = ""
+    OVES_AWS_SECRET_ACCESS_KEY: str = ""
+    OVES_AWS_DB_REGION: str = "eu-central-1"
+    # Comma-separated "name=instance-id" pairs for the MongoDB members.
+    OVES_AWS_DB_INSTANCES: str = (
+        "mongo1 (10.0.1.19)=i-0d45d621c58b850c0,"
+        "mongo (10.0.1.97)=i-0017ff94ab0464d93,"
+        "mongo0 (10.0.1.129)=i-0dd1b03899e0bb058"
+    )
+    OVES_HEALTH_PROBE_TIMEOUT_SECONDS: float = 10.0
+    # Apollo GraphOS insights (errors + error rate per operation, like Studio):
+    # comma-separated "Graph-Id=service:Graph-Id:..." -- each subgraph's own
+    # key, as in its deployment-charts APOLLO_KEY. Empty = GraphQL tab off.
+    OVES_APOLLO_GRAPH_KEYS: str = ""
 
     class Config:
         env_file = ".env"

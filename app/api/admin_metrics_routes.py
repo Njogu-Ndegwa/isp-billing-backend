@@ -415,6 +415,48 @@ async def admin_ops_health_history(
 
 
 # ---------------------------------------------------------------------------
+# OVES platform health (read-only: serves stored snapshots, never probes)
+# ---------------------------------------------------------------------------
+
+@router.get("/api/admin/oves-health")
+async def admin_oves_health(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Latest OVES platform snapshot: code generation, database, clusters,
+    dependencies (OVES prod, AWS dev, Tencent, third party), alerts."""
+    await _require_admin(token, db)
+    await db.commit()
+    from app.services.oves_health import service as oves
+
+    latest = await oves.load_latest()
+    now = datetime.utcnow()
+    if latest is None:
+        return {"enabled": oves.enabled(), "generated_at": None, "snapshot_age_seconds": None,
+                "overall_status": "unknown", "alerts": [], "sections": {}, "sources": {}}
+    generated = datetime.fromisoformat(latest["generated_at"].replace("Z", ""))
+    return {"enabled": oves.enabled(),
+            "snapshot_age_seconds": max(0, int((now - generated).total_seconds())),
+            **latest}
+
+
+@router.get("/api/admin/oves-health/history")
+async def admin_oves_health_history(
+    hours: int = Query(24, ge=1, le=336, description="Look back N hours (max 14 days)"),
+    probe: Optional[str] = Query(None, max_length=64, description="Probe id for a latency series"),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Bucketed history: codes ok/failed, success rate, code p50/p95, DB log
+    errors, cluster gauges, per-probe uptime and p95 over the window."""
+    await _require_admin(token, db)
+    await db.commit()
+    from app.services.oves_health import service as oves
+
+    return await oves.load_history(datetime.utcnow(), hours, probe)
+
+
+# ---------------------------------------------------------------------------
 # 1. MRR
 # ---------------------------------------------------------------------------
 
@@ -657,3 +699,46 @@ async def admin_set_own_reseller_accounts(
         "reseller_ids": saved,
         "accounts": await svc.own_reseller_accounts(db, saved),
     }
+
+
+@router.get("/api/admin/oves-health/graphql/graphs")
+async def admin_oves_graphql_graphs(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """The Apollo graphs the GraphQL errors view can show, most important first."""
+    await _require_admin(token, db)
+    await db.commit()
+    from app.config import settings as _settings
+    from app.services.oves_health import apollo
+
+    keys = apollo.parse_graph_keys(getattr(_settings, "OVES_APOLLO_GRAPH_KEYS", ""))
+    return {"configured": bool(keys), "graphs": apollo.graph_list(keys)}
+
+
+@router.get("/api/admin/oves-health/graphql")
+async def admin_oves_graphql_insights(
+    graph: str = Query(..., max_length=80),
+    hours: int = Query(24, ge=1, le=336),
+    operation: Optional[str] = Query(None, max_length=200),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Apollo Studio-style insights for one graph: requests, errors and error
+    rate per operation, error groups with messages, and a request/error series.
+    Live from GraphOS (cached 60 s); no DB session is held during the call."""
+    await _require_admin(token, db)
+    await db.commit()
+    from app.config import settings as _settings
+    from app.services.oves_health import apollo
+
+    keys = apollo.parse_graph_keys(getattr(_settings, "OVES_APOLLO_GRAPH_KEYS", ""))
+    if graph not in keys:
+        raise HTTPException(status_code=404, detail="Graph not configured")
+    try:
+        return await apollo.insights(keys, graph, hours, operation or None)
+    except apollo.ApolloError as exc:
+        raise HTTPException(status_code=502, detail=f"Apollo GraphOS: {exc}")
+    except Exception as exc:  # noqa: BLE001 - network
+        logger.warning("[OVES-HEALTH] Apollo insights failed for %s: %s", graph, exc)
+        raise HTTPException(status_code=502, detail="Apollo GraphOS unreachable")

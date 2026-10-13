@@ -215,6 +215,12 @@ class Customer(Base):
     pppoe_username = Column(String)
     pppoe_password = Column(String)
     static_ip = Column(String)
+    # Static-IP customers only: the device MAC the static IP is pinned to. The
+    # router drops forwarded traffic from the IP with any other MAC, so a
+    # neighbour who types in a paying customer's IP gets nothing. Deliberately
+    # NOT mac_address — that column is the hotspot identity and drives hotspot
+    # bindings, the bypass safety net and expiry cleanup.
+    static_mac = Column(String(50), nullable=True)
     status = Column(Enum(CustomerStatus), nullable=False, default=CustomerStatus.INACTIVE)
     expiry = Column(DateTime)
     plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"))
@@ -1182,6 +1188,29 @@ class RouterAvailabilityCheck(Base):
     source = Column(String(50), nullable=False, default="unknown")
 
     router = relationship("Router")
+
+
+class RouterPublicContact(Base):
+    """A router reaching us over the public internet instead of its tunnel.
+
+    Router scripts call through the management tunnel first and fall back to
+    public HTTPS only when it fails, so a call here proves the site was online
+    while its tunnel was not (2026-10-12: routers 448 and 351 kept calling for
+    75 minutes while every tunnel check failed). Kept apart from
+    router_availability_checks on purpose: those rows mean "we could manage
+    the router", and a dozen readers treat a success there that way.
+    """
+    __tablename__ = "router_public_contacts"
+    __table_args__ = (
+        Index("idx_router_public_contacts_router_at", "router_id", "contacted_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # No FK: rows are pruned with availability history and must never block
+    # deleting a router.
+    router_id = Column(Integer, nullable=False)
+    contacted_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    source = Column(String(30), nullable=False)
 
 
 # ========================================
@@ -2640,6 +2669,30 @@ class OpsHealthSnapshot(Base):
     metrics = Column(JSON, nullable=True)
 
 
+class OvesHealthSnapshot(Base):
+    """One OVES platform health cycle (app/services/oves_health/service.py).
+
+    ``metrics`` is the small per-minute record (code counts and latencies,
+    probe up/latency, cluster gauges, per-service ingress traffic) that the
+    history charts, rolling alert windows and baselines read; kept 14 days.
+    ``payload`` is the full panel object, kept only for recent rows (the prune
+    step nulls it after a few hours) so the table stays small.
+    """
+    __tablename__ = "oves_health_snapshots"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    generated_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    overall_status = Column(String(16), nullable=False, default="unknown")
+    payload = Column(JSON, nullable=True)
+    metrics = Column(JSON, nullable=True)
+    # The counters history charts SUM over every row, as plain columns: pulling
+    # them out of the JSON blob cost ~0.3 ms/row (about 6 s for 14 days).
+    codes_ok = Column(Integer, nullable=True)
+    codes_failed = Column(Integer, nullable=True)
+    codes_failed_system = Column(Integer, nullable=True)
+    index_failures = Column(Integer, nullable=True)
+    db_errors = Column(Integer, nullable=True)
+
+
 class AppInstanceHeartbeat(Base):
     """Liveness row per running app process.
 
@@ -2658,3 +2711,76 @@ class AppInstanceHeartbeat(Base):
     app_version = Column(String(64), nullable=True)
     started_at = Column(DateTime, nullable=True)
     last_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+# ========================================
+# CUSTOMER AUDIT LOG
+# ========================================
+
+class CustomerEvent(Base):
+    """One entry in a customer's audit log (``GET /api/customers/{id}/audit-log``).
+
+    Holds the facts that no other table keeps: session transitions seen in the
+    router's push reports, the router's own log lines that name the customer,
+    and who changed what on the customer record. Payments, M-Pesa attempts and
+    provisioning actions already have tables and are merged in at read time.
+
+    ``customer_id``/``router_id`` are plain ints, not FKs: the history must
+    outlive a deleted customer or router, and must never block either delete.
+    ``dedup_key`` makes re-reading the same router log lines a no-op.
+    Startup migration: run_customer_event_migrations() in main.py.
+    """
+    __tablename__ = "customer_events"
+    __table_args__ = (
+        Index("ix_customer_events_customer_occurred", "customer_id", "occurred_at"),
+        Index("ix_customer_events_category_occurred", "category", "occurred_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, nullable=True)
+    user_id = Column(Integer, nullable=True, index=True)  # owning reseller
+    router_id = Column(Integer, nullable=True)
+    occurred_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # session | router_log | change
+    category = Column(String(20), nullable=False)
+    event_type = Column(String(40), nullable=False)
+    # info | warning | error
+    severity = Column(String(10), nullable=False, default="info", server_default="info")
+    # router_push | router_log | admin | system
+    source = Column(String(20), nullable=False)
+    actor_user_id = Column(Integer, nullable=True)
+    actor_label = Column(String(120), nullable=True)
+    message = Column(String(1000), nullable=False)
+    details = Column(JSON, nullable=True)
+    dedup_key = Column(String(64), nullable=True, unique=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ImpersonationSession(Base):
+    """Audit row for one admin "View as reseller" session.
+
+    The admin gets a short-lived, read-only token carrying ``imp_sid`` (this
+    row's id). ``enforce_impersonation_read_only`` in main.py checks the row on
+    every request that carries such a token, so ending the session here
+    (``ended_at``) revokes the token before it expires.
+
+    end_reason: "exit" (admin pressed exit) | "expired" (TTL ran out).
+    Startup migration: ImpersonationSession.__table__.create in main.py.
+    """
+    __tablename__ = "impersonation_sessions"
+    __table_args__ = (
+        Index("ix_impersonation_sessions_admin_started", "admin_id", "started_at"),
+        Index("ix_impersonation_sessions_reseller_started", "reseller_id", "started_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reason = Column(Text, nullable=False)
+    started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    ended_at = Column(DateTime, nullable=True)
+    end_reason = Column(String(20), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(300), nullable=True)
+    request_count = Column(Integer, nullable=False, default=0, server_default="0")

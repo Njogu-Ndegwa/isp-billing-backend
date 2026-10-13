@@ -1,0 +1,114 @@
+# Read-only identity for the Bitwave billing box's OVES health collector
+# (app/services/oves_health/). Apply to each cluster it watches:
+#
+#   kubectl --context oves-prod apply -f deploy/oves-health/rbac.yaml
+#   kubectl --context oves-dev  apply -f deploy/oves-health/rbac.yaml
+#   kubectl --kubeconfig <tencent.kubeconfig> apply -f deploy/oves-health/rbac.yaml
+#
+# Grants list/get on workloads, pods and nodes cluster-wide; pod LOGS only in
+# the namespaces the collector reads (erm: code generation + DB errors,
+# ingress-nginx: request rates/latency); and the service proxy ONLY for the
+# in-cluster Prometheus. Nothing here can create, change, exec or delete.
+# Remove the "logs" RoleBindings for a cluster whose logs are not read
+# (dev, tencent) if you want the narrowest grant.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bitwave-health-reader
+  namespace: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bitwave-health-reader-token
+  namespace: default
+  annotations:
+    kubernetes.io/service-account.name: bitwave-health-reader
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bitwave-health-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bitwave-health-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bitwave-health-reader
+subjects:
+  - kind: ServiceAccount
+    name: bitwave-health-reader
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bitwave-health-reader-logs
+rules:
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bitwave-health-reader-logs
+  namespace: erm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bitwave-health-reader-logs
+subjects:
+  - kind: ServiceAccount
+    name: bitwave-health-reader
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bitwave-health-reader-logs
+  namespace: ingress-nginx
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bitwave-health-reader-logs
+subjects:
+  - kind: ServiceAccount
+    name: bitwave-health-reader
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: bitwave-health-reader-prometheus
+  namespace: monitoring
+rules:
+  - apiGroups: [""]
+    resources: ["services/proxy"]
+    resourceNames: ["prometheus-operated:9090", "prometheus-operated"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bitwave-health-reader-prometheus
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: bitwave-health-reader-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: bitwave-health-reader
+    namespace: default

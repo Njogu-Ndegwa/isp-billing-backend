@@ -184,6 +184,23 @@
   "wallet_after_kes",
   "wallet_before_kes"
  ],
+ "customer_events": [
+  "actor_label",
+  "actor_user_id",
+  "category",
+  "created_at",
+  "customer_id",
+  "dedup_key",
+  "details",
+  "event_type",
+  "id",
+  "message",
+  "occurred_at",
+  "router_id",
+  "severity",
+  "source",
+  "user_id"
+ ],
  "customer_expiry_sms_settings": [
   "created_at",
   "custom_templates",
@@ -273,6 +290,7 @@
   "pppoe_username",
   "router_id",
   "static_ip",
+  "static_mac",
   "status",
   "subscription_owner_id",
   "user_id",
@@ -370,6 +388,19 @@
   "target_value",
   "unit",
   "updated_at"
+ ],
+ "impersonation_sessions": [
+  "admin_id",
+  "end_reason",
+  "ended_at",
+  "expires_at",
+  "id",
+  "ip_address",
+  "reason",
+  "request_count",
+  "reseller_id",
+  "started_at",
+  "user_agent"
  ],
  "lead_activities": [
   "activity_type",
@@ -531,6 +562,18 @@
   "router_ids",
   "total_seconds_credited",
   "user_id"
+ ],
+ "oves_health_snapshots": [
+  "codes_failed",
+  "codes_failed_system",
+  "codes_ok",
+  "db_errors",
+  "generated_at",
+  "id",
+  "index_failures",
+  "metrics",
+  "overall_status",
+  "payload"
  ],
  "password_reset_tokens": [
   "created_at",
@@ -800,6 +843,12 @@
   "severity",
   "topic",
   "username"
+ ],
+ "router_public_contacts": [
+  "contacted_at",
+  "id",
+  "router_id",
+  "source"
  ],
  "router_usage_buckets": [
   "bucket_start",

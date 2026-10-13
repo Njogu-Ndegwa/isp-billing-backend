@@ -394,6 +394,11 @@ async def handle_confirmation(
                 "[C2B] No BackgroundTasks available; skipping provisioning queue for customer %s",
                 customer.id,
             )
+    elif plan and plan.connection_type == ConnectionType.STATIC_IP and customer.router:
+        from app.services.static_ip import schedule_static_provision
+
+        schedule_static_provision(customer.id)
+        logger.info("[C2B] Queued static-IP provisioning for customer %s", customer.id)
     else:
         # Hotspot or missing prerequisites — payment is recorded but we don't
         # auto-provision. Same behavior as the STK callback in payment_routes.

@@ -37,6 +37,20 @@ async def _validation_error_handler(request: Request, exc: RequestValidationErro
     await log_rejected_push(request, exc)
     return await request_validation_exception_handler(request, exc)
 
+# Admin "View as reseller" guard: View-as tokens are read-only and revocable.
+# Registered BEFORE CORSMiddleware so CORS wraps it -- the browser can then
+# read its 401/403 bodies (codes impersonation_ended / impersonation_read_only).
+# Every other request passes straight through. See app/services/impersonation.py.
+from app.services.impersonation import (  # noqa: E402
+    enforce_impersonation_read_only as _enforce_impersonation_read_only,
+)
+
+
+@app.middleware("http")
+async def enforce_impersonation_read_only(request: Request, call_next):
+    return await _enforce_impersonation_read_only(request, call_next)
+
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -81,6 +95,7 @@ from app.api.router_operations import router as router_ops_router
 from app.api.admin_routes import router as admin_router
 from app.api.plan_routes import router as plan_router
 from app.api.customer_routes import router as customer_router
+from app.api.customer_audit_routes import router as customer_audit_router
 from app.api.payment_routes import router as payment_router
 from app.api.dashboard_routes import router as dashboard_router
 from app.api.mikrotik_routes import router as mikrotik_router
@@ -120,6 +135,8 @@ from app.api.admin_feedback_routes import router as admin_feedback_router
 from app.api.agent_board_routes import router as agent_board_router
 from app.api.load_balancing_routes import router as load_balancing_router
 from app.api.outage_compensation_routes import router as outage_compensation_router
+from app.api.impersonation_routes import router as impersonation_router
+from app.api.static_ip_import_routes import router as static_ip_import_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -131,6 +148,7 @@ app.include_router(router_ops_router)
 app.include_router(admin_router)
 app.include_router(plan_router)
 app.include_router(customer_router)
+app.include_router(customer_audit_router)
 app.include_router(payment_router)
 app.include_router(dashboard_router)
 app.include_router(mikrotik_router)
@@ -170,6 +188,8 @@ app.include_router(admin_feedback_router)
 app.include_router(agent_board_router)
 app.include_router(load_balancing_router)
 app.include_router(outage_compensation_router)
+app.include_router(impersonation_router)
+app.include_router(static_ip_import_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -387,6 +407,12 @@ async def run_radius_migrations():
             logger.info("Migration: Created provisioning_tokens table")
         else:
             logger.info("Migration: provisioning_tokens table already exists, skipping")
+
+        # --- Admin "View as reseller" audit sessions ---
+        from app.db.models import ImpersonationSession
+        await conn.run_sync(
+            lambda c: ImpersonationSession.__table__.create(c, checkfirst=True)
+        )
 
         # --- Provisioning attempts table / provisioning_logs correlation ---
         from app.db.models import ProvisioningAttempt, RouterCommand
@@ -927,6 +953,12 @@ async def run_monitoring_migrations():
             "CREATE INDEX IF NOT EXISTS idx_router_availability_router_checked "
             "ON router_availability_checks(router_id, checked_at)"
         ))
+        # router_public_contacts: routers calling over the internet while
+        # their tunnel is down (app/services/router_availability.py).
+        from app.db.models import RouterPublicContact  # noqa: F401
+        await conn.run_sync(
+            lambda c: RouterPublicContact.__table__.create(c, checkfirst=True)
+        )
 
 
 async def run_reconnection_migrations():
@@ -2640,6 +2672,15 @@ async def run_load_balancing_migrations():
     logger.info("Load-balancing migrations complete")
 
 
+async def run_static_ip_migrations():
+    """Static-IP customers: the pinned device MAC (anti IP-spoofing)."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE customers
+            ADD COLUMN IF NOT EXISTS static_mac VARCHAR(50) NULL
+        """))
+
+
 async def run_management_tunnel_migrations():
     """Add routers.management_tunnel (e.g. "sstp") so ops health can show routers
     whose management tunnel differs from what their ip_address range implies.
@@ -3046,6 +3087,91 @@ async def run_ops_health_migrations():
     logger.info("Ops health migrations complete")
 
 
+async def run_oves_health_migrations():
+    """OVES platform health (app/services/oves_health/): one NEW table,
+    oves_health_snapshots, via the checkfirst create_all pattern. Safe to run
+    on every startup.
+    """
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+
+        from app.db.models import OvesHealthSnapshot
+        # Explicit startup create_all targets: oves_health_snapshots.
+        targets = [OvesHealthSnapshot]
+        to_create = [m.__table__ for m in targets if m.__tablename__ not in tables]
+        if to_create:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
+            logger.info(
+                "OVES health migration: created %s",
+                ", ".join(t.name for t in to_create),
+            )
+
+        # Counter columns (history sums read these instead of the JSON blob).
+        for column in ("codes_ok", "codes_failed", "codes_failed_system",
+                       "index_failures", "db_errors"):
+            await conn.execute(sa_text(
+                f"ALTER TABLE oves_health_snapshots ADD COLUMN IF NOT EXISTS {column} INTEGER"
+            ))
+
+    logger.info("OVES health migrations complete")
+
+
+async def run_customer_event_migrations():
+    """Customer audit log (app/services/customer_events.py): one NEW table,
+    customer_events, via the checkfirst create_all pattern. Its indexes are
+    created with it. Safe to run on every startup.
+    """
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+
+        from app.db.models import CustomerEvent
+        # Explicit startup create_all target: customer_events.
+        if CustomerEvent.__tablename__ not in tables:
+            await conn.run_sync(
+                lambda c: Base.metadata.create_all(c, tables=[CustomerEvent.__table__])
+            )
+            logger.info("Customer event migration: created customer_events")
+
+    logger.info("Customer event migrations complete")
+
+
+async def run_customer_audit_index_migrations():
+    """Indexes for the per-customer audit log's reads (Postgres only).
+
+    GET /api/customers/{id}/audit-log reads provisioning_logs and
+    reconnection_attempts by customer_id, newest first; neither had an index
+    on it. Same pattern as run_hot_path_index_migrations: CONCURRENTLY,
+    outside a transaction, invalid leftovers dropped and rebuilt.
+    """
+    if async_engine.dialect.name != "postgresql":
+        return
+    indexes = (
+        ("ix_provisioning_logs_customer_date", "provisioning_logs", "(customer_id, log_date DESC)"),
+        ("ix_reconnection_attempts_customer_created", "reconnection_attempts", "(customer_id, created_at DESC)"),
+    )
+    async with async_engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(sa_text("SET maintenance_work_mem = '16MB'"))
+        await conn.execute(sa_text("SET max_parallel_maintenance_workers = 0"))
+        for name, table, columns in indexes:
+            valid = (await conn.execute(sa_text(
+                f"SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('public.{name}')"
+            ))).scalar_one_or_none()
+            if valid is False:
+                await conn.execute(sa_text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{name}"))
+            await conn.execute(sa_text(
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON public.{table} {columns}"
+            ))
+    logger.info("Customer audit index migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     if shadow_mode_enabled():
@@ -3244,6 +3370,12 @@ async def startup_event():
         logger.error(f"Router status-alert migration failed (non-fatal): {e}")
 
     try:
+        await run_static_ip_migrations()
+        logger.info("Static-IP migration completed successfully")
+    except Exception as e:
+        logger.error(f"Static-IP migration failed (non-fatal): {e}")
+
+    try:
         await run_management_tunnel_migrations()
         logger.info("Management-tunnel migration completed successfully")
     except Exception as e:
@@ -3320,9 +3452,24 @@ async def startup_event():
         logger.error(f"Ops health migration failed (non-fatal): {e}")
 
     try:
+        await run_oves_health_migrations()
+    except Exception as e:
+        logger.error(f"OVES health migration failed (non-fatal): {e}")
+
+    try:
         await run_checkin_delivery_migrations()
     except Exception as e:
         logger.error(f"CRITICAL: check-in delivery migration failed: {e}")
+
+    try:
+        await run_customer_event_migrations()
+    except Exception as e:
+        logger.error(f"Customer event migration failed (non-fatal): {e}")
+
+    try:
+        await run_customer_audit_index_migrations()
+    except Exception as e:
+        logger.error(f"Customer audit index migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
     if not scheduler_enabled():
@@ -3402,6 +3549,19 @@ async def startup_event():
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=120,
+    )
+    from app.services.static_ip import (
+        ENFORCE_INTERVAL_SECONDS as STATIC_IP_ENFORCE_SECONDS,
+        enforce_static_ip_customers_background,
+    )
+    scheduler.add_job(
+        enforce_static_ip_customers_background,
+        trigger=IntervalTrigger(seconds=STATIC_IP_ENFORCE_SECONDS),
+        id='enforce_static_ip_customers',
+        name='Static-IP customers: suspend expired, repair drift, pin MACs',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,
     )
     scheduler.add_job(
         reconcile_lb_paid_background,
@@ -3690,6 +3850,33 @@ async def startup_event():
         misfire_grace_time=30,
     )
 
+    # OVES platform health (app/services/oves_health/): code generation,
+    # MongoDB, the three Kubernetes clusters and every external dependency.
+    # Off unless OVES_HEALTH_ENABLED. All network I/O runs with no DB session
+    # open; sheds when the pool is busy, like ops health.
+    async def _oves_health_background():
+        from app.services.oves_health.service import run_cycle
+        try:
+            await run_cycle()
+        except Exception as e:
+            logger.error(f"[OVES-HEALTH] Cycle failed: {e}")
+
+    from datetime import datetime as _oves_dt, timedelta as _oves_td, timezone as _oves_tz
+    scheduler.add_job(
+        _oves_health_background,
+        trigger=IntervalTrigger(seconds=60),
+        id='oves_health_snapshot',
+        name='OVES platform health snapshot + alerting',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
+        # Half a minute out of phase with ops_health_snapshot (also 60 s):
+        # measured 2026-10-12, both firing in the same second stacked their
+        # CPU on the request loop.
+        next_run_time=_oves_dt.now(_oves_tz.utc) + _oves_td(seconds=30),
+    )
+
     # "What is ailing this router" for the Problem routers card
     # (app/services/router_diagnosis.py). Probes the <=15 routers in
     # `attention`: 5 timed raw TCP connects + at most one background-lane API
@@ -3711,6 +3898,65 @@ async def startup_event():
         trigger=IntervalTrigger(minutes=5),
         id='router_diagnosis',
         name='Problem-router diagnosis probes',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+    )
+
+    # Customer audit log. The push path only queues session events in memory;
+    # this writes them in one batch (and skips a tick when the pool is busy).
+    async def _flush_customer_events_background():
+        from app.services.customer_events import flush_customer_events
+        try:
+            await flush_customer_events()
+        except Exception as e:
+            logger.error(f"[AUDIT] customer event flush failed: {e}")
+
+    scheduler.add_job(
+        _flush_customer_events_background,
+        trigger=IntervalTrigger(seconds=30),
+        id='flush_customer_events',
+        name='Write queued customer session events',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+
+    async def _prune_customer_events_background():
+        from app.services.customer_events import prune_customer_events
+        try:
+            removed = await prune_customer_events(app_settings.CUSTOMER_EVENT_RETENTION_DAYS)
+            if removed:
+                logger.info(f"[AUDIT] pruned {removed} old customer session/log events")
+        except Exception as e:
+            logger.error(f"[AUDIT] customer event prune failed: {e}")
+
+    scheduler.add_job(
+        _prune_customer_events_background,
+        trigger=CronTrigger(hour=1, minute=40),
+        id='prune_customer_events',
+        name='Prune old customer session and router-log events',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Off unless CUSTOMER_LOG_COLLECTOR_ENABLED; the job itself checks, so the
+    # flag can be flipped with a restart and no code change.
+    async def _collect_customer_router_logs_background():
+        from app.services.customer_router_logs import collect_router_logs_background
+        try:
+            await collect_router_logs_background()
+        except Exception as e:
+            logger.error(f"[AUDIT] router log collector failed: {e}")
+
+    scheduler.add_job(
+        _collect_customer_router_logs_background,
+        trigger=IntervalTrigger(seconds=120),
+        id='collect_customer_router_logs',
+        name='Keep router log lines that name a customer',
         replace_existing=True,
         max_instances=1,
         coalesce=True,

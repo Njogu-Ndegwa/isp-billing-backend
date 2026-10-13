@@ -94,7 +94,8 @@ def _shared_strings(zip_file: zipfile.ZipFile) -> List[str]:
     return out
 
 
-def _sheet_path(zip_file: zipfile.ZipFile, sheet_name: str) -> str:
+def _sheet_path(zip_file: zipfile.ZipFile, sheet_name: Optional[str]) -> str:
+    """Archive path of a worksheet; ``sheet_name=None`` means the first sheet."""
     with zip_file.open("xl/workbook.xml") as handle:
         workbook = ET.parse(handle).getroot()
     with zip_file.open("xl/_rels/workbook.xml.rels") as handle:
@@ -106,7 +107,7 @@ def _sheet_path(zip_file: zipfile.ZipFile, sheet_name: str) -> str:
     }
 
     for sheet in workbook.findall("main:sheets/main:sheet", _XML_NS):
-        if sheet.attrib.get("name") != sheet_name:
+        if sheet_name is not None and sheet.attrib.get("name") != sheet_name:
             continue
         rel_id = sheet.attrib.get(f"{{{_XML_NS['rel']}}}id")
         target = rel_targets[rel_id]
@@ -136,6 +137,16 @@ def _cell_value(cell: ET.Element, shared: List[str]) -> str:
 
 def read_pppoe_workbook(path: str | Path, *, sheet_name: str = "Items") -> List[Dict[str, str]]:
     """Read the exported PPPoE workbook using only Python stdlib OpenXML parsing."""
+    return read_workbook_records(path, sheet_name=sheet_name)
+
+
+def read_workbook_records(path: str | Path, *, sheet_name: Optional[str] = None) -> List[Dict[str, str]]:
+    """Rows of one worksheet as ``{header: text}`` dicts (stdlib OpenXML only).
+
+    Row 1 is the header. Each record carries ``__row_number`` (the sheet row).
+    ``sheet_name=None`` reads the first sheet. Dates come back as Excel serial
+    numbers, exactly as stored.
+    """
     path = Path(path)
     with zipfile.ZipFile(path) as zip_file:
         shared = _shared_strings(zip_file)

@@ -60,6 +60,7 @@ from app.db.models import (
     User,
 )
 from app.services.mikrotik_api import normalize_mac_address
+from app.services.static_ip import STATIC_KEY_PREFIX, normalize_static_ip
 from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
 from app.services.usage_tracking import pooled_period_usage_bytes
@@ -155,6 +156,14 @@ class IngestResult:
     live_hotspot_customers: dict[str, int] = field(default_factory=dict)
     # "pppoe:<username>" -> customer id, for PPPoE customers live on this router.
     live_pppoe_customers: dict[str, int] = field(default_factory=dict)
+    # "pppoe:<username>" -> customer id for EVERY PPPoE customer on the router,
+    # live or not: the audit log must see the session that expiry cuts.
+    known_pppoe_customers: dict[str, int] = field(default_factory=dict)
+    # "static:<ip>" -> customer id, for static-IP customers live on this router.
+    live_static_customers: dict[str, int] = field(default_factory=dict)
+    # True once the maps above were built from this router's customers.
+    # Empty maps on an early return mean "not looked at", not "nobody live".
+    customers_resolved: bool = False
     errors: list[str] = field(default_factory=list)
     snapshot_written: bool = False
 
@@ -189,6 +198,10 @@ def _canonical_key(raw: str) -> Optional[str]:
         if not username or not _PPPOE_USERNAME_RE.match(username):
             return None
         return f"pppoe:{username}"
+    if key.lower().startswith(STATIC_KEY_PREFIX):
+        # plan_static:<ip> queues, reported by the stock push script.
+        ip = normalize_static_ip(key.split(":", 1)[1])
+        return f"{STATIC_KEY_PREFIX}{ip}" if ip else None
     if not _MAC_RE.match(key):
         return None
     return normalize_mac_address(key).upper()
@@ -217,6 +230,16 @@ def _index_customers(customers: Iterable[Customer], now: Optional[datetime] = No
             normalized = normalize_mac_address(customer.mac_address)
             if normalized:
                 _put(normalized.upper(), customer)
+        # Only static-IP plans: PPPoE customers also use static_ip (as their
+        # remote address) and are metered by their session queue instead.
+        if (
+            getattr(customer, "static_ip", None)
+            and customer.plan is not None
+            and customer.plan.connection_type == ConnectionType.STATIC_IP
+        ):
+            ip = normalize_static_ip(customer.static_ip)
+            if ip:
+                _put(f"{STATIC_KEY_PREFIX}{ip}", customer)
     return index
 
 
@@ -400,6 +423,8 @@ async def ingest_usage_reports(
         ).scalars().all()
         index = _index_customers(owned, now)
         for key, customer in index.items():
+            if key.startswith("pppoe:"):
+                result.known_pppoe_customers[key] = customer.id
             if (
                 not key.startswith("pppoe:")
                 and customer.plan is not None
@@ -414,6 +439,9 @@ async def ingest_usage_reports(
                 and _customer_is_live(customer, now)
             ):
                 result.live_pppoe_customers[key] = customer.id
+            if key.startswith(STATIC_KEY_PREFIX) and _customer_is_live(customer, now):
+                result.live_static_customers[key] = customer.id
+        result.customers_resolved = True
 
         # RouterOS can list one host entry twice (its script walks the bypassed
         # and the authorized lists); crediting both would double-count it.
@@ -427,7 +455,7 @@ async def ingest_usage_reports(
                 if host_id in seen_hosts:
                     continue
                 seen_hosts.add(host_id)
-            if not key or (is_host and key.startswith("pppoe:")):
+            if not key or (is_host and (key.startswith("pppoe:") or key.startswith(STATIC_KEY_PREFIX))):
                 result.rejected += 1
                 result.errors.append("bad_queue_key")
                 continue
@@ -470,6 +498,7 @@ async def ingest_usage_reports(
             if plan.connection_type not in (
                 ConnectionType.HOTSPOT,
                 ConnectionType.PPPOE,
+                ConnectionType.STATIC_IP,
             ):
                 result.rejected += 1
                 result.errors.append(f"unsupported_connection_type:{key}")

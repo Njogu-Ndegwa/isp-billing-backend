@@ -34,8 +34,14 @@ from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.router_availability import (
     build_router_status,
+    public_contact_times,
     record_router_availability,
+    split_tunnel_outages,
     summarize_router_flaps,
+    uptime_outages,
+    time_based_uptime,
+    uptime_timeline,
+    ROUTER_AVAILABILITY_RETENTION_DAYS,
 )
 from app.services.provisioning import provision_base_url_for_vpn
 from app.services.router_helpers import connect_to_router
@@ -1637,71 +1643,107 @@ async def get_router_uptime(
     recent_checks = max(1, min(recent_checks, 200))
     now = datetime.utcnow()
     since = now - timedelta(hours=hours)
+    overall_since = now - timedelta(days=ROUTER_AVAILABILITY_RETENTION_DAYS)
 
-    window_stmt = select(
-        func.count(RouterAvailabilityCheck.id),
-        func.coalesce(
-            func.sum(case((RouterAvailabilityCheck.is_online.is_(True), 1), else_=0)),
-            0,
-        ),
-        func.min(RouterAvailabilityCheck.checked_at),
-        func.max(RouterAvailabilityCheck.checked_at),
-    ).where(
-        RouterAvailabilityCheck.router_id == router_id,
-        RouterAvailabilityCheck.checked_at >= since,
-    )
-    window_result = await db.execute(window_stmt)
-    window_total, window_online, window_first, window_last = window_result.one()
-
-    checks_stmt = (
-        select(RouterAvailabilityCheck)
-        .where(
-            RouterAvailabilityCheck.router_id == router_id,
-            RouterAvailabilityCheck.checked_at >= since,
+    # Uptime is a share of TIME, judged the same way as everywhere else
+    # (summarize_router_flaps): a router that keeps sending its own reports is
+    # up even when our RouterOS connection to it fails. Counting raw samples
+    # used to turn every failed connection attempt into lost uptime.
+    rows = (
+        await db.execute(
+            select(
+                RouterAvailabilityCheck.checked_at,
+                RouterAvailabilityCheck.is_online,
+                RouterAvailabilityCheck.source,
+            )
+            .where(
+                RouterAvailabilityCheck.router_id == router_id,
+                RouterAvailabilityCheck.checked_at >= min(since, overall_since),
+            )
+            .order_by(RouterAvailabilityCheck.checked_at, RouterAvailabilityCheck.id)
         )
-        .order_by(
-            RouterAvailabilityCheck.checked_at,
-            RouterAvailabilityCheck.id,
-        )
-    )
-    checks_result = await db.execute(checks_stmt)
-    checks = checks_result.scalars().all()
+    ).all()
+    contacts = await public_contact_times(db, router_id, since=min(since, overall_since), until=now)
+    await db.commit()
 
-    flap_summary = summarize_router_flaps(checks, now=now)
-    overall_total = int(router_obj.availability_checks or 0)
-    overall_online = int(router_obj.availability_successes or 0)
+    all_checks = [
+        {"checked_at": r.checked_at, "is_online": r.is_online, "source": r.source} for r in rows
+    ]
+    window_checks = [c for c in all_checks if c["checked_at"] >= since]
+
+    # Outages during which the router kept calling us over the public
+    # internet were its management tunnel, not the site: listed apart and not
+    # counted against uptime.
+    judged = split_tunnel_outages(uptime_outages(all_checks, now=now), contacts, now=now)
+    outages = judged["outages"]
+    tunnel_outages = judged["tunnel_outages"]
+    first_any = judged["first_data_at"]
+    first_window = window_checks[0]["checked_at"] if window_checks else None
+
+    window_stats = time_based_uptime(outages, start=since, end=now, first_data_at=first_any, now=now)
+    overall_stats = time_based_uptime(outages, start=overall_since, end=now, first_data_at=first_any, now=now)
+
+    def in_outage(at: datetime, among: list) -> bool:
+        for outage in among:
+            started = datetime.fromisoformat(outage["started_at"])
+            ended = datetime.fromisoformat(outage["ended_at"]) if outage.get("ended_at") else now
+            if started <= at <= ended:
+                return True
+        return False
+
+    def in_window(among: list) -> list:
+        return [
+            o for o in among
+            if (datetime.fromisoformat(o["ended_at"]) if o.get("ended_at") else now) > since
+        ]
+
+    window_outages = in_window(outages)
+    flap_summary = summarize_router_flaps(window_checks, now=now)
 
     return {
         "router_id": router_obj.id,
         "router_name": router_obj.name,
         "generated_at": now.isoformat(),
         "current_status": build_router_status(router_obj, now=now),
+        "method": "time",
+        "judged_by": judged["judged_by"],
         "overall": {
-            "total_checks": overall_total,
-            "online_checks": overall_online,
-            "uptime_percentage": round((overall_online / overall_total) * 100, 2) if overall_total else None,
+            "days": ROUTER_AVAILABILITY_RETENTION_DAYS,
+            "total_checks": len(all_checks),
+            "online_checks": sum(1 for c in all_checks if c["is_online"]),
+            **overall_stats,
         },
         "window": {
             "hours": hours,
             "from": since.isoformat(),
             "to": now.isoformat(),
-            "first_check_at": window_first.isoformat() if window_first else None,
-            "last_check_at": window_last.isoformat() if window_last else None,
-            "total_checks": int(window_total or 0),
-            "online_checks": int(window_online or 0),
-            "uptime_percentage": round((window_online / window_total) * 100, 2) if window_total else None,
+            "first_check_at": first_window.isoformat() if first_window else None,
+            "last_check_at": window_checks[-1]["checked_at"].isoformat() if window_checks else None,
+            "total_checks": len(window_checks),
+            "online_checks": sum(1 for c in window_checks if c["is_online"]),
+            **window_stats,
         },
+        "outages": window_outages[-50:],
+        "tunnel_outages": in_window(tunnel_outages)[-50:],
+        "timeline": uptime_timeline(
+            outages, start=since, end=now, first_data_at=first_any,
+            buckets=min(84, max(12, hours)), now=now,
+        ),
         "flapping": {
             **flap_summary,
             "window_hours": hours,
         },
         "recent_checks": [
             {
-                "checked_at": check.checked_at.isoformat(),
-                "is_online": check.is_online,
-                "source": check.source,
+                "checked_at": check["checked_at"].isoformat(),
+                "is_online": check["is_online"],
+                "source": check["source"],
+                # A failed check outside any outage was our connection failing
+                # while the router was demonstrably up; it costs no uptime.
+                "counted_as_outage": (not check["is_online"]) and in_outage(check["checked_at"], outages),
+                "in_tunnel_outage": (not check["is_online"]) and in_outage(check["checked_at"], tunnel_outages),
             }
-            for check in checks[-recent_checks:][::-1]
+            for check in window_checks[-recent_checks:][::-1]
         ],
     }
 

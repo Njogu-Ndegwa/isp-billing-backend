@@ -248,6 +248,27 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   protocol, safety rules and runbook:
   [`docs/expiry-enforcement-architecture.md`](docs/expiry-enforcement-architecture.md).
 
+## Customer Audit Log
+
+- `GET /api/customers/{id}/audit-log` (`app/api/customer_audit_routes.py`) merges, at read
+  time, `customer_events` with payments, failed/pending M-Pesa prompts, provisioning
+  attempts/logs and portal reconnects. Frontend: `/customers/[id]/activity`.
+- `customer_events` holds only what no other table keeps (`app/services/customer_events.py`):
+  session connect/drop/silent-reconnect diffed in memory from usage-push reports (queued,
+  flushed every 30 s, never written on the push path); router log lines naming the customer
+  (`app/services/customer_router_logs.py`, de-duplicated by `dedup_key`); and who edited
+  the customer. Session and router-log rows are pruned after `CUSTOMER_EVENT_RETENTION_DAYS`.
+- "Site went offline" vs "management tunnel down": everything uptime is judged on (usage
+  reports, RouterOS checks) travels through the management tunnel, so a dead tunnel looks
+  like a dead site. The expiry reaper falls back to public HTTPS when the tunnel fails; each
+  such call is kept in `router_public_contacts`, and `split_tunnel_outages`
+  (`app/services/router_availability.py`) turns an outage with calls inside into a tunnel
+  outage — listed apart in uptime and the activity log, not counted as downtime.
+- Router logs live in router RAM (~1000 lines). They are kept only when read: the
+  per-customer "Pull router logs now" button, or the collector job, which is OFF unless
+  `CUSTOMER_LOG_COLLECTOR_ENABLED=true` (a few PPPoE routers per 2-min tick, each at most
+  every 15 min, skips offline routers, sheds on pool pressure).
+
 ## Feedback Board (Ideas + Bugs)
 
 - Shared reseller feedback board (levelsio-style): bug reports / feature ideas

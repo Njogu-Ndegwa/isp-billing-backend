@@ -27,7 +27,7 @@ from app.db.models import (
     SubscriptionShareCode, C2BTransaction, UnmatchedC2BPayment,
     SmsCreditAccount, SmsCreditTransaction, SmsCreditOrder, MessageTemplate,
     SmsCampaign, SmsMessage, ResellerInboxMessage,
-    CollectionMode, PaymentStatus,
+    CollectionMode, PaymentStatus, ImpersonationSession,
 )
 from app.services.auth import verify_token, get_current_user, pwd_context
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer, remove_sstp_peer
@@ -2215,6 +2215,11 @@ async def delete_reseller(
 
     # 23. Null out created_by references from other users
     await db.execute(update(User).where(User.created_by == reseller_id).values(created_by=None))
+
+    # 23b. View-as audit rows reference this reseller (users.id FK)
+    await db.execute(
+        delete(ImpersonationSession).where(ImpersonationSession.reseller_id == reseller_id)
+    )
 
     # 24. Delete the user row
     await db.execute(delete(User).where(User.id == reseller_id))
