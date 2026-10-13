@@ -2750,3 +2750,33 @@ class CustomerEvent(Base):
     details = Column(JSON, nullable=True)
     dedup_key = Column(String(64), nullable=True, unique=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ImpersonationSession(Base):
+    """Audit row for one admin "View as reseller" session.
+
+    The admin gets a short-lived, read-only token carrying ``imp_sid`` (this
+    row's id). ``enforce_impersonation_read_only`` in main.py checks the row on
+    every request that carries such a token, so ending the session here
+    (``ended_at``) revokes the token before it expires.
+
+    end_reason: "exit" (admin pressed exit) | "expired" (TTL ran out).
+    Startup migration: ImpersonationSession.__table__.create in main.py.
+    """
+    __tablename__ = "impersonation_sessions"
+    __table_args__ = (
+        Index("ix_impersonation_sessions_admin_started", "admin_id", "started_at"),
+        Index("ix_impersonation_sessions_reseller_started", "reseller_id", "started_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reason = Column(Text, nullable=False)
+    started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    ended_at = Column(DateTime, nullable=True)
+    end_reason = Column(String(20), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(300), nullable=True)
+    request_count = Column(Integer, nullable=False, default=0, server_default="0")

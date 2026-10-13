@@ -37,6 +37,20 @@ async def _validation_error_handler(request: Request, exc: RequestValidationErro
     await log_rejected_push(request, exc)
     return await request_validation_exception_handler(request, exc)
 
+# Admin "View as reseller" guard: View-as tokens are read-only and revocable.
+# Registered BEFORE CORSMiddleware so CORS wraps it -- the browser can then
+# read its 401/403 bodies (codes impersonation_ended / impersonation_read_only).
+# Every other request passes straight through. See app/services/impersonation.py.
+from app.services.impersonation import (  # noqa: E402
+    enforce_impersonation_read_only as _enforce_impersonation_read_only,
+)
+
+
+@app.middleware("http")
+async def enforce_impersonation_read_only(request: Request, call_next):
+    return await _enforce_impersonation_read_only(request, call_next)
+
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -121,6 +135,7 @@ from app.api.admin_feedback_routes import router as admin_feedback_router
 from app.api.agent_board_routes import router as agent_board_router
 from app.api.load_balancing_routes import router as load_balancing_router
 from app.api.outage_compensation_routes import router as outage_compensation_router
+from app.api.impersonation_routes import router as impersonation_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -172,6 +187,7 @@ app.include_router(admin_feedback_router)
 app.include_router(agent_board_router)
 app.include_router(load_balancing_router)
 app.include_router(outage_compensation_router)
+app.include_router(impersonation_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -389,6 +405,12 @@ async def run_radius_migrations():
             logger.info("Migration: Created provisioning_tokens table")
         else:
             logger.info("Migration: provisioning_tokens table already exists, skipping")
+
+        # --- Admin "View as reseller" audit sessions ---
+        from app.db.models import ImpersonationSession
+        await conn.run_sync(
+            lambda c: ImpersonationSession.__table__.create(c, checkfirst=True)
+        )
 
         # --- Provisioning attempts table / provisioning_logs correlation ---
         from app.db.models import ProvisioningAttempt, RouterCommand
