@@ -812,13 +812,18 @@ async def active_fup_restriction(db, customer_id: int):
     return None
 
 
-async def reprovision_plan_pppoe_customers(plan_id: int) -> dict:
-    """Push a PPPoE plan's device allowance to its active customers' routers.
+async def reprovision_plan_pppoe_customers(plan_id: int, *, speed_changed: bool = True) -> dict:
+    """Push a PPPoE plan's speed and device allowance to its active customers.
 
-    Runs in the background after a reseller changes the plan's device count.
-    Customers with their own device limit (``max_devices_override``) are not
-    affected by the plan's number and are skipped, as are customers FUP is
-    holding down this period (they pick the change up at renewal). Each
+    Runs in the background after a reseller edits the plan. A PPPoE customer's
+    speed and device limit live on the router (their PPP profile), so without
+    this they would keep the old ones until their next payment.
+
+    When only the device count changed (``speed_changed=False``), customers
+    with their own device limit (``max_devices_override``) are unaffected and
+    skipped. Customers FUP is holding down this period are always skipped:
+    re-provisioning would lift the throttle or block, and the normal profile
+    they return to when it ends is built from the plan as it is then. Each
     re-provision reconnects that customer's devices once.
 
     The customer list is read in one short session that is closed before any
@@ -839,7 +844,7 @@ async def reprovision_plan_pppoe_customers(plan_id: int) -> dict:
                     Customer.pppoe_username.isnot(None),
                     Customer.pppoe_password.isnot(None),
                     Customer.router_id.isnot(None),
-                    Customer.max_devices_override.is_(None),
+                    *(() if speed_changed else (Customer.max_devices_override.is_(None),)),
                 )
             )
         ).scalars().all()
@@ -862,9 +867,9 @@ async def reprovision_plan_pppoe_customers(plan_id: int) -> dict:
         else:
             failed += 1
             logger.warning(
-                "[PPPoE] Plan %s device-limit update failed for customer %s: %s",
+                "[PPPoE] Plan %s change failed for customer %s: %s",
                 plan_id, customer_id, (result or {}).get("error"),
             )
     summary = {"plan_id": plan_id, "applied": applied, "failed": failed, "skipped_fup": skipped_fup}
-    logger.info("[PPPoE] Plan device-limit update: %s", summary)
+    logger.info("[PPPoE] Plan change pushed to routers: %s", summary)
     return summary

@@ -6,6 +6,7 @@ on-up script that keeps the login to N sessions. Every session's queue is
 credited to the customer, so the plan's data cap stays one shared total.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -321,7 +322,47 @@ async def test_plan_device_change_reaches_active_customers(db, session_factory, 
     import app.db.database as database
     monkeypatch.setattr(database, "async_session", session_factory)
 
-    summary = await pppoe_provisioning.reprovision_plan_pppoe_customers(plan.id)
-
+    # Device count only: bob has his own limit, so the plan's number is not his.
+    summary = await pppoe_provisioning.reprovision_plan_pppoe_customers(plan.id, speed_changed=False)
     assert pushed == [("alice", 3)]
     assert summary["applied"] == 1 and summary["failed"] == 0
+
+    # A speed change reaches everyone on the plan, bob included.
+    pushed.clear()
+    await pppoe_provisioning.reprovision_plan_pppoe_customers(plan.id, speed_changed=True)
+    assert sorted(pushed) == [("alice", 3), ("bob", 1)]
+
+
+@pytest.mark.asyncio
+async def test_editing_a_pppoe_plan_schedules_the_router_push(db, monkeypatch):
+    from app.api import plan_routes
+
+    reseller, _router, plan, _customer = await _pppoe_customer(db, max_shared_users=1)
+    scheduled = []
+
+    async def fake_push(plan_id, *, speed_changed):
+        scheduled.append((plan_id, speed_changed))
+        return {}
+
+    async def fake_current_user(_token, _db):
+        return reseller
+
+    async def no_cache():
+        return None
+
+    monkeypatch.setattr(plan_routes, "get_current_user", fake_current_user)
+    monkeypatch.setattr(plan_routes, "enforce_active_subscription", lambda _user: None)
+    monkeypatch.setattr(plan_routes, "invalidate_plan_cache", no_cache)
+    monkeypatch.setattr(pppoe_provisioning, "reprovision_plan_pppoe_customers", fake_push)
+
+    async def update(**fields):
+        await plan_routes.update_plan_api(
+            plan.id, plan_routes.PlanUpdateRequest(**fields), db=db, token="token",
+        )
+        await asyncio.sleep(0)  # let the background task run
+
+    await update(speed="20M/20M")
+    await update(max_shared_users=3)
+    await update(price=999)  # nothing the router holds
+
+    assert scheduled == [(plan.id, True), (plan.id, False)]
