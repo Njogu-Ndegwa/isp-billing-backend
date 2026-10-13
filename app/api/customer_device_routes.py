@@ -39,6 +39,7 @@ from app.db.models import (
 from app.services.auth import get_current_user, verify_token
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services import realtime_state
+from app.services.pppoe_provisioning import build_pppoe_payload, call_pppoe_provision
 from app.services.router_concurrency import run_with_guard
 from app.services.subscription_sharing import (
     max_devices_for_customer,
@@ -348,11 +349,30 @@ async def set_customer_device_limit(
     user = await get_current_user(token, db)
     owner = await _load_owner_scoped(db, customer_id, user)
     owner.max_devices_override = body.max_devices
-    await db.commit()
-    return {
+    response = {
         "success": True,
         "owner_customer_id": owner.id,
         "max_devices_override": owner.max_devices_override,
         "max_devices": max_devices_for_customer(owner, owner.plan),
         "plan_max_devices": max_shared_users_for_plan(owner.plan),
+        "router_update": None,
     }
+
+    # PPPoE: the limit lives on the router (the secret's profile), so apply it
+    # now for a paying customer. Their devices reconnect once to pick it up.
+    pppoe_payload = None
+    if (
+        owner.plan
+        and owner.plan.connection_type == ConnectionType.PPPOE
+        and owner.pppoe_username
+        and owner.pppoe_password
+        and owner.router is not None
+        and owner.status == CustomerStatus.ACTIVE
+    ):
+        pppoe_payload = build_pppoe_payload(owner, owner.router)
+    await db.commit()
+
+    if pppoe_payload is not None:
+        result = await call_pppoe_provision(pppoe_payload)
+        response["router_update"] = "applied" if result and result.get("success") else "failed"
+    return response

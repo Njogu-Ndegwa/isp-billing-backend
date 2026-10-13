@@ -24,7 +24,12 @@ from app.db.models import (
     Router,
     RouterAuthMethod,
 )
-from app.services.mikrotik_api import LANE_PAYMENT, MikroTikAPI
+from app.services.mikrotik_api import (
+    LANE_PAYMENT,
+    MikroTikAPI,
+    multi_device_profile_kwargs,
+    multi_device_profile_suffix,
+)
 from app.services.provisioning_retry_policy import (
     PAID_PROVISIONING_RETRY_MAX_ATTEMPTS,
     retry_due_clause,
@@ -140,17 +145,25 @@ def _local_address_from_pool(api: MikroTikAPI) -> str:
     return PPPOE_DEFAULT_LOCAL_ADDRESS
 
 
-def ensure_plan_pppoe_profile(api: MikroTikAPI, bandwidth_limit: str) -> dict:
+def ensure_plan_pppoe_profile(api: MikroTikAPI, bandwidth_limit: str, max_devices: int = 1) -> dict:
     """Ensure the ``pppoe_<rate>`` profile a plan's customers normally sit on.
 
     Shared by provisioning and by FUP revert, so a customer released from a
     throttle lands on exactly the profile provisioning would have given them.
     Caller owns the connection.
+
+    ``max_devices`` above 1 selects ``pppoe_<rate>_d<N>``: the same rate with
+    ``only-one=no`` and an on-up script that keeps the login to N sessions.
+    Each session gets its own dynamic queue at the full plan rate.
     """
+    max_devices = max(1, int(max_devices or 1))
     base_rate_limit = api._parse_speed_to_mikrotik(bandwidth_limit)
     headroom_factor = float(getattr(settings, "PPPOE_RATE_LIMIT_HEADROOM", 1.0) or 1.0)
     rate_limit = _apply_pppoe_headroom(base_rate_limit, headroom_factor)
-    profile_name = f"pppoe_{base_rate_limit.replace('/', '_')}"
+    profile_name = (
+        f"pppoe_{base_rate_limit.replace('/', '_')}"
+        f"{multi_device_profile_suffix(max_devices)}"
+    )
 
     base_profile = api.get_active_pppoe_profile()
     base_profile_data = base_profile.get("data") if base_profile.get("found") else {}
@@ -177,6 +190,7 @@ def ensure_plan_pppoe_profile(api: MikroTikAPI, bandwidth_limit: str) -> dict:
         pool_name=pool_name,
         dns_server=base_profile_data.get("dns_server", ""),
         change_tcp_mss=base_profile_data.get("change_tcp_mss", ""),
+        **multi_device_profile_kwargs(max_devices),
     )
     if profile_result.get("error"):
         logger.error(f"[PPPoE] Profile creation failed: {profile_result['error']}")
@@ -215,7 +229,9 @@ def _provision_pppoe_sync(payload: dict) -> dict:
         return {"error": "Failed to connect to router"}
 
     try:
-        ensured = ensure_plan_pppoe_profile(api, payload["bandwidth_limit"])
+        ensured = ensure_plan_pppoe_profile(
+            api, payload["bandwidth_limit"], payload.get("max_devices", 1),
+        )
         if ensured.get("error"):
             return ensured
         profile_name = ensured["profile"]
@@ -716,6 +732,7 @@ async def retry_pending_pppoe_provisioning_background():
                     "pppoe_username": customer.pppoe_username,
                     "pppoe_password": customer.pppoe_password,
                     "bandwidth_limit": _plan.speed if _plan else "10Mbps",
+                    "max_devices": _pppoe_max_devices(customer, _plan),
                     "comment": (
                         f"CID:{customer.id}|{customer.name or customer.phone}|"
                         f"{datetime.utcnow().strftime('%Y-%m-%d')}"
@@ -737,12 +754,20 @@ async def retry_pending_pppoe_provisioning_background():
         logger.error("[PPPoE-RETRY] Background retry job failed: %s", exc)
 
 
+def _pppoe_max_devices(customer, plan) -> int:
+    """Devices this customer may log in with at once on one PPPoE username."""
+    from app.services.subscription_sharing import max_devices_for_customer
+
+    return max_devices_for_customer(customer, plan)
+
+
 def build_pppoe_payload(customer, router) -> dict:
     """Build the payload dict for PPPoE provisioning from ORM objects."""
     return {
         "pppoe_username": customer.pppoe_username,
         "pppoe_password": customer.pppoe_password,
         "bandwidth_limit": customer.plan.speed if customer.plan else "10Mbps",
+        "max_devices": _pppoe_max_devices(customer, customer.plan),
         "comment": f"CID:{customer.id}|{customer.name or customer.phone}|{datetime.utcnow().strftime('%Y-%m-%d')}",
         "router_ip": router.ip_address,
         "router_username": router.username,

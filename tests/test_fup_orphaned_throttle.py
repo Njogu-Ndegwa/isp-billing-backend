@@ -78,7 +78,7 @@ async def test_uncapped_plan_revert_restores_plan_speed_profile_not_default(db, 
 
     calls = []
 
-    def fake_restore(router_info, username, bandwidth_limit):
+    def fake_restore(router_info, username, bandwidth_limit, max_devices=1):
         calls.append((router_info["ip"], username, bandwidth_limit))
         return {"success": True}
 

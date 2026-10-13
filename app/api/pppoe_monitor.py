@@ -854,6 +854,8 @@ async def pppoe_customer_presence(
             Router.port.label("router_port"),
             Plan.name.label("plan_name"),
             Plan.speed.label("plan_speed"),
+            Plan.max_shared_users.label("plan_max_shared_users"),
+            Customer.max_devices_override.label("customer_max_devices_override"),
         )
         .outerjoin(Router, Customer.router_id == Router.id)
         .outerjoin(Plan, Customer.plan_id == Plan.id)
@@ -1038,6 +1040,14 @@ async def pppoe_customer_presence(
         },
         "billing_active": billing_active,
         "speed_enforcement": speed_enforcement,
+        "device_limit": {
+            "plan_max_devices": max(1, int(row["plan_max_shared_users"] or 1)),
+            "max_devices_override": row["customer_max_devices_override"],
+            "max_devices": max(
+                1,
+                int(row["customer_max_devices_override"] or row["plan_max_shared_users"] or 1),
+            ),
+        },
         "mikrotik": presence,
         # Plain-language reading of the router's last-disconnect-reason, so
         # the customer page can say why nobody is connected.

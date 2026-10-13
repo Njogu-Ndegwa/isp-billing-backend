@@ -55,7 +55,7 @@ async def test_pppoe_fup_throttle_derives_rate_and_ensures_speed_profile(db, mon
 
     calls = []
 
-    def fake_set_throttle(router_info, username, profile_name, rate_limit):
+    def fake_set_throttle(router_info, username, profile_name, rate_limit, max_devices=1):
         calls.append(
             {
                 "router": router_info["ip"],
@@ -127,7 +127,7 @@ async def test_pppoe_fup_throttle_blank_profile_falls_back_to_default_rate(db, m
 
     calls = []
 
-    def fake_set_throttle(router_info, username, profile_name, rate_limit):
+    def fake_set_throttle(router_info, username, profile_name, rate_limit, max_devices=1):
         calls.append({"username": username, "profile": profile_name, "rate": rate_limit})
         return {"success": True}
 
@@ -158,7 +158,7 @@ def test_set_secret_throttle_profile_sync_ensures_profile_then_points_secret(mon
         def disconnect(self):
             self.commands.append(("disconnect", None))
 
-        def ensure_pppoe_profile(self, profile_name, rate_limit):
+        def ensure_pppoe_profile(self, profile_name, rate_limit, **_kwargs):
             self.ensured.append((profile_name, rate_limit))
             return {"success": True}
 

@@ -35,7 +35,14 @@ from app.db.models import (
     Plan,
     Router,
 )
-from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, parse_speed_to_mikrotik
+from app.services.mikrotik_api import (
+    MikroTikAPI,
+    multi_device_profile_kwargs,
+    multi_device_profile_suffix,
+    normalize_mac_address,
+    parse_speed_to_mikrotik,
+)
+from app.services.subscription_sharing import max_devices_for_customer
 from app.services.usage_tracking import pooled_period_usage_bytes
 from app.services.hotspot_mac_login import (
     block_customer as mac_login_block_customer,
@@ -128,7 +135,9 @@ def _hotspot_identity(customer: Customer) -> tuple[Optional[str], Optional[str]]
 # --------------------------- Sync MikroTik helpers ---------------------------
 
 
-def _restore_pppoe_plan_profile_sync(router_info: dict, username: str, bandwidth_limit: str) -> dict:
+def _restore_pppoe_plan_profile_sync(
+    router_info: dict, username: str, bandwidth_limit: str, max_devices: int = 1,
+) -> dict:
     """Point the PPP secret back at its plan's ``pppoe_<rate>`` profile and re-enable it.
 
     Uses the same profile provisioning creates. ``plan.router_profile`` is not
@@ -145,7 +154,7 @@ def _restore_pppoe_plan_profile_sync(router_info: dict, username: str, bandwidth
     if not api.connect():
         return {"error": "connect_failed"}
     try:
-        ensured = ensure_plan_pppoe_profile(api, bandwidth_limit)
+        ensured = ensure_plan_pppoe_profile(api, bandwidth_limit, max_devices)
         if ensured.get("error"):
             return {"error": ensured["error"]}
         result = api.send_command("/ppp/secret/set", {
@@ -160,13 +169,14 @@ def _restore_pppoe_plan_profile_sync(router_info: dict, username: str, bandwidth
 
 
 def _set_secret_throttle_profile_sync(
-    router_info: dict, username: str, profile_name: str, rate_limit: str
+    router_info: dict, username: str, profile_name: str, rate_limit: str, max_devices: int = 1,
 ) -> dict:
     """Throttle a PPPoE user to ``rate_limit``.
 
     Ensures a ``/ppp/profile`` named ``profile_name`` carries ``rate_limit``,
     points the PPP secret at it, and drops the live session so the new rate
-    takes effect immediately.
+    takes effect immediately. A customer allowed several devices keeps that
+    allowance while throttled (``only-one=no`` + the same session limit).
     """
     api = MikroTikAPI(
         router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
@@ -175,7 +185,9 @@ def _set_secret_throttle_profile_sync(
     if not api.connect():
         return {"error": "connect_failed"}
     try:
-        ensured = api.ensure_pppoe_profile(profile_name, rate_limit)
+        ensured = api.ensure_pppoe_profile(
+            profile_name, rate_limit, **multi_device_profile_kwargs(max_devices),
+        )
         if ensured.get("error"):
             return {"error": ensured["error"]}
         result = api.send_command("/ppp/secret/set", {
@@ -517,7 +529,8 @@ async def apply_throttle(
     if not customer.pppoe_username:
         return {"error": "no_pppoe_username"}
     rate_limit = pppoe_throttle_rate_for_plan(plan)
-    profile_name = _fup_profile_name_for_rate(rate_limit)
+    max_devices = max_devices_for_customer(customer, plan)
+    profile_name = _fup_profile_name_for_rate(rate_limit) + multi_device_profile_suffix(max_devices)
     router = await _load_router(db, customer.router_id)
     if not router:
         return {"error": "no_router"}
@@ -529,6 +542,7 @@ async def apply_throttle(
         customer.pppoe_username,
         profile_name,
         rate_limit,
+        max_devices,
     )
 
 
@@ -586,13 +600,14 @@ async def restore_normal_profile(
     if not customer.pppoe_username:
         return {"error": "no_pppoe_username"}
     bandwidth_limit = (plan.speed if plan else None) or "10Mbps"
+    max_devices = max_devices_for_customer(customer, plan)
     router = await _load_router(db, customer.router_id)
     if not router:
         return {"error": "no_router"}
     info = _router_info(router)
     await db.commit()
     return await asyncio.to_thread(
-        _restore_pppoe_plan_profile_sync, info, customer.pppoe_username, bandwidth_limit
+        _restore_pppoe_plan_profile_sync, info, customer.pppoe_username, bandwidth_limit, max_devices
     )
 
 

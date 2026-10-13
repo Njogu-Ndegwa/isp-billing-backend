@@ -379,6 +379,9 @@ async def receive_usage_push(
             ] if pilot else []),
             router_metrics=metrics,
             meter_hotspot_by_host=pilot and "hosts" in payload.model_fields_set,
+            pppoe_session_users={
+                p.address.split("/", 1)[0]: p.name for p in payload.ppp if p.address and p.name
+            },
         )
 
     if result.customers_resolved:

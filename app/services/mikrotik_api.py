@@ -43,6 +43,45 @@ PPPOE_SUBNET_CANDIDATES = ("192.168.89", "192.168.189", "192.168.199", "172.16.8
 DEFAULT_PPPOE_KEEPALIVE_TIMEOUT = "10"
 DEFAULT_PPPOE_ONE_SESSION_PER_HOST = "yes"
 DEFAULT_PPPOE_PROFILE_ONLY_ONE = "yes"
+
+# Profiles for customers allowed several devices on one PPPoE login end in
+# "_d<N>" (pppoe_10M_10M_d3, fup-2M_2M_d3): only-one=no plus an on-up script
+# that drops any session beyond N. The access-defaults re-stamp of only-one=yes
+# must leave them alone.
+MULTI_DEVICE_PROFILE_RE = re.compile(r"_d(?P<n>\d{1,2})$")
+
+
+def multi_device_profile_suffix(max_devices: int) -> str:
+    """Profile-name suffix for a device limit; empty for a single device."""
+    return f"_d{int(max_devices)}" if int(max_devices or 1) > 1 else ""
+
+
+def multi_device_profile_kwargs(max_devices: int) -> dict:
+    """Extra ``ensure_pppoe_profile`` arguments for a device limit; none for one device."""
+    n = int(max_devices or 1)
+    if n <= 1:
+        return {}
+    return {"only_one": "no", "on_up": multi_device_on_up_script(n)}
+
+
+def is_multi_device_profile(profile_name: str) -> bool:
+    return bool(MULTI_DEVICE_PROFILE_RE.search(profile_name or ""))
+
+
+def multi_device_on_up_script(max_devices: int) -> str:
+    """RouterOS on-up script that keeps a username to ``max_devices`` sessions.
+
+    Runs when a session comes up. If the username now has more sessions than
+    allowed, the session that just came up (identified by its caller-id, the
+    device MAC) is removed, so devices already online keep working. The extra
+    device sees its dial fail and retries.
+    """
+    n = int(max_devices)
+    return (
+        f':if ([:len [/ppp active find where name=$user]] > {n}) do={{ '
+        f':log info ("bitwave: " . $user . " is at its {n}-device limit, dropping " . $"caller-id"); '
+        f'/ppp active remove [find where name=$user and caller-id=$"caller-id"] }}'
+    )
 DEFAULT_HOTSPOT_KEEPALIVE_TIMEOUT = "2m"
 
 
@@ -2734,10 +2773,12 @@ class MikroTikAPI:
         dns_server: str = "",
         change_tcp_mss: str = "",
         only_one: str = DEFAULT_PPPOE_PROFILE_ONLY_ONE,
+        on_up: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Ensure a PPPoE profile exists with the specified rate limit.
-        Creates or updates /ppp/profile.
+        Creates or updates /ppp/profile. ``on_up`` (when given) replaces the
+        profile's on-up script; multi-device profiles use it for their limit.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -2772,6 +2813,8 @@ class MikroTikAPI:
                 profile_args["change-tcp-mss"] = change_tcp_mss
             if only_one:
                 profile_args["only-one"] = only_one
+            if on_up is not None:
+                profile_args["on-up"] = on_up
 
             if profile_exists:
                 profile_args["numbers"] = profile_id
@@ -5060,6 +5103,9 @@ class MikroTikAPI:
                 )
 
             for profile_name in sorted(profile_names):
+                if is_multi_device_profile(profile_name):
+                    # Deliberately only-one=no: customers allowed several devices.
+                    continue
                 profile = self.send_command_optimized(
                     "/ppp/profile/print",
                     proplist=[".id", "name", "only-one"],
