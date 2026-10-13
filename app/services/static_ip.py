@@ -44,12 +44,14 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db import database as db_module
@@ -119,6 +121,55 @@ def normalize_static_ip(value: Optional[str]) -> Optional[str]:
     if addr.version != 4 or addr.is_unspecified or addr.is_loopback or addr.is_multicast:
         return None
     return str(addr)
+
+
+_MAC_SHAPE = re.compile(r"^[0-9A-Fa-f]{2}([:-]?[0-9A-Fa-f]{2}){5}$")
+
+
+def normalize_pin_mac(value: Optional[str]) -> Optional[str]:
+    """Canonical ``AA:BB:CC:DD:EE:FF`` pin MAC, None when blank.
+
+    Raises ``ValueError`` for anything that is not a MAC. Shared by customer
+    registration/edit and the bulk static-IP import so both accept the same
+    spellings.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    if not _MAC_SHAPE.match(text):
+        raise ValueError(f"'{text}' is not a valid MAC address")
+    return normalize_mac_address(text).upper()
+
+
+INVALID_STATIC_IP_MESSAGE = (
+    "Static IP plans need a valid IPv4 address for the customer, e.g. 192.168.2.24"
+)
+
+
+async def static_ips_in_use(
+    db: AsyncSession, router_id: Optional[int], exclude_customer_id: Optional[int] = None,
+) -> Dict[str, tuple]:
+    """``{ip: (customer_id, name)}`` for every static-IP-plan customer on a router.
+
+    One query; the uniqueness rule used by registration, edit and import.
+    """
+    stmt = (
+        select(Customer.id, Customer.name, Customer.static_ip)
+        .join(Plan, Plan.id == Customer.plan_id)
+        .where(
+            Customer.router_id == router_id,
+            Plan.connection_type == ConnectionType.STATIC_IP,
+            Customer.static_ip.isnot(None),
+        )
+    )
+    if exclude_customer_id is not None:
+        stmt = stmt.where(Customer.id != exclude_customer_id)
+    out: Dict[str, tuple] = {}
+    for row in (await db.execute(stmt)).all():
+        ip = normalize_static_ip(row.static_ip)
+        if ip and ip not in out:
+            out[ip] = (row.id, row.name)
+    return out
 
 
 def static_queue_name(ip: str) -> str:
