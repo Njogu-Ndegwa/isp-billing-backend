@@ -5,7 +5,6 @@ from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
-import re
 import secrets
 import string
 
@@ -34,9 +33,12 @@ from app.services.account_numbers import generate_account_number
 from app.services.customer_events import record_customer_event
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.static_ip import (
+    INVALID_STATIC_IP_MESSAGE,
     customer_should_have_access,
     inspect_static_customer,
+    normalize_pin_mac,
     normalize_static_ip,
+    static_ips_in_use,
     provision_static_customer,
     remove_static_customer_from_router,
 )
@@ -51,16 +53,11 @@ def _generate_pppoe_password(length: int = 12) -> str:
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
-_MAC_SHAPE = re.compile(r"^[0-9A-Fa-f]{2}([:-]?[0-9A-Fa-f]{2}){5}$")
-
-
 def _normalize_pin_mac(value: Optional[str]) -> Optional[str]:
-    text = (value or "").strip()
-    if not text:
-        return None
-    if not _MAC_SHAPE.match(text):
-        raise HTTPException(status_code=400, detail=f"'{text}' is not a valid MAC address")
-    return normalize_mac_address(text).upper()
+    try:
+        return normalize_pin_mac(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 async def _validate_static_ip(
@@ -69,27 +66,13 @@ async def _validate_static_ip(
     """A static-IP plan needs a valid, unused IPv4 on its router."""
     ip = normalize_static_ip(raw_ip)
     if not ip:
+        raise HTTPException(status_code=400, detail=INVALID_STATIC_IP_MESSAGE)
+    taken = (await static_ips_in_use(db, router_id, exclude_customer_id)).get(ip)
+    if taken is not None:
         raise HTTPException(
-            status_code=400,
-            detail="Static IP plans need a valid IPv4 address for the customer, e.g. 192.168.2.24",
+            status_code=409,
+            detail=f"{ip} is already assigned to {taken[1] or 'another customer'} on this router",
         )
-    stmt = (
-        select(Customer.id, Customer.name, Customer.static_ip)
-        .join(Plan, Plan.id == Customer.plan_id)
-        .where(
-            Customer.router_id == router_id,
-            Plan.connection_type == ConnectionType.STATIC_IP,
-            Customer.static_ip.isnot(None),
-        )
-    )
-    if exclude_customer_id is not None:
-        stmt = stmt.where(Customer.id != exclude_customer_id)
-    for row in (await db.execute(stmt)).all():
-        if normalize_static_ip(row.static_ip) == ip:
-            raise HTTPException(
-                status_code=409,
-                detail=f"{ip} is already assigned to {row.name or 'another customer'} on this router",
-            )
     return ip
 
 

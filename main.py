@@ -136,6 +136,7 @@ from app.api.agent_board_routes import router as agent_board_router
 from app.api.load_balancing_routes import router as load_balancing_router
 from app.api.outage_compensation_routes import router as outage_compensation_router
 from app.api.impersonation_routes import router as impersonation_router
+from app.api.static_ip_import_routes import router as static_ip_import_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -188,6 +189,7 @@ app.include_router(agent_board_router)
 app.include_router(load_balancing_router)
 app.include_router(outage_compensation_router)
 app.include_router(impersonation_router)
+app.include_router(static_ip_import_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
