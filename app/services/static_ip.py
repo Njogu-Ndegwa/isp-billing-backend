@@ -54,6 +54,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.services.customer_grace import has_access_time
 from app.db import database as db_module
 from app.db.models import (
     ConnectionType,
@@ -208,10 +209,11 @@ def _target_ip(target: Any) -> Optional[str]:
 
 def customer_should_have_access(customer: Customer, now: Optional[datetime] = None) -> bool:
     now = now or datetime.utcnow()
+    # Effective expiry: paid expiry plus any reseller-set grace period.
     return (
         customer.status == CustomerStatus.ACTIVE
         and customer.expiry is not None
-        and customer.expiry > now
+        and has_access_time(customer, now)
     )
 
 
@@ -925,7 +927,7 @@ async def _mark_suspended(customer_ids: list[int], router_id: int, now: datetime
             customer = await db.get(Customer, cid)
             if customer is None:
                 continue
-            if customer.status == CustomerStatus.ACTIVE and customer.expiry and customer.expiry > datetime.utcnow():
+            if customer_should_have_access(customer, datetime.utcnow()):
                 renewed.append(cid)
                 continue
             if customer.status == CustomerStatus.ACTIVE:
@@ -975,7 +977,8 @@ async def enforce_static_ip_customers_background() -> dict:
                 return
             expired = [
                 c for c in rows
-                if c.status == CustomerStatus.ACTIVE and c.expiry is not None and c.expiry <= now
+                if c.status == CustomerStatus.ACTIVE and c.expiry is not None
+                and not has_access_time(c, now)
             ]
             last = _last_full_reconcile.get(router_id)
             full = last is None or (now - last).total_seconds() >= FULL_RECONCILE_SECONDS

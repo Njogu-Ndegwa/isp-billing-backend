@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update, text, and_, or_
 from sqlalchemy.orm import selectinload
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta
+import asyncio
 import secrets
 import string
 
@@ -26,10 +27,18 @@ from app.services.pppoe_provisioning import (
     build_pppoe_payload, build_pppoe_remove_payload,
 )
 from app.services.hotspot_provisioning import (
+    build_hotspot_payload,
     get_or_create_provisioning_attempt,
     schedule_provisioning_attempt,
 )
 from app.services.account_numbers import generate_account_number
+from app.services.customer_grace import (
+    MAX_GRACE_MINUTES,
+    effective_expiry,
+    grace_fields,
+    has_access_time,
+    normalize_grace_minutes,
+)
 from app.services.customer_events import record_customer_event
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.static_ip import (
@@ -46,6 +55,9 @@ from app.services.static_ip import (
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Strong references to detached grace-restore tasks (asyncio keeps only weak ones).
+_grace_restore_tasks: set[asyncio.Task] = set()
 
 
 def _generate_pppoe_password(length: int = 12) -> str:
@@ -811,6 +823,156 @@ async def delete_customer(
         raise HTTPException(status_code=500, detail=f"Failed to delete customer: {str(e)}")
 
 
+class CustomerGraceRequest(BaseModel):
+    # 0 removes the grace period.
+    grace_period_minutes: int = Field(..., ge=0, le=MAX_GRACE_MINUTES)
+
+
+async def _restore_customer_access(customer_id: int) -> None:
+    """Put a customer whose grace reopened their access back on the router.
+
+    Runs detached after the grant has committed. The DB is read in one short
+    session and released before any RouterOS I/O. Failures are logged only:
+    the customer is ACTIVE again, so the check-in delivery and the normal
+    retry machinery still bring the router in line.
+    """
+    from app.db.database import async_session
+
+    try:
+        async with async_session() as db:
+            customer = (
+                await db.execute(
+                    select(Customer)
+                    .options(selectinload(Customer.plan), selectinload(Customer.router))
+                    .where(Customer.id == customer_id)
+                )
+            ).scalar_one_or_none()
+            if (
+                customer is None
+                or customer.status != CustomerStatus.ACTIVE
+                or not has_access_time(customer, datetime.utcnow())
+                or customer.router is None
+                or customer.plan is None
+            ):
+                await db.commit()
+                return
+            router_id = customer.router.id
+            is_pppoe = customer.plan.connection_type == ConnectionType.PPPOE
+            if is_pppoe and customer.pppoe_username:
+                payload = build_pppoe_payload(customer, customer.router)
+            elif not is_pppoe and customer.mac_address:
+                payload = build_hotspot_payload(
+                    customer, customer.plan, customer.router,
+                    f"CID:{customer.id}|grace-period-restore",
+                )
+            else:
+                await db.commit()
+                return
+            await db.commit()
+
+        if is_pppoe:
+            result = await provision_pppoe_customer(
+                customer_id=customer_id,
+                router_id=router_id,
+                pppoe_payload=payload,
+                action="grace_period_restore",
+            )
+        else:
+            from app.services.hotspot_provisioning import provision_hotspot_customer
+
+            result = await provision_hotspot_customer(
+                customer_id, router_id, payload, "grace_period_restore",
+            )
+        if not (isinstance(result, dict) and result.get("success")):
+            logger.warning(
+                "[GRACE] Restore for customer %s did not complete: %s",
+                customer_id,
+                (result or {}).get("error") if isinstance(result, dict) else result,
+            )
+    except Exception:
+        logger.exception("[GRACE] Restore for customer %s failed", customer_id)
+
+
+@router.put("/api/customers/{customer_id}/grace-period")
+async def set_customer_grace_period(
+    customer_id: int,
+    request: CustomerGraceRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Set a customer's standing grace period.
+
+    Access is cut at expiry + grace instead of at expiry; the paid expiry is
+    not changed. Companion devices sharing this customer's subscription get the
+    same grace. If the new grace reopens access for a customer already cut
+    off, they are reactivated and put back on the router.
+    """
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+
+    customer = (
+        await db.execute(
+            select(Customer).where(Customer.id == customer_id, Customer.user_id == user.id)
+        )
+    ).scalar_one_or_none()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    minutes = normalize_grace_minutes(request.grace_period_minutes)
+    now = datetime.utcnow()
+    companions = (
+        await db.execute(
+            select(Customer).where(
+                Customer.subscription_owner_id == customer.id,
+                Customer.user_id == user.id,
+            )
+        )
+    ).scalars().all()
+
+    restore_ids: list[int] = []
+    for row in [customer, *companions]:
+        row.grace_period_minutes = minutes
+        # Reopen access cut off at the old deadline. PENDING rows have not
+        # been delivered yet and are left to their own flow.
+        if (
+            row.status == CustomerStatus.INACTIVE
+            and row.expiry is not None
+            and has_access_time(row, now)
+            and (row.mac_address or row.pppoe_username)
+        ):
+            row.status = CustomerStatus.ACTIVE
+            restore_ids.append(row.id)
+    await db.commit()
+
+    # Routers that remove their own expired customers hold the deadline in
+    # the binding; move it later when the grace extended access.
+    tag_ids = [row.id for row in [customer, *companions] if not row.pppoe_username]
+    if tag_ids:
+        from app.services.expiry_tag_sync import schedule_expiry_tag_sync
+
+        schedule_expiry_tag_sync(tag_ids, "grace period change")
+    for restore_id in restore_ids:
+        task = asyncio.create_task(_restore_customer_access(restore_id))
+        _grace_restore_tasks.add(task)
+        task.add_done_callback(_grace_restore_tasks.discard)
+
+    logger.info(
+        "[GRACE] Reseller %s set grace %s min on customer %s (+%d companion(s)); restored %s",
+        user.id, minutes, customer.id, len(companions), restore_ids,
+    )
+    eff = effective_expiry(customer)
+    return {
+        "success": True,
+        "customer_id": customer.id,
+        "status": customer.status.value,
+        "expiry": customer.expiry.isoformat() if customer.expiry else None,
+        **grace_fields(customer, now),
+        "access_until": eff.isoformat() if eff else None,
+        "restored": customer.id in restore_ids,
+        "companions_updated": len(companions),
+    }
+
+
 @router.get("/api/customers")
 async def get_customers_api(
     router_id: Optional[int] = None,
@@ -866,6 +1028,7 @@ async def get_customers_api(
                 "router_id": c.router_id,
                 "account_number": c.account_number,
                 "wallet_credit_kes": c.wallet_credit_kes,
+                **grace_fields(c, now),
                 "subscription_owner_id": c.subscription_owner_id,
                 "has_paid": bool(c_has_paid),
                 "tier": "customer" if c_has_paid else "visitor",
@@ -941,6 +1104,7 @@ async def get_active_customers(
                 "router_id": c.router_id,
                 "account_number": c.account_number,
                 "wallet_credit_kes": c.wallet_credit_kes,
+                **grace_fields(c, now),
                 "has_paid": bool(c_has_paid),
                 "tier": "customer" if c_has_paid else "visitor",
                 "plan": {
@@ -997,6 +1161,7 @@ async def get_customer_detail(
             "router_id": customer.router_id,
             "account_number": customer.account_number,
             "wallet_credit_kes": customer.wallet_credit_kes,
+            **grace_fields(customer, datetime.utcnow()),
             "subscription_owner_id": customer.subscription_owner_id,
             "plan": {
                 "id": customer.plan.id,
@@ -1476,7 +1641,7 @@ async def resume_static_customer(
     user = await get_current_user(token, db)
     enforce_active_subscription(user)
     customer = await _load_static_customer(db, customer_id, user)
-    if customer.expiry is None or customer.expiry <= datetime.utcnow():
+    if customer.expiry is None or not has_access_time(customer, datetime.utcnow()):
         raise HTTPException(status_code=400, detail="The subscription has expired. Record a payment or set the correct expiry before resuming.")
     customer.status = CustomerStatus.ACTIVE
     await db.commit()

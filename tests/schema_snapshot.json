@@ -276,6 +276,7 @@
   "account_number",
   "created_at",
   "expiry",
+  "grace_period_minutes",
   "id",
   "latitude",
   "location_captured_at",

@@ -56,6 +56,7 @@ from app.services.radius_service import (
 )
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.plan_cache import FREE_TRIAL_NOT_PURCHASABLE, plan_model_allows_router
+from app.services.customer_grace import has_access_time
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ def _radius_username_from_mac(mac_address: Optional[str]) -> Optional[str]:
 def _is_customer_active(customer: Customer) -> bool:
     if customer.status != CustomerStatus.ACTIVE:
         return False
-    if customer.expiry and customer.expiry <= datetime.utcnow():
+    if customer.expiry and not has_access_time(customer, datetime.utcnow()):
         return False
     return True
 

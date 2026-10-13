@@ -56,6 +56,7 @@ from app.db import database
 from app.db.models import Customer, CustomerStatus, ProvisioningLog, Router, RouterAuthMethod
 from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI
 from app.services.router_expiry import expiry_second, normalize_mac, to_seconds
+from app.services.customer_grace import access_floor, effective_expiry_of
 
 logger = logging.getLogger(__name__)
 
@@ -170,14 +171,19 @@ async def load_targets(now: datetime, customer_ids: Optional[list[int]] = None) 
                                    r.username, r.password, r.port or 8728)
         if targets:
             paid = (await db.execute(
-                select(Customer.id, Customer.router_id, Customer.mac_address, Customer.expiry)
+                select(Customer.id, Customer.router_id, Customer.mac_address, Customer.expiry,
+                       Customer.grace_period_minutes)
                 .where(Customer.router_id.in_(list(targets)),
                        Customer.status == CustomerStatus.ACTIVE,
                        Customer.pppoe_username.is_(None),
                        Customer.mac_address.isnot(None),
-                       Customer.expiry > now)
+                       Customer.expiry > access_floor(now))
             )).all()
-            for cid, rid, raw_mac, expiry in paid:
+            for cid, rid, raw_mac, paid_expiry, grace in paid:
+                # The router deadline is the effective expiry (paid + grace).
+                expiry = effective_expiry_of(paid_expiry, grace)
+                if expiry <= now:
+                    continue
                 mac = normalize_mac(raw_mac)
                 if not mac or (macs_filter is not None and (rid, mac) not in macs_filter):
                     continue
@@ -193,16 +199,20 @@ async def fresh_wanted(router_id: int, macs: Iterable[str], now: datetime) -> di
     macs = set(macs)
     async with database.async_session() as db:
         rows = (await db.execute(
-            select(Customer.id, Customer.mac_address, Customer.expiry)
+            select(Customer.id, Customer.mac_address, Customer.expiry,
+                   Customer.grace_period_minutes)
             .where(Customer.router_id == router_id,
                    Customer.status == CustomerStatus.ACTIVE,
                    Customer.pppoe_username.is_(None),
                    Customer.mac_address.isnot(None),
-                   Customer.expiry > now)
+                   Customer.expiry > access_floor(now))
         )).all()
         await db.commit()
     out: dict[str, tuple[int, datetime]] = {}
-    for cid, raw_mac, expiry in rows:
+    for cid, raw_mac, paid_expiry, grace in rows:
+        expiry = effective_expiry_of(paid_expiry, grace)
+        if expiry <= now:
+            continue
         mac = normalize_mac(raw_mac)
         if mac in macs and (mac not in out or expiry > out[mac][1]):
             out[mac] = (cid, expiry)

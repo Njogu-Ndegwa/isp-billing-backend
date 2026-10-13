@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.database import get_db
 from app.db.models import Customer, Router
 from app.services import mikrotik_lb
+from app.services.customer_grace import access_prefilter, effective_expiry, has_access_time
 from app.services.auth import get_current_user, verify_token
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.router_availability import record_router_availability
@@ -371,15 +372,16 @@ async def enable_load_balancing(
             select(Customer).where(
                 Customer.router_id == router_id,
                 Customer.expiry.isnot(None),
-                Customer.expiry > datetime.utcnow(),
+                access_prefilter(datetime.utcnow()),
                 Customer.mac_address.isnot(None),
             )
         )
     ).scalars().all()
+    seed_now = datetime.utcnow()
     active_customers = [
-        {"mac": (c.mac_address or "").upper(), "expiry": c.expiry}
+        {"mac": (c.mac_address or "").upper(), "expiry": effective_expiry(c)}
         for c in rows
-        if c.mac_address
+        if c.mac_address and has_access_time(c, seed_now)
     ]
     await db.commit()  # release the DB before router I/O
 

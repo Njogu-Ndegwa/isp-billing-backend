@@ -242,6 +242,10 @@ class Customer(Base):
     # top up. Replaced (not incremented) by the C2B handler. CHECK >= 0 at
     # DB level (see migrations/add_customer_wallet_credit.py).
     wallet_credit_kes = Column(Integer, nullable=False, default=0, server_default="0")
+    # Standing grace period set by the reseller: access is cut at
+    # expiry + grace instead of at expiry, without moving the paid expiry.
+    # See app/services/customer_grace.py.
+    grace_period_minutes = Column(Integer, nullable=False, default=0, server_default="0")
     # Nullable self-reference used by managed companion devices that share the
     # paying customer's subscription/expiry instead of buying their own plan.
     subscription_owner_id = Column(

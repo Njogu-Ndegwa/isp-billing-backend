@@ -39,6 +39,7 @@ from app.services.pppoe_customer_import import (
     import_pppoe_customers,
 )
 from app.services.pppoe_router_transfer import transfer_pppoe_customers_between_routers
+from app.services.customer_grace import effective_expiry_of, has_access_time
 from app.config import settings
 
 import logging
@@ -1196,7 +1197,10 @@ async def cleanup_expired_customers_for_router(
         )
         
         result = await db.execute(stmt)
-        expired_customers = result.scalars().all()
+        # Customers inside their reseller-set grace window are not expired yet.
+        expired_customers = [
+            c for c in result.scalars().all() if not has_access_time(c, now)
+        ]
         
         if not expired_customers:
             return {
@@ -1208,14 +1212,20 @@ async def cleanup_expired_customers_for_router(
             }
         
         current_state = await db.execute(
-            select(Customer.id, Customer.status, Customer.expiry).where(
+            select(
+                Customer.id, Customer.status, Customer.expiry, Customer.grace_period_minutes
+            ).where(
                 Customer.id.in_([customer.id for customer in expired_customers])
             )
         )
         now_before_router_cleanup = datetime.utcnow()
         still_expired_ids = set()
-        for customer_id, status, expiry in current_state.all():
-            if status == CustomerStatus.ACTIVE and expiry and expiry <= now_before_router_cleanup:
+        for customer_id, status, expiry, grace in current_state.all():
+            if (
+                status == CustomerStatus.ACTIVE
+                and expiry
+                and effective_expiry_of(expiry, grace) <= now_before_router_cleanup
+            ):
                 still_expired_ids.add(customer_id)
 
         expired_customers = [
@@ -1275,7 +1285,7 @@ async def cleanup_expired_customers_for_router(
         for customer in expired_customers:
             if customer.id in successful_ids:
                 await db.refresh(customer)
-                if customer.expiry and customer.expiry > now_after_cleanup:
+                if customer.expiry and has_access_time(customer, now_after_cleanup):
                     logger.warning(
                         "[ROUTER-CLEANUP] Customer %s renewed during cleanup; skipping deactivation",
                         customer.id,
