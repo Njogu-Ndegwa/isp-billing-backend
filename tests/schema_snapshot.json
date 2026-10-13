@@ -388,6 +388,19 @@
   "unit",
   "updated_at"
  ],
+ "impersonation_sessions": [
+  "admin_id",
+  "end_reason",
+  "ended_at",
+  "expires_at",
+  "id",
+  "ip_address",
+  "reason",
+  "request_count",
+  "reseller_id",
+  "started_at",
+  "user_agent"
+ ],
  "lead_activities": [
   "activity_type",
   "created_at",
