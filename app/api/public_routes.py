@@ -14,6 +14,7 @@ from app.db.models import (
 )
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
+from app.services.customer_grace import access_floor, effective_expiry, has_access_time
 from app.services.plan_cache import (
     get_plans_cached,
     select_portal_plans,
@@ -1389,7 +1390,7 @@ async def _provision_reconnected_mac_if_current(
                 and current.router_id == router_id
                 and current.status == CustomerStatus.ACTIVE
                 and current.expiry
-                and current.expiry > datetime.utcnow()
+                and has_access_time(current, datetime.utcnow())
                 and normalize_mac_address(current.mac_address or "") == target_mac
             )
             await verify_db.rollback()
@@ -1490,12 +1491,18 @@ async def reconnect_self_service(
             Customer.subscription_owner_id.is_(None),
             Customer.status == CustomerStatus.ACTIVE,
             Customer.expiry.isnot(None),
-            Customer.expiry > now,
+            Customer.expiry > access_floor(now),
         )
         .order_by(Customer.expiry.desc())
-        .limit(1)
     )
-    customer = (await db.execute(customer_stmt)).scalar_one_or_none()
+    # Latest-expiring row that still has access (paid time or grace).
+    customer = next(
+        (
+            c for c in (await db.execute(customer_stmt)).scalars().all()
+            if has_access_time(c, now)
+        ),
+        None,
+    )
 
     if not customer:
         record_code_failure(request.router_id, normalized_mac)
@@ -1559,7 +1566,7 @@ async def restore_customer_on_device(
         if (
             customer.status != CustomerStatus.ACTIVE
             or not customer.expiry
-            or customer.expiry <= now
+            or not has_access_time(customer, now)
         ):
             await db.rollback()
             raise HTTPException(status_code=404, detail="Active subscription not found")
@@ -1612,7 +1619,7 @@ async def restore_customer_on_device(
             conflicting
             and conflicting.status == CustomerStatus.ACTIVE
             and conflicting.expiry
-            and conflicting.expiry > now
+            and has_access_time(conflicting, now)
         ):
             db.add(ReconnectionAttempt(
                 phone=lookup_key, mac_address=normalized_mac,
@@ -1683,7 +1690,8 @@ async def restore_customer_on_device(
 
         customer_name = customer.name
         plan_name = customer.plan.name
-        expiry = customer.expiry
+        # Access runs to the effective expiry (paid expiry + reseller grace).
+        expiry = effective_expiry(customer)
         expiry_iso = expiry.isoformat()
         router_name = current_router.name
 

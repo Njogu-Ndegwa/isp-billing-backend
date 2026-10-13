@@ -329,6 +329,44 @@ async def test_pppoe_customer_presence_uses_db_values_and_reports_offline(db, mo
     }]
 
 
+async def test_pppoe_customer_presence_explains_last_disconnect(db, monkeypatch):
+    pppoe_monitor._pppoe_presence_cache.clear()
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+
+    async def _run_with_guard(router_id, fn, router_info, username, **kwargs):
+        return {
+            "success": True,
+            "username": username,
+            "present_on_router": True,
+            "online": False,
+            "state": "offline",
+            "secret": {
+                "name": username,
+                "profile": "pppoe_5M_5M",
+                "disabled": False,
+                "last_logged_out": "2026-10-12 21:04:11",
+                "last_disconnect_reason": "peer-not-responding",
+                "last_caller_id": "AA:BB:CC:DD:EE:FF",
+            },
+            "active_session": None,
+            "active_sessions": [],
+            "profile_detail": {"name": "pppoe_5M_5M", "rate_limit": "5400000/5400000"},
+            "profile_lookup_success": True,
+            "session_lookup_success": True,
+        }
+
+    monkeypatch.setattr(pppoe_monitor, "run_with_guard", _run_with_guard)
+
+    response = await pppoe_monitor.pppoe_customer_presence(customer.id, db, _token(reseller))
+
+    last = response["last_disconnect"]
+    assert last["reason"] == "peer-not-responding"
+    assert last["at"] == "2026-10-12 21:04:11"
+    assert last["caller_id"] == "AA:BB:CC:DD:EE:FF"
+    assert last["category"] == "physical_or_cpe"
+    assert last["technician_action"]
+
+
 async def test_pppoe_customer_presence_flags_plan_rate_mismatch(db, monkeypatch):
     pppoe_monitor._pppoe_presence_cache.clear()
     reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)

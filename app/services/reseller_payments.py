@@ -16,6 +16,7 @@ from app.db.models import (
     Router,
     CustomerStatus,
 )
+from app.services.customer_grace import renewal_expiry
 import logging
 
 logger = logging.getLogger(__name__)
@@ -131,11 +132,10 @@ async def record_customer_payment(
         # Fallback to days_paid_for if unit is unknown
         time_delta = timedelta(days=days_paid_for)
     
-    # Add to existing expiry or start from now
-    if customer.expiry and customer.expiry > now:
-        customer.expiry = customer.expiry + time_delta
-    else:
-        customer.expiry = now + time_delta
+    # Extend from the paid expiry while the customer still has access (paid
+    # time or reseller grace, so grace keeps the billing date); otherwise
+    # start from now.
+    customer.expiry = renewal_expiry(customer, now, time_delta)
     
     customer.status = CustomerStatus.ACTIVE
 

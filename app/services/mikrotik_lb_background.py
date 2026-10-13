@@ -64,6 +64,7 @@ async def reconcile_lb_paid_background():
 
     from app.db.database import async_session
     from app.db.models import Customer, Router
+    from app.services.customer_grace import access_prefilter, effective_expiry, has_access_time
     from app.services.mikrotik_background import (
         _background_db_pool_is_busy,
         _router_recently_offline,
@@ -105,11 +106,12 @@ async def reconcile_lb_paid_background():
                         select(Customer).where(
                             Customer.router_id == r.id,
                             Customer.expiry.isnot(None),
-                            Customer.expiry > now,
+                            access_prefilter(now),
                             Customer.mac_address.isnot(None),
                         )
                     )).scalars().all()
                 )
+                customers = [c for c in customers if has_access_time(c, now)]
                 bundles.append({
                     "router_key": f"{r.ip_address}:{r.port}",
                     "router_info": {
@@ -121,7 +123,7 @@ async def reconcile_lb_paid_background():
                         "port": r.port,
                     },
                     "customers": [
-                        {"mac": (c.mac_address or "").upper(), "expiry": c.expiry}
+                        {"mac": (c.mac_address or "").upper(), "expiry": effective_expiry(c)}
                         for c in customers
                         if c.mac_address
                     ],

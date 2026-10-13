@@ -64,6 +64,7 @@ from app.services.static_ip import STATIC_KEY_PREFIX, normalize_static_ip
 from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
 from app.services.usage_tracking import pooled_period_usage_bytes
+from app.services.customer_grace import has_access_time
 
 logger = logging.getLogger(__name__)
 
@@ -251,7 +252,7 @@ def _customer_is_live(customer: Customer, now: datetime) -> bool:
     """
     if customer.status != CustomerStatus.ACTIVE:
         return False
-    return customer.expiry is not None and customer.expiry > now
+    return has_access_time(customer, now)
 
 
 async def _latest_period_is_closed(db, customer_id: int) -> bool:

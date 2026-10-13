@@ -5,7 +5,7 @@ import hashlib
 import logging
 import time
 import ipaddress
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 from decimal import Decimal
 import json  # Ensure you import json for serializing logs
@@ -3495,14 +3495,86 @@ class MikroTikAPI:
             logger.error(f"Error getting active PPPoE sessions: {e}")
             return {"error": str(e)}
 
-    def get_pppoe_sessions_with_bandwidth(self) -> Dict[str, Any]:
-        """Get active PPPoE sessions enriched with per-user bandwidth from dynamic queues.
+    @staticmethod
+    def _pppoe_queue_indexes(queues: List[dict]) -> Tuple[Dict[str, dict], Dict[str, dict]]:
+        """Index ``<pppoe-…>`` dynamic queues by target IP and by queue name.
 
-        MikroTik creates dynamic simple queues named ``<pppoe-USERNAME>`` for
-        each PPPoE user whose PPP profile has a rate-limit set.  This method
-        joins ``/ppp/active/print`` with ``/queue/simple/print`` to return
-        live upload/download byte counters and current rate for every online
-        PPPoE user.
+        One username can hold several sessions at once (a profile with
+        ``only-one=no``); each session gets its own dynamic queue, so the
+        session's address is the only reliable join key. The name index is
+        the fallback for queues whose target we cannot read.
+        """
+        by_ip: Dict[str, dict] = {}
+        by_name: Dict[str, dict] = {}
+        for q in queues:
+            qname = q.get("name", "")
+            if not (qname.startswith("<pppoe-") and qname.endswith(">")):
+                continue
+            by_name.setdefault(qname[7:-1], q)
+            for target in (q.get("target") or "").split(","):
+                ip = target.strip().split("/")[0]
+                if ip:
+                    by_ip[ip] = q
+        return by_ip, by_name
+
+    @staticmethod
+    def _pppoe_session_with_queue(
+        session: dict,
+        by_ip: Dict[str, dict],
+        by_name: Dict[str, dict],
+    ) -> Dict[str, Any]:
+        """Shape one ``/ppp/active`` row and attach the queue that belongs to it."""
+        user = session.get("name", "")
+        address = session.get("address", "")
+        q = by_ip.get(address) if address else None
+        if q is None:
+            q = by_name.get(user, {})
+            # A name match whose target is another session's IP is that
+            # session's queue, not ours.
+            target_ips = {
+                t.strip().split("/")[0]
+                for t in (q.get("target") or "").split(",")
+                if t.strip()
+            }
+            if address and target_ips and address not in target_ips:
+                q = {}
+
+        bytes_str = q.get("bytes", "0/0")
+        parts = bytes_str.split("/")
+        upload_bytes = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+        download_bytes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+        rate_str = q.get("rate", "0/0")
+        rate_parts = rate_str.split("/")
+        upload_rate = rate_parts[0] if len(rate_parts) > 0 else "0"
+        download_rate = rate_parts[1] if len(rate_parts) > 1 else "0"
+
+        return {
+            "id": session.get(".id", ""),
+            "user": user,
+            "service": session.get("service", ""),
+            "caller_id": session.get("caller-id", ""),
+            "address": address,
+            "uptime": session.get("uptime", ""),
+            "encoding": session.get("encoding", ""),
+            "session_id": session.get("session-id", ""),
+            "upload_bytes": upload_bytes,
+            "download_bytes": download_bytes,
+            "upload_rate": upload_rate,
+            "download_rate": download_rate,
+            "max_limit": q.get("max-limit", ""),
+            "has_queue": bool(q),
+        }
+
+    def get_pppoe_sessions_with_bandwidth(self) -> Dict[str, Any]:
+        """Get active PPPoE sessions enriched with per-session bandwidth from dynamic queues.
+
+        MikroTik creates a dynamic simple queue named ``<pppoe-USERNAME>`` for
+        each PPPoE session whose PPP profile has a rate-limit set.  This method
+        joins ``/ppp/active/print`` with ``/queue/simple/print`` on the
+        session address to return live upload/download byte counters and
+        current rate for every online session — one row per session, so a
+        username logged in on several devices appears several times.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -3516,50 +3588,21 @@ class MikroTikAPI:
                 proplist=[".id", "name", "target", "max-limit", "rate", "bytes",
                           "queued-bytes", "dynamic", "disabled"],
             )
-            queue_map: Dict[str, dict] = {}
-            for q in queue_result.get("data", []) if queue_result.get("success") else []:
-                qname = q.get("name", "")
-                if qname.startswith("<pppoe-") and qname.endswith(">"):
-                    username = qname[7:-1]
-                    queue_map[username] = q
+            by_ip, by_name = self._pppoe_queue_indexes(
+                queue_result.get("data", []) if queue_result.get("success") else []
+            )
 
-            sessions = []
-            for session in active.get("data", []):
-                user = session.get("name", "")
-                q = queue_map.get(user, {})
-
-                bytes_str = q.get("bytes", "0/0")
-                parts = bytes_str.split("/")
-                upload_bytes = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
-                download_bytes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-
-                rate_str = q.get("rate", "0/0")
-                rate_parts = rate_str.split("/")
-                upload_rate = rate_parts[0] if len(rate_parts) > 0 else "0"
-                download_rate = rate_parts[1] if len(rate_parts) > 1 else "0"
-
-                sessions.append({
-                    "user": user,
-                    "service": session.get("service", ""),
-                    "caller_id": session.get("caller-id", ""),
-                    "address": session.get("address", ""),
-                    "uptime": session.get("uptime", ""),
-                    "encoding": session.get("encoding", ""),
-                    "session_id": session.get("session-id", ""),
-                    "upload_bytes": upload_bytes,
-                    "download_bytes": download_bytes,
-                    "upload_rate": upload_rate,
-                    "download_rate": download_rate,
-                    "max_limit": q.get("max-limit", ""),
-                    "has_queue": bool(q),
-                })
+            sessions = [
+                self._pppoe_session_with_queue(session, by_ip, by_name)
+                for session in active.get("data", [])
+            ]
             return {"success": True, "data": sessions, "count": len(sessions)}
         except Exception as e:
             logger.error(f"Error getting PPPoE sessions with bandwidth: {e}")
             return {"error": str(e)}
 
-    def get_pppoe_session_with_bandwidth(self, username: str) -> Dict[str, Any]:
-        """Get one active PPPoE session, enriched with its dynamic queue if present."""
+    def get_pppoe_user_sessions_with_bandwidth(self, username: str) -> Dict[str, Any]:
+        """Get every active session for one PPPoE username, each with its own queue."""
         if not self.connected:
             return {"error": "Not connected"}
         try:
@@ -3580,61 +3623,44 @@ class MikroTikAPI:
             if not active.get("success"):
                 return active
 
-            session = next(
-                (s for s in active.get("data", []) if s.get("name") == username),
-                None,
-            )
-            if not session:
-                return {"success": True, "found": False, "data": None}
+            rows = [s for s in active.get("data", []) if s.get("name") == username]
+            if not rows:
+                return {"success": True, "data": [], "count": 0}
 
-            queue_result = self.send_command_optimized(
-                "/queue/simple/print",
-                proplist=[".id", "name", "target", "max-limit", "rate", "bytes", "dynamic", "disabled"],
-                query=f"?name=<pppoe-{username}>",
-            )
-            q = {}
-            if queue_result.get("success"):
-                q = next(
-                    (
-                        queue
-                        for queue in queue_result.get("data", [])
-                        if queue.get("name") == f"<pppoe-{username}>"
-                    ),
-                    {},
+            queue_proplist = [".id", "name", "target", "max-limit", "rate", "bytes", "dynamic", "disabled"]
+            queue_queries = [f"?name=<pppoe-{username}>"] + [
+                f"?target={s['address']}/32" for s in rows if s.get("address")
+            ]
+            queues: List[dict] = []
+            for query in queue_queries:
+                queue_result = self.send_command_optimized(
+                    "/queue/simple/print", proplist=queue_proplist, query=query,
                 )
-
-            bytes_str = q.get("bytes", "0/0")
-            parts = bytes_str.split("/")
-            upload_bytes = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
-            download_bytes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-
-            rate_str = q.get("rate", "0/0")
-            rate_parts = rate_str.split("/")
-            upload_rate = rate_parts[0] if len(rate_parts) > 0 else "0"
-            download_rate = rate_parts[1] if len(rate_parts) > 1 else "0"
-
-            return {
-                "success": True,
-                "found": True,
-                "data": {
-                    "user": username,
-                    "service": session.get("service", ""),
-                    "caller_id": session.get("caller-id", ""),
-                    "address": session.get("address", ""),
-                    "uptime": session.get("uptime", ""),
-                    "encoding": session.get("encoding", ""),
-                    "session_id": session.get("session-id", ""),
-                    "upload_bytes": upload_bytes,
-                    "download_bytes": download_bytes,
-                    "upload_rate": upload_rate,
-                    "download_rate": download_rate,
-                    "max_limit": q.get("max-limit", ""),
-                    "has_queue": bool(q),
-                },
-            }
+                if queue_result.get("success"):
+                    queues.extend(queue_result.get("data", []))
+            by_ip, by_name = self._pppoe_queue_indexes(queues)
+            sessions = [self._pppoe_session_with_queue(s, by_ip, by_name) for s in rows]
+            return {"success": True, "data": sessions, "count": len(sessions)}
         except Exception as e:
-            logger.error(f"Error getting PPPoE session with bandwidth for {username}: {e}")
+            logger.error(f"Error getting PPPoE sessions with bandwidth for {username}: {e}")
             return {"error": str(e)}
+
+    def get_pppoe_session_with_bandwidth(self, username: str) -> Dict[str, Any]:
+        """Get one active PPPoE session, enriched with its dynamic queue if present.
+
+        ``data`` is the first session; ``sessions`` carries all of them for
+        usernames logged in on more than one device.
+        """
+        result = self.get_pppoe_user_sessions_with_bandwidth(username)
+        if not result.get("success"):
+            return result
+        sessions = result.get("data", [])
+        return {
+            "success": True,
+            "found": bool(sessions),
+            "data": sessions[0] if sessions else None,
+            "sessions": sessions,
+        }
 
     def get_pppoe_secrets_minimal(self) -> Dict[str, Any]:
         """Fetch PPPoE secrets with essential fields."""
