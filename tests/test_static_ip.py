@@ -172,6 +172,43 @@ def test_suspend_disables_binding_and_kicks_host(fake):
     assert fake.find("/ip/hotspot/host", address=IP) == []
 
 
+def _host_vanishes_on_remove(fake, monkeypatch):
+    """RouterOS drops a bypassed host itself once its binding is disabled, so
+    the remove by the id read earlier answers "no such item" (router 602,
+    2026-10-13: every suspend of an online static customer returned 503)."""
+    original = fake.send_command
+
+    def send(cmd, args=None):
+        if cmd == "/ip/hotspot/host/remove":
+            fake.tables["/ip/hotspot/host"] = []
+            return {"success": False, "error": "no such item (4)"}
+        return original(cmd, args)
+
+    monkeypatch.setattr(fake, "send_command", send)
+
+
+def test_suspend_succeeds_when_router_already_dropped_the_host(fake, monkeypatch):
+    apply_static_items_sync(ROUTER, [_item()])
+    fake.add("/ip/hotspot/host", {"address": IP, "mac-address": MAC, "bypassed": "true"})
+    _host_vanishes_on_remove(fake, monkeypatch)
+
+    res = apply_static_items_sync(ROUTER, [_item(enabled=False)])["results"][0]
+
+    assert res["success"] and res["access"] == "suspended"
+    assert fake.find("/ip/hotspot/ip-binding", address=IP)[0]["disabled"] == "yes"
+
+
+def test_removal_succeeds_when_router_already_dropped_the_host(fake, monkeypatch):
+    apply_static_items_sync(ROUTER, [_item()])
+    fake.add("/ip/hotspot/host", {"address": IP, "mac-address": MAC})
+    _host_vanishes_on_remove(fake, monkeypatch)
+
+    result = static_ip.remove_static_ip_sync(ROUTER, IP)
+
+    assert result.get("success")
+    assert fake.find("/ip/hotspot/ip-binding", address=IP) == []
+
+
 def test_suspended_customer_never_gets_a_binding_created(fake):
     res = apply_static_items_sync(ROUTER, [_item(enabled=False)])["results"][0]
     assert res["success"] and fake.find("/ip/hotspot/ip-binding", address=IP) == []

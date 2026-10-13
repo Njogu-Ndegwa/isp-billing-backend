@@ -230,6 +230,21 @@ def _ok(result: Dict[str, Any]) -> bool:
     return True
 
 
+def _removed(result: Dict[str, Any]) -> bool:
+    """Like ``_ok`` for a remove, but an item that is already gone counts as removed.
+
+    RouterOS drops a bypassed hotspot host by itself the moment its binding is
+    disabled, so removing it by the id read a moment earlier answers
+    "no such item". The desired state (absent) holds, so that must not fail
+    the whole apply -- it used to turn every suspend of an online static
+    customer into a 503 that the enforcement job then undid.
+    """
+    error = str(result.get("error") or "")
+    if not result.get("success") and "no such item" in error.lower():
+        return False
+    return _ok(result)
+
+
 def _gateway_ok(tables: _RouterTables, ip: str) -> bool:
     addr = ipaddress.ip_address(ip)
     for row in tables.addresses:
@@ -334,7 +349,7 @@ def _ensure_shared_rules(api: MikroTikAPI, tables: _RouterTables, changes: list)
                 _ok(api.send_command("/ip/firewall/filter/move", {"numbers": rule[".id"], "destination": fasttrack_id}))
                 changes.append(f"fasttrack bypass moved ({match})")
             for extra in existing[1:]:
-                _ok(api.send_command("/ip/firewall/filter/remove", {"numbers": extra[".id"]}))
+                _removed(api.send_command("/ip/firewall/filter/remove", {"numbers": extra[".id"]}))
             continue
         result = api.send_command("/ip/firewall/filter/add", {**wanted, "place-before": fasttrack_id})
         if _ok(result):
@@ -357,7 +372,7 @@ def _apply_item(api: MikroTikAPI, tables: _RouterTables, item: StaticItem) -> Di
     comment = _comment(item.customer_id, item.name)
     bindings = _bindings_for(tables, ip)
     for extra in bindings[1:]:
-        if _ok(api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": extra[".id"]})):
+        if _removed(api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": extra[".id"]})):
             changes.append("duplicate binding removed")
     binding = bindings[0] if bindings else None
     want_disabled = "no" if item.enabled else "yes"
@@ -392,12 +407,12 @@ def _apply_item(api: MikroTikAPI, tables: _RouterTables, item: StaticItem) -> Di
         # Drop the bypassed host so its next packet is judged as unpaid.
         for host in tables.hosts:
             if str(host.get("address") or "") == ip and host.get(".id"):
-                _ok(api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]}))
+                _removed(api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]}))
 
     # --- queue: the speed ----------------------------------------------
     queues = _queues_for(tables, ip)
     for extra in queues[1:]:
-        if _ok(api.send_command("/queue/simple/remove", {"numbers": extra[".id"]})):
+        if _removed(api.send_command("/queue/simple/remove", {"numbers": extra[".id"]})):
             changes.append(f"duplicate queue {extra.get('name')} removed")
     queue = queues[0] if queues else None
     wanted_queue = {
@@ -445,7 +460,7 @@ def _apply_item(api: MikroTikAPI, tables: _RouterTables, item: StaticItem) -> Di
     pin_mac = normalize_mac_address(item.mac).upper() if item.mac else None
     if item.clear_pin:
         for rule in pins:
-            _ok(api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]}))
+            _removed(api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]}))
         if pins:
             changes.append("MAC pin cleared")
         pins, router_pin = [], None
@@ -462,7 +477,7 @@ def _apply_item(api: MikroTikAPI, tables: _RouterTables, item: StaticItem) -> Di
             if keep is None and _pin_mac(rule) == pin_mac and rule.get("action") == "drop" and not _is_true(rule.get("disabled")):
                 keep = rule
                 continue
-            _ok(api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]}))
+            _removed(api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]}))
             changes.append("stale MAC pin removed")
         if keep is None:
             args = {
@@ -522,20 +537,20 @@ def _place_queue_above_hotspot_parent(api: MikroTikAPI, tables: _RouterTables, q
 
 def _remove_item(api: MikroTikAPI, tables: _RouterTables, ip: str, changes: list) -> None:
     for b in _bindings_for(tables, ip):
-        if _ok(api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})):
+        if _removed(api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})):
             changes.append(f"binding for {ip} removed")
     for q in _queues_for(tables, ip):
-        if _ok(api.send_command("/queue/simple/remove", {"numbers": q[".id"]})):
+        if _removed(api.send_command("/queue/simple/remove", {"numbers": q[".id"]})):
             changes.append(f"queue for {ip} removed")
     for rule in _pins_for(tables, ip):
-        if _ok(api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]})):
+        if _removed(api.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]})):
             changes.append(f"MAC pin for {ip} removed")
     for row in tables.address_list:
         if str(row.get("address") or "") == ip:
-            _ok(api.send_command("/ip/firewall/address-list/remove", {"numbers": row[".id"]}))
+            _removed(api.send_command("/ip/firewall/address-list/remove", {"numbers": row[".id"]}))
     for host in tables.hosts:
         if str(host.get("address") or "") == ip and host.get(".id"):
-            _ok(api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]}))
+            _removed(api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]}))
 
 
 def _connect(router: dict, lane: str) -> MikroTikAPI:
