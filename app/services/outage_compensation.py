@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.services.customer_grace import access_floor, has_access_time
 from app.services.outage_reprovision import (
     REPROVISION_FAILED,
     REPROVISION_PENDING,
@@ -168,7 +169,7 @@ async def _collect(
             await db.execute(
                 base.where(
                     Customer.status == CustomerStatus.ACTIVE,
-                    Customer.expiry > now,
+                    Customer.expiry > access_floor(now),
                     # Bought after the power came back -> not affected.
                     existed_before_end,
                 ).order_by(Customer.id)
@@ -177,7 +178,12 @@ async def _collect(
         .scalars()
         .all()
     )
-    affected = [c for c in affected if c.id not in excluded]
+    # Still connected, counting a reseller grace period: their credit extends
+    # the paid expiry like any active customer's, so the billing date holds.
+    affected = [
+        c for c in affected if c.id not in excluded and has_access_time(c, now)
+    ]
+    affected_ids = {c.id for c in affected}
 
     skipped_expired = (
         (
@@ -195,7 +201,9 @@ async def _collect(
     # The exclusion list has to reach this group too: now that expired
     # customers can be revived, unticking one in the preview must actually
     # keep them out of the run rather than being silently ignored.
-    skipped_expired = [c for c in skipped_expired if c.id not in excluded]
+    skipped_expired = [
+        c for c in skipped_expired if c.id not in excluded and c.id not in affected_ids
+    ]
     return affected, skipped_expired
 
 
