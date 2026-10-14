@@ -3547,60 +3547,98 @@ class MikroTikAPI:
             return {"error": str(e)}
 
     @staticmethod
-    def _queue_target_ips(queue: dict) -> set:
-        """The IP addresses in a simple queue's ``target``.
+    def _queue_targets(queue: dict) -> Tuple[set, set]:
+        """Split a simple queue's ``target`` into (IP addresses, interface names).
 
-        RouterOS 6 targets a dynamic PPPoE queue at the session address
-        (``192.168.89.10/32``); RouterOS 7 targets the session interface
-        (``<pppoe-alice>``). Interface names are not addresses and are skipped.
+        Dynamic PPPoE queues on the fleet target the session interface
+        (``<pppoe-alice>``) on RouterOS 6 and 7 alike; hand-made queues
+        target an address (``192.168.89.10/32``).
         """
-        ips = set()
+        ips, interfaces = set(), set()
         for target in (queue.get("target") or "").split(","):
-            candidate = target.strip().split("/")[0]
-            try:
-                ips.add(str(ipaddress.ip_address(candidate)))
-            except ValueError:
+            target = target.strip()
+            if not target:
                 continue
-        return ips
+            try:
+                ips.add(str(ipaddress.ip_address(target.split("/")[0])))
+            except ValueError:
+                interfaces.add(target)
+        return ips, interfaces
 
     @staticmethod
     def _pppoe_queue_indexes(queues: List[dict]) -> Tuple[Dict[str, dict], Dict[str, dict]]:
-        """Index ``<pppoe-…>`` dynamic queues by target IP and by queue name.
+        """Index ``<pppoe-…>`` dynamic queues by target and by queue name.
 
         One username can hold several sessions at once (a profile with
         ``only-one=no``); each session gets its own dynamic queue, so the
-        session's address is the only reliable join key. The name index is
-        the fallback for queues whose target is not an address (RouterOS 7
-        targets the session interface) or cannot be read.
+        session's own interface or address is the reliable join key. The
+        name index is the fallback for when neither is known.
         """
-        by_ip: Dict[str, dict] = {}
+        by_target: Dict[str, dict] = {}
         by_name: Dict[str, dict] = {}
         for q in queues:
             qname = q.get("name", "")
             if not (qname.startswith("<pppoe-") and qname.endswith(">")):
                 continue
             by_name.setdefault(qname[7:-1], q)
-            for ip in MikroTikAPI._queue_target_ips(q):
-                by_ip[ip] = q
-        return by_ip, by_name
+            ips, interfaces = MikroTikAPI._queue_targets(q)
+            for target in ips | interfaces:
+                by_target[target] = q
+        return by_target, by_name
+
+    @staticmethod
+    def _pppoe_interface_key(user: str, mac: str) -> Tuple[str, str]:
+        return (user or "", (mac or "").upper())
+
+    def _pppoe_session_interfaces(self, username: Optional[str] = None) -> Dict[Tuple[str, str], str]:
+        """Map (username, caller MAC) to the session's ``<pppoe-…>`` interface.
+
+        ``/ppp/active`` does not name the interface; ``/interface/pppoe-server``
+        does, and its ``user`` + ``remote-address`` identify the session. A
+        failed read returns {} and matching falls back to the queue name.
+        """
+        try:
+            result = self.send_command_optimized(
+                "/interface/pppoe-server/print",
+                proplist=["name", "user", "remote-address"],
+                query=f"?user={username}" if username else None,
+            )
+        except Exception:
+            return {}
+        if not result.get("success"):
+            return {}
+        return {
+            self._pppoe_interface_key(row.get("user"), row.get("remote-address")): row["name"]
+            for row in result.get("data", [])
+            if row.get("name")
+        }
 
     @staticmethod
     def _pppoe_session_with_queue(
         session: dict,
-        by_ip: Dict[str, dict],
+        by_target: Dict[str, dict],
         by_name: Dict[str, dict],
+        interfaces: Optional[Dict[Tuple[str, str], str]] = None,
     ) -> Dict[str, Any]:
         """Shape one ``/ppp/active`` row and attach the queue that belongs to it."""
         user = session.get("name", "")
         address = session.get("address", "")
-        q = by_ip.get(address) if address else None
+        interface = (interfaces or {}).get(
+            MikroTikAPI._pppoe_interface_key(user, session.get("caller-id"))
+        )
+        q = None
+        for key in (interface, address):
+            if key and key in by_target:
+                q = by_target[key]
+                break
         if q is None:
             q = by_name.get(user, {})
-            # A name match whose target is another session's IP is that
-            # session's queue, not ours. An interface target (RouterOS 7)
-            # carries no IP, so the name match stands.
-            target_ips = MikroTikAPI._queue_target_ips(q)
+            # A name match aimed at another session's address or interface is
+            # that session's queue, not ours.
+            target_ips, target_interfaces = MikroTikAPI._queue_targets(q)
             if address and target_ips and address not in target_ips:
+                q = {}
+            elif interface and target_interfaces and interface not in target_interfaces:
                 q = {}
 
         bytes_str = q.get("bytes", "0/0")
@@ -3634,11 +3672,12 @@ class MikroTikAPI:
         """Get active PPPoE sessions enriched with per-session bandwidth from dynamic queues.
 
         MikroTik creates a dynamic simple queue named ``<pppoe-USERNAME>`` for
-        each PPPoE session whose PPP profile has a rate-limit set.  This method
-        joins ``/ppp/active/print`` with ``/queue/simple/print`` on the
-        session address to return live upload/download byte counters and
-        current rate for every online session — one row per session, so a
-        username logged in on several devices appears several times.
+        each PPPoE session whose PPP profile has a rate-limit set, targeted at
+        the session interface.  This method joins ``/ppp/active/print`` with
+        ``/queue/simple/print`` through that interface to return live
+        upload/download byte counters and current rate for every online
+        session — one row per session, so a username logged in on several
+        devices appears several times.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -3652,12 +3691,13 @@ class MikroTikAPI:
                 proplist=[".id", "name", "target", "max-limit", "rate", "bytes",
                           "queued-bytes", "dynamic", "disabled"],
             )
-            by_ip, by_name = self._pppoe_queue_indexes(
+            by_target, by_name = self._pppoe_queue_indexes(
                 queue_result.get("data", []) if queue_result.get("success") else []
             )
+            interfaces = self._pppoe_session_interfaces()
 
             sessions = [
-                self._pppoe_session_with_queue(session, by_ip, by_name)
+                self._pppoe_session_with_queue(session, by_target, by_name, interfaces)
                 for session in active.get("data", [])
             ]
             return {"success": True, "data": sessions, "count": len(sessions)}
@@ -3691,19 +3731,29 @@ class MikroTikAPI:
             if not rows:
                 return {"success": True, "data": [], "count": 0}
 
+            interfaces = self._pppoe_session_interfaces(username)
+            # A dynamic queue is named after the interface it targets, so the
+            # session interfaces find every session's queue, extras included.
+            queue_names = {f"<pppoe-{username}>"} | set(interfaces.values())
             queue_proplist = [".id", "name", "target", "max-limit", "rate", "bytes", "dynamic", "disabled"]
-            queue_queries = [f"?name=<pppoe-{username}>"] + [
+            queue_queries = [f"?name={name}" for name in sorted(queue_names)] + [
                 f"?target={s['address']}/32" for s in rows if s.get("address")
             ]
             queues: List[dict] = []
+            seen_ids: set = set()
             for query in queue_queries:
                 queue_result = self.send_command_optimized(
                     "/queue/simple/print", proplist=queue_proplist, query=query,
                 )
                 if queue_result.get("success"):
-                    queues.extend(queue_result.get("data", []))
-            by_ip, by_name = self._pppoe_queue_indexes(queues)
-            sessions = [self._pppoe_session_with_queue(s, by_ip, by_name) for s in rows]
+                    for q in queue_result.get("data", []):
+                        if q.get(".id") not in seen_ids:
+                            seen_ids.add(q.get(".id"))
+                            queues.append(q)
+            by_target, by_name = self._pppoe_queue_indexes(queues)
+            sessions = [
+                self._pppoe_session_with_queue(s, by_target, by_name, interfaces) for s in rows
+            ]
             return {"success": True, "data": sessions, "count": len(sessions)}
         except Exception as e:
             logger.error(f"Error getting PPPoE sessions with bandwidth for {username}: {e}")

@@ -32,7 +32,7 @@ QUEUES = [
 ]
 
 
-def _api(active, queues):
+def _api(active, queues, pppoe_interfaces=None):
     api = MikroTikAPI.__new__(MikroTikAPI)
     api.connected = True
     api.send_command = Mock(return_value={"success": True, "data": active})
@@ -41,6 +41,11 @@ def _api(active, queues):
         if command == "/ppp/active/print":
             name = (query or "").removeprefix("?name=")
             return {"success": True, "data": [s for s in active if s["name"] == name]}
+        if command == "/interface/pppoe-server/print":
+            rows = list(pppoe_interfaces or [])
+            if query and query.startswith("?user="):
+                rows = [r for r in rows if r["user"] == query.removeprefix("?user=")]
+            return {"success": True, "data": rows}
         if command == "/queue/simple/print":
             if query and query.startswith("?name="):
                 rows = [q for q in queues if q["name"] == query.removeprefix("?name=")]
@@ -91,21 +96,36 @@ def test_name_fallback_still_works_without_target():
     assert result["data"][0]["upload_bytes"] == 5
 
 
-# RouterOS 7 targets a dynamic PPPoE queue at the session interface, not its
-# address (router 393, 7.18.2, 2026-10-14: every session showed "No speed limit
-# queue" while each had a 12.96M queue).
-ROS7_ACTIVE = [
+# What the fleet actually returns: RouterOS 6 and 7 both target a dynamic
+# PPPoE queue at the session interface, not its address. Matching on the
+# address alone showed "No speed limit queue" for all 175 sessions on 30
+# routers (2026-10-14; router 393 "house 24" had a 12.96M queue).
+IFACE_ACTIVE = [
     {".id": "*80000002", "name": "house 24", "service": "pppoe", "caller-id": "50:0F:F5:E5:A1:C8",
      "address": "192.168.89.252", "uptime": "1h16m42s", "session-id": "0x81500002"},
+    {".id": "*80000003", "name": "alice", "service": "pppoe", "caller-id": "AA:AA:AA:AA:AA:01",
+     "address": "192.168.89.10", "uptime": "2h5m", "session-id": "0x81500003"},
+    {".id": "*80000004", "name": "alice", "service": "pppoe", "caller-id": "aa:aa:aa:aa:aa:02",
+     "address": "192.168.89.11", "uptime": "15m", "session-id": "0x81500004"},
 ]
-ROS7_QUEUES = [
+IFACE_QUEUES = [
     {".id": "*3", "name": "<pppoe-house 24>", "target": "<pppoe-house 24>",
      "max-limit": "12960000/12960000", "rate": "168/336", "bytes": "4336713/7714873"},
+    {".id": "*4", "name": "<pppoe-alice>", "target": "<pppoe-alice>",
+     "max-limit": "5400000/5400000", "rate": "1000/2000", "bytes": "100/200"},
+    {".id": "*5", "name": "<pppoe-alice-1>", "target": "<pppoe-alice-1>",
+     "max-limit": "5400000/5400000", "rate": "3000/4000", "bytes": "300/400"},
+]
+# The second alice device logged in first, so it holds the unsuffixed interface.
+PPPOE_INTERFACES = [
+    {"name": "<pppoe-house 24>", "user": "house 24", "remote-address": "50:0F:F5:E5:A1:C8"},
+    {"name": "<pppoe-alice-1>", "user": "alice", "remote-address": "AA:AA:AA:AA:AA:01"},
+    {"name": "<pppoe-alice>", "user": "alice", "remote-address": "AA:AA:AA:AA:AA:02"},
 ]
 
 
-def test_ros7_interface_target_queue_is_matched_by_name():
-    api = _api(ROS7_ACTIVE, ROS7_QUEUES)
+def test_interface_target_queue_is_found():
+    api = _api(IFACE_ACTIVE[:1], IFACE_QUEUES[:1], PPPOE_INTERFACES[:1])
 
     session = api.get_pppoe_sessions_with_bandwidth()["data"][0]
 
@@ -115,19 +135,50 @@ def test_ros7_interface_target_queue_is_matched_by_name():
     assert session["download_rate"] == "336"
 
 
-def test_ros7_single_user_lookup_finds_interface_target_queue():
-    api = _api(ROS7_ACTIVE, ROS7_QUEUES)
+def test_interface_target_queue_is_found_by_name_when_interfaces_unreadable():
+    api = _api(IFACE_ACTIVE[:1], IFACE_QUEUES[:1])
 
-    result = api.get_pppoe_session_with_bandwidth("house 24")
+    session = api.get_pppoe_sessions_with_bandwidth()["data"][0]
 
-    assert result["data"]["has_queue"] is True
-    assert result["data"]["max_limit"] == "12960000/12960000"
+    assert session["has_queue"] is True
+    assert session["max_limit"] == "12960000/12960000"
 
 
-def test_interface_target_is_not_indexed_as_an_address():
-    by_ip, by_name = MikroTikAPI._pppoe_queue_indexes(ROS7_QUEUES + QUEUES[:1])
+def test_each_device_gets_its_own_interface_queue():
+    api = _api(IFACE_ACTIVE, IFACE_QUEUES, PPPOE_INTERFACES)
 
-    assert set(by_ip) == {"192.168.89.10"}
+    by_address = {s["address"]: s for s in api.get_pppoe_sessions_with_bandwidth()["data"]}
+
+    assert by_address["192.168.89.10"]["upload_bytes"] == 300
+    assert by_address["192.168.89.11"]["upload_bytes"] == 100
+    assert all(s["has_queue"] for s in by_address.values())
+
+
+def test_name_match_for_another_sessions_interface_is_not_borrowed():
+    # Only <pppoe-alice> exists, and it belongs to the ...:02 device.
+    api = _api(IFACE_ACTIVE[1:], IFACE_QUEUES[1:2], PPPOE_INTERFACES)
+
+    by_address = {s["address"]: s for s in api.get_pppoe_sessions_with_bandwidth()["data"]}
+
+    assert by_address["192.168.89.11"]["has_queue"] is True
+    assert by_address["192.168.89.10"]["has_queue"] is False
+
+
+def test_single_user_lookup_finds_interface_target_queues():
+    api = _api(IFACE_ACTIVE, IFACE_QUEUES, PPPOE_INTERFACES)
+
+    house = api.get_pppoe_session_with_bandwidth("house 24")
+    alice = api.get_pppoe_session_with_bandwidth("alice")
+
+    assert house["data"]["has_queue"] is True
+    assert house["data"]["max_limit"] == "12960000/12960000"
+    assert [s["upload_bytes"] for s in alice["sessions"]] == [300, 100]
+
+
+def test_interface_targets_are_indexed_apart_from_addresses():
+    by_target, by_name = MikroTikAPI._pppoe_queue_indexes(IFACE_QUEUES[:1] + QUEUES[:1])
+
+    assert set(by_target) == {"<pppoe-house 24>", "192.168.89.10"}
     assert set(by_name) == {"house 24", "alice"}
 
 
