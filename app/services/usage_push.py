@@ -79,7 +79,12 @@ PUSH_COMMIT_CHUNK = 100
 MAX_REPORTS_PER_BATCH = 500
 
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$|^[0-9A-Fa-f]{12}$")
-_PPPOE_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+# RouterOS accepts almost any text as a PPP secret name, and resellers use it:
+# "house 24", "TELV!AN", "Mama mishel" are live usernames. Rejecting them here
+# drops the customer's usage and live queue. Only control characters and the
+# JSON-breaking quote/backslash are refused; the key must still match a
+# customer on the router before anything is banked.
+_PPPOE_USERNAME_RE = re.compile(r'^[^\x00-\x1f\x7f"\\]{1,64}$')
 
 # No real queue counter reaches 9 PB. A value above this is a corrupt read or a
 # hostile router, and banking it would instantly trip FUP and cut off a paying

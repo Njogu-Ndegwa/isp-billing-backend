@@ -3547,13 +3547,31 @@ class MikroTikAPI:
             return {"error": str(e)}
 
     @staticmethod
+    def _queue_target_ips(queue: dict) -> set:
+        """The IP addresses in a simple queue's ``target``.
+
+        RouterOS 6 targets a dynamic PPPoE queue at the session address
+        (``192.168.89.10/32``); RouterOS 7 targets the session interface
+        (``<pppoe-alice>``). Interface names are not addresses and are skipped.
+        """
+        ips = set()
+        for target in (queue.get("target") or "").split(","):
+            candidate = target.strip().split("/")[0]
+            try:
+                ips.add(str(ipaddress.ip_address(candidate)))
+            except ValueError:
+                continue
+        return ips
+
+    @staticmethod
     def _pppoe_queue_indexes(queues: List[dict]) -> Tuple[Dict[str, dict], Dict[str, dict]]:
         """Index ``<pppoe-…>`` dynamic queues by target IP and by queue name.
 
         One username can hold several sessions at once (a profile with
         ``only-one=no``); each session gets its own dynamic queue, so the
         session's address is the only reliable join key. The name index is
-        the fallback for queues whose target we cannot read.
+        the fallback for queues whose target is not an address (RouterOS 7
+        targets the session interface) or cannot be read.
         """
         by_ip: Dict[str, dict] = {}
         by_name: Dict[str, dict] = {}
@@ -3562,10 +3580,8 @@ class MikroTikAPI:
             if not (qname.startswith("<pppoe-") and qname.endswith(">")):
                 continue
             by_name.setdefault(qname[7:-1], q)
-            for target in (q.get("target") or "").split(","):
-                ip = target.strip().split("/")[0]
-                if ip:
-                    by_ip[ip] = q
+            for ip in MikroTikAPI._queue_target_ips(q):
+                by_ip[ip] = q
         return by_ip, by_name
 
     @staticmethod
@@ -3581,12 +3597,9 @@ class MikroTikAPI:
         if q is None:
             q = by_name.get(user, {})
             # A name match whose target is another session's IP is that
-            # session's queue, not ours.
-            target_ips = {
-                t.strip().split("/")[0]
-                for t in (q.get("target") or "").split(",")
-                if t.strip()
-            }
+            # session's queue, not ours. An interface target (RouterOS 7)
+            # carries no IP, so the name match stands.
+            target_ips = MikroTikAPI._queue_target_ips(q)
             if address and target_ips and address not in target_ips:
                 q = {}
 

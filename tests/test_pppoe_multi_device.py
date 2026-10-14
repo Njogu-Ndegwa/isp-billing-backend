@@ -91,6 +91,46 @@ def test_name_fallback_still_works_without_target():
     assert result["data"][0]["upload_bytes"] == 5
 
 
+# RouterOS 7 targets a dynamic PPPoE queue at the session interface, not its
+# address (router 393, 7.18.2, 2026-10-14: every session showed "No speed limit
+# queue" while each had a 12.96M queue).
+ROS7_ACTIVE = [
+    {".id": "*80000002", "name": "house 24", "service": "pppoe", "caller-id": "50:0F:F5:E5:A1:C8",
+     "address": "192.168.89.252", "uptime": "1h16m42s", "session-id": "0x81500002"},
+]
+ROS7_QUEUES = [
+    {".id": "*3", "name": "<pppoe-house 24>", "target": "<pppoe-house 24>",
+     "max-limit": "12960000/12960000", "rate": "168/336", "bytes": "4336713/7714873"},
+]
+
+
+def test_ros7_interface_target_queue_is_matched_by_name():
+    api = _api(ROS7_ACTIVE, ROS7_QUEUES)
+
+    session = api.get_pppoe_sessions_with_bandwidth()["data"][0]
+
+    assert session["has_queue"] is True
+    assert session["max_limit"] == "12960000/12960000"
+    assert session["upload_bytes"] == 4336713
+    assert session["download_rate"] == "336"
+
+
+def test_ros7_single_user_lookup_finds_interface_target_queue():
+    api = _api(ROS7_ACTIVE, ROS7_QUEUES)
+
+    result = api.get_pppoe_session_with_bandwidth("house 24")
+
+    assert result["data"]["has_queue"] is True
+    assert result["data"]["max_limit"] == "12960000/12960000"
+
+
+def test_interface_target_is_not_indexed_as_an_address():
+    by_ip, by_name = MikroTikAPI._pppoe_queue_indexes(ROS7_QUEUES + QUEUES[:1])
+
+    assert set(by_ip) == {"192.168.89.10"}
+    assert set(by_name) == {"house 24", "alice"}
+
+
 def test_single_user_lookup_returns_every_session():
     api = _api(ACTIVE_TWO_DEVICES, QUEUES)
 
