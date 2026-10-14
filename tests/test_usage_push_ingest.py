@@ -288,7 +288,10 @@ async def test_under_cap_customer_is_not_reported_for_enforcement(db, session_fa
 
 
 @pytest.mark.asyncio
-async def test_pppoe_report_is_matched_by_username(db, session_factory):
+# Spaces and punctuation are real: "house 24" went unmetered for weeks because
+# the push refused its key (router 393, 2026-10-14).
+@pytest.mark.parametrize("username", ["alex", "house 24", "TELV!AN"])
+async def test_pppoe_report_is_matched_by_username(db, session_factory, username):
     reseller = await make_reseller(db)
     router = await make_router(db, reseller)
     plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
@@ -297,19 +300,19 @@ async def test_pppoe_report_is_matched_by_username(db, session_factory):
         reseller,
         plan,
         router,
-        pppoe_username="alex",
+        pppoe_username=username,
         status=CustomerStatus.ACTIVE,
         expiry=datetime.utcnow() + timedelta(days=30),
     )
 
     await usage_push.ingest_usage_reports(
         router.id,
-        [UsageReport(queue_key="pppoe:alex", upload_bytes=0, download_bytes=0)],
+        [UsageReport(queue_key=f"pppoe:{username}", upload_bytes=0, download_bytes=0)],
         session_factory=session_factory,
     )
     await usage_push.ingest_usage_reports(
         router.id,
-        [UsageReport(queue_key="pppoe:alex", upload_bytes=3 * MB, download_bytes=21 * MB)],
+        [UsageReport(queue_key=f"pppoe:{username}", upload_bytes=3 * MB, download_bytes=21 * MB)],
         session_factory=session_factory,
     )
 

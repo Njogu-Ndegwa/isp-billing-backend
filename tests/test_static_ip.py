@@ -287,6 +287,16 @@ def test_usage_key_shape():
     assert _canonical_key("static:not-an-ip") is None
 
 
+def test_pppoe_usage_key_accepts_real_usernames():
+    assert _canonical_key("pppoe:house 24") == "pppoe:house 24"
+    assert _canonical_key("pppoe:TELV!AN") == "pppoe:TELV!AN"
+    assert _canonical_key("pppoe:Mama mishel") == "pppoe:Mama mishel"
+    assert _canonical_key("pppoe:") is None
+    assert _canonical_key('pppoe:bad"quote') is None
+    assert _canonical_key("pppoe:bad\nline") is None
+    assert _canonical_key("pppoe:" + "x" * 65) is None
+
+
 # ---------------------------------------------------------------------------
 # DB-backed: metering, live view, routes, enforcement
 # ---------------------------------------------------------------------------
