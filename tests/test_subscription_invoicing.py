@@ -2,7 +2,7 @@
 
 The platform bills resellers a SaaS subscription — this is real money:
   * 3% of hotspot revenue collected in the billing period
-  * KES 25 per ACTIVE PPPoE user whose access is unexpired at invoice time
+  * KES 25 per ACTIVE PPPoE/static-IP user unexpired at invoice time
   * KES 500 minimum monthly charge
 
 Pins:
@@ -145,12 +145,13 @@ async def test_charges_minimum_charge_floor(db):
     assert charges["final_charge"] == MINIMUM_CHARGE
 
 
-async def test_charges_exclude_non_qualifying_payments(db):
+@pytest.mark.parametrize("connection_type", [ConnectionType.PPPOE, ConnectionType.STATIC_IP])
+async def test_charges_exclude_non_qualifying_payments(db, connection_type):
     """Hotspot revenue counts only COMPLETED + counts_as_revenue payments made
     inside [period_start, period_end) by customers whose plan is HOTSPOT."""
     reseller = await make_reseller(db)
     hotspot_plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
-    pppoe_plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    pppoe_plan = await make_plan(db, reseller, connection_type=connection_type)
     hot_cust = await make_customer(db, reseller, hotspot_plan)
     ppp_cust = await make_customer(db, reseller, pppoe_plan)
 
@@ -171,9 +172,10 @@ async def test_charges_exclude_non_qualifying_payments(db):
     assert charges["hotspot_charge"] == 300.0
 
 
-async def test_charges_pppoe_counts_only_active_unexpired_customers_at_cutoff(db):
+@pytest.mark.parametrize("connection_type", [ConnectionType.PPPOE, ConnectionType.STATIC_IP])
+async def test_charges_pppoe_counts_only_active_unexpired_customers_at_cutoff(db, connection_type):
     reseller = await make_reseller(db)
-    pppoe_plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    pppoe_plan = await make_plan(db, reseller, connection_type=connection_type)
     hotspot_plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
 
     await make_customer(
@@ -220,6 +222,51 @@ async def test_charges_pppoe_counts_only_active_unexpired_customers_at_cutoff(db
 
     assert charges["pppoe_user_count"] == 1
     assert charges["pppoe_charge"] == PPPOE_PER_USER
+    assert charges["final_charge"] == MINIMUM_CHARGE
+
+
+async def test_charges_combine_pppoe_and_static_customers_for_only_this_reseller(db):
+    reseller = await make_reseller(db)
+    other = await make_reseller(db)
+    for owner, connection_type, count in [
+        (reseller, ConnectionType.PPPOE, 12),
+        (reseller, ConnectionType.STATIC_IP, 11),
+        (other, ConnectionType.STATIC_IP, 3),
+    ]:
+        plan = await make_plan(db, owner, connection_type=connection_type)
+        for _ in range(count):
+            await make_customer(db, owner, plan, status=CustomerStatus.ACTIVE,
+                                expiry=PERIOD_END + timedelta(days=1))
+
+    charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
+
+    assert charges["pppoe_user_count"] == 23
+    assert charges["pppoe_charge"] == 575.0
+    assert charges["hotspot_charge"] == 0.0
+    assert charges["final_charge"] == 575.0
+
+
+async def test_first_invoice_for_73_static_customers_is_1825_kes(db):
+    reseller = await make_reseller(db, subscription_status=SubscriptionStatus.TRIAL)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.STATIC_IP)
+    for index in range(73):
+        customer = await make_customer(
+            db, reseller, plan, status=CustomerStatus.ACTIVE,
+            static_ip=f"172.172.10.{index + 2}", expiry=PERIOD_END + timedelta(days=1),
+        )
+        customer.mac_address = None  # Static subscribers do not have hotspot MAC accounts.
+    await db.commit()
+
+    invoice = await generate_invoice_for_reseller(db, reseller.id, PERIOD_START, PERIOD_END)
+    await db.commit()
+
+    assert invoice.pppoe_user_count == 73
+    assert invoice.pppoe_charge == 1825.0
+    assert invoice.hotspot_charge == 0.0
+    assert invoice.final_charge == 1825.0
+    assert invoice.currency == "KES"
+    assert invoice.status == InvoiceStatus.PENDING
+    assert await _invoice_count(db, reseller.id) == 1
 
 
 # ---------------------------------------------------------------------------

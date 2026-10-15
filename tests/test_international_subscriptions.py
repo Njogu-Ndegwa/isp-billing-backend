@@ -154,9 +154,10 @@ async def test_cameroon_reseller_above_threshold_pays_three_percent_in_usd(db):
 
 
 @pytest.mark.asyncio
-async def test_international_pppoe_users_cost_twenty_cents(db):
+@pytest.mark.parametrize("connection_type", [ConnectionType.PPPOE, ConnectionType.STATIC_IP])
+async def test_international_pppoe_users_cost_twenty_cents(db, connection_type):
     reseller = await make_reseller(db, market_code="UG")
-    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    plan = await make_plan(db, reseller, connection_type=connection_type)
     for _ in range(60):
         await make_customer(
             db, reseller, plan, status=CustomerStatus.ACTIVE,
