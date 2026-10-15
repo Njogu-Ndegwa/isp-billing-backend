@@ -125,6 +125,8 @@ async def calculate_reseller_charges(
         )
     )).scalar())
 
+    # Static-IP subscriptions use the same per-customer rate and eligibility
+    # rules as PPPoE. Keep the existing invoice/API field names for compatibility.
     pppoe_user_count = (await db.execute(
         select(func.count(Customer.id))
         .join(Plan, Customer.plan_id == Plan.id)
@@ -133,7 +135,7 @@ async def calculate_reseller_charges(
             Customer.status == CustomerStatus.ACTIVE,
             Customer.expiry.is_not(None),
             Customer.expiry > period_end,
-            Plan.connection_type == ConnectionType.PPPOE,
+            Plan.connection_type.in_([ConnectionType.PPPOE, ConnectionType.STATIC_IP]),
         )
     )).scalar() or 0
 
