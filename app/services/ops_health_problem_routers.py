@@ -23,6 +23,14 @@ since a tunnel change inside them), BEFORE the rest of the week, and the
 evidence thresholds shrink with the window so a short window can still call a
 router fixed. That is how an admin checks a fix without waiting a day.
 
+Site online, management tunnel down: a router with paid customers waiting, no
+management contact, and proof the SITE has internet (customers still starting
+payments / vouchers / trials through its captive portal in the last 15 min, or
+the router reaching us over public HTTPS) is flagged ``site_online_tunnel_down``
+and listed in ``tunnel_down_sites``; ``ops_health_rules`` raises an admin alert
+from that list. RONGAI (448) and HOME951 (351), 2026-10-12: about 75 min of
+customers paying into a dead tunnel, 212 retries, nothing alerted.
+
 States: ``attention`` (bad now, or paid customers waiting), ``recovering`` (was bad, better but not clean
 or too little activity to tell), ``fixed`` (was bad, clean since). Routers of
 suspended/inactive resellers are left out: they are cut off at the platform.
@@ -43,7 +51,9 @@ from typing import Optional
 from sqlalchemy import select
 
 from app.db import database
-from app.db.models import ProvisioningAttempt, ProvisioningState, Router, RouterAvailabilityCheck, User
+from app.db.models import (
+    ProvisioningAttempt, ProvisioningAttemptEntrypoint, ProvisioningState, Router, RouterAvailabilityCheck, User,
+)
 from app.services.router_diagnosis import attach_diagnoses
 
 RECENT = timedelta(hours=24)
@@ -65,6 +75,14 @@ WAITING_GRACE = timedelta(minutes=5)
 _WAITING_STATES = (ProvisioningState.RETRY_PENDING.value, ProvisioningState.IN_PROGRESS.value,
                    ProvisioningState.SCHEDULED.value)
 ADVISORY_SOURCES = ("expired_cleanup",)  # failure-only probes; they bias reachability down
+# "The site is online": something only a working site can do happened this recently.
+SITE_ONLINE_WINDOW = timedelta(minutes=15)
+# Attempts a customer can only start through the router's own captive portal.
+PORTAL_ENTRYPOINTS = frozenset({
+    ProvisioningAttemptEntrypoint.HOTSPOT_PAYMENT.value,
+    ProvisioningAttemptEntrypoint.VOUCHER_DIRECT_API.value,
+    ProvisioningAttemptEntrypoint.FREE_TRIAL.value,
+})
 
 _TUNNEL_LABELS = {"sstp": "SSTP", "wireguard": "WireGuard"}
 _STATE_ORDER = {"attention": 0, "recovering": 1, "fixed": 2}
@@ -227,6 +245,38 @@ def waiting_reason(waiting: int, oldest: datetime, now: datetime,
     return text
 
 
+def site_online_evidence(portal_attempts: int, public_contact_at: Optional[datetime],
+                         last_online_at: Optional[datetime], now: datetime) -> Optional[dict]:
+    """Proof the site has internet while we cannot manage the router, or None.
+
+    Only meaningful for a router with paid customers waiting; a router we still
+    reached within WAITING_GRACE has a working management link, whatever else
+    is wrong with it.
+    """
+    if last_online_at is not None and now - last_online_at < WAITING_GRACE:
+        return None
+    public = public_contact_at if (public_contact_at and now - public_contact_at <= SITE_ONLINE_WINDOW) else None
+    if not portal_attempts and public is None:
+        return None
+    return {
+        "portal_attempts_15m": portal_attempts,
+        "public_contact_at": public.replace(microsecond=0).isoformat() + "Z" if public else None,
+    }
+
+
+def tunnel_down_reason(waiting: int, oldest: datetime, now: datetime,
+                       last_online_at: Optional[datetime], evidence: dict) -> str:
+    text = (f"Site online, management tunnel down: {_plural(waiting, 'paid customer')} waiting"
+            f" (oldest {_age_label(now - oldest)})")
+    if evidence.get("portal_attempts_15m"):
+        text += f" · {_plural(evidence['portal_attempts_15m'], 'new portal payment')} in 15 min"
+    if evidence.get("public_contact_at"):
+        text += " · router reached us over public HTTPS"
+    if last_online_at is None:
+        return text + " · never reached"
+    return text + f" · no management contact since {last_online_at.strftime('%d %b %H:%M UTC')}"
+
+
 def _since_label(fix: Optional[dict], window: Optional[timedelta] = None) -> str:
     if not fix:
         return f"in the last {window_label(window or RECENT)}"
@@ -275,10 +325,13 @@ def _fix_info(management_tunnel: Optional[str], changed_at: Optional[datetime], 
 
 
 def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], now: datetime,
-             window: Optional[timedelta] = None) -> dict:
+             window: Optional[timedelta] = None,
+             public_contact: Optional[dict[int, datetime]] = None) -> dict:
     """Pure core. routers: dicts with id, name, reseller, tunnel, management_tunnel,
     changed_at, last_online_at. checks: (router_id, checked_at, is_online).
-    attempts: (router_id, created_at, state, attempt_count, router_updated_at).
+    attempts: (router_id, created_at, state, attempt_count, router_updated_at[, entrypoint]).
+    public_contact: router id -> latest time the router reached us over public
+    HTTPS (optional; feeds the site-online evidence).
 
     ``window`` None is the dashboard snapshot (AFTER = since a tunnel change in the
     last 7 days, else the last 24 h). A window judges AFTER on the last N hours,
@@ -327,9 +380,14 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
 
     waiting: dict[int, int] = defaultdict(int)
     oldest_waiting: dict[int, datetime] = {}
-    for rid, created_at, state, attempt_count, updated_at in attempts:
+    portal_recent: dict[int, int] = defaultdict(int)
+    for rid, created_at, state, attempt_count, updated_at, *extra in attempts:
         if rid not in windows:
             continue
+        entrypoint = extra[0] if extra else None
+        if (getattr(entrypoint, "value", entrypoint) in PORTAL_ENTRYPOINTS
+                and timedelta(0) <= now - created_at <= SITE_ONLINE_WINDOW):
+            portal_recent[rid] += 1
         before, after = windows[rid]
         w = after if created_at >= after.start else before
         w.payments += 1
@@ -351,9 +409,11 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
                 t.first_try += 1
 
     rows = []
+    tunnel_down_sites = []
     for r in routers:
         last_online = r.get("last_online_at")
         n_waiting = waiting.get(r["id"], 0)
+        evidence = None
         # No contact for the whole lookback: an abandoned or long-dead site, not a
         # problem anyone can act on today (the tunnels section counts those) --
         # unless customers are still paying into it.
@@ -363,7 +423,20 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
         fix = fixes[r["id"]]
         if n_waiting:
             state = "attention"
-            reason = waiting_reason(n_waiting, oldest_waiting[r["id"]], now, last_online)
+            evidence = site_online_evidence(portal_recent.get(r["id"], 0),
+                                            (public_contact or {}).get(r["id"]), last_online, now)
+            if evidence:
+                reason = tunnel_down_reason(n_waiting, oldest_waiting[r["id"]], now, last_online, evidence)
+                tunnel_down_sites.append({
+                    "router_id": r["id"], "router_name": r.get("name"), "reseller": r.get("reseller"),
+                    "tunnel": r.get("tunnel"), "waiting": n_waiting,
+                    "oldest_waiting_at": oldest_waiting[r["id"]].replace(microsecond=0).isoformat() + "Z",
+                    "last_online_at": (last_online.replace(microsecond=0).isoformat() + "Z"
+                                       if last_online else None),
+                    "evidence": evidence,
+                })
+            else:
+                reason = waiting_reason(n_waiting, oldest_waiting[r["id"]], now, last_online)
         else:
             state = classify(before, after, th)
             if not state:
@@ -395,6 +468,8 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
             "before": before.as_dict(),
             "last_online_at": (r["last_online_at"].replace(microsecond=0).isoformat() + "Z"
                                if r.get("last_online_at") else None),
+            "site_online_tunnel_down": evidence is not None,
+            "site_evidence": evidence,
         })
     def _rank(x):
         # Customers waiting now first, then lost payments, first-try failures, reachability.
@@ -422,6 +497,8 @@ def evaluate(routers: list[dict], checks: list[tuple], attempts: list[tuple], no
         "waiting_routers": sum(1 for r in routers if waiting.get(r["id"])),
         "routers": attention + outcomes,
         "routers_total": len(rows),
+        # Uncapped (it is short): what the "site online, tunnel down" alert reads.
+        "tunnel_down_sites": sorted(tunnel_down_sites, key=lambda x: x["oldest_waiting_at"]),
     }
     if window:
         # Same headline for the chosen window: lost in it vs the average per
@@ -466,7 +543,7 @@ async def _load_inputs(now: datetime) -> tuple[list[dict], list, list]:
         attempt_rows = (await db.execute(
             select(ProvisioningAttempt.router_id, ProvisioningAttempt.created_at,
                    ProvisioningAttempt.provisioning_state, ProvisioningAttempt.attempt_count,
-                   ProvisioningAttempt.router_updated_at)
+                   ProvisioningAttempt.router_updated_at, ProvisioningAttempt.entrypoint)
             .where(ProvisioningAttempt.created_at >= since, ProvisioningAttempt.router_id.isnot(None))
         )).all()
         await db.commit()
