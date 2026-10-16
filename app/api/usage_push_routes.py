@@ -352,6 +352,10 @@ async def receive_usage_push(
                 hotspot_active=payload.router.hotspot_active,
                 pppoe_active=payload.router.pppoe_active,
                 queue_count=payload.router.queue_count,
+                bypassed_host_ips=(
+                    frozenset(h.ip for h in payload.hosts if h.bypassed and h.ip)
+                    if "hosts" in payload.model_fields_set else None
+                ),
             )
 
         result = await ingest_usage_reports(
