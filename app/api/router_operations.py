@@ -3005,6 +3005,8 @@ def _analyze_port_rows(
     bridge_port_by_interface = {
         row.get("interface"): row for row in bridge_port_rows if row.get("interface")
     }
+    lb_config = router_info.get("lb_config") or {}
+    wan_ports = set(lb_config.get("wan_ports") or []) if router_info.get("lb_enabled") else set()
 
     learned_macs_by_port: Dict[str, Set[str]] = {}
     for row in bridge_host_rows:
@@ -3260,7 +3262,11 @@ def _analyze_port_rows(
         tx_errors = _safe_routeros_int(iface.get("tx-error"))
         port_warnings = []
         health = "down"
-        if link_up and learned_macs:
+        # WAN ports are routed interfaces: bridge MAC learning says nothing
+        # about their health. Only trust configured WANs that are unbridged;
+        # stale LB configuration must not hide an access-port warning.
+        is_wan = port_name in wan_ports and not bridge_port.get("bridge")
+        if link_up and (learned_macs or is_wan):
             health = "active"
         elif link_up:
             health = "silent_link"
@@ -3272,6 +3278,8 @@ def _analyze_port_rows(
                 port_warnings.append(
                     "Link is up but no downstream MACs are currently learned"
                 )
+        elif is_wan:
+            port_warnings.append("Configured WAN port has no physical link")
         if rx_errors or tx_errors:
             port_warnings.append("Interface errors are present")
         if port_warnings:
@@ -3612,6 +3620,8 @@ async def get_router_port_analytics(
         "username": router_obj.username,
         "password": router_obj.password,
         "port": router_obj.port,
+        "lb_enabled": router_obj.lb_enabled,
+        "lb_config": router_obj.lb_config,
     }
     await db.commit()
 
