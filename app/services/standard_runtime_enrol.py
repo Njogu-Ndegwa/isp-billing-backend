@@ -365,11 +365,19 @@ async def standard_runtime_enrol_background(*, now: Optional[datetime] = None) -
 # little and retries on a short schedule. Whatever is still missing after
 # that is left to the background job, which keeps running as the safety net.
 
-SETUP_FIRST_DELAY_SECONDS = 20
-SETUP_RETRY_DELAYS_SECONDS = (40, 120, 300, 600)
-# At setup, a tunnel that is not up YET is a passing condition, not a
-# permanent one (the background job treats "no watched tunnel" as permanent).
-_SETUP_RETRYABLE_PREFIXES = ("unreachable", "busy", "no watched tunnel", "error")
+# The setup script calls /complete and then REBOOTS the router 5 s later
+# (provisioning._rsc_notify_and_reboot); an RB951 takes ~60-90 s to boot and
+# bring its tunnel back. A first try at 20 s hit router 544 mid-reboot
+# (2026-09-28): "Not connected", then "no hotspot ip-binding table" while the
+# hotspot was still loading, and both stopped the retries.
+SETUP_FIRST_DELAY_SECONDS = 90
+SETUP_RETRY_DELAYS_SECONDS = (60, 120, 300, 600)
+# At setup these are passing conditions, not permanent ones (the background
+# job treats "no watched tunnel" / "no hotspot" as permanent for a week):
+# the tunnel or the hotspot may simply not be up yet after the reboot.
+_SETUP_RETRYABLE_PREFIXES = ("unreachable", "busy", "no watched tunnel", "no hotspot", "error")
+# ...and so is any RouterOS API connection failure, whatever step hit it.
+_SETUP_RETRYABLE_FRAGMENTS = ("Not connected", "timed out", "Socket closed", "Connection")
 
 _setup_tasks: set = set()
 
@@ -404,7 +412,10 @@ async def _load_setup_candidate(router_id: int) -> Optional[Candidate]:
 
 def _setup_retryable(o: Outcome) -> bool:
     return any(
-        comp is not None and not comp.installed and comp.reason.startswith(_SETUP_RETRYABLE_PREFIXES)
+        comp is not None and not comp.installed and (
+            comp.reason.startswith(_SETUP_RETRYABLE_PREFIXES)
+            or any(f in comp.reason for f in _SETUP_RETRYABLE_FRAGMENTS)
+        )
         for comp in (o.watchdog, o.checkin)
     )
 
