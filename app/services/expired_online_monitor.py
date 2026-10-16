@@ -43,6 +43,12 @@ _CANDIDATES = text("""
             AND other.expiry + coalesce(other.grace_period_minutes, 0) * interval '1 minute'
                 > (now() AT TIME ZONE 'UTC')
       )
+      AND NOT EXISTS (
+          SELECT 1 FROM access_credentials ac
+          WHERE ac.router_id = c.router_id
+            AND upper(ac.bound_mac_address) = upper(c.mac_address)
+            AND ac.status = 'active' AND ac.revoked_at IS NULL
+      )
     ORDER BY r.id, c.id
 """)
 
@@ -143,6 +149,12 @@ async def _run_scan() -> None:
                             AND other.id <> c.id AND other.status IN ('ACTIVE', 'PENDING')
                             AND other.expiry + coalesce(other.grace_period_minutes, 0) * interval '1 minute'
                                 > (now() AT TIME ZONE 'UTC')
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM access_credentials ac
+                          WHERE ac.router_id = c.router_id
+                            AND upper(ac.bound_mac_address) = upper(c.mac_address)
+                            AND ac.status = 'active' AND ac.revoked_at IS NULL
                       )
                 """))
                 valid = set(valid_result.scalars().all())
