@@ -278,3 +278,131 @@ async def test_validation_route_rejects_unknown_account(client):
 
     assert resp.status_code == 200
     assert resp.json() == {"ResultCode": "C2B00012", "ResultDesc": "Invalid Account Number"}
+
+
+# ---------------------------------------------------------------------------
+# Registering a reseller's own paybill
+#
+# c2b_registered_at is what makes reminder SMS advertise the reseller's own
+# paybill, so it must only be set when Safaricom actually accepted the
+# registration (2026-10-11).
+# ---------------------------------------------------------------------------
+
+import app.api.c2b_routes as c2b_routes_module  # noqa: E402
+from app.db.models import ResellerPaymentMethod, ResellerPaymentMethodType  # noqa: E402
+from app.services.auth import verify_token  # noqa: E402
+from app.services.payment_gateway import encrypt_credential  # noqa: E402
+from tests.factories import make_admin  # noqa: E402
+
+REGISTER_BODY = {
+    "confirmation_url": "https://api.example/api/c2b/confirmation",
+    "validation_url": "https://api.example/api/c2b/validation",
+}
+
+
+async def _keyed_method(db, reseller):
+    pm = ResellerPaymentMethod(
+        user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
+        label="Own", is_active=True, mpesa_shortcode="4699342",
+        mpesa_consumer_key_encrypted=encrypt_credential(" ck "),
+        mpesa_consumer_secret_encrypted=encrypt_credential("cs"),
+    )
+    db.add(pm)
+    await db.commit()
+    return pm
+
+
+def _as_user(app, monkeypatch, user):
+    app.dependency_overrides[verify_token] = lambda: "tok"
+
+    async def _fake(token, db):
+        return user
+    monkeypatch.setattr(c2b_routes_module, "get_current_user", _fake)
+
+
+def _safaricom_answers(monkeypatch, body, calls):
+    async def _fake(**kwargs):
+        calls.append(kwargs)
+        return body
+    monkeypatch.setattr(c2b_routes_module, "_call_daraja_registerurl", _fake)
+
+
+async def test_register_marks_paybill_only_when_safaricom_accepts(app, client, db, session_factory, monkeypatch):
+    reseller = await make_reseller(db)
+    pm = await _keyed_method(db, reseller)
+    _as_user(app, monkeypatch, reseller)
+    calls = []
+
+    _safaricom_answers(monkeypatch, {"ResponseCode": "500.003.1001",
+                                     "ResponseDescription": "Urls are already registered"}, calls)
+    resp = await client.post(f"/api/payment-methods/{pm.id}/register-c2b", json=REGISTER_BODY)
+    assert resp.status_code == 502
+    async with session_factory() as s:
+        assert (await s.get(ResellerPaymentMethod, pm.id)).c2b_registered_at is None
+
+    _safaricom_answers(monkeypatch, {"ResponseCode": "0", "ResponseDescription": "Success"}, calls)
+    resp = await client.post(f"/api/payment-methods/{pm.id}/register-c2b", json=REGISTER_BODY)
+    assert resp.status_code == 200
+    async with session_factory() as s:
+        saved = await s.get(ResellerPaymentMethod, pm.id)
+        assert saved.c2b_registered_at is not None
+        assert saved.c2b_confirmation_url == REGISTER_BODY["confirmation_url"]
+    assert calls[-1]["shortcode"] == "4699342"
+    assert calls[-1]["consumer_key"] == "ck"  # stored keys are trimmed before use
+
+
+async def test_reseller_cannot_register_someone_elses_paybill(app, client, db, monkeypatch):
+    owner = await make_reseller(db)
+    other = await make_reseller(db)
+    pm = await _keyed_method(db, owner)
+    _as_user(app, monkeypatch, other)
+    _safaricom_answers(monkeypatch, {"ResponseCode": "0"}, [])
+
+    resp = await client.post(f"/api/payment-methods/{pm.id}/register-c2b", json=REGISTER_BODY)
+    assert resp.status_code == 404
+
+
+async def test_admin_can_register_a_resellers_paybill(app, client, db, session_factory, monkeypatch):
+    reseller = await make_reseller(db)
+    admin = await make_admin(db)
+    pm = await _keyed_method(db, reseller)
+    _safaricom_answers(monkeypatch, {"ResponseCode": "0"}, [])
+
+    _as_user(app, monkeypatch, reseller)
+    resp = await client.post(f"/api/admin/payment-methods/{pm.id}/register-c2b", json=REGISTER_BODY)
+    assert resp.status_code == 403
+
+    _as_user(app, monkeypatch, admin)
+    resp = await client.post(f"/api/admin/payment-methods/{pm.id}/register-c2b", json=REGISTER_BODY)
+    assert resp.status_code == 200
+    async with session_factory() as s:
+        assert (await s.get(ResellerPaymentMethod, pm.id)).c2b_registered_at is not None
+
+
+async def test_unmatched_list_hides_echoes_whose_prompt_payment_was_recorded(
+    app, client, db, monkeypatch,
+):
+    """The echo can beat the prompt's own callback and get queued; once the
+    receipt is recorded as a payment it must leave the reseller's queue."""
+    from app.db.models import User
+
+    customer = await _seed_pppoe(db)
+    reseller = await db.get(User, customer.user_id)
+    for trans_id in ("UKRACE01", "UKREAL01"):
+        txn = C2BTransaction(trans_id=trans_id, bill_ref_number="TECH ISP", trans_amount=500,
+                             msisdn="254700000000", business_shortcode="4699342",
+                             status=C2BTransactionStatus.UNMATCHED, matched_reseller_id=reseller.id)
+        db.add(txn)
+        await db.flush()
+        db.add(UnmatchedC2BPayment(c2b_transaction_id=txn.id,
+                                   reason=UnmatchedC2BReason.INVALID_LUHN,
+                                   assigned_reseller_id=reseller.id))
+    db.add(CustomerPayment(customer_id=customer.id, reseller_id=reseller.id, amount=500,
+                           payment_method="MOBILE_MONEY", payment_reference="UKRACE01",
+                           days_paid_for=30, status="COMPLETED"))
+    await db.commit()
+    _as_user(app, monkeypatch, reseller)
+
+    resp = await client.get("/api/c2b/unmatched")
+    assert resp.status_code == 200
+    assert [row["transaction"]["trans_id"] for row in resp.json()] == ["UKREAL01"]

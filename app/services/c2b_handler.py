@@ -34,6 +34,7 @@ from app.db.models import (
     CollectionMode,
     ConnectionType,
     Customer,
+    CustomerPayment,
     PaymentMethod,
     Plan,
     ResellerPaymentMethod,
@@ -134,9 +135,20 @@ async def _resolve_reseller_from_shortcode(
     if shortcode == settings.MPESA_SHORTCODE:
         return (None, True)
 
-    stmt = select(ResellerPaymentMethod).where(
-        ResellerPaymentMethod.mpesa_shortcode == shortcode,
-        ResellerPaymentMethod.is_active.is_(True),
+    # Two active methods can carry the same shortcode (a reseller re-adding
+    # their paybill); scalar_one_or_none would raise on every confirmation
+    # for it. Prefer the one we registered C2B for, then the newest.
+    stmt = (
+        select(ResellerPaymentMethod)
+        .where(
+            ResellerPaymentMethod.mpesa_shortcode == shortcode,
+            ResellerPaymentMethod.is_active.is_(True),
+        )
+        .order_by(
+            ResellerPaymentMethod.c2b_registered_at.is_(None),
+            ResellerPaymentMethod.id.desc(),
+        )
+        .limit(1)
     )
     pm = (await db.execute(stmt)).scalar_one_or_none()
     if pm:
@@ -198,6 +210,26 @@ async def handle_confirmation(
         logger.info(
             "[C2B] Duplicate confirmation for trans_id=%s (was status=%s) — no-op",
             fields.trans_id, existing.status,
+        )
+        return SUCCESS_RESPONSE
+
+    # 1b. Already paid through another path. Safaricom also posts a C2B
+    # confirmation for every M-Pesa prompt (STK) payment into a registered
+    # paybill; that payment was already recorded by the STK callback under the
+    # same receipt. Crediting it again would double the customer's period, and
+    # bucketing it would flood the reseller's unmatched queue with every
+    # prompt payment once their own paybill is registered.
+    if await _receipt_already_recorded(db, fields.trans_id):
+        await _archive(
+            db, fields,
+            status=C2BTransactionStatus.DUPLICATE,
+            matched_customer=None,
+            matched_reseller_id=None,
+        )
+        await db.commit()
+        logger.info(
+            "[C2B] trans_id=%s already recorded as a payment (prompt echo) — no-op",
+            fields.trans_id,
         )
         return SUCCESS_RESPONSE
 
@@ -479,6 +511,17 @@ async def _archive(
     db.add(txn)
     await db.flush()  # need txn.id for UnmatchedC2BPayment FK
     return txn
+
+
+async def _receipt_already_recorded(db: AsyncSession, trans_id: str) -> bool:
+    """True when a customer payment already carries this M-Pesa receipt."""
+    if not trans_id:
+        return False
+    return (await db.execute(
+        select(CustomerPayment.id)
+        .where(CustomerPayment.payment_reference == trans_id)
+        .limit(1)
+    )).scalar_one_or_none() is not None
 
 
 async def _bucket_unmatched(
