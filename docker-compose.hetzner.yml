@@ -34,7 +34,15 @@ services:
     # cheap 503 instead of queueing until the box falls over. Normal evening
     # peak is ~10 (Caddy keeps idle upstream connections, which count too).
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000",
-              "--limit-concurrency", "100", "--backlog", "128", "--timeout-keep-alive", "5"]
+              "--limit-concurrency", "100", "--backlog", "128", "--timeout-keep-alive", "5",
+              "--timeout-graceful-shutdown", "20"]
+    # On SIGTERM uvicorn stops accepting, lets in-flight requests (and their
+    # BackgroundTasks) finish for up to 20 s, then runs the shutdown hook
+    # (scheduler stop, heartbeat retirement). Docker's default 10 s killed the
+    # app mid-drain on every deploy ("failed to exit within 10s of signal 15",
+    # 2026-10-03 06:59). The deploy takes the container out of Caddy's
+    # rotation before stopping it, so a long drain costs customers nothing.
+    stop_grace_period: 30s
     env_file:
       - ${HETZNER_ENV_FILE:-.env.hetzner}
     environment:
