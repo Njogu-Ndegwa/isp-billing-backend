@@ -1318,6 +1318,8 @@ async def get_routers(
             "emergency_message": getattr(router_obj, "emergency_message", None),
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
             "status_alerts_enabled": getattr(router_obj, "status_alerts_enabled", False),
+            "lb_enabled": bool(router_obj.lb_enabled),
+            "lb_config": router_obj.lb_config,
         }
         if is_admin:
             token_obj = token_by_router.get(router_obj.id)
