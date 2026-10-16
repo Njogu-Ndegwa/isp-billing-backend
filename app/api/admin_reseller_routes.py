@@ -1211,6 +1211,18 @@ async def get_reseller_routers(
 # ---------------------------------------------------------------------------
 # 5. GET /api/admin/dashboard -- Aggregate Admin Dashboard
 # ---------------------------------------------------------------------------
+@router.get("/api/admin/expired-online-audit")
+async def admin_expired_online_audit(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Cached live RouterOS check; starts a bounded scan when stale."""
+    await _require_admin(token, db)
+    from app.services.expired_online_monitor import get_snapshot
+
+    return get_snapshot()
+
+
 @router.get("/api/admin/dashboard")
 async def admin_dashboard(
     db: AsyncSession = Depends(get_db),

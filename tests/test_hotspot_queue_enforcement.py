@@ -132,6 +132,39 @@ async def test_queue_sync_processes_only_capped_router_batch(db, session_factory
 
 
 @pytest.mark.asyncio
+async def test_queue_sync_does_not_recreate_a_customer_expired_after_snapshot(
+    db, session_factory, monkeypatch,
+):
+    monkeypatch.setattr(mikrotik_background, "async_session", session_factory)
+    monkeypatch.setattr(mikrotik_background, "queue_sync_running", False)
+    monkeypatch.setattr(mikrotik_background, "_queue_sync_router_cursor", 0)
+    monkeypatch.setattr(mikrotik_background, "_background_db_pool_is_busy", lambda _name: False)
+    reseller = await make_reseller(db)
+    plan = await make_plan(db, reseller)
+    router = await make_router(db, reseller)
+    customer = await make_customer(
+        db, reseller, plan, router, status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(hours=1),
+        mac_address="AA:BB:CC:DD:EE:FB",
+    )
+    original = mikrotik_background._queue_sync_customer_item
+
+    def expire_after_snapshot(row, period):
+        payload = original(row, period)
+        row.status = CustomerStatus.INACTIVE
+        return payload
+
+    calls = []
+    monkeypatch.setattr(mikrotik_background, "_queue_sync_customer_item", expire_after_snapshot)
+    monkeypatch.setattr(mikrotik_background, "_sync_single_router_queues_sync",
+                        lambda *_args, **_kwargs: calls.append(customer.id))
+
+    await mikrotik_background.sync_active_user_queues()
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_queue_sync_keeps_active_hotspot_fup_throttle(db, session_factory, monkeypatch):
     monkeypatch.setattr(mikrotik_background, "async_session", session_factory)
     monkeypatch.setattr(mikrotik_background, "queue_sync_running", False)

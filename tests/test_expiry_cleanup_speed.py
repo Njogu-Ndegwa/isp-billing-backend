@@ -16,11 +16,12 @@ MACS = ["AA:BB:CC:00:00:01", "AA:BB:CC:00:00:02", "AA:BB:CC:00:00:03"]
 class FakeRouter:
     """A router whose tables hold one binding/host/queue per expired MAC."""
 
-    def __init__(self, macs, *, sticky_binding=None, bindings_fail=False,
+    def __init__(self, macs, *, sticky_binding=None, sticky_active=None, bindings_fail=False,
                  shared_host_ip=None):
         self.calls = []
         self.bindings_fail = bindings_fail
         self.sticky_binding = sticky_binding  # this binding id survives removal
+        self.sticky_active = sticky_active
         self.tables = {
             "/ip/hotspot/ip-binding": [
                 {".id": f"*B{i}", "mac-address": m, "type": "bypassed",
@@ -51,10 +52,8 @@ class FakeRouter:
             return {"success": True, "data": list(self.tables.get(table, []))}
         if verb == "remove":
             entry_id = (arguments or {}).get("numbers")
-            if entry_id == self.sticky_binding:
-                # says ok the first time but the binding stays; the retry errors
-                if self.removes(table).count(entry_id) > 1:
-                    return {"error": "failure: item is busy"}
+            if entry_id in (self.sticky_binding, self.sticky_active):
+                # RouterOS acknowledges the command but leaves the entry.
                 return {"success": True, "data": []}
             self.tables[table] = [e for e in self.tables.get(table, []) if e[".id"] != entry_id]
             return {"success": True, "data": []}
@@ -84,24 +83,35 @@ def test_each_table_is_read_once_per_router_not_once_per_customer(monkeypatch):
     assert sorted(r["id"] for r in results["removed"]) == [1, 2, 3]
     assert results["failed"] == []
     prints = api.prints()
-    # 7 snapshot reads + 1 verification read of the bindings, for 3 customers
-    assert sum(prints.values()) == 8
+    # 7 snapshot reads + 3 verification reads, regardless of customer count.
+    assert sum(prints.values()) == 10
     assert prints["/ip/hotspot/ip-binding/print"] == 2
-    assert all(n == 1 for cmd, n in prints.items() if cmd != "/ip/hotspot/ip-binding/print")
+    assert prints["/ip/hotspot/user/print"] == 2
+    assert prints["/ip/hotspot/active/print"] == 2
     assert sorted(api.removes("/ip/hotspot/ip-binding")) == ["*B0", "*B1", "*B2"]
     assert sorted(api.removes("/queue/simple")) == ["*Q0", "*Q1", "*Q2"]
     assert api.tables["/ip/hotspot/ip-binding"] == []
 
 
-def test_binding_that_survives_removal_and_retry_keeps_customer_active(monkeypatch):
+def test_binding_that_survives_removal_keeps_customer_active(monkeypatch):
     api = FakeRouter(MACS[:2], sticky_binding="*B0")
     results = _run(monkeypatch, api, macs=MACS[:2])
 
     assert [r["id"] for r in results["removed"]] == [2]
     assert [f["id"] for f in results["failed"]] == [1]
-    assert "may still have access" in results["failed"][0]["error"]
-    # removed, still there on verification, removed once more
-    assert api.removes("/ip/hotspot/ip-binding").count("*B0") == 2
+    assert "binding=True" in results["failed"][0]["error"]
+    assert api.removes("/ip/hotspot/ip-binding").count("*B0") == 1
+
+
+def test_active_session_without_binding_or_user_is_not_reported_removed(monkeypatch):
+    api = FakeRouter([], sticky_active="*A0")
+    api.tables["/ip/hotspot/active"] = [
+        {".id": "*A0", "mac-address": MACS[0], "user": MACS[0],
+         "address": "192.168.88.10"}]
+    results = _run(monkeypatch, api, macs=MACS[:1])
+    assert results["removed"] == []
+    assert results["failed"][0]["id"] == 1
+    assert "active=True" in results["failed"][0]["error"]
 
 
 def test_unreadable_bindings_fail_every_customer_on_the_router(monkeypatch):
@@ -118,7 +128,7 @@ def test_customer_without_binding_counts_as_already_removed(monkeypatch):
 
     assert [r["id"] for r in results["removed"]] == [1]
     # nothing was bound, so there is nothing to verify
-    assert api.prints()["/ip/hotspot/ip-binding/print"] == 1
+    assert api.prints()["/ip/hotspot/ip-binding/print"] == 2
 
 
 def test_entry_matched_by_several_customers_is_removed_once(monkeypatch):
