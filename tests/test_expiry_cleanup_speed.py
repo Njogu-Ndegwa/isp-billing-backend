@@ -17,6 +17,7 @@ class FakeRouter:
     """A router whose tables hold one binding/host/queue per expired MAC."""
 
     def __init__(self, macs, *, sticky_binding=None, sticky_active=None, sticky_host=None,
+                 reappear_unauthorized_host=False,
                  bindings_fail=False,
                  shared_host_ip=None):
         self.calls = []
@@ -24,12 +25,14 @@ class FakeRouter:
         self.sticky_binding = sticky_binding  # this binding id survives removal
         self.sticky_active = sticky_active
         self.sticky_host = sticky_host
+        self.reappear_unauthorized_host = reappear_unauthorized_host
         self.tables = {
             "/ip/hotspot/ip-binding": [
                 {".id": f"*B{i}", "mac-address": m, "type": "bypassed",
                  "comment": f"USER:{m.replace(':', '')}"} for i, m in enumerate(macs)],
             "/ip/hotspot/host": [
-                {".id": f"*H{i}", "mac-address": m, "address": f"192.168.88.{10 + i}"}
+                {".id": f"*H{i}", "mac-address": m, "address": f"192.168.88.{10 + i}",
+                 "authorized": "true"}
                 for i, m in enumerate(macs)],
             "/queue/simple": [
                 {".id": f"*Q{i}", "name": f"plan_{m.replace(':', '')}", "comment": ""}
@@ -58,6 +61,9 @@ class FakeRouter:
                 # RouterOS acknowledges the command but leaves the entry.
                 return {"success": True, "data": []}
             self.tables[table] = [e for e in self.tables.get(table, []) if e[".id"] != entry_id]
+            if table == "/ip/hotspot/host" and self.reappear_unauthorized_host:
+                self.tables[table].append({".id": "*HNEW", "mac-address": MACS[0],
+                                           "authorized": "false", "bypassed": "false"})
             return {"success": True, "data": []}
         return {"success": True, "data": []}
 
@@ -122,6 +128,14 @@ def test_authorized_host_that_survives_removal_is_not_reported_removed(monkeypat
     results = _run(monkeypatch, api, macs=MACS[:1])
     assert results["removed"] == []
     assert "host=True" in results["failed"][0]["error"]
+
+
+def test_reconnected_unauthorized_host_does_not_block_expiry(monkeypatch):
+    api = FakeRouter(MACS[:1], reappear_unauthorized_host=True)
+    results = _run(monkeypatch, api, macs=MACS[:1])
+    assert [r["id"] for r in results["removed"]] == [1]
+    assert results["failed"] == []
+    assert api.tables["/ip/hotspot/host"][0]["authorized"] == "false"
 
 
 def test_unreadable_bindings_fail_every_customer_on_the_router(monkeypatch):

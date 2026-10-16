@@ -35,7 +35,7 @@ import re
 from app.services.router_script_gate import gate_rsc_body
 from app.services.usage_push_auth import derive_router_token
 
-SCRIPT_VERSION = 3
+SCRIPT_VERSION = 4
 SCRIPT_NAME = "bitwave-expiry-reaper"
 SCHEDULER_NAME = "bitwave-expiry-reaper"
 POLICY = "read,write,test,policy"
@@ -318,12 +318,16 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 :do { /ip hotspot user set [find where name=$m] disabled=yes } on-error={}
                 :do { /ip hotspot active remove [find where mac-address=$m] } on-error={}
                 :do { /ip hotspot host remove [find where mac-address=$m] } on-error={}
-                :if (([:len [/ip hotspot active find where mac-address=$m]] = 0) && ([:len [/ip hotspot host find where mac-address=$m]] = 0)) do={
+                # An unplugged session can leave a new unauthorized host row as
+                # soon as the device reconnects. Only an authorized host blocks
+                # disconnect verification; any bypass is checked after binding removal.
+                :if (([:len [/ip hotspot active find where mac-address=$m]] = 0) && ([:len [/ip hotspot host find where mac-address=$m and authorized]] = 0)) do={
                     :do { /ip hotspot user remove [find where name=$u] } on-error={}
                     :do { /ip hotspot user remove [find where name=$m] } on-error={}
-                    :if (([:len [/ip hotspot user find where name=$u]] = 0) && ([:len [/ip hotspot user find where name=$m]] = 0) && ([:len [/ip hotspot active find where mac-address=$m]] = 0) && ([:len [/ip hotspot host find where mac-address=$m]] = 0)) do={
+                    :if (([:len [/ip hotspot user find where name=$u]] = 0) && ([:len [/ip hotspot user find where name=$m]] = 0) && ([:len [/ip hotspot active find where mac-address=$m]] = 0) && ([:len [/ip hotspot host find where mac-address=$m and authorized]] = 0)) do={
                         :do { /ip hotspot ip-binding remove [find where mac-address=$m] } on-error={}
-                        :if ([:len [/ip hotspot ip-binding find where mac-address=$m]] = 0) do={
+                        :do { /ip hotspot host remove [find where mac-address=$m and bypassed] } on-error={}
+                        :if (([:len [/ip hotspot ip-binding find where mac-address=$m]] = 0) && ([:len [/ip hotspot active find where mac-address=$m]] = 0) && ([:len [/ip hotspot host find where mac-address=$m and authorized]] = 0) && ([:len [/ip hotspot host find where mac-address=$m and bypassed]] = 0)) do={
                             :do { /queue simple remove [find where name=("plan_" . $u)] } on-error={}
                             :if ([:len $bwExpDone] < 700) do={ :set bwExpDone ($bwExpDone . $m . "@" . $nows . ",") }
                             :log info ("expiry-reaper: removed " . $m)

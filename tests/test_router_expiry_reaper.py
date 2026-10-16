@@ -392,7 +392,7 @@ def test_v2_script_reads_asks_about_redates_and_removes_mac_login_users():
     assert '/ip hotspot user remove [find where name=$m]' in src
     assert '/ip hotspot user remove [find where name=$u]' in src
     # and it tells the server it can see them
-    assert '"ident=" . $ident . "&v=3&now="' in src
+    assert '"ident=" . $ident . "&v=4&now="' in src
 
 
 def test_reaper_blocks_relogin_and_reports_only_after_verified_disconnect():
@@ -404,7 +404,8 @@ def test_reaper_blocks_relogin_and_reports_only_after_verified_disconnect():
     report = src.index(':set bwExpDone ($bwExpDone . $m . "@" . $nows . ",")')
     assert disable < kick < delete_user < delete_binding < report
     assert '[:len [/ip hotspot active find where mac-address=$m]] = 0' in src
-    assert '[:len [/ip hotspot host find where mac-address=$m]] = 0' in src
+    assert '[:len [/ip hotspot host find where mac-address=$m and authorized]] = 0' in src
+    assert '[:len [/ip hotspot host find where mac-address=$m and bypassed]] = 0' in src
     assert '[:len [/ip hotspot ip-binding find where mac-address=$m]] = 0' in src
 
 
