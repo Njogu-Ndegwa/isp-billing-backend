@@ -70,6 +70,7 @@ from app.services.hotspot_mac_login import (
     reconcile_router as reconcile_mac_login_router,
 )
 import asyncio
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import functools
@@ -2197,6 +2198,10 @@ def _scan_router_idle_credentials_sync(
 
     try:
         hosts_resp = api.send_command("/ip/hotspot/host/print")
+        if not hosts_resp.get("success"):
+            logger.warning("[REAPER] Could not read hosts on %s; keeping credential bindings",
+                           router_info.get("name"))
+            return out
         hosts_by_mac = {}
         if hosts_resp.get("success") and hosts_resp.get("data"):
             for h in hosts_resp["data"]:
@@ -2206,13 +2211,19 @@ def _scan_router_idle_credentials_sync(
 
         # Pull bindings + queues once so per-cred release is just a lookup + remove.
         bindings_resp = api.send_command("/ip/hotspot/ip-binding/print")
-        bindings_by_mac: dict[str, str] = {}
+        if not bindings_resp.get("success"):
+            logger.warning("[REAPER] Could not read bindings on %s; keeping credential bindings",
+                           router_info.get("name"))
+            return out
+        bindings_by_credential: dict[tuple[int, str], list[str]] = defaultdict(list)
         if bindings_resp.get("success") and bindings_resp.get("data"):
             for b in bindings_resp["data"]:
                 bm = b.get("mac-address", "")
                 bid = b.get(".id")
-                if bm and bid:
-                    bindings_by_mac[normalize_mac_address(bm)] = bid
+                match = re.search(r"ACCESS_CRED\|cred:(\d+)", b.get("comment", ""))
+                if bm and bid and match:
+                    bindings_by_credential[(int(match.group(1)),
+                                            normalize_mac_address(bm))].append(bid)
 
         queues_resp = api.send_command("/queue/simple/print")
         queues_by_name: dict[str, str] = {}
@@ -2225,6 +2236,7 @@ def _scan_router_idle_credentials_sync(
 
         now_utc = datetime.utcnow()
 
+        pending_releases = []
         for cred in creds:
             mac = cred.get("bound_mac_address")
             if not mac:
@@ -2262,15 +2274,24 @@ def _scan_router_idle_credentials_sync(
                     should_release = True
 
             if should_release:
-                binding_id = bindings_by_mac.get(wanted)
-                if binding_id:
-                    api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
-                queue_id = queues_by_name.get(queue_name_for_credential(cred["id"]))
-                if queue_id:
-                    api.send_command("/queue/simple/remove", {"numbers": queue_id})
-                out["to_release"].append({
+                remove_failed = False
+                for binding_id in bindings_by_credential.get((cred["id"], wanted), []):
+                    result = api.send_command("/ip/hotspot/ip-binding/remove",
+                                              {"numbers": binding_id})
+                    if not result.get("success"):
+                        remove_failed = True
+                if remove_failed:
+                    logger.warning("[REAPER] Credential %s binding removal failed; keeping bound MAC",
+                                   cred["id"])
+                    continue
+                if host and str(host.get("bypassed", "false")).lower() == "true":
+                    host_id = host.get(".id")
+                    if host_id:
+                        api.send_command("/ip/hotspot/host/remove", {"numbers": host_id})
+                pending_releases.append({
                     "id": cred["id"],
                     "mac": mac,
+                    "normalized_mac": wanted,
                     "bytes_in": int(host.get("bytes-in", 0) or 0) if host else 0,
                     "bytes_out": int(host.get("bytes-out", 0) or 0) if host else 0,
                     "ip": (host.get("address") or host.get("to-address")) if host else None,
@@ -2282,6 +2303,36 @@ def _scan_router_idle_credentials_sync(
                     "bytes_out": int(host.get("bytes-out", 0) or 0),
                     "ip": host.get("address") or host.get("to-address"),
                 })
+        if pending_releases:
+            verified_bindings = api.send_command("/ip/hotspot/ip-binding/print")
+            verified_hosts = api.send_command("/ip/hotspot/host/print")
+            if not verified_bindings.get("success") or not verified_hosts.get("success"):
+                logger.warning("[REAPER] Could not verify credential release on %s; keeping bound MACs",
+                               router_info.get("name"))
+                return out
+            remaining = {
+                (int(match.group(1)), normalize_mac_address(b.get("mac-address")))
+                for b in verified_bindings.get("data") or []
+                if b.get("mac-address")
+                if (match := re.search(r"ACCESS_CRED\|cred:(\d+)", b.get("comment", "")))
+            }
+            bypassed_macs = {
+                normalize_mac_address(h.get("mac-address"))
+                for h in verified_hosts.get("data") or []
+                if h.get("mac-address")
+                and str(h.get("bypassed", "false")).lower() == "true"
+            }
+            for entry in pending_releases:
+                key = (entry["id"], entry["normalized_mac"])
+                if key in remaining or entry["normalized_mac"] in bypassed_macs:
+                    logger.warning("[REAPER] Credential %s still bypassed; keeping bound MAC",
+                                   entry["id"])
+                    continue
+                queue_id = queues_by_name.get(queue_name_for_credential(entry["id"]))
+                if queue_id:
+                    api.send_command("/queue/simple/remove", {"numbers": queue_id})
+                entry.pop("normalized_mac")
+                out["to_release"].append(entry)
         return out
     finally:
         api.disconnect()
@@ -2393,8 +2444,15 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
             continue
         _rid, scan = outcome
         for entry in scan.get("to_release", []):
-            cred = cred_by_id.get(entry["id"])
+            # A login may have rebound this credential while RouterOS was
+            # being checked. Refresh before clearing the bound MAC.
+            cred = await db.get(AccessCredential, entry["id"], populate_existing=True)
             if not cred:
+                continue
+            if (cred.status != AccessCredStatus.ACTIVE
+                    or not cred.bound_mac_address
+                    or normalize_mac_address(cred.bound_mac_address)
+                       != normalize_mac_address(entry["mac"])):
                 continue
             if entry.get("bytes_in"):
                 cred.total_bytes_in = (cred.total_bytes_in or 0) + entry["bytes_in"]
