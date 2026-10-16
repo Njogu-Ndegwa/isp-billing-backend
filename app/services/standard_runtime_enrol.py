@@ -21,7 +21,9 @@ at most ``STANDARD_RUNTIME_BATCH`` routers per run, never-looked-at routers
 first. What happened is recorded per router and per component
 (``routers.checkin_*`` / ``routers.mgmt_watchdog_*``), so:
 
-* installed components are never looked at again;
+* installed components are never looked at again, except a check-in applier
+  whose reports carry an older ``v=`` than the server's template: it is
+  re-installed (``checkin_delivery.outdated_applier_router_ids``);
 * hardware/setup reasons (small board, no watched tunnel, a scheduler someone
   disabled on purpose) are looked at again after a week;
 * passing conditions (unreachable, busy, an API error) after 30 minutes, so a
@@ -166,6 +168,7 @@ async def load_candidates(now: datetime, limit: int) -> list[Candidate]:
         )).all()
         await db.commit()
 
+    outdated = checkin_delivery.outdated_applier_router_ids()
     picked: list[tuple[tuple, Candidate]] = []
     for r in rows:
         if not in_scope(r.id):
@@ -176,7 +179,9 @@ async def load_candidates(now: datetime, limit: int) -> list[Candidate]:
         if r.last_status is False:
             continue
         want_checkin = (
-            r.checkin_installed_at is None
+            # Missing, or installed but reporting an older applier version
+            # (the installer rewrites the script in place).
+            (r.checkin_installed_at is None or r.id in outdated)
             and r.auth_method != RouterAuthMethod.RADIUS
             and checkin_wanted(r.id)
             and _due(r.checkin_checked_at, r.checkin_install_reason, now)
