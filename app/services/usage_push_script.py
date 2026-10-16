@@ -25,6 +25,8 @@ is ever embedded — same discipline as ``pull_provisioning.render_hotspot_provi
 from __future__ import annotations
 
 import re
+from typing import Optional
+from urllib.parse import urlparse
 
 from app.services.router_script_gate import gate_rsc_body
 from app.services.usage_push_auth import derive_router_token
@@ -39,6 +41,16 @@ _URL_RE = re.compile(r"^https?://[A-Za-z0-9._:/-]{3,200}$")
 SCHEDULER_NAME = "bitwave-usage-push"
 SCRIPT_NAME = "bitwave-usage-push"
 LOGOUT_SCRIPT_NAME = "bitwave-usage-final"
+
+# The ``"v":N`` every real-time report carries; the installer reads it back off
+# the router to tell an outdated reporter from the current one. v3: ports and
+# long lists. v4 (2026-10-12): tunnel installs fall back to public HTTPS when
+# the management tunnel is down (routers 448 / 351 went dark with their tunnel).
+REALTIME_SCRIPT_VERSION = 4
+# While on the fallback, at most one public HTTPS report per this many minutes
+# (TLS is heavy on RB951 / hAP lite). Kept in a RAM-only address-list entry.
+PUBLIC_FALLBACK_MINUTES = 15
+PUBLIC_FALLBACK_LIST = "bw-push-fb"
 
 
 def _require(value: str, rx: re.Pattern, name: str) -> str:
@@ -241,8 +253,10 @@ def render_logout_hook_attach(profile_name: str) -> str:
 #               byte counters, which are what the pilot meters usage from.
 #   router{}  — WAN counters, CPU, memory, uptime, version, board, counts.
 #
-# Only reads, plus one write: the scheduler's own interval. Parsing uses
-# :find/:pick, not :deserialize, so it runs on RouterOS 6 as well as 7.
+# Only reads, plus one write: the scheduler's own interval (and, on a tunnel
+# install whose tunnel is down, one RAM-only address-list entry that rate-limits
+# the public HTTPS fallback). Parsing uses :find/:pick, not :deserialize, so it
+# runs on RouterOS 6 as well as 7.
 
 _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
 /system script remove [find name="__SCRIPT__"]
@@ -262,7 +276,7 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local upt [/system resource get uptime]
     :local ver [/system resource get version]
     :local brd [/system resource get board-name]
-    :local body "{\"identity\":\"$ident\",\"v\":3,\"reports\":["
+    :local body "{\"identity\":\"$ident\",\"v\":__VERSION__,\"reports\":["
     :local first true
     :local qcount 0
     # An entry can vanish between find and get (customer logs out, queue
@@ -452,7 +466,14 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
         :set body ($body . ",\"router\":{\"iface_rx_bytes\":" . $rxb . ",\"iface_tx_bytes\":" . $txb . ",\"hotspot_active\":" . $hs . ",\"pppoe_active\":" . $pp . ",\"queue_count\":" . $qcount . ",\"cpu_load\":" . $cpu . ",\"free_memory\":" . $fm . ",\"total_memory\":" . $tm . ",\"free_hdd\":" . $fh . ",\"total_hdd\":" . $th . ",\"uptime\":\"" . $upt . "\",\"version\":\"" . $ver . "\",\"board\":\"" . $brd . "\"}")
     } on-error={ :log info "usage-push: metrics skipped" }
     :set body ($body . "}")
-    :do {
+__SEND__}
+
+/system scheduler add name="__SCHED__" interval=__INTERVAL__s start-time=startup on-event="/system script run __SCRIPT__" policy=read,write,test,policy comment="Bitwave usage reporting v2 (real-time)"
+:log info "usage-push v2: installed for __IDENT__"
+'''
+
+# One URL (public HTTPS installs, and every install before v4): unchanged.
+_SEND_DIRECT = r'''    :do {
         :local res [/tool fetch url=$url http-method=post http-header-field=("Content-Type: application/json,Authorization: Bearer " . $tok) http-data=$body output=user as-value]
         :local d ($res->"data")
         :local p [:find $d "\"next_push_seconds\":"]
@@ -469,13 +490,65 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
             }
         }
     } on-error={ :log info "usage-push: deferred" }
-}
+'''
 
-/system scheduler add name="__SCHED__" interval=__INTERVAL__s start-time=startup on-event="/system script run __SCRIPT__" policy=read,write,test,policy comment="Bitwave usage reporting v2 (real-time)"
-:log info "usage-push v2: installed for __IDENT__"
+# Tunnel install (v4): the tunnel URL first, public HTTPS only when that fails
+# AND the tunnel server does not answer a ping (the tunnel is down, not the
+# server shedding load with a 503), and then at most once per __FB_MIN__ min.
+# The rate limit is a RAM-only dynamic address-list entry with a timeout, the
+# watchdog's pattern: :global does not persist between scheduler runs of an
+# API-created script. A healthy tunnel never touches the address list.
+# No X-Bitwave-Push-Channel header from here: Caddy's tunnel-only site sets it,
+# so a report that came in over public HTTPS is counted as public.
+_SEND_WITH_FALLBACK = r'''    :local hdr ("Content-Type: application/json,Authorization: Bearer " . $tok)
+    :local d ""
+    :local ok false
+    :do {
+        :local res [/tool fetch url=$url http-method=post http-header-field=$hdr http-data=$body output=user as-value]
+        :set d [:tostr ($res->"data")]
+        :set ok true
+    } on-error={}
+    :if (!$ok) do={
+        :if ([:len [/ip firewall address-list find where list="__FB_LIST__"]] = 0) do={
+            :if ([/ping __THOST__ count=1] = 0) do={
+                :do { /ip firewall address-list add list=__FB_LIST__ address=0.0.0.1 timeout=__FB_MIN__m } on-error={}
+                :do {
+                    :local res2 [/tool fetch url="__PURL__" http-method=post http-header-field=$hdr http-data=$body output=user as-value]
+                    :set d [:tostr ($res2->"data")]
+                    :set ok true
+                    :log info "usage-push: tunnel down, sent over public HTTPS"
+                } on-error={}
+            }
+        }
+    }
+    :if ($ok) do={
+        :do {
+            :local p [:find $d "\"next_push_seconds\":"]
+            :if ([:typeof $p] = "num") do={
+                :local s ($p + 20)
+                :local e [:find $d "}" $s]
+                :local n [:tonum [:pick $d $s $e]]
+                :if (([:typeof $n] = "num") && ($n >= 5) && ($n <= 3600)) do={
+                    :local want [:totime ($n . "s")]
+                    :if ([/system scheduler get [find name="__SCHED__"] interval] != $want) do={
+                        /system scheduler set [find name="__SCHED__"] interval=$want
+                        :log info ("usage-push: interval now " . $n . "s")
+                    }
+                }
+            }
+        } on-error={}
+    } else={ :log info "usage-push: deferred" }
 '''
 
 _WAN_RE = re.compile(r"^[A-Za-z0-9._\[\]-]{1,32}$")  # "Ether1[WAN]" exists in the fleet
+_HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+_VERSION_IN_SOURCE_RE = re.compile(r'\\"v\\":(\d+)')
+
+
+def push_script_version(source: str) -> int:
+    """The report version (``"v":N``) a reporter source sends; 0 for v1/v2 or none."""
+    m = _VERSION_IN_SOURCE_RE.search(source or "")
+    return int(m.group(1)) if m else 0
 
 
 def render_realtime_push_script(
@@ -485,12 +558,18 @@ def render_realtime_push_script(
     interval_seconds: int = 10,
     wan_interface: str = "ether1",
     lists_every: int = 5,
+    fallback_url: Optional[str] = None,
 ) -> str:
     """Render the v2 (real-time pilot) reporter. See the block comment above.
 
     ``lists_every``: the slow-changing lists (device-per-port, bindings,
     leases, neighbours, bridge ports) ride every Nth report. Smallest boards
     use a larger N; keep N x interval under the 15-minute list freshness.
+
+    ``fallback_url``: for a tunnel install, the public HTTPS push URL to use
+    when the tunnel is down (rate limited to one report per
+    ``PUBLIC_FALLBACK_MINUTES``). None, or the same URL, renders the one-URL
+    reporter exactly as before.
     """
     identity = _require(identity, _IDENTITY_RE, "identity")
     endpoint_url = _require(endpoint_url, _URL_RE, "endpoint_url")
@@ -499,8 +578,21 @@ def render_realtime_push_script(
         raise ValueError("usage-push script: interval must be 5..3600 seconds")
     if not (2 <= int(lists_every) <= 15):
         raise ValueError("usage-push script: lists_every must be 2..15")
+    send = _SEND_DIRECT
+    if fallback_url and fallback_url.strip() != endpoint_url:
+        fallback_url = _require(fallback_url, _URL_RE, "fallback_url")
+        tunnel_host = _require(urlparse(endpoint_url).hostname or "", _HOST_RE, "tunnel host")
+        send = (
+            _SEND_WITH_FALLBACK
+            .replace("__PURL__", fallback_url)
+            .replace("__THOST__", tunnel_host)
+            .replace("__FB_LIST__", PUBLIC_FALLBACK_LIST)
+            .replace("__FB_MIN__", str(PUBLIC_FALLBACK_MINUTES))
+        )
     return gate_rsc_body(SCRIPT_NAME, (
         _REALTIME_TEMPLATE
+        .replace("__SEND__", send)
+        .replace("__VERSION__", str(REALTIME_SCRIPT_VERSION))
         .replace("__SCRIPT__", SCRIPT_NAME)
         .replace("__LOGOUT__", LOGOUT_SCRIPT_NAME)
         .replace("__SCHED__", SCHEDULER_NAME)

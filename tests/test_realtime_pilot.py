@@ -367,6 +367,23 @@ async def test_tunnel_reports_skip_the_https_override_but_keep_cpu_back_off(db, 
 
 
 @pytest.mark.asyncio
+async def test_v4_public_fallback_report_registers_as_public_and_keeps_the_router_live(db, client, monkeypatch):
+    # 2026-10-12: a tunnel-push router whose tunnel died now reports over public
+    # HTTPS (no channel header). It must stay enrolled and be treated as public.
+    router, _ = await _setup(db)
+    monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "")       # enrolled by the v4 report alone
+    monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_SECONDS", 60)
+    monkeypatch.setattr(settings, "REALTIME_PUSH_INTERVAL_OVERRIDES", f"{router.id}:120")
+    monkeypatch.setattr(routes, "_repair", lambda router_id: _noop())
+
+    body = {**_push(1, 1, 0, 0), "v": 4}
+    fallback = await client.post("/api/router/usage-push", json=body, headers=_auth())
+    assert fallback.status_code == 200
+    assert fallback.json()["next_push_seconds"] == 120       # HTTPS cadence, not the tunnel's 60
+    assert realtime_state.is_pilot_router(router.id)
+
+
+@pytest.mark.asyncio
 async def test_any_router_pushing_metrics_is_marked_so_pollers_stand_down(db, client, monkeypatch):
     router, _ = await _setup(db)
     monkeypatch.setattr(settings, "REALTIME_PILOT_ROUTER_IDS", "")  # not a pilot: v1 with metrics
@@ -445,7 +462,7 @@ async def test_port_attribution_uses_the_pushed_map_without_logging_in(monkeypat
 
 def test_realtime_script_v3_reports_ports_and_long_lists_every_fifth_run():
     script = render_realtime_push_script(identity="Router-0977", endpoint_url="http://10.251.0.1:8088/api/router/usage-push")
-    assert '\\"v\\":3' in script
+    assert '\\"v\\":4' in script          # v4 = v3 + public fallback for tunnel installs
     assert '/interface find where (type="ether" or type="wlan" or type="wifi")' in script
     assert "($bwPushN % 5) = 1" in script
     assert "/interface bridge host find where !local" in script and "/ip hotspot ip-binding find" in script
