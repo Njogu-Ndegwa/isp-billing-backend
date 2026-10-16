@@ -23,7 +23,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ _router_cursor = 0
 def _seed_router_lb_paid_sync(router_info: dict, active_customers: list) -> dict:
     """Connect and seed LB_PAID for one router. Runs in a worker thread."""
     from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI
-    from app.services.mikrotik_lb import lb_seed_paid
+    from app.services.mikrotik_lb import lb_seed_paid, lb_seed_static_paid
 
     api = MikroTikAPI(
         router_info["ip"],
@@ -50,7 +50,12 @@ def _seed_router_lb_paid_sync(router_info: dict, active_customers: list) -> dict
     if not api.connect():
         return {"error": "connect_failed", "detail": api.last_connect_error}
     try:
-        return lb_seed_paid(api, active_customers)
+        report = lb_seed_paid(api, [c for c in active_customers if not c.get("static_ip")])
+        static = lb_seed_static_paid(api, [c for c in active_customers if c.get("static_ip")])
+        report["static"] = static
+        report["success"] = report.get("success", False) and static["success"]
+        report["added"].extend({"ip": ip, "kind": "static_ip"} for ip in static["added"])
+        return report
     finally:
         api.disconnect()
 
@@ -63,7 +68,7 @@ async def reconcile_lb_paid_background():
         return
 
     from app.db.database import async_session
-    from app.db.models import Customer, Router
+    from app.db.models import Customer, Router, Plan, ConnectionType, CustomerStatus
     from app.services.customer_grace import access_prefilter, effective_expiry, has_access_time
     from app.services.mikrotik_background import (
         _background_db_pool_is_busy,
@@ -103,15 +108,19 @@ async def reconcile_lb_paid_background():
                     continue
                 customers = (
                     (await db.execute(
-                        select(Customer).where(
+                        select(Customer, Plan.connection_type).join(Plan, Customer.plan_id == Plan.id).where(
                             Customer.router_id == r.id,
                             Customer.expiry.isnot(None),
                             access_prefilter(now),
-                            Customer.mac_address.isnot(None),
+                            or_(
+                                Customer.mac_address.isnot(None),
+                                (Plan.connection_type == ConnectionType.STATIC_IP) & Customer.static_ip.isnot(None),
+                            ),
                         )
-                    )).scalars().all()
+                    )).all()
                 )
-                customers = [c for c in customers if has_access_time(c, now)]
+                customers = [(c, kind) for c, kind in customers if has_access_time(c, now)
+                             and (kind != ConnectionType.STATIC_IP or c.status == CustomerStatus.ACTIVE)]
                 bundles.append({
                     "router_key": f"{r.ip_address}:{r.port}",
                     "router_info": {
@@ -123,9 +132,10 @@ async def reconcile_lb_paid_background():
                         "port": r.port,
                     },
                     "customers": [
-                        {"mac": (c.mac_address or "").upper(), "expiry": effective_expiry(c)}
-                        for c in customers
-                        if c.mac_address
+                        ({"id": c.id, "static_ip": c.static_ip, "expiry": effective_expiry(c)}
+                         if kind == ConnectionType.STATIC_IP else
+                         {"mac": (c.mac_address or "").upper(), "expiry": effective_expiry(c)})
+                        for c, kind in customers
                     ],
                 })
             # Release the DB before any RouterOS I/O.
@@ -160,6 +170,8 @@ async def reconcile_lb_paid_background():
                     rid, outcome.get("error"), outcome.get("detail"),
                 )
             else:
+                if not outcome.get("success", True):
+                    logger.warning("[LB-RECONCILE] Router %s: partial seed failure: %s", rid, outcome)
                 added = len(outcome.get("added", []))
                 if added:
                     logger.info(

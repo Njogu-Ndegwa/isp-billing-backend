@@ -103,6 +103,25 @@ def _item(**kw):
     return StaticItem(**base)
 
 
+@pytest.mark.parametrize("operation", ["suspend", "delete", "change_ip"])
+def test_lb_entry_removed_before_static_binding_is_disabled_or_removed(fake, operation):
+    apply_static_items_sync(ROUTER, [_item()])
+    fake.add("/ip/firewall/address-list", {"list": "LB_PAID", "address": IP,
+                                          "comment": "ISP_BILLING_STATIC_PAID:7", "timeout": "1d"})
+    fake.writes.clear()
+    if operation == "suspend":
+        result = apply_static_items_sync(ROUTER, [_item(enabled=False)])
+    elif operation == "delete":
+        result = static_ip.remove_static_ip_sync(ROUTER, IP)
+    else:
+        result = apply_static_items_sync(ROUTER, [_item(ip="192.168.2.25", old_ip=IP)])
+    assert not result.get("error")
+    assert not fake.find("/ip/firewall/address-list", list="LB_PAID", address=IP)
+    lb_remove = next(i for i, (cmd, _) in enumerate(fake.writes) if cmd == "/ip/firewall/address-list/remove")
+    binding_change = next(i for i, (cmd, _) in enumerate(fake.writes) if cmd in ("/ip/hotspot/ip-binding/set", "/ip/hotspot/ip-binding/remove"))
+    assert lb_remove < binding_change
+
+
 # ---------------------------------------------------------------------------
 # Router desired state
 # ---------------------------------------------------------------------------

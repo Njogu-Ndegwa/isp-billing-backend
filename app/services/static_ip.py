@@ -249,6 +249,7 @@ class _RouterTables:
     addresses: list = field(default_factory=list)
     hosts: list = field(default_factory=list)
     arp: list = field(default_factory=list)
+    lb_paid: list = field(default_factory=list)
 
 
 def _rows(api: MikroTikAPI, command: str) -> list:
@@ -259,15 +260,17 @@ def _rows(api: MikroTikAPI, command: str) -> list:
 
 
 def _read_tables(api: MikroTikAPI) -> _RouterTables:
+    address_lists = _rows(api, "/ip/firewall/address-list/print")
     tables = _RouterTables(
         bindings=_rows(api, "/ip/hotspot/ip-binding/print"),
         queues=_rows(api, "/queue/simple/print"),
         filters=_rows(api, "/ip/firewall/filter/print"),
         address_list=[
-            row for row in _rows(api, "/ip/firewall/address-list/print")
+            row for row in address_lists
             if row.get("list") == STATIC_ADDRESS_LIST
         ],
         addresses=_rows(api, "/ip/address/print"),
+        lb_paid=[row for row in address_lists if row.get("list") == "LB_PAID"],
     )
     # Observational only: a router without hotspot or ARP must still apply.
     for attr, command in (("hosts", "/ip/hotspot/host/print"), ("arp", "/ip/arp/print")):
@@ -416,6 +419,8 @@ def _apply_item(api: MikroTikAPI, tables: _RouterTables, item: StaticItem) -> Di
 
     if item.old_ip and item.old_ip != ip:
         _remove_item(api, tables, item.old_ip, changes)
+    if not item.enabled:
+        _remove_static_lb_paid(api, tables, ip, changes)
 
     out["gateway_ok"] = _gateway_ok(tables, ip)
     observed = _observed_mac(tables, ip)
@@ -588,7 +593,18 @@ def _place_queue_above_hotspot_parent(api: MikroTikAPI, tables: _RouterTables, q
             tables.queues = _rows(api, "/queue/simple/print")
 
 
+def _remove_static_lb_paid(api: MikroTikAPI, tables: _RouterTables, ip: str, changes: list) -> None:
+    # Remove before disabling/removing the bypass: an unpaid host must never
+    # retain a routing mark that sends its captive-portal request out a WAN.
+    for row in list(tables.lb_paid):
+        if row.get("address") == ip:
+            if _removed(api.send_command("/ip/firewall/address-list/remove", {"numbers": row[".id"]})):
+                tables.lb_paid.remove(row)
+                changes.append(f"load-balancing entry for {ip} removed")
+
+
 def _remove_item(api: MikroTikAPI, tables: _RouterTables, ip: str, changes: list) -> None:
+    _remove_static_lb_paid(api, tables, ip, changes)
     for b in _bindings_for(tables, ip):
         if _removed(api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})):
             changes.append(f"binding for {ip} removed")
