@@ -1295,6 +1295,94 @@ def lb_seed_paid(api, active_customers: List[dict]) -> dict:
     return report
 
 
+def lb_seed_static_paid(api, active_customers: List[dict]) -> dict:
+    """Restore static subscribers after reboot, using owned bypass bindings.
+
+    Static customers need neither a hotspot MAC nor a currently-online host.
+    Their exact IP/customer binding is the authority; an unbypassed host at that
+    IP blocks seeding. Entries always expire and renewals update their timeout.
+    """
+    from app.services.static_ip import normalize_static_ip
+
+    prefix = "ISP_BILLING_STATIC_PAID:"
+    report = {"steps": [], "success": True, "added": [], "updated": [],
+              "removed": [], "skipped": []}
+    snapshots = []
+    for path, props in [
+        ("/ip/hotspot/ip-binding/print", ["address", "type", "disabled", "comment"]),
+        ("/ip/hotspot/host/print", ["address", "bypassed"]),
+        ("/ip/firewall/address-list/print", [".id", "list", "address", "comment", "timeout"]),
+    ]:
+        result = api.send_command_optimized(path, proplist=props)
+        if not result.get("success"):
+            _step(report, path, False, result.get("error"))
+            return report  # A failed read is not an empty authoritative table.
+        snapshots.append(result.get("data") or [])
+    bindings, hosts, address_lists = snapshots
+    entries = [a for a in address_lists if a.get("list") == LB_PAID_LIST]
+    now = datetime.utcnow()
+    eligible = {}
+    for customer in active_customers:
+        ip = normalize_static_ip(customer.get("static_ip"))
+        cid = customer.get("id")
+        expiry = customer.get("expiry")
+        remaining = int((expiry - now).total_seconds()) if isinstance(expiry, datetime) else 0
+        if not ip or not cid or remaining <= 0:
+            report["skipped"].append({"id": cid, "why": "no usable IP or expiry"})
+            continue
+        secs = min(LB_PAID_MAX_TIMEOUT_SECONDS, remaining)
+        matching = [b for b in bindings if b.get("address") == ip]
+        if (len(matching) != 1 or matching[0].get("type") != "bypassed"
+                or matching[0].get("disabled") == "true"
+                or not matching[0].get("comment", "").startswith("STATIC:")
+                or not matching[0].get("comment", "").endswith(f"(cust {cid})")):
+            report["skipped"].append({"id": cid, "why": "no unique owned enabled bypass binding"})
+            continue
+        if any(h.get("address") == ip and h.get("bypassed") != "true" for h in hosts):
+            report["skipped"].append({"id": cid, "why": "host not bypassed"})
+            continue
+        eligible[ip] = (customer, secs)
+
+    # Only this helper's entries are removed by reconciliation; hotspot entries
+    # remain owned by their existing lifecycle. Disabling/deleting a static
+    # binding also removes its LB entry synchronously in static_ip.py.
+    for entry in entries:
+        if entry.get("comment", "").startswith(prefix) and entry.get("address") not in eligible:
+            result = api.send_command("/ip/firewall/address-list/remove", {".id": entry[".id"]})
+            ok = bool(result.get("success"))
+            _step(report, f"lb_static.remove.{entry.get('address')}", ok, result.get("error"))
+            if ok:
+                report["removed"].append(entry["address"])
+
+    for ip, (customer, secs) in eligible.items():
+        # Router calls can be slow: never extend access by the time spent
+        # processing the preceding customers in this batch.
+        secs = min(LB_PAID_MAX_TIMEOUT_SECONDS,
+                   int((customer["expiry"] - datetime.utcnow()).total_seconds()))
+        if secs <= 0:
+            continue
+        comment = f"{prefix}{customer['id']}:{customer['expiry'].isoformat()}"
+        existing = [e for e in entries if e.get("address") == ip]
+        if existing and all(e.get("comment") == comment and e.get("timeout") for e in existing):
+            continue
+        args = {"timeout": f"{secs}s", "comment": comment}
+        if existing:
+            for entry in existing:
+                result = api.send_command("/ip/firewall/address-list/set", {".id": entry[".id"], **args})
+                ok = bool(result.get("success"))
+                _step(report, f"lb_static.update.{ip}", ok, result.get("error"))
+                if ok:
+                    report["updated"].append(ip)
+        else:
+            result = api.send_command("/ip/firewall/address-list/add",
+                                      {"list": LB_PAID_LIST, "address": ip, **args})
+            ok = bool(result.get("success"))
+            _step(report, f"lb_static.add.{ip}", ok, result.get("error"))
+            if ok:
+                report["added"].append(ip)
+    return report
+
+
 def lb_add_paid_entry(api, mac_address: str, expiry: Any) -> dict:
     """Best-effort single LB_PAID add for a just-provisioned bypassed customer.
 
