@@ -685,7 +685,7 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
     """Cleanup expired hotspot users on ONE router.
 
     Reads each table once, removes every expired customer's entries from that
-    snapshot, then verifies that bindings, users and active sessions are gone.
+    snapshot, then verifies that bindings, users, hosts and active sessions are gone.
     """
     results = {"removed": [], "failed": [], "connected": False}
     if not customers_data:
@@ -715,7 +715,7 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
         for name, command in _EXPIRY_SNAPSHOT_COMMANDS.items():
             reply = api.send_command(command)
             if not reply.get("success"):
-                if name in ("bindings", "users", "active"):
+                if name in ("bindings", "users", "active", "hosts"):
                     critical_read_failed = True
                     logger.error(f"[CRON] Failed to fetch {name} on {router_info['name']}: {reply.get('error', 'unknown')}")
                 snapshot[name] = []
@@ -813,7 +813,7 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
         # Verify all three access paths for the whole batch. A command can
         # return success while RouterOS leaves a session behind.
         verified: dict[str, list] = {}
-        for name in ("bindings", "users", "active"):
+        for name in ("bindings", "users", "active", "hosts"):
             reply = api.send_command(_EXPIRY_SNAPSHOT_COMMANDS[name])
             if reply.get("success"):
                 verified[name] = reply.get("data") or []
@@ -832,8 +832,10 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
             user = any(hotspot_user_is_for_mac(u, mac) for u in verified["users"])
             active = any(_mac_of(s) == mac or s.get("user", "").upper() in (mac, compact)
                          for s in verified["active"])
-            if critical_read_failed or bound or user or active:
-                reason = f"Router access still present or unverified (binding={bound}, user={user}, active={active})"
+            host = any(_mac_of(h) == mac for h in verified["hosts"])
+            if critical_read_failed or bound or user or active or host:
+                reason = (f"Router access still present or unverified "
+                          f"(binding={bound}, user={user}, active={active}, host={host})")
                 results["failed"].append({"id": customer_id, "error": reason})
                 logger.error("[CRON] %s for %s - keeping ACTIVE for retry", reason, cust["name"])
             else:

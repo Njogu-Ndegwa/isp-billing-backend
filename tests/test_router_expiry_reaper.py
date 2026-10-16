@@ -404,6 +404,7 @@ def test_reaper_blocks_relogin_and_reports_only_after_verified_disconnect():
     report = src.index(':set bwExpDone ($bwExpDone . $m . "@" . $nows . ",")')
     assert disable < kick < delete_user < delete_binding < report
     assert '[:len [/ip hotspot active find where mac-address=$m]] = 0' in src
+    assert '[:len [/ip hotspot host find where mac-address=$m]] = 0' in src
     assert '[:len [/ip hotspot ip-binding find where mac-address=$m]] = 0' in src
 
 

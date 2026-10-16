@@ -16,12 +16,14 @@ MACS = ["AA:BB:CC:00:00:01", "AA:BB:CC:00:00:02", "AA:BB:CC:00:00:03"]
 class FakeRouter:
     """A router whose tables hold one binding/host/queue per expired MAC."""
 
-    def __init__(self, macs, *, sticky_binding=None, sticky_active=None, bindings_fail=False,
+    def __init__(self, macs, *, sticky_binding=None, sticky_active=None, sticky_host=None,
+                 bindings_fail=False,
                  shared_host_ip=None):
         self.calls = []
         self.bindings_fail = bindings_fail
         self.sticky_binding = sticky_binding  # this binding id survives removal
         self.sticky_active = sticky_active
+        self.sticky_host = sticky_host
         self.tables = {
             "/ip/hotspot/ip-binding": [
                 {".id": f"*B{i}", "mac-address": m, "type": "bypassed",
@@ -52,7 +54,7 @@ class FakeRouter:
             return {"success": True, "data": list(self.tables.get(table, []))}
         if verb == "remove":
             entry_id = (arguments or {}).get("numbers")
-            if entry_id in (self.sticky_binding, self.sticky_active):
+            if entry_id in (self.sticky_binding, self.sticky_active, self.sticky_host):
                 # RouterOS acknowledges the command but leaves the entry.
                 return {"success": True, "data": []}
             self.tables[table] = [e for e in self.tables.get(table, []) if e[".id"] != entry_id]
@@ -83,11 +85,12 @@ def test_each_table_is_read_once_per_router_not_once_per_customer(monkeypatch):
     assert sorted(r["id"] for r in results["removed"]) == [1, 2, 3]
     assert results["failed"] == []
     prints = api.prints()
-    # 7 snapshot reads + 3 verification reads, regardless of customer count.
-    assert sum(prints.values()) == 10
+    # 7 snapshot reads + 4 verification reads, regardless of customer count.
+    assert sum(prints.values()) == 11
     assert prints["/ip/hotspot/ip-binding/print"] == 2
     assert prints["/ip/hotspot/user/print"] == 2
     assert prints["/ip/hotspot/active/print"] == 2
+    assert prints["/ip/hotspot/host/print"] == 2
     assert sorted(api.removes("/ip/hotspot/ip-binding")) == ["*B0", "*B1", "*B2"]
     assert sorted(api.removes("/queue/simple")) == ["*Q0", "*Q1", "*Q2"]
     assert api.tables["/ip/hotspot/ip-binding"] == []
@@ -112,6 +115,13 @@ def test_active_session_without_binding_or_user_is_not_reported_removed(monkeypa
     assert results["removed"] == []
     assert results["failed"][0]["id"] == 1
     assert "active=True" in results["failed"][0]["error"]
+
+
+def test_authorized_host_that_survives_removal_is_not_reported_removed(monkeypatch):
+    api = FakeRouter(MACS[:1], sticky_host="*H0")
+    results = _run(monkeypatch, api, macs=MACS[:1])
+    assert results["removed"] == []
+    assert "host=True" in results["failed"][0]["error"]
 
 
 def test_unreadable_bindings_fail_every_customer_on_the_router(monkeypatch):
