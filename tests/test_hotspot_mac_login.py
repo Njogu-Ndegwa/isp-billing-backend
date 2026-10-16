@@ -487,3 +487,24 @@ def test_queue_sync_items_carry_the_expiry():
     c = SimpleNamespace(id=1, mac_address=MAC, expiry=datetime(2026, 10, 1),
                         plan=SimpleNamespace(speed="5M/5M", fup_action=None))
     assert mikrotik_background._queue_sync_customer_item(c, None)["expiry"] == datetime(2026, 10, 1)
+
+
+def test_reconcile_never_recreates_a_customer_who_expired_after_the_list_was_read():
+    from datetime import datetime, timedelta
+    router = FakeRouter()
+    # the reaper already removed the user; the stale list still says "paid"
+    summary = ml.reconcile_router(router.api(), [
+        {"mac_address": MAC, "plan_speed": "5M/5M", "expiry": datetime.utcnow() - timedelta(seconds=90)},
+        {"mac_address": OTHER, "plan_speed": "5M/5M", "expiry": datetime.utcnow() + timedelta(seconds=20)},
+    ])
+
+    assert summary["expired_skipped"] == 2 and summary["provisioned"] == 0
+    assert router.user(MAC) is None and router.user(OTHER) is None
+
+
+def test_reconcile_still_provisions_a_customer_with_time_left():
+    from datetime import datetime, timedelta
+    router = FakeRouter()
+    summary = ml.reconcile_router(router.api(), [
+        {"mac_address": MAC, "plan_speed": "5M/5M", "expiry": datetime.utcnow() + timedelta(hours=2)}])
+    assert summary["provisioned"] == 1 and router.user(MAC) is not None
