@@ -685,9 +685,7 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
     """Cleanup expired hotspot users on ONE router.
 
     Reads each table once, removes every expired customer's entries from that
-    snapshot, then re-reads the bindings once to verify. A customer counts as
-    removed only when its ip-binding (what grants access) is gone or was never
-    there, exactly as before.
+    snapshot, then verifies that bindings, users, hosts and active sessions are gone.
     """
     results = {"removed": [], "failed": [], "connected": False}
     if not customers_data:
@@ -713,13 +711,13 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
 
     try:
         snapshot: dict[str, list] = {}
-        binding_fetch_failed = False
+        critical_read_failed = False
         for name, command in _EXPIRY_SNAPSHOT_COMMANDS.items():
             reply = api.send_command(command)
             if not reply.get("success"):
-                if name == "bindings":
-                    binding_fetch_failed = True
-                    logger.error(f"[CRON] Failed to fetch IP bindings on {router_info['name']}: {reply.get('error', 'unknown')}")
+                if name in ("bindings", "users", "active", "hosts"):
+                    critical_read_failed = True
+                    logger.error(f"[CRON] Failed to fetch {name} on {router_info['name']}: {reply.get('error', 'unknown')}")
                 snapshot[name] = []
                 continue
             snapshot[name] = reply.get("data") or []
@@ -759,25 +757,6 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                             f"(ignored): {lb_exc}"
                         )
 
-                binding_found = False
-                binding_remove_failed = False
-                mac_login_user_remove_failed = False
-                for b in snapshot["bindings"]:
-                    mac_match = _mac_of(b) == normalized_mac
-                    username_match = f"USER:{username}" in b.get("comment", "").upper()
-                    if mac_match or username_match:
-                        binding_found = True
-                        if remove("bindings", "/ip/hotspot/ip-binding/remove", b.get(".id")):
-                            removed["binding_removed"] = True
-                        else:
-                            binding_remove_failed = True
-                            logger.error(f"[CRON] Failed to remove IP binding {b.get('.id')} for {normalized_mac}")
-
-                for host in snapshot["hosts"]:
-                    if _mac_of(host) == normalized_mac or (client_ip and host.get("address") == client_ip):
-                        if remove("hosts", "/ip/hotspot/host/remove", host[".id"]):
-                            removed["hosts"] += 1
-
                 # Every matching user goes: a MAC-login user left behind logs
                 # the device straight back in, so its removal must succeed.
                 for u in snapshot["users"]:
@@ -788,7 +767,6 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                         if remove("users", "/ip/hotspot/user/remove", u.get(".id")):
                             removed["user"] = True
                         elif is_mac_login_user(u):
-                            mac_login_user_remove_failed = True
                             logger.error(f"[CRON] Failed to remove MAC-login user {u.get('name')} for {normalized_mac}")
 
                 for session in snapshot["active"]:
@@ -796,6 +774,20 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                             or session.get("user", "").upper() == username.upper()):
                         if remove("active", "/ip/hotspot/active/remove", session.get(".id")):
                             removed["active_sessions"] += 1
+
+                for host in snapshot["hosts"]:
+                    if _mac_of(host) == normalized_mac or (client_ip and host.get("address") == client_ip):
+                        if remove("hosts", "/ip/hotspot/host/remove", host[".id"]):
+                            removed["hosts"] += 1
+
+                for b in snapshot["bindings"]:
+                    mac_match = _mac_of(b) == normalized_mac
+                    username_match = f"USER:{username}" in b.get("comment", "").upper()
+                    if mac_match or username_match:
+                        if remove("bindings", "/ip/hotspot/ip-binding/remove", b.get(".id")):
+                            removed["binding_removed"] = True
+                        else:
+                            logger.error(f"[CRON] Failed to remove IP binding {b.get('.id')} for {normalized_mac}")
 
                 for q in snapshot["queues"]:
                     queue_name = q.get("name", "")
@@ -813,43 +805,39 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
 
                 outcomes[cust["id"]] = {
                     "cust": cust, "mac": normalized_mac, "removed": removed,
-                    "binding_found": binding_found or mac_login_user_remove_failed,
-                    "remove_failed": binding_remove_failed or mac_login_user_remove_failed,
                 }
             except Exception as e:
                 results["failed"].append({"id": cust["id"], "error": str(e)})
                 logger.error(f"[CRON] Failed to remove customer {cust['id']}: {e}")
 
-        # One verification read for the whole batch: a binding still carrying
-        # an expired customer's MAC gets one more removal attempt.
-        still_bound: dict[str, str] = {}
-        if not binding_fetch_failed and any(o["binding_found"] for o in outcomes.values()):
-            verify = api.send_command("/ip/hotspot/ip-binding/print")
-            if verify.get("success"):
-                wanted = {o["mac"] for o in outcomes.values()}
-                for b in verify.get("data") or []:
-                    mac = _mac_of(b)
-                    if mac in wanted:
-                        still_bound[mac] = b.get(".id")
+        # Verify all three access paths for the whole batch. A command can
+        # return success while RouterOS leaves a session behind.
+        verified: dict[str, list] = {}
+        for name in ("bindings", "users", "active", "hosts"):
+            reply = api.send_command(_EXPIRY_SNAPSHOT_COMMANDS[name])
+            if reply.get("success"):
+                verified[name] = reply.get("data") or []
+            else:
+                critical_read_failed = True
+                verified[name] = []
+                logger.error("[CRON] Could not verify %s on %s: %s",
+                             name, router_info["name"], reply.get("error", "unknown"))
 
         for customer_id, o in outcomes.items():
             cust, removed = o["cust"], o["removed"]
-            if o["mac"] in still_bound:
-                logger.error(f"[CRON] VERIFICATION FAILED: IP binding STILL EXISTS for {o['mac']}!")
-                retry = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": still_bound[o["mac"]]})
-                if _removed_ok(retry):
-                    removed["binding_removed"] = True
-                    o["remove_failed"] = False
-                else:
-                    o["remove_failed"] = True
-                    logger.error(f"[CRON] Retry removal FAILED: {retry.get('error', 'unknown')}")
-
-            if binding_fetch_failed:
-                results["failed"].append({"id": customer_id, "error": "Could not fetch IP bindings - user status unknown"})
-                logger.error(f"[CRON] FAILED to check bindings for {cust['name']} - keeping ACTIVE for retry")
-            elif o["binding_found"] and o["remove_failed"]:
-                results["failed"].append({"id": customer_id, "error": "IP binding removal failed - user may still have access"})
-                logger.error(f"[CRON] FAILED to remove binding for {cust['name']} - keeping ACTIVE for retry")
+            mac = o["mac"]
+            compact = mac.replace(":", "")
+            bound = any(_mac_of(b) == mac or f"USER:{compact}" in b.get("comment", "").upper()
+                        for b in verified["bindings"])
+            user = any(hotspot_user_is_for_mac(u, mac) for u in verified["users"])
+            active = any(_mac_of(s) == mac or s.get("user", "").upper() in (mac, compact)
+                         for s in verified["active"])
+            host = any(_mac_of(h) == mac for h in verified["hosts"])
+            if critical_read_failed or bound or user or active or host:
+                reason = (f"Router access still present or unverified "
+                          f"(binding={bound}, user={user}, active={active}, host={host})")
+                results["failed"].append({"id": customer_id, "error": reason})
+                logger.error("[CRON] %s for %s - keeping ACTIVE for retry", reason, cust["name"])
             else:
                 results["removed"].append({"id": customer_id, "details": removed})
                 logger.info(f"[CRON] Expired customer {cust['name']} removed: {removed}")
@@ -3269,8 +3257,29 @@ async def sync_active_user_queues():
         async def _sync_router_task(rk, rd):
             try:
                 async with router_locks.acquire(rk):
+                    # The fleet snapshot can wait behind another router job.
+                    # Re-read entitlement while holding this router's lock, so
+                    # a completed expiry cleanup cannot be undone by a stale
+                    # MAC-login reconcile. Close the DB session before I/O.
+                    ids = [item["id"] for item in rd["customers"]]
+                    async with async_session() as fresh_db:
+                        states = (await fresh_db.execute(
+                            select(Customer.id, Customer.status, Customer.expiry,
+                                   Customer.grace_period_minutes).where(Customer.id.in_(ids))
+                        )).all()
+                        await fresh_db.commit()
+                    checked_at = datetime.utcnow()
+                    paid_ids = {
+                        cid for cid, status, expiry, grace in states
+                        if status == CustomerStatus.ACTIVE and expiry is not None
+                        and effective_expiry_of(expiry, grace) > checked_at
+                    }
+                    current_customers = [item for item in rd["customers"] if item["id"] in paid_ids]
+                    if not current_customers:
+                        return {"synced": 0, "errors": 0, "skipped": len(ids),
+                                "routers_connected": 0}
                     return await asyncio.to_thread(
-                        _sync_single_router_queues_sync, rd["router"], rd["customers"],
+                        _sync_single_router_queues_sync, rd["router"], current_customers,
                         *((True,) if is_pilot_router(rd["router"].get("id")) else ()),
                     )
             except Exception as exc:

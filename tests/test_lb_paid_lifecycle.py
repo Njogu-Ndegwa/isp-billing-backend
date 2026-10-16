@@ -102,6 +102,9 @@ class FakeCleanupAPI:
             {".id": "*B1", "mac-address": MAC, "type": "bypassed",
              "comment": f"USER:{MAC.replace(':', '')}"},
         ]
+        self.hosts = [
+            {".id": "*H1", "mac-address": MAC, "address": CLIENT_IP},
+        ]
         self.lb_paid = [
             {".id": "*L1", "list": "LB_PAID", "address": CLIENT_IP},
         ]
@@ -124,9 +127,11 @@ class FakeCleanupAPI:
             return {"success": True, "data": list(self.bindings)}
         if command == "/ip/hotspot/host/print":
             # cleanup reads the client IP from the hosts snapshot
-            return {"success": True, "data": [
-                {".id": "*H1", "mac-address": MAC, "address": CLIENT_IP},
-            ]}
+            return {"success": True, "data": list(self.hosts)}
+        if command == "/ip/hotspot/host/remove":
+            self.hosts = [h for h in self.hosts
+                          if h.get(".id") != args.get("numbers")]
+            return {"success": True, "data": []}
         if command == "/ip/hotspot/ip-binding/remove":
             self.bindings = [b for b in self.bindings
                              if b.get(".id") != args.get("numbers")]
