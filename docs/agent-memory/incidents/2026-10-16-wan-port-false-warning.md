@@ -20,3 +20,11 @@ Regression tests cover live and push input, WAN errors and link loss, disabled
 LB, other access ports, stale configuration pointing at a bridge, and endpoint
 configuration propagation. No router configuration or frontend changes are
 required to remove the false warning.
+
+The follow-up frontend change (frontend PR #113) makes the existing selected-port
+bandwidth panel work for configured WANs. Production verification exposed a second
+contract gap: `GET /api/routers` omitted `lb_enabled` and `lb_config`, although the
+frontend Router type and its test fixtures included them. The list now returns
+both saved fields, including disabled state and retained configuration. An HTTP
+regression test checks enabled, disabled and unconfigured routers and reseller
+ownership filtering. This adds no router calls or database schema changes.
