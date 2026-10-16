@@ -685,7 +685,9 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
     """Cleanup expired hotspot users on ONE router.
 
     Reads each table once, removes every expired customer's entries from that
-    snapshot, then verifies that bindings, users, hosts and active sessions are gone.
+    snapshot, then verifies that bindings, users and active sessions are gone.
+    A physical device can immediately reappear as an unauthorized hotspot host;
+    only an authorized or bypassed host still represents access.
     """
     results = {"removed": [], "failed": [], "connected": False}
     if not customers_data:
@@ -832,7 +834,12 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
             user = any(hotspot_user_is_for_mac(u, mac) for u in verified["users"])
             active = any(_mac_of(s) == mac or s.get("user", "").upper() in (mac, compact)
                          for s in verified["active"])
-            host = any(_mac_of(h) == mac for h in verified["hosts"])
+            host = any(
+                _mac_of(h) == mac
+                and (str(h.get("authorized", "false")).lower() == "true"
+                     or str(h.get("bypassed", "false")).lower() == "true")
+                for h in verified["hosts"]
+            )
             if critical_read_failed or bound or user or active or host:
                 reason = (f"Router access still present or unverified "
                           f"(binding={bound}, user={user}, active={active}, host={host})")
