@@ -326,6 +326,7 @@ async def test_customer_event_settings_default_update_and_preview(db, client, mo
         "payment_receipt": None, "welcome": None, "reminder": None, "expiry": None,
     }
     assert "{amount}" in body["defaults"]["payment_receipt"]
+    assert "{plan}" not in body["defaults"]["payment_receipt"]
     assert "password" in body["placeholders"]["welcome"]
     # A GET never creates the settings row.
     assert await db.get(CustomerExpirySmsSettings, reseller.id) is None
@@ -354,6 +355,12 @@ async def test_customer_event_settings_default_update_and_preview(db, client, mo
         # paybill (600980 in tests) is what customers would be told.
         "paybill": "600980", "paybill_note": None,
     }
+
+    receipt_preview = await client.post("/api/messaging/customer-events/preview", json={
+        "event": "payment_receipt",
+    })
+    assert "Your internet is active" in receipt_preview.json()["text"]
+    assert "10Mbps" not in receipt_preview.json()["text"]
 
     default_preview = await client.post("/api/messaging/customer-events/preview", json={
         "event": "welcome",
