@@ -13,16 +13,16 @@ def test_template_validation_names_the_bad_placeholder():
     assert customer_sms_templates.validate_template("welcome", "x" * 481) is not None
 
 
-def test_receipt_without_reference_drops_the_ref_clause():
+def test_receipt_without_reference_drops_the_ref_clause_and_plan_speed():
     context = customer_sms_templates.build_context(
         reseller=type("R", (), {"business_name": None, "organization_name": "ISP"})(),
         tz_name="Africa/Nairobi",
-        plan_name="Daily",
+        plan_name="25MBPS@3500",
         expiry=datetime(2030, 1, 1, 9, 30),
         amount="KES 50",
     )
     assert customer_sms_templates.render("payment_receipt", context) == (
-        "Payment of KES 50 received. Your Daily is active until 01 Jan, 12:30. - ISP"
+        "Payment of KES 50 received. Your internet is active until 01 Jan, 12:30. - ISP"
     )
 
 

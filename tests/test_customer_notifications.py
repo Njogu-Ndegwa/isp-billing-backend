@@ -112,7 +112,7 @@ async def test_pppoe_payment_gets_receipt_with_amount_reference_and_expiry(
     assert message.customer_id == customer.id
     assert message.category == customer_notifications.receipt_category(payment.id)
     assert message.body == (
-        "Payment of KES 1,500 received. Your Home 10Mbps is active until "
+        "Payment of KES 1,500 received. Your internet is active until "
         "08 Oct, 21:00. Ref QJK3ABCD12. - Twork Links"
     )
     assert credits.balance == 4
