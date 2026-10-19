@@ -2,7 +2,7 @@
 
 Status: experimental. Native collection is disabled by default. Do not use these results as a fleet rollout approval or a 200-user traffic capacity claim.
 
-The acceptance requirement is a **strict 1–2 percentage point peak increase**, including RouterOS work triggered by our scripts. Every tested candidate fails this requirement. Average CPU reductions cannot satisfy it. No fleet rollout is approved by this work.
+The original **strict 1–2 percentage point peak increase** target, including RouterOS work triggered by our scripts, was not met. Current canary work targets avoiding sampled 100% CPU during realistic small payment and expiry cohorts; see [paced work canary](router-paced-work-canary.md). Neither result approves a fleet rollout.
 
 ## Changes
 

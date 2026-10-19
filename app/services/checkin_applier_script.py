@@ -461,6 +461,9 @@ def render_checkin_applier_source(
     endpoint_url: str,
     check_certificate: str = "no",
     native_census: bool | None = None,
+    mutation_limit: int | None = None,
+    cpu_ceiling: int = 85,
+    pause_ms: int = 200,
 ) -> str:
     """Return the ``source`` of the ``bitwave-checkin`` system script.
 
@@ -507,6 +510,34 @@ def render_checkin_applier_source(
             '                            :set uadded true\n'
             '                            :set ($userNames->$mac) true\n',
         )
+    if mutation_limit is not None:
+        if (type(mutation_limit) is not int or not 1 <= mutation_limit <= 10
+                or type(cpu_ceiling) is not int or not 50 <= cpu_ceiling <= 90
+                or type(pause_ms) is not int or not 100 <= pause_ms <= 500
+                or mutation_limit * pause_ms * 7 > 10_000):
+            raise ValueError("invalid checkin work budget")
+        # Validate the entire frame first. Unapplied lines remain absent from
+        # the next census, so server delivery retries them without false ACKs.
+        template = template.replace(
+            ':while ((!$done) && ($guard < 40)) do={',
+            f':while ((!$done) && ($guard < {mutation_limit}) && ([/system resource get cpu-load] < {cpu_ceiling})) do={{',
+        )
+        apply_at = template.index('    :if ($frameOk && ($want > 0)) do={')
+        cadence_at = template.index('    # Cadence:', apply_at)
+        apply = template[apply_at:cadence_at]
+        # Yield after complete logical stages, including creation of a rate
+        # profile before creating its user. Never interrupt an add mid-stage.
+        for marker in (
+            '                            /ip hotspot user add ',
+            '                            :set uadded true',
+            '                            :log info ("checkin: mac-login "',
+            '                            :set added true',
+            '                    :if ($added || ($kind = "Q"))',
+            '                                /queue simple add ',
+            '                            :if ($kind = "Q")',
+        ):
+            apply = apply.replace(marker, f'                    :delay {pause_ms}ms\n' + marker)
+        template = template[:apply_at] + apply + template[cadence_at:]
     token = derive_checkin_token(identity)
     return with_gate(SCRIPT_NAME, (
         template
@@ -547,6 +578,9 @@ def install_checkin_applier(
     identity: str,
     endpoint_url: str,
     check_certificate: str = "no",
+    mutation_limit: int | None = None,
+    cpu_ceiling: int = 85,
+    pause_ms: int = 200,
 ) -> dict:
     """Install or update the applier script + scheduler. Idempotent.
 
@@ -564,6 +598,7 @@ def install_checkin_applier(
             return {"status": "skipped_unsupported_native", "error": "Native census requires RouterOS 7.19.6+"}
     source = render_checkin_applier_source(
         identity=identity, endpoint_url=endpoint_url, check_certificate=check_certificate,
+        mutation_limit=mutation_limit, cpu_ceiling=cpu_ceiling, pause_ms=pause_ms,
     )
     changed = False
     res: dict = {}

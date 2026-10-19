@@ -415,14 +415,69 @@ def _require(value: str, rx: re.Pattern, name: str) -> str:
     return v
 
 
-def render_expiry_reaper_script(*, identity: str, tunnel_url: str, public_url: str) -> str:
+def render_expiry_reaper_script(*, identity: str, tunnel_url: str, public_url: str,
+                               removal_limit: int | None = None,
+                               cpu_ceiling: int = 85, pause_ms: int = 200) -> str:
     """The installable RouterOS script (the ``source={...}`` body is also what
     the API installer puts into ``/system script``)."""
     identity = _require(identity, _IDENTITY_RE, "identity")
     tunnel_url = _require(tunnel_url, _URL_RE, "tunnel_url")
     public_url = _require(public_url, _URL_RE, "public_url")
+    template = _TEMPLATE
+    if removal_limit is not None:
+        if (type(removal_limit) is not int or not 1 <= removal_limit <= 10
+                or type(cpu_ceiling) is not int or not 50 <= cpu_ceiling <= 90
+                or type(pause_ms) is not int or not 100 <= pause_ms <= 500
+                or removal_limit * pause_ms * 7 > 10_000):
+            raise ValueError("invalid expiry work budget")
+        # One authorization at a time, yielding before each identity. The
+        # untouched due suffix is rediscovered on the next pass; EXP tags and
+        # acknowledgement proof remain the authority after partial failures.
+        start = template.index('        :local macPattern "^("')
+        end = template.index('\n    }\n}\n\n/system scheduler add', start)
+        removal = template[start:end].replace('($batchSeen < 40)', '($batchSeen < 1)')
+        # Do not insert sleeps after disabling access: a renewal can arrive
+        # during that pause. Sleep first, then re-read current deadlines and
+        # perform the single-customer removal without artificial gaps.
+        renewal_check = '''        :local renewed false
+        :do {
+        :foreach ru in=[/ip hotspot user find where name~$userPattern] do={
+            :local cm [/ip hotspot user get $ru comment]
+            :local p [:find $cm "EXP:"]
+            :if ([:typeof $p] != "num") do={ :set renewed true } else={
+                :local v [:pick $cm ($p + 4) [:len $cm]]
+                :local e [:find $v "|"]
+                :if ([:typeof $e] = "num") do={ :set v [:pick $v 0 $e] }
+                :local x [:tonum $v]
+                :if ([:typeof $x] != "num") do={ :set renewed true } else={ :if ($x > $nows) do={ :set renewed true } }
+            }
+        }
+        :foreach rb in=[/ip hotspot ip-binding find where mac-address~$macPattern] do={
+            :local cm [/ip hotspot ip-binding get $rb comment]
+            :local p [:find $cm "EXP:"]
+            :if ([:typeof $p] != "num") do={ :set renewed true } else={
+                :local v [:pick $cm ($p + 4) [:len $cm]]
+                :local e [:find $v "|"]
+                :if ([:typeof $e] = "num") do={ :set v [:pick $v 0 $e] }
+                :local x [:tonum $v]
+                :if ([:typeof $x] != "num") do={ :set renewed true } else={
+                    :if ($x < 1000000000) do={ :set x ($x * 60) }
+                    :if ($x > $nows) do={ :set renewed true }
+                }
+            }
+        }
+        } on-error={ :set renewed true }
+'''
+        removal = removal.replace('\n        :if ($batchCount > 0) do={',
+                                  '\n' + renewal_check + f'        :if (($batchCount > 0) && (!$renewed) && ([/system resource get cpu-load] < {cpu_ceiling})) do={{')
+        template = (template[:start]
+                    + '        :local workCount 0\n'
+                    + f'        :while (([:len $todo] > 0) && ($workCount < {removal_limit}) && ([/system resource get cpu-load] < {cpu_ceiling})) do={{\n'
+                    + '        :set workCount ($workCount + 1)\n'
+                    + f'        :delay {pause_ms * 7}ms\n'
+                    + removal + '\n        }' + template[end:])
     return gate_rsc_body(SCRIPT_NAME, (
-        _TEMPLATE
+        template
         .replace("__SCRIPT__", SCRIPT_NAME)
         .replace("__SCHED__", SCHEDULER_NAME)
         .replace("__POLICY__", POLICY)

@@ -6,6 +6,7 @@ These guards catch a return to a table search for every customer.
 from app.services.checkin_applier_script import render_checkin_applier_source
 from app.services.expiry_reaper_script import render_expiry_reaper_script, script_source
 from app.services.router_expiry import MAX_ITEMS_PER_CALL, parse_request
+import pytest
 
 
 def test_checkin_collects_queue_names_once_and_uses_exact_keys():
@@ -73,3 +74,36 @@ def test_outage_acknowledgements_are_sent_in_server_sized_chunks():
     advance = source.index(':set bwExpDone $doneRest')
     assert accepted < advance
     assert ':set bwExpDone ""' not in source[accepted:]
+
+
+def test_paced_expiry_preserves_ack_contract_and_processes_single_mac_stages():
+    source = script_source(render_expiry_reaper_script(
+        identity="Bench", tunnel_url="http://example.com/expiry", public_url="https://example.com/expiry",
+        removal_limit=5))
+    assert '($workCount < 5)' in source and 'cpu-load] < 85' in source
+    assert '($batchSeen < 1)' in source
+    assert '($doneCount < 40)' in source  # report backlog is independent of removal pacing
+    assert source.index(':delay 1400ms') < source.index(':local renewed false') < source.index('/ip hotspot user set $users disabled=yes')
+    assert '(!$renewed)' in source
+    assert source.count(':local renewed false') == 1
+    assert source.index(':set queuePattern ($queuePattern . ")\\$")') < source.index(':local renewed false')
+    assert ':if ($x > $nows) do={ :set renewed true }' in source
+    assert ':delay ' not in source[source.index(':local renewed false'):]
+    assert source.index('/ip hotspot user remove $users') < source.index(':set bwExpDone ($bwExpDone . $m . "@"')
+
+
+def test_paced_checkin_validates_complete_frame_before_limiting_application():
+    source = render_checkin_applier_source(identity="Bench", endpoint_url="http://example.com/checkin", mutation_limit=2)
+    assert '($guard < 2)' in source and 'cpu-load] < 85' in source
+    assert source.index(':local frameOk false') < source.index('($guard < 2)')
+    assert source.index(':delay 200ms', source.index(':local urate')) < source.index('/ip hotspot user add name=$mac')
+
+
+@pytest.mark.parametrize('limit,ceiling,pause', [(0,85,200), (11,85,200), (True,85,200), (2,100,200), (2,85,0), (10,85,500)])
+def test_work_budgets_reject_unsafe_or_ambiguous_values(limit,ceiling,pause):
+    with pytest.raises(ValueError):
+        render_checkin_applier_source(identity="Bench", endpoint_url="http://example.com/checkin",
+                                     mutation_limit=limit,cpu_ceiling=ceiling,pause_ms=pause)
+    with pytest.raises(ValueError):
+        render_expiry_reaper_script(identity="Bench",tunnel_url="http://example.com/expiry",public_url="https://example.com/expiry",
+                                    removal_limit=limit,cpu_ceiling=ceiling,pause_ms=pause)
