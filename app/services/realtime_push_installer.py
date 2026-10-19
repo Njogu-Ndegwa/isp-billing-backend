@@ -115,10 +115,12 @@ def cpu_samples(api, n: int = 3) -> list:
 
 
 def recent_push_log(api) -> list:
+    # Wrapped RouterOS configuration logs may contain script source/tokens.
+    # Return only bounded, plain status messages emitted by the reporter.
     lines = [
         f"{row.get('time', '')} {row.get('message', '')}"
         for row in _data(api.send_command("/log/print"))
-        if (row.get("message") or "").startswith("usage-push")
+        if re.fullmatch(r'usage-push(?: v[0-9]+)?: [^\r\n;"\\]{1,240}', row.get("message") or "")
     ]
     return lines[-4:]
 
