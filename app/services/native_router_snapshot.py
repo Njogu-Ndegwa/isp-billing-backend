@@ -1,4 +1,4 @@
-"""Decode bounded, atomic native RouterOS snapshots without router-side row loops.
+"""Decode bounded, atomic RouterOS snapshots with exact usage counters.
 
 The router sends data only. A partial upload never becomes a usage report.
 This module has no database or network I/O.
@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 BASE_PARTS = frozenset({"queues", "queue_stats", "hosts", "summary"})
@@ -65,6 +66,21 @@ def _number(value: Any) -> int:
     return integer
 
 
+def _duration(value: Any) -> str:
+    text = _text(value)
+    # RouterOS JSON serializes typed durations as dates relative to Unix epoch.
+    # Absolute link timestamps use _text instead and must remain absolute.
+    if re.fullmatch(r"\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:\.\d+)?", text):
+        try:
+            seconds = (datetime.fromisoformat(text) - datetime(1970, 1, 1)).total_seconds()
+        except ValueError as exc:
+            raise ValueError("invalid native duration") from exc
+        if not 0 <= seconds <= 10_000_000_000:
+            raise ValueError("native duration out of range")
+        return f"{int(seconds)}s"
+    return text
+
+
 def decode_snapshot(identity: str, parts: dict[str, Any]) -> dict:
     """Return the existing v3-shaped ingestion contract, preserving queue order."""
     if not BASE_PARTS <= parts.keys():
@@ -106,9 +122,9 @@ def decode_snapshot(identity: str, parts: dict[str, Any]) -> dict:
         hosts.append({"mac": _text(host.get("mac-address")), "ip": _text(host.get("address")),
                       "bytes_in": _number(host.get("bytes-in")), "bytes_out": _number(host.get("bytes-out")),
                       "authorized": _id(host) in authorized, "bypassed": _id(host) in bypassed,
-                      "idle_time": _text(host.get("idle-time")), "uptime": _text(host.get("uptime"))})
+                      "idle_time": _duration(host.get("idle-time")), "uptime": _duration(host.get("uptime"))})
     ppp = [{"name": _text(x.get("name")), "address": _text(x.get("address")),
-            "uptime": _text(x.get("uptime")), "caller_id": _text(x.get("caller-id"))}
+            "uptime": _duration(x.get("uptime")), "caller_id": _text(x.get("caller-id"))}
            for x in rows(summary.get("ppp"))]
     interface_stats = {_id(x): x for x in rows(summary.get("interface_stats"))}
     running = ids(summary.get("interface_running"))
@@ -140,7 +156,7 @@ def decode_snapshot(identity: str, parts: dict[str, Any]) -> dict:
                               ("total-hdd-space", "total_hdd")):
         metrics[canonical] = _number(resource.get(native))
     for native, canonical in (("uptime", "uptime"), ("version", "version"), ("board-name", "board")):
-        metrics[canonical] = _text(resource.get(native))
+        metrics[canonical] = _duration(resource.get(native)) if native == "uptime" else _text(resource.get(native))
     result = {"identity": identity, "v": 4, "reports": reports, "hosts": hosts, "ppp": ppp,
               "ports": ports, "router": metrics}
     mappings = {

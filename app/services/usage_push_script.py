@@ -271,7 +271,7 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     # removed). ROS 7 then returns EMPTY values instead of an error, which
     # wrote "upload_bytes":, and got the whole report rejected (2026-09-26,
     # busy routers 118/221/256). Every loop skips an entry that came back empty.
-    :foreach q in=[/queue simple find] do={
+    :foreach q in=[/queue simple find where name~"^(plan_|<pppoe-)"] do={
       :do {
         :local qrow [/queue simple get $q]
         :local qn ($qrow->"name")

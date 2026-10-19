@@ -111,6 +111,17 @@ def test_hotspot_rows_preserve_counters_and_reject_racing_incomplete_presence():
         decode_snapshot("R", p)
 
 
+def test_typed_routeros_durations_are_relative_to_epoch_but_link_dates_are_absolute():
+    p = parts()
+    p["summary"]["resource"][0]["uptime"] = "1970-01-02 01:02:03"
+    p["summary"]["interfaces"][0]["last-link-up-time"] = "2026-10-19 10:00:00"
+    p["summary"]["ppp"] = [{"name": "demo", "uptime": "1970-01-01 00:00:19"}]
+    r = decode_snapshot("R", p)
+    assert r["router"]["uptime"] == "90123s"
+    assert r["ppp"][0]["uptime"] == "19s"
+    assert r["ports"][0]["last_link_up"] == "2026-10-19 10:00:00"
+
+
 def census():
     c = {name: {"count": 0, "data": ""} for name in
          ["users", "checkin_users", "bindings", "checkin_bindings", "queues", "others"]}

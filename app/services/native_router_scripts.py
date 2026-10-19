@@ -1,4 +1,4 @@
-"""Opt-in RouterOS 7 native snapshot collectors; no customer-sized script loops."""
+"""Opt-in RouterOS 7 collectors with native serialization and exact counters."""
 from __future__ import annotations
 
 import re
@@ -68,10 +68,26 @@ NATIVE_PUSH_BODY = r'''# bw-native-snapshot v1: RouterOS 7.19.6+; send native ta
         :if (!$failed) do={
             :do {
                 :local data [:toarray ""]
-                :if ($part = "queues") do={ :set data [/queue simple print as-value proplist=name,target,max-limit,disabled] }
-                :if ($part = "queue_stats") do={ :set data [/queue simple print stats as-value proplist=name,bytes] }
+                :if ($part = "queues") do={ :set data [/queue simple print as-value proplist=name,target,max-limit,disabled where name~"^(plan_|<pppoe-)"] }
+                :if ($part = "queue_stats") do={ :set data [/queue simple print stats as-value proplist=name,bytes where name~"^(plan_|<pppoe-)"] }
                 :if ($part = "hosts") do={
-                    :set data {"rows"=[/ip hotspot host print as-value proplist=mac-address,address,bytes-in,bytes-out,idle-time,uptime];"authorized"=[/ip hotspot host find where authorized];"bypassed"=[/ip hotspot host find where bypassed]}
+                    # Host print omits byte counters even with proplist/detail.
+                    # One get returns exact counters and metadata together.
+                    :local hostRows [:toarray ""]
+                    :local authorized [:toarray ""]
+                    :local bypassed [:toarray ""]
+                    :foreach h in=[/ip hotspot host find where authorized or bypassed] do={
+                        :do {
+                            :local row [/ip hotspot host get $h]
+                            :if (($row->"authorized") || ($row->"bypassed")) do={
+                                :local selected {".id"=$h;"mac-address"=($row->"mac-address");"address"=($row->"address");"bytes-in"=($row->"bytes-in");"bytes-out"=($row->"bytes-out");"idle-time"=($row->"idle-time");"uptime"=($row->"uptime")}
+                                :set hostRows ($hostRows, {$selected})
+                                :if ($row->"authorized") do={ :set authorized ($authorized, {$h}) }
+                                :if ($row->"bypassed") do={ :set bypassed ($bypassed, {$h}) }
+                            }
+                        } on-error={}
+                    }
+                    :set data {"rows"=$hostRows;"authorized"=$authorized;"bypassed"=$bypassed}
                 }
                 :if ($part = "summary") do={
                     :set data {"resource"=$health;"wan"="__WAN__";"queue_disabled"=[/queue simple find where disabled];"ppp"=[/ppp active print as-value proplist=name,address,uptime,caller-id];"interfaces"=[/interface print as-value proplist=name,type,last-link-up-time];"interface_stats"=[/interface print stats as-value proplist=name,rx-byte,tx-byte,rx-packet,tx-packet,rx-error,tx-error,link-downs];"interface_running"=[/interface find where running];"interface_disabled"=[/interface find where disabled]}
