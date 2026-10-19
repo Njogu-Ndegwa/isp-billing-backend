@@ -1078,7 +1078,7 @@ def test_percentile_nearest_rank():
 
 def test_applier_reports_bindings_without_queue():
     src = _src()
-    assert '[:len [/queue simple find where name=("plan_" . $rf)]] = 0' in src
+    assert '[:typeof ($queueNames->("plan_" . $rf))] != "bool"' in src
     assert ':if ($qOk) do={ :set post ($post . "&q=" . $qmacs) }' in src
     assert "http-data=$post" in src
     # The report still carries n= and macs= exactly as before (old servers).
@@ -1095,7 +1095,9 @@ def test_applier_queue_checks_only_checkin_bindings():
     collect = src[src.index(':foreach b in=[/ip hotspot ip-binding find where comment~"USER:"]'):
                   src.index(":local post (")]
     gate = collect.index('[:typeof [:find $bc "CHECKIN"]] = "num"')
-    assert ":set bc [:tostr [/ip hotspot ip-binding get $b comment]]" in collect
+    assert ":local brow ($bindingRows->$bi)" in collect
+    assert '($brow->".id") = $b' in collect
+    assert ':set bc [:tostr ($brow->"comment")]' in collect
     # Every queue lookup in the collection loop sits behind the CHECKIN gate...
     assert collect.count("/queue simple find") == 1
     assert gate < collect.index("/queue simple find")
@@ -1365,8 +1367,8 @@ def test_applier_reports_checkin_bindings_from_the_same_comment_read():
     src = _src()
     collect = _collect_block(src)
     # One comment read per USER: binding, shared by c= and q=.
-    assert collect.count("/ip hotspot ip-binding get $b comment") == 1
-    read = collect.index(":set bc [:tostr [/ip hotspot ip-binding get $b comment]]")
+    assert collect.count("/ip hotspot ip-binding get $b comment]") == 1
+    read = collect.index(':set bc [:tostr ($brow->"comment")]')
     gate = collect.index('[:typeof [:find $bc "CHECKIN"]] = "num"')
     assert read < gate < collect.index(":set cmacs ($cmacs . $bm)") < collect.index("/queue simple find")
     # A failed comment read drops c= (a partial list would read as complete).

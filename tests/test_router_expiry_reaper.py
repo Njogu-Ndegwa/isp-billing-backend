@@ -389,24 +389,24 @@ def test_v2_script_reads_asks_about_redates_and_removes_mac_login_users():
     assert '/ip hotspot user set $ku comment=' in src
     assert '"EXX:"' in src and '/ip hotspot user set $xu comment=' in src
     # removal takes the MAC-login user (named with colons) as well as the old one
-    assert '/ip hotspot user remove [find where name=$m]' in src
-    assert '/ip hotspot user remove [find where name=$u]' in src
+    assert '/ip hotspot user remove $users' in src
+    assert ':set userPattern ($userPattern . $m . "|" . $u)' in src
     # and it tells the server it can see them
     assert '"ident=" . $ident . "&v=4&now="' in src
 
 
 def test_reaper_blocks_relogin_and_reports_only_after_verified_disconnect():
     src = _script()
-    disable = src.index('/ip hotspot user set [find where name=$m] disabled=yes')
-    kick = src.index('/ip hotspot active remove [find where mac-address=$m]')
-    delete_user = src.index('/ip hotspot user remove [find where name=$m]')
-    delete_binding = src.index('/ip hotspot ip-binding remove [find where mac-address=$m]')
+    disable = src.index('/ip hotspot user set $users disabled=yes')
+    kick = src.index('/ip hotspot active remove $sessions')
+    delete_user = src.index('/ip hotspot user remove $users')
+    delete_binding = src.index('/ip hotspot ip-binding remove $bindings')
     report = src.index(':set bwExpDone ($bwExpDone . $m . "@" . $nows . ",")')
     assert disable < kick < delete_user < delete_binding < report
-    assert '[:len [/ip hotspot active find where mac-address=$m]] = 0' in src
-    assert '[:len [/ip hotspot host find where mac-address=$m and authorized]] = 0' in src
-    assert '[:len [/ip hotspot host find where mac-address=$m and bypassed]] = 0' in src
-    assert '[:len [/ip hotspot ip-binding find where mac-address=$m]] = 0' in src
+    assert '[:len [/ip hotspot active find where mac-address~$macPattern]] = 0' in src
+    assert '[:len [/ip hotspot host find where mac-address~$macPattern and authorized]] = 0' in src
+    assert '[:len [/ip hotspot host find where mac-address~$macPattern and bypassed]] = 0' in src
+    assert '[:len [/ip hotspot ip-binding find where mac-address~$macPattern]] = 0' in src
 
 
 def test_parse_request_reads_the_script_version():

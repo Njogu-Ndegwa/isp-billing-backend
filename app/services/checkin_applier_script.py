@@ -102,6 +102,8 @@ _TEMPLATE = r''':local url "__URL__"
     :local qmacs ""
     :local nq 0
     :local qOk true
+    :local queueNames [:toarray ""]
+    :local queuesRead false
     :local cmacs ""
     :local nc 0
     :local cOk true
@@ -109,15 +111,20 @@ _TEMPLATE = r''':local url "__URL__"
     :local nOth 0
     :local oOk true
     :do {
+        :local bindingRows [/ip hotspot ip-binding print as-value where comment~"USER:"]
+        :local bi 0
         :foreach b in=[/ip hotspot ip-binding find where comment~"USER:"] do={
-            :local bm [:tostr [/ip hotspot ip-binding get $b mac-address]]
+            :local brow ($bindingRows->$bi)
+            :set bi ($bi + 1)
+            :local bm ""
+            :if (($brow->".id") = $b) do={ :set bm [:tostr ($brow->"mac-address")] } else={ :set bm [:tostr [/ip hotspot ip-binding get $b mac-address]] }
             :if ([:len $bm] = 17) do={
                 :if ($n > 0) do={ :set macs ($macs . ",") }
                 :set macs ($macs . $bm)
                 :set n ($n + 1)
                 :local bc ""
                 :do {
-                    :set bc [:tostr [/ip hotspot ip-binding get $b comment]]
+                    :if (($brow->".id") = $b) do={ :set bc [:tostr ($brow->"comment")] } else={ :set bc [:tostr [/ip hotspot ip-binding get $b comment]] }
                 } on-error={
                     :set cOk false
                     :set qOk false
@@ -128,7 +135,19 @@ _TEMPLATE = r''':local url "__URL__"
                     :set nc ($nc + 1)
                     :do {
                         :local rf ([:pick $bm 0 2] . [:pick $bm 3 5] . [:pick $bm 6 8] . [:pick $bm 9 11] . [:pick $bm 12 14] . [:pick $bm 15 17])
-                        :if ([:len [/queue simple find where name=("plan_" . $rf)]] = 0) do={
+                        :if (!$queuesRead) do={
+                            :local queueRows [/queue simple print as-value]
+                            :local qi 0
+                            :foreach q in=[/queue simple find] do={
+                                :local qrow ($queueRows->$qi)
+                                :set qi ($qi + 1)
+                                :local qn ""
+                                :if (($qrow->".id") = $q) do={ :set qn ($qrow->"name") } else={ :set qn [/queue simple get $q name] }
+                                :set ($queueNames->$qn) true
+                            }
+                            :set queuesRead true
+                        }
+                        :if ([:typeof ($queueNames->("plan_" . $rf))] != "bool") do={
                             :if ($nq > 0) do={ :set qmacs ($qmacs . ",") }
                             :set qmacs ($qmacs . $bm)
                             :set nq ($nq + 1)
@@ -142,14 +161,21 @@ _TEMPLATE = r''':local url "__URL__"
     # are this app's access on MAC-login routers; report them like bindings so
     # the server sees them as delivered. "^MACLOGIN": "|" is regex alternation.
     :do {
+        :local userRows [/ip hotspot user print as-value where comment~"^MACLOGIN"]
+        :local ui 0
         :foreach u in=[/ip hotspot user find where comment~"^MACLOGIN"] do={
-            :local um [:tostr [/ip hotspot user get $u name]]
+            :local urow ($userRows->$ui)
+            :set ui ($ui + 1)
+            :local um ""
+            :if (($urow->".id") = $u) do={ :set um [:tostr ($urow->"name")] } else={ :set um [:tostr [/ip hotspot user get $u name]] }
             :if ([:len $um] = 17) do={
                 :if ($n > 0) do={ :set macs ($macs . ",") }
                 :set macs ($macs . $um)
                 :set n ($n + 1)
                 :local uc ""
-                :do { :set uc [:tostr [/ip hotspot user get $u comment]] } on-error={ :set cOk false }
+                :do {
+                    :if (($urow->".id") = $u) do={ :set uc [:tostr ($urow->"comment")] } else={ :set uc [:tostr [/ip hotspot user get $u comment]] }
+                } on-error={ :set cOk false }
                 :if ([:typeof [:find $uc "CHECKIN"]] = "num") do={
                     :if ($nc > 0) do={ :set cmacs ($cmacs . ",") }
                     :set cmacs ($cmacs . $um)
@@ -434,6 +460,10 @@ def render_checkin_applier_source(
     identity: str,
     endpoint_url: str,
     check_certificate: str = "no",
+    native_census: bool | None = None,
+    mutation_limit: int | None = None,
+    cpu_ceiling: int = 85,
+    pause_ms: int = 200,
 ) -> str:
     """Return the ``source`` of the ``bitwave-checkin`` system script.
 
@@ -446,9 +476,71 @@ def render_checkin_applier_source(
     endpoint_url = _require(endpoint_url, _URL_RE, "endpoint_url")
     if check_certificate not in CHECK_CERTIFICATE_VALUES:
         raise ValueError(f"checkin applier: check_certificate must be one of {CHECK_CERTIFICATE_VALUES}")
+    from app.services.native_router_scripts import NATIVE_CENSUS_COLLECT, native_cpu_enabled
+    use_native = native_cpu_enabled(identity) if native_census is None else native_census
+    template = _TEMPLATE
+    if use_native:
+        start = template.index('    :local macs ""')
+        end = template.index('    :local d ""', start)
+        template = template[:start] + NATIVE_CENSUS_COLLECT + template[end:]
+        template = template.replace("Content-Type: text/plain", "Content-Type: application/json")
+        # Retry batches often contain users already created by a previous reply.
+        # A live table search per user made even these no-op batches expensive.
+        # Keep single-user delivery cheap; cache names only for larger frames.
+        template = template.replace(
+            '    :if ($frameOk && ($want > 0)) do={\n',
+            '    :if ($frameOk && ($want > 0)) do={\n'
+            '        :local userNames [:toarray ""]\n'
+            '        :local usersRead false\n',
+        ).replace(
+            '                    :if ([:len [/ip hotspot user find where name=$mac]] = 0) do={\n',
+            '                    :local haveUser false\n'
+            '                    :if ($want >= 5) do={\n'
+            '                        :if (!$usersRead) do={\n'
+            '                            :foreach row in=[/ip hotspot user print as-value proplist=name] do={\n'
+            '                                :set ($userNames->($row->"name")) true\n'
+            '                            }\n'
+            '                            :set usersRead true\n'
+            '                        }\n'
+            '                        :set haveUser ([:typeof ($userNames->$mac)] = "bool")\n'
+            '                    } else={ :set haveUser ([:len [/ip hotspot user find where name=$mac]] > 0) }\n'
+            '                    :if (!$haveUser) do={\n',
+        ).replace(
+            '                            :set uadded true\n',
+            '                            :set uadded true\n'
+            '                            :set ($userNames->$mac) true\n',
+        )
+    if mutation_limit is not None:
+        if (type(mutation_limit) is not int or not 1 <= mutation_limit <= 10
+                or type(cpu_ceiling) is not int or not 50 <= cpu_ceiling <= 90
+                or type(pause_ms) is not int or not 100 <= pause_ms <= 500
+                or mutation_limit * pause_ms * 7 > 10_000):
+            raise ValueError("invalid checkin work budget")
+        # Validate the entire frame first. Unapplied lines remain absent from
+        # the next census, so server delivery retries them without false ACKs.
+        template = template.replace(
+            ':while ((!$done) && ($guard < 40)) do={',
+            f':while ((!$done) && ($guard < {mutation_limit}) && ([/system resource get cpu-load] < {cpu_ceiling})) do={{',
+        )
+        apply_at = template.index('    :if ($frameOk && ($want > 0)) do={')
+        cadence_at = template.index('    # Cadence:', apply_at)
+        apply = template[apply_at:cadence_at]
+        # Yield after complete logical stages, including creation of a rate
+        # profile before creating its user. Never interrupt an add mid-stage.
+        for marker in (
+            '                            /ip hotspot user add ',
+            '                            :set uadded true',
+            '                            :log info ("checkin: mac-login "',
+            '                            :set added true',
+            '                    :if ($added || ($kind = "Q"))',
+            '                                /queue simple add ',
+            '                            :if ($kind = "Q")',
+        ):
+            apply = apply.replace(marker, f'                    :delay {pause_ms}ms\n' + marker)
+        template = template[:apply_at] + apply + template[cadence_at:]
     token = derive_checkin_token(identity)
     return with_gate(SCRIPT_NAME, (
-        _TEMPLATE
+        template
         .replace("__URL__", endpoint_url)
         .replace("__TOKEN__", token)
         .replace("__IDENT__", identity)
@@ -486,6 +578,9 @@ def install_checkin_applier(
     identity: str,
     endpoint_url: str,
     check_certificate: str = "no",
+    mutation_limit: int | None = None,
+    cpu_ceiling: int = 85,
+    pause_ms: int = 200,
 ) -> dict:
     """Install or update the applier script + scheduler. Idempotent.
 
@@ -496,8 +591,14 @@ def install_checkin_applier(
     DISABLED scheduler means someone paused the check-in on this router on
     purpose (e.g. the 2026-09-26 hAP lite CPU A/B): reported, not re-enabled.
     """
+    from app.services.native_router_scripts import native_cpu_enabled, native_cpu_supported
+    if native_cpu_enabled(identity):
+        resources = _rows(api, "/system/resource")
+        if not resources or not native_cpu_supported(resources[0].get("version", "")):
+            return {"status": "skipped_unsupported_native", "error": "Native census requires RouterOS 7.19.6+"}
     source = render_checkin_applier_source(
         identity=identity, endpoint_url=endpoint_url, check_certificate=check_certificate,
+        mutation_limit=mutation_limit, cpu_ceiling=cpu_ceiling, pause_ms=pause_ms,
     )
     changed = False
     res: dict = {}

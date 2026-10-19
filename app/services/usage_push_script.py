@@ -3,10 +3,10 @@
 Two pieces get installed on a router:
 
 1. **A periodic reporter** — a scheduler script that walks ``/queue simple``,
-   builds one JSON batch and POSTs it. Reading the queues is free: the router
-   already holds those counters in memory, so the only real cost is the outbound
-   HTTPS call, and that cost is per *push*, not per customer. A router with 5
-   users and one with 50 cost the same.
+   builds a cumulative snapshot and POSTs it. The counters are held in memory,
+   but reading and formatting them still costs CPU and grows with customer count.
+   The opt-in native collector moves row formatting to the server; hardware CPU
+   measurements, including transport and bursts, remain the acceptance gate.
 
 2. **An on-logout hook** — set on the hotspot user profile. RouterOS runs it when
    a session ends and hands it that session's exact totals, so a 15-minute
@@ -265,21 +265,24 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local body "{\"identity\":\"$ident\",\"v\":3,\"reports\":["
     :local first true
     :local qcount 0
+    # One get returns a property map. Avoid an IPC round trip per field on
+    # small CPUs. Unlike print as-value, get also works when run via the API.
     # An entry can vanish between find and get (customer logs out, queue
     # removed). ROS 7 then returns EMPTY values instead of an error, which
     # wrote "upload_bytes":, and got the whole report rejected (2026-09-26,
     # busy routers 118/221/256). Every loop skips an entry that came back empty.
-    :foreach q in=[/queue simple find] do={
+    :foreach q in=[/queue simple find where name~"^(plan_|<pppoe-)"] do={
       :do {
-        :local qn [/queue simple get $q name]
+        :local qrow [/queue simple get $q]
+        :local qn ($qrow->"name")
         :local key ""
         :if ([:pick $qn 0 5] = "plan_") do={ :set key [:pick $qn 5 [:len $qn]] }
         :if ([:pick $qn 0 7] = "<pppoe-") do={ :set key ("pppoe:" . [:pick $qn 7 ([:len $qn] - 1)]) }
         :if ($key != "") do={
-            :local qb [/queue simple get $q bytes]
-            :local qt [:tostr [/queue simple get $q target]]
-            :local ql [/queue simple get $q max-limit]
-            :local qd [/queue simple get $q disabled]
+            :local qb ($qrow->"bytes")
+            :local qt [:tostr ($qrow->"target")]
+            :local ql ($qrow->"max-limit")
+            :local qd ($qrow->"disabled")
             :local slash [:find $qb "/"]
             :if (([:typeof $slash] = "num") && ([:typeof $qd] = "bool")) do={
                 :local up [:pick $qb 0 $slash]
@@ -297,14 +300,15 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local hids ([/ip hotspot host find where bypassed] , [/ip hotspot host find where authorized])
     :foreach h in=$hids do={
         :do {
-            :local hm [/ip hotspot host get $h mac-address]
-            :local ha [/ip hotspot host get $h address]
-            :local hbi [/ip hotspot host get $h bytes-in]
-            :local hbo [/ip hotspot host get $h bytes-out]
-            :local hby [/ip hotspot host get $h bypassed]
-            :local hau [/ip hotspot host get $h authorized]
-            :local hit [/ip hotspot host get $h idle-time]
-            :local hup [/ip hotspot host get $h uptime]
+            :local hrow [/ip hotspot host get $h]
+            :local hm ($hrow->"mac-address")
+            :local ha ($hrow->"address")
+            :local hbi ($hrow->"bytes-in")
+            :local hbo ($hrow->"bytes-out")
+            :local hby ($hrow->"bypassed")
+            :local hau ($hrow->"authorized")
+            :local hit ($hrow->"idle-time")
+            :local hup ($hrow->"uptime")
             :if (([:len $hm] > 0) && ([:typeof $hbi] = "num") && ([:typeof $hbo] = "num") && ([:typeof $hby] = "bool") && ([:typeof $hau] = "bool")) do={
             :if (!$hfirst) do={ :set body ($body . ",") }
             :set body ($body . "{\"mac\":\"" . $hm . "\",\"ip\":\"" . $ha . "\",\"bytes_in\":" . $hbi . ",\"bytes_out\":" . $hbo . ",\"bypassed\":" . $hby . ",\"authorized\":" . $hau . ",\"idle_time\":\"" . $hit . "\",\"uptime\":\"" . $hup . "\"}")
@@ -316,10 +320,11 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local pfirst true
     :do {
         :foreach a in=[/ppp active find] do={
-            :local an [/ppp active get $a name]
-            :local aa [/ppp active get $a address]
-            :local au [/ppp active get $a uptime]
-            :local ac [/ppp active get $a caller-id]
+            :local arow [/ppp active get $a]
+            :local an ($arow->"name")
+            :local aa ($arow->"address")
+            :local au ($arow->"uptime")
+            :local ac ($arow->"caller-id")
             :if ([:len $an] > 0) do={
             :if (!$pfirst) do={ :set body ($body . ",") }
             :set body ($body . "{\"name\":\"" . $an . "\",\"address\":\"" . $aa . "\",\"uptime\":\"" . $au . "\",\"caller_id\":\"" . $ac . "\"}")
@@ -333,17 +338,18 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local ifirst true
     :foreach i in=[/interface find where (type="ether" or type="wlan" or type="wifi")] do={
         :do {
-            :local inm [/interface get $i name]
-            :local iru [/interface get $i running]
-            :local idi [/interface get $i disabled]
-            :local irx [/interface get $i rx-byte]
-            :local itx [/interface get $i tx-byte]
-            :local ild [/interface get $i link-downs]
-            :local irp [/interface get $i rx-packet]
-            :local itp [/interface get $i tx-packet]
-            :local ire [/interface get $i rx-error]
-            :local ite [/interface get $i tx-error]
-            :local ilu [:tostr [/interface get $i last-link-up-time]]
+            :local irow [/interface get $i]
+            :local inm ($irow->"name")
+            :local iru ($irow->"running")
+            :local idi ($irow->"disabled")
+            :local irx ($irow->"rx-byte")
+            :local itx ($irow->"tx-byte")
+            :local ild ($irow->"link-downs")
+            :local irp ($irow->"rx-packet")
+            :local itp ($irow->"tx-packet")
+            :local ire ($irow->"rx-error")
+            :local ite ($irow->"tx-error")
+            :local ilu [:tostr ($irow->"last-link-up-time")]
             # Some drivers (RB4011 ethernet/SFP on ROS 7) return no value for
             # a counter; an empty value made the JSON invalid ("rx_errors":,)
             # and every report from those routers was rejected (2026-09-26).
@@ -371,8 +377,9 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
         :local bfirst true
         :do {
             :foreach b in=[/interface bridge host find where !local] do={
-                :local bm [/interface bridge host get $b mac-address]
-                :local bo [/interface bridge host get $b on-interface]
+                :local brow [/interface bridge host get $b]
+                :local bm ($brow->"mac-address")
+                :local bo ($brow->"on-interface")
                 :if (!$bfirst) do={ :set body ($body . ",") }
                 :set body ($body . "{\"mac\":\"" . $bm . "\",\"port\":\"" . $bo . "\"}")
                 :set bfirst false
@@ -382,9 +389,10 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
         :local gfirst true
         :do {
             :foreach g in=[/ip hotspot ip-binding find] do={
-                :local gm [/ip hotspot ip-binding get $g mac-address]
-                :local gt [/ip hotspot ip-binding get $g type]
-                :local gd [/ip hotspot ip-binding get $g disabled]
+                :local grow [/ip hotspot ip-binding get $g]
+                :local gm ($grow->"mac-address")
+                :local gt ($grow->"type")
+                :local gd ($grow->"disabled")
                 :if ([:typeof $gd] = "bool") do={
                 :if (!$gfirst) do={ :set body ($body . ",") }
                 :set body ($body . "{\"mac\":\"" . $gm . "\",\"type\":\"" . $gt . "\",\"disabled\":" . $gd . "}")
@@ -398,11 +406,12 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
         :local lfirst true
         :do {
             :foreach l in=[/ip dhcp-server lease find] do={
-                :local lm [/ip dhcp-server lease get $l mac-address]
-                :local la [/ip dhcp-server lease get $l address]
-                :local lh [:tostr [/ip dhcp-server lease get $l host-name]]
-                :local ls [:tostr [/ip dhcp-server lease get $l status]]
-                :local lc [:tostr [/ip dhcp-server lease get $l comment]]
+                :local lrow [/ip dhcp-server lease get $l]
+                :local lm ($lrow->"mac-address")
+                :local la ($lrow->"address")
+                :local lh [:tostr ($lrow->"host-name")]
+                :local ls [:tostr ($lrow->"status")]
+                :local lc [:tostr ($lrow->"comment")]
                 :if (([:typeof [:find $lh "\""]] = "num") || ([:typeof [:find $lh "\\"]] = "num")) do={ :set lh "" }
                 :if (([:typeof [:find $lc "\""]] = "num") || ([:typeof [:find $lc "\\"]] = "num")) do={ :set lc "" }
                 :if (!$lfirst) do={ :set body ($body . ",") }
@@ -416,13 +425,14 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
         :local nfirst true
         :do {
             :foreach n in=[/ip neighbor find] do={
-                :local nm [:tostr [/ip neighbor get $n mac-address]]
-                :local ni [:tostr [/ip neighbor get $n identity]]
-                :local nb [:tostr [/ip neighbor get $n board]]
-                :local np [:tostr [/ip neighbor get $n platform]]
-                :local nv [:tostr [/ip neighbor get $n version]]
-                :local nf [:tostr [/ip neighbor get $n interface]]
-                :local na [:tostr [/ip neighbor get $n address]]
+                :local nrow [/ip neighbor get $n]
+                :local nm [:tostr ($nrow->"mac-address")]
+                :local ni [:tostr ($nrow->"identity")]
+                :local nb [:tostr ($nrow->"board")]
+                :local np [:tostr ($nrow->"platform")]
+                :local nv [:tostr ($nrow->"version")]
+                :local nf [:tostr ($nrow->"interface")]
+                :local na [:tostr ($nrow->"address")]
                 :if (([:typeof [:find $ni "\""]] = "num") || ([:typeof [:find $ni "\\"]] = "num")) do={ :set ni "" }
                 :if (([:typeof [:find $nb "\""]] = "num") || ([:typeof [:find $nb "\\"]] = "num")) do={ :set nb "" }
                 :if (([:typeof [:find $nv "\""]] = "num") || ([:typeof [:find $nv "\\"]] = "num")) do={ :set nv "" }
@@ -435,8 +445,9 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
         :local pfirst2 true
         :do {
             :foreach p in=[/interface bridge port find] do={
-                :local pi [/interface bridge port get $p interface]
-                :local pb [/interface bridge port get $p bridge]
+                :local prow [/interface bridge port get $p]
+                :local pi ($prow->"interface")
+                :local pb ($prow->"bridge")
                 :if (!$pfirst2) do={ :set body ($body . ",") }
                 :set body ($body . "{\"interface\":\"" . $pi . "\",\"bridge\":\"" . $pb . "\"}")
                 :set pfirst2 false
@@ -485,6 +496,7 @@ def render_realtime_push_script(
     interval_seconds: int = 10,
     wan_interface: str = "ether1",
     lists_every: int = 5,
+    native_snapshot: bool | None = None,
 ) -> str:
     """Render the v2 (real-time pilot) reporter. See the block comment above.
 
@@ -499,8 +511,15 @@ def render_realtime_push_script(
         raise ValueError("usage-push script: interval must be 5..3600 seconds")
     if not (2 <= int(lists_every) <= 15):
         raise ValueError("usage-push script: lists_every must be 2..15")
+    from app.services.native_router_scripts import NATIVE_PUSH_BODY, native_cpu_enabled
+    use_native = native_cpu_enabled(identity) if native_snapshot is None else native_snapshot
+    template = _REALTIME_TEMPLATE
+    if use_native:
+        start = template.index("source={\n") + len("source={\n")
+        end = template.index("\n}\n\n/system scheduler add", start)
+        template = template[:start] + NATIVE_PUSH_BODY + template[end:]
     return gate_rsc_body(SCRIPT_NAME, (
-        _REALTIME_TEMPLATE
+        template
         .replace("__SCRIPT__", SCRIPT_NAME)
         .replace("__LOGOUT__", LOGOUT_SCRIPT_NAME)
         .replace("__SCHED__", SCHEDULER_NAME)

@@ -35,6 +35,8 @@ import re
 from app.services.router_script_gate import gate_rsc_body
 from app.services.usage_push_auth import derive_router_token
 
+# Keep the wire version stable: this is an explicit installer rollout, not
+# permission to auto-upgrade every serving router when the app is deployed.
 SCRIPT_VERSION = 4
 SCRIPT_NAME = "bitwave-expiry-reaper"
 SCHEDULER_NAME = "bitwave-expiry-reaper"
@@ -148,8 +150,16 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
         :local due ""
         :if (($nows >= $bwExpNext) || ($cnt != $bwExpCount) || ([:len $bwExpDone] > 0)) do={
             :local nxt ($nows + 300)
+            # Scheduled execution can read a table in one call. RouterOS API
+            # execution may stream print results instead of returning a map;
+            # match each ID and fall back to field reads in that context.
+            :local bindingRows [/ip hotspot ip-binding print as-value where comment~"EXP:"]
+            :local bi 0
             :foreach b in=[/ip hotspot ip-binding find where comment~"EXP:"] do={
-                :local cm [/ip hotspot ip-binding get $b comment]
+                :local row ($bindingRows->$bi)
+                :set bi ($bi + 1)
+                :local cm ""
+                :if (($row->".id") = $b) do={ :set cm ($row->"comment") } else={ :set cm [/ip hotspot ip-binding get $b comment] }
                 :local p [:find $cm "EXP:"]
                 :local v [:pick $cm ($p + 4) [:len $cm]]
                 :local e [:find $v "|"]
@@ -159,7 +169,8 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 :if (([:typeof $x] = "num") && ($x < 1000000000)) do={ :set x ($x * 60) }
                 :if ([:typeof $x] = "num") do={
                     :if ($x <= $nows) do={
-                        :local bm [:tostr [/ip hotspot ip-binding get $b mac-address]]
+                        :local bm ""
+                        :if (($row->".id") = $b) do={ :set bm [:tostr ($row->"mac-address")] } else={ :set bm [:tostr [/ip hotspot ip-binding get $b mac-address]] }
                         :if (([:len $bm] = 17) && ([:len $due] < 700)) do={ :set due ($due . $bm . ",") }
                         :set nxt $nows
                     } else={
@@ -168,8 +179,13 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 }
             }
             # MAC-login users: the user is the access, named after the MAC.
+            :local userRows [/ip hotspot user print as-value where comment~"^MACLOGIN.*EXP:"]
+            :local ui 0
             :foreach u in=[/ip hotspot user find where comment~"^MACLOGIN.*EXP:"] do={
-                :local cm [/ip hotspot user get $u comment]
+                :local row ($userRows->$ui)
+                :set ui ($ui + 1)
+                :local cm ""
+                :if (($row->".id") = $u) do={ :set cm ($row->"comment") } else={ :set cm [/ip hotspot user get $u comment] }
                 :local p [:find $cm "EXP:"]
                 :local v [:pick $cm ($p + 4) [:len $cm]]
                 :local e [:find $v "|"]
@@ -177,7 +193,8 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
                 :local x [:tonum $v]
                 :if ([:typeof $x] = "num") do={
                     :if ($x <= $nows) do={
-                        :local um [:tostr [/ip hotspot user get $u name]]
+                        :local um ""
+                        :if (($row->".id") = $u) do={ :set um [:tostr ($row->"name")] } else={ :set um [:tostr [/ip hotspot user get $u name]] }
                         :if (([:len $um] = 17) && ([:len $due] < 700)) do={ :set due ($due . $um . ",") }
                         :set nxt $nows
                     } else={
@@ -195,7 +212,21 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
         :if (($due != "") || ([:len $bwExpDone] > 0) || (($nows - $bwExpBeat) >= 3600)) do={ :set docall true }
         :if ($nows < $bwExpRetryAt) do={ :set docall false }
         :if ($docall) do={
-            :local body ("ident=" . $ident . "&v=__VERSION__&now=" . $nows . "&due=" . $due . "&done=" . $bwExpDone)
+            # The server accepts 40 acknowledgements per call. An outage can
+            # leave several batches pending; retain the unsent suffix rather
+            # than clearing it when only the first 40 were accepted.
+            :local doneSend ""
+            :local doneRest $bwExpDone
+            :local doneCount 0
+            :while (([:len $doneRest] > 0) && ($doneCount < 40)) do={
+                :local e [:find $doneRest ","]
+                :if ([:typeof $e] = "num") do={
+                    :set doneSend ($doneSend . [:pick $doneRest 0 ($e + 1)])
+                    :set doneRest [:pick $doneRest ($e + 1) [:len $doneRest]]
+                } else={ :set doneSend ($doneSend . $doneRest) ; :set doneRest "" }
+                :set doneCount ($doneCount + 1)
+            }
+            :local body ("ident=" . $ident . "&v=__VERSION__&now=" . $nows . "&due=" . $due . "&done=" . $doneSend)
             :local hdr ("Content-Type: text/plain,Authorization: Bearer " . $tok)
             :local rd ""
             :local ok false
@@ -214,7 +245,7 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
             :if ($ok && ([:pick $rd 0 3] = "BW1")) do={
                 :set bwExpBeat $nows
                 :set bwExpRetryAt 0
-                :set bwExpDone ""
+                :set bwExpDone $doneRest
                 :set bwExpClockOk ([:typeof [:find $rd ";C=1;"]] = "num")
                 # Clock not confirmed (e.g. a no-RTC board just rebooted and NTP
                 # has not caught up): check in again in 5 minutes, not an hour.
@@ -301,35 +332,68 @@ _TEMPLATE = r'''# Bitwave expiry reaper - safe to re-run.
             :if (($due != "") && ($nows < $bwExpRetryAt) && $bwExpClockOk) do={ :set todo $due }
         }
 
-        # --- remove ---------------------------------------------------------
-        :while ([:len $todo] > 0) do={
+        # --- remove: one bounded batch, with live verification at each stage ---
+        # Only validated MACs enter these anchored regexes. Repeating the same
+        # table searches for every MAC used to saturate an RB951 during expiry.
+        :local macPattern "^("
+        :local userPattern "^("
+        :local queuePattern "^plan_("
+        :local batch ""
+        :local batchCount 0
+        :local batchSeen 0
+        :while (([:len $todo] > 0) && ($batchSeen < 40)) do={
+            :set batchSeen ($batchSeen + 1)
             :local ti [:find $todo ","]
             :local m $todo
             :if ([:typeof $ti] = "num") do={
                 :set m [:pick $todo 0 $ti]
                 :set todo [:pick $todo ($ti + 1) [:len $todo]]
             } else={ :set todo "" }
-            :if ([:len $m] = 17) do={
+            :if (([:len $m] = 17) && ($m ~ "^[0-9A-Fa-f:]+\$")) do={
                 :local u ([:pick $m 0 2] . [:pick $m 3 5] . [:pick $m 6 8] . [:pick $m 9 11] . [:pick $m 12 14] . [:pick $m 15 17])
-                # Stop new logins before kicking the current session. Keep the
-                # EXP-tagged binding/user until access is proven gone, so a
-                # failed removal is retried on the next scheduler run.
-                :do { /ip hotspot user set [find where name=$u] disabled=yes } on-error={}
-                :do { /ip hotspot user set [find where name=$m] disabled=yes } on-error={}
-                :do { /ip hotspot active remove [find where mac-address=$m] } on-error={}
-                :do { /ip hotspot host remove [find where mac-address=$m] } on-error={}
-                # An unplugged session can leave a new unauthorized host row as
-                # soon as the device reconnects. Only an authorized host blocks
-                # disconnect verification; any bypass is checked after binding removal.
-                :if (([:len [/ip hotspot active find where mac-address=$m]] = 0) && ([:len [/ip hotspot host find where mac-address=$m and authorized]] = 0)) do={
-                    :do { /ip hotspot user remove [find where name=$u] } on-error={}
-                    :do { /ip hotspot user remove [find where name=$m] } on-error={}
-                    :if (([:len [/ip hotspot user find where name=$u]] = 0) && ([:len [/ip hotspot user find where name=$m]] = 0) && ([:len [/ip hotspot active find where mac-address=$m]] = 0) && ([:len [/ip hotspot host find where mac-address=$m and authorized]] = 0)) do={
-                        :do { /ip hotspot ip-binding remove [find where mac-address=$m] } on-error={}
-                        :do { /ip hotspot host remove [find where mac-address=$m and bypassed] } on-error={}
-                        :if (([:len [/ip hotspot ip-binding find where mac-address=$m]] = 0) && ([:len [/ip hotspot active find where mac-address=$m]] = 0) && ([:len [/ip hotspot host find where mac-address=$m and authorized]] = 0) && ([:len [/ip hotspot host find where mac-address=$m and bypassed]] = 0)) do={
-                            :do { /queue simple remove [find where name=("plan_" . $u)] } on-error={}
-                            :if ([:len $bwExpDone] < 700) do={ :set bwExpDone ($bwExpDone . $m . "@" . $nows . ",") }
+                :if ([:len $u] = 12) do={
+                    :if ($batchCount > 0) do={
+                        :set macPattern ($macPattern . "|")
+                        :set userPattern ($userPattern . "|")
+                        :set queuePattern ($queuePattern . "|")
+                    }
+                    :set macPattern ($macPattern . $m)
+                    :set userPattern ($userPattern . $m . "|" . $u)
+                    :set queuePattern ($queuePattern . $u)
+                    :set batch ($batch . $m . ",")
+                    :set batchCount ($batchCount + 1)
+                }
+            }
+        }
+        :set macPattern ($macPattern . ")\$")
+        :set userPattern ($userPattern . ")\$")
+        :set queuePattern ($queuePattern . ")\$")
+        :if ($batchCount > 0) do={
+            # Block re-login before disconnecting. Empty ID lists are never
+            # passed to set/remove. A failed stage leaves EXP tags for retry.
+            :local users [/ip hotspot user find where name~$userPattern]
+            :if ([:len $users] > 0) do={ :do { /ip hotspot user set $users disabled=yes } on-error={} }
+            :local sessions [/ip hotspot active find where mac-address~$macPattern]
+            :if ([:len $sessions] > 0) do={ :do { /ip hotspot active remove $sessions } on-error={} }
+            :local hosts [/ip hotspot host find where mac-address~$macPattern]
+            :if ([:len $hosts] > 0) do={ :do { /ip hotspot host remove $hosts } on-error={} }
+            :if (([:len [/ip hotspot active find where mac-address~$macPattern]] = 0) && ([:len [/ip hotspot host find where mac-address~$macPattern and authorized]] = 0)) do={
+                :if ([:len $users] > 0) do={ :do { /ip hotspot user remove $users } on-error={} }
+                :if (([:len [/ip hotspot user find where name~$userPattern]] = 0) && ([:len [/ip hotspot active find where mac-address~$macPattern]] = 0) && ([:len [/ip hotspot host find where mac-address~$macPattern and authorized]] = 0)) do={
+                    :local bindings [/ip hotspot ip-binding find where mac-address~$macPattern]
+                    :if ([:len $bindings] > 0) do={ :do { /ip hotspot ip-binding remove $bindings } on-error={} }
+                    :local bypasses [/ip hotspot host find where mac-address~$macPattern and bypassed]
+                    :if ([:len $bypasses] > 0) do={ :do { /ip hotspot host remove $bypasses } on-error={} }
+                    :if (([:len [/ip hotspot ip-binding find where mac-address~$macPattern]] = 0) && ([:len [/ip hotspot user find where name~$userPattern]] = 0) && ([:len [/ip hotspot active find where mac-address~$macPattern]] = 0) && ([:len [/ip hotspot host find where mac-address~$macPattern and authorized]] = 0) && ([:len [/ip hotspot host find where mac-address~$macPattern and bypassed]] = 0)) do={
+                        :local queues [/queue simple find where name~$queuePattern]
+                        :if ([:len $queues] > 0) do={ :do { /queue simple remove $queues } on-error={} }
+                        :while ([:len $batch] > 0) do={
+                            :local e [:find $batch ","]
+                            :local m [:pick $batch 0 $e]
+                            :set batch [:pick $batch ($e + 1) [:len $batch]]
+                            # Retain an outage backlog on larger boards too;
+                            # only a bounded 40-entry prefix travels per call.
+                            :if ([:len $bwExpDone] < 60000) do={ :set bwExpDone ($bwExpDone . $m . "@" . $nows . ",") }
                             :log info ("expiry-reaper: removed " . $m)
                         }
                     }
@@ -351,14 +415,69 @@ def _require(value: str, rx: re.Pattern, name: str) -> str:
     return v
 
 
-def render_expiry_reaper_script(*, identity: str, tunnel_url: str, public_url: str) -> str:
+def render_expiry_reaper_script(*, identity: str, tunnel_url: str, public_url: str,
+                               removal_limit: int | None = None,
+                               cpu_ceiling: int = 85, pause_ms: int = 200) -> str:
     """The installable RouterOS script (the ``source={...}`` body is also what
     the API installer puts into ``/system script``)."""
     identity = _require(identity, _IDENTITY_RE, "identity")
     tunnel_url = _require(tunnel_url, _URL_RE, "tunnel_url")
     public_url = _require(public_url, _URL_RE, "public_url")
+    template = _TEMPLATE
+    if removal_limit is not None:
+        if (type(removal_limit) is not int or not 1 <= removal_limit <= 10
+                or type(cpu_ceiling) is not int or not 50 <= cpu_ceiling <= 90
+                or type(pause_ms) is not int or not 100 <= pause_ms <= 500
+                or removal_limit * pause_ms * 7 > 10_000):
+            raise ValueError("invalid expiry work budget")
+        # One authorization at a time, yielding before each identity. The
+        # untouched due suffix is rediscovered on the next pass; EXP tags and
+        # acknowledgement proof remain the authority after partial failures.
+        start = template.index('        :local macPattern "^("')
+        end = template.index('\n    }\n}\n\n/system scheduler add', start)
+        removal = template[start:end].replace('($batchSeen < 40)', '($batchSeen < 1)')
+        # Do not insert sleeps after disabling access: a renewal can arrive
+        # during that pause. Sleep first, then re-read current deadlines and
+        # perform the single-customer removal without artificial gaps.
+        renewal_check = '''        :local renewed false
+        :do {
+        :foreach ru in=[/ip hotspot user find where name~$userPattern] do={
+            :local cm [/ip hotspot user get $ru comment]
+            :local p [:find $cm "EXP:"]
+            :if ([:typeof $p] != "num") do={ :set renewed true } else={
+                :local v [:pick $cm ($p + 4) [:len $cm]]
+                :local e [:find $v "|"]
+                :if ([:typeof $e] = "num") do={ :set v [:pick $v 0 $e] }
+                :local x [:tonum $v]
+                :if ([:typeof $x] != "num") do={ :set renewed true } else={ :if ($x > $nows) do={ :set renewed true } }
+            }
+        }
+        :foreach rb in=[/ip hotspot ip-binding find where mac-address~$macPattern] do={
+            :local cm [/ip hotspot ip-binding get $rb comment]
+            :local p [:find $cm "EXP:"]
+            :if ([:typeof $p] != "num") do={ :set renewed true } else={
+                :local v [:pick $cm ($p + 4) [:len $cm]]
+                :local e [:find $v "|"]
+                :if ([:typeof $e] = "num") do={ :set v [:pick $v 0 $e] }
+                :local x [:tonum $v]
+                :if ([:typeof $x] != "num") do={ :set renewed true } else={
+                    :if ($x < 1000000000) do={ :set x ($x * 60) }
+                    :if ($x > $nows) do={ :set renewed true }
+                }
+            }
+        }
+        } on-error={ :set renewed true }
+'''
+        removal = removal.replace('\n        :if ($batchCount > 0) do={',
+                                  '\n' + renewal_check + f'        :if (($batchCount > 0) && (!$renewed) && ([/system resource get cpu-load] < {cpu_ceiling})) do={{')
+        template = (template[:start]
+                    + '        :local workCount 0\n'
+                    + f'        :while (([:len $todo] > 0) && ($workCount < {removal_limit}) && ([/system resource get cpu-load] < {cpu_ceiling})) do={{\n'
+                    + '        :set workCount ($workCount + 1)\n'
+                    + f'        :delay {pause_ms * 7}ms\n'
+                    + removal + '\n        }' + template[end:])
     return gate_rsc_body(SCRIPT_NAME, (
-        _TEMPLATE
+        template
         .replace("__SCRIPT__", SCRIPT_NAME)
         .replace("__SCHED__", SCHEDULER_NAME)
         .replace("__POLICY__", POLICY)

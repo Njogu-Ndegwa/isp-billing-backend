@@ -413,6 +413,37 @@ def _remove_legacy_bypass(api, mac: str) -> Dict[str, int]:
     return removed
 
 
+def _healthy_same_plan_session(api, mac: str) -> bool:
+    """Only preserve a renewal when native authorization is already healthy.
+
+    A timed native session needs a relogin to acquire its new deadline. A
+    missing/unauthorized host, a different login or an unreadable table also
+    keeps the existing repair path.
+    """
+    sessions = api.send_command_optimized(
+        "/ip/hotspot/active/print",
+        proplist=["mac-address", "user", "address", "session-time-left"],
+    )
+    hosts = api.get_hotspot_hosts_minimal()
+    if not sessions.get("success") or not hosts.get("success"):
+        return False
+    matching = [s for s in _data(sessions) if str(s.get("mac-address", "")).upper() == mac]
+    if not matching or any(
+        str(s.get("user", "")).upper() != mac
+        or s.get("session-time-left", "0s") not in ("", "0s", "0")
+        for s in matching
+    ):
+        return False
+    return all(any(
+        str(h.get("mac-address", "")).upper() == mac
+        and (h.get("to-address") or h.get("address")) == session.get("address")
+        and bool(session.get("address"))
+        and str(h.get("authorized", "false")).lower() in ("true", "yes")
+        and str(h.get("bypassed", "false")).lower() not in ("true", "yes")
+        for h in _data(hosts)
+    ) for session in matching)
+
+
 def provision_customer(
     api,
     mac_address: str,
@@ -439,14 +470,25 @@ def provision_customer(
         comment = build_user_comment(mac, note, expiry=expiry)
         users = api.send_command_optimized(
             "/ip/hotspot/user/print",
-            proplist=[".id", "name", "profile", "comment", "disabled", "mac-address"],
+            proplist=[".id", "name", "profile", "comment", "disabled", "mac-address", "limit-uptime"],
         )
         if not users.get("success"):
             return {"error": f"hotspot user read failed: {users.get('error')}"}
         existing = next((u for u in _data(users) if str(u.get("name", "")).upper() == mac), None)
+        same_plan = bool(
+            existing
+            and existing.get("profile") == profile
+            and str(existing.get("mac-address", "")).upper() == mac
+            and str(existing.get("comment", "")).startswith(COMMENT_PREFIX)
+            and str(existing.get("disabled", "false")).lower() in ("false", "no")
+            and existing.get("limit-uptime", "0s") in ("0s", "0")
+            and profile_result.get("unchanged")
+            and not setup_result.get("error")
+        )
+        healthy_session = same_plan and _healthy_same_plan_session(api, mac)
 
         if existing:
-            user_result = api.send_command("/ip/hotspot/user/set", {
+            user_args = {
                 "numbers": existing.get(".id"),
                 "password": "",
                 "profile": profile,
@@ -454,7 +496,12 @@ def provision_customer(
                 "limit-uptime": "0s",
                 "disabled": "no",
                 "comment": comment,
-            })
+            }
+            if healthy_session:
+                # Even rewriting unchanged authentication fields can cause
+                # native work; a same-plan renewal only changes the deadline.
+                user_args = {"numbers": existing.get(".id"), "comment": comment}
+            user_result = api.send_command("/ip/hotspot/user/set", user_args)
         else:
             user_result = api.send_command("/ip/hotspot/user/add", {
                 "name": mac,
@@ -470,10 +517,12 @@ def provision_customer(
 
         legacy = _remove_legacy_bypass(api, mac)
         time.sleep(CMD_DELAY)
-        # A live session keeps the rate it logged in with, and a host that was
-        # bypassed keeps that state until it is re-evaluated: kick both so the
-        # device logs in by MAC now, on the new profile.
-        kicked = _kick(api, mac)
+        # Extending an already authorized, unlimited-uptime session on the
+        # same profile needs only the new expiry tag. Avoid rebuilding its
+        # host, connections and dynamic queue on every renewal/retry.
+        preserve_session = healthy_session and not any(legacy.values())
+        kicked = ({"sessions_removed": 0, "hosts_removed": 0}
+                  if preserve_session else _kick(api, mac))
 
         return {
             "success": True,
@@ -490,6 +539,7 @@ def provision_customer(
             "hotspot_user_result": user_result,
             "legacy_removed": legacy,
             "kick_result": kicked,
+            "session_preserved": preserve_session,
             "setup_result": setup_result,
             "queue_result": {"skipped": True, "message": "router-managed dynamic hotspot queue"},
         }

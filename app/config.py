@@ -401,6 +401,9 @@ class Settings(BaseSettings):
     # key, as in its deployment-charts APOLLO_KEY. Empty = GraphQL tab off.
     OVES_APOLLO_GRAPH_KEYS: str = ""
 
+    # Explicit canary identities only; requires tested RouterOS 7.19.6+.
+    ROUTER_NATIVE_CPU_IDENTITIES: str = ""
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

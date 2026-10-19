@@ -115,10 +115,12 @@ def cpu_samples(api, n: int = 3) -> list:
 
 
 def recent_push_log(api) -> list:
+    # Wrapped RouterOS configuration logs may contain script source/tokens.
+    # Return only bounded, plain status messages emitted by the reporter.
     lines = [
         f"{row.get('time', '')} {row.get('message', '')}"
         for row in _data(api.send_command("/log/print"))
-        if (row.get("message") or "").startswith("usage-push")
+        if re.fullmatch(r'usage-push(?: v[0-9]+)?: [^\r\n;"\\]{1,240}', row.get("message") or "")
     ]
     return lines[-4:]
 
@@ -185,6 +187,10 @@ def install_router(
         if rollback:
             return _rollback(api, result, current)
 
+        from app.services.native_router_scripts import native_cpu_enabled, native_cpu_supported
+        use_native = native_cpu_enabled(ident)
+        if use_native and not native_cpu_supported(res.get("version", "")):
+            return {**result, "status": "skipped_unsupported_native"}
         iface, kind = tunnel_interface(api)
         ping_ok = bool([p for p in _data(c("/ping", {"address": TUNNEL_SERVER_IP, "count": "2"})) if p.get("time")])
         via_tunnel = bool(iface and ping_ok)
@@ -218,9 +224,10 @@ def install_router(
                  else c("/system/script/add", {"name": SCRIPT_NAME, "policy": POLICY, "source": source}))
         if res_s.get("error"):
             return {**result, "status": "script_failed", "error": str(res_s["error"])[:200]}
-        # First report before the scheduler exists, so the two can't collide (429).
+        # Legacy first report precedes the scheduler, so they cannot collide.
+        # Native print-as-value requires scheduler execution, not an API run.
         run = {}
-        if not skip_run:
+        if not skip_run and not use_native:
             sid = find_one(api, "/system/script", SCRIPT_NAME)[".id"]
             t0 = time.time()
             run = c("/system/script/run", {".id": sid})

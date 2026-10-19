@@ -205,3 +205,16 @@ async def test_startup_catch_up_requeues_recent_routers_that_are_not_pushing(db,
 
 def test_setup_retries_span_hours_not_minutes():
     assert sum(rpi.SETUP_RETRY_DELAYS_SECONDS) + rpi.SETUP_FIRST_DELAY_SECONDS >= 6 * 3600
+
+
+def test_install_status_never_echoes_wrapped_router_source():
+    class Logs:
+        def send_command(self, path):
+            return {'data': [
+                {'time': '1', 'message': 'usage-push: interval now 60s'},
+                {'time': '2', 'message': 'usage-push" or script="other"]; :local tok "private"'},
+                {'time': '3', 'message': 'usage-push: deferred"; :local tok "private"'},
+                {'time': '4', 'message': 'usage-push v2: installed for Router-0001'},
+            ]}
+    assert rpi.recent_push_log(Logs()) == [
+        '1 usage-push: interval now 60s', '4 usage-push v2: installed for Router-0001']
