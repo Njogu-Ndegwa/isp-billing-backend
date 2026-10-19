@@ -83,6 +83,38 @@ def _auth(identity):
 
 
 @pytest.mark.asyncio
+async def test_native_upload_ingests_once_after_all_parts(db, client, monkeypatch):
+    from tests.test_native_router_snapshot import parts, envelope
+    from unittest.mock import AsyncMock
+    from app.api import usage_push_routes as routes
+    await _setup(db, mac="AA:BB:CC:DD:EE:FF")
+    health = AsyncMock()
+    monkeypatch.setattr(routes.router_health, "record_and_evaluate", health)
+    monkeypatch.setattr(routes, "is_pilot_router", lambda router_id: False)
+    collected = []
+    original_ingest = routes.ingest_usage_reports
+
+    async def observe(*args, **kwargs):
+        collected.append((args, kwargs))
+        return await original_ingest(*args, **kwargs)
+
+    monkeypatch.setattr(routes, "ingest_usage_reports", observe)
+    data = parts()
+    for name in ["queues", "queue_stats", "summary", "hosts"]:
+        payload = {"identity": "Router-0721", "v": 4, "native": envelope(name, data[name])}
+        response = await client.post("/api/router/usage-push", headers=_auth("Router-0721"), json=payload)
+        assert response.status_code == 200, response.text
+        if name != "hosts":
+            assert not collected and health.await_count == 0
+        else:
+            assert response.json()["accepted"] == 1
+    assert len(collected) == 1 and health.await_count == 1
+    assert collected[0][0][1][0].queue_key == "AABBCCDDEEFF"
+    duplicate = await client.post("/api/router/usage-push", headers=_auth("Router-0721"), json=payload)
+    assert duplicate.status_code == 200 and len(collected) == 1
+
+
+@pytest.mark.asyncio
 async def test_authenticated_push_is_accepted_and_recorded(db, client, session_factory):
     router, customer = await _setup(db)
 

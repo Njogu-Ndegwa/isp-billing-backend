@@ -491,6 +491,13 @@ def parse_checkin_body(raw: bytes) -> CheckinReport:
     Tolerant of field order and a trailing newline; strict about content. An
     unparseable body raises ``BadCheckin`` (the endpoint answers 400).
     """
+    if raw.lstrip().startswith(b"{"):
+        from app.services.native_router_census import native_census_as_legacy
+        try:
+            raw = native_census_as_legacy(raw, max_body=MAX_BODY_BYTES,
+                                         max_macs=MAX_REPORTED_MACS, max_others=MAX_REPORTED_OTHERS)
+        except ValueError as exc:
+            raise BadCheckin(str(exc)) from exc
     if len(raw) > MAX_BODY_BYTES:
         raise BadCheckin("body too large")
     try:

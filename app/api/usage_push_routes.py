@@ -32,7 +32,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -45,6 +45,7 @@ from app.services.usage_push import (
     _canonical_key,
     ingest_usage_reports,
 )
+from app.services.native_router_snapshot import NativeSnapshotAssembler, SnapshotBusy
 from app.services.usage_push_auth import verify_router_token
 from app.services import customer_events, realtime_state
 from app.services.hotspot_mac_login import mac_login_enabled
@@ -98,6 +99,7 @@ _usage_ingest_gate = asyncio.Semaphore(MAX_CONCURRENT_USAGE_INGESTS)
 
 # identity -> monotonic timestamp of last accepted push.
 _last_push_at: dict[str, float] = {}
+_native_snapshots = NativeSnapshotAssembler()
 
 # Identities seen belonging to pilot routers (learned on first push, so the
 # rate-limit check stays ahead of the DB lookup).
@@ -110,7 +112,8 @@ _background_tasks: set = set()
 
 def reset_rate_limiter() -> None:
     """Test hook — the limiter is process state, so tests must start clean."""
-    global _usage_ingest_gate
+    global _usage_ingest_gate, _native_snapshots
+    _native_snapshots = NativeSnapshotAssembler()
     _last_push_at.clear()
     _pilot_identities.clear()
     _usage_ingest_gate = asyncio.Semaphore(MAX_CONCURRENT_USAGE_INGESTS)
@@ -232,6 +235,7 @@ class RouterMetricsIn(BaseModel):
 
 
 class UsagePushIn(BaseModel):
+    native: Optional[dict] = None
     identity: str = Field(max_length=128)
     v: int = 1
     reports: list[UsageReportIn] = Field(default_factory=list)
@@ -264,6 +268,22 @@ async def receive_usage_push(
     # cannot be used to enumerate which routers exist.
     if not verify_router_token(identity, presented):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # A native upload is data-only and atomic. No DB or customer presence update
+    # happens until every declared part has arrived and validated. The app runs
+    # one worker; multiple workers require shared assembly or sticky routing.
+    if payload.native is not None or payload.v == 4:
+        if payload.v != 4 or payload.native is None:
+            raise HTTPException(status_code=422, detail="Invalid native snapshot version")
+        try:
+            complete = _native_snapshots.accept(identity, payload.native, now=time.monotonic())
+            if complete is None:
+                return {"accepted_part": True, "next_push_seconds": 60}
+            payload = UsagePushIn.model_validate(complete)
+        except SnapshotBusy as exc:
+            raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "60"}) from exc
+        except (ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid native snapshot") from exc
 
     # Refuse an implausible payload before touching the database.
     if (
