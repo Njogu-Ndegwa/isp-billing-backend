@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 from sqlalchemy import select
@@ -114,6 +114,9 @@ class UsageReport:
     # "queue": a simple-queue counter (default). "host": a /ip hotspot host
     # counter for one device — real-time pilot routers are metered from these.
     source: str = "queue"
+    # Native subscriptions can arrive before their HTTP batch is sent. Preserve
+    # the actual observation time so another writer's newer sample wins.
+    sampled_at: Optional[datetime] = None
 
 
 # Device-metered usage rows live under their own key so a queue counter and a
@@ -484,6 +487,14 @@ async def ingest_usage_reports(
         seen_hosts: set[tuple[str, str]] = set()
         pending = 0
         for report in reports:
+            observed = report.sampled_at
+            if observed is not None:
+                if observed.tzinfo is not None:
+                    observed = observed.astimezone(timezone.utc).replace(tzinfo=None)
+                if observed > now or observed < now - timedelta(seconds=360):
+                    result.rejected += 1
+                    result.errors.append("implausible_sample_time")
+                    continue
             key = _canonical_key(report.queue_key)
             is_host = report.source == "host"
             if is_host and key:
@@ -577,6 +588,7 @@ async def ingest_usage_reports(
                     target_ip=report.target_ip or "",
                     max_limit=report.max_limit or "",
                     now=now,
+                    sampled_at=observed,
                     first_sample_is_total=bool(report.final),
                 )
             except Exception as exc:  # one bad row must not lose the whole batch

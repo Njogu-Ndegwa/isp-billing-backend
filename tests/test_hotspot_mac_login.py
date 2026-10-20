@@ -40,6 +40,7 @@ class FakeRouter:
             self.tables["/ip/firewall/filter"].append(self._row(
                 chain="forward", action="accept", comment="defconf: accept established,related"))
         self.writes = []
+        self.reads = []
 
     def _row(self, **fields):
         return {".id": f"*{next(self._ids)}", **fields}
@@ -48,8 +49,19 @@ class FakeRouter:
         api = MikroTikAPI.__new__(MikroTikAPI)
         api.connected = True
         api.send_command = self.send_command
-        api.send_command_optimized = lambda path, proplist=None, query=None: self.send_command(path)
+        api.send_command_optimized = self.read_optimized
         return api
+
+    def read_optimized(self, path, proplist=None, query=None):
+        self.reads.append((path, proplist, query))
+        result = self.send_command(path)
+        data = result['data']
+        if query:
+            key, value = query[1:].split('=', 1)
+            data = [row for row in data if str(row.get(key, '')) == value]
+        if proplist:
+            data = [{k: v for k, v in row.items() if k in proplist} for row in data]
+        return {**result, 'data': data}
 
     def send_command(self, path, args=None):
         args = dict(args or {})
@@ -223,6 +235,123 @@ def test_provision_updates_an_existing_user_in_place():
     # plan speeds are download/upload; RouterOS profiles are upload/download
     assert user["profile"] == "plan_5M_10M"
     assert user["disabled"] == "no" and user["limit-uptime"] == "0s"
+
+
+def _healthy_renewal(router):
+    router.tables['/ip/hotspot/user/profile'].append(router._row(
+        name='plan_5M_5M', **{'rate-limit': '5M/5M', 'shared-users': '2'}))
+    router.tables['/ip/hotspot/user'].append(router._row(
+        name=MAC, profile='plan_5M_5M', disabled='false', password='',
+        comment=f'MACLOGIN|MAC:{MAC}|T:1|EXP:1900000000',
+        **{'mac-address': MAC, 'limit-uptime': '0s'}))
+    router.tables['/ip/hotspot/active'].append(router._row(
+        user=MAC, address='192.168.88.10', **{'mac-address': MAC}))
+    router.tables['/ip/hotspot/host'].append(router._row(
+        address='192.168.88.10', authorized='true', bypassed='false',
+        **{'mac-address': MAC}))
+    router.tables['/queue/simple'].append(router._row(
+        name='<hotspot-test>', dynamic='true', target='192.168.88.10/32',
+        **{'max-limit': '5M/5M'}))
+
+
+def test_same_plan_renewal_preserves_authorized_session_host_and_native_queue():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    before = {table: [dict(x) for x in router.tables[table]] for table in
+              ['/ip/hotspot/active', '/ip/hotspot/host', '/queue/simple']}
+    result = ml.provision_customer(router.api(), MAC, '5M/5M', note='renewal')
+    assert result['success'] and result['session_preserved']
+    assert result['kick_result'] == {'sessions_removed': 0, 'hosts_removed': 0}
+    assert all(router.tables[table] == rows for table, rows in before.items())
+    assert router.user(MAC)['comment'] != f'MACLOGIN|MAC:{MAC}|T:1|EXP:1900000000'
+    assert not any(path.endswith('/remove') for path, _ in router.writes)
+    user_writes = [args for path, args in router.writes if path == '/ip/hotspot/user/set']
+    assert len(user_writes) == 1 and set(user_writes[0]) == {'numbers', 'comment'}
+
+
+def test_same_plan_renewal_preserves_universal_nat_session():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    router.tables['/ip/hotspot/host'][0].update(
+        {'address': '198.18.1.2', 'to-address': '192.168.88.10'})
+    result = ml.provision_customer(router.api(), MAC, '5M/5M')
+    assert result['success'] and result['session_preserved']
+    assert result['kick_result'] == {'sessions_removed': 0, 'hosts_removed': 0}
+
+
+def test_renewal_reads_only_customer_metadata_and_static_queue_ownership():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    result = ml.provision_customer(router.api(), MAC, '5M/5M')
+    assert result['session_preserved']
+    customer_reads = [r for r in router.reads if r[0] in (
+        '/ip/hotspot/user/print', '/ip/hotspot/active/print',
+        '/ip/hotspot/host/print', '/ip/hotspot/ip-binding/print')]
+    assert customer_reads and all(r[2] in (f'?name={MAC}', f'?mac-address={MAC}') for r in customer_reads)
+    queue_reads = [r for r in router.reads if r[0] == '/queue/simple/print']
+    assert queue_reads == [('/queue/simple/print', ['.id', 'name', 'comment', 'dynamic'], '?dynamic=false')]
+
+
+def test_renewal_still_finds_lowercase_legacy_username_without_duplicate():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    router.user(MAC)['name'] = MAC.lower()
+    result = ml.provision_customer(router.api(), MAC, '5M/5M')
+    assert result['success'] and result['session_preserved']
+    assert len(router.tables['/ip/hotspot/user']) == 1
+    assert router.user(MAC.lower())['comment'].startswith('MACLOGIN|')
+    assert not any(path == '/ip/hotspot/user/add' for path, _ in router.writes)
+
+
+@pytest.mark.parametrize('fail_fallback', [False, True])
+def test_failed_user_lookup_never_creates_a_duplicate(fail_fallback):
+    router = FakeRouter()
+    _healthy_renewal(router)
+    api = router.api()
+    original_read = api.send_command_optimized
+
+    def read(path, proplist=None, query=None):
+        if path == '/ip/hotspot/user/print':
+            if fail_fallback and query:
+                return {'success': True, 'data': []}
+            return {'success': False, 'error': 'read unavailable'}
+        return original_read(path, proplist=proplist, query=query)
+
+    api.send_command_optimized = read
+    result = ml.provision_customer(api, MAC, '5M/5M')
+    assert 'read failed' in result['error']
+    assert not any(path in ('/ip/hotspot/user/add', '/ip/hotspot/user/set') for path, _ in router.writes)
+    assert len(router.tables['/ip/hotspot/user']) == 1
+
+
+@pytest.mark.parametrize('case', ['speed_change', 'disabled', 'unauthorized', 'bypassed', 'timed', 'missing_host', 'wrong_login', 'profile_repaired', 'legacy_queue', 'limited_uptime'])
+def test_renewal_keeps_relogin_for_access_or_rate_repairs(case):
+    router = FakeRouter()
+    _healthy_renewal(router)
+    speed = '5M/5M'
+    if case == 'speed_change':
+        speed = '10M/5M'
+    elif case == 'disabled':
+        router.user(MAC)['disabled'] = 'true'
+    elif case == 'unauthorized':
+        router.tables['/ip/hotspot/host'][0]['authorized'] = 'false'
+    elif case == 'bypassed':
+        router.tables['/ip/hotspot/host'][0]['bypassed'] = 'true'
+    elif case == 'timed':
+        router.tables['/ip/hotspot/active'][0]['session-time-left'] = '1m'
+    elif case == 'missing_host':
+        router.tables['/ip/hotspot/host'].clear()
+    elif case == 'wrong_login':
+        router.tables['/ip/hotspot/active'][0]['user'] = 'voucher'
+    elif case == 'profile_repaired':
+        router.tables['/ip/hotspot/user/profile'][-1]['rate-limit'] = '10M/10M'
+    elif case == 'legacy_queue':
+        router.tables['/queue/simple'].append(router._row(name='plan_AABBCCDDEE01', dynamic='false'))
+    elif case == 'limited_uptime':
+        router.user(MAC)['limit-uptime'] = '1h'
+    result = ml.provision_customer(router.api(), MAC, speed)
+    assert result['success'] and not result['session_preserved']
+    assert result['kick_result']['sessions_removed'] == 1
 
 
 def test_verify_requires_the_user_not_a_binding():
