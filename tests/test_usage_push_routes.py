@@ -83,6 +83,31 @@ def _auth(identity):
 
 
 @pytest.mark.asyncio
+async def test_native_observation_times_reach_both_counter_domains(db, client, monkeypatch):
+    router, _ = await _setup(db)
+    import app.api.usage_push_routes as routes
+    captured = []
+
+    async def capture(router_id, reports, **kwargs):
+        assert router_id == router.id
+        captured.extend(reports)
+        return IngestResult()
+
+    monkeypatch.setattr(routes, "ingest_usage_reports", capture)
+    monkeypatch.setattr(routes, "_record_live_state", lambda *args: None)
+    observed = datetime.utcnow() - timedelta(seconds=20)
+    response = await client.post("/api/router/usage-push", headers=_auth("Router-0721"), json={
+        "identity": "Router-0721", "v": 3,
+        "reports": [{"queue_key": "pppoe:test", "upload_bytes": 10, "download_bytes": 20,
+                     "sampled_at": observed.isoformat()}],
+        "hosts": [{"mac": "AA:BB:CC:11:22:33", "ip": "192.0.2.4", "bytes_in": 30, "bytes_out": 40,
+                   "authorized": True, "sampled_at": observed.isoformat()}],
+    })
+    assert response.status_code == 200
+    assert [(r.source, r.sampled_at) for r in captured] == [("queue", observed), ("host", observed)]
+
+
+@pytest.mark.asyncio
 async def test_authenticated_push_is_accepted_and_recorded(db, client, session_factory):
     router, customer = await _setup(db)
 
