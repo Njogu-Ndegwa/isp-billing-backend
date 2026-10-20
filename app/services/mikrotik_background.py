@@ -3679,12 +3679,6 @@ async def collect_bandwidth_snapshot():
             start_index = _bandwidth_router_cursor % len(eligible_routers)
             ordered_routers = eligible_routers[start_index:] + eligible_routers[:start_index]
             routers_to_process = ordered_routers[:BANDWIDTH_MAX_ROUTERS_PER_RUN]
-            # Advance the rotation cursor BEFORE processing. When it was advanced
-            # after the loop, any exception escaping the per-router handler froze
-            # the cursor and the job re-processed the same window forever while
-            # every other router's dashboard flatlined (2026-07-29). Advancing
-            # first costs at most one repeat visit after a crash; never a freeze.
-            _bandwidth_router_cursor = (start_index + len(routers_to_process)) % len(eligible_routers)
             processed_count = 0
             logger.info(
                 "[BANDWIDTH] Processing %d/%d eligible router(s) this run "
@@ -3698,7 +3692,7 @@ async def collect_bandwidth_snapshot():
                 start_index,
             )
 
-            for router in routers_to_process:
+            for offset, router in enumerate(routers_to_process):
                 if time.monotonic() - run_started >= BANDWIDTH_RUN_TIME_BUDGET_SECONDS:
                     logger.warning(
                         "[BANDWIDTH] Stopping run after %.1fs budget; processed %d router(s)",
@@ -3712,6 +3706,11 @@ async def collect_bandwidth_snapshot():
                         processed_count,
                     )
                     break
+                # Advance before this attempt, not before the whole batch. A
+                # slow first router can consume the budget; the other seven
+                # must remain next in the rotation. Advancing before I/O also
+                # preserves progress if this attempt raises or is cancelled.
+                _bandwidth_router_cursor = (start_index + offset + 1) % len(eligible_routers)
                 processed_count += 1
                 try:
                     router_info = {
