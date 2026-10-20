@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     # /complete), once their encrypted management tunnel answers. hAP lite/mini
     # are skipped. False = switch off (existing routers are unaffected).
     REALTIME_PUSH_INSTALL_AT_SETUP: bool = True
+    # Opt-in only: selected RB951s whose exact reporter source was reviewed.
+    NATIVE_STREAM_ROUTER_IDS: str = ""
+    NATIVE_STREAM_REPORTER_HASHES: str = ""
     # Router expiry reaper (app/services/expiry_reaper_script.py): tried in this
     # order. The tunnel one is plain HTTP inside the management tunnel (Caddy's
     # 10.251.0.1:8088 site); public HTTPS costs a hAP lite ~5-7 s of full CPU.
