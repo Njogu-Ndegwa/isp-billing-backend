@@ -71,13 +71,15 @@ def counting(session_factory):
 
 class FakeRouterOS:
     def __init__(self, identity, *, board="RB951Ui-2HnD", model="RB951Ui-2HnD", version="6.49.19",
-                 cpu=10, tunnel=True, reachable=True, scheduler_error=None, clock_ok=True):
+                 cpu=10, tunnel=True, reachable=True, scheduler_error=None, clock_ok=True,
+                 scheduler_disabled=False):
         self.identity, self.board, self.model, self.version = identity, board, model, version
         self.cpu, self.tunnel, self.reachable = cpu, tunnel, reachable
         self.scheduler_error, self.clock_ok = scheduler_error, clock_ok
         self.commands = []
         self.bindings = [{".id": "*1", "mac-address": MAC, "comment": "USER:AABBCC000001|EXPIRES:DB_MANAGED"}]
         self.installed = False
+        self.scheduler_disabled = scheduler_disabled
 
     def connect(self):
         # AGENTS.md rule 1: no DB session may be open while we talk to the router.
@@ -91,6 +93,9 @@ class FakeRouterOS:
         self.commands.append((cmd, dict(args or {})))
         if cmd == "/system/identity/print":
             return {"data": [{"name": self.identity}]}
+        if cmd == "/system/scheduler/print":
+            return {"data": [{"name": enrol.SCHEDULER_NAME, "disabled": "true"}]
+                    if self.scheduler_disabled else []}
         if cmd == "/system/resource/print":
             return {"data": [{"board-name": self.board, "version": self.version, "cpu-load": str(self.cpu)}]}
         if cmd == "/system/routerboard/print":
@@ -269,6 +274,37 @@ async def test_identity_mismatch_is_not_touched(db, wired):
     [o] = await enrol.expiry_reaper_enrol_background()
     assert o.reason.startswith("identity mismatch") and o.mode is None
     assert not fake.did("/system/script/add")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setup_callback", [False, True])
+async def test_operator_pause_outlives_recheck_and_setup_does_not_override_it(db, wired, setup_callback):
+    now = datetime.utcnow()
+    r = await _router(db, "10.0.0.58", "Router-5008",
+                      expiry_reaper_reason="operator pause: CPU investigation",
+                      expiry_reaper_checked_at=now - timedelta(days=30))
+    fake = wired["10.0.0.58"] = FakeRouterOS("Router-5008")
+    candidates = await enrol.load_candidates(now, 10, only_id=r.id if setup_callback else None)
+    assert candidates == []
+    assert await enrol.expiry_reaper_enrol_background(now=now) == []
+    assert fake.commands == []
+    # Clearing the explicit pause makes normal automatic enrolment available.
+    r.expiry_reaper_reason = None
+    await db.commit()
+    assert [c.id for c in await enrol.load_candidates(now, 10)] == [r.id]
+
+
+@pytest.mark.asyncio
+async def test_disabled_scheduler_stops_a_stale_enrolment_before_any_router_writes(db, wired):
+    await _router(db, "10.0.0.59", "Router-5009")
+    fake = wired["10.0.0.59"] = FakeRouterOS("Router-5009", scheduler_disabled=True)
+    [outcome] = await enrol.expiry_reaper_enrol_background()
+    assert outcome.mode == MODE_SERVER and not outcome.installed
+    assert outcome.reason.startswith(enrol.OPERATOR_PAUSE_PREFIX)
+    assert all(cmd.endswith("/print") for cmd, _ in fake.commands)
+    fake.commands.clear()
+    assert await enrol.load_candidates(datetime.utcnow() + timedelta(days=30), 10) == []
+    assert fake.commands == []
 
 
 # --- tunnel check -------------------------------------------------------------
