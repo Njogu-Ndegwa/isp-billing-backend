@@ -111,8 +111,8 @@ class StreamSession:
             GUARD_COMMENT + ":" + str(int(time.time())) + ":" + self.owner
         )
 
-    async def read(self, path: str, properties: str):
-        return (await self.api.rpc(path, {".proplist": properties}))["rows"]
+    async def read(self, path: str, properties: str, query=()):
+        return (await self.api.rpc(path, {".proplist": properties}, **({"query": query} if query else {})))["rows"]
 
     async def timer(self):
         found = [
@@ -142,7 +142,9 @@ class StreamSession:
             raise RuntimeError("Native stream board/version is not enrolled")
         scripts = [
             s
-            for s in await self.read("/system/script/print", "name,source")
+            for s in await self.read(
+                "/system/script/print", "name,source", ("?name=" + REPORTER,)
+            )
             if s["name"] == REPORTER
         ]
         if len(scripts) != 1:

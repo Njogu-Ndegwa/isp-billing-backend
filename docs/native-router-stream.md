@@ -21,6 +21,12 @@ is rebuilt from current IDs. Host counters
 retain the existing MAC plus original-IP key; queue order and limits are retained.
 Per-row observation times protect the billing baseline from delayed delivery.
 
+The interval feed supplies its own initial snapshot. Startup waits for every
+selected ID before publishing counters, without an extra full counter request
+before each subscription. A missing ID, ended feed, lost connection or deadline
+aborts that bootstrap and cancels the incomplete feed. Later updates continue on
+the same subscription.
+
 DHCP leases, learned bridge hosts, bindings, neighbours and bridge membership use
 native `find` for IDs, followed by selected-ID pages of at most four rows. Pages
 are at least one second apart and never create interval subscriptions. A scan
@@ -43,6 +49,8 @@ does not lose the pending inventory.
 
 Before pausing the usage timer, the collector verifies its exact source hash,
 identity and token, creates its own fallback timer, and seeds a RAM-only lease.
+The source verification requests only the named usage reporter. It does not
+download the source of unrelated or stored backup scripts.
 The previous reporter job is allowed to drain. Other timers and script sources
 are preserved. A unique guard and owner marker prevent overlapping collectors;
 fresh claims cannot be mistaken for stale guards during startup.

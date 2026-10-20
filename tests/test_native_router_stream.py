@@ -123,6 +123,27 @@ def test_enrollment_is_empty_by_default_and_requires_exact_hashes():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scripts,error", [
+    ([], "not unique"),
+    ([{"name": stream.REPORTER, "source": "changed"}], "changed since review"),
+    ([{"name": stream.REPORTER, "source": "x"}] * 2, "not unique"),
+])
+async def test_filtered_preflight_still_rejects_missing_duplicate_or_changed_reporter(scripts, error):
+    api = AsyncMock()
+    api.rpc.side_effect = [
+        {"rows": [{"name": "Router-test"}]},
+        {"rows": [{"board-name": "RB951Ui-2HnD", "version": "7.24.2"}]},
+        {"rows": scripts},
+    ]
+    session = stream.StreamSession({"identity": "Router-test"}, "a" * 64, api)
+    with pytest.raises(RuntimeError, match=error):
+        await session.preflight()
+    assert api.rpc.await_count == 3
+    assert api.rpc.await_args.args == ("/system/script/print", {".proplist": "name,source"})
+    assert api.rpc.await_args.kwargs == {"query": ("?name=" + stream.REPORTER,)}
+
+
+@pytest.mark.asyncio
 async def test_long_inventory_scan_does_not_delay_usage_posts_or_router_lease(monkeypatch):
     class StopTest(Exception):
         pass
@@ -308,7 +329,9 @@ async def test_fresh_guard_between_claim_and_first_heartbeat_cannot_be_stolen():
         "comment": stream.GUARD_COMMENT + ":" + str(int(time.time())) + ":" + 32 * "a",
     }
 
-    async def read(path, properties):
+    async def read(path, properties, query=()):
+        if path == "/system/script/print":
+            assert query == ("?name=" + stream.REPORTER,)
         return {
             "/system/identity/print": [{"name": info["identity"]}],
             "/system/resource/print": [
@@ -342,11 +365,11 @@ async def test_interface_subscriptions_exclude_unneeded_customer_ppp_counters():
         return {"rows": [r for r in metadata if r[".id"] in args["from"].split(",")]}
 
     api.rpc.side_effect = rpc
-    api.subscribe.return_value = "stream"
+    api.subscribe_initial.return_value = "stream"
     tables = NativeTables(api, wan="pppoe-out")
     await tables.refresh("interfaces")
     assert tables.orders["interfaces"] == ["*1", "*2", "*4"]
-    assert api.subscribe.call_args.args[1]["from"] == "*1,*2,*4"
+    assert api.subscribe_initial.call_args.args[1]["from"] == "*1,*2,*4"
 
 
 @pytest.mark.asyncio
@@ -393,8 +416,8 @@ async def test_host_stats_only_stream_for_authorized_or_bypassed_entries():
         return {"rows": [r for r in rows if r[".id"] in args["from"].split(",")]}
 
     api.rpc.side_effect = rpc
-    api.subscribe.return_value = "feed"
+    api.subscribe_initial.return_value = "feed"
     tables = NativeTables(api)
     await tables.refresh("hosts")
     assert tables.orders["hosts"] == ["*1", "*2"]
-    assert api.subscribe.call_args.args[1]["from"] == "*1,*2"
+    assert api.subscribe_initial.call_args.args[1]["from"] == "*1,*2"
