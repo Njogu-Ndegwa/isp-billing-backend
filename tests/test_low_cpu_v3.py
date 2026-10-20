@@ -23,5 +23,6 @@ def test_native_encoder_keeps_the_existing_per_router_token_and_transport():
     for prefix in ['    :local tok ', '    :local url ', '    :local ident ']:
         assert next(s for s in legacy.splitlines() if s.startswith(prefix)) == next(s for s in native.splitlines() if s.startswith(prefix))
     assert native.startswith('# Bitwave usage push')
-    assert '# bw-gate v1' in native
+    from app.services.router_script_gate import GATE_VERSION
+    assert f'# bw-gate v{GATE_VERSION}' in native
     assert 'interval=60s' in native
