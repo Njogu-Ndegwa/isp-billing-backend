@@ -359,8 +359,12 @@ def _ensure_profile(api, rate_limit: str, cache: Optional[Dict[str, Any]] = None
         return cache[profile]
     # Written only when missing or different: rate-limit plus the second
     # session for the same device (MAC_LOGIN_SHARED_USERS).
-    existing = next((p for p in _data(api.send_command("/ip/hotspot/user/profile/print"))
-                     if p.get("name") == profile), None)
+    profiles = api.send_command_optimized(
+        "/ip/hotspot/user/profile/print",
+        proplist=[".id", "name", "rate-limit", "shared-users"],
+        query=f"?name={profile}",
+    )
+    existing = next((p for p in _data(profiles) if p.get("name") == profile), None)
     wanted = {"rate-limit": rate_limit, "shared-users": MAC_LOGIN_SHARED_USERS}
     if existing is None:
         result = api.send_command("/ip/hotspot/user/profile/add", {"name": profile, **wanted})
@@ -396,13 +400,23 @@ def _remove_legacy_bypass(api, mac: str) -> Dict[str, int]:
     """Drop this MAC's bypassed binding and static plan queue (bypass era)."""
     compact = mac.replace(":", "")
     removed = {"bindings": 0, "queues": 0}
-    for binding in _data(api.send_command("/ip/hotspot/ip-binding/print")):
+    for binding in _data(api.send_command_optimized(
+        "/ip/hotspot/ip-binding/print",
+        proplist=[".id", "mac-address", "type"],
+        query=f"?mac-address={mac}",
+    )):
         b_mac = binding.get("mac-address")
         if (b_mac and normalize_mac_address(b_mac).upper() == mac
                 and str(binding.get("type", "")).lower() == "bypassed"):
             if _ok(api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding.get(".id")})):
                 removed["bindings"] += 1
-    for queue in _data(api.send_command("/queue/simple/print")):
+    # A default queue print also computes counters/rates for every dynamic
+    # HotSpot queue. Cleanup needs only static queue identity and ownership.
+    for queue in _data(api.send_command_optimized(
+        "/queue/simple/print",
+        proplist=[".id", "name", "comment", "dynamic"],
+        query="?dynamic=false",
+    )):
         if str(queue.get("dynamic", "false")).lower() == "true":
             continue
         name = str(queue.get("name", ""))
@@ -423,8 +437,13 @@ def _healthy_same_plan_session(api, mac: str) -> bool:
     sessions = api.send_command_optimized(
         "/ip/hotspot/active/print",
         proplist=["mac-address", "user", "address", "session-time-left"],
+        query=f"?mac-address={mac}",
     )
-    hosts = api.get_hotspot_hosts_minimal()
+    hosts = api.send_command_optimized(
+        "/ip/hotspot/host/print",
+        proplist=["mac-address", "address", "to-address", "authorized", "bypassed"],
+        query=f"?mac-address={mac}",
+    )
     if not sessions.get("success") or not hosts.get("success"):
         return False
     matching = [s for s in _data(sessions) if str(s.get("mac-address", "")).upper() == mac]
@@ -471,9 +490,20 @@ def provision_customer(
         users = api.send_command_optimized(
             "/ip/hotspot/user/print",
             proplist=[".id", "name", "profile", "comment", "disabled", "mac-address", "limit-uptime"],
+            query=f"?name={mac}",
         )
         if not users.get("success"):
             return {"error": f"hotspot user read failed: {users.get('error')}"}
+        if not _data(users):
+            # Legacy MAC usernames can be lowercase. Retain case-insensitive
+            # discovery before creating a new user; healthy canonical renewals
+            # avoid transferring the whole user table.
+            users = api.send_command_optimized(
+                "/ip/hotspot/user/print",
+                proplist=[".id", "name", "profile", "comment", "disabled", "mac-address", "limit-uptime"],
+            )
+            if not users.get("success"):
+                return {"error": f"hotspot user read failed: {users.get('error')}"}
         existing = next((u for u in _data(users) if str(u.get("name", "")).upper() == mac), None)
         same_plan = bool(
             existing

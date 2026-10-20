@@ -24,6 +24,31 @@ customers. A separate five-minute observer sampled once per second:
 HotSpot customers at each minute check. Other billing timers stayed enabled.
 These are measured windows, not an unlimited capacity or peak CPU guarantee.
 
+The full payment-renewal path was also tested on home RB951 563, RouterOS
+7.19.6, with 200 simultaneous synthetic MAC-login sessions carrying an
+aggregate 200 UDP packets/second with 1024-byte payloads. Five healthy
+same-plan renewals originally saturated the CPU in both runs despite
+preserving sessions. Legacy cleanup requested every property of every
+simple queue, and renewal checks transferred entire customer tables.
+The release now filters customer metadata reads and requests only static
+queue identity/ownership fields. A case-insensitive discovery fallback
+preserves existing lowercase MAC usernames.
+
+| Renewal path | Baseline mean / peak | Observation mean / peak | 100% samples | Five-renewal time |
+| --- | --- | --- | --- | --- |
+| Before, run 1 | 11.133 / 30 | 29.200 / 100 | 3 | 23.532 s |
+| Before, run 2 | 12.200 / 47 | 25.911 / 100 | 1 | 23.905 s |
+| Narrow reads, run 1 | 10.933 / 43 | 13.711 / 61 | 0 | 13.235 s |
+| Narrow reads, run 2 | 11.267 / 57 | 15.578 / 73 | 0 | 13.266 s |
+
+Each observation covers 45 roughly one-second CPU reads, including time
+before and after the renewal operations. Both optimized runs retained all
+200 session uptimes, successful traffic, and the five renewed users' native
+1 Mbps queues. Only five user comments were written. The isolated fixture
+was removed and all original billing timers restored. This validates a
+specific improvement, not a 1–2 percentage-point peak contribution, initial
+router setup cost, real Wi-Fi capacity, or 200 customers at full plan speed.
+
 CJ's existing gate-only update preserves all four script bodies. Its reviewed
 usage reporter SHA-256 is:
 

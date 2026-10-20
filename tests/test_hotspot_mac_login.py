@@ -40,6 +40,7 @@ class FakeRouter:
             self.tables["/ip/firewall/filter"].append(self._row(
                 chain="forward", action="accept", comment="defconf: accept established,related"))
         self.writes = []
+        self.reads = []
 
     def _row(self, **fields):
         return {".id": f"*{next(self._ids)}", **fields}
@@ -48,8 +49,19 @@ class FakeRouter:
         api = MikroTikAPI.__new__(MikroTikAPI)
         api.connected = True
         api.send_command = self.send_command
-        api.send_command_optimized = lambda path, proplist=None, query=None: self.send_command(path)
+        api.send_command_optimized = self.read_optimized
         return api
+
+    def read_optimized(self, path, proplist=None, query=None):
+        self.reads.append((path, proplist, query))
+        result = self.send_command(path)
+        data = result['data']
+        if query:
+            key, value = query[1:].split('=', 1)
+            data = [row for row in data if str(row.get(key, '')) == value]
+        if proplist:
+            data = [{k: v for k, v in row.items() if k in proplist} for row in data]
+        return {**result, 'data': data}
 
     def send_command(self, path, args=None):
         args = dict(args or {})
@@ -265,6 +277,51 @@ def test_same_plan_renewal_preserves_universal_nat_session():
     result = ml.provision_customer(router.api(), MAC, '5M/5M')
     assert result['success'] and result['session_preserved']
     assert result['kick_result'] == {'sessions_removed': 0, 'hosts_removed': 0}
+
+
+def test_renewal_reads_only_customer_metadata_and_static_queue_ownership():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    result = ml.provision_customer(router.api(), MAC, '5M/5M')
+    assert result['session_preserved']
+    customer_reads = [r for r in router.reads if r[0] in (
+        '/ip/hotspot/user/print', '/ip/hotspot/active/print',
+        '/ip/hotspot/host/print', '/ip/hotspot/ip-binding/print')]
+    assert customer_reads and all(r[2] in (f'?name={MAC}', f'?mac-address={MAC}') for r in customer_reads)
+    queue_reads = [r for r in router.reads if r[0] == '/queue/simple/print']
+    assert queue_reads == [('/queue/simple/print', ['.id', 'name', 'comment', 'dynamic'], '?dynamic=false')]
+
+
+def test_renewal_still_finds_lowercase_legacy_username_without_duplicate():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    router.user(MAC)['name'] = MAC.lower()
+    result = ml.provision_customer(router.api(), MAC, '5M/5M')
+    assert result['success'] and result['session_preserved']
+    assert len(router.tables['/ip/hotspot/user']) == 1
+    assert router.user(MAC.lower())['comment'].startswith('MACLOGIN|')
+    assert not any(path == '/ip/hotspot/user/add' for path, _ in router.writes)
+
+
+@pytest.mark.parametrize('fail_fallback', [False, True])
+def test_failed_user_lookup_never_creates_a_duplicate(fail_fallback):
+    router = FakeRouter()
+    _healthy_renewal(router)
+    api = router.api()
+    original_read = api.send_command_optimized
+
+    def read(path, proplist=None, query=None):
+        if path == '/ip/hotspot/user/print':
+            if fail_fallback and query:
+                return {'success': True, 'data': []}
+            return {'success': False, 'error': 'read unavailable'}
+        return original_read(path, proplist=proplist, query=query)
+
+    api.send_command_optimized = read
+    result = ml.provision_customer(api, MAC, '5M/5M')
+    assert 'read failed' in result['error']
+    assert not any(path in ('/ip/hotspot/user/add', '/ip/hotspot/user/set') for path, _ in router.writes)
+    assert len(router.tables['/ip/hotspot/user']) == 1
 
 
 @pytest.mark.parametrize('case', ['speed_change', 'disabled', 'unauthorized', 'bypassed', 'timed', 'missing_host', 'wrong_login', 'profile_repaired', 'legacy_queue', 'limited_uptime'])
