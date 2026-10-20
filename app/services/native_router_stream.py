@@ -286,6 +286,7 @@ class StreamSession:
             )
             if (current.get(".id") != self.original[".id"]
                     or current.get("interval") != self.original["interval"]
+                    or current.get("on-event") != self.original.get("on-event")
                     or len(guards) != 1):
                 raise RuntimeError("Native handover changed during claim")
             validate_handoff(guards[0], current, self.cfg, leases,

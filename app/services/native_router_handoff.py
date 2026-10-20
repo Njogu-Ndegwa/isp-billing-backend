@@ -19,6 +19,9 @@ def guard_marker(comment):
 
 def validate_handoff(guard, timer, cfg, leases, *, expected_comment=None):
     marker = guard_marker(guard.get("comment"))
+    upgrade_list = "bw-native-upgrade-" + cfg["name"].removeprefix("bw-native-api-fallback-")
+    wrapper = (':if ([:len [/ip firewall address-list find where list="'
+               + upgrade_list + '"]] = 0) do={ /system script run bitwave-usage-push }')
     if (
         not marker or not marker["handoff"]
         or not 0 <= time.time() - marker["created"] <= 120
@@ -26,6 +29,9 @@ def validate_handoff(guard, timer, cfg, leases, *, expected_comment=None):
         or guard.get("disabled") != "false"
         or guard.get("on-event") != cfg["guard"]
         or timer.get("disabled") != "true"
+        or timer.get("on-event") not in (
+            "bitwave-usage-push", "/system script run bitwave-usage-push", wrapper,
+        )
         or (expected_comment is not None and guard.get("comment") != expected_comment)
     ):
         raise RuntimeError("Native handover is not available")

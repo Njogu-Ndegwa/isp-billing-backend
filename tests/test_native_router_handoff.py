@@ -20,7 +20,7 @@ class RouterState:
         self.info = {"id": 563, "identity": "Router-test"}
         self.source = ':local tok "' + stream.derive_router_token(self.info['identity']) + '"'
         self.digest = hashlib.sha256(self.source.encode()).hexdigest()
-        self.timers = {"*1": {".id": "*1", "name": stream.REPORTER, "disabled": "true", "interval": "1m"}}
+        self.timers = {"*1": {".id": "*1", "name": stream.REPORTER, "disabled": "true", "interval": "1m", "on-event": "/system script run bitwave-usage-push"}}
         self.scripts = {"*2": {".id": "*2", "name": stream.REPORTER, "source": self.source}}
         self.leases, self.calls, self.serial = {}, [], 10
 
@@ -170,7 +170,7 @@ async def test_manually_paused_reporter_without_handoff_stays_paused(monkeypatch
     assert api.timers['*1']['disabled'] == 'true'
 
 
-@pytest.mark.parametrize('change', ['expired', 'future', 'source', 'owner', 'static', 'missing'])
+@pytest.mark.parametrize('change', ['expired', 'future', 'source', 'owner', 'static', 'missing', 'reporter_event'])
 def test_handoff_validation_refuses_untrusted_or_expired_state(change):
     api = RouterState()
     owner = api.owner()
@@ -186,6 +186,8 @@ def test_handoff_validation_refuses_untrusted_or_expired_state(change):
         leases[0]['comment'] = 'another owner'
     elif change == 'static':
         leases[0]['dynamic'] = 'false'
+    elif change == 'reporter_event':
+        api.timers['*1']['on-event'] = 'different-script'
     else:
         leases = []
     with pytest.raises(RuntimeError):
