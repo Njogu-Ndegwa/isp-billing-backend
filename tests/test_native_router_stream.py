@@ -1,4 +1,6 @@
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
+import asyncio
 
 import pytest
 
@@ -7,6 +9,92 @@ from app.services.native_router_api import NativeApiError, NativeTables
 from app.services.native_router_lease import lease_sources, touch_lease
 import hashlib
 import time
+
+
+def test_inventory_cycle_staggers_lists_and_never_catches_up_in_a_burst():
+    cycle = stream.SlowInventoryCycle(100)
+    assert cycle.take_due(114.9) is None
+    first = cycle.take_due(115)
+    assert first == "bridge_hosts"
+    assert cycle.take_due(115) is None
+    assert cycle.take_due(164.9) is None
+    names = [first] + [cycle.take_due(t) for t in (165, 215, 265, 315, 365)]
+    assert set(names) == {*stream.INVENTORY_TABLES, "interfaces"}
+    assert cycle.take_due(10_000) == "bridge_hosts"
+    assert cycle.take_due(10_000) is None
+    assert cycle.take_due(10_049) is None
+    assert cycle.take_due(10_050) == "bindings"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [NativeApiError("optional unavailable"), TimeoutError()])
+async def test_optional_inventory_failure_keeps_usage_posts_running(monkeypatch, failure):
+    class StopTest(Exception):
+        pass
+
+    clock, refreshes, posts = [100.0], [], []
+    api = AsyncMock()
+    api.failure = None
+    api.ended = {}
+    api.rpc.return_value = {"done": {"ret": "0"}}
+    session = AsyncMock()
+    session.preflight.return_value = "ether1"
+    session.cfg = {}
+
+    class Tables:
+        groups = {name: [] for name in stream.STREAM_TABLES}
+        orders, observed = {}, {}
+
+        async def bootstrap(self):
+            pass
+
+        async def refresh(self, name):
+            refreshes.append((clock[0], name))
+            if name == "bridge_hosts":
+                raise failure
+
+        def snapshot(self):
+            return {}
+
+        def inventory_accepted(self, body):
+            pass
+
+    class Http:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            posts.append(clock[0])
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                                   json=lambda: {"next_push_seconds": 60})
+
+    async def advance(seconds):
+        clock[0] += seconds
+        if clock[0] >= 330:
+            raise StopTest()
+
+    monkeypatch.setattr(stream, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(stream, "asyncio", SimpleNamespace(sleep=advance, wait_for=asyncio.wait_for))
+    monkeypatch.setattr(stream, "load_router", AsyncMock(return_value={
+        "id": 563, "identity": "Router-test", "ip_address": "10.0.0.217",
+        "username": "test", "password": "test", "port": 8728,
+    }))
+    monkeypatch.setattr(stream, "AsyncNativeAPI", lambda *args: api)
+    monkeypatch.setattr(stream, "StreamSession", lambda *args: session)
+    monkeypatch.setattr(stream, "NativeTables", lambda *args, **kwargs: Tables())
+    monkeypatch.setattr(stream, "native_api_to_v3", lambda *args, **kwargs: {"hosts": [], "reports": [], "router": {}})
+    monkeypatch.setattr(stream, "touch_lease", AsyncMock())
+    monkeypatch.setattr(stream.httpx, "AsyncClient", lambda **kwargs: Http())
+    with pytest.raises(StopTest):
+        await stream.stream_router(563, 64 * "a")
+    assert [t for t, name in refreshes if name == "bridge_hosts"] == [115]
+    assert len(posts) >= 3 and posts[-1] > 215
+    assert any(name == "leases" for _, name in refreshes)
+    session.release.assert_awaited_once()
+    api.close.assert_awaited_once()
 
 
 def test_enrollment_is_empty_by_default_and_requires_exact_hashes():

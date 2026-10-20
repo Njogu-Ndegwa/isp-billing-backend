@@ -16,10 +16,27 @@ start it. Observation-time support from PR #232 is required.
 Counter subscriptions use direct native IDs in chunks of 32. Host statistics are
 requested only for authorized or bypassed entries, and interface statistics only
 for physical ports and the WAN. Membership discovery runs every 30 seconds;
-inventory discovery runs every five minutes. Stable chunks stay subscribed when
-other clients join. A feed that ends is rebuilt from current IDs. Host counters
+stable chunks stay subscribed when other clients join. A billing feed that ends
+is rebuilt from current IDs. Host counters
 retain the existing MAC plus original-IP key; queue order and limits are retained.
 Per-row observation times protect the billing baseline from delayed delivery.
+
+DHCP leases, learned bridge hosts, bindings, neighbours and bridge membership use
+one-shot native reads rather than subscriptions. These lists do not contain the
+usage counters. This avoids recreating selected-ID jobs as learned rows age out.
+Each complete list replaces its cache atomically, including a valid empty list.
+Invalid or failed reads preserve the last complete cache.
+
+Optional lists and interface membership are refreshed one at a time, 50 seconds
+apart, so a full round takes about five minutes. Startup establishes billing
+streams first. A delayed cycle does not catch up by reading all lists together.
+An optional read failure is deferred to the next round without restarting healthy
+billing feeds. Connection loss and billing-stream failures retain normal fallback.
+
+A collected list accompanies the next usage report and stays pending until that
+report is accepted. Subsequent usage-only reports omit the list, preserving its
+cached contents and observation age at ingest. Retrying a rejected HTTP upload
+does not lose the pending inventory.
 
 Before pausing the usage timer, the collector verifies its exact source hash,
 identity and token, creates its own fallback timer, and seeds a RAM-only lease.
@@ -64,8 +81,8 @@ Those windows were below peak customer traffic.
 The production session's guard and RAM lease were also exercised on the empty
 spare: a second owner was refused, loss of the test heartbeat restored reporting,
 an operator's changed interval was preserved, and cleanup succeeded. That test
-peaked at 14% total CPU. The permanent background worker still requires a normal
-deployment and supervised canary acceptance before retaining enrollment.
+peaked at 14% total CPU. The permanent worker was subsequently deployed through
+PR #236; enrollment remains explicit and source-hash guarded.
 
 Expiry remains a separate optimization. The scan-only candidate still saturated
 at 200 clients and is not part of this change. No universal CPU ceiling is claimed

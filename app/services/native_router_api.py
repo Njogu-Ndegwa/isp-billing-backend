@@ -37,6 +37,9 @@ TABLES = {
     "bridge_ports": ("/interface/bridge/port/print", ".id,interface,bridge"),
 }
 
+INVENTORY_TABLES = ("bridge_hosts", "bindings", "leases", "neighbors", "bridge_ports")
+STREAM_TABLES = tuple(name for name in TABLES if name not in INVENTORY_TABLES)
+
 
 def encode_word(value):
     data = value.encode()
@@ -256,6 +259,7 @@ class NativeTables:
         self.cache_size = 0
         self.host_keys = {}
         self.wan = wan
+        self.inventory_pending = set()
 
     def discard(self, table, identifier):
         old = self.data[table].pop(identifier, None)
@@ -299,6 +303,34 @@ class NativeTables:
 
     async def refresh(self, table):
         path, props = TABLES[table]
+        if table in INVENTORY_TABLES:
+            # These lists describe topology, not cumulative billing counters.
+            # A one-shot native read avoids creating/rebuilding long-lived
+            # selected-ID jobs whenever DHCP or learned bridge rows disappear.
+            reply = await self.api.rpc(path, {".proplist": props})
+            data, sizes = {}, {}
+            for row in reply["rows"]:
+                row = dict(row)
+                row.pop(".section", None)
+                identifier = row.get(".id", "")
+                if (not re.fullmatch(r"\*[A-Fa-f0-9]+", identifier)
+                        or identifier in data or len(data) >= 2000):
+                    raise NativeApiError("Invalid native inventory IDs")
+                size = sum(len(str(k)) + len(str(v)) for k, v in row.items())
+                if size > 64_000:
+                    raise NativeApiError("Native row size exceeded")
+                data[identifier], sizes[identifier] = row, size
+            size = self.cache_size - sum(self.row_sizes[table].values()) + sum(sizes.values())
+            if size > 4_000_000:
+                raise NativeApiError("Native cache size exceeded")
+            # Publish a complete replacement only after validation. Empty lists
+            # are meaningful; failed reads must not erase the previous cache.
+            self.data[table], self.row_sizes[table] = data, sizes
+            self.cache_size = size
+            now = datetime.datetime.now(datetime.timezone.utc)
+            self.observed[table] = {identifier: now for identifier in data}
+            self.inventory_pending.add(table)
+            return
         if table == "resource":
             if self.groups[table] and self.groups[table][0]["tag"] in self.api.ended:
                 await self.api.cancel(self.groups[table][0]["tag"])
@@ -396,11 +428,16 @@ class NativeTables:
             await asyncio.sleep(0.35)
 
     async def bootstrap(self):
-        for table in TABLES:
+        for table in STREAM_TABLES:
             await self.refresh(table)
 
     def snapshot(self):
         return {
             name: [dict(row) for row in table.values()]
             for name, table in self.data.items()
+            if name not in INVENTORY_TABLES or name in self.inventory_pending
         }
+
+    def inventory_accepted(self, body):
+        """Do not re-advertise an old topology observation on every usage post."""
+        self.inventory_pending.difference_update(set(body) & set(INVENTORY_TABLES))

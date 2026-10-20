@@ -163,6 +163,17 @@ class NativeApiContractTests(unittest.TestCase):
         self.assertEqual(body["ports"][0]["last_link_up"], "")
         self.assertEqual(len(body["bridge_hosts"]), 1)
 
+    def test_uncollected_inventory_is_omitted_without_changing_billing(self):
+        tables = sample()
+        complete = self.decode(tables)
+        for name in ("bridge_hosts", "bindings", "leases", "neighbors", "bridge_ports"):
+            tables.pop(name, None)
+        body = self.decode(tables)
+        for name in ("bridge_hosts", "bindings", "leases", "neighbors", "bridge_ports"):
+            self.assertNotIn(name, body)
+        for name in ("hosts", "reports", "ppp", "ports", "router"):
+            self.assertEqual(body[name], complete[name])
+
     def test_negative_counter_and_invalid_flag_fail_closed(self):
         tables = sample()
         tables["hosts"][0]["bytes-in"] = "-1"

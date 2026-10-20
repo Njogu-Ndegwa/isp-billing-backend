@@ -178,6 +178,64 @@ class FakeAPI:
 
 
 class CacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_optional_inventory_is_one_atomic_read_without_native_jobs(self):
+        class InventoryAPI(FakeAPI):
+            async def rpc(self, path, args):
+                self.calls.append((path, dict(args)))
+                return {"rows": self.members}
+
+        api = InventoryAPI()
+        tables = native.NativeTables(api)
+        self.assertNotIn("leases", tables.snapshot())
+        api.members = [{".id": "*1", "host-name": "first"}]
+        await tables.refresh("leases")
+        self.assertEqual(len(api.calls), 1)
+        self.assertNotIn("from", api.calls[0][1])
+        self.assertEqual(api.subs, [])
+        self.assertEqual(tables.groups["leases"], [])
+        body = tables.snapshot()
+        self.assertEqual(body["leases"], api.members)
+        # A rejected or failed upload has no acceptance call: retry the list.
+        self.assertEqual(tables.snapshot()["leases"], body["leases"])
+        tables.inventory_accepted(body)
+        self.assertNotIn("leases", tables.snapshot())
+        # A later complete empty read must clear the server's old lease list.
+        api.members = []
+        await tables.refresh("leases")
+        self.assertEqual(tables.snapshot()["leases"], [])
+        self.assertEqual(tables.cache_size, 0)
+
+    async def test_invalid_inventory_keeps_previous_complete_snapshot(self):
+        class InventoryAPI(FakeAPI):
+            async def rpc(self, path, args):
+                return {"rows": self.members}
+
+        api = InventoryAPI()
+        tables = native.NativeTables(api)
+        api.members = [{".id": "*1", "host-name": "old"}]
+        await tables.refresh("leases")
+        original_size = tables.cache_size
+        for invalid in ([{".id": "bad"}], [{".id": "*1"}, {".id": "*1"}],
+                        [{".id": "*2", "comment": "x" * 64_001}]):
+            api.members = invalid
+            with self.assertRaises(native.NativeApiError):
+                await tables.refresh("leases")
+            self.assertEqual(tables.snapshot()["leases"], [{".id": "*1", "host-name": "old"}])
+            self.assertEqual(tables.cache_size, original_size)
+
+    async def test_billing_bootstrap_does_not_wait_for_optional_topology(self):
+        tables = native.NativeTables(None)
+        calls = []
+
+        async def refresh(name):
+            calls.append(name)
+
+        tables.refresh = refresh
+        await tables.bootstrap()
+        self.assertEqual(set(calls), set(native.STREAM_TABLES))
+        self.assertTrue({"hosts", "queues", "ppp", "interfaces", "resource"} <= set(calls))
+        self.assertFalse(set(calls) & set(native.INVENTORY_TABLES))
+
     async def test_ended_native_feed_is_rebuilt_with_current_members(self):
         api = FakeAPI()
         tables = native.NativeTables(api, chunk_size=4)
