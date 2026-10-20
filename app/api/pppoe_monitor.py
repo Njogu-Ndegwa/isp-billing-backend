@@ -115,29 +115,39 @@ def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list, db_dual_ports:
         # Dual-mode ports (PPPoE + Hotspot on same bridge)
         dual_port_checks = []
         has_dual = access_state.get("has_dual", False)
+        has_hotspot_bridge_pppoe = (
+            access_state.get("has_hotspot_bridge_pppoe", False)
+            if access_state.get("success") else False
+        )
         for port_name in (db_dual_ports or []):
             iface = ifaces.get(port_name, {})
             link_up = iface.get("running", False)
             actual_bridge = port_bridge_map.get(port_name)
             attachment = attachment_map.get(port_name, {})
+            shared_bridge_dual = actual_bridge == "bridge" and has_hotspot_bridge_pppoe
+            attachment_mode = (
+                "shared_hotspot_bridge" if shared_bridge_dual else attachment.get("mode", "none")
+            )
             dual_port_checks.append({
                 "port": port_name,
                 "mode": "dual",
                 "actual_bridge": actual_bridge or "(none)",
-                "pppoe_attachment_mode": attachment.get("mode", "none"),
-                "pppoe_server_on_bridge": has_dual and attachment.get("mode") == "dual",
+                "pppoe_attachment_mode": attachment_mode,
+                "pppoe_server_on_bridge": shared_bridge_dual or (
+                    has_dual and attachment_mode == "dual"
+                ),
                 "link_up": link_up,
             })
         if dual_port_checks:
             all_dual_ports_attached = all(
-                p["pppoe_attachment_mode"] == "dual"
+                p["pppoe_server_on_bridge"]
                 for p in dual_port_checks
             )
             any_dual_port_up = any(p["link_up"] for p in dual_port_checks)
             checks.append({
                 "check": "dual_ports",
-                "description": "Dual-mode ports (PPPoE + Hotspot) on the dual bridge",
-                "passed": has_dual and all_dual_ports_attached,
+                "description": "Dual-mode ports (PPPoE + Hotspot) attached correctly",
+                "passed": all_dual_ports_attached,
                 "any_port_up": any_dual_port_up,
                 "detail": dual_port_checks,
             })
