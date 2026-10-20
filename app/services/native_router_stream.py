@@ -466,31 +466,43 @@ async def stream_router(router_id: int, expected_hash: str):
                             raise RuntimeError(
                                 "Native billing observations became stale"
                             )
-                    response = await http.post(
-                        "http://127.0.0.1:8000/api/router/usage-push",
-                        json=body,
-                        headers={
-                            "Authorization": "Bearer "
-                            + derive_router_token(info["identity"]),
-                            "X-Bitwave-Push-Channel": "tunnel",
-                        },
-                    )
-                    if response.status_code in (429, 503):
-                        retry = response.headers.get("Retry-After", "30")
-                        next_post = time.monotonic() + min(
-                            90, max(5, int(retry) if retry.isdecimal() else 30)
+                    try:
+                        response = await http.post(
+                            "http://127.0.0.1:8000/api/router/usage-push",
+                            json=body,
+                            headers={
+                                "Authorization": "Bearer "
+                                + derive_router_token(info["identity"]),
+                                "X-Bitwave-Push-Channel": "tunnel",
+                            },
                         )
+                    except httpx.TransportError as exc:
+                        # The local HTTP listener closes before ASGI shutdown
+                        # finishes draining requests. Keep the router lease until
+                        # stop() can hand it over; a short refusal is not an
+                        # instruction to restart the heavy legacy reporter.
+                        logger.warning(
+                            "[NATIVE-STREAM] router=%s ingestion transport=%s; retrying",
+                            router_id, type(exc).__name__,
+                        )
+                        next_post = time.monotonic() + 5
                     else:
-                        response.raise_for_status()
-                        tables.inventory_accepted(body)
-                        last_accepted = time.monotonic()
-                        session.last_accepted = last_accepted
-                        next_post = last_accepted + min(
-                            120,
-                            max(
-                                30, int(response.json().get("next_push_seconds") or 60)
-                            ),
-                        )
+                        if response.status_code in (429, 503):
+                            retry = response.headers.get("Retry-After", "30")
+                            next_post = time.monotonic() + min(
+                                90, max(5, int(retry) if retry.isdecimal() else 30)
+                            )
+                        else:
+                            response.raise_for_status()
+                            tables.inventory_accepted(body)
+                            last_accepted = time.monotonic()
+                            session.last_accepted = last_accepted
+                            next_post = last_accepted + min(
+                                120,
+                                max(
+                                    30, int(response.json().get("next_push_seconds") or 60)
+                                ),
+                            )
                 if time.monotonic() - last_accepted > 180:
                     raise RuntimeError("Native ingestion remained unavailable")
                 await asyncio.sleep(1 if tables.inventory_scan is not None else 5)
