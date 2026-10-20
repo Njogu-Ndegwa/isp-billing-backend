@@ -28,6 +28,75 @@ class FakeWriter:
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_subscription_waits_for_every_selected_id_then_keeps_streaming(self):
+        api = native.AsyncNativeAPI("x", "u", "secret")
+        api.reader, api.writer = asyncio.StreamReader(), FakeWriter()
+        api.task = asyncio.create_task(api.pump())
+        received = []
+        call = asyncio.create_task(api.subscribe_initial(
+            "/test/print", {"from": "*A,*B", "interval": "60"},
+            received.append, members=["*A", "*B"], timeout=1,
+        ))
+        await asyncio.sleep(0)
+
+        def feed(identifier, value):
+            words = ["!re", "=.id=" + identifier, "=counter=" + value, ".tag=s0"]
+            api.reader.feed_data(b"".join(native.encode_word(w) for w in words) + b"\0")
+
+        feed("*a", "1")
+        await asyncio.sleep(0.01)
+        self.assertFalse(call.done())
+        feed("*B", "2")
+        self.assertEqual(await call, "s0")
+        self.assertEqual(len(received), 2)
+        self.assertEqual(len(api.writer.writes), 1)
+        feed("*a", "3")
+        await asyncio.sleep(0.01)
+        self.assertEqual(received[-1]["counter"], "3")
+        await api.close()
+
+    async def test_initial_subscription_failure_never_returns_a_partial_snapshot(self):
+        for failure in ("trap", "disconnect", "timeout", "cancel", "close"):
+            with self.subTest(failure=failure):
+                api = native.AsyncNativeAPI("x", "u", "secret")
+                api.reader, api.writer = asyncio.StreamReader(), FakeWriter()
+                api.task = asyncio.create_task(api.pump())
+                # Complete cancellation locally; this checks the actual cancel RPC
+                # for deadline/cancellation without waiting on a fake router.
+                original_send = api.send
+
+                async def send(words):
+                    await original_send(words)
+                    if words[0] == "/cancel":
+                        tag = next(w for w in words if w.startswith(".tag="))
+                        api.reader.feed_data(native.encode_word("!done") + native.encode_word(tag) + b"\0")
+
+                api.send = send
+                call = asyncio.create_task(api.subscribe_initial(
+                    "/test/print", {"from": "*A,*B", "interval": "60"},
+                    lambda row: None, members=["*A", "*B"], timeout=0.05,
+                ))
+                await asyncio.sleep(0.001)
+                api.reader.feed_data(b"".join(native.encode_word(w) for w in
+                    ["!re", "=.id=*A", ".tag=s0"]) + b"\0")
+                if failure == "trap":
+                    api.reader.feed_data(b"".join(native.encode_word(w) for w in
+                        ["!trap", "=message=private-secret", ".tag=s0"]) + b"\0")
+                elif failure == "disconnect":
+                    api.reader.feed_eof()
+                elif failure == "cancel":
+                    call.cancel()
+                elif failure == "close":
+                    await api.close()
+                with self.assertRaises((native.NativeApiError, asyncio.TimeoutError, asyncio.CancelledError)) as raised:
+                    await call
+                self.assertNotIn("private-secret", str(raised.exception))
+                self.assertEqual(api.subscribers, {})
+                self.assertEqual(api.pending, {})
+                if failure in ("timeout", "cancel"):
+                    self.assertIn(b"/cancel", api.writer.writes[-1])
+                await api.close()
+
     async def test_rpc_deadline_includes_a_blocked_write(self):
         api = native.AsyncNativeAPI("x", "u", "secret")
         api.writer = FakeWriter()
@@ -173,6 +242,14 @@ class FakeAPI:
         self.subs.append((tag, dict(args), callback))
         return tag
 
+    async def subscribe_initial(self, path, args, callback, members=None):
+        tag = await self.subscribe(path, args, callback)
+        if members is None:
+            callback({"cpu-load": "7"})
+        for identifier in members or []:
+            callback({".id": identifier, "mac-address": "AA:" + identifier, "address": "192.0.2.1"})
+        return tag
+
     async def cancel(self, tag):
         self.cancelled.append(tag)
         self.ended.pop(tag, None)
@@ -195,6 +272,18 @@ class InventoryAPI(FakeAPI):
 
 
 class CacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_counter_bootstrap_uses_initial_feed_without_duplicate_full_reads(self):
+        api = FakeAPI()
+        api.members = ["*1", "*2"]
+        tables = native.NativeTables(api)
+        with patch.object(native.asyncio, "sleep", return_value=None):
+            await tables.refresh("hosts")
+            await tables.refresh("resource")
+        self.assertEqual(api.calls, [("/ip/hotspot/host/print", {".proplist": ".id,authorized,bypassed"})])
+        self.assertEqual(set(tables.data["hosts"]), {"*1", "*2"})
+        self.assertEqual(tables.data["resource"]["singleton"]["cpu-load"], "7")
+        self.assertEqual(len(api.subs), 2)
+
     async def test_inventory_pages_are_paced_and_only_publish_after_completion(self):
         api = InventoryAPI()
         api.members = [{".id": "*" + format(i, "X"), "host-name": str(i)} for i in range(1, 10)]
