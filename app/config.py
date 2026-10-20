@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     # Opt-in only: selected RB951s whose exact reporter source was reviewed.
     NATIVE_STREAM_ROUTER_IDS: str = ""
     NATIVE_STREAM_REPORTER_HASHES: str = ""
+    NATIVE_STREAM_GRACEFUL_HANDOFF: bool = False
     # Router expiry reaper (app/services/expiry_reaper_script.py): tried in this
     # order. The tunnel one is plain HTTP inside the management tunnel (Caddy's
     # 10.251.0.1:8088 site); public HTTPS costs a hAP lite ~5-7 s of full CPU.

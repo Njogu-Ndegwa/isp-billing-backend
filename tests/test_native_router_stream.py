@@ -85,7 +85,7 @@ async def test_optional_inventory_failure_keeps_usage_posts_running(monkeypatch,
             raise StopTest()
 
     monkeypatch.setattr(stream, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    monkeypatch.setattr(stream, "asyncio", SimpleNamespace(sleep=advance, wait_for=asyncio.wait_for))
+    monkeypatch.setattr(stream, "asyncio", SimpleNamespace(sleep=advance, wait_for=asyncio.wait_for, CancelledError=asyncio.CancelledError))
     monkeypatch.setattr(stream, "load_router", AsyncMock(return_value={
         "id": 563, "identity": "Router-test", "ip_address": "10.0.0.217",
         "username": "test", "password": "test", "port": 8728,
@@ -202,7 +202,7 @@ async def test_long_inventory_scan_does_not_delay_usage_posts_or_router_lease(mo
         touches.append(clock[0])
 
     monkeypatch.setattr(stream, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    monkeypatch.setattr(stream, "asyncio", SimpleNamespace(sleep=advance, wait_for=asyncio.wait_for))
+    monkeypatch.setattr(stream, "asyncio", SimpleNamespace(sleep=advance, wait_for=asyncio.wait_for, CancelledError=asyncio.CancelledError))
     monkeypatch.setattr(stream, "load_router", AsyncMock(return_value={
         "id": 563, "identity": "Router-test", "ip_address": "10.0.0.217",
         "username": "test", "password": "test", "port": 8728,
