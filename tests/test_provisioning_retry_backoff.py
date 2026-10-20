@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 
+import pytest
+
 from app.db.models import (
     ConnectionType,
     CustomerStatus,
@@ -16,6 +18,22 @@ from app.services.provisioning_retry_policy import (
     retry_delay_seconds,
 )
 from tests.factories import make_customer, make_plan, make_reseller, make_router
+
+
+@pytest.fixture
+def retry_clock(monkeypatch):
+    now = datetime.utcnow()
+
+    class FixedUTC(datetime):
+        @classmethod
+        def utcnow(cls):
+            return now
+
+    # These assertions test the 90-second boundary, independent of how long
+    # Postgres fixture setup or a contended CI runner takes.
+    monkeypatch.setattr(hotspot_provisioning, "datetime", FixedUTC)
+    monkeypatch.setattr(pppoe_provisioning, "datetime", FixedUTC)
+    return now
 
 
 async def _seed_attempt(
@@ -94,13 +112,11 @@ def test_shared_retry_policy_keeps_rapid_front_then_spreads_attempts():
     assert sum(retry_delay_seconds(count) for count in range(1, 14)) < 4 * 60 * 60
 
 
-async def test_hotspot_recent_retry_is_not_replayed_before_backoff(db, monkeypatch):
+async def test_hotspot_recent_retry_is_not_replayed_before_backoff(db, monkeypatch, retry_clock):
     await _seed_attempt(
         db,
         attempt_count=5,
-        # Attempt 5 waits 90s. 80s is past attempt 4's 75s, and leaves a 10s
-        # margin; 89s flaked on slow CI runners.
-        last_attempt_at=datetime.utcnow() - timedelta(seconds=80),
+        last_attempt_at=retry_clock - timedelta(seconds=89),
     )
     groups_seen = []
 
@@ -171,12 +187,12 @@ async def test_hotspot_legacy_config_failure_stays_terminal(db, monkeypatch):
     assert groups_seen == []
 
 
-async def test_pppoe_recent_retry_is_not_replayed_before_backoff(db, monkeypatch):
+async def test_pppoe_recent_retry_is_not_replayed_before_backoff(db, monkeypatch, retry_clock):
     await _seed_attempt(
         db,
         connection_type=ConnectionType.PPPOE,
         attempt_count=5,
-        last_attempt_at=datetime.utcnow() - timedelta(seconds=89),
+        last_attempt_at=retry_clock - timedelta(seconds=89),
     )
     calls = []
 
