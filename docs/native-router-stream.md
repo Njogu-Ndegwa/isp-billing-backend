@@ -43,6 +43,8 @@ does not lose the pending inventory.
 
 Before pausing the usage timer, the collector verifies its exact source hash,
 identity and token, creates its own fallback timer, and seeds a RAM-only lease.
+The source verification requests only the named usage reporter. It does not
+download the source of unrelated or stored backup scripts.
 The previous reporter job is allowed to drain. Other timers and script sources
 are preserved. A unique guard and owner marker prevent overlapping collectors;
 fresh claims cannot be mistaken for stale guards during startup.
