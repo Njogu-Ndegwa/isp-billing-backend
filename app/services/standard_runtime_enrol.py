@@ -258,7 +258,10 @@ def _checkin_sync(api, c: Candidate, identity: str, board: str, arch: str, versi
         return Component(False, f"RouterOS {version or '?'} too old for the applier")
     if (api.send_command("/ip/hotspot/ip-binding/print") or {}).get("error"):
         return Component(False, "no hotspot ip-binding table")
-    res = install_checkin_applier(api, identity=identity, endpoint_url=settings.CHECKIN_ENDPOINT_URL)
+    transport = {}
+    if c.id in _parse_ids(settings.CHECKIN_TUNNEL_ROUTER_IDS):
+        transport["tunnel_endpoint_url"] = settings.CHECKIN_TUNNEL_ENDPOINT_URL
+    res = install_checkin_applier(api, identity=identity, endpoint_url=settings.CHECKIN_ENDPOINT_URL, **transport)
     status = res.get("status")
     if status in _OK_STATUSES:
         return Component(True, f"installed ({status})")

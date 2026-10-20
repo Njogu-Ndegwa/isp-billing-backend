@@ -106,6 +106,9 @@ class Settings(BaseSettings):
     # Where the applier posts. Public HTTPS (through Cloudflare): it keeps
     # working when the management tunnel is down, which is the point.
     CHECKIN_ENDPOINT_URL: str = "https://isp.bitwavetechnologies.net/api/router/checkin"
+    # Explicit transport pilot; this does not enroll routers for check-in.
+    CHECKIN_TUNNEL_ROUTER_IDS: str = ""
+    CHECKIN_TUNNEL_ENDPOINT_URL: str = "http://10.251.0.1:8088/api/router/checkin"
     CHECKIN_MODE: str = "shadow"
     CHECKIN_KILL_SWITCH: bool = False
     CHECKIN_MAX_LINES_PER_REPLY: int = 10
