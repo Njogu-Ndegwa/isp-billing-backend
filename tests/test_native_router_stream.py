@@ -365,11 +365,11 @@ async def test_interface_subscriptions_exclude_unneeded_customer_ppp_counters():
         return {"rows": [r for r in metadata if r[".id"] in args["from"].split(",")]}
 
     api.rpc.side_effect = rpc
-    api.subscribe_initial.return_value = "stream"
+    api.subscribe.return_value = "stream"
     tables = NativeTables(api, wan="pppoe-out")
     await tables.refresh("interfaces")
     assert tables.orders["interfaces"] == ["*1", "*2", "*4"]
-    assert api.subscribe_initial.call_args.args[1]["from"] == "*1,*2,*4"
+    assert api.subscribe.call_args.args[1]["from"] == "*1,*2,*4"
 
 
 @pytest.mark.asyncio
@@ -416,8 +416,8 @@ async def test_host_stats_only_stream_for_authorized_or_bypassed_entries():
         return {"rows": [r for r in rows if r[".id"] in args["from"].split(",")]}
 
     api.rpc.side_effect = rpc
-    api.subscribe_initial.return_value = "feed"
+    api.subscribe.return_value = "feed"
     tables = NativeTables(api)
     await tables.refresh("hosts")
     assert tables.orders["hosts"] == ["*1", "*2"]
-    assert api.subscribe_initial.call_args.args[1]["from"] == "*1,*2"
+    assert api.subscribe.call_args.args[1]["from"] == "*1,*2"

@@ -221,54 +221,6 @@ class AsyncNativeAPI:
         )
         return tag
 
-    async def subscribe_initial(self, path, args, callback, members=None, timeout=25):
-        """Use the interval feed's first rows as its initial counter snapshot.
-
-        Selected IDs must all arrive before the caller can publish the cache.
-        A disappearing ID, closed connection or deadline aborts the feed rather
-        than allowing a partial bootstrap to become an accounting observation.
-        """
-        if self.failure or self.writer is None or self.writer.is_closing():
-            raise NativeApiError("Native connection unavailable")
-        tag = "s" + str(next(self.counter))
-        remaining = {identifier.upper() for identifier in members} if members else None
-        ready = asyncio.Event()
-
-        def receive(row):
-            callback(row)
-            if remaining is None:
-                ready.set()
-            else:
-                remaining.discard(row.get(".id", "").upper())
-                if not remaining:
-                    ready.set()
-
-        self.subscribers[tag] = receive
-        try:
-            async with asyncio.timeout(timeout):
-                await self.send([
-                    path, *["=" + k + "=" + str(v) for k, v in args.items()],
-                    ".tag=" + tag,
-                ])
-                while True:
-                    if self.failure or tag in self.ended:
-                        raise NativeApiError("Native initial stream ended")
-                    if ready.is_set():
-                        return tag
-                    try:
-                        await asyncio.wait_for(ready.wait(), 0.1)
-                    except asyncio.TimeoutError:
-                        pass
-        except BaseException:
-            try:
-                await asyncio.wait_for(self.cancel(tag), 2)
-            except (OSError, NativeApiError, asyncio.TimeoutError):
-                pass
-            finally:
-                self.subscribers.pop(tag, None)
-                self.ended.pop(tag, None)
-            raise
-
     async def cancel(self, tag):
         self.subscribers.pop(tag, None)
         if self.ended.pop(tag, None) is not None:
@@ -437,7 +389,10 @@ class NativeTables:
                 await self.api.cancel(self.groups[table][0]["tag"])
                 self.groups[table] = []
             if not self.groups[table]:
-                tag = await self.api.subscribe_initial(
+                reply = await self.api.rpc(path, {".proplist": props})
+                for row in reply["rows"]:
+                    self.update(table, row)
+                tag = await self.api.subscribe(
                     path,
                     {".proplist": props, "interval": str(self.interval)},
                     lambda row: self.update(table, row),
@@ -511,13 +466,16 @@ class NativeTables:
         for start in range(0, len(remaining), self.chunk_size):
             members = remaining[start : start + self.chunk_size]
             args = {".proplist": props, "from": ",".join(members)}
+            reply = await self.api.rpc(path, args)
+            for row in reply["rows"]:
+                self.update(table, row)
             args["interval"] = str(
                 self.interval
                 if table in ("hosts", "queues", "ppp", "interfaces")
                 else 300
             )
-            tag = await self.api.subscribe_initial(
-                path, args, lambda row, t=table: self.update(t, row), members=members
+            tag = await self.api.subscribe(
+                path, args, lambda row, t=table: self.update(t, row)
             )
             self.groups[table].append({"tag": tag, "members": members})
             await asyncio.sleep(0.35)

@@ -21,12 +21,6 @@ is rebuilt from current IDs. Host counters
 retain the existing MAC plus original-IP key; queue order and limits are retained.
 Per-row observation times protect the billing baseline from delayed delivery.
 
-The interval feed supplies its own initial snapshot. Startup waits for every
-selected ID before publishing counters, without an extra full counter request
-before each subscription. A missing ID, ended feed, lost connection or deadline
-aborts that bootstrap and cancels the incomplete feed. Later updates continue on
-the same subscription.
-
 DHCP leases, learned bridge hosts, bindings, neighbours and bridge membership use
 native `find` for IDs, followed by selected-ID pages of at most four rows. Pages
 are at least one second apart and never create interval subscriptions. A scan
