@@ -21,7 +21,9 @@ from sqlalchemy import select
 from app.config import settings
 from app.db.database import async_session
 from app.db.models import Router
-from app.services.native_router_api import AsyncNativeAPI, NativeTables, TABLES
+from app.services.native_router_api import (
+    AsyncNativeAPI, INVENTORY_TABLES, NativeApiError, NativeTables, STREAM_TABLES,
+)
 from app.services.native_router_counters import native_api_to_v3
 from app.services.native_router_lease import lease_sources, touch_lease
 from app.services.usage_push_auth import derive_router_token
@@ -30,6 +32,22 @@ logger = logging.getLogger(__name__)
 _tasks: dict[int, asyncio.Task] = {}
 REPORTER = "bitwave-usage-push"
 GUARD_COMMENT = "Bitwave native API fallback v1"
+
+
+class SlowInventoryCycle:
+    """Spread a full topology refresh over five minutes, with no catch-up burst."""
+
+    def __init__(self, started):
+        self.names = (*INVENTORY_TABLES, "interfaces")
+        self.index, self.next_at = 0, started + 15
+
+    def take_due(self, now):
+        if now < self.next_at:
+            return None
+        name = self.names[self.index]
+        self.index = (self.index + 1) % len(self.names)
+        self.next_at = now + 50
+        return name
 
 
 def enrollment(ids: str, hashes: str) -> dict[int, str]:
@@ -313,7 +331,8 @@ async def stream_router(router_id: int, expected_hash: str):
         tables = NativeTables(api, interval=60, wan=wan)
         await tables.bootstrap()
         started = time.monotonic()
-        next_post, next_membership, next_inventory = 0, started + 30, started + 300
+        next_post, next_membership = 0, started + 30
+        inventory = SlowInventoryCycle(started)
         last_accepted, last_touch = started, 0
         async with httpx.AsyncClient(timeout=45, follow_redirects=False) as http:
             while True:
@@ -324,24 +343,28 @@ async def stream_router(router_id: int, expected_hash: str):
                     await session.verify_ownership()
                     await touch_lease(api, session.cfg)
                     last_touch = time.monotonic()
-                for name in TABLES:
+                for name in STREAM_TABLES:
                     if any(group["tag"] in api.ended for group in tables.groups[name]):
                         await tables.refresh(name)
                 if now >= next_membership:
                     for name in ("hosts", "queues", "ppp"):
                         await tables.refresh(name)
                     next_membership = time.monotonic() + 30
-                if now >= next_inventory:
-                    for name in (
-                        "interfaces",
-                        "bridge_hosts",
-                        "bindings",
-                        "leases",
-                        "neighbors",
-                        "bridge_ports",
-                    ):
-                        await tables.refresh(name)
-                    next_inventory = time.monotonic() + 300
+                name = None if tables.inventory_scan is not None else inventory.take_due(time.monotonic())
+                if name is not None or tables.inventory_scan is not None:
+                    inventory_name = name or tables.inventory_scan["table"]
+                    try:
+                        if name is None:
+                            await tables.advance_inventory()
+                        else:
+                            await tables.refresh(name)
+                    except (NativeApiError, TimeoutError):
+                        if inventory_name not in INVENTORY_TABLES or api.failure:
+                            raise
+                        # Optional topology must not take down healthy billing
+                        # feeds or be retried every five seconds.
+                        logger.warning("[NATIVE-STREAM] router=%s inventory=%s deferred",
+                                       router_id, inventory_name)
                 if now >= next_post:
                     await session.verify_ownership()
                     body = native_api_to_v3(
@@ -383,6 +406,7 @@ async def stream_router(router_id: int, expected_hash: str):
                         )
                     else:
                         response.raise_for_status()
+                        tables.inventory_accepted(body)
                         last_accepted = time.monotonic()
                         next_post = last_accepted + min(
                             120,
@@ -392,7 +416,7 @@ async def stream_router(router_id: int, expected_hash: str):
                         )
                 if time.monotonic() - last_accepted > 180:
                     raise RuntimeError("Native ingestion remained unavailable")
-                await asyncio.sleep(5)
+                await asyncio.sleep(1 if tables.inventory_scan is not None else 5)
     finally:
         try:
             await asyncio.wait_for(session.release(), 10)

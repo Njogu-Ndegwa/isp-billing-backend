@@ -332,16 +332,18 @@ def native_api_to_v3(identity, tables, wan, *, queue_order=None, observed=None):
                 i[".id"] for i in interfaces if api_bool(i.get("disabled"))
             ],
         },
-        "bindings": {
+    }
+    if "bindings" in tables:
+        parts["bindings"] = {
             "rows": bindings,
             "disabled": [b[".id"] for b in bindings if api_bool(b.get("disabled"))],
-        },
-        "bridge_hosts": [
+        }
+    if "bridge_hosts" in tables:
+        parts["bridge_hosts"] = [
             b
             for b in rows(tables.get("bridge_hosts", []))
             if not api_bool(b.get("local"))
-        ],
-    }
+        ]
     for name in ["leases", "neighbors", "bridge_ports"]:
         if name in tables:
             parts[name] = tables[name]

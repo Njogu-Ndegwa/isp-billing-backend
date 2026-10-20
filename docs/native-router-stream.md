@@ -16,10 +16,30 @@ start it. Observation-time support from PR #232 is required.
 Counter subscriptions use direct native IDs in chunks of 32. Host statistics are
 requested only for authorized or bypassed entries, and interface statistics only
 for physical ports and the WAN. Membership discovery runs every 30 seconds;
-inventory discovery runs every five minutes. Stable chunks stay subscribed when
-other clients join. A feed that ends is rebuilt from current IDs. Host counters
+stable chunks stay subscribed when other clients join. A billing feed that ends
+is rebuilt from current IDs. Host counters
 retain the existing MAC plus original-IP key; queue order and limits are retained.
 Per-row observation times protect the billing baseline from delayed delivery.
+
+DHCP leases, learned bridge hosts, bindings, neighbours and bridge membership use
+native `find` for IDs, followed by selected-ID pages of at most four rows. Pages
+are at least one second apart and never create interval subscriptions. A scan
+returns control to the worker after each request, keeping usage posts and lease
+refreshes running. These optional lists do not contain the billing counters.
+Each completed list replaces its cache atomically, including a valid empty list.
+Partial, invalid, failed or ten-minute-old scans preserve the last complete cache.
+
+Optional scans and interface membership refreshes start one at a time, at least
+50 seconds apart. A large scan can extend the round beyond five minutes; it does
+not overlap the next optional scan. Startup establishes billing
+streams first. A delayed cycle does not catch up by reading all lists together.
+An optional read failure is deferred to the next round without restarting healthy
+billing feeds. Connection loss and billing-stream failures retain normal fallback.
+
+A collected list accompanies the next usage report and stays pending until that
+report is accepted. Subsequent usage-only reports omit the list, preserving its
+cached contents and observation age at ingest. Retrying a rejected HTTP upload
+does not lose the pending inventory.
 
 Before pausing the usage timer, the collector verifies its exact source hash,
 identity and token, creates its own fallback timer, and seeds a RAM-only lease.
@@ -64,9 +84,31 @@ Those windows were below peak customer traffic.
 The production session's guard and RAM lease were also exercised on the empty
 spare: a second owner was refused, loss of the test heartbeat restored reporting,
 an operator's changed interval was preserved, and cleanup succeeded. That test
-peaked at 14% total CPU. The permanent background worker still requires a normal
-deployment and supervised canary acceptance before retaining enrollment.
+peaked at 14% total CPU. The permanent worker was subsequently deployed through
+PR #236; enrollment remains explicit and source-hash guarded.
 
 Expiry remains a separate optimization. The scan-only candidate still saturated
 at 200 clients and is not part of this change. No universal CPU ceiling is claimed
 when forwarding traffic itself exhausts the board.
+
+On October 20, a controlled attribution test on spare 563 kept sixteen real
+MAC-authenticated sessions at 250 aggregate UDP packets per second. Reading all
+1,000 log rows produced peaks of 81% and 83%, against control peaks of 45–47%.
+Rebuilding DHCP and bridge inventory subscriptions separately produced peaks of
+67% and 74%, against controls of 44–48%. Session-list reads stayed near controls.
+Diagnostic collection can therefore distort a live peak measurement.
+
+The paced inventory candidate was then compared with the deployed collector in
+six equal 90-second windows: control, old, paced, paced, old, control. The fixture
+had 200 configured accounts, 200 disabled DHCP leases and sixteen active clients
+at the same packet rate. The old collector peaked at 76% and 72%; paced reads
+peaked at 59% and 57%; controls peaked at 58% and 55%. The paced means were 44.61%
+and 44.97%, against control means of 44.87% and 46.37%. Both versions returned all
+200 leases and all sixteen unique client MACs in bridge inventory. Every client
+kept its session ID and uptime. No sampled CPU value reached 100%.
+
+The tradeoff is completion time: the two paced tables took about 69 seconds,
+compared with about six seconds for the burst. Billing counters use separate
+feeds, and the worker keeps posting and refreshing its lease between pages.
+This is evidence for the tested workload, not a universal 1–2% overhead ceiling
+or a certification of maximum simultaneous customer capacity.
