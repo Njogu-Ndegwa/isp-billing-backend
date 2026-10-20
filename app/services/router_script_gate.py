@@ -13,14 +13,14 @@ means "one started before me": wait for it, 1 s at a time, at most
 ``MAX_WAIT_SECONDS``. The oldest job never waits, so there is no deadlock,
 and the cap bounds how long a hung fetch can hold the others back.
 
-It fails open: if this router's ids cannot be read or parsed, the script runs
-as it did before the gate. Only ``:local`` variables (the check-in applier
+If a known earlier job remains after the wait budget, this run is deferred.
+Unreadable job IDs retain the existing compatibility behavior. Only ``:local`` variables (the check-in applier
 must not use ``:global``) and no ``:return`` (RouterOS 7.19+ rejects it).
 """
 
 from __future__ import annotations
 
-GATE_VERSION = 1
+GATE_VERSION = 2
 MAX_WAIT_SECONDS = 20
 
 GATED_SCRIPTS = (
@@ -60,6 +60,7 @@ _GATE_TEMPLATE = r'''# bw-gate v__VERSION__: run one Bitwave script at a time. W
         :set bwgWait ($bwgWait + 1)
     }
 }
+:if ($bwgBusy) do={ :error "bw-gate: deferred while an earlier Bitwave job is still running" }
 # bw-gate end
 '''
 
