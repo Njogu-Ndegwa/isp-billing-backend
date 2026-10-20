@@ -2,6 +2,20 @@
 
 Status: live in production since 2026-09-26, fleet-wide since 2026-09-27.
 
+### Operator pauses
+
+For a deliberate support pause, disable the expiry scheduler, set
+`expiry_reaper_enabled=false` and `expiry_reaper_mode=server`, and record a
+reason beginning with `operator pause:`. Automatic enrolment and the setup
+callback leave that router alone until an operator clears the reason. The
+installer also checks for a disabled expiry scheduler before making changes,
+so a previously selected enrolment cannot simply replace the disabled timer.
+Server cleanup remains responsible for expiry while the reaper is paused.
+
+To resume, first restore and verify the intended router script and scheduler,
+then clear the pause reason and restore the router's expiry ownership fields.
+Do not clear the reason merely to let a background job undo an active test.
+
 This document explains how an expired hotspot customer loses internet access: who removes them, how fast, how the platform stays in sync with the router, and how new routers are enrolled. It covers hotspot customers only. PPPoE customers are still removed by the server job alone.
 
 ## 1. The short version
