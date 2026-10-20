@@ -4010,6 +4010,11 @@ async def startup_event():
     from app.services.realtime_push_installer import schedule_catch_up_after_restart
 
     schedule_catch_up_after_restart()
+    try:
+        from app.services.native_router_stream import start as start_native_streams
+        start_native_streams()
+    except Exception as exc:
+        logger.warning("[NATIVE-STREAM] disabled (%s)", type(exc).__name__)
     logger.info(
         "Background scheduler started - cleanup every 67s, bandwidth every 157s, "
         "cap sampler every 19s, queue repair every 313s, hotspot provisioning retry every 97s, "
@@ -4026,6 +4031,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    from app.services.native_router_stream import stop as stop_native_streams
+    await stop_native_streams()
     if scheduler.running:
         scheduler.shutdown(wait=False)
         logger.info("Background scheduler stopped")
