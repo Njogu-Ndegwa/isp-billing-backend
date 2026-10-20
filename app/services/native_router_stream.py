@@ -350,17 +350,21 @@ async def stream_router(router_id: int, expected_hash: str):
                     for name in ("hosts", "queues", "ppp"):
                         await tables.refresh(name)
                     next_membership = time.monotonic() + 30
-                name = inventory.take_due(now)
-                if name is not None:
+                name = None if tables.inventory_scan is not None else inventory.take_due(time.monotonic())
+                if name is not None or tables.inventory_scan is not None:
+                    inventory_name = name or tables.inventory_scan["table"]
                     try:
-                        await tables.refresh(name)
+                        if name is None:
+                            await tables.advance_inventory()
+                        else:
+                            await tables.refresh(name)
                     except (NativeApiError, TimeoutError):
-                        if name not in INVENTORY_TABLES or api.failure:
+                        if inventory_name not in INVENTORY_TABLES or api.failure:
                             raise
                         # Optional topology must not take down healthy billing
                         # feeds or be retried every five seconds.
                         logger.warning("[NATIVE-STREAM] router=%s inventory=%s deferred",
-                                       router_id, name)
+                                       router_id, inventory_name)
                 if now >= next_post:
                     await session.verify_ownership()
                     body = native_api_to_v3(
@@ -412,7 +416,7 @@ async def stream_router(router_id: int, expected_hash: str):
                         )
                 if time.monotonic() - last_accepted > 180:
                     raise RuntimeError("Native ingestion remained unavailable")
-                await asyncio.sleep(5)
+                await asyncio.sleep(1 if tables.inventory_scan is not None else 5)
     finally:
         try:
             await asyncio.wait_for(session.release(), 10)

@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 import asyncio
 import unittest
 from unittest.mock import patch
@@ -177,51 +178,98 @@ class FakeAPI:
         self.ended.pop(tag, None)
 
 
+class InventoryAPI(FakeAPI):
+    def __init__(self):
+        super().__init__()
+        self.discovery = None
+        self.page = None
+
+    async def rpc(self, path, args=None):
+        args = dict(args or {})
+        self.calls.append((path, args))
+        if path.endswith("/find"):
+            ids = self.discovery if self.discovery is not None else ";".join(r[".id"] for r in self.members)
+            return {"rows": [], "done": {"ret": ids}}
+        wanted = set(args["from"].split(","))
+        return {"rows": self.page if self.page is not None else [r for r in self.members if r[".id"] in wanted]}
+
+
 class CacheTests(unittest.IsolatedAsyncioTestCase):
-    async def test_optional_inventory_is_one_atomic_read_without_native_jobs(self):
-        class InventoryAPI(FakeAPI):
-            async def rpc(self, path, args):
-                self.calls.append((path, dict(args)))
-                return {"rows": self.members}
+    async def test_inventory_pages_are_paced_and_only_publish_after_completion(self):
+        api = InventoryAPI()
+        api.members = [{".id": "*" + format(i, "X"), "host-name": str(i)} for i in range(1, 10)]
+        tables = native.NativeTables(api)
+        clock = [100.0]
+        with patch.object(native, "time", SimpleNamespace(monotonic=lambda: clock[0])):
+            await tables.refresh("leases")
+            self.assertEqual(api.calls, [("/ip/dhcp-server/lease/find", {})])
+            await tables.advance_inventory()
+            self.assertEqual(len(api.calls), 1)
+            for index in range(3):
+                clock[0] += 1
+                await tables.advance_inventory()
+                self.assertLessEqual(len(api.calls[-1][1]["from"].split(",")), 4)
+                if index < 2:
+                    self.assertNotIn("leases", tables.snapshot())
+                    tables.update("hosts", {".id": "*A", "bytes-in": str(index)})
+                calls = len(api.calls)
+                await tables.advance_inventory()
+                self.assertEqual(len(api.calls), calls)
+            self.assertIsNone(tables.inventory_scan)
+            self.assertEqual(tables.snapshot()["leases"], api.members)
+            self.assertEqual(api.subs, [])
+            body = tables.snapshot()
+            tables.inventory_accepted(body)
+            self.assertNotIn("leases", tables.snapshot())
+            api.members = []
+            await tables.refresh("leases")
+            self.assertEqual(tables.snapshot()["leases"], [])
+            self.assertEqual(tables.data["hosts"]["*A"]["bytes-in"], "1")
 
+    async def test_invalid_discovery_or_page_preserves_previous_complete_inventory(self):
         api = InventoryAPI()
         tables = native.NativeTables(api)
-        self.assertNotIn("leases", tables.snapshot())
-        api.members = [{".id": "*1", "host-name": "first"}]
-        await tables.refresh("leases")
-        self.assertEqual(len(api.calls), 1)
-        self.assertNotIn("from", api.calls[0][1])
-        self.assertEqual(api.subs, [])
-        self.assertEqual(tables.groups["leases"], [])
-        body = tables.snapshot()
-        self.assertEqual(body["leases"], api.members)
-        # A rejected or failed upload has no acceptance call: retry the list.
-        self.assertEqual(tables.snapshot()["leases"], body["leases"])
-        tables.inventory_accepted(body)
-        self.assertNotIn("leases", tables.snapshot())
-        # A later complete empty read must clear the server's old lease list.
-        api.members = []
-        await tables.refresh("leases")
-        self.assertEqual(tables.snapshot()["leases"], [])
-        self.assertEqual(tables.cache_size, 0)
-
-    async def test_invalid_inventory_keeps_previous_complete_snapshot(self):
-        class InventoryAPI(FakeAPI):
-            async def rpc(self, path, args):
-                return {"rows": self.members}
-
-        api = InventoryAPI()
-        tables = native.NativeTables(api)
-        api.members = [{".id": "*1", "host-name": "old"}]
-        await tables.refresh("leases")
-        original_size = tables.cache_size
-        for invalid in ([{".id": "bad"}], [{".id": "*1"}, {".id": "*1"}],
-                        [{".id": "*2", "comment": "x" * 64_001}]):
-            api.members = invalid
-            with self.assertRaises(native.NativeApiError):
+        clock = [100.0]
+        with patch.object(native, "time", SimpleNamespace(monotonic=lambda: clock[0])):
+            api.members = [{".id": "*1", "host-name": "old"}]
+            await tables.refresh("leases")
+            clock[0] += 1
+            await tables.advance_inventory()
+            original_size = tables.cache_size
+            for invalid in ("bad", "*1;*1", "*a;*A", ";", ";".join("*%X" % i for i in range(2001))):
+                api.discovery = invalid
+                with self.assertRaises(native.NativeApiError):
+                    await tables.refresh("leases")
+                self.assertIsNone(tables.inventory_scan)
+            api.discovery = None
+            api.members = [{".id": "*2"}]
+            for invalid in ([{".id": "*9"}], [{".id": "*2"}, {".id": "*2"}],
+                            [{".id": "*2", "comment": "x" * 64_001}]):
                 await tables.refresh("leases")
-            self.assertEqual(tables.snapshot()["leases"], [{".id": "*1", "host-name": "old"}])
-            self.assertEqual(tables.cache_size, original_size)
+                api.page = invalid
+                clock[0] += 1
+                with self.assertRaises(native.NativeApiError):
+                    await tables.advance_inventory()
+                self.assertIsNone(tables.inventory_scan)
+                self.assertEqual(tables.snapshot()["leases"], [{".id": "*1", "host-name": "old"}])
+                self.assertEqual(tables.cache_size, original_size)
+
+    async def test_expired_scan_discards_partial_rows_and_preserves_old_table(self):
+        api = InventoryAPI()
+        api.members = [{".id": "*%X" % i} for i in range(8)]
+        tables = native.NativeTables(api)
+        clock = [100.0]
+        with patch.object(native, "time", SimpleNamespace(monotonic=lambda: clock[0])):
+            await tables.refresh("leases")
+            clock[0] += 1
+            await tables.advance_inventory()
+            self.assertNotIn("leases", tables.snapshot())
+            clock[0] += 601
+            with self.assertRaises(native.NativeApiError):
+                await tables.advance_inventory()
+        self.assertIsNone(tables.inventory_scan)
+        self.assertNotIn("leases", tables.snapshot())
+        self.assertEqual(tables.cache_size, 0)
 
     async def test_billing_bootstrap_does_not_wait_for_optional_topology(self):
         tables = native.NativeTables(None)

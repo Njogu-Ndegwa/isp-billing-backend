@@ -28,7 +28,8 @@ def test_inventory_cycle_staggers_lists_and_never_catches_up_in_a_burst():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [NativeApiError("optional unavailable"), TimeoutError()])
-async def test_optional_inventory_failure_keeps_usage_posts_running(monkeypatch, failure):
+@pytest.mark.parametrize("stage", ["start", "page"])
+async def test_optional_inventory_failure_keeps_usage_posts_running(monkeypatch, failure, stage):
     class StopTest(Exception):
         pass
 
@@ -42,6 +43,7 @@ async def test_optional_inventory_failure_keeps_usage_posts_running(monkeypatch,
     session.cfg = {}
 
     class Tables:
+        inventory_scan = None
         groups = {name: [] for name in stream.STREAM_TABLES}
         orders, observed = {}, {}
 
@@ -51,7 +53,13 @@ async def test_optional_inventory_failure_keeps_usage_posts_running(monkeypatch,
         async def refresh(self, name):
             refreshes.append((clock[0], name))
             if name == "bridge_hosts":
-                raise failure
+                if stage == "start":
+                    raise failure
+                self.inventory_scan = {"table": name}
+
+        async def advance_inventory(self):
+            self.inventory_scan = None
+            raise failure
 
         def snapshot(self):
             return {}
@@ -112,6 +120,86 @@ def test_enrollment_is_empty_by_default_and_requires_exact_hashes():
     ]:
         with pytest.raises(ValueError):
             stream.enrollment(ids, hashes)
+
+
+@pytest.mark.asyncio
+async def test_long_inventory_scan_does_not_delay_usage_posts_or_router_lease(monkeypatch):
+    class StopTest(Exception):
+        pass
+
+    clock, posts, touches, pages = [100.0], [], [], []
+    api = AsyncMock()
+    api.failure, api.ended = None, {}
+    api.rpc.return_value = {"done": {"ret": "0"}}
+    session = AsyncMock()
+    session.preflight.return_value = "ether1"
+    session.cfg = {}
+
+    class Tables:
+        groups = {name: [] for name in stream.STREAM_TABLES}
+        orders, observed = {}, {}
+        inventory_scan = None
+        remaining = 150
+
+        async def bootstrap(self):
+            pass
+
+        async def refresh(self, name):
+            if name == "bridge_hosts":
+                self.inventory_scan = {"table": name}
+
+        async def advance_inventory(self):
+            pages.append(clock[0])
+            self.remaining -= 1
+            if self.remaining == 0:
+                self.inventory_scan = None
+
+        def snapshot(self):
+            return {}
+
+        def inventory_accepted(self, body):
+            pass
+
+    class Http:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            posts.append(clock[0])
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                                   json=lambda: {"next_push_seconds": 60})
+
+    async def advance(seconds):
+        clock[0] += seconds
+        if clock[0] >= 330:
+            raise StopTest()
+
+    async def touch(*args):
+        touches.append(clock[0])
+
+    monkeypatch.setattr(stream, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(stream, "asyncio", SimpleNamespace(sleep=advance, wait_for=asyncio.wait_for))
+    monkeypatch.setattr(stream, "load_router", AsyncMock(return_value={
+        "id": 563, "identity": "Router-test", "ip_address": "10.0.0.217",
+        "username": "test", "password": "test", "port": 8728,
+    }))
+    monkeypatch.setattr(stream, "AsyncNativeAPI", lambda *args: api)
+    monkeypatch.setattr(stream, "StreamSession", lambda *args: session)
+    monkeypatch.setattr(stream, "NativeTables", lambda *args, **kwargs: Tables())
+    monkeypatch.setattr(stream, "native_api_to_v3", lambda *args, **kwargs: {"hosts": [], "reports": [], "router": {}})
+    monkeypatch.setattr(stream, "touch_lease", touch)
+    monkeypatch.setattr(stream.httpx, "AsyncClient", lambda **kwargs: Http())
+    with pytest.raises(StopTest):
+        await stream.stream_router(563, "a" * 64)
+    assert len(pages) == 150
+    assert sum(pages[0] <= t <= pages[-1] for t in posts) >= 2
+    assert max(b-a for a, b in zip(posts, posts[1:])) <= 65
+    assert max(b-a for a, b in zip(touches, touches[1:])) <= 50
+    session.release.assert_awaited_once()
+    api.close.assert_awaited_once()
 
 
 def test_native_cache_bounds_rows_and_removes_old_host_key_index():

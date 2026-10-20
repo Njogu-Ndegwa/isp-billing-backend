@@ -22,13 +22,16 @@ retain the existing MAC plus original-IP key; queue order and limits are retaine
 Per-row observation times protect the billing baseline from delayed delivery.
 
 DHCP leases, learned bridge hosts, bindings, neighbours and bridge membership use
-one-shot native reads rather than subscriptions. These lists do not contain the
-usage counters. This avoids recreating selected-ID jobs as learned rows age out.
-Each complete list replaces its cache atomically, including a valid empty list.
-Invalid or failed reads preserve the last complete cache.
+native `find` for IDs, followed by selected-ID pages of at most four rows. Pages
+are at least one second apart and never create interval subscriptions. A scan
+returns control to the worker after each request, keeping usage posts and lease
+refreshes running. These optional lists do not contain the billing counters.
+Each completed list replaces its cache atomically, including a valid empty list.
+Partial, invalid, failed or ten-minute-old scans preserve the last complete cache.
 
-Optional lists and interface membership are refreshed one at a time, 50 seconds
-apart, so a full round takes about five minutes. Startup establishes billing
+Optional scans and interface membership refreshes start one at a time, at least
+50 seconds apart. A large scan can extend the round beyond five minutes; it does
+not overlap the next optional scan. Startup establishes billing
 streams first. A delayed cycle does not catch up by reading all lists together.
 An optional read failure is deferred to the next round without restarting healthy
 billing feeds. Connection loss and billing-stream failures retain normal fallback.
@@ -87,3 +90,25 @@ PR #236; enrollment remains explicit and source-hash guarded.
 Expiry remains a separate optimization. The scan-only candidate still saturated
 at 200 clients and is not part of this change. No universal CPU ceiling is claimed
 when forwarding traffic itself exhausts the board.
+
+On October 20, a controlled attribution test on spare 563 kept sixteen real
+MAC-authenticated sessions at 250 aggregate UDP packets per second. Reading all
+1,000 log rows produced peaks of 81% and 83%, against control peaks of 45–47%.
+Rebuilding DHCP and bridge inventory subscriptions separately produced peaks of
+67% and 74%, against controls of 44–48%. Session-list reads stayed near controls.
+Diagnostic collection can therefore distort a live peak measurement.
+
+The paced inventory candidate was then compared with the deployed collector in
+six equal 90-second windows: control, old, paced, paced, old, control. The fixture
+had 200 configured accounts, 200 disabled DHCP leases and sixteen active clients
+at the same packet rate. The old collector peaked at 76% and 72%; paced reads
+peaked at 59% and 57%; controls peaked at 58% and 55%. The paced means were 44.61%
+and 44.97%, against control means of 44.87% and 46.37%. Both versions returned all
+200 leases and all sixteen unique client MACs in bridge inventory. Every client
+kept its session ID and uptime. No sampled CPU value reached 100%.
+
+The tradeoff is completion time: the two paced tables took about 69 seconds,
+compared with about six seconds for the burst. Billing counters use separate
+feeds, and the worker keeps posting and refreshing its lease between pages.
+This is evidence for the tested workload, not a universal 1–2% overhead ceiling
+or a certification of maximum simultaneous customer capacity.

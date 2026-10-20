@@ -260,6 +260,84 @@ class NativeTables:
         self.host_keys = {}
         self.wan = wan
         self.inventory_pending = set()
+        self.inventory_scan = None
+
+    async def start_inventory(self, table):
+        """Discover IDs cheaply; the caller advances bounded pages between posts."""
+        if table not in INVENTORY_TABLES or self.inventory_scan is not None:
+            raise NativeApiError("Native inventory scan is already active or invalid")
+        path, _ = TABLES[table]
+        reply = await self.api.rpc(path.removesuffix("print") + "find")
+        raw = reply.get("done", {}).get("ret")
+        if not isinstance(raw, str) or len(raw) > 24_000 or reply.get("rows"):
+            raise NativeApiError("Invalid native inventory discovery")
+        identifiers = raw.split(";") if raw else []
+        if (len(identifiers) > 2000
+                or any(not re.fullmatch(r"\*[A-Fa-f0-9]+", i) for i in identifiers)
+                or len({i.upper() for i in identifiers}) != len(identifiers)):
+            raise NativeApiError("Invalid native inventory IDs")
+        self.inventory_scan = {
+            "table": table, "ids": identifiers, "offset": 0,
+            "data": {}, "sizes": {}, "started": time.monotonic(),
+            "next_at": time.monotonic() + 1,
+        }
+        if not identifiers:
+            self._publish_inventory()
+
+    def _publish_inventory(self):
+        scan = self.inventory_scan
+        table, data, sizes = scan["table"], scan["data"], scan["sizes"]
+        size = self.cache_size - sum(self.row_sizes[table].values()) + sum(sizes.values())
+        if size > 4_000_000:
+            raise NativeApiError("Native cache size exceeded")
+        self.data[table], self.row_sizes[table], self.cache_size = data, sizes, size
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.observed[table] = {identifier: now for identifier in data}
+        self.inventory_pending.add(table)
+        self.inventory_scan = None
+
+    async def advance_inventory(self):
+        """At most four selected rows and one RPC; never await an entire scan."""
+        scan = self.inventory_scan
+        if scan is None:
+            return
+        now = time.monotonic()
+        try:
+            if now - scan["started"] > 600:
+                raise NativeApiError("Native inventory scan expired")
+            if now < scan["next_at"]:
+                return
+            table = scan["table"]
+            path, props = TABLES[table]
+            members = scan["ids"][scan["offset"]:scan["offset"] + 4]
+            reply = await self.api.rpc(path, {".proplist": props, "from": ",".join(members)})
+            wanted = {i.upper() for i in members}
+            seen = set()
+            for row in reply["rows"]:
+                row = dict(row)
+                row.pop(".section", None)
+                identifier = row.get(".id", "").upper()
+                if identifier not in wanted or identifier in seen:
+                    raise NativeApiError("Invalid native inventory page")
+                seen.add(identifier)
+                row[".id"] = identifier
+                size = sum(len(str(k)) + len(str(v)) for k, v in row.items())
+                if size > 64_000:
+                    raise NativeApiError("Native row size exceeded")
+                scan["data"][identifier], scan["sizes"][identifier] = row, size
+            size = (self.cache_size - sum(self.row_sizes[table].values())
+                    + sum(scan["sizes"].values()))
+            if size > 4_000_000:
+                raise NativeApiError("Native cache size exceeded")
+            scan["offset"] += len(members)
+            scan["next_at"] = time.monotonic() + 1
+            if scan["offset"] >= len(scan["ids"]):
+                self._publish_inventory()
+        except BaseException:
+            # Preserve the last complete table. Dynamic rows can vanish while
+            # a page is in flight; a later scheduled cycle can try again.
+            self.inventory_scan = None
+            raise
 
     def discard(self, table, identifier):
         old = self.data[table].pop(identifier, None)
@@ -304,32 +382,7 @@ class NativeTables:
     async def refresh(self, table):
         path, props = TABLES[table]
         if table in INVENTORY_TABLES:
-            # These lists describe topology, not cumulative billing counters.
-            # A one-shot native read avoids creating/rebuilding long-lived
-            # selected-ID jobs whenever DHCP or learned bridge rows disappear.
-            reply = await self.api.rpc(path, {".proplist": props})
-            data, sizes = {}, {}
-            for row in reply["rows"]:
-                row = dict(row)
-                row.pop(".section", None)
-                identifier = row.get(".id", "")
-                if (not re.fullmatch(r"\*[A-Fa-f0-9]+", identifier)
-                        or identifier in data or len(data) >= 2000):
-                    raise NativeApiError("Invalid native inventory IDs")
-                size = sum(len(str(k)) + len(str(v)) for k, v in row.items())
-                if size > 64_000:
-                    raise NativeApiError("Native row size exceeded")
-                data[identifier], sizes[identifier] = row, size
-            size = self.cache_size - sum(self.row_sizes[table].values()) + sum(sizes.values())
-            if size > 4_000_000:
-                raise NativeApiError("Native cache size exceeded")
-            # Publish a complete replacement only after validation. Empty lists
-            # are meaningful; failed reads must not erase the previous cache.
-            self.data[table], self.row_sizes[table] = data, sizes
-            self.cache_size = size
-            now = datetime.datetime.now(datetime.timezone.utc)
-            self.observed[table] = {identifier: now for identifier in data}
-            self.inventory_pending.add(table)
+            await self.start_inventory(table)
             return
         if table == "resource":
             if self.groups[table] and self.groups[table][0]["tag"] in self.api.ended:
