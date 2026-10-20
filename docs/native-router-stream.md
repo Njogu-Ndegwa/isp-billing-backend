@@ -59,6 +59,32 @@ interval. Normal shutdown restores reporting and removes only the collector's
 own guard and lease entries. Removing enrollment restores the original path at
 the next normal deployment; no router reset is needed.
 
+`NATIVE_STREAM_GRACEFUL_HANDOFF=true` changes clean application shutdown for the
+explicitly enrolled routers. An owner with an ingestion acknowledgement less
+than two minutes old refreshes its RAM lease and marks its guard for handover.
+The reporter stays paused while the API connection closes. For two minutes, a
+successor can adopt the guard after validating the reporter source and token,
+timer identity, exact guard source and predecessor lease.
+
+A uniquely named empty script serializes competing successors; it is never
+executed. The successor seeds its own RAM lease before updating the guard owner
+and retiring predecessor entries. A manually paused reporter without a valid
+handover marker is refused. Unknown claims are preserved; recognized empty
+claims can be retired after four minutes. This option is off by default.
+
+Counter, ingestion and transport failures retain the existing release and
+fallback path. If a successor never appears, the router guard restores reporting
+after lease expiry. Removing enrollment under this option also allows the guard
+to restore reporting after lease expiry.
+
+The first upgrade from a version without handover support still has the old
+shutdown behavior. Before that deployment, a reviewed temporary scheduler
+wrapper can skip the reporter while a short-lived RAM upgrade marker exists.
+Restore the original scheduler event once the new native owner is confirmed.
+Marker expiry permits the original reporter to run if an upgrade fails. This
+initial transition must be performed explicitly; the option alone cannot change
+an old process. The reporter script source is preserved.
+
 The client bounds reply sizes, table sizes and cached data. It does not log
 RouterOS error bodies, HTTP bodies, tokens, script sources or customer identifiers.
 Database reads commit and close before router or HTTP I/O.
