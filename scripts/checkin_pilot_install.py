@@ -47,6 +47,7 @@ PUBLIC_URL = "https://isp.bitwavetechnologies.net/api/router/checkin"
 APPLY = os.environ.get("APPLY") == "1"
 UNINSTALL = os.environ.get("UNINSTALL") == "1"
 CHECK_CERT = os.environ.get("CHECK_CERT", "no").strip() or "no"
+TUNNEL_URL = os.environ.get("CHECKIN_TUNNEL_URL", "").strip() or None
 _rid = os.environ.get("ROUTER_ID", "").strip()
 ROUTER_ID = int(_rid) if _rid.isdigit() else None
 
@@ -98,6 +99,7 @@ def run(r):
 
         source = render_checkin_applier_source(
             identity=ident, endpoint_url=PUBLIC_URL, check_certificate=CHECK_CERT,
+            tunnel_endpoint_url=TUNNEL_URL,
         )
         print(f"   plan: {'update' if scripts else 'add'} script '{SCRIPT_NAME}' ({len(source)} bytes, "
               f"check-certificate={CHECK_CERT}), {'update' if scheds else 'add'} scheduler "

@@ -56,6 +56,19 @@ def test_auto_install_is_off_by_default():
     assert Settings.model_fields["STANDARD_RUNTIME_AUTO_INSTALL"].default is False
 
 
+@pytest.mark.parametrize("selected", ["", "598", "597"])
+def test_tunnel_transport_only_applies_to_explicitly_selected_router(monkeypatch, selected):
+    from app.services.checkin_tunnel_transport import BEGIN
+    monkeypatch.setattr(settings, "CHECKIN_TUNNEL_ROUTER_IDS", selected)
+    monkeypatch.setattr(settings, "CHECKIN_TUNNEL_ENDPOINT_URL", "http://10.251.0.1:8088/api/router/checkin")
+    candidate = enrol.Candidate(597, "CJ", "Router-1426", "10.0.0.235", "u", "p", 8728, True, False)
+    api = FakeRouterOS(candidate.identity, version="7.24.2")
+    result = enrol._checkin_sync(api, candidate, candidate.identity, api.board, api.arch, api.version)
+    assert result.installed
+    installed = api.named("/system/script", applier.SCRIPT_NAME)["source"]
+    assert (BEGIN in installed) is (selected == "597")
+
+
 # --- "all" enrolment ----------------------------------------------------------
 
 def test_checkin_enrolment_list_all_and_exclude(monkeypatch):
