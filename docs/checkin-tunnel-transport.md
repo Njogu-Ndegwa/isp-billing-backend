@@ -31,3 +31,15 @@ tunnel path, unavailable tunnel/public fallback, and rejection of malformed
 frames on the spare. Then measure a scoped live canary, preserving source
 backups and an automatic rollback. Unit tests establish source and selection
 contracts; they do not establish a CPU ceiling or RouterOS 6 hardware support.
+
+
+Validated 2026-10-20 on the home RB951 (563, RouterOS 7.19.6) and CJ
+(597, 7.24.2): each completed two scheduled, fully validated tunnel replies
+with no public fallback. The private Caddy route is active and still rejects
+unauthenticated requests. A separate home trial completed two public fallbacks
+when that route was unavailable. Original source backups are retained.
+
+This removes TLS work, but does not establish a CPU ceiling: the 200-session
+home test still saturated while building inventory and processing the reply,
+even with HTTP over the tunnel. Native configuration events are being tested
+as the replacement for that recurring script work.
