@@ -366,6 +366,36 @@ async def attribute_unmatched_c2b(
 # ---------------------------------------------------------------------------
 
 
+# Safaricom's error text is shown to the reseller as-is; cap it so a stray HTML
+# error page can't flood the dashboard alert or the log line.
+_SAFARICOM_ERROR_TEXT_LIMIT = 300
+
+
+def _safaricom_error_text(body: object) -> str:
+    """Pull the human-readable reason out of a Safaricom error body.
+
+    Daraja errors look like {"errorCode": "...", "errorMessage": "Urls are
+    already registered"}; some answers carry ResponseDescription instead, and
+    gateway failures come back as plain text/HTML (kept under "raw")."""
+    text = ""
+    if isinstance(body, dict):
+        for key in ("errorMessage", "ResponseDescription", "error_description", "message", "raw"):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value
+                break
+        else:
+            text = str(body) if body else ""
+    elif body is not None:
+        text = str(body)
+    text = " ".join(text.split())
+    if not text:
+        return "no reason given"
+    if len(text) > _SAFARICOM_ERROR_TEXT_LIMIT:
+        text = text[:_SAFARICOM_ERROR_TEXT_LIMIT] + "..."
+    return text
+
+
 async def _call_daraja_registerurl(
     *,
     shortcode: str,
@@ -377,11 +407,31 @@ async def _call_daraja_registerurl(
 ) -> dict:
     """Call Safaricom Daraja /mpesa/c2b/v2/registerurl. Returns Safaricom's
     response verbatim so the caller can show ResponseDescription / errors
-    back to the operator."""
+    back to the operator.
+
+    Failures are raised as 4xx/503 with a plain-string ``detail``, never 502:
+    the API sits behind Cloudflare, which swaps an origin 502/504 for its own
+    page without CORS headers, so the dashboard only saw "Failed to fetch" and
+    the reseller never learned why Safaricom said no."""
     require_external_side_effects_enabled("M-Pesa C2B callback registration")
-    access_token = await get_access_token(
-        consumer_key=consumer_key, consumer_secret=consumer_secret
-    )
+    try:
+        access_token = await get_access_token(
+            consumer_key=consumer_key, consumer_secret=consumer_secret
+        )
+    except HTTPException as exc:
+        logger.warning(
+            "[C2B] registerurl token request failed shortcode=%s: %s",
+            shortcode,
+            exc.detail,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Could not get a Safaricom access token for this paybill. "
+                "Check the consumer key and secret; if they are correct, "
+                "Safaricom may be down, so try again in a few minutes."
+            ),
+        ) from exc
     base_url = (
         "https://api.safaricom.co.ke"
         if settings.MPESA_ENVIRONMENT == "production"
@@ -393,22 +443,53 @@ async def _call_daraja_registerurl(
         "ConfirmationURL": confirmation_url,
         "ValidationURL": validation_url,
     }
-    async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
-        resp = await client.post(
-            f"{base_url}/mpesa/c2b/v2/registerurl",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
+    try:
+        async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
+            resp = await client.post(
+                f"{base_url}/mpesa/c2b/v2/registerurl",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except httpx.TimeoutException as exc:
+        logger.warning(
+            "[C2B] registerurl timed out shortcode=%s: %s", shortcode, type(exc).__name__
         )
-        try:
-            body = resp.json()
-        except Exception:
-            body = {"raw": resp.text}
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=502, detail={"safaricom_status": resp.status_code, "body": body})
-        return body
+        raise HTTPException(
+            status_code=503,
+            detail="Safaricom did not respond in time to the C2B registration. Please try again in a few minutes.",
+        ) from exc
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "[C2B] registerurl transport error shortcode=%s: %s: %s",
+            shortcode,
+            type(exc).__name__,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Could not reach Safaricom to register the C2B URLs. Please try again in a few minutes.",
+        ) from exc
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": resp.text}
+    if resp.status_code >= 400:
+        reason = _safaricom_error_text(body)
+        logger.warning(
+            "[C2B] registerurl rejected shortcode=%s safaricom_status=%s body=%s",
+            shortcode,
+            resp.status_code,
+            str(body)[:1000],
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=f"Safaricom rejected C2B registration ({resp.status_code}): {reason}",
+        )
+    return body
 
 
 def _serialize_unmatched(row: UnmatchedC2BPayment) -> dict:
