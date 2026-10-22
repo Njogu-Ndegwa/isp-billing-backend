@@ -333,6 +333,14 @@ class Settings(BaseSettings):
     FEEDBACK_REPLY_MODEL: str = "claude-opus-4-8"
     FEEDBACK_DAILY_POST_CAP: int = 15
 
+    # --- Support desk snapshot (admin-only, read-only) --------------------
+    # Dennis's laptop pushes its support dashboard JSON over root SSH to the
+    # host (/opt/isp-billing-shadow/support-desk/snapshot.json, tmp + mv);
+    # docker-compose.hetzner.yml bind-mounts that directory read-only here.
+    # GET /api/admin/support-desk reads it per request. Missing file = 404.
+    SUPPORT_DESK_SNAPSHOT_PATH: str = "/srv/support-desk/snapshot.json"
+    SUPPORT_DESK_SNAPSHOT_MAX_BYTES: int = 5 * 1024 * 1024
+
     # --- Transactional email (password reset) ----------------------------
     # Credentials live in the server .env only — never committed.
     # SMTP is preferred when SMTP_HOST is set (e.g. smtp.gmail.com + app

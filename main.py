@@ -138,6 +138,7 @@ from app.api.outage_compensation_routes import router as outage_compensation_rou
 from app.api.impersonation_routes import router as impersonation_router
 from app.api.static_ip_import_routes import router as static_ip_import_router
 from app.api.customer_device_routes import router as customer_device_router
+from app.api.admin_support_desk_routes import router as admin_support_desk_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -192,6 +193,7 @@ app.include_router(outage_compensation_router)
 app.include_router(impersonation_router)
 app.include_router(static_ip_import_router)
 app.include_router(customer_device_router)
+app.include_router(admin_support_desk_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (

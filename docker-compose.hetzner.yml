@@ -51,6 +51,13 @@ services:
       MPESA_B2B_DAILY_PAYOUT_ENABLED: ${MPESA_B2B_DAILY_PAYOUT_ENABLED:-false}
       FEEDBACK_AI_ENABLED: ${FEEDBACK_AI_ENABLED:-false}
       PYTHONDONTWRITEBYTECODE: "1"
+      SUPPORT_DESK_SNAPSHOT_PATH: /srv/support-desk/snapshot.json
+    volumes:
+      # Support desk snapshot pushed from Dennis's laptop over root SSH
+      # (tmp + mv into this host dir). Mount the DIRECTORY, not the file: an
+      # atomic mv swaps the inode, and a file bind mount would keep serving
+      # the old one. Read-only; served by GET /api/admin/support-desk.
+      - ${SUPPORT_DESK_HOST_DIR:-/opt/isp-billing-shadow/support-desk}:/srv/support-desk:ro
     ports:
       - "127.0.0.1:${HETZNER_WEB_PORT:-8000}:8000"
     extra_hosts:
