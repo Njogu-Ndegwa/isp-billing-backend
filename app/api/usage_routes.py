@@ -652,13 +652,8 @@ async def get_router_live(
     )
 
 
-@router.get("/api/realtime/routers", response_model=list[int])
-async def list_live_router_ids(
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(verify_token),
-):
-    """Ids of the caller's routers that are reporting live right now."""
-    user = await get_current_user(token, db)
+async def _live_router_ids_for(db: AsyncSession, user) -> list[int]:
+    """The caller's routers that have sent a real-time report in the last 5 min."""
     ids = [
         rid for rid in realtime_state.pilot_router_ids()
         if (state := realtime_state.get_router_live(rid)) is not None
@@ -670,3 +665,54 @@ async def list_live_router_ids(
     if user.role != UserRole.ADMIN:
         stmt = stmt.where(Router.user_id == user.id)
     return sorted((await db.execute(stmt)).scalars().all())
+
+
+@router.get("/api/realtime/routers", response_model=list[int])
+async def list_live_router_ids(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Ids of the caller's routers that are reporting live right now."""
+    user = await get_current_user(token, db)
+    return await _live_router_ids_for(db, user)
+
+
+class RealtimeOnlineOut(BaseModel):
+    router_ids: list[int]
+    online_customer_ids: list[int]
+
+
+@router.get("/api/realtime/customers/online", response_model=RealtimeOnlineOut)
+async def list_realtime_online_customers(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Which of the caller's customers are online right now on live routers.
+
+    Feeds the Online / Offline filter on the Customers page. Only routers on
+    real-time push are covered (``router_ids``, the same set as
+    ``/api/realtime/routers``); a customer on one of them who is not in
+    ``online_customer_ids`` is offline. Customers on other routers are left to
+    the per-router hotspot / PPPoE monitor endpoints.
+
+    Answered from the push state in memory plus one customer query: no RouterOS
+    calls, however many customers the reseller has. Scoped to the caller's own
+    customers, like ``/api/customers``.
+    """
+    user = await get_current_user(token, db)
+    router_ids = await _live_router_ids_for(db, user)
+    if not router_ids:
+        return RealtimeOnlineOut(router_ids=[], online_customer_ids=[])
+
+    customers = (
+        await db.execute(
+            select(Customer)
+            .options(selectinload(Customer.plan))
+            .where(Customer.user_id == user.id, Customer.router_id.in_(router_ids))
+        )
+    ).scalars().all()
+    online_ids = sorted(
+        c.id for c in customers
+        if (live := _live_for(c)) is not None and live.online
+    )
+    return RealtimeOnlineOut(router_ids=router_ids, online_customer_ids=online_ids)
