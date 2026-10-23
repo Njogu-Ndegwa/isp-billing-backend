@@ -49,7 +49,7 @@ _PHONE_RE = re.compile(r"^\+?[0-9 ]{9,16}$")
 _REVIEWED_FIELDS = {
     "title", "description", "image_url", "seller_name", "seller_location",
     "phone_number", "whatsapp_number", "price", "media_type", "video_url",
-    "poster_url", "category",
+    "poster_url", "category", "placement",
 }
 
 
@@ -115,6 +115,7 @@ class AdCreateRequest(BaseModel):
 
 
 class AdUpdateRequest(BaseModel):
+    advertiser_id: Optional[int] = None     # admin only; Bitwave ads
     title: Optional[str] = None
     description: Optional[str] = None
     image_url: Optional[str] = None
@@ -235,7 +236,7 @@ async def _load_owned_ad(db: AsyncSession, user: User, ad_id: int) -> Ad:
     return ad
 
 
-def _serialize_manage(ad: Ad, stats: Optional[dict] = None) -> dict:
+def _serialize_manage(ad: Ad, stats: Optional[dict] = None, owner_name: Optional[str] = None) -> dict:
     stats = stats or {}
     return {
         "id": ad.id,
@@ -262,6 +263,8 @@ def _serialize_manage(ad: Ad, stats: Optional[dict] = None) -> dict:
         "bg_color": ad.bg_color,
         "slot": ad.slot,
         "owner_user_id": ad.owner_user_id,
+        # Who to show as the owner: the reseller's business, or Bitwave.
+        "owner_name": owner_name if ad.owner_user_id is not None else "Bitwave",
         "router_ids": normalize_router_ids(ad.router_ids),
         "status": ad.status,
         "review_note": ad.review_note,
@@ -288,6 +291,16 @@ async def _event_totals(db: AsyncSession, ad_ids: list[int], days: int = 30) -> 
     for ad_id, event_type, n in rows:
         totals.setdefault(ad_id, {})[event_type] = n
     return totals
+
+
+async def _owner_names(db: AsyncSession, owner_ids) -> dict:
+    ids = {i for i in owner_ids if i is not None}
+    if not ids:
+        return {}
+    rows = (await db.execute(
+        select(User.id, User.business_name, User.organization_name).where(User.id.in_(ids))
+    )).all()
+    return {uid: (business or org) for uid, business, org in rows}
 
 
 def _apply_fields(ad: Ad, data: dict) -> None:
@@ -400,17 +413,25 @@ async def get_advertisers(
 async def list_manage_ads(
     status: Optional[str] = None,
     placement: Optional[str] = None,
+    owner_user_id: Optional[int] = None,
+    bitwave_only: bool = False,
     page: int = 1,
     per_page: int = 50,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Admins see every ad; a reseller sees their own. ?status=pending is the review queue."""
+    """Admins see every ad; a reseller sees their own. ?status=pending is the
+    review queue. Admins can narrow to one reseller (?owner_user_id=) or to
+    Bitwave's own ads (?bitwave_only=true)."""
     user = await get_current_user(token, db)
     page, per_page = max(page, 1), min(max(per_page, 1), 100)
     q = select(Ad)
     if not _is_admin(user):
         q = q.where(Ad.owner_user_id == user.id)
+    elif bitwave_only:
+        q = q.where(Ad.owner_user_id == None)  # noqa: E711
+    elif owner_user_id is not None:
+        q = q.where(Ad.owner_user_id == owner_user_id)
     if status:
         q = q.where(Ad.status == _check_choice(status, STATUSES, "status"))
     if placement:
@@ -420,8 +441,9 @@ async def list_manage_ads(
         q.order_by(Ad.created_at.desc(), Ad.id.desc()).offset((page - 1) * per_page).limit(per_page)
     )).scalars().all()
     totals = await _event_totals(db, [a.id for a in ads])
+    names = await _owner_names(db, [a.owner_user_id for a in ads])
     return {
-        "ads": [_serialize_manage(a, totals.get(a.id)) for a in ads],
+        "ads": [_serialize_manage(a, totals.get(a.id), names.get(a.owner_user_id)) for a in ads],
         "pagination": {
             "page": page, "per_page": per_page, "total": total,
             "total_pages": (total + per_page - 1) // per_page,
@@ -438,7 +460,8 @@ async def get_manage_ad(
     user = await get_current_user(token, db)
     ad = await _load_owned_ad(db, user, ad_id)
     totals = await _event_totals(db, [ad.id])
-    return _serialize_manage(ad, totals.get(ad.id))
+    names = await _owner_names(db, [ad.owner_user_id])
+    return _serialize_manage(ad, totals.get(ad.id), names.get(ad.owner_user_id))
 
 
 @router.post("/api/ads")
@@ -504,6 +527,15 @@ async def update_ad(
     admin = _is_admin(user)
 
     data = request.model_dump(exclude_unset=True)
+    if "advertiser_id" in data:
+        advertiser_id = data.pop("advertiser_id")
+        if not admin or ad.owner_user_id is not None:
+            raise HTTPException(status_code=400, detail="Only Bitwave ads can be linked to an advertiser")
+        if advertiser_id is not None:
+            found = (await db.execute(select(Advertiser.id).where(Advertiser.id == advertiser_id))).scalar_one_or_none()
+            if not found:
+                raise HTTPException(status_code=404, detail="Advertiser not found")
+        ad.advertiser_id = advertiser_id
     slot = data.pop("slot", None)
     if slot is not None:
         allowed = ("platform",) if ad.owner_user_id is None else ("house", "reseller")
@@ -514,13 +546,16 @@ async def update_ad(
         data.pop("priority", None)
     is_active = data.pop("is_active", None)
 
+    before = {f: getattr(ad, f) for f in _REVIEWED_FIELDS}
     _apply_fields(ad, data)
     _check_media_complete(ad)
     if is_active is not None:
         ad.is_active = bool(is_active)
 
     # A reseller changing what customers see goes back to the review queue.
-    if not admin and _REVIEWED_FIELDS & set(data) and ad.status != "pending":
+    # Compared by value, so re-saving the form unchanged keeps it live.
+    changed = any(getattr(ad, f) != before[f] for f in _REVIEWED_FIELDS)
+    if not admin and changed and ad.status != "pending":
         ad.status = "pending"
         ad.review_note = None
         ad.reviewed_at = None
@@ -530,7 +565,8 @@ async def update_ad(
     await db.refresh(ad)
     await invalidate_ad_cache()
     totals = await _event_totals(db, [ad.id])
-    return _serialize_manage(ad, totals.get(ad.id))
+    names = await _owner_names(db, [ad.owner_user_id])
+    return _serialize_manage(ad, totals.get(ad.id), names.get(ad.owner_user_id))
 
 
 @router.delete("/api/ads/{ad_id}")

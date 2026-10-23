@@ -351,3 +351,55 @@ def test_upload_slot_checks_type_and_size(monkeypatch):
     assert "X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost" in ticket.upload_url
     assert ticket.public_url.startswith("https://isp.example.com/media/ads/")
     assert ticket.public_url.endswith(".mp4")
+
+
+# ---------------------------------------------------------------------------
+# Review triggers, owner names and filters
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resaving_unchanged_values_keeps_the_ad_live(client, db, monkeypatch):
+    reseller = await _reseller(db)
+    ad = await _ad(db, owner_user_id=reseller.id, slot="house", status="approved")
+    _auth_as(monkeypatch, reseller)
+    r = await client.put(f"/api/ads/{ad.id}", json={"title": ad.title, "phone_number": ad.phone_number})
+    assert r.json()["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_moving_an_ad_into_the_hero_is_reviewed(client, db, monkeypatch):
+    reseller = await _reseller(db)
+    ad = await _ad(db, owner_user_id=reseller.id, slot="house", status="approved", placement="local")
+    _auth_as(monkeypatch, reseller)
+    r = await client.put(f"/api/ads/{ad.id}", json={"placement": "hero"})
+    assert r.json()["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_admin_list_names_owners_and_filters_by_owner(client, db, monkeypatch):
+    a = await make_reseller(db, subscription_status=SubscriptionStatus.ACTIVE, business_name="Acme WiFi")
+    b = await _reseller(db)
+    await _ad(db, owner_user_id=a.id, slot="house")
+    await _ad(db, owner_user_id=b.id, slot="house")
+    await _ad(db)  # Bitwave's
+    _auth_as(monkeypatch, await make_admin(db))
+
+    only_a = (await client.get(f"/api/ads/manage?owner_user_id={a.id}")).json()["ads"]
+    assert [x["owner_name"] for x in only_a] == ["Acme WiFi"]
+    ours = (await client.get("/api/ads/manage?bitwave_only=true")).json()["ads"]
+    assert [x["owner_name"] for x in ours] == ["Bitwave"]
+
+
+@pytest.mark.asyncio
+async def test_only_bitwave_ads_can_be_relinked_to_an_advertiser(client, db, monkeypatch):
+    from app.db.models import Advertiser
+    adv = Advertiser(name="Wanjiku", phone_number="0712000111")
+    db.add(adv)
+    await db.commit()
+    reseller = await _reseller(db)
+    theirs = await _ad(db, owner_user_id=reseller.id, slot="house")
+    ours = await _ad(db)
+
+    _auth_as(monkeypatch, await make_admin(db))
+    assert (await client.put(f"/api/ads/{ours.id}", json={"advertiser_id": adv.id})).json()["advertiser_id"] == adv.id
+    assert (await client.put(f"/api/ads/{theirs.id}", json={"advertiser_id": adv.id})).status_code == 400

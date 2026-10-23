@@ -35,6 +35,7 @@ Hero ads are ordered platform → reseller → house, at most 3.
   "bg_color": "#14532D",
   "slot": "house",                // "platform" | "reseller" | "house"
   "owner_user_id": 7,             // null = Bitwave
+  "owner_name": "Acme WiFi",      // reseller's business name, or "Bitwave"
   "router_ids": [50, 51],         // null = all the owner's routers (network-wide for Bitwave)
   "status": "pending",            // "pending" | "approved" | "rejected"
   "review_note": null, "reviewed_at": null,
@@ -50,10 +51,10 @@ Hero ads are ordered platform → reseller → house, at most 3.
 
 | Method & path | Body / query | Notes |
 |---|---|---|
-| `GET /api/ads/manage` | `?status=pending&placement=hero&page=1&per_page=50` | `{ads: [Ad], pagination}`. `status=pending` is the admin review queue. |
+| `GET /api/ads/manage` | `?status=pending&placement=hero&owner_user_id=7&bitwave_only=true&page=1&per_page=50` | `{ads: [Ad], pagination}`. `status=pending` is the admin review queue; `owner_user_id` / `bitwave_only` are admin filters. |
 | `GET /api/ads/manage/{id}` | | one Ad; 404 for someone else's |
 | `POST /api/ads` | Ad fields: required `title`, `seller_name`, `phone_number`; a photo ad needs `image_url`, a video ad `video_url` (+ `poster_url`). Optional `slot`, `router_ids`, `starts_at`, `expires_at` (ISO), `advertiser_id` (admin only), `priority` (admin only) | returns the Ad |
-| `PUT /api/ads/{id}` | any subset of the create fields, plus `is_active` | returns the Ad |
+| `PUT /api/ads/{id}` | any subset of the create fields, plus `is_active`; `advertiser_id` (admin, Bitwave ads only) | returns the Ad. A reseller's ad goes back to pending only when a customer-visible value actually changes (placement included). |
 | `DELETE /api/ads/{id}` | | |
 | `POST /api/ads/{id}/review` | `{action: "approve" \| "reject", note}` | admin only; `reject` needs a `note` (shown to the reseller) |
 | `GET /api/ads/{id}/stats` | `?days=30` | `{impressions, clicks, by_placement: {hero: {impressions, clicks}, wait_screen…}, daily: [{day, impressions, clicks}]}` |
