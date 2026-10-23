@@ -2207,6 +2207,11 @@ class CustomerExpirySmsSettings(Base):
     enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     reminder_offsets_minutes = Column(JSON, nullable=False, default=lambda: [1440])
     send_at_expiry = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Expiry reminders and the at-expiry message go to hotspot customers too
+    # unless the reseller turns this off (PPPoE and static always get them).
+    # Defaults on so resellers who never touch it keep the original behaviour.
+    expiry_include_hotspot = Column(Boolean, nullable=False, default=True,
+                                    server_default="true")
     # "Payment received, active until ..." after every recorded payment.
     payment_receipt_enabled = Column(Boolean, nullable=False, default=False,
                                      server_default="false")

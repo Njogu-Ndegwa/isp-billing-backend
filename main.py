@@ -2343,6 +2343,12 @@ async def run_messaging_migrations():
             "ADD COLUMN IF NOT EXISTS welcome_enabled BOOLEAN NOT NULL DEFAULT false, "
             "ADD COLUMN IF NOT EXISTS custom_templates JSON NULL"
         ))
+        # Expiry reminders can skip hotspot customers. Existing rows default
+        # to true so nothing changes for resellers who don't touch it.
+        await conn.execute(text(
+            "ALTER TABLE customer_expiry_sms_settings "
+            "ADD COLUMN IF NOT EXISTS expiry_include_hotspot BOOLEAN NOT NULL DEFAULT true"
+        ))
         # --- Per-tenant gateway accounts -------------------------------
         # A reseller on their own SMS gateway gets a row in
         # messaging_provider_accounts; user_id NULL is the platform default.
