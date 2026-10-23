@@ -424,3 +424,105 @@ async def test_validation_rejects_unknown_account(db):
     payload = _make_payload(trans_id="V003", bill_ref=_valid_account("9999999"), amount=500)
     result = await handle_validation(payload, db)
     assert result == REJECT_INVALID_ACCOUNT
+
+
+# ---------------------------------------------------------------------------
+# Prompt (STK) echoes: Safaricom posts a C2B confirmation for every prompt
+# payment into a registered paybill. Before direct-settlement resellers'
+# paybills are registered, an echo must never credit twice or flood the
+# reseller's unmatched queue.
+# ---------------------------------------------------------------------------
+
+
+async def _record_prompt_payment(db, customer, receipt):
+    db.add(CustomerPayment(
+        customer_id=customer.id, reseller_id=customer.user_id, amount=500,
+        payment_method="MOBILE_MONEY", payment_reference=receipt, days_paid_for=30,
+        status="COMPLETED",
+    ))
+    await db.commit()
+
+
+async def test_prompt_echo_with_valid_account_is_not_credited_twice(db, session_factory):
+    expiry = datetime.utcnow() + timedelta(days=30)
+    _, _, _, customer = await _seed_pppoe_customer(db, expiry=expiry)
+    await _record_prompt_payment(db, customer, "UKECHO001")
+    payload = _make_payload(trans_id="UKECHO001", bill_ref=customer.account_number, amount=500)
+    bg, queued = _make_bg()
+
+    with patch("app.services.c2b_handler.call_pppoe_provision", new=AsyncMock()):
+        result = await handle_confirmation(payload, db, background_tasks=bg)
+
+    assert result == SUCCESS_RESPONSE
+    async with session_factory() as s:
+        txn = (await s.execute(select(C2BTransaction).where(
+            C2BTransaction.trans_id == "UKECHO001"))).scalar_one()
+        assert txn.status == C2BTransactionStatus.DUPLICATE
+        payments = (await s.execute(select(CustomerPayment).where(
+            CustomerPayment.payment_reference == "UKECHO001"))).scalars().all()
+        assert len(payments) == 1  # only the prompt's own record
+        refreshed = await s.get(Customer, customer.id)
+        assert abs((refreshed.expiry - expiry).total_seconds()) < 2  # not extended again
+        assert (await s.execute(select(UnmatchedC2BPayment))).scalars().all() == []
+    assert queued == []
+
+
+async def test_prompt_echo_with_business_name_reference_is_not_queued(db, session_factory):
+    """Prompts put the reseller's business name in AccountReference, which
+    fails Luhn; before this fix every one of them became an unmatched row."""
+    _, _, _, customer = await _seed_pppoe_customer(db)
+    await _record_prompt_payment(db, customer, "UKECHO002")
+    payload = _make_payload(trans_id="UKECHO002", bill_ref="TECH ISP", amount=500)
+
+    await handle_confirmation(payload, db, background_tasks=_make_bg()[0])
+
+    async with session_factory() as s:
+        txn = (await s.execute(select(C2BTransaction).where(
+            C2BTransaction.trans_id == "UKECHO002"))).scalar_one()
+        assert txn.status == C2BTransactionStatus.DUPLICATE
+        assert (await s.execute(select(UnmatchedC2BPayment))).scalars().all() == []
+
+
+async def test_payment_on_resellers_registered_paybill_activates_as_direct(db, session_factory):
+    reseller, _, _, customer = await _seed_pppoe_customer(db)
+    db.add(ResellerPaymentMethod(
+        user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
+        label="Own", is_active=True, mpesa_shortcode="4699342",
+        c2b_registered_at=datetime.utcnow(),
+    ))
+    await db.commit()
+    payload = _make_payload(trans_id="UKOWN001", bill_ref=customer.account_number,
+                            amount=500, shortcode="4699342")
+
+    with patch("app.services.c2b_handler.call_pppoe_provision", new=AsyncMock()):
+        await handle_confirmation(payload, db, background_tasks=_make_bg()[0])
+
+    async with session_factory() as s:
+        refreshed = await s.get(Customer, customer.id)
+        assert refreshed.status == CustomerStatus.ACTIVE
+        payment = (await s.execute(select(CustomerPayment).where(
+            CustomerPayment.payment_reference == "UKOWN001"))).scalar_one()
+        # The money went to the reseller's own paybill: never paid out again.
+        assert payment.collection_mode.value == "direct"
+
+
+async def test_two_active_methods_with_one_shortcode_do_not_break_confirmation(db, session_factory):
+    reseller, _, _, customer = await _seed_pppoe_customer(db)
+    for registered in (None, datetime.utcnow()):
+        db.add(ResellerPaymentMethod(
+            user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
+            label="Own", is_active=True, mpesa_shortcode="4699342",
+            c2b_registered_at=registered,
+        ))
+    await db.commit()
+    payload = _make_payload(trans_id="UKDUP001", bill_ref=customer.account_number,
+                            amount=500, shortcode="4699342")
+
+    with patch("app.services.c2b_handler.call_pppoe_provision", new=AsyncMock()):
+        result = await handle_confirmation(payload, db, background_tasks=_make_bg()[0])
+
+    assert result == SUCCESS_RESPONSE
+    async with session_factory() as s:
+        txn = (await s.execute(select(C2BTransaction).where(
+            C2BTransaction.trans_id == "UKDUP001"))).scalar_one()
+        assert txn.status == C2BTransactionStatus.PROCESSED
