@@ -1913,7 +1913,8 @@ class PortalSettings(Base):
 
     # ── Theme ────────────────────────────────────────────────────────────────
     # Preselected options: ocean_blue | emerald_green | sunset_orange |
-    #                      midnight_purple | rose_gold | slate_gray
+    #                      bright_violet | rose_gold | slate_gray
+    # (legacy midnight_purple is still accepted, see portal_routes.LEGACY_THEMES)
     color_theme = Column(String(50), nullable=False, default="slate_gray", server_default="slate_gray")
 
     # ── Header section ───────────────────────────────────────────────────────

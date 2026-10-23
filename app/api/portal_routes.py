@@ -23,14 +23,25 @@ router = APIRouter(tags=["portal"])
 # Supported preset values (validated in Pydantic models)
 # ─────────────────────────────────────────────────────────────────────────────
 
-VALID_THEMES = {
+# The themes the admin app offers (isp-frontend-admin portalThemes.ts) and the
+# captive portal can paint (isp-frontend script.js THEMES). Keep all three in
+# step: the admin app renamed midnight_purple to bright_violet and the backend
+# never followed, so saving "Bright Violet" was rejected with a 422.
+OFFERED_THEMES = {
     "ocean_blue",
     "emerald_green",
     "sunset_orange",
-    "midnight_purple",
+    "bright_violet",
     "rose_gold",
     "slate_gray",
 }
+
+# Still accepted so rows saved before the rename keep validating when the
+# admin app re-sends them, but no longer advertised. Stored values are never
+# rewritten.
+LEGACY_THEMES = {"midnight_purple"}
+
+VALID_THEMES = OFFERED_THEMES | LEGACY_THEMES
 
 VALID_HEADER_STYLES = {"standard", "minimal", "hero", "compact"}
 VALID_LANGUAGES = {"en", "sw", "fr"}
@@ -85,7 +96,7 @@ class PortalSettingsUpdate(BaseModel):
     @classmethod
     def validate_theme(cls, v):
         if v is not None and v not in VALID_THEMES:
-            raise ValueError(f"color_theme must be one of: {', '.join(sorted(VALID_THEMES))}")
+            raise ValueError(f"color_theme must be one of: {', '.join(sorted(OFFERED_THEMES))}")
         return v
 
     @field_validator("header_style")
@@ -197,7 +208,7 @@ async def get_portal_settings(
     settings = await _get_or_create_settings(db, user.id)
     return {
         "settings": _settings_to_dict(settings),
-        "available_themes": sorted(VALID_THEMES),
+        "available_themes": sorted(OFFERED_THEMES),
         "available_header_styles": sorted(VALID_HEADER_STYLES),
         "available_languages": sorted(VALID_LANGUAGES),
         "available_announcement_types": sorted(VALID_ANNOUNCEMENT_TYPES),
