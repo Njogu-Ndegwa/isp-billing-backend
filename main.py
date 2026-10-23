@@ -138,6 +138,7 @@ from app.api.outage_compensation_routes import router as outage_compensation_rou
 from app.api.impersonation_routes import router as impersonation_router
 from app.api.static_ip_import_routes import router as static_ip_import_router
 from app.api.customer_device_routes import router as customer_device_router
+from app.api.admin_support_desk_routes import router as admin_support_desk_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -192,6 +193,7 @@ app.include_router(outage_compensation_router)
 app.include_router(impersonation_router)
 app.include_router(static_ip_import_router)
 app.include_router(customer_device_router)
+app.include_router(admin_support_desk_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -3174,6 +3176,27 @@ async def run_customer_event_migrations():
     logger.info("Customer event migrations complete")
 
 
+async def run_support_desk_migrations():
+    """WhatsApp support desk snapshot (app/api/admin_support_desk_routes.py):
+    one NEW single-row table, support_desk_snapshots, via the checkfirst
+    create_all pattern. Safe to run on every startup.
+    """
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+
+        from app.db.models import SupportDeskSnapshot
+        # Explicit startup create_all target: support_desk_snapshots.
+        if SupportDeskSnapshot.__tablename__ not in tables:
+            await conn.run_sync(
+                lambda c: Base.metadata.create_all(c, tables=[SupportDeskSnapshot.__table__])
+            )
+            logger.info("Support desk migration: created support_desk_snapshots")
+
+    logger.info("Support desk migrations complete")
+
+
 async def run_customer_audit_index_migrations():
     """Indexes for the per-customer audit log's reads (Postgres only).
 
@@ -3508,6 +3531,11 @@ async def startup_event():
         await run_customer_audit_index_migrations()
     except Exception as e:
         logger.error(f"Customer audit index migration failed (non-fatal): {e}")
+
+    try:
+        await run_support_desk_migrations()
+    except Exception as e:
+        logger.error(f"Support desk migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
     if not scheduler_enabled():

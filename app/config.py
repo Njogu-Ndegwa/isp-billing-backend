@@ -333,6 +333,16 @@ class Settings(BaseSettings):
     FEEDBACK_REPLY_MODEL: str = "claude-opus-4-8"
     FEEDBACK_DAILY_POST_CAP: int = 15
 
+    # --- Support desk snapshot (platform admin only) ----------------------
+    # Dennis's laptop builds the WhatsApp support dashboard JSON and POSTs it
+    # to /api/admin/support-desk/snapshot with this bearer token. Empty (the
+    # default) or shorter than SUPPORT_DESK_INGEST_TOKEN_MIN_LENGTH means the
+    # ingest endpoint is disabled and answers 503. Server env only, never
+    # committed. Generate with: openssl rand -hex 32
+    SUPPORT_DESK_INGEST_TOKEN: str = ""
+    SUPPORT_DESK_INGEST_TOKEN_MIN_LENGTH: int = 32
+    SUPPORT_DESK_SNAPSHOT_MAX_BYTES: int = 2 * 1024 * 1024
+
     # --- Transactional email (password reset) ----------------------------
     # Credentials live in the server .env only — never committed.
     # SMTP is preferred when SMTP_HOST is set (e.g. smtp.gmail.com + app

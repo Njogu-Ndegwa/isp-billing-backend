@@ -2793,3 +2793,21 @@ class ImpersonationSession(Base):
     ip_address = Column(String(64), nullable=True)
     user_agent = Column(String(300), nullable=True)
     request_count = Column(Integer, nullable=False, default=0, server_default="0")
+
+
+class SupportDeskSnapshot(Base):
+    """Latest WhatsApp support dashboard snapshot pushed from Dennis's laptop.
+
+    One row only (id=1), overwritten on every push to
+    POST /api/admin/support-desk/snapshot and read by the platform-admin-only
+    GET /api/admin/support-desk. ``payload`` is already privacy-masked on the
+    laptop and masked again on ingest (app/services/support_desk.py), so the
+    table never holds phone numbers, emails or WhatsApp JIDs.
+    """
+    __tablename__ = "support_desk_snapshots"
+    id = Column(Integer, primary_key=True)
+    payload = Column(JSON, nullable=False)
+    received_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    size_bytes = Column(Integer, nullable=False, default=0)
+    sha256 = Column(String(64), nullable=False)
+    masked_count = Column(Integer, nullable=False, default=0)
