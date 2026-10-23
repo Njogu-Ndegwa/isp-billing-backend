@@ -552,7 +552,17 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                     customer.router_id,
                     customer.mac_address,
                 )
-            
+
+            # A paybill with C2B URLs registered also sends a C2B copy of this
+            # receipt; if it beat this callback it sits in the reseller's
+            # unmatched list. Retire it (own session, never raises).
+            from app.services.c2b_handler import mark_stk_echo_after_stk_payment
+            await mark_stk_echo_after_stk_payment(
+                receipt_number,
+                customer_id=customer.id,
+                reseller_id=customer.user_id,
+            )
+
             return {"ResultCode": 0, "ResultDesc": "Payment processed successfully"}
         
         else:
@@ -1575,6 +1585,9 @@ async def get_mpesa_transactions(
                 ))
                 .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(C2BTransaction.matched_reseller_id == user.id)
+                # An STK echo is the C2B copy of an STK payment that Query 1
+                # already lists; showing it again would double the sale.
+                .where(C2BTransaction.status != C2BTransactionStatus.STK_ECHO)
             )
             if router_id:
                 c2b_stmt = c2b_stmt.where(Router.id == router_id)

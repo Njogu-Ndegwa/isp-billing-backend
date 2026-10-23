@@ -2182,9 +2182,15 @@ async def run_c2b_migrations():
         await conn.execute(sa_text("""
             DO $$ BEGIN
                 CREATE TYPE c2btransactionstatus AS ENUM
-                    ('processed', 'unmatched', 'rejected', 'duplicate');
+                    ('processed', 'unmatched', 'rejected', 'duplicate', 'stk_echo');
             EXCEPTION WHEN duplicate_object THEN null; END $$;
         """))
+        # The production type predates 'stk_echo' and the CREATE TYPE above
+        # no-ops on it, so add the label explicitly (native enums never gain a
+        # label implicitly; see 'timeout' on b2btransactionstatus, 2026-07-18).
+        await conn.execute(sa_text(
+            "ALTER TYPE c2btransactionstatus ADD VALUE IF NOT EXISTS 'stk_echo'"
+        ))
         await conn.execute(sa_text("""
             DO $$ BEGIN
                 CREATE TYPE unmatchedc2breason AS ENUM
@@ -2958,6 +2964,8 @@ async def run_hot_path_index_migrations():
         "ix_mpesa_txn_status_created",
         "ix_mpesa_txn_customer_created",
         "ix_customer_payments_customer_status",
+        "ix_mpesa_txn_receipt_number",
+        "ix_customer_payments_payment_reference",
     )
     async with async_engine.connect() as conn:
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -3044,6 +3052,29 @@ async def run_hot_path_index_migrations():
                     ix_customer_payments_customer_status
                 ON public.customer_payments (customer_id, status)
             """))
+
+            # Receipt lookups for the STK-echo guard: every C2B confirmation
+            # checks whether its TransID was already credited by an STK push
+            # (mpesa_transactions.mpesa_receipt_number) or recorded as a
+            # payment (customer_payments.payment_reference). Both tables are
+            # 300k+ rows in production; without these each confirmation
+            # would scan them in full.
+            for receipt_index, receipt_table, receipt_column in (
+                ("ix_mpesa_txn_receipt_number", "mpesa_transactions", "mpesa_receipt_number"),
+                ("ix_customer_payments_payment_reference", "customer_payments", "payment_reference"),
+            ):
+                result = await conn.execute(sa_text(
+                    "SELECT indisvalid FROM pg_index "
+                    f"WHERE indexrelid = to_regclass('public.{receipt_index}')"
+                ))
+                if result.scalar_one_or_none() is False:
+                    await conn.execute(sa_text(
+                        f"DROP INDEX CONCURRENTLY IF EXISTS public.{receipt_index}"
+                    ))
+                await conn.execute(sa_text(
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {receipt_index} "
+                    f"ON public.{receipt_table} ({receipt_column})"
+                ))
         finally:
             await conn.execute(sa_text("RESET max_parallel_maintenance_workers"))
             await conn.execute(sa_text("RESET maintenance_work_mem"))

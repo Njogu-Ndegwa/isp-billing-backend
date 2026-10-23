@@ -1989,6 +1989,11 @@ class C2BTransactionStatus(str, enum.Enum):
     UNMATCHED = "unmatched"    # Account number unknown / amount too low — needs human attention
     REJECTED = "rejected"      # Paybill shortcode didn't resolve to anyone we know
     DUPLICATE = "duplicate"    # Safaricom retry — same TransID seen before, no-op
+    # Safaricom's C2B copy of an STK push on a paybill that has C2B URLs
+    # registered. The STK callback already credited this receipt, so the C2B
+    # copy is archived for audit only: no payment, no wallet change, never
+    # shown to the reseller as an unmatched payment.
+    STK_ECHO = "stk_echo"
 
 
 class UnmatchedC2BReason(str, enum.Enum):

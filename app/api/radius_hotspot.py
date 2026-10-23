@@ -703,6 +703,15 @@ async def radius_mpesa_callback(payload: dict, db: AsyncSession = Depends(get_db
                 )
                 await db.commit()
 
+            # Retire a C2B copy of this receipt that arrived before the STK
+            # callback (paybills with C2B URLs registered send both).
+            from app.services.c2b_handler import mark_stk_echo_after_stk_payment
+            await mark_stk_echo_after_stk_payment(
+                receipt_number,
+                customer_id=customer.id,
+                reseller_id=customer.user_id,
+            )
+
             return {"ResultCode": 0, "ResultDesc": "RADIUS payment processed successfully"}
 
         else:
