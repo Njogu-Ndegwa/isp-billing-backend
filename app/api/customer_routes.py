@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta
 import asyncio
+import re
 import secrets
 import string
 
@@ -59,6 +60,33 @@ logger = logging.getLogger(__name__)
 
 # Strong references to detached grace-restore tasks (asyncio keeps only weak ones).
 _grace_restore_tasks: set[asyncio.Task] = set()
+
+
+def _generated_pppoe_username(phone: str) -> Optional[str]:
+    """Default PPPoE username for a phone number: ``pppoe_`` + its digits.
+
+    Only digits are kept, so a phone pasted with a tab, newline, dash,
+    bracket or "+" can never leak whitespace or punctuation into the router
+    login. Returns None when the phone has no digits at all.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    return f"pppoe_{digits}" if digits else None
+
+
+async def _pppoe_username_taken(
+    db: AsyncSession, username: str, exclude_customer_id: Optional[int] = None
+) -> bool:
+    """True if any customer already uses this PPPoE username.
+
+    There is no unique constraint on the column, so duplicates can exist;
+    ``.first()`` keeps the check a clean yes/no instead of raising
+    MultipleResultsFound (a 500) when they do.
+    """
+    stmt = select(Customer.id).where(Customer.pppoe_username == username)
+    if exclude_customer_id is not None:
+        stmt = stmt.where(Customer.id != exclude_customer_id)
+    result = await db.execute(stmt.limit(1))
+    return result.first() is not None
 
 
 def _generate_pppoe_password(length: int = 12) -> str:
@@ -236,19 +264,22 @@ async def register_customer_api(
             if existing_result.scalar_one_or_none():
                 raise HTTPException(status_code=409, detail="Customer with this MAC address already exists")
         
+        phone = request.phone.strip()
         pppoe_username = request.pppoe_username.strip() if request.pppoe_username else None
         pppoe_password = request.pppoe_password
 
         if plan.connection_type == ConnectionType.PPPOE:
             if not pppoe_username:
-                clean_phone = request.phone.replace("+", "").replace(" ", "")
-                pppoe_username = f"pppoe_{clean_phone}"
+                pppoe_username = _generated_pppoe_username(phone)
+                if not pppoe_username:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Enter a PPPoE username, or a phone number with digits to generate one",
+                    )
             if not pppoe_password:
                 pppoe_password = _generate_pppoe_password()
 
-            existing_pppoe = select(Customer).where(Customer.pppoe_username == pppoe_username)
-            existing_pppoe_result = await db.execute(existing_pppoe)
-            if existing_pppoe_result.scalar_one_or_none():
+            if await _pppoe_username_taken(db, pppoe_username):
                 raise HTTPException(
                     status_code=409,
                     detail=f"PPPoE username '{pppoe_username}' already exists"
@@ -259,7 +290,7 @@ async def register_customer_api(
         # Create customer
         customer = Customer(
             name=request.name,
-            phone=request.phone,
+            phone=phone,
             mac_address=mac_address,
             pppoe_username=pppoe_username,
             pppoe_password=pppoe_password,
@@ -400,12 +431,9 @@ async def edit_customer(
             and normalized_pppoe_username
             and normalized_pppoe_username != customer.pppoe_username
         ):
-            pppoe_stmt = select(Customer).where(
-                Customer.pppoe_username == normalized_pppoe_username,
-                Customer.id != customer_id,
-            )
-            pppoe_result = await db.execute(pppoe_stmt)
-            if pppoe_result.scalar_one_or_none():
+            if await _pppoe_username_taken(
+                db, normalized_pppoe_username, exclude_customer_id=customer_id
+            ):
                 raise HTTPException(
                     status_code=409,
                     detail=f"PPPoE username '{normalized_pppoe_username}' already exists",
@@ -460,6 +488,8 @@ async def edit_customer(
         pppoe_location_changed = False
 
         update_fields = request.model_dump(exclude_none=True)
+        if "phone" in update_fields:
+            update_fields["phone"] = update_fields["phone"].strip()
         if request.pppoe_username is not None:
             update_fields["pppoe_username"] = normalized_pppoe_username or None
         if request.pppoe_password is not None:
