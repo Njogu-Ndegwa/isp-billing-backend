@@ -42,7 +42,7 @@ from app.services.fup import evaluate_and_enforce
 from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI, normalize_mac_address
 from app.services.realtime_state import host_metered_router_ids
 from app.services.usage_counters import parse_queue_bytes, record_queue_usage_sample
-from app.services.usage_tracking import pooled_period_usage_bytes
+from app.services.usage_tracking import fup_usage_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -550,9 +550,12 @@ async def _persist_samples(samples: list[QueueSample], now: datetime) -> list[in
             used_bytes: Optional[int] = None
             if update.period:
                 used_bytes = int(update.period.total_bytes or 0)
-                if 0 < cap_bytes and used_bytes < cap_bytes:
-                    # A shared plan's cap covers all its devices together.
-                    used_bytes = await pooled_period_usage_bytes(db, customer, update.period)
+                if 0 < cap_bytes:
+                    # The plan's FUP window (period or today), pooled across a
+                    # shared plan's devices.
+                    used_bytes = await fup_usage_bytes(
+                        db, customer, update.period, plan=plan, now=now, cap_bytes=cap_bytes
+                    )
 
             interval, tier = _poll_schedule_for(update.period, plan, used_bytes=used_bytes)
             state.consecutive_errors = 0

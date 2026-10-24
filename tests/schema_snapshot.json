@@ -600,6 +600,7 @@
   "duration_unit",
   "duration_value",
   "fup_action",
+  "fup_period",
   "fup_throttle_profile",
   "id",
   "is_hidden",

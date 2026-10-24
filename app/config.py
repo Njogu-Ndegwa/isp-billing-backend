@@ -181,6 +181,9 @@ class Settings(BaseSettings):
     # "today" on a dashboard means the local calendar day (00:00 EAT -> now),
     # not a rolling 24h window. Kenya/EAT = UTC+3 and has no DST.
     LOCAL_UTC_OFFSET_HOURS: int = 3
+    # Local hour (0-23, in LOCAL_UTC_OFFSET_HOURS time) at which plans with
+    # fup_period='daily' start a fresh daily allowance. 0 = local midnight.
+    FUP_DAILY_RESET_HOUR: int = 0
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440

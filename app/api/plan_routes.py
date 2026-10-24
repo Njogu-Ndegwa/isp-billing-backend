@@ -23,6 +23,7 @@ from app.services.plan_cache import (
 )
 from app.services.subscription import enforce_active_subscription
 from app.services.payment_plan import payment_plan_id
+from app.services.usage_tracking import FUP_PERIOD_PLAN, FUP_PERIODS, plan_fup_period
 import logging
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,19 @@ def _parse_fup_action(value: Optional[str]) -> Optional[FupAction]:
             detail=f"Invalid fup_action. Must be one of: {', '.join(VALID_FUP_ACTIONS)}",
         )
     return FupAction(value.lower())
+
+
+def _parse_fup_period(value: Optional[str]) -> str:
+    """``"plan"`` (default, cap per paid period) or ``"daily"`` (cap per day)."""
+    if value is None or str(value).strip() == "":
+        return FUP_PERIOD_PLAN
+    normalized = str(value).strip().lower()
+    if normalized not in FUP_PERIODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid fup_period. Must be one of: {', '.join(FUP_PERIODS)}",
+        )
+    return normalized
 
 
 async def _loosen_open_period_caps(db: AsyncSession, plan_id: int, new_cap_mb: Optional[int]) -> int:
@@ -75,6 +89,7 @@ def _serialize_plan_fup(plan: Plan) -> dict:
         "data_cap_mb": plan.data_cap_mb,
         "fup_action": plan.fup_action.value if plan.fup_action else None,
         "fup_throttle_profile": plan.fup_throttle_profile,
+        "fup_period": plan_fup_period(plan),
     }
 
 
@@ -178,6 +193,9 @@ class PlanCreateRequest(BaseModel):
     data_cap_mb: Optional[int] = None
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
+    # "plan" (default): the cap covers the whole paid period. "daily": the cap
+    # covers each day and throttled customers get full speed back at the reset.
+    fup_period: Optional[str] = None
     max_shared_users: Optional[int] = 1
     # Omit or send null/[] to offer the plan on every router the reseller owns.
     router_ids: Optional[List[int]] = None
@@ -202,6 +220,7 @@ class PlanUpdateRequest(BaseModel):
     data_cap_mb: Optional[int] = None
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
+    fup_period: Optional[str] = None
     max_shared_users: Optional[int] = None
     # Send null/[] to revert the plan to "all routers". Only applied when the
     # field is actually present in the request body.
@@ -273,6 +292,7 @@ async def create_plan_api(
             raise HTTPException(status_code=409, detail="Plan with this name already exists")
         
         fup_action_enum = _parse_fup_action(request.fup_action)
+        fup_period = _parse_fup_period(request.fup_period)
         if request.data_cap_mb is not None and request.data_cap_mb < 0:
             raise HTTPException(status_code=400, detail="data_cap_mb cannot be negative")
         max_shared_users = _validate_max_shared_users(request.max_shared_users)
@@ -295,6 +315,7 @@ async def create_plan_api(
             data_cap_mb=request.data_cap_mb,
             fup_action=fup_action_enum,
             fup_throttle_profile=request.fup_throttle_profile,
+            fup_period=fup_period,
             max_shared_users=max_shared_users,
             router_ids=scoped_router_ids,
             trial_once_per_customer=(
@@ -478,6 +499,8 @@ async def update_plan_api(
             plan.fup_action = _parse_fup_action(request.fup_action)
         if "fup_throttle_profile" in fields_set:
             plan.fup_throttle_profile = request.fup_throttle_profile if request.fup_throttle_profile else None
+        if "fup_period" in fields_set:
+            plan.fup_period = _parse_fup_period(request.fup_period)
         previous_max_devices = int(plan.max_shared_users or 1)
         if request.max_shared_users is not None:
             plan.max_shared_users = _validate_max_shared_users(request.max_shared_users)

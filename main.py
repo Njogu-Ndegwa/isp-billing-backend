@@ -209,6 +209,7 @@ from app.services.mikrotik_background import (
     _cleanup_single_router_hotspot_sync,
 )
 from app.services.usage_cap_sampler import sample_capped_usage_background
+from app.services.fup_daily_reset import reset_daily_fup_background
 from app.services.mikrotik_lb_background import reconcile_lb_paid_background
 from app.services.payment_port_attribution import attribute_recent_payment_ports_background
 from app.services.router_status_alerts import scan_and_notify_offline_routers
@@ -1600,6 +1601,11 @@ async def run_fup_usage_migrations():
         ))
         await conn.execute(sa_text(
             "ALTER TABLE plans ADD COLUMN IF NOT EXISTS fup_throttle_profile VARCHAR(100) NULL"
+        ))
+        # Daily FUP (opt-in per plan). The default keeps every existing plan on
+        # the original per-plan-period cap.
+        await conn.execute(sa_text(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS fup_period VARCHAR(16) NOT NULL DEFAULT 'plan'"
         ))
 
         await conn.execute(sa_text(
@@ -3688,6 +3694,14 @@ async def startup_event():
         trigger=IntervalTrigger(seconds=19),
         id='usage_cap_sampler',
         name='Lightweight capped customer usage sampler',
+        replace_existing=True,
+        max_instances=1
+    )
+    scheduler.add_job(
+        reset_daily_fup_background,
+        trigger=IntervalTrigger(seconds=127),
+        id='fup_daily_reset',
+        name='Lift daily-FUP throttles left over from before the daily reset (daily plans only)',
         replace_existing=True,
         max_instances=1
     )

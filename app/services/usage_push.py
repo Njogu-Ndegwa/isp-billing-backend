@@ -64,7 +64,7 @@ from app.services.pppoe_sessions import resolve_extra_session_customer
 from app.services.static_ip import STATIC_KEY_PREFIX, normalize_static_ip
 from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
-from app.services.usage_tracking import pooled_period_usage_bytes
+from app.services.usage_tracking import fup_usage_bytes
 from app.services.customer_grace import has_access_time
 
 logger = logging.getLogger(__name__)
@@ -610,10 +610,11 @@ async def ingest_usage_reports(
                 and period.fup_triggered_at is None
                 and customer.id not in result.over_cap_customer_ids
             ):
-                used_bytes = int(period.total_bytes or 0)
-                if used_bytes < cap_bytes:
-                    # A shared plan's cap covers all its devices together.
-                    used_bytes = await pooled_period_usage_bytes(db, customer, period)
+                # The plan's FUP window (period or today), pooled across a
+                # shared plan's devices.
+                used_bytes = await fup_usage_bytes(
+                    db, customer, period, plan=plan, now=now, cap_bytes=cap_bytes
+                )
                 if used_bytes >= cap_bytes:
                     result.over_cap_customer_ids.append(customer.id)
 
