@@ -310,6 +310,11 @@ class Plan(Base):
         nullable=True,
     )
     fup_throttle_profile = Column(String(100), nullable=True)
+    # Window the data cap applies to: "plan" = the whole paid period (resets on
+    # renewal; the original behaviour and the default for every existing plan),
+    # "daily" = usage since the last local daily reset (settings.FUP_DAILY_RESET_HOUR),
+    # with throttled/blocked customers restored at the reset.
+    fup_period = Column(String(16), nullable=False, default="plan", server_default="plan")
     # Total customers/devices allowed on one paid subscription. 1 = no sharing.
     max_shared_users = Column(Integer, nullable=False, default=1, server_default="1")
     # Routers this plan is offered on, e.g. [12, 47]. NULL means "every router the

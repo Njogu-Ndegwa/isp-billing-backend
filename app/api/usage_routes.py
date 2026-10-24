@@ -27,7 +27,10 @@ from app.services.auth import verify_token, get_current_user
 from app.services.usage_tracking import (
     CUSTOMER_USAGE_BUCKET_RETENTION_DAYS,
     customer_bucket_start_for,
+    fup_usage_bytes,
+    fup_window_start,
     get_open_period,
+    plan_fup_period,
     pooled_period_usage_bytes,
 )
 
@@ -56,6 +59,11 @@ class PeriodOut(BaseModel):
     # is enforced against. None unless other devices on the plan have used data.
     shared_total_mb: Optional[float] = None
     shared_percent_used: Optional[float] = None
+    # Daily-FUP plans only (single-customer endpoint): the usage the cap is
+    # enforced against -- since today's reset, pooled for a shared plan.
+    fup_window_start: Optional[datetime] = None
+    fup_window_used_mb: Optional[float] = None
+    fup_window_percent_used: Optional[float] = None
 
 
 class LiveOut(BaseModel):
@@ -80,6 +88,8 @@ class UsageOut(BaseModel):
     plan_name: Optional[str]
     plan_data_cap_mb: Optional[int]
     plan_fup_action: Optional[str]
+    # "plan" = cap per paid period, "daily" = cap per day (see PeriodOut.fup_window_*).
+    plan_fup_period: Optional[str] = None
     period: Optional[PeriodOut]
     live: Optional[LiveOut] = None
 
@@ -210,6 +220,7 @@ def _serialize_usage(
         plan_name=plan.name if plan else None,
         plan_data_cap_mb=plan.data_cap_mb if plan else None,
         plan_fup_action=plan.fup_action.value if (plan and plan.fup_action) else None,
+        plan_fup_period=plan_fup_period(plan) if plan else None,
         period=_serialize_period(open_period) if open_period else None,
         live=_live_for(customer),
     )
@@ -253,6 +264,13 @@ async def get_customer_usage(
         if pooled != int(open_period.total_bytes or 0):
             usage.period.shared_total_mb = _bytes_to_mb(pooled)
             usage.period.shared_percent_used = _percent(pooled, open_period.cap_mb_snapshot)
+        now = datetime.utcnow()
+        window_start = fup_window_start(open_period, customer.plan, now)
+        if window_start is not None:
+            window_used = await fup_usage_bytes(db, customer, open_period, plan=customer.plan, now=now)
+            usage.period.fup_window_start = window_start
+            usage.period.fup_window_used_mb = _bytes_to_mb(window_used)
+            usage.period.fup_window_percent_used = _percent(window_used, open_period.cap_mb_snapshot)
     return usage
 
 

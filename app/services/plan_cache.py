@@ -236,6 +236,7 @@ def _serialize_plan(plan: Plan) -> Dict:
         "data_cap_mb": plan.data_cap_mb,
         "fup_action": plan.fup_action.value if plan.fup_action else None,
         "fup_throttle_profile": plan.fup_throttle_profile,
+        "fup_period": getattr(plan, "fup_period", None) or "plan",
         "max_shared_users": int(plan.max_shared_users or 1),
         "sharing_enabled": int(plan.max_shared_users or 1) > 1,
         "router_ids": normalize_router_ids(getattr(plan, "router_ids", None)),
