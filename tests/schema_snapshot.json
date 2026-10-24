@@ -1107,6 +1107,14 @@
   "updated_at",
   "user_id"
  ],
+ "support_desk_snapshots": [
+  "id",
+  "masked_count",
+  "payload",
+  "received_at",
+  "sha256",
+  "size_bytes"
+ ],
  "unmatched_c2b_payments": [
   "assigned_reseller_id",
   "c2b_transaction_id",
