@@ -89,3 +89,26 @@ def ingest_token_matches(presented: Optional[str], expected: str) -> bool:
     if not presented:
         return False
     return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+
+
+def find_open_dennis_item(snapshot: Any, item_id: str) -> Optional[dict]:
+    """The open needs_dennis work-log entry with this id in a snapshot, or None.
+
+    "Open" is no outcome, "open" (what the page lists today) or "waiting"
+    (what the inbox agent often writes for the same state).
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    worklog = snapshot.get("worklog")
+    entries = worklog.get("entries") if isinstance(worklog, dict) else None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("id") != item_id:
+            continue
+        if entry.get("category") != "needs_dennis":
+            return None
+        if entry.get("outcome") not in (None, "", "open", "waiting"):
+            return None
+        return entry
+    return None

@@ -1107,6 +1107,15 @@
   "updated_at",
   "user_id"
  ],
+ "support_desk_decisions": [
+  "action",
+  "consumed_at",
+  "created_at",
+  "decided_by",
+  "id",
+  "item_id",
+  "note"
+ ],
  "support_desk_snapshots": [
   "id",
   "masked_count",

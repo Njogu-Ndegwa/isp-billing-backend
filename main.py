@@ -3208,22 +3208,29 @@ async def run_customer_event_migrations():
 
 
 async def run_support_desk_migrations():
-    """WhatsApp support desk snapshot (app/api/admin_support_desk_routes.py):
-    one NEW single-row table, support_desk_snapshots, via the checkfirst
-    create_all pattern. Safe to run on every startup.
+    """WhatsApp support desk (app/api/admin_support_desk_routes.py): two NEW
+    tables, support_desk_snapshots (single row) and support_desk_decisions
+    (Dennis's go/close decisions), via the checkfirst create_all pattern.
+    Safe to run on every startup.
     """
     from sqlalchemy import inspect
 
     async with async_engine.begin() as conn:
         tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
 
-        from app.db.models import SupportDeskSnapshot
+        from app.db.models import SupportDeskDecision, SupportDeskSnapshot
         # Explicit startup create_all target: support_desk_snapshots.
         if SupportDeskSnapshot.__tablename__ not in tables:
             await conn.run_sync(
                 lambda c: Base.metadata.create_all(c, tables=[SupportDeskSnapshot.__table__])
             )
             logger.info("Support desk migration: created support_desk_snapshots")
+        # Explicit startup create_all target: support_desk_decisions.
+        if SupportDeskDecision.__tablename__ not in tables:
+            await conn.run_sync(
+                lambda c: Base.metadata.create_all(c, tables=[SupportDeskDecision.__table__])
+            )
+            logger.info("Support desk migration: created support_desk_decisions")
 
     logger.info("Support desk migrations complete")
 
