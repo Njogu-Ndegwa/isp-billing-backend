@@ -154,6 +154,7 @@
   "active_hotspot_users",
   "active_queues",
   "active_sessions",
+  "active_static_users",
   "avg_download_bps",
   "avg_upload_bps",
   "hotspot_download_bytes",

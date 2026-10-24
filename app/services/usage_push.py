@@ -154,6 +154,23 @@ class RouterMetrics:
     hotspot_active: int = 0
     pppoe_active: int = 0
     queue_count: int = 0
+    # Addresses of the bypassed hotspot hosts, when the report lists hosts.
+    # Static-IP customers reach the internet as bypassed hosts, so
+    # ``hotspot_active`` includes them; these let the snapshot count them apart.
+    bypassed_host_ips: Optional[frozenset] = None
+
+
+def online_static_count(bypassed_host_ips, static_ips) -> Optional[int]:
+    """Static-IP customers online = bypassed hosts sitting on a static customer's IP.
+
+    None when the router did not list its hosts (the count is then unknown and
+    the hotspot figure is left as reported).
+    """
+    if bypassed_host_ips is None:
+        return None
+    if not static_ips:
+        return 0
+    return len(set(bypassed_host_ips) & set(static_ips))
 
 
 @dataclass
@@ -323,6 +340,7 @@ async def _persist_router_metrics(
     metrics: RouterMetrics,
     now: datetime,
     result: IngestResult,
+    static_ips: frozenset = frozenset(),
 ) -> None:
     """Write a bandwidth snapshot from pushed router metrics, throttled.
 
@@ -335,6 +353,7 @@ async def _persist_router_metrics(
     hotspot = int(metrics.hotspot_active or 0)
     pppoe = int(metrics.pppoe_active or 0)
     queues = int(metrics.queue_count or 0)
+    static_online = online_static_count(metrics.bypassed_host_ips, static_ips)
     if (
         rx < 0 or tx < 0
         or rx > MAX_PLAUSIBLE_COUNTER_BYTES or tx > MAX_PLAUSIBLE_COUNTER_BYTES
@@ -375,7 +394,8 @@ async def _persist_router_metrics(
         router_id=router_id,
         interface_rx_bytes=rx,
         interface_tx_bytes=tx,
-        active_hotspot_users=hotspot,
+        active_hotspot_users=max(0, hotspot - (static_online or 0)),
+        active_static_users=static_online,
         active_sessions=pppoe,
         # ``active_queues`` is a legacy name. Dashboard consumers treat it as
         # the combined number of active Hotspot and PPPoE users, matching the
@@ -622,7 +642,10 @@ async def ingest_usage_reports(
                 pending = 0
 
         if router_metrics is not None:
-            await _persist_router_metrics(db, router_id, router_metrics, now, result)
+            static_ips = frozenset(
+                key[len(STATIC_KEY_PREFIX):] for key in index if key.startswith(STATIC_KEY_PREFIX)
+            )
+            await _persist_router_metrics(db, router_id, router_metrics, now, result, static_ips)
 
         await db.commit()
 

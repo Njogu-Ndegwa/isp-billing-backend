@@ -1621,6 +1621,9 @@ async def run_fup_usage_migrations():
                 f"ALTER TABLE bandwidth_snapshots "
                 f"ADD COLUMN IF NOT EXISTS {col_name} BIGINT NOT NULL DEFAULT 0"
             ))
+        await conn.execute(sa_text(
+            "ALTER TABLE bandwidth_snapshots ADD COLUMN IF NOT EXISTS active_static_users INTEGER NULL"
+        ))
 
         await conn.execute(sa_text(
             """
