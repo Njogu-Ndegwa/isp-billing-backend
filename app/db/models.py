@@ -2817,3 +2817,26 @@ class SupportDeskSnapshot(Base):
     size_bytes = Column(Integer, nullable=False, default=0)
     sha256 = Column(String(64), nullable=False)
     masked_count = Column(Integer, nullable=False, default=0)
+
+
+class SupportDeskDecision(Base):
+    """Dennis's decision on a "Waiting on Dennis" support desk item.
+
+    Written by the platform admin from the Support desk page
+    (POST /api/admin/support-desk/decisions): ``go`` tells the support agent
+    to start on the item, ``close`` closes it as not relevant. Dennis's laptop
+    pulls unconsumed rows with the support desk machine token and stamps
+    ``consumed_at`` once it has handed them to the inbox agent.
+
+    ``item_id`` is the stable work-log entry id from the snapshot
+    ("wl-" + 12 letters, optional "-N" suffix). ``note`` is masked like the
+    snapshot (no phone numbers, emails or WhatsApp JIDs).
+    """
+    __tablename__ = "support_desk_decisions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    item_id = Column(String(64), nullable=False, index=True)
+    action = Column(String(8), nullable=False)
+    note = Column(String(500), nullable=True)
+    decided_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    consumed_at = Column(DateTime, nullable=True, index=True)
