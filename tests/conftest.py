@@ -243,6 +243,18 @@ def reset_expiry_cleanup_router_memo():
 
 
 @pytest.fixture(autouse=True)
+def _no_live_presence_probe(monkeypatch):
+    """Reconnect's live device-presence probe talks to RouterOS. Default it to
+    "could not tell" so no test dials a router; presence tests patch it."""
+    from app.services import device_entitlements
+
+    async def _unknown(_router_info, _macs):
+        return None
+
+    monkeypatch.setattr(device_entitlements, "probe_online_macs", _unknown)
+
+
+@pytest.fixture(autouse=True)
 def _reset_realtime_state():
     """Live push state is process memory; no test may inherit another's."""
     from app.services import customer_events, realtime_state

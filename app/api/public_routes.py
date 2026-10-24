@@ -1500,16 +1500,14 @@ async def reconnect_self_service(
         )
         .order_by(Customer.expiry.desc())
     )
-    # Latest-expiring row that still has access (paid time or grace).
-    customer = next(
-        (
-            c for c in (await db.execute(customer_stmt)).scalars().all()
-            if has_access_time(c, now)
-        ),
-        None,
-    )
+    # Every purchase on this number that still has access (paid time or
+    # grace), latest-expiring first. Each one belongs to its own device.
+    candidates = [
+        c for c in (await db.execute(customer_stmt)).scalars().all()
+        if has_access_time(c, now)
+    ]
 
-    if not customer:
+    if not candidates:
         record_code_failure(request.router_id, normalized_mac)
         db.add(ReconnectionAttempt(
             phone=phone_raw, mac_address=normalized_mac,
@@ -1523,33 +1521,54 @@ async def reconnect_self_service(
             detail="No active subscription found for this phone number on this network",
         )
 
-    # On a plan that covers several devices, a new device reconnecting by phone
-    # is added alongside the customer's other devices instead of taking the
-    # plan away from them (the one-slot swap that dropped TVs). It is labelled
-    # "Added by phone" so the reseller can spot a stranger using a known phone
-    # number. When every slot is taken this falls through to moving the plan's
-    # main device, exactly as before: the customer's own phone with a changed
-    # MAC must never be locked out, and the extra devices keep their slots.
-    # Only for paid time: sharing requires an unexpired plan, so a customer in
-    # grace keeps the move behaviour too.
+    # (1) A purchase already bound to this device: restore that one. One number
+    # may hold a plan per device in the house (TV, phones); reconnecting from
+    # the phone must give the phone its own plan back, never the TV's.
+    own = next(
+        (
+            c for c in candidates
+            if c.mac_address and normalize_mac_address(c.mac_address) == normalized_mac
+        ),
+        None,
+    )
+    if own is not None:
+        return await restore_customer_on_device(
+            db,
+            customer=own,
+            router_obj=router_obj,
+            normalized_mac=normalized_mac,
+            lookup_key=phone_raw,
+            background_tasks=background_tasks,
+        )
+
+    # (2) On a plan that covers several devices, a new device reconnecting by
+    # phone is added alongside the customer's other devices instead of taking
+    # the plan away from them (the one-slot swap that dropped TVs). It is
+    # labelled "Added by phone" so the reseller can spot a stranger using a
+    # known phone number. Only for paid time: sharing requires an unexpired
+    # plan, so a customer in grace goes to the move rules below.
     from app.services.subscription_sharing import sharing_enabled_for_customer
 
-    owner_mac = normalize_mac_address(customer.mac_address) if customer.mac_address else None
-    customer_id = customer.id
-    if (
-        owner_mac
-        and owner_mac != normalized_mac
-        and customer.plan
-        and customer.plan.connection_type == ConnectionType.HOTSPOT
-        and customer.expiry > now
-        and sharing_enabled_for_customer(customer, customer.plan)
-    ):
+    device_limit_exc: HTTPException | None = None
+    shared = next(
+        (
+            c for c in candidates
+            if c.mac_address
+            and c.plan
+            and c.plan.connection_type == ConnectionType.HOTSPOT
+            and c.expiry > now
+            and sharing_enabled_for_customer(c, c.plan)
+        ),
+        None,
+    )
+    if shared is not None:
         from app.api.access_code_routes import add_device_to_owner_plan
 
+        shared_id = shared.id
         try:
             result = await add_device_to_owner_plan(
                 db,
-                owner=customer,
+                owner=shared,
                 router_id=request.router_id,
                 normalized_mac=normalized_mac,
                 device_name=PHONE_ADDED_DEVICE_NAME,
@@ -1558,28 +1577,105 @@ async def reconnect_self_service(
             detail = exc.detail if isinstance(exc.detail, dict) else {}
             if exc.status_code != 409 or detail.get("error") != "device_limit_reached":
                 raise
-            # Full: move the main device below. The failed add rolled back, so
-            # reload the row rather than touch an expired instance.
-            customer = await db.get(Customer, customer_id)
-            if customer is None:
-                raise HTTPException(status_code=404, detail="Active subscription not found")
+            # Full: its main device may still move below if it is not in use.
+            # The failed add rolled back, so reload the rows.
+            device_limit_exc = exc
+            candidates = [
+                c for c in (await db.execute(customer_stmt)).scalars().all()
+                if has_access_time(c, datetime.utcnow())
+            ]
         else:
             db.add(ReconnectionAttempt(
                 phone=phone_raw, mac_address=normalized_mac,
-                router_id=request.router_id, customer_id=customer_id,
+                router_id=request.router_id, customer_id=shared_id,
                 success=True, created_at=datetime.utcnow(),
             ))
             await db.commit()
             return result
 
-    return await restore_customer_on_device(
+    # (3) Move a purchase whose device is not in use (a phone whose randomized
+    # MAC rotated, a replaced phone, a plan never bound to a device).
+    # (4) Otherwise refuse: never revoke a device that is in use.
+    return await _move_idle_purchase_or_refuse(
         db,
-        customer=customer,
+        candidates=candidates,
         router_obj=router_obj,
         normalized_mac=normalized_mac,
         lookup_key=phone_raw,
         background_tasks=background_tasks,
+        device_limit_exc=device_limit_exc,
     )
+
+
+async def _move_idle_purchase_or_refuse(
+    db: AsyncSession,
+    *,
+    candidates: list[Customer],
+    router_obj: Router,
+    normalized_mac: str,
+    lookup_key: str,
+    background_tasks: BackgroundTasks,
+    device_limit_exc: HTTPException | None = None,
+) -> dict:
+    """Move the best idle purchase to this device, or raise 409.
+
+    See app/services/device_entitlements.py for what "in use" means. Raises
+    the multi-device ``device_limit_reached`` 409 (with the device list the
+    portal shows) when a full shared plan was the reason, else
+    ``plan_in_use_on_another_device``.
+    """
+    from app.services.device_entitlements import (
+        assess_bound_devices,
+        pick_blocker,
+        pick_movable,
+        plan_in_use_detail,
+        router_probe_info,
+    )
+
+    candidates = [
+        c for c in candidates
+        if not c.mac_address or normalize_mac_address(c.mac_address) != normalized_mac
+    ]
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Active subscription not found")
+
+    uses = await assess_bound_devices(
+        db,
+        candidates,
+        router_id=router_obj.id,
+        router_info=router_probe_info(router_obj),
+    )
+    chosen = pick_movable(candidates, uses, requesting_mac=normalized_mac)
+    if chosen is not None:
+        return await restore_customer_on_device(
+            db,
+            customer=chosen,
+            router_obj=router_obj,
+            normalized_mac=normalized_mac,
+            lookup_key=lookup_key,
+            background_tasks=background_tasks,
+            expected_mac=uses[chosen.id].mac,
+        )
+
+    blocker = pick_blocker(candidates, uses, requesting_mac=normalized_mac)
+    logger.info(
+        "[RECONNECT] Refusing %s on router %s: every purchase is in use (%s)",
+        normalized_mac, router_obj.id,
+        ", ".join(f"{u.customer_id}:{u.mac}:{u.reason}" for u in uses.values()),
+    )
+    db.add(ReconnectionAttempt(
+        phone=lookup_key, mac_address=normalized_mac,
+        router_id=router_obj.id, customer_id=blocker.customer_id,
+        success=False, failure_reason=f"plan_in_use:{blocker.reason}",
+        old_mac_address=blocker.mac, created_at=datetime.utcnow(),
+    ))
+    await db.commit()
+    if device_limit_exc is not None:
+        raise device_limit_exc
+    raise HTTPException(status_code=409, detail=plan_in_use_detail(blocker))
+
+
+_UNCHECKED_MAC = object()
 
 
 async def restore_customer_on_device(
@@ -1590,12 +1686,17 @@ async def restore_customer_on_device(
     normalized_mac: str,
     lookup_key: str,
     background_tasks: BackgroundTasks,
+    expected_mac: Any = _UNCHECKED_MAC,
 ) -> dict:
     """Put a paying customer's plan on ``normalized_mac``.
 
     If the customer's recorded device is a different MAC (new phone, or a
     randomized MAC), direct-API routers revoke and verify the old device before
     the database moves the entitlement to the new one.
+
+    ``expected_mac`` is the device the caller judged idle (or None for "no
+    device"). If the row is bound elsewhere by the time the lock is held, the
+    move is refused rather than revoking a device nobody assessed.
     """
     customer_id = customer.id
     router_id = router_obj.id
@@ -1615,6 +1716,16 @@ async def restore_customer_on_device(
         if not customer or customer.router_id != router_id:
             await db.rollback()
             raise HTTPException(status_code=404, detail="Active subscription not found")
+        if expected_mac is not _UNCHECKED_MAC:
+            bound_now = (
+                normalize_mac_address(customer.mac_address) if customer.mac_address else None
+            )
+            if bound_now not in (expected_mac, normalized_mac):
+                await db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="This subscription was moved by another request. Please try again.",
+                )
 
         now = datetime.utcnow()
         if (
