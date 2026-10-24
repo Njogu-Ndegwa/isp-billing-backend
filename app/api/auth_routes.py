@@ -11,7 +11,8 @@ import secrets
 from app.services.markets import market_summary
 from app.db.database import get_db
 from app.db.models import User, UserRole, PasswordResetToken
-from app.services.auth import create_user, authenticate_user, create_access_token, pwd_context
+from app.services.auth import create_user, authenticate_user, create_access_token, get_current_user, pwd_context
+from app.core.deps import oauth2_scheme as optional_oauth2_scheme  # auto_error=False: signup is public
 from app.services.subscription import get_invoice_alert_for_user
 from app.services import email_service
 from app.services import attribution as attribution_service
@@ -46,14 +47,28 @@ class UserRegisterRequest(BaseModel):
 async def register_user_api(
     request: UserRegisterRequest,
     background: BackgroundTasks,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    token: Optional[str] = Depends(optional_oauth2_scheme),
 ):
-    """Register a new user (admin or reseller)"""
+    """Register a new user.
+
+    Public for resellers (the signup page). Creating an admin requires the
+    caller to already be an admin, proven by their bearer token.
+    """
     try:
         try:
             role_enum = UserRole(request.role.lower())
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid role. Must be 'admin' or 'reseller'")
+
+        created_by = None
+        if role_enum == UserRole.ADMIN:
+            if not token:
+                raise HTTPException(status_code=403, detail="Admin access required to create an admin")
+            caller = await get_current_user(token, db)
+            if caller.role != UserRole.ADMIN:
+                raise HTTPException(status_code=403, detail="Admin access required to create an admin")
+            created_by = caller.id
 
         existing_user_stmt = select(User).filter(User.email == request.email.lower())
         existing_result = await db.execute(existing_user_stmt)
@@ -64,6 +79,7 @@ async def register_user_api(
 
         user = await create_user(
             db, request.email, request.password, role_enum, request.organization_name,
+            created_by=created_by,
             business_name=request.business_name,
             support_phone=request.support_phone,
             mpesa_shortcode=request.mpesa_shortcode,
