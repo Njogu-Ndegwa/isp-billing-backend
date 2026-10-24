@@ -275,3 +275,75 @@ async def test_window_build_clamps_hours_and_shares_one_read(db, monkeypatch):
     assert len(reads) == 1
     await pr.build_problem_routers_window(now + timedelta(minutes=2), 6)
     assert len(reads) == 2
+
+
+# --- site online, management tunnel down ---------------------------------------
+# 2026-10-12 RONGAI (448) / HOME951 (351): both WireGuard tunnels dead for ~75 min
+# while customers kept paying through the captive portal; 212 retries, no alert.
+
+PORTAL = "hotspot_payment"
+
+
+def _portal(rid, minutes_ago, state=ProvisioningState.RETRY_PENDING, entrypoint=PORTAL):
+    created = NOW - timedelta(minutes=minutes_ago)
+    return (rid, created, state, 3 if state != DELIVERED else 1,
+            created + timedelta(seconds=10) if state == DELIVERED else None, entrypoint)
+
+
+def test_customers_still_paying_through_the_portal_means_site_online_tunnel_down():
+    rongai = _router(448, name="RONGAI", reseller="Kennice Networks", tunnel="wireguard",
+                     last_online_at=NOW - timedelta(minutes=20))
+    attempts = [_portal(448, m) for m in (15, 11, 9, 6)] + [_portal(448, 2)]  # 2 min: inside the grace
+    out = pr.evaluate([rongai], [], attempts, NOW)
+    row = out["routers"][0]
+    assert row["state"] == "attention" and row["waiting"] == 4
+    assert row["site_online_tunnel_down"] is True
+    assert row["site_evidence"] == {"portal_attempts_15m": 5, "public_contact_at": None}
+    assert row["reason"] == ("Site online, management tunnel down: 4 paid customers waiting (oldest 15 min)"
+                             " · 5 new portal payments in 15 min · no management contact since 25 Sep 11:40 UTC")
+    [site] = out["tunnel_down_sites"]
+    assert site["router_id"] == 448 and site["waiting"] == 4 and site["oldest_waiting_at"] == "2026-09-25T11:45:00Z"
+
+
+def test_waiting_without_fresh_site_activity_is_not_called_site_online():
+    # The last portal payment was 40 min ago: the whole site may be down (power, WAN).
+    dead_site = _router(1, last_online_at=NOW - timedelta(hours=1))
+    out = pr.evaluate([dead_site], [], [_portal(1, 40)], NOW)
+    row = out["routers"][0]
+    assert row["site_online_tunnel_down"] is False and row["site_evidence"] is None
+    assert row["reason"].startswith("1 paid customer waiting to be connected")
+    assert out["tunnel_down_sites"] == []
+
+
+def test_a_router_we_still_reach_is_never_tunnel_down():
+    reachable = _router(1, last_online_at=NOW - timedelta(minutes=2))
+    out = pr.evaluate([reachable], [], [_portal(1, m) for m in (12, 8)], NOW)
+    assert out["routers"][0]["site_online_tunnel_down"] is False
+    assert out["tunnel_down_sites"] == []
+
+
+def test_only_portal_entrypoints_count_as_proof_the_site_is_online():
+    r = _router(1, last_online_at=NOW - timedelta(minutes=30))
+    reconciled = [_portal(1, m, entrypoint="hotspot_reconciliation") for m in (12, 8)]
+    assert pr.evaluate([r], [], reconciled, NOW)["tunnel_down_sites"] == []
+    for entry in ("voucher_direct_api", "free_trial"):
+        attempts = reconciled + [_portal(1, 3, state=DELIVERED, entrypoint=entry)]
+        assert len(pr.evaluate([r], [], attempts, NOW)["tunnel_down_sites"]) == 1
+
+
+def test_public_https_contact_is_proof_too_while_fresh():
+    r = _router(351, name="HOME951", last_online_at=NOW - timedelta(minutes=50))
+    waiting = [_portal(351, 45, entrypoint="hotspot_reconciliation")]
+    fresh = pr.evaluate([r], [], waiting, NOW, public_contact={351: NOW - timedelta(minutes=4)})
+    row = fresh["routers"][0]
+    assert row["site_online_tunnel_down"] is True
+    assert row["site_evidence"]["public_contact_at"] == "2026-09-25T11:56:00Z"
+    assert "router reached us over public HTTPS" in row["reason"]
+    stale = pr.evaluate([r], [], waiting, NOW, public_contact={351: NOW - timedelta(minutes=20)})
+    assert stale["tunnel_down_sites"] == []
+
+
+def test_attempt_rows_without_an_entrypoint_still_work():
+    # Five-element rows (no entrypoint) are what older callers and the tests above pass.
+    out = pr.evaluate([_router(1, last_online_at=NOW - timedelta(hours=1))], [], [_waiting(1, 20)], NOW)
+    assert out["routers"][0]["site_online_tunnel_down"] is False
