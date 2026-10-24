@@ -670,6 +670,14 @@ def _rsc_preflight_hotspot(token: ProvisioningToken) -> str:
             "within 5 minutes when prompted, wait for the router to come back, "
             "then re-run this provisioning command"
         )
+    # smips builds (hAP lite, hAP mini, cAP lite) on RouterOS 7.20+ ship
+    # without hotspot in the main package -- it is a separate
+    # hotspot-<ver>-smips.npk in the extra-packages zip (7.20 changelog), so
+    # the device-mode remedy above is wrong there. The script reads the
+    # architecture and version at runtime (the router may not run the version
+    # the reseller picked) and swaps in the right message. Message only: the
+    # abort itself is unchanged, and if /system resource cannot be read the
+    # default remedy is kept.
     return f"""
 # ---- PRE-FLIGHT: HOTSPOT AVAILABILITY CHECK ----
 # If the hotspot feature is unavailable its console menus do not exist and
@@ -682,7 +690,38 @@ def _rsc_preflight_hotspot(token: ProvisioningToken) -> str:
     $bwHsProbe
     :log info "Provisioning: hotspot feature available"
 }} on-error={{
-    :log error "PROVISION ABORTED: the hotspot feature is not available on this router -- {remedy}."
+    :local bwRemedy "{remedy}"
+    # smips (hAP lite / hAP mini / cAP lite) on RouterOS 7.20+: hotspot is a
+    # separate extra package, so device-mode cannot fix it. Message only.
+    :do {{
+        :local bwArch [/system resource get architecture-name]
+        :local bwVer [/system resource get version]
+        :local bwSp [:find $bwVer " "]
+        :if ([:typeof $bwSp] = "num") do={{ :set bwVer [:pick $bwVer 0 $bwSp] }}
+        :local bwDot [:find $bwVer "."]
+        :if (($bwArch = "smips") && ([:typeof $bwDot] = "num")) do={{
+            :local bwMajor [:tonum [:pick $bwVer 0 $bwDot]]
+            :local bwMinor ""
+            :local bwI ($bwDot + 1)
+            :local bwMore true
+            :while ($bwMore && ($bwI < [:len $bwVer])) do={{
+                :local bwCh [:pick $bwVer $bwI]
+                :if ([:typeof [:find "0123456789" $bwCh]] = "num") do={{
+                    :set bwMinor ($bwMinor . $bwCh)
+                    :set bwI ($bwI + 1)
+                }} else={{
+                    :set bwMore false
+                }}
+            }}
+            :if (([:typeof $bwMajor] = "num") && ([:len $bwMinor] > 0)) do={{
+                :if (($bwMajor > 7) || (($bwMajor = 7) && ([:tonum $bwMinor] >= 20))) do={{
+                    :set bwRemedy ("this is a smips router (hAP lite / hAP mini / cAP lite) on RouterOS " . $bwVer . ", and since RouterOS 7.20 smips builds do not include hotspot. Fix: downgrade to RouterOS 6.49.x (recommended for these models), or upload hotspot-" . $bwVer . "-smips.npk from the extra-packages zip for " . $bwVer . " (mikrotik.com/download) to Files, reboot, then re-run this provisioning command")
+                }}
+            }}
+        }}
+    }} on-error={{}}
+    :log error ("PROVISION ABORTED: the hotspot feature is not available on this router -- " . $bwRemedy . ".")
+    :put ("PROVISION ABORTED: the hotspot feature is not available on this router -- " . $bwRemedy . ".")
     :error "hotspot feature unavailable -- aborting before any config is applied (see /log print)"
 }}"""
 
