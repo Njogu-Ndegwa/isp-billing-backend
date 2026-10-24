@@ -261,7 +261,13 @@ def _provision_pppoe_sync(payload: dict) -> dict:
             logger.warning(f"[PPPoE] FastTrack bypass ensure failed: {bypass_result['error']}")
 
         # Force the client to reconnect so any profile/rate-limit change applies immediately.
-        disconnect_result = api.disconnect_pppoe_session(payload["pppoe_username"])
+        # "disconnect": False is passed when nothing about the login changed (a
+        # re-save that only makes sure the secret exists, or a recovery sweep
+        # re-adding a missing secret): a connected device is left alone.
+        if payload.get("disconnect", True):
+            disconnect_result = api.disconnect_pppoe_session(payload["pppoe_username"])
+        else:
+            disconnect_result = {"success": True, "skipped": True}
 
         logger.info(
             f"[PPPoE] Provisioned {payload['pppoe_username']} "
