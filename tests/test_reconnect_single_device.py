@@ -90,6 +90,73 @@ async def test_cleanup_removes_and_verifies_every_authorization_artifact(monkeyp
     }
 
 
+async def test_cleanup_prevents_coloned_mac_user_from_logging_back_in(monkeypatch):
+    fake = FakeMikroTik()
+    fake.rows["/ip/hotspot/ip-binding"] = []
+    fake.rows["/ip/hotspot/user"] = [
+        {".id": "*4", "name": OLD_MAC, "mac-address": OLD_MAC},
+        {".id": "*8", "name": NEW_MAC, "mac-address": NEW_MAC},
+    ]
+    fake.rows["/ip/hotspot/active"][0]["user"] = OLD_MAC
+    original_send = fake.send_command
+
+    def mac_login(command, arguments=None):
+        result = original_send(command, arguments)
+        if command == "/ip/hotspot/active/remove" and any(
+            row["name"] == OLD_MAC for row in fake.rows["/ip/hotspot/user"]
+        ):
+            # A still-connected device immediately reauthenticates by MAC if
+            # its RouterOS login user survives session removal.
+            fake.rows["/ip/hotspot/active"].append({
+                ".id": "*9", "mac-address": OLD_MAC, "user": OLD_MAC,
+            })
+            fake.rows["/ip/hotspot/host"].append({
+                ".id": "*10", "mac-address": OLD_MAC,
+                "authorized": "true", "bypassed": "false",
+            })
+        return result
+
+    fake.send_command = mac_login
+    monkeypatch.setattr(public_routes, "MikroTikAPI", lambda *_args, **_kwargs: fake)
+
+    result = public_routes._cleanup_old_mac_from_router_sync(
+        {"ip": "10.0.0.2", "username": "admin", "password": "x", "port": 8728},
+        OLD_MAC,
+    )
+
+    assert result["success"] is True
+    assert result["removed"]["users"] == 1
+    assert fake.rows["/ip/hotspot/active"] == []
+    assert fake.rows["/ip/hotspot/user"] == [
+        {".id": "*8", "name": NEW_MAC, "mac-address": NEW_MAC},
+    ]
+
+
+async def test_cleanup_fails_closed_if_coloned_mac_user_survives(monkeypatch):
+    fake = FakeMikroTik()
+    fake.rows["/ip/hotspot/user"] = [
+        {".id": "*4", "name": OLD_MAC, "mac-address": OLD_MAC},
+    ]
+    original_send = fake.send_command
+
+    def refuse_user_removal(command, arguments=None):
+        if command == "/ip/hotspot/user/remove":
+            return {"success": False, "error": "router rejected removal"}
+        return original_send(command, arguments)
+
+    fake.send_command = refuse_user_removal
+    monkeypatch.setattr(public_routes, "MikroTikAPI", lambda *_args, **_kwargs: fake)
+
+    result = public_routes._cleanup_old_mac_from_router_sync(
+        {"ip": "10.0.0.2", "username": "admin", "password": "x", "port": 8728},
+        OLD_MAC,
+    )
+
+    assert "error" in result
+    assert result["remaining"]["users"] == 1
+    assert any("/ip/hotspot/user/remove" in error for error in result["command_errors"])
+
+
 async def test_cleanup_fails_closed_when_bypass_binding_remains(monkeypatch):
     fake = FakeMikroTik()
 
