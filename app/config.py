@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # /complete), once their encrypted management tunnel answers. hAP lite/mini
     # are skipped. False = switch off (existing routers are unaffected).
     REALTIME_PUSH_INSTALL_AT_SETUP: bool = True
+    # When a router comes back online, re-add the missing PPPoE secrets of its
+    # active customers and remove secrets left by deleted/moved customers
+    # (app/services/pppoe_resync.py). False = switch the sweep off.
+    PPPOE_RECOVERY_SWEEP_ENABLED: bool = True
     # Opt-in only: selected RB951s whose exact reporter source was reviewed.
     NATIVE_STREAM_ROUTER_IDS: str = ""
     NATIVE_STREAM_REPORTER_HASHES: str = ""

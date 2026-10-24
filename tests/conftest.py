@@ -38,6 +38,7 @@ os.environ.setdefault("MPESA_ENVIRONMENT", "sandbox")
 # inherit pilot behaviour by accident. Pilot tests opt in explicitly.
 os.environ.setdefault("REALTIME_PILOT_ROUTER_IDS", "")
 os.environ.setdefault("REALTIME_PUSH_INSTALL_AT_SETUP", "false")  # no background router installs in tests
+os.environ.setdefault("PPPOE_RECOVERY_SWEEP_ENABLED", "false")  # no background recovery sweeps in tests
 
 from datetime import datetime
 from typing import AsyncIterator

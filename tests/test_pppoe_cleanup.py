@@ -452,7 +452,8 @@ async def test_edit_active_pppoe_plan_reprovisions_with_new_speed(db, monkeypatc
         return {"success": True}
 
     monkeypatch.setattr(customer_routes, "get_current_user", fake_current_user)
-    monkeypatch.setattr(customer_routes, "call_pppoe_provision", fake_provision)
+    # Edits push through the attempt path (pppoe_provisioning), like activation.
+    monkeypatch.setattr(pppoe_provisioning, "call_pppoe_provision", fake_provision)
     monkeypatch.setattr(customer_routes, "call_pppoe_remove", fake_remove)
 
     response = await customer_routes.edit_customer(

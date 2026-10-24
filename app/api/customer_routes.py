@@ -359,6 +359,16 @@ class CustomerEditRequest(BaseModel):
     static_ip: Optional[str] = None
     static_mac: Optional[str] = None
     expiry: Optional[datetime] = None
+    # PPPoE only: "Activate now - already paid until <expiry>". Turns an
+    # INACTIVE customer ACTIVE until the expiry on the form and puts them on
+    # the router, WITHOUT recording money: for customers migrated from another
+    # system who already paid there. Never implied by editing the expiry.
+    activate_paid_until: bool = False
+
+
+# Furthest ahead "already paid until" may reach: a year's subscription plus a
+# margin, so a mistyped year cannot hand out free access for decades.
+PAID_UNTIL_MAX_AHEAD = timedelta(days=400)
 
 
 @router.put("/api/customers/{customer_id}")
@@ -439,7 +449,25 @@ async def edit_customer(
                     detail=f"PPPoE username '{normalized_pppoe_username}' already exists",
                 )
 
-        was_static = bool(customer.plan and customer.plan.connection_type == ConnectionType.STATIC_IP)
+        activating = bool(request.activate_paid_until)
+        if activating:
+            _validate_paid_until_activation(
+                customer,
+                request,
+                target_is_pppoe=target_is_pppoe,
+                pppoe_username=(
+                    normalized_pppoe_username
+                    if request.pppoe_username is not None
+                    else customer.pppoe_username
+                ),
+                pppoe_password=(
+                    normalized_pppoe_password
+                    if request.pppoe_password is not None
+                    else customer.pppoe_password
+                ),
+            )
+
+        was_static =bool(customer.plan and customer.plan.connection_type == ConnectionType.STATIC_IP)
         target_is_static = bool(target_plan and target_plan.connection_type == ConnectionType.STATIC_IP)
         old_static_ip = normalize_static_ip(customer.static_ip)
         old_static_mac = customer.static_mac
@@ -487,7 +515,7 @@ async def edit_customer(
         pppoe_changed = False
         pppoe_location_changed = False
 
-        update_fields = request.model_dump(exclude_none=True)
+        update_fields = request.model_dump(exclude_none=True, exclude={"activate_paid_until"})
         if "phone" in update_fields:
             update_fields["phone"] = update_fields["phone"].strip()
         if request.pppoe_username is not None:
@@ -502,6 +530,43 @@ async def edit_customer(
             setattr(customer, field, value)
         if target_is_static and not was_static:
             customer.mac_address = None
+
+        activation_payment = None
+        if activating:
+            # Same transaction as the edit: the customer turns ACTIVE until the
+            # expiry on the form, and the ledger gets a zero, non-revenue row
+            # saying no money was collected (the free-trial / compensation
+            # pattern). The row is also the source the delivery attempt hangs
+            # off, so the PPPoE retry worker can finish the job.
+            activation_now = datetime.utcnow()
+            customer.status = CustomerStatus.ACTIVE
+            activation_payment = CustomerPayment(
+                customer_id=customer.id,
+                reseller_id=user.id,
+                plan_id=target_plan.id if target_plan else None,
+                amount=0.0,
+                payment_method=PaymentMethod.OTHER,
+                payment_reference=f"PAID-UNTIL-{customer.id}",
+                days_paid_for=max(
+                    1, -(-int((customer.expiry - activation_now).total_seconds()) // 86400)
+                ),
+                status=PaymentStatus.COMPLETED,
+                notes=(
+                    "No payment collected: activated as already paid until "
+                    f"{customer.expiry:%Y-%m-%d %H:%M} UTC (migrated customer)"
+                ),
+                customer_name=customer.name,
+                counts_as_revenue=False,
+            )
+            db.add(activation_payment)
+            try:
+                from app.services.usage_tracking import on_renewal
+
+                await on_renewal(db, customer, plan=target_plan, now=activation_now)
+            except Exception as renew_err:
+                logger.error(
+                    f"[USAGE] on_renewal failed in paid-until activation for customer {customer.id}: {renew_err}"
+                )
 
         if customer.pppoe_username and customer.status == CustomerStatus.ACTIVE:
             pppoe_changed = (
@@ -545,8 +610,10 @@ async def edit_customer(
             schedule_expiry_tag_sync([customer.id], "admin expiry edit")
 
         provision_status = None
+        provision_error = None
         if (
-            pppoe_changed
+            customer.status == CustomerStatus.ACTIVE
+            and customer.pppoe_username
             and customer.router
             and customer.plan
             and customer.plan.connection_type == ConnectionType.PPPOE
@@ -563,15 +630,36 @@ async def edit_customer(
                 except Exception as e:
                     logger.warning(f"Failed to prepare old PPPoE secret removal during edit: {e}")
 
-            pppoe_payload = build_pppoe_payload(customer, customer.router)
             await db.commit()
             if remove_payload:
                 try:
                     await call_pppoe_remove(remove_payload)
                 except Exception as e:
                     logger.warning(f"Failed to remove old PPPoE secret during edit: {e}")
-            provision_result = await call_pppoe_provision(pppoe_payload)
-            provision_status = "ok" if provision_result and provision_result.get("success") else "failed"
+            if activating:
+                delivered = await _deliver_paid_until_activation(db, customer, activation_payment, user)
+            else:
+                # Every save of an ACTIVE PPPoE customer makes sure the router
+                # has their secret (the customer page says "Re-save the
+                # customer to provision it again"), through the attempt path
+                # so an unreachable router is retried. Only a real login
+                # change reconnects the customer's devices.
+                from app.services.pppoe_resync import push_active_pppoe_customer
+
+                delivered = await push_active_pppoe_customer(
+                    customer.id,
+                    action="pppoe_edit" if pppoe_changed else "pppoe_resave",
+                    disconnect=pppoe_changed,
+                    skip_if_fup_restricted=not pppoe_changed,
+                )
+                delivered = {
+                    "provision_result": delivered.get("result"),
+                    "provision_error": delivered.get("error"),
+                }
+            provision_status = delivered.get("provision_result")
+            if provision_status in ("not_eligible", "fup_restricted"):
+                provision_status = None
+            provision_error = delivered.get("provision_error")
 
         static_status = None
         if was_static or target_is_static:
@@ -609,7 +697,11 @@ async def edit_customer(
                     "name": customer.router.name,
                 } if customer.router else None,
             },
+            # ok | retry_pending (router not updated yet, retried automatically)
+            # | in_progress | failed | None (nothing to push)
             "pppoe_reprovisioned": provision_status,
+            "pppoe_provision_error": provision_error,
+            "activated_paid_until": activating,
             "static_reprovisioned": static_status,
         }
     except HTTPException:
@@ -618,6 +710,107 @@ async def edit_customer(
         logger.error(f"Error editing customer {customer_id}: {e}")
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to edit customer: {str(e)}")
+
+
+def _validate_paid_until_activation(
+    customer: Customer,
+    request: "CustomerEditRequest",
+    *,
+    target_is_pppoe: bool,
+    pppoe_username: Optional[str],
+    pppoe_password: Optional[str],
+) -> None:
+    """Refuse an "already paid until" activation before anything is changed."""
+    if not target_is_pppoe:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PPPoE customers can be activated as already paid.",
+        )
+    if customer.status == CustomerStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail="This customer is already active.")
+    paid_until = (
+        request.expiry.replace(tzinfo=None) if request.expiry is not None else customer.expiry
+    )
+    now = datetime.utcnow()
+    if paid_until is None or paid_until <= now:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Set the expiry to the date the customer has already paid until "
+                "(a future date), then activate."
+            ),
+        )
+    if paid_until > now + PAID_UNTIL_MAX_AHEAD:
+        raise HTTPException(
+            status_code=400,
+            detail="That expiry is more than 400 days away. Check the year and try again.",
+        )
+    if not pppoe_username or not pppoe_password:
+        raise HTTPException(
+            status_code=400,
+            detail="Set a PPPoE username and password before activating.",
+        )
+    if request.router_id is None and customer.router_id is None:
+        raise HTTPException(status_code=400, detail="Assign a router before activating.")
+
+
+async def _deliver_paid_until_activation(
+    db: AsyncSession,
+    customer: Customer,
+    payment: CustomerPayment,
+    user,
+) -> dict:
+    """Put a just-activated "already paid until" customer on their router.
+
+    Same delivery as activate-pppoe: a provisioning attempt sourced from the
+    (zero, non-revenue) payment row, so a failed push is retried by the PPPoE
+    retry worker instead of leaving the customer off the router.
+    """
+    attempt = await get_or_create_provisioning_attempt(
+        db,
+        customer_id=customer.id,
+        router_id=customer.router.id,
+        mac_address=None,
+        source_table=ProvisioningAttemptSource.CUSTOMER_PAYMENT,
+        source_pk=payment.id,
+        external_reference=payment.payment_reference,
+        entrypoint=ProvisioningAttemptEntrypoint.MANUAL_TRANSACTION_PROVISION,
+    )
+    await schedule_provisioning_attempt(db, attempt)
+    pppoe_payload = build_pppoe_payload(customer, customer.router)
+    attempt_id = attempt.id
+    plan_name = customer.plan.name if customer.plan else "plan"
+    expiry = customer.expiry
+    await db.commit()
+
+    provision_result = await provision_pppoe_customer(
+        customer_id=customer.id,
+        router_id=customer.router.id,
+        pppoe_payload=pppoe_payload,
+        action="pppoe_activation",
+        attempt_id=attempt_id,
+    )
+    ok = bool(provision_result and provision_result.get("success"))
+    error = (provision_result or {}).get("error")
+    await record_customer_event(
+        customer.id, "pppoe_activated",
+        f"PPPoE activated on {plan_name} as already paid until {expiry:%Y-%m-%d %H:%M} UTC "
+        "(no payment recorded); router "
+        + ("updated" if ok else f"not updated yet: {error or 'will retry'}"),
+        severity="info" if ok else "warning",
+        actor=user, user_id=user.id, router_id=customer.router_id,
+        details={
+            "payment_id": payment.id,
+            "paid_until": expiry.isoformat() if expiry else None,
+            "counts_as_revenue": False,
+            "provision_result": "ok" if ok else "retry_pending",
+        },
+    )
+    return {
+        "provision_result": "ok" if ok else "retry_pending",
+        "provision_error": None if ok else error,
+        "delivery": (provision_result or {}).get("delivery"),
+    }
 
 
 def _router_creds(router_obj: Optional[Router]) -> Optional[dict]:
