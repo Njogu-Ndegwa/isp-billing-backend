@@ -16,6 +16,18 @@ What the scripts do (patient, never reboot):
   ``wg-hz`` / ``wg-aws`` whose INTERFACE is enabled. A peer whose handshake is
   older than 5 min is reset (conntrack for its endpoint flow removed, peer
   disabled/enabled), with the same hold-off and backoff.
+  v5: when a reset did not bring the peer back (the backoff entry from the
+  previous reset is still there) and the router's internet works, the
+  interface's ``listen-port`` is also moved to a random port. A reset alone
+  keeps the same source port, so a broken NAT entry on the ISP modem/CGNAT
+  that our 25 s keepalives never let expire keeps eating the replies (router
+  393, 2026-09-30: 5 h dark, fixed at once by a new port). The servers learn
+  the new endpoint from the next handshake; replies are accepted as
+  established traffic, so no new input rule is needed.
+  That last point is checked per router before rotation is switched on
+  (``check_wg_firewall``): a router whose input firewall could drop the
+  replies on a rotated port gets v5 with rotation left out, and is looked at
+  again a week later.
 * State lives in RAM-only dynamic address-list entries (``bw-wd-*``, with
   timeouts): script ``:global`` variables do NOT persist between scheduler runs
   of an API-created script (verified on RouterOS 6.48.6).
@@ -51,6 +63,20 @@ SSTP_CLIENT = "sstp-hetzner"
 WG_INTERFACES = ("wg-hz", "wg-aws")
 SPLAY_MOD = {KIND_SSTP: 40, KIND_WG: 20}
 STATE_LIST_PREFIX = "bw-wd"
+# Bump when a template changes: routers whose recorded install reason lacks
+# "<kind> <version>" are picked up again by standard_runtime_enrol and updated.
+VERSIONS = {KIND_SSTP: "v3", KIND_WG: "v5"}
+# Range the WG watchdog picks a new listen-port from (above the 51820-51834
+# ports provisioning uses, below the ephemeral range).
+ROTATE_PORT_MIN = 40000
+ROTATE_PORT_MAX = 48999
+# The one line that arms the rotation; dropped from the source when the
+# router's firewall fails ``check_wg_firewall``.
+_ROTATE_ARM = ":if ($up) do={ :set rotate true }"
+_ROTATE_OFF = "# rotation off: this router's firewall failed the install-time check"
+# Recorded in the install reason of a rotation-less install; such an install is
+# not "current", so it is looked at again (``standard_runtime_enrol``).
+NOROTATE = "norotate"
 
 _SSTP_TEMPLATE = r'''# bw-mgmt-watchdog v3 (Bitwave): restart the SSTP management tunnel if it stays dead. Never reboots.
 # v3: healthy fast path (tunnel running + 1 ping answered) exits before any address-list scan.
@@ -108,11 +134,13 @@ _SSTP_TEMPLATE = r'''# bw-mgmt-watchdog v3 (Bitwave): restart the SSTP managemen
 }
 '''
 
-_WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v4 (Bitwave, RouterOS 7): reset a WireGuard management peer whose handshake is stale.
+_WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v5 (Bitwave, RouterOS 7): reset a WireGuard management peer whose handshake is stale.
 # Never reboots. State in RAM-only address-list entries (bw-wd-*). Test hook: list bw-wd-test-stale => treat all as stale.
 # v3: healthy fast path (every watched peer enabled with a fresh handshake) exits before pings/address-list scans.
 # v4: only tunnels whose INTERFACE is enabled are watched, so a Hetzner-only router with wg-aws switched off is not
 # treated as stale every minute (and the AWS peer is never touched).
+# v5: a reset that did not help (backoff entry still present) + working internet => also move the interface to a
+# random listen-port, so the ISP NAT has to build a fresh entry (a stuck one outlives every same-port reset).
 :local hzOn ([:len [/interface wireguard find where name="wg-hz" disabled=no]] > 0)
 :local awsOn ([:len [/interface wireguard find where name="wg-aws" disabled=no]] > 0)
 :local fresh true
@@ -157,9 +185,11 @@ _WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v4 (Bitwave, RouterOS 7): reset a WireG
       :if ([:len [/ip firewall address-list find where list=$hl]] = 0) do={
         :local hold 10
         :local b [/ip firewall address-list find where list=$bl]
+        :local rotate false
         :if ([:len $b] > 0) do={
           :local a [:tostr [/ip firewall address-list get [:pick $b 0] address]]
           :set hold [:tonum [:pick $a 6 [:len $a]]]
+          :if ($up) do={ :set rotate true }
         }
         :if ($up = false) do={ :set hold 60 }
         :local ep [/interface wireguard peers get $p endpoint-address]
@@ -179,6 +209,16 @@ _WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v4 (Bitwave, RouterOS 7): reset a WireG
         }
         :do { /ip firewall address-list add list=("bw-wd-busy-" . $ifn) address=0.0.0.1 timeout=5m } on-error={}
         :do { /interface wireguard peers disable $p } on-error={}
+        :if ($rotate) do={
+          :do {
+            :local wi [/interface wireguard find where name=$ifn]
+            :local op [/interface wireguard get $wi listen-port]
+            :local np [:rndnum from=__PORT_MIN__ to=__PORT_MAX__]
+            :if ($np = $op) do={ :set np ($np + 1) }
+            /interface wireguard set $wi listen-port=$np
+            :log warning ("bw-watchdog: " . $ifn . " still stale after a reset, listen-port " . $op . " -> " . $np)
+          } on-error={ :log warning ("bw-watchdog: " . $ifn . " listen-port change failed") }
+        }
         :delay 2s
         :do { /interface wireguard peers enable $p } on-error={}
         :do { /ip firewall address-list remove [find where list=("bw-wd-busy-" . $ifn)] } on-error={}
@@ -207,10 +247,192 @@ def splay_seconds(kind: str, mgmt_ip: Optional[str]) -> int:
         return 0
 
 
-def render_watchdog_source(kind: str, mgmt_ip: Optional[str]) -> str:
-    """The ``source`` of the watchdog script for this router."""
+def render_watchdog_source(kind: str, mgmt_ip: Optional[str], rotate: bool = True) -> str:
+    """The ``source`` of the watchdog script for this router.
+
+    ``rotate=False`` (WireGuard only) leaves the listen-port rotation disarmed:
+    the peer is still reset, the port never moves.
+    """
     name = script_name(kind)  # validates kind
-    return with_gate(name, _TEMPLATES[kind].replace("__SPLAY__", f"{splay_seconds(kind, mgmt_ip)}s"))
+    template = _TEMPLATES[kind]
+    if kind == KIND_WG and not rotate:
+        template = template.replace(_ROTATE_ARM, _ROTATE_OFF)
+    return with_gate(name, (
+        template
+        .replace("__SPLAY__", f"{splay_seconds(kind, mgmt_ip)}s")
+        .replace("__PORT_MIN__", str(ROTATE_PORT_MIN))
+        .replace("__PORT_MAX__", str(ROTATE_PORT_MAX))
+    ))
+
+
+def version_tag(kind: str) -> str:
+    """``"wg v5"``: recorded in the install reason so outdated installs can be found."""
+    script_name(kind)  # validates kind
+    return f"{kind} {VERSIONS[kind]}"
+
+
+def is_current(kind: Optional[str], reason: Optional[str]) -> bool:
+    """Whether a router's recorded install (kind + reason) has the current template.
+
+    A rotation-less install (``NOROTATE`` in the reason) is not: its firewall is
+    checked again, and rotation switched on once it passes.
+    """
+    reason = str(reason or "")
+    return kind in VERSIONS and version_tag(kind) in reason and NOROTATE not in reason
+
+
+# ---------------------------------------------------------------------------
+# Install-time firewall check for the WireGuard port rotation
+# ---------------------------------------------------------------------------
+#
+# After a rotation the router talks from a port nothing else knows about, and
+# the server's replies reach it only as conntrack "established" traffic. So the
+# rotation is safe only if the input chain accepts established traffic before
+# any rule that could drop a UDP reply to a port in the rotation range. The
+# check reads the rules (no writes) and errs on the side of "not safe": the
+# worst a false "not safe" costs is a router without rotation, while a false
+# "safe" could cut its management tunnel.
+
+_DROP_ACTIONS = ("drop", "reject", "tarpit")
+# Matchers a rule uses to aim at particular traffic. A drop rule carrying one
+# (not negated) is taken NOT to hit our replies; an accept rule carrying one is
+# taken NOT to cover them. Interface matchers are left out on purpose: which
+# interface is the WAN is not known here, so they never make a rule harmless.
+_SPECIFIC_MATCHERS = (
+    "src-address", "dst-address", "src-address-list", "dst-address-list", "src-port",
+    "src-mac-address", "connection-mark", "packet-mark", "routing-mark", "connection-type",
+    "connection-nat-state", "layer7-protocol", "content", "hotspot", "ipsec-policy",
+    "tcp-flags", "icmp-options", "limit", "dst-limit", "connection-limit", "nth", "random",
+    "time", "psd", "per-connection-classifier",
+    # Packet-shape matchers. Our ISP_BILLING_ANTI_TETHERING raw rules drop
+    # in-interface=bridge ttl=equal:63/127/254 (a phone sharing its hotspot
+    # session); a reply crossing the internet from our servers never arrives
+    # with exactly such a TTL. Fleet scan 2026-10-12: 15 routers were wrongly
+    # failed on those rules before "ttl" was listed here.
+    "ttl", "packet-size", "dscp", "priority", "fragment",
+)
+
+
+@dataclass(frozen=True)
+class FirewallCheck:
+    ok: bool
+    reason: str
+    # The rules could not be read (API error, timeout): no verdict, try again soon.
+    transient: bool = False
+
+
+def _ports_overlap(spec, lo: int, hi: int) -> bool:
+    """Whether a RouterOS port matcher ("80,443", "40000-49999", "!22") can match
+    a port in [lo, hi]. No matcher, a negated one or one we cannot parse: yes."""
+    spec = str(spec or "").strip()
+    if not spec or spec.startswith("!"):
+        return True
+    for part in spec.split(","):
+        a, _, b = part.strip().partition("-")
+        try:
+            first, last = int(a), int(b or a)
+        except ValueError:
+            return True
+        if first <= hi and last >= lo:
+            return True
+    return False
+
+
+def _negated(value) -> bool:
+    return str(value or "").strip().startswith("!")
+
+
+def _matches_udp_reply(rule: dict, conntrack: bool = True) -> bool:
+    """Could this rule match a WireGuard reply (UDP, conntrack "established") to a
+    port in the rotation range? Unknowns count as "yes"."""
+    proto = str(rule.get("protocol") or "").strip()
+    if proto:
+        hit = proto.lstrip("!") in ("udp", "17")
+        if hit == _negated(proto):
+            return False
+    states = str(rule.get("connection-state") or "").strip()
+    if states:
+        if not conntrack:
+            # Without connection tracking nothing is "established"; a rule on any
+            # other state is a guess, so only "!..." rules are taken to match.
+            if not _negated(states):
+                return False
+        else:
+            hit = "established" in states.lstrip("!").split(",")
+            if hit == _negated(states):
+                return False
+    for key in ("dst-port", "port"):
+        if not _ports_overlap(rule.get(key), ROTATE_PORT_MIN, ROTATE_PORT_MAX):
+            return False
+    for key in _SPECIFIC_MATCHERS:
+        value = rule.get(key)
+        if value not in (None, "") and not _negated(value):
+            return False
+    return True
+
+
+def _covers_udp_reply(rule: dict, conntrack: bool) -> bool:
+    """An accept rule that certainly lets our established UDP replies in."""
+    if not conntrack:
+        return False
+    states = str(rule.get("connection-state") or "").strip()
+    if not states or _negated(states) or "established" not in states.split(","):
+        return False
+    proto = str(rule.get("protocol") or "").strip()
+    if proto and proto not in ("udp", "17"):
+        return False
+    if not _ports_overlap(rule.get("dst-port"), ROTATE_PORT_MIN, ROTATE_PORT_MAX):
+        return False
+    narrowing = _SPECIFIC_MATCHERS + ("in-interface", "in-interface-list", "port")
+    return all(rule.get(key) in (None, "") for key in narrowing)
+
+
+def _walk_chain(rules: list, chain: str, conntrack: bool, seen: frozenset) -> Optional[FirewallCheck]:
+    """First decision for our replies in ``chain`` (following jumps), or None if
+    they fall through."""
+    for r in rules:
+        if r.get("chain") != chain or r.get("disabled") == "true":
+            continue
+        action = r.get("action") or "accept"
+        rid = r.get(".id") or "?"
+        if action == "accept" and _covers_udp_reply(r, conntrack):
+            return FirewallCheck(True, f"established accepted ({chain} {rid})")
+        if action in _DROP_ACTIONS and _matches_udp_reply(r, conntrack):
+            return FirewallCheck(False, f"{action} rule {rid} in {chain} before established-accept")
+        if action == "jump" and _matches_udp_reply(r, conntrack):
+            target = r.get("jump-target")
+            if not target or target in seen:
+                return FirewallCheck(False, f"jump {rid} in {chain} to {target or '?'} not followed")
+            inner = _walk_chain(rules, target, conntrack, seen | {target})
+            if inner is not None:
+                return inner
+        if action == "return" and _matches_udp_reply(r, conntrack):
+            return None
+    return None
+
+
+def check_wg_firewall(api) -> FirewallCheck:
+    """Is it safe to move this router's WireGuard listen-port? Reads only."""
+    try:
+        tracking = (_data(api.send_command("/ip/firewall/connection/tracking/print")) or [{}])[0]
+        conntrack = str(tracking.get("enabled") or "auto").strip().lower() != "no"
+        filt = api.send_command("/ip/firewall/filter/print")
+        if (filt or {}).get("error"):
+            return FirewallCheck(False, "filter rules unreadable", transient=True)
+        raw = api.send_command("/ip/firewall/raw/print")
+        if (raw or {}).get("error"):
+            return FirewallCheck(False, "raw rules unreadable", transient=True)
+    except Exception as exc:  # noqa: BLE001 - an unreadable firewall is "not safe"
+        return FirewallCheck(False, f"check failed: {exc}"[:80], transient=True)
+    for r in _data(raw):
+        if (r.get("chain") == "prerouting" and r.get("disabled") != "true"
+                and (r.get("action") or "accept") == "drop" and _matches_udp_reply(r, conntrack=True)):
+            return FirewallCheck(False, f"raw drop rule {r.get('.id') or '?'} may hit the replies")
+    rules = _data(filt)
+    decision = _walk_chain(rules, "input", conntrack, frozenset({"input"}))
+    if decision is not None:
+        return decision
+    return FirewallCheck(True, "no input rule drops the replies")
 
 
 def _data(res) -> list:
@@ -266,8 +488,10 @@ def _remove_named(api, name: str) -> None:
                 api.send_command(f"{path}/remove", {".id": item[".id"]})
 
 
-def install_watchdog(api, kind: str, mgmt_ip: Optional[str]) -> InstallResult:
+def install_watchdog(api, kind: str, mgmt_ip: Optional[str], rotate: bool = True) -> InstallResult:
     """Install or update the ``kind`` watchdog. Idempotent.
+
+    ``rotate`` is passed to ``render_watchdog_source`` (WireGuard only).
 
     * The other kind's script and scheduler are removed (the router moved
       between SSTP and WireGuard).
@@ -278,7 +502,7 @@ def install_watchdog(api, kind: str, mgmt_ip: Optional[str]) -> InstallResult:
       not re-enabled.
     """
     name = script_name(kind)
-    source = render_watchdog_source(kind, mgmt_ip)
+    source = render_watchdog_source(kind, mgmt_ip, rotate=rotate)
     for other_kind, other in SCRIPT_NAMES.items():
         if other_kind != kind:
             _remove_named(api, other)
