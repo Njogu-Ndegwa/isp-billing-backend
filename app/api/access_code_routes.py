@@ -13,10 +13,12 @@ only credential that can list or remove the plan's devices.
 """
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.device_pairing import (
@@ -37,7 +39,7 @@ from app.api.device_pairing import (
     shareable_code_for_owner,
 )
 from app.db.database import get_db
-from app.db.models import Customer, Router
+from app.db.models import Customer, CustomerStatus, Router
 from app.services.code_attempt_limiter import check_code_attempts, record_code_failure
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.router_helpers import get_router_by_id
@@ -156,15 +158,49 @@ async def redeem_code_on_device(
     summary = _plan_summary(owner)
     owner_mac = normalize_mac_address(owner.mac_address) if owner.mac_address else None
 
-    # The plan's own device (or a single-device plan) moves to wherever the
-    # code is entered, exactly like a reconnect.
-    if owner_mac is None or owner_mac == normalized_mac or not summary["sharing_enabled"]:
+    lookup_key = f"code:{resolved.kind}"
+
+    # The plan's own device, or a plan not bound to a device yet.
+    if owner_mac is None or owner_mac == normalized_mac:
         result = await restore_customer_on_device(
             db,
             customer=owner,
             router_obj=router_obj,
             normalized_mac=normalized_mac,
-            lookup_key=f"code:{resolved.kind}",
+            lookup_key=lookup_key,
+            background_tasks=background_tasks,
+        )
+        return {**result, **summary, "outcome": "main_device"}
+
+    # A single-device purchase belongs to the device it is bound to. Entered on
+    # another device it is only moved when its own device is not in use (a
+    # phone whose randomized MAC rotated, a replaced phone); see
+    # app/services/device_entitlements.py. If this device already holds its
+    # own purchase on the same number, that one is restored instead.
+    if not summary["sharing_enabled"]:
+        own = await _own_purchase_on_device(
+            db, owner=owner, router_id=router_id, normalized_mac=normalized_mac,
+        )
+        if own is not None:
+            await db.refresh(own, ["plan"])
+            result = await restore_customer_on_device(
+                db,
+                customer=own,
+                router_obj=router_obj,
+                normalized_mac=normalized_mac,
+                lookup_key=lookup_key,
+                background_tasks=background_tasks,
+            )
+            return {**result, **_plan_summary(own), "outcome": "main_device"}
+
+        from app.api.public_routes import _move_idle_purchase_or_refuse
+
+        result = await _move_idle_purchase_or_refuse(
+            db,
+            candidates=[owner],
+            router_obj=router_obj,
+            normalized_mac=normalized_mac,
+            lookup_key=lookup_key,
             background_tasks=background_tasks,
         )
         return {**result, **summary, "outcome": "main_device"}
@@ -178,6 +214,37 @@ async def redeem_code_on_device(
         device_name=device_name,
         summary=summary,
     )
+
+
+async def _own_purchase_on_device(
+    db: AsyncSession,
+    *,
+    owner: Customer,
+    router_id: int,
+    normalized_mac: str,
+) -> Optional[Customer]:
+    """A live purchase on the owner's number that is bound to this device."""
+    from app.services.customer_grace import access_floor, has_access_time
+
+    now = datetime.utcnow()
+    rows = (
+        await db.execute(
+            select(Customer).where(
+                Customer.phone == owner.phone,
+                Customer.router_id == router_id,
+                Customer.id != owner.id,
+                Customer.subscription_owner_id.is_(None),
+                Customer.status == CustomerStatus.ACTIVE,
+                Customer.expiry.isnot(None),
+                Customer.expiry > access_floor(now),
+                Customer.mac_address.isnot(None),
+            )
+        )
+    ).scalars().all()
+    for row in rows:
+        if normalize_mac_address(row.mac_address) == normalized_mac and has_access_time(row, now):
+            return row
+    return None
 
 
 async def add_device_to_owner_plan(
