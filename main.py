@@ -51,14 +51,25 @@ async def enforce_impersonation_read_only(request: Request, call_next):
     return await _enforce_impersonation_read_only(request, call_next)
 
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
+# CORS middleware. CORS_OPTIONS is also handed to the catch-all 500 handler
+# below, so an unhandled error carries exactly the same CORS headers as any
+# other response -- one source of truth, never wider.
+CORS_OPTIONS = dict(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(CORSMiddleware, **CORS_OPTIONS)
+
+# Unhandled exceptions become a 500 in Starlette's outermost layer, OUTSIDE
+# CORSMiddleware, so the browser could not read them and resellers saw
+# "NetworkError" / "Failed to fetch" (25 Oct 2026, Generate Vouchers). This
+# returns {"detail": "Internal server error"} with the CORS headers above.
+# HTTPException and validation errors keep their own handlers.
+from app.core.error_handlers import install_unhandled_error_handler  # noqa: E402
+
+install_unhandled_error_handler(app, CORS_OPTIONS)
 
 
 @app.middleware("http")
