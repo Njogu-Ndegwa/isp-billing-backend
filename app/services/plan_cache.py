@@ -239,6 +239,7 @@ def _serialize_plan(plan: Plan) -> Dict:
         "fup_period": getattr(plan, "fup_period", None) or "plan",
         "max_shared_users": int(plan.max_shared_users or 1),
         "sharing_enabled": int(plan.max_shared_users or 1) > 1,
+        "share_speed_across_devices": bool(getattr(plan, "share_speed_across_devices", False)),
         "router_ids": normalize_router_ids(getattr(plan, "router_ids", None)),
         "trial_once_per_customer": bool(getattr(plan, "trial_once_per_customer", True)),
     }

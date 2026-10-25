@@ -2551,6 +2551,12 @@ async def run_free_trial_migrations():
             "ALTER TABLE plans "
             "ADD COLUMN IF NOT EXISTS trial_once_per_customer BOOLEAN NOT NULL DEFAULT true"
         ))
+        # PPPoE "share speed across devices" opt-in; false keeps every
+        # existing plan on per-session speed.
+        await conn.execute(sa_text(
+            "ALTER TABLE plans "
+            "ADD COLUMN IF NOT EXISTS share_speed_across_devices BOOLEAN NOT NULL DEFAULT false"
+        ))
 
         def existing_tables(connection):
             return set(inspect(connection).get_table_names())

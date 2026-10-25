@@ -326,6 +326,10 @@ class Plan(Base):
     # Free-trial plans only (plan_type=free_trial): True lets each device claim
     # the trial once; False lets it claim again after the previous trial ends.
     trial_once_per_customer = Column(Boolean, nullable=False, default=True, server_default="true")
+    # PPPoE plans allowing 2+ devices: True makes all of one login's sessions
+    # share the plan speed (one router queue) instead of each session getting
+    # the full speed. Off by default, so existing plans keep per-session speed.
+    share_speed_across_devices = Column(Boolean, nullable=False, default=False, server_default="false")
 
 class FreeTrialClaim(Base):
     """One row per free-trial plan claimed from the captive portal.

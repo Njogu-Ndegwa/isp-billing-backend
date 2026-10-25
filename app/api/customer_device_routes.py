@@ -397,6 +397,10 @@ async def set_customer_device_limit(
         fup_hold = await active_fup_restriction(db, owner.id)
         if fup_hold is None:
             pppoe_payload = build_pppoe_payload(owner, owner.router)
+            # Down to one device on a shared-speed plan: the login leaves the
+            # shared queue for a normal per-session one.
+            if pppoe_payload.get("shared_speed"):
+                pppoe_payload["clear_shared_speed_queue"] = True
     await db.commit()
 
     if fup_hold == FupAction.THROTTLE:

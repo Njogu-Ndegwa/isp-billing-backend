@@ -611,6 +611,7 @@
   "price",
   "router_ids",
   "router_profile",
+  "share_speed_across_devices",
   "speed",
   "trial_once_per_customer",
   "user_id",
