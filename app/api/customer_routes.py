@@ -200,6 +200,26 @@ def _validate_tier(tier: Optional[str]) -> str:
     return normalized
 
 
+async def _payment_paybills(db: AsyncSession, user, router_ids) -> dict:
+    """{router_id: paybill} customers on each router should pay into.
+
+    Same rule as the expiry reminders and the M-Pesa prompt
+    (customer_expiry_notifications.resolve_paybills): the reseller's own
+    C2B-registered paybill, else the platform paybill (settings.MPESA_SHORTCODE)
+    when the money is platform-collected, else None (settles straight to the
+    reseller with no account-number paybill we can match, or outside Kenya).
+    One lookup per distinct router, not per customer. A display field, so a
+    failure here returns {} instead of failing the customer list.
+    """
+    from app.services.customer_expiry_notifications import resolve_paybills
+
+    try:
+        return await resolve_paybills(db, user, set(router_ids) or {None})
+    except Exception:
+        logger.exception("Could not resolve payment paybills for user %s", getattr(user, "id", None))
+        return {}
+
+
 router = APIRouter(tags=["customers"])
 
 
@@ -1234,6 +1254,7 @@ async def get_customers_api(
             stmt = stmt.where(~has_paid)
         result = await db.execute(stmt)
         rows = result.all()
+        paybills = await _payment_paybills(db, user, {c.router_id for c, _ in rows})
 
         return [
             {
@@ -1251,6 +1272,7 @@ async def get_customers_api(
                 "plan_id": c.plan_id,
                 "router_id": c.router_id,
                 "account_number": c.account_number,
+                "payment_paybill": paybills.get(c.router_id),
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
                 "subscription_owner_id": c.subscription_owner_id,
@@ -1309,6 +1331,7 @@ async def get_active_customers(
 
         result = await db.execute(stmt)
         rows = result.all()
+        paybills = await _payment_paybills(db, user, {c.router_id for c, _ in rows})
 
         return [
             {
@@ -1327,6 +1350,7 @@ async def get_active_customers(
                 "plan_id": c.plan_id,
                 "router_id": c.router_id,
                 "account_number": c.account_number,
+                "payment_paybill": paybills.get(c.router_id),
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
                 "has_paid": bool(c_has_paid),
@@ -1368,6 +1392,7 @@ async def get_customer_detail(
         customer = result.scalar_one_or_none()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
+        paybills = await _payment_paybills(db, user, {customer.router_id})
 
         return {
             "id": customer.id,
@@ -1384,6 +1409,7 @@ async def get_customer_detail(
             "plan_id": customer.plan_id,
             "router_id": customer.router_id,
             "account_number": customer.account_number,
+            "payment_paybill": paybills.get(customer.router_id),
             "wallet_credit_kes": customer.wallet_credit_kes,
             **grace_fields(customer, datetime.utcnow()),
             "subscription_owner_id": customer.subscription_owner_id,
