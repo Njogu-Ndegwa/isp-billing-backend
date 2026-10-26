@@ -33,7 +33,7 @@ def test_oui_match_colonless_lowercase():
 
 def test_oui_match_ubiquiti_and_mercusys():
     assert vendor_from_mac("24:A4:3C:00:00:01") == "Ubiquiti"
-    assert vendor_from_mac("b8:3a:34:00:00:01") == "Mercusys"
+    assert vendor_from_mac("0c:1c:31:00:00:01") == "Mercusys"
 
 
 def test_oui_unknown_returns_none():
@@ -210,10 +210,56 @@ def test_classify_ordinary_hotspot_client_stays_customer():
     }
 
 
-def test_fcaab6_is_tenda():
-    # Field case: Major1's well-behaved AP (lease hostname "Tenda") whose OUI
-    # was missing from the map — port 5 showed customers with no equipment.
-    from app.services.device_classifier import vendor_from_mac
+def test_fcaab6_is_samsung_not_tenda_but_tenda_hostname_still_matches():
+    # Major1's AP (lease hostname "Tenda") was once matched by OUI FC:AA:B6,
+    # but IEEE assigns that block to Samsung, so the OUI alone must not say
+    # Tenda (it would label Samsung phones as equipment). The AP is still
+    # recognised through its hostname.
+    assert vendor_from_mac("FC:AA:B6:74:1A:33") is None
+    result = classify_device(mac_address="FC:AA:B6:74:1A:33", hostnames=("Tenda",))
+    assert result["vendor"] == "Tenda"
+    assert result["device_class"] == "infrastructure"
 
-    assert vendor_from_mac("FC:AA:B6:74:1A:33") == "Tenda"
-    assert vendor_from_mac("fcaab674:1a:33") == "Tenda"
+
+# ---------------------------------------------------------------------------
+# OUI table audited against the IEEE registry (2026-10-26)
+# ---------------------------------------------------------------------------
+
+def test_500ff5_is_tenda_not_tp_link():
+    # Field case 2026-10-26: Fastnet (router 647) saw his Tenda AP labelled
+    # "TP-Link AP" on the Ports panel. IEEE: "Tenda Technology Co.,Ltd.
+    # Dongguan branch".
+    assert vendor_from_mac("50:0F:F5:12:11:C0") == "Tenda"
+    result = classify_device(mac_address="50:0f:f5:12:11:c0")
+    assert result["vendor"] == "Tenda"
+    assert result["device_class"] == "infrastructure"
+
+
+def test_corrected_oui_entries():
+    # 8C:44:BB was also mapped to TP-Link; IEEE: SHEN ZHEN TENDA TECHNOLOGY.
+    assert vendor_from_mac("8C:44:BB:00:00:01") == "Tenda"
+    # B8:3A:34 is not assigned to anyone, so it no longer claims Mercusys.
+    assert vendor_from_mac("B8:3A:34:00:00:01") is None
+    # Real Mercusys and Cudy blocks.
+    assert vendor_from_mac("94:74:2E:00:00:01") == "Mercusys"
+    assert vendor_from_mac("D4:0D:AB:00:00:01") == "Cudy"
+
+
+def test_common_tenda_prefixes_seen_in_the_field():
+    for mac in ("B4:0F:3B:00:00:01", "C8:3A:35:00:00:01", "E8:65:D4:00:00:01",
+                "CC:2D:21:00:00:01", "50:DA:9E:00:00:01"):
+        assert vendor_from_mac(mac) == "Tenda", mac
+
+
+def test_genuine_tp_link_entries_unchanged():
+    for mac in ("50:C7:BF:00:00:01", "D8:07:B6:00:00:01", "F4:EC:38:00:00:01",
+                "B0:4E:26:00:00:01"):
+        assert vendor_from_mac(mac) == "TP-Link", mac
+
+
+def test_oui_table_keys_are_well_formed():
+    from app.services.device_classifier import INFRASTRUCTURE_OUI_VENDORS
+
+    for key in INFRASTRUCTURE_OUI_VENDORS:
+        assert len(key) == 6 and key == key.upper(), key
+        int(key, 16)
