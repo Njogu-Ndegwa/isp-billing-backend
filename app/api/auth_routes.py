@@ -70,9 +70,8 @@ async def register_user_api(
                 raise HTTPException(status_code=403, detail="Admin access required to create an admin")
             created_by = caller.id
 
-        existing_user_stmt = select(User).filter(User.email == request.email.lower())
-        existing_result = await db.execute(existing_user_stmt)
-        if existing_result.scalar_one_or_none():
+        from app.api.staff_routes import email_in_use
+        if await email_in_use(db, request.email):
             raise HTTPException(status_code=409, detail="User with this email already exists")
 
         acquisition = attribution_service.sanitize_attribution(request.attribution)
@@ -159,7 +158,8 @@ def login_token_claims(user) -> dict:
         "user_code": user.user_code,
         "user_id": user.id,
         "role": user.role.value,
-        "organization_name": user.organization_name
+        "organization_name": user.organization_name,
+        "tv": int(getattr(user, "token_version", 0) or 0),
     }
 
 
@@ -197,6 +197,10 @@ async def login_api(
     try:
         user = await authenticate_user(db, request.email, request.password)
         if not user:
+            from app.api.staff_routes import login_staff
+            staff_response = await login_staff(db, request.email, request.password)
+            if staff_response is not None:
+                return staff_response
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
         from app.core.runtime_mode import shadow_mode_enabled
@@ -366,7 +370,10 @@ async def reset_password(
         )
 
     user.password_hash = await asyncio.to_thread(pwd_context.hash, request.new_password)
+    user.token_version = int(user.token_version or 0) + 1
     token_row.used_at = now
     await db.commit()
+    from app.services.staff_access import invalidate_owner
+    invalidate_owner(user.id)
     logger.info(f"Password reset completed for user {user.id}")
     return {"message": "Password reset successfully. You can now sign in."}

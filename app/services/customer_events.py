@@ -166,6 +166,10 @@ async def record_customer_event(
 
 
 def actor_label(actor) -> Optional[str]:
+    from app.services.staff_access import current_staff
+    staff = current_staff()
+    if staff is not None:
+        return f"{staff.name} (staff)"
     if actor is None:
         return None
     if getattr(getattr(actor, "role", None), "value", None) == "admin":

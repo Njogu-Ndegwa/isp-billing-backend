@@ -127,14 +127,9 @@ async def update_profile(
     user = await get_current_user(token, db)
 
     if request.email is not None and request.email != user.email:
-        existing = await db.execute(
-            select(User).where(User.email == request.email, User.id != user.id)
-        )
-        if existing.scalar_one_or_none():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A user with this email already exists",
-            )
+        from app.api.staff_routes import email_in_use
+        if await email_in_use(db, request.email):
+            raise HTTPException(status_code=409, detail="A user with this email already exists")
         user.email = request.email
 
     if request.organization_name is not None:
@@ -187,9 +182,17 @@ async def change_password(
         )
 
     user.password_hash = pwd_context.hash(request.new_password)
+    user.token_version = int(user.token_version or 0) + 1
     await db.commit()
 
-    return {"detail": "Password updated successfully"}
+    from app.api.auth_routes import login_token_claims
+    from app.services.auth import create_access_token
+    from app.services.staff_access import invalidate_owner, token_expiry
+    invalidate_owner(user.id)
+    return {
+        "detail": "Password updated successfully",
+        "access_token": create_access_token(login_token_claims(user), token_expiry()),
+    }
 
 
 # ---------------------------------------------------------------------------

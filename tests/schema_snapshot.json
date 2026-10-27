@@ -788,6 +788,22 @@
   "reseller_id",
   "router_id"
  ],
+ "reseller_staff": [
+  "created_at",
+  "deleted_at",
+  "email",
+  "id",
+  "is_active",
+  "last_login_at",
+  "name",
+  "parent_reseller_id",
+  "password_hash",
+  "permissions",
+  "permissions_updated_at",
+  "phone",
+  "token_version",
+  "updated_at"
+ ],
  "reseller_transaction_charges": [
   "amount",
   "created_at",
@@ -1040,6 +1056,20 @@
   "updated_at",
   "user_id"
  ],
+ "staff_activity_log": [
+  "action",
+  "actor_label",
+  "created_at",
+  "id",
+  "ip_address",
+  "method",
+  "owner_id",
+  "path",
+  "permission",
+  "staff_id",
+  "status_code",
+  "summary"
+ ],
  "subscription_expiry_reminders": [
   "created_at",
   "expires_at",
@@ -1191,6 +1221,7 @@
   "subscription_price_override",
   "subscription_status",
   "support_phone",
+  "token_version",
   "user_code"
  ],
  "vouchers": [
