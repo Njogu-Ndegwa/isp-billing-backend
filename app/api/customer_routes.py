@@ -1479,6 +1479,124 @@ class ActivatePPPoERequest(BaseModel):
     payment_method: str = "cash"
     payment_reference: Optional[str] = None
     notes: Optional[str] = None
+    # Record another payment even though the customer is already active or
+    # paid moments ago. The admin UI only sends this after the reseller has
+    # seen the 409 below and confirmed.
+    force: bool = False
+
+
+# A manual activation records money the reseller took outside the system.
+# mobile_money is deliberately absent: it is how M-Pesa/C2B rows are stored,
+# the transaction ledger treats those rows as twins of an M-Pesa record and
+# hides them, and the admin M-Pesa totals count them. A hand-entered
+# "M-Pesa" row would be a revenue row with no M-Pesa receipt behind it.
+MANUAL_ACTIVATION_PAYMENT_METHODS = {
+    "cash": PaymentMethod.CASH,
+    "other": PaymentMethod.OTHER,
+    "bank_transfer": PaymentMethod.BANK_TRANSFER,
+    "card": PaymentMethod.CARD,
+}
+
+# A payment completed this recently means the customer was just activated
+# (C2B, STK or another manual activation) and a second activation is almost
+# certainly a stale screen or a double click.
+RECENT_PAYMENT_WINDOW = timedelta(minutes=10)
+
+
+def manual_activation_payment_method(value: Optional[str]) -> PaymentMethod:
+    """Map the activation form's payment method, refusing values that would
+    be stored as something else ("mpesa" and "voucher" used to be saved
+    silently as CASH)."""
+    key = (value or "cash").strip().lower()
+    method = MANUAL_ACTIVATION_PAYMENT_METHODS.get(key)
+    if method is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{value}' is not a valid payment method for a manual activation. "
+                "Use 'cash' (cash received) or 'other' (paid outside the system). "
+                "M-Pesa payments to your paybill or till activate the customer automatically."
+            ),
+        )
+    return method
+
+
+async def manual_activation_conflict(
+    db: AsyncSession, customer: Customer, now: datetime
+) -> Optional[dict]:
+    """Why activating ``customer`` again now would double-renew them, or None.
+
+    Two signals: paid time still running (status ACTIVE with expiry in the
+    future; grace does not count, a customer in grace genuinely owes), or a
+    completed payment in the last few minutes.
+    """
+    active_until = (
+        customer.expiry
+        if customer.status == CustomerStatus.ACTIVE
+        and customer.expiry is not None
+        and customer.expiry > now
+        else None
+    )
+    recent = (
+        await db.execute(
+            select(
+                CustomerPayment.payment_date,
+                CustomerPayment.amount,
+                CustomerPayment.payment_method,
+            )
+            .where(
+                CustomerPayment.customer_id == customer.id,
+                CustomerPayment.status == PaymentStatus.COMPLETED,
+                CustomerPayment.payment_date >= now - RECENT_PAYMENT_WINDOW,
+            )
+            .order_by(CustomerPayment.payment_date.desc())
+            .limit(1)
+        )
+    ).first()
+    if active_until is None and recent is None:
+        return None
+
+    if recent is not None:
+        code = "customer_already_paid"
+        message = (
+            f"This customer already paid at {recent.payment_date:%Y-%m-%d %H:%M} UTC"
+            + (f" and is active until {active_until:%Y-%m-%d %H:%M} UTC" if active_until else "")
+            + ". Activating again records another payment and adds another period."
+        )
+    else:
+        code = "customer_already_active"
+        message = (
+            f"This customer is already active until {active_until:%Y-%m-%d %H:%M} UTC. "
+            "Activating again records another payment and adds another period."
+        )
+    method = recent.payment_method if recent is not None else None
+    return {
+        "code": code,
+        "message": message,
+        "customer_id": customer.id,
+        "status": customer.status.value if customer.status else None,
+        "expiry": customer.expiry.isoformat() if customer.expiry else None,
+        "last_payment_at": recent.payment_date.isoformat() if recent is not None else None,
+        "last_payment_amount": float(recent.amount) if recent is not None else None,
+        "last_payment_method": getattr(method, "value", method),
+    }
+
+
+async def refuse_duplicate_manual_activation(
+    db: AsyncSession, customer: Customer, request: "ActivatePPPoERequest", now: datetime
+) -> bool:
+    """Raise 409 when this activation would double-renew, unless forced.
+    Returns True when the reseller confirmed past a conflict (for the audit trail)."""
+    conflict = await manual_activation_conflict(db, customer, now)
+    if conflict is None:
+        return False
+    if not request.force:
+        raise HTTPException(status_code=409, detail=conflict)
+    logger.warning(
+        "Manual activation of customer %s forced past %s (expiry %s, last payment %s)",
+        customer.id, conflict["code"], conflict["expiry"], conflict["last_payment_at"],
+    )
+    return True
 
 
 @router.post("/api/customers/{customer_id}/activate-pppoe")
@@ -1516,6 +1634,9 @@ async def activate_pppoe_customer(
             raise HTTPException(status_code=400, detail="Customer has no router assigned")
 
         plan = customer.plan
+        pm_enum = manual_activation_payment_method(request.payment_method)
+        now = datetime.utcnow()
+        forced = await refuse_duplicate_manual_activation(db, customer, request, now)
 
         duration_unit = plan.duration_unit.value.upper()
         duration_value = plan.duration_value
@@ -1529,7 +1650,6 @@ async def activate_pppoe_customer(
             expiry_delta = timedelta(days=duration_value)
             days_paid_for = duration_value
 
-        now = datetime.utcnow()
         # An active customer (paid time or grace) keeps their billing date.
         if customer.status == CustomerStatus.ACTIVE:
             customer.expiry = renewal_expiry(customer, now, expiry_delta)
@@ -1537,11 +1657,6 @@ async def activate_pppoe_customer(
             customer.expiry = now + expiry_delta
 
         customer.status = CustomerStatus.ACTIVE
-
-        try:
-            pm_enum = PaymentMethod(request.payment_method.lower())
-        except ValueError:
-            pm_enum = PaymentMethod.CASH
 
         payment = CustomerPayment(
             customer_id=customer.id,
@@ -1595,13 +1710,14 @@ async def activate_pppoe_customer(
         await record_customer_event(
             customer.id, "pppoe_activated",
             f"PPPoE activated on {plan.name} until {customer.expiry:%Y-%m-%d %H:%M} UTC "
-            f"({request.payment_method}); router "
+            f"({pm_enum.value}{', confirmed although already active/paid' if forced else ''}); router "
             + ("updated" if provision_succeeded else
                f"not updated yet: {(provision_result or {}).get('error') or 'will retry'}"),
             severity="info" if provision_succeeded else "warning",
             actor=user, user_id=user.id, router_id=customer.router_id,
             details={"payment_id": payment.id, "reference": request.payment_reference,
-                     "provision_result": "ok" if provision_succeeded else "retry_pending"},
+                     "provision_result": "ok" if provision_succeeded else "retry_pending",
+                     "forced": forced},
         )
 
         return {
@@ -1759,6 +1875,9 @@ async def activate_static_customer(
         enforce_active_subscription(user)
         customer = await _load_static_customer(db, customer_id, user)
         plan = customer.plan
+        pm_enum = manual_activation_payment_method(request.payment_method)
+        now = datetime.utcnow()
+        forced = await refuse_duplicate_manual_activation(db, customer, request, now)
 
         duration_unit = plan.duration_unit.value.upper()
         duration_value = plan.duration_value
@@ -1772,18 +1891,12 @@ async def activate_static_customer(
             expiry_delta = timedelta(days=duration_value)
             days_paid_for = duration_value
 
-        now = datetime.utcnow()
         # An active customer (paid time or grace) keeps their billing date.
         if customer.status == CustomerStatus.ACTIVE:
             customer.expiry = renewal_expiry(customer, now, expiry_delta)
         else:
             customer.expiry = now + expiry_delta
         customer.status = CustomerStatus.ACTIVE
-
-        try:
-            pm_enum = PaymentMethod(request.payment_method.lower())
-        except ValueError:
-            pm_enum = PaymentMethod.CASH
 
         payment = CustomerPayment(
             customer_id=customer.id,
@@ -1814,11 +1927,12 @@ async def activate_static_customer(
         await record_customer_event(
             customer.id, "static_ip_activated",
             f"Static IP {customer.static_ip} activated on {plan.name} until {expiry:%Y-%m-%d %H:%M} UTC "
-            f"({request.payment_method}); router "
+            f"({pm_enum.value}{', confirmed although already active/paid' if forced else ''}); router "
             + ("updated" if ok else f"not updated yet: {result.get('error') or 'will retry'}"),
             severity="info" if ok else "warning",
             actor=user, user_id=user.id, router_id=customer.router_id,
-            details={"payment_id": payment.id, "reference": request.payment_reference},
+            details={"payment_id": payment.id, "reference": request.payment_reference,
+                     "forced": forced},
         )
         return {
             "success": True,
