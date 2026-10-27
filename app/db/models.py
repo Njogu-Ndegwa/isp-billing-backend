@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, Text, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
 from sqlalchemy.ext.asyncio import AsyncAttrs
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Session, relationship
+from sqlalchemy import event
 from datetime import datetime
 import enum
 from sqlalchemy import JSON
@@ -250,6 +251,14 @@ class Customer(Base):
     # total devices including the owner's). NULL = use the plan's value.
     # See app/services/subscription_sharing.py max_devices_for_customer.
     max_devices_override = Column(Integer, nullable=True)
+    # Pause / resume (app/services/customer_pause.py). While paused the
+    # customer is INACTIVE, `expiry` is frozen at the pause moment (so nothing
+    # reads it as paid time) and the unused paid time waits in
+    # paused_remaining_seconds; resume sets expiry = now + that. NULL paused_at
+    # means not paused. pause_resume_at is an optional auto-resume time.
+    paused_at = Column(DateTime, nullable=True)
+    paused_remaining_seconds = Column(Integer, nullable=True)
+    pause_resume_at = Column(DateTime, nullable=True)
     # Nullable self-reference used by managed companion devices that share the
     # paying customer's subscription/expiry instead of buying their own plan.
     subscription_owner_id = Column(
@@ -263,6 +272,30 @@ class Customer(Base):
         remote_side=[id],
         backref="shared_subscription_customers",
     )
+
+@event.listens_for(Session, "before_flush")
+def _active_customers_are_never_paused(session, _flush_context, _instances):
+    """Invariant: an ACTIVE customer is not paused.
+
+    Pause/resume (app/services/customer_pause.py) keep this themselves. Any
+    other path that makes a paused customer ACTIVE -- in practice a payment
+    (M-Pesa, paybill, voucher, cash activation) while paused -- ends the pause
+    here and adds the paused paid time on top of the new expiry, so the
+    customer never loses time they already paid for and the pause can never
+    be left behind on a paying customer (which would deny them access).
+    """
+    for obj in list(session.new) + list(session.dirty):
+        # status first: it is what was just changed (already loaded), so
+        # paused_at is only read for customers turning ACTIVE.
+        if (
+            isinstance(obj, Customer)
+            and obj.status == CustomerStatus.ACTIVE
+            and obj.paused_at is not None
+        ):
+            from app.services.customer_pause import end_pause_on_activation
+
+            end_pause_on_activation(obj)
+
 
 class CustomerRating(Base):
     """Customer ratings/feedback after purchase - identified by phone number"""

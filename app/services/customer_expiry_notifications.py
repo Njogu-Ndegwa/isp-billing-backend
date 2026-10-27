@@ -442,6 +442,8 @@ async def _queue_reseller_expired_campaign(
                     Customer.id.in_(customer_ids),
                     Customer.user_id == reseller_id,
                     Customer.status == CustomerStatus.INACTIVE,
+                    # Paused customers are INACTIVE with a frozen expiry: not expired.
+                    Customer.paused_at.is_(None),
                     Customer.expiry.isnot(None),
                     Customer.expiry <= now,
                     Customer.phone.isnot(None),
@@ -633,6 +635,7 @@ async def collect_due_reminder_groups(
                 .where(
                     Customer.user_id.in_(offsets_by_reseller),
                     Customer.status == CustomerStatus.ACTIVE,
+                    Customer.paused_at.is_(None),
                     Customer.expiry.isnot(None),
                     Customer.expiry > now,
                     Customer.expiry <= now + timedelta(minutes=max_offset),
@@ -721,6 +724,7 @@ async def _queue_reseller_reminder_campaign(
                     Customer.id.in_(customer_ids),
                     Customer.user_id == reseller_id,
                     Customer.status == CustomerStatus.ACTIVE,
+                    Customer.paused_at.is_(None),
                     Customer.expiry.isnot(None),
                     Customer.expiry > now,
                     Customer.expiry <= now + timedelta(minutes=offset_minutes),

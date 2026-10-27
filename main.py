@@ -2800,6 +2800,32 @@ async def run_customer_device_limit_migrations():
     raise last_exc
 
 
+async def run_customer_pause_migrations():
+    """Add the customers columns for pause / resume (app/services/customer_pause.py):
+    paused_at, paused_remaining_seconds and pause_resume_at. All nullable with
+    no default, so this is a metadata-only change. Idempotent.
+
+    Same retry loop as run_customer_grace_migrations: customers is the hottest
+    table and app connections carry lock_timeout.
+    """
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(sa_text("""
+                    ALTER TABLE customers
+                    ADD COLUMN IF NOT EXISTS paused_at TIMESTAMP NULL,
+                    ADD COLUMN IF NOT EXISTS paused_remaining_seconds INTEGER NULL,
+                    ADD COLUMN IF NOT EXISTS pause_resume_at TIMESTAMP NULL
+                """))
+            return
+        except Exception as exc:  # lock_timeout under a busy table: try again
+            last_exc = exc
+            logger.warning("Customer pause migration attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise last_exc
+
+
 async def run_standard_runtime_migrations():
     """Add the routers columns the standard-runtime installer records its work
     in (app/services/standard_runtime_enrol.py): check-in applier and
@@ -3510,6 +3536,12 @@ async def startup_event():
         logger.error(f"Customer device-limit migration failed (non-fatal): {e}")
 
     try:
+        await run_customer_pause_migrations()
+        logger.info("Customer pause migration completed successfully")
+    except Exception as e:
+        logger.error(f"Customer pause migration failed (non-fatal): {e}")
+
+    try:
         await run_standard_runtime_migrations()
         logger.info("Standard-runtime migration completed successfully")
     except Exception as e:
@@ -3661,6 +3693,17 @@ async def startup_event():
         name='Safety-net bypass scan and idle credential reaper',
         replace_existing=True,
         max_instances=1
+    )
+    # Paused customers with an auto-resume date (app/services/customer_pause.py).
+    from app.services.customer_pause import auto_resume_due_customers_background
+    scheduler.add_job(
+        auto_resume_due_customers_background,
+        trigger=IntervalTrigger(minutes=2),
+        id='auto_resume_paused_customers',
+        name='Resume paused customers whose auto-resume time has come',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=120,
     )
     scheduler.add_job(
         reconcile_inactive_pppoe_access_background,

@@ -191,6 +191,9 @@ async def _collect(
                 base.where(
                     Customer.expiry > outage_start,
                     Customer.expiry <= now,
+                    # A paused customer's expiry is the pause moment, not a
+                    # lapse: reviving them would undo the pause.
+                    Customer.paused_at.is_(None),
                     existed_before_end,
                 ).order_by(Customer.id)
             )
