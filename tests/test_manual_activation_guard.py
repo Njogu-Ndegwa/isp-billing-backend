@@ -349,3 +349,96 @@ async def test_failed_gateway_initiation_leaves_customer_status_alone(db, monkey
     assert exc.value.status_code == 500
     await db.refresh(customer)
     assert customer.status == CustomerStatus.ACTIVE
+
+
+# --- 4. staff tokens (#272) ---------------------------------------------------
+# A staff JWT carries the owner's user_id, so get_current_user resolves to the
+# owner and the ownership check compares against the owner, never staff_id.
+# These go through the real app so the staff middleware runs too.
+
+
+async def _staff_token(db, owner, permissions):
+    from app.db.models import ResellerStaff
+    from app.services import staff_access
+    from app.services.auth import create_access_token, pwd_context
+
+    staff = ResellerStaff(
+        parent_reseller_id=owner.id, name="Front desk", email=f"desk{owner.id}@example.com",
+        password_hash=pwd_context.hash("staff-password"), permissions=permissions,
+    )
+    db.add(staff)
+    await db.commit()
+    await db.refresh(staff)
+    return create_access_token(staff_access.staff_token_claims(staff, owner), timedelta(hours=1))
+
+
+@pytest.fixture
+def staff_app(engine, monkeypatch):
+    from app.services import mpesa as mpesa_service
+    from app.services import payment_gateway, staff_access
+
+    staff_access.reset_cache()
+    sent = []
+
+    async def _no_alert(*_args, **_kwargs):
+        pass
+
+    async def _no_method(_db, _router_id):
+        return None
+
+    async def _stk(**kwargs):
+        sent.append(kwargs)
+        return {"checkoutRequestId": f"ws_CO_staff_{len(sent)}", "merchantRequestId": "m-staff"}
+
+    monkeypatch.setattr(staff_access, "alert_owner", _no_alert)
+    monkeypatch.setattr(payment_gateway, "resolve_collection_payment_method", _no_method)
+    monkeypatch.setattr(mpesa_service, "initiate_stk_push", _stk)
+    yield sent
+    staff_access.reset_cache()
+
+
+async def _post_initiate(token, customer):
+    import main
+    from httpx import ASGITransport, AsyncClient
+
+    async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test") as client:
+        return await client.post(
+            "/api/mpesa/initiate-payment",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"customer_id": customer.id, "amount": 1000, "phone": "254712345678"},
+        )
+
+
+async def test_staff_may_initiate_payment_for_their_owners_customer(db, staff_app):
+    owner = await make_reseller(db)
+    plan = await make_plan(db, owner)
+    router = await make_router(db, owner)
+    customer = await make_customer(db, owner, plan, router)
+    token = await _staff_token(db, owner, ["customers.view", "customers.manage"])
+
+    response = await _post_initiate(token, customer)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["checkout_request_id"] == "ws_CO_staff_1"
+    assert len(staff_app) == 1
+
+
+async def test_staff_of_another_reseller_gets_403_and_no_stk(db, staff_app):
+    owner = await make_reseller(db)
+    other = await make_reseller(db)
+    plan = await make_plan(db, owner)
+    router = await make_router(db, owner)
+    customer = await make_customer(
+        db, owner, plan, router, status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=10),
+    )
+    token = await _staff_token(db, other, ["customers.view", "customers.manage"])
+
+    response = await _post_initiate(token, customer)
+
+    assert response.status_code == 403, response.text
+    # The handler's ownership check, not the staff permission middleware.
+    assert "your own customers" in response.json()["detail"]
+    assert staff_app == [], "no STK prompt for another reseller's customer"
+    await db.refresh(customer)
+    assert customer.status == CustomerStatus.ACTIVE
