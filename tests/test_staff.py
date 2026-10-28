@@ -72,6 +72,17 @@ def test_presets_never_grant_sensitive_or_staff_management():
     assert perms.match_rule("PUT", "/api/staff/123")[0] is None
 
 
+@pytest.mark.parametrize("action", ["pause", "resume"])
+def test_pause_resume_need_customers_manage(action):
+    # Pause/Resume (#274) handlers call require_permission("customers.manage");
+    # the deny-by-default route map must list them too or staff are refused.
+    rule, params = perms.match_rule("POST", f"/api/customers/42/{action}")
+    assert rule is not None
+    assert rule.requirement == "customers.manage"
+    assert params == {"customer_id": "42"}
+    assert not rule.allows(["customers.view"])
+
+
 @pytest.mark.asyncio
 async def test_staff_login_is_own_identity_in_owner_scope(client, actor):
     owner, staff, token = actor
