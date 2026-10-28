@@ -11,7 +11,7 @@ from app.db.models import (
     CustomerStatus, CustomerPayment, CollectionMode, ConnectionType, User, PaymentMethod,
     ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
     C2BTransaction, C2BTransactionStatus,
-    OutageCompensation, OutageCompensationItem, PaymentStatus,
+    OutageCompensation, OutageCompensationItem, PaymentStatus, UserRole,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -621,6 +621,22 @@ async def initiate_mpesa_payment_api(
         customer = result.scalar_one_or_none()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
+        # Tenant check: a reseller may only prompt their own customers (this
+        # route always needs a login; the captive portal pays through the
+        # public /api/hotspot/register-and-pay instead). Checked before any
+        # side effect: no STK, no transaction row, no status change.
+        # A staff token carries its owner's user_id, so current_user is the
+        # owner here and staff pass for the owner's customers. Keep comparing
+        # against current_user.id, never a staff id.
+        if current_user.role != UserRole.ADMIN and customer.user_id != current_user.id:
+            logger.warning(
+                "Refused initiate-payment: user %s is not the owner of customer %s",
+                current_user.id, customer.id,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="You can only send a payment request to your own customers",
+            )
 
         # Snapshot the plan being paid for now — customer.plan_id gets
         # overwritten by later purchases, and the session may roll back
