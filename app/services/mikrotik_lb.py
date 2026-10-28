@@ -158,6 +158,34 @@ def _wr(api, report: dict, name: str, cmd: str, args: Dict[str, str]) -> bool:
     return ok
 
 
+# RouterOS answers an add for an object that is already there with
+# "failure: already have such entry" (address lists) — the state we wanted.
+_ALREADY_PRESENT_MARKER = "already have such entry"
+
+
+def _wr_add(api, report: dict, name: str, cmd: str, args: Dict[str, str]) -> bool:
+    """Idempotent add: an "already have such entry" refusal counts as success."""
+    r = api.send_command(cmd, args)
+    err = r.get("error")
+    if r.get("success"):
+        _step(report, name, True, {"cmd": cmd, "args": args})
+        return True
+    if _ALREADY_PRESENT_MARKER in str(err or "").lower():
+        _step(report, name, True, {"cmd": cmd, "args": args, "already_present": True})
+        return True
+    _step(report, name, False, {"cmd": cmd, "args": args, "error": err})
+    return False
+
+
+def _unique(items) -> List[str]:
+    """Drop repeats (and blanks), keeping first-seen order."""
+    out: List[str] = []
+    for item in items:
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
 def ros_major(version: Optional[str]) -> Optional[int]:
     """'6.49.21 (long-term)' -> 6; unreadable -> None."""
     m = re.match(r"\s*(\d+)\.", version or "")
@@ -861,14 +889,18 @@ def lb_apply(api, wan_ports: List[str]) -> dict:
     # 4. address lists (LB_SRC + LB_BYPASS_DST incl. backends + live wg endpoints)
     al = _rd(api, "/ip/firewall/address-list/print", ["list", "address"])
     have_al = {(a.get("list"), a.get("address")) for a in al}
-    for addr in LB_SRC_NETWORKS:
+    for addr in _unique(LB_SRC_NETWORKS):
         if (LB_SRC_LIST, addr) not in have_al:
-            _wr(api, report, f"address_list.add.{LB_SRC_LIST}.{addr}",
-                "/ip/firewall/address-list/add", {"list": LB_SRC_LIST, "address": addr})
-    for addr in LB_BYPASS_BASE + BACKEND_IPS + sorted(seen_eps):
+            _wr_add(api, report, f"address_list.add.{LB_SRC_LIST}.{addr}",
+                    "/ip/firewall/address-list/add", {"list": LB_SRC_LIST, "address": addr})
+    # The management tunnels usually point AT our backends (wg-aws ->
+    # 54.91.202.229, wg-hz -> 91.98.238.12), so the same address shows up in
+    # BACKEND_IPS and seen_eps. Adding it twice made RouterOS refuse the second
+    # add and failed the whole enable (router 487, 2026-10-28).
+    for addr in _unique(LB_BYPASS_BASE + BACKEND_IPS + sorted(seen_eps)):
         if (LB_BYPASS_LIST, addr) not in have_al:
-            _wr(api, report, f"address_list.add.{LB_BYPASS_LIST}.{addr}",
-                "/ip/firewall/address-list/add", {"list": LB_BYPASS_LIST, "address": addr})
+            _wr_add(api, report, f"address_list.add.{LB_BYPASS_LIST}.{addr}",
+                    "/ip/firewall/address-list/add", {"list": LB_BYPASS_LIST, "address": addr})
 
     # 5. fasttrack restricted to connection-mark=no-mark (record prior state)
     ft = _rd(api, "/ip/firewall/filter/print", [".id", "connection-mark"],

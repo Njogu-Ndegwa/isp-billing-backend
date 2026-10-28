@@ -139,6 +139,37 @@ async def test_preflight_applies_same_port_validation(db):
     assert exc.value.status_code == 422
 
 
+async def test_preflight_accepts_sfp_plus_wan(db, monkeypatch):
+    # RB4011 / RB5009 / CCR2004 name their SFP+ cage sfp-sfpplus1 (router 487).
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    calls = []
+    monkeypatch.setattr(lbr, "_run_locked_router_thread",
+                        _fake_runner({"blockers": [], "warnings": []}, calls))
+
+    resp = await lbr.preflight_load_balancing(
+        router.id, lbr.LBPreflightRequest(wan_ports=["ether1", "sfp-sfpplus1"]),
+        db, _token(reseller),
+    )
+    assert resp["success"] is True
+    assert resp["wan_ports"] == ["ether1", "sfp-sfpplus1"]
+    assert calls[0]["args"][1] == ["ether1", "sfp-sfpplus1"]
+
+
+async def test_enable_rejects_bridge_vlan_and_tunnel_ports(db):
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+
+    for bad in ("bridge", "vlan10", "wg-aws", "pppoe-out1"):
+        with pytest.raises(HTTPException) as exc:
+            await lbr.enable_load_balancing(
+                router.id, lbr.LBEnableRequest(wan_ports=["ether1", bad], confirm=True),
+                db, _token(reseller),
+            )
+        assert exc.value.status_code == 422
+        assert "Invalid WAN port" in str(exc.value.detail)
+
+
 async def test_enable_requires_confirm(db, monkeypatch):
     reseller = await make_reseller(db)
     router = await make_router(db, reseller)
