@@ -42,8 +42,10 @@ class FakeLBAPI(MikroTikAPI):
         sstp_clients=None,
         clock=None,
         internet=True,
+        arp_replies=None,
     ):
         self.connected = True
+        self.arp_replies = set(arp_replies or [])
         self.commands = []
         self._id = 0
         self.fail_commands = set(fail_commands or [])
@@ -152,6 +154,12 @@ class FakeLBAPI(MikroTikAPI):
         if command.endswith("/print"):
             return self._print(command)
         self.commands.append((command, args))
+        if command == "/ping" and args.get("arp-ping") == "yes":
+            # ARP probe out of one port: only the configured (port, ip) answer.
+            hit = (args.get("interface"), args.get("address")) in self.arp_replies
+            return {"success": True,
+                    "data": [{"host": args.get("address"),
+                              "received": args.get("count", "1") if hit else "0"}]}
         if command == "/ping":
             return {"success": True,
                     "data": [{"host": args.get("address"),
@@ -623,3 +631,161 @@ def test_verify_flags_lb_paid_entry_held_by_unauth_host():
     report = mikrotik_lb.lb_verify(api)
     assert any("DANGER" in w for w in report["warnings"])
     assert report["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# second line in the same IP range as WAN1: hard stop (router 487, 2026-10-28:
+# both modems 192.168.1.0/24, gateway 192.168.1.1)
+# ---------------------------------------------------------------------------
+
+def _router487(**overrides):
+    kwargs = dict(
+        dhcp_clients=[{"interface": "ether1", "status": "bound",
+                       "gateway": "192.168.1.1", "address": "192.168.1.50/24"}],
+        ip_addresses=[{"address": "192.168.88.1/24", "interface": "bridge"},
+                      {"address": "192.168.1.50/24", "interface": "ether1"}],
+        bridge_ports=[{".id": "*B3", "interface": "ether3", "bridge": "bridge"}],
+        list_members=[{".id": "*M1", "list": "WAN", "interface": "ether1"}],
+    )
+    kwargs.update(overrides)
+    return FakeLBAPI(**kwargs)
+
+
+def _bind_on_add(api, address, gateway):
+    original = api.send_command
+
+    def wrapped(command, arguments=None):
+        result = original(command, arguments)
+        if command == "/ip/dhcp-client/add":
+            api.dhcp_clients.append({
+                ".id": "*D2", "interface": (arguments or {}).get("interface"),
+                "comment": (arguments or {}).get("comment"),
+                "status": "bound", "address": address, "gateway": gateway,
+            })
+        return result
+
+    api.send_command = wrapped
+
+
+def _writes(api):
+    return [c for c, _ in api.commands if c != "/ping"]
+
+
+def test_preflight_blocks_second_modem_answering_on_wan1_gateway():
+    api = _router487(arp_replies={("ether2", "192.168.1.1")})
+    report = mikrotik_lb.lb_preflight(api, ["ether1", "ether2"])
+
+    assert report["success"] is False
+    assert report["blockers"] == [
+        "Your second line uses the same IP range as the first (192.168.1.x). "
+        "Change the second modem's LAN IP (e.g. to 192.168.2.1) and try again."
+    ]
+    clash = report["per_port"]["ether2"]["subnet_clash"]
+    assert clash["detected_by"] == "arp_probe"
+    assert clash["clashes_with"] == "ether1"
+    assert clash["suggested_modem_ip"] == "192.168.2.1"
+    assert _writes(api) == []
+
+
+def test_convert_refuses_overlapping_subnet_before_any_change():
+    api = _router487(arp_replies={("ether2", "192.168.1.1")})
+    _bind_on_add(api, "192.168.1.60/24", "192.168.1.1")
+    report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1",
+                                         wan_ports=["ether1", "ether2"])
+
+    assert report["success"] is False
+    assert "same IP range as the first (192.168.1.x)" in report["aborted"]
+    assert report["subnet_clash"]["detected_by"] == "arp_probe"
+    assert _writes(api) == []  # no DHCP client, no NAT, no route
+
+
+def test_convert_refuses_when_port_already_holds_an_overlapping_lease():
+    api = _router487()
+    api.dhcp_clients.append({".id": "*D7", "interface": "ether2", "status": "bound",
+                             "gateway": "192.168.1.1", "address": "192.168.1.61/24"})
+    report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1",
+                                         wan_ports=["ether1", "ether2"])
+    assert report["subnet_clash"]["detected_by"] == "existing_lease"
+    assert _writes(api) == []
+
+
+def test_convert_proceeds_on_distinct_subnet():
+    # the modem answers ARP, but on its own address, not on WAN1's gateway
+    api = _router487(arp_replies={("ether2", "192.168.2.1")})
+    _bind_on_add(api, "192.168.2.20/24", "192.168.2.1")
+    report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1",
+                                         wan_ports=["ether1", "ether2"])
+
+    assert report["success"] is True, report["steps"]
+    assert "subnet_clash" not in report
+    assert report["lease"] == {"address": "192.168.2.20/24", "gateway": "192.168.2.1"}
+    probes = _commands(api, "/ping")
+    assert probes and probes[0] == {"address": "192.168.1.1", "arp-ping": "yes",
+                                    "interface": "ether2", "count": "2"}
+    comments = [a["comment"] for a in _commands(api, "/ip/route/add")]
+    assert "ISP_BILLING_DUAL_WAN_ETHER2_PROBE" in comments
+    assert "ISP_BILLING_DUAL_WAN_BACKUP_CHECKED" in comments
+
+
+def test_lease_time_overlap_is_rolled_back_and_port_rejoins_lan():
+    # bridge port with the modem seen on a foreign address; ARP is not possible
+    # on a bridge member, so only the lease shows the clash
+    api = _router487(
+        bridge_ports=[{".id": "*B2", "interface": "ether2", "bridge": "bridge"}],
+        bridge_hosts=[{"mac-address": "EC:1A:02:00:00:01", "on-interface": "ether2",
+                       "local": "false"}],
+        hotspot_hosts=[{"mac-address": "EC:1A:02:00:00:01", "address": "10.10.10.1"}],
+    )
+    _bind_on_add(api, "192.168.1.61/24", "192.168.1.1")
+    report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1",
+                                         wan_ports=["ether1", "ether2"])
+
+    assert report["success"] is False
+    assert report["subnet_clash"]["detected_by"] == "lease"
+    assert report["aborted"].startswith("Your second line uses the same IP range")
+    assert report["reverted"] is True
+    writes = _writes(api)
+    assert writes[writes.index("/ip/dhcp-client/add") + 1] == "/ip/dhcp-client/remove"
+    assert not any(d.get("interface") == "ether2" for d in api.dhcp_clients)
+    assert not any(m["interface"] == "ether2" for m in api.list_members)
+    assert any(p["interface"] == "ether2" for p in api.bridge_ports)
+    assert _commands(api, "/ip/route/add") == []
+
+
+def test_lease_gateway_inside_wan1_range_counts_as_overlap():
+    # odd /30 lease whose gateway is WAN1's gateway
+    api = _router487()
+    _bind_on_add(api, "192.168.1.1/30", "192.168.1.1")
+    report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1",
+                                         wan_ports=["ether1", "ether2"])
+    assert report["subnet_clash"]["detected_by"] == "lease"
+
+
+def test_suggested_modem_ip_skips_ranges_already_in_use():
+    api = _router487(ip_addresses=[
+        {"address": "192.168.88.1/24", "interface": "bridge"},
+        {"address": "192.168.1.50/24", "interface": "ether1"},
+        {"address": "192.168.2.1/24", "interface": "bridge2"},
+    ], arp_replies={("ether2", "192.168.1.1")})
+    report = mikrotik_lb.lb_preflight(api, ["ether1", "ether2"])
+    assert report["per_port"]["ether2"]["subnet_clash"]["suggested_modem_ip"] == "192.168.3.1"
+
+
+def test_third_line_message_names_the_third_modem():
+    api = _router487(arp_replies={("ether3", "192.168.1.1")}, bridge_ports=[])
+    report = mikrotik_lb.lb_preflight(api, ["ether1", "ether2", "ether3"])
+    assert any(b.startswith("Your third line uses the same IP range")
+               and "third modem's LAN IP" in b for b in report["blockers"])
+
+
+def test_third_line_clashing_with_second_line_names_that_port():
+    api = _router487(bridge_ports=[])
+    api.dhcp_clients.append({"interface": "ether2", "status": "bound",
+                             "gateway": "192.168.2.1", "address": "192.168.2.20/24"})
+    _bind_on_add(api, "192.168.2.30/24", "192.168.2.1")
+    report = mikrotik_lb.lb_convert_port(api, "ether3", 2, wan1_port="ether1",
+                                         wan_ports=["ether1", "ether2", "ether3"])
+    assert report["subnet_clash"]["clashes_with"] == "ether2"
+    assert report["aborted"].startswith(
+        "Your third line uses the same IP range as the line on ether2 (192.168.2.x)")
+    assert report["reverted"] is True
