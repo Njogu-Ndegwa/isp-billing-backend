@@ -41,7 +41,7 @@ from app.services.customer_grace import (
     normalize_grace_minutes,
     renewal_expiry,
 )
-from app.services.customer_events import record_customer_event
+from app.services.customer_events import actor_label, record_customer_event
 from app.services.customer_pause import (
     PauseError,
     pause_customer,
@@ -1503,6 +1503,9 @@ async def update_customer_location(
 # =========================================================================
 
 class ActivatePPPoERequest(BaseModel):
+    # cash / other / bank_transfer / card record money taken outside the
+    # system. "none" activates without recording any payment (a free month,
+    # a comp, money already recorded elsewhere): see NO_PAYMENT below.
     payment_method: str = "cash"
     payment_reference: Optional[str] = None
     notes: Optional[str] = None
@@ -1524,6 +1527,71 @@ MANUAL_ACTIVATION_PAYMENT_METHODS = {
     "card": PaymentMethod.CARD,
 }
 
+# "Activate without payment": the customer gets the plan's period but no
+# money is recorded. The ledger gets the same zero-amount, non-revenue row
+# the paid-until activation writes (PUT /api/customers/{id} with
+# activate_paid_until), so revenue, the dashboard, the transactions totals
+# and the subscription charge (all filter counts_as_revenue) never see it.
+NO_PAYMENT = "none"
+
+
+def is_no_payment_activation(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() == NO_PAYMENT
+
+
+def manual_activation_ledger_row(
+    customer: Customer,
+    plan: Plan,
+    user,
+    request: "ActivatePPPoERequest",
+    *,
+    no_payment: bool,
+    pm_enum: PaymentMethod,
+    days_paid_for: int,
+    default_note: str,
+) -> CustomerPayment:
+    """The customer_payments row behind a manual activation.
+
+    It is also the source the provisioning attempt hangs off, so a no-payment
+    activation still gets one (amount 0, not revenue)."""
+    if no_payment:
+        return CustomerPayment(
+            customer_id=customer.id,
+            reseller_id=user.id,
+            plan_id=plan.id,
+            amount=0.0,
+            payment_method=PaymentMethod.OTHER,
+            payment_reference=request.payment_reference or f"NO-PAYMENT-{customer.id}",
+            days_paid_for=days_paid_for,
+            status=PaymentStatus.COMPLETED,
+            notes=(
+                "No payment collected: activated without payment"
+                + (f" ({request.notes})" if request.notes else "")
+            ),
+            customer_name=customer.name,
+            counts_as_revenue=False,
+        )
+    return CustomerPayment(
+        customer_id=customer.id,
+        reseller_id=user.id,
+        plan_id=plan.id,
+        amount=float(plan.price),
+        payment_method=pm_enum,
+        payment_reference=request.payment_reference,
+        days_paid_for=days_paid_for,
+        status=PaymentStatus.COMPLETED,
+        notes=request.notes or default_note,
+        customer_name=customer.name,
+    )
+
+
+def manual_activation_event_text(user, pm_enum: PaymentMethod, *, no_payment: bool, forced: bool) -> str:
+    confirmed = ", confirmed although already active/paid" if forced else ""
+    if no_payment:
+        return f"without payment by {actor_label(user) or 'the reseller'}{confirmed}"
+    return f"{pm_enum.value}{confirmed}"
+
+
 # A payment completed this recently means the customer was just activated
 # (C2B, STK or another manual activation) and a second activation is almost
 # certainly a stale screen or a double click.
@@ -1541,7 +1609,8 @@ def manual_activation_payment_method(value: Optional[str]) -> PaymentMethod:
             status_code=400,
             detail=(
                 f"'{value}' is not a valid payment method for a manual activation. "
-                "Use 'cash' (cash received) or 'other' (paid outside the system). "
+                "Use 'cash' (cash received), 'other' (paid outside the system) "
+                "or 'none' (activate without recording a payment). "
                 "M-Pesa payments to your paybill or till activate the customer automatically."
             ),
         )
@@ -1549,7 +1618,7 @@ def manual_activation_payment_method(value: Optional[str]) -> PaymentMethod:
 
 
 async def manual_activation_conflict(
-    db: AsyncSession, customer: Customer, now: datetime
+    db: AsyncSession, customer: Customer, now: datetime, *, no_payment: bool = False
 ) -> Optional[dict]:
     """Why activating ``customer`` again now would double-renew them, or None.
 
@@ -1583,18 +1652,26 @@ async def manual_activation_conflict(
     if active_until is None and recent is None:
         return None
 
+    again = (
+        "Activating again adds another period without recording a payment."
+        if no_payment
+        else "Activating again records another payment and adds another period."
+    )
     if recent is not None:
         code = "customer_already_paid"
+        happened = (
+            "already paid" if float(recent.amount or 0) else "was activated without payment"
+        )
         message = (
-            f"This customer already paid at {recent.payment_date:%Y-%m-%d %H:%M} UTC"
+            f"This customer {happened} at {recent.payment_date:%Y-%m-%d %H:%M} UTC"
             + (f" and is active until {active_until:%Y-%m-%d %H:%M} UTC" if active_until else "")
-            + ". Activating again records another payment and adds another period."
+            + f". {again}"
         )
     else:
         code = "customer_already_active"
         message = (
             f"This customer is already active until {active_until:%Y-%m-%d %H:%M} UTC. "
-            "Activating again records another payment and adds another period."
+            + again
         )
     method = recent.payment_method if recent is not None else None
     return {
@@ -1614,7 +1691,9 @@ async def refuse_duplicate_manual_activation(
 ) -> bool:
     """Raise 409 when this activation would double-renew, unless forced.
     Returns True when the reseller confirmed past a conflict (for the audit trail)."""
-    conflict = await manual_activation_conflict(db, customer, now)
+    conflict = await manual_activation_conflict(
+        db, customer, now, no_payment=is_no_payment_activation(request.payment_method),
+    )
     if conflict is None:
         return False
     if not request.force:
@@ -1661,7 +1740,11 @@ async def activate_pppoe_customer(
             raise HTTPException(status_code=400, detail="Customer has no router assigned")
 
         plan = customer.plan
-        pm_enum = manual_activation_payment_method(request.payment_method)
+        no_payment = is_no_payment_activation(request.payment_method)
+        pm_enum = (
+            PaymentMethod.OTHER if no_payment
+            else manual_activation_payment_method(request.payment_method)
+        )
         now = datetime.utcnow()
         forced = await refuse_duplicate_manual_activation(db, customer, request, now)
 
@@ -1685,17 +1768,9 @@ async def activate_pppoe_customer(
 
         customer.status = CustomerStatus.ACTIVE
 
-        payment = CustomerPayment(
-            customer_id=customer.id,
-            reseller_id=user.id,
-            plan_id=plan.id,
-            amount=float(plan.price),
-            payment_method=pm_enum,
-            payment_reference=request.payment_reference,
-            days_paid_for=days_paid_for,
-            status=PaymentStatus.COMPLETED,
-            notes=request.notes or f"PPPoE activation via admin",
-            customer_name=customer.name,
+        payment = manual_activation_ledger_row(
+            customer, plan, user, request, no_payment=no_payment, pm_enum=pm_enum,
+            days_paid_for=days_paid_for, default_note="PPPoE activation via admin",
         )
         db.add(payment)
 
@@ -1737,14 +1812,14 @@ async def activate_pppoe_customer(
         await record_customer_event(
             customer.id, "pppoe_activated",
             f"PPPoE activated on {plan.name} until {customer.expiry:%Y-%m-%d %H:%M} UTC "
-            f"({pm_enum.value}{', confirmed although already active/paid' if forced else ''}); router "
+            f"({manual_activation_event_text(user, pm_enum, no_payment=no_payment, forced=forced)}); router "
             + ("updated" if provision_succeeded else
                f"not updated yet: {(provision_result or {}).get('error') or 'will retry'}"),
             severity="info" if provision_succeeded else "warning",
             actor=user, user_id=user.id, router_id=customer.router_id,
-            details={"payment_id": payment.id, "reference": request.payment_reference,
+            details={"payment_id": payment.id, "reference": payment.payment_reference,
                      "provision_result": "ok" if provision_succeeded else "retry_pending",
-                     "forced": forced},
+                     "forced": forced, "no_payment": no_payment},
         )
 
         return {
@@ -1754,6 +1829,7 @@ async def activate_pppoe_customer(
             "status": customer.status.value,
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
             "plan_name": plan.name,
+            "payment_recorded": not no_payment,
             "provision_result": "ok" if provision_succeeded else "retry_pending",
             "provision_error": provision_result.get("error") if provision_result else None,
             "delivery": delivery,
@@ -1975,7 +2051,11 @@ async def activate_static_customer(
         enforce_active_subscription(user)
         customer = await _load_static_customer(db, customer_id, user)
         plan = customer.plan
-        pm_enum = manual_activation_payment_method(request.payment_method)
+        no_payment = is_no_payment_activation(request.payment_method)
+        pm_enum = (
+            PaymentMethod.OTHER if no_payment
+            else manual_activation_payment_method(request.payment_method)
+        )
         now = datetime.utcnow()
         forced = await refuse_duplicate_manual_activation(db, customer, request, now)
 
@@ -1998,17 +2078,9 @@ async def activate_static_customer(
             customer.expiry = now + expiry_delta
         customer.status = CustomerStatus.ACTIVE
 
-        payment = CustomerPayment(
-            customer_id=customer.id,
-            reseller_id=user.id,
-            plan_id=plan.id,
-            amount=float(plan.price),
-            payment_method=pm_enum,
-            payment_reference=request.payment_reference,
-            days_paid_for=days_paid_for,
-            status=PaymentStatus.COMPLETED,
-            notes=request.notes or "Static IP activation via admin",
-            customer_name=customer.name,
+        payment = manual_activation_ledger_row(
+            customer, plan, user, request, no_payment=no_payment, pm_enum=pm_enum,
+            days_paid_for=days_paid_for, default_note="Static IP activation via admin",
         )
         db.add(payment)
         try:
@@ -2027,12 +2099,12 @@ async def activate_static_customer(
         await record_customer_event(
             customer.id, "static_ip_activated",
             f"Static IP {customer.static_ip} activated on {plan.name} until {expiry:%Y-%m-%d %H:%M} UTC "
-            f"({pm_enum.value}{', confirmed although already active/paid' if forced else ''}); router "
+            f"({manual_activation_event_text(user, pm_enum, no_payment=no_payment, forced=forced)}); router "
             + ("updated" if ok else f"not updated yet: {result.get('error') or 'will retry'}"),
             severity="info" if ok else "warning",
             actor=user, user_id=user.id, router_id=customer.router_id,
-            details={"payment_id": payment.id, "reference": request.payment_reference,
-                     "forced": forced},
+            details={"payment_id": payment.id, "reference": payment.payment_reference,
+                     "forced": forced, "no_payment": no_payment},
         )
         return {
             "success": True,
@@ -2040,6 +2112,7 @@ async def activate_static_customer(
             "status": CustomerStatus.ACTIVE.value,
             "expiry": expiry.isoformat() if expiry else None,
             "plan_name": plan.name,
+            "payment_recorded": not no_payment,
             # The enforcement job re-applies within minutes if this failed.
             "provision_result": "ok" if ok else "retry_pending",
             "provision_error": result.get("error"),
