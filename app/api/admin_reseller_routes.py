@@ -126,6 +126,7 @@ async def admin_reset_user_password(
         raise HTTPException(status_code=404, detail="User not found")
 
     target.password_hash = await asyncio.to_thread(pwd_context.hash, request.new_password)
+    target.token_version = int(target.token_version or 0) + 1
     await db.commit()
 
     return {

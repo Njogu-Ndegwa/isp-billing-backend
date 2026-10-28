@@ -583,6 +583,8 @@ async def open_router_webfig(
         router_name=router_name,
         router_ip=router_ip,
         created_by_user_id=user.id,
+        staff_id=token.get("staff_id"),
+        staff_token_version=token.get("stv"),
         webfig_scheme=webfig_scheme,
         webfig_port=webfig_port,
     )
@@ -832,6 +834,11 @@ async def _proxy_webfig_request(
     refresh_access_cookies: bool,
 ) -> Response:
     """Proxy a request to RouterOS WebFig using an already validated session."""
+
+    if getattr(session, "staff_id", None) is not None:
+        from app.services.staff_access import webfig_staff_session_valid
+        if not await webfig_staff_session_valid(session):
+            return _webfig_expired_response()
 
     query = _forward_webfig_query(request)
     target_url = _build_webfig_upstream_url(session, proxy_path)
@@ -1934,6 +1941,8 @@ async def update_router(
         if request.password is not None:
             router_obj.password = request.password
         if request.payment_methods is not None:
+            from app.services.staff_access import require_permission
+            require_permission("payment_methods.manage")
             router_obj.payment_methods = request.payment_methods
         if request.emergency_active is not None:
             router_obj.emergency_active = request.emergency_active

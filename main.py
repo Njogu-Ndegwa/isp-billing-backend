@@ -51,6 +51,23 @@ async def enforce_impersonation_read_only(request: Request, call_next):
     return await _enforce_impersonation_read_only(request, call_next)
 
 
+from app.services.staff_access import (  # noqa: E402
+    enforce_staff_access as _enforce_staff_access,
+    StaffPermissionDenied,
+    staff_permission_denied_response,
+)
+
+
+@app.middleware("http")
+async def enforce_staff_access(request: Request, call_next):
+    return await _enforce_staff_access(request, call_next)
+
+
+@app.exception_handler(StaffPermissionDenied)
+async def staff_permission_error(request: Request, exc: StaffPermissionDenied):
+    return staff_permission_denied_response(exc)
+
+
 # CORS middleware. CORS_OPTIONS is also handed to the catch-all 500 handler
 # below, so an unhandled error carries exactly the same CORS headers as any
 # other response -- one source of truth, never wider.
@@ -150,6 +167,7 @@ from app.api.impersonation_routes import router as impersonation_router
 from app.api.static_ip_import_routes import router as static_ip_import_router
 from app.api.customer_device_routes import router as customer_device_router
 from app.api.admin_support_desk_routes import router as admin_support_desk_router
+from app.api.staff_routes import router as staff_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -205,6 +223,7 @@ app.include_router(impersonation_router)
 app.include_router(static_ip_import_router)
 app.include_router(customer_device_router)
 app.include_router(admin_support_desk_router)
+app.include_router(staff_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -2648,6 +2667,30 @@ async def run_international_subscription_migrations():
     logger.info("International subscription migrations complete")
 
 
+async def run_staff_migrations():
+    """Create staff and audit tables and add session revocation to existing users.
+
+    Must succeed before serving logins; an incomplete auth schema is not safe.
+    SQLite support allows an actual existing-database migration test locally.
+    """
+    from app.db.models import ResellerStaff, StaffActivityLog
+
+    async with async_engine.begin() as conn:
+        if conn.dialect.name == "sqlite":
+            columns = (await conn.execute(sa_text("PRAGMA table_info(users)"))).all()
+            if "token_version" not in {row[1] for row in columns}:
+                await conn.execute(sa_text(
+                    "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+                ))
+        else:
+            await conn.execute(sa_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0"
+            ))
+        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(
+            sync_conn, tables=[ResellerStaff.__table__, StaffActivityLog.__table__], checkfirst=True
+        ))
+
+
 async def run_settlement_mode_migrations():
     """Add users.settlement_mode ('platform' | 'direct').
 
@@ -3352,6 +3395,9 @@ async def startup_event():
         logger.info("User migrations completed successfully")
     except Exception as e:
         logger.error(f"User migration failed (non-fatal): {e}")
+
+    # Auth queries below include users.token_version; migrate before any user reads.
+    await run_staff_migrations()
 
     try:
         await run_password_reset_migrations()

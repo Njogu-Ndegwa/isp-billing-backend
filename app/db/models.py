@@ -187,6 +187,12 @@ class User(Base):
     # (they opt in from the Account Statement); new signups default to
     # 'direct'. Plain string, not a Postgres enum.
     settlement_mode = Column(String(20), nullable=False, default="direct", server_default="direct")
+    # Bumped whenever this account's existing sessions must stop working (a
+    # password change or reset). Login tokens carry it as the "tv" claim and
+    # app/services/staff_access.py rejects a token whose tv is behind. Tokens
+    # issued before this column existed carry no tv and count as 0, so nobody
+    # is logged out by the deploy itself.
+    token_version = Column(Integer, nullable=False, default=0, server_default="0")
 
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
@@ -2837,6 +2843,88 @@ class ImpersonationSession(Base):
     ip_address = Column(String(64), nullable=True)
     user_agent = Column(String(300), nullable=True)
     request_count = Column(Integer, nullable=False, default=0, server_default="0")
+
+
+class ResellerStaff(Base):
+    """A staff login that works inside one reseller's account.
+
+    The owner (``parent_reseller_id``) creates it and grants named permissions
+    (app/services/staff_permissions.py). A staff member logs in through the
+    normal /api/auth/login with their own email and password and gets a token
+    whose identity is the OWNER's -- so every existing endpoint scopes data to
+    the owner exactly as before -- plus ``staff_id``/``stv`` claims that
+    ``enforce_staff_access`` (app/services/staff_access.py) checks on every
+    request: the row must be active, not removed, ``token_version`` must match
+    ``stv``, and the route must be allowed by ``permissions``.
+
+    Any change that must end the staff member's sessions (permissions edited,
+    deactivated, removed, password reset) bumps ``token_version``.
+
+    Removal is soft (``deleted_at``) so the activity log keeps a name for old
+    rows; a removed row can never log in again. Emails are unique across live
+    staff and ``users``: a partial unique index enforces live staff emails,
+    and the account APIs also check across the two tables. Removed staff keep
+    their email for history and do not block reuse.
+
+    Startup migration: run_staff_migrations() in main.py.
+    """
+    __tablename__ = "reseller_staff"
+    __table_args__ = (
+        Index("ix_reseller_staff_email", "email"),
+        Index("uq_reseller_staff_live_email", "email", unique=True,
+              postgresql_where=text("deleted_at IS NULL"),
+              sqlite_where=text("deleted_at IS NULL")),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    parent_reseller_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name = Column(String(120), nullable=False)
+    email = Column(String(255), nullable=False)
+    phone = Column(String(20), nullable=True)
+    password_hash = Column(String, nullable=False)
+    # List of permission keys, e.g. ["customers.view", "routers.view"].
+    permissions = Column(JSON, nullable=False, default=list)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    token_version = Column(Integer, nullable=False, default=0, server_default="0")
+    permissions_updated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=True)
+    last_login_at = Column(DateTime, nullable=True)
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class StaffActivityLog(Base):
+    """Who did what in a reseller account: staff actions and owner money/settings changes.
+
+    Written by ``enforce_staff_access`` after the request finishes, in its own
+    short session. ``owner_id``/``staff_id`` are plain ints, not FKs, so the
+    history outlives a removed staff member and never blocks a delete.
+    ``staff_id`` NULL means the owner did it. Request bodies are never stored
+    (they can hold API keys and passwords) -- only the route, result and a
+    human summary.
+
+    Startup migration: run_staff_migrations() in main.py.
+    """
+    __tablename__ = "staff_activity_log"
+    __table_args__ = (
+        Index("ix_staff_activity_owner_created", "owner_id", "created_at"),
+        Index("ix_staff_activity_staff_created", "staff_id", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(Integer, nullable=False)
+    staff_id = Column(Integer, nullable=True)
+    actor_label = Column(String(160), nullable=True)
+    action = Column(String(80), nullable=False)
+    permission = Column(String(40), nullable=True)
+    method = Column(String(10), nullable=False)
+    path = Column(String(300), nullable=False)
+    status_code = Column(Integer, nullable=True)
+    summary = Column(String(300), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 class SupportDeskSnapshot(Base):
