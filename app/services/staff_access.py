@@ -409,6 +409,11 @@ async def _after_write(
     status_code: int,
 ) -> None:
     summary = perms.summarize(rule, params, method, path)
+    # A handler may leave a more precise line (what it did and how it went),
+    # e.g. the port restart's method and result.
+    detailed = getattr(request.state, "staff_activity_summary", None)
+    if isinstance(detailed, str) and detailed.strip():
+        summary = detailed.strip()[:300]
     action = rule.template if rule is not None else "unmapped"
     await record_activity(
         owner_id=owner_id,

@@ -287,6 +287,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/routers/{router_id}/diagnose/{mac_address}", "routers.view", None),
     ((R,), "/api/routers/{router_id}/illegal-connections", "routers.view", None),
     ((R,), "/api/routers/{router_id}/interfaces", "routers.view", None),
+    ((R,), "/api/routers/{router_id}/interfaces/restart-options", "routers.view", None),
     ((R,), "/api/routers/{router_id}/load-balancing", "routers.view", None),
     ((R,), "/api/routers/{router_id}/port-analytics", "routers.view", None),
     ((R,), "/api/routers/{router_id}/port-config-jobs/{job_id}", "routers.view", None),
@@ -342,6 +343,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Healed dual mode on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/reboot", "routers.manage",
      "Rebooted router {router_id}"),
+    (("POST",), "/api/routers/{router_id}/interfaces/{interface_name}/restart", "routers.manage",
+     "Restarted port {interface_name} on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/remove-illegal-users", "routers.manage",
      "Removed illegal users on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/sync", "routers.manage",
@@ -508,6 +511,8 @@ OWNER_ALERT_TEMPLATES = frozenset({
 OWNER_LOGGED_TEMPLATES = OWNER_ALERT_TEMPLATES | frozenset({
     "/api/payment-methods/{method_id}/register-c2b",
     "/api/reseller/withdraw",
+    # Port restarts drop customers for a few seconds: keep who/when/how.
+    "/api/routers/{router_id}/interfaces/{interface_name}/restart",
 })
 
 

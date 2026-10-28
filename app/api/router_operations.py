@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +31,7 @@ from app.services.device_classifier import classify_device, infer_hotspot_subnet
 from app.core.protected_devices import is_protected_device
 from app.services.router_availability import record_router_availability
 from app.services.router_concurrency import run_with_guard
+from app.services import port_restart
 from app.services.router_remote_access import configure_router_remote_access_sync
 from app.services.provisioning import provision_base_url_for_vpn, fetch_certificate_flag_for_url
 from app.services.pppoe_customer_import import (
@@ -4124,6 +4125,195 @@ async def reboot_router(
         "connection_closed": bool(result.get("connection_closed", False)),
         "message": result.get("message", "Reboot command sent to router"),
         "reason": reason,
+        "requested_at": datetime.utcnow().isoformat(),
+    }
+
+
+# =========================================================================
+# RESTART ONE LAN PORT (power-cycle / bounce the access point behind it)
+# =========================================================================
+
+class RestartPortRequest(BaseModel):
+    confirm: bool = False
+
+
+_PORT_RESTART_TIMEOUT_SECONDS = 50
+
+_PORT_RESTART_REFUSAL_STATUS = {
+    port_restart.REASON_NOT_FOUND: 404,
+}
+
+
+def _port_restart_router_info(router_obj: Router) -> dict:
+    lb_config = router_obj.lb_config if isinstance(router_obj.lb_config, dict) else {}
+    return {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+        # Kept even while LB is off: that port is usually still cabled to an ISP.
+        "lb_wan_ports": list(lb_config.get("wan_ports") or []),
+    }
+
+
+def _set_activity_summary(request: Optional[Request], summary: str) -> None:
+    """Hand the staff-activity middleware a precise line for this write."""
+    if request is None:
+        return
+    try:
+        request.state.staff_activity_summary = summary[:300]
+    except Exception:
+        pass
+
+
+@router.get("/api/routers/{router_id}/interfaces/restart-options")
+async def get_port_restart_options(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Which ethernet ports can be restarted remotely, and why not for the rest.
+
+    Read-only. Uses the exact guard evaluation the restart endpoint applies.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+    router_info = _port_restart_router_info(router_obj)
+    router_name = router_obj.name
+    await db.commit()
+
+    result = await run_with_guard(
+        router_id,
+        port_restart.restart_options_sync,
+        router_info,
+        acquire_timeout_seconds=5,
+        timeout_seconds=30,
+    )
+    if result.get("error") == "busy":
+        raise HTTPException(status_code=429, detail=result.get("detail", "Router is busy, try again shortly"))
+    if result.get("error") == "timeout":
+        raise HTTPException(status_code=504, detail=result.get("detail", "Router did not answer in time"))
+    if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "port_restart_options")
+        raise HTTPException(status_code=503, detail=result.get("message") or f"Failed to connect to router: {router_name}")
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=result.get("message") or result["error"])
+
+    return {
+        "router_id": router_id,
+        "router_name": router_name,
+        "restart_in_progress": port_restart.restart_in_progress(router_id),
+        "ports": result.get("ports", []),
+    }
+
+
+@router.post("/api/routers/{router_id}/interfaces/{interface_name}/restart")
+async def restart_router_port(
+    router_id: int,
+    interface_name: str,
+    request: Request,
+    body: Optional[RestartPortRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Restart whatever is plugged into one LAN port (e.g. a hung access point).
+
+    PoE-powered port: power-cycle the PoE. Otherwise: disable the port for a
+    few seconds and enable it again. The previous state is always restored.
+    WAN, management, API-ingress, non-ethernet and non-LAN ports are refused.
+    One restart per router at a time (a second request gets 409).
+    """
+    body = body or RestartPortRequest()
+    interface_name = (interface_name or "").strip()
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to restart this port")
+    if not interface_name or len(interface_name) > 64:
+        raise HTTPException(status_code=400, detail="Invalid port name")
+
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+    router_info = _port_restart_router_info(router_obj)
+    router_name = router_obj.name
+    user_id = user.id
+    await db.commit()
+
+    claim = port_restart.try_claim(router_id)
+    if claim is None:
+        _set_activity_summary(
+            request, f"Port restart of {interface_name} on router {router_id} refused: another restart is running",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Another port restart is already running on this router. Wait for it to finish.",
+        )
+
+    try:
+        result = await run_with_guard(
+            router_id,
+            port_restart.restart_port_sync,
+            router_info,
+            interface_name,
+            claim,
+            acquire_timeout_seconds=5,
+            timeout_seconds=_PORT_RESTART_TIMEOUT_SECONDS,
+        )
+    finally:
+        port_restart.abandon_if_not_started(claim)
+
+    method = result.get("method")
+    method_label = port_restart.METHOD_LABELS.get(method, method or "none")
+    error = result.get("error")
+    outcome = "ok" if not error else error
+    _set_activity_summary(
+        request,
+        f"Restarted port {interface_name} on router {router_id} by {method_label}: {outcome}"
+        if not error else
+        f"Port restart of {interface_name} on router {router_id} ({method_label}) failed: "
+        f"{outcome} - {result.get('message') or result.get('detail') or ''}",
+    )
+    logger.info(
+        "[port-restart] router=%s (%s) port=%s user_id=%s method=%s result=%s %s",
+        router_id, router_name, interface_name, user_id, method, outcome,
+        result.get("message") or "",
+    )
+
+    if error == "busy":
+        raise HTTPException(status_code=429, detail=result.get("detail", "Router is busy, try again shortly"))
+    if error == "timeout":
+        raise HTTPException(
+            status_code=504,
+            detail="The router is slow to answer. The port is put back automatically; check it in a minute.",
+        )
+    if error == "connect_failed":
+        await record_router_availability(db, router_id, False, "port_restart")
+        raise HTTPException(status_code=503, detail=result.get("message") or f"Failed to connect to router: {router_name}")
+    if error == "refused":
+        status = _PORT_RESTART_REFUSAL_STATUS.get(result.get("reason_code"), 400)
+        raise HTTPException(status_code=status, detail=result.get("message") or "This port cannot be restarted")
+    if error == "restore_failed":
+        raise HTTPException(
+            status_code=502,
+            detail=(result.get("message") or "The port may not have come back")
+            + ". Open the router's ports and turn it back on, or reboot the router.",
+        )
+    if error:
+        raise HTTPException(status_code=502, detail=result.get("message") or "Port restart failed")
+
+    _port_status_cache.pop(router_id, None)
+    return {
+        "success": True,
+        "router_id": router_id,
+        "router_name": router_name,
+        "interface": interface_name,
+        "method": method,
+        "method_label": method_label,
+        "restored": bool(result.get("restored")),
+        "off_seconds": result.get("off_seconds"),
+        "message": f"{interface_name} restarted ({method_label}). Devices on it reconnect in a few seconds.",
         "requested_at": datetime.utcnow().isoformat(),
     }
 
