@@ -248,6 +248,16 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   protocol, safety rules and runbook:
   [`docs/expiry-enforcement-architecture.md`](docs/expiry-enforcement-architecture.md).
 
+## Customer Pause / Resume
+
+- `POST /api/customers/{id}/pause` / `/resume` (`app/services/customer_pause.py`), PPPoE and
+  static IP only. Paused = `INACTIVE` + `paused_at` set + `expiry` frozen at the pause moment;
+  the unused paid time is in `paused_remaining_seconds`. Every expiry/reminder/retry job keys on
+  ACTIVE or "expiry in the future", so they ignore paused customers without knowing about pauses;
+  `customer_grace.effective_expiry` gives no grace while paused.
+- Invariant enforced by a `before_flush` hook in `app/db/models.py`: an ACTIVE customer is never
+  paused. A payment while paused ends the pause and adds the paused time to the new expiry.
+
 ## Customer Audit Log
 
 - `GET /api/customers/{id}/audit-log` (`app/api/customer_audit_routes.py`) merges, at read

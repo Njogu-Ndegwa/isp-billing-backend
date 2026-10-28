@@ -51,6 +51,23 @@ async def enforce_impersonation_read_only(request: Request, call_next):
     return await _enforce_impersonation_read_only(request, call_next)
 
 
+from app.services.staff_access import (  # noqa: E402
+    enforce_staff_access as _enforce_staff_access,
+    StaffPermissionDenied,
+    staff_permission_denied_response,
+)
+
+
+@app.middleware("http")
+async def enforce_staff_access(request: Request, call_next):
+    return await _enforce_staff_access(request, call_next)
+
+
+@app.exception_handler(StaffPermissionDenied)
+async def staff_permission_error(request: Request, exc: StaffPermissionDenied):
+    return staff_permission_denied_response(exc)
+
+
 # CORS middleware. CORS_OPTIONS is also handed to the catch-all 500 handler
 # below, so an unhandled error carries exactly the same CORS headers as any
 # other response -- one source of truth, never wider.
@@ -150,6 +167,7 @@ from app.api.impersonation_routes import router as impersonation_router
 from app.api.static_ip_import_routes import router as static_ip_import_router
 from app.api.customer_device_routes import router as customer_device_router
 from app.api.admin_support_desk_routes import router as admin_support_desk_router
+from app.api.staff_routes import router as staff_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -205,6 +223,7 @@ app.include_router(impersonation_router)
 app.include_router(static_ip_import_router)
 app.include_router(customer_device_router)
 app.include_router(admin_support_desk_router)
+app.include_router(staff_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -2648,6 +2667,30 @@ async def run_international_subscription_migrations():
     logger.info("International subscription migrations complete")
 
 
+async def run_staff_migrations():
+    """Create staff and audit tables and add session revocation to existing users.
+
+    Must succeed before serving logins; an incomplete auth schema is not safe.
+    SQLite support allows an actual existing-database migration test locally.
+    """
+    from app.db.models import ResellerStaff, StaffActivityLog
+
+    async with async_engine.begin() as conn:
+        if conn.dialect.name == "sqlite":
+            columns = (await conn.execute(sa_text("PRAGMA table_info(users)"))).all()
+            if "token_version" not in {row[1] for row in columns}:
+                await conn.execute(sa_text(
+                    "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+                ))
+        else:
+            await conn.execute(sa_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0"
+            ))
+        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(
+            sync_conn, tables=[ResellerStaff.__table__, StaffActivityLog.__table__], checkfirst=True
+        ))
+
+
 async def run_settlement_mode_migrations():
     """Add users.settlement_mode ('platform' | 'direct').
 
@@ -2796,6 +2839,32 @@ async def run_customer_device_limit_migrations():
         except Exception as exc:  # lock_timeout under a busy table: try again
             last_exc = exc
             logger.warning("Customer device-limit migration attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise last_exc
+
+
+async def run_customer_pause_migrations():
+    """Add the customers columns for pause / resume (app/services/customer_pause.py):
+    paused_at, paused_remaining_seconds and pause_resume_at. All nullable with
+    no default, so this is a metadata-only change. Idempotent.
+
+    Same retry loop as run_customer_grace_migrations: customers is the hottest
+    table and app connections carry lock_timeout.
+    """
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(sa_text("""
+                    ALTER TABLE customers
+                    ADD COLUMN IF NOT EXISTS paused_at TIMESTAMP NULL,
+                    ADD COLUMN IF NOT EXISTS paused_remaining_seconds INTEGER NULL,
+                    ADD COLUMN IF NOT EXISTS pause_resume_at TIMESTAMP NULL
+                """))
+            return
+        except Exception as exc:  # lock_timeout under a busy table: try again
+            last_exc = exc
+            logger.warning("Customer pause migration attempt %d failed: %s", attempt, exc)
             await asyncio.sleep(2 * attempt)
     raise last_exc
 
@@ -3327,6 +3396,9 @@ async def startup_event():
     except Exception as e:
         logger.error(f"User migration failed (non-fatal): {e}")
 
+    # Auth queries below include users.token_version; migrate before any user reads.
+    await run_staff_migrations()
+
     try:
         await run_password_reset_migrations()
         logger.info("Password reset migrations completed successfully")
@@ -3510,6 +3582,12 @@ async def startup_event():
         logger.error(f"Customer device-limit migration failed (non-fatal): {e}")
 
     try:
+        await run_customer_pause_migrations()
+        logger.info("Customer pause migration completed successfully")
+    except Exception as e:
+        logger.error(f"Customer pause migration failed (non-fatal): {e}")
+
+    try:
         await run_standard_runtime_migrations()
         logger.info("Standard-runtime migration completed successfully")
     except Exception as e:
@@ -3661,6 +3739,17 @@ async def startup_event():
         name='Safety-net bypass scan and idle credential reaper',
         replace_existing=True,
         max_instances=1
+    )
+    # Paused customers with an auto-resume date (app/services/customer_pause.py).
+    from app.services.customer_pause import auto_resume_due_customers_background
+    scheduler.add_job(
+        auto_resume_due_customers_background,
+        trigger=IntervalTrigger(minutes=2),
+        id='auto_resume_paused_customers',
+        name='Resume paused customers whose auto-resume time has come',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=120,
     )
     scheduler.add_job(
         reconcile_inactive_pppoe_access_background,

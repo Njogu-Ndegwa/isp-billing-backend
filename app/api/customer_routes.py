@@ -42,6 +42,12 @@ from app.services.customer_grace import (
     renewal_expiry,
 )
 from app.services.customer_events import record_customer_event
+from app.services.customer_pause import (
+    PauseError,
+    pause_customer,
+    pause_fields,
+    resume_customer,
+)
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.static_ip import (
     INVALID_STATIC_IP_MESSAGE,
@@ -412,6 +418,24 @@ async def edit_customer(
         customer = result.scalar_one_or_none()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
+
+        if customer.paused_at is not None and (
+            request.activate_paid_until
+            or (
+                request.expiry is not None
+                and (
+                    customer.expiry is None
+                    or abs((request.expiry.replace(tzinfo=None) - customer.expiry).total_seconds()) > 60
+                )
+            )
+        ):
+            # A paused customer's expiry is frozen and their paid time is held
+            # separately; an edited expiry would be silently overwritten on
+            # resume (or stacked on top of it).
+            raise HTTPException(
+                status_code=409,
+                detail="This customer is paused. Resume them first, then change the expiry.",
+            )
 
         target_plan = customer.plan
         if request.plan_id is not None:
@@ -1275,6 +1299,7 @@ async def get_customers_api(
                 "payment_paybill": paybills.get(c.router_id),
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
+                **pause_fields(c),
                 "subscription_owner_id": c.subscription_owner_id,
                 "has_paid": bool(c_has_paid),
                 "tier": "customer" if c_has_paid else "visitor",
@@ -1353,6 +1378,7 @@ async def get_active_customers(
                 "payment_paybill": paybills.get(c.router_id),
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
+                **pause_fields(c),
                 "has_paid": bool(c_has_paid),
                 "tier": "customer" if c_has_paid else "visitor",
                 "plan": {
@@ -1412,6 +1438,7 @@ async def get_customer_detail(
             "payment_paybill": paybills.get(customer.router_id),
             "wallet_credit_kes": customer.wallet_credit_kes,
             **grace_fields(customer, datetime.utcnow()),
+            **pause_fields(customer),
             "subscription_owner_id": customer.subscription_owner_id,
             "plan": {
                 "id": customer.plan.id,
@@ -1820,6 +1847,79 @@ async def deactivate_pppoe_customer(
     except Exception as e:
         logger.error(f"Error deactivating PPPoE customer {customer_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to deactivate PPPoE customer: {str(e)}")
+
+
+# =========================================================================
+# PAUSE / RESUME (PPPoE and static IP) -- app/services/customer_pause.py
+# =========================================================================
+
+class PauseCustomerRequest(BaseModel):
+    # Optional: resume automatically at this time (UTC if no timezone given).
+    resume_at: Optional[datetime] = None
+
+
+def _require_customers_manage() -> None:
+    """Staff need ``customers.manage`` to pause/resume.
+
+    Works with or without the staff-roles change (#272): when it is not
+    deployed there are no staff sessions and this is a no-op. Its route map
+    is deny-by-default, so staff also need the two pause/resume routes listed
+    there under ``customers.manage``.
+    """
+    try:
+        from app.services.staff_access import require_permission
+    except ImportError:
+        return
+    require_permission("customers.manage")
+
+
+def _pause_http_error(exc: PauseError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+@router.post("/api/customers/{customer_id}/pause")
+async def pause_customer_api(
+    customer_id: int,
+    request: Optional[PauseCustomerRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Pause a PPPoE or static-IP customer and keep their remaining paid time.
+
+    The router is updated first (PPPoE: secret removed and session dropped;
+    static IP: access suspended); the pause is recorded only after the router
+    confirms. Pausing an already paused customer changes nothing.
+    """
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    _require_customers_manage()
+    await db.commit()
+    try:
+        return await pause_customer(
+            customer_id, actor=user, resume_at=request.resume_at if request else None,
+        )
+    except PauseError as exc:
+        raise _pause_http_error(exc)
+
+
+@router.post("/api/customers/{customer_id}/resume")
+async def resume_customer_api(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Resume a paused customer: new expiry = now + the paused time, router back on.
+
+    Same username and password, so the customer's device just dials again.
+    """
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    _require_customers_manage()
+    await db.commit()
+    try:
+        return await resume_customer(customer_id, actor=user)
+    except PauseError as exc:
+        raise _pause_http_error(exc)
 
 
 # =========================================================================

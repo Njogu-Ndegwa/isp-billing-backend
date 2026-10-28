@@ -138,6 +138,8 @@ def test_every_add_column_is_idempotent():
         # Form 2: the check-then-act guard sits above the statement.
         if "information_schema" in "\n".join(lines[max(0, i - 30):i]).lower():
             continue
+        if "pragma table_info" in "\n".join(lines[max(0, i - 10):i]).lower():
+            continue  # SQLite's column-existence check, tested against an old schema.
         # Form 3: the EXCEPTION clause sits below, inside the same DO block.
         if "duplicate_column" in "\n".join(lines[i:i + 10]).lower():
             continue

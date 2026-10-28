@@ -11,6 +11,7 @@ MIGRATION_CALLS = (
     "run_monitoring_migrations",
     "run_payment_method_migrations",
     "run_user_migrations",
+    "run_staff_migrations",
     "run_password_reset_migrations",
     "run_reconnection_migrations",
     "run_device_pairing_migrations",

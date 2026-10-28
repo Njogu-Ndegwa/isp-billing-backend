@@ -56,7 +56,13 @@ def effective_expiry_of(expiry: Optional[datetime], grace_minutes: Any) -> Optio
 
 
 def effective_expiry(customer: Any) -> Optional[datetime]:
-    """When this customer's access actually ends."""
+    """When this customer's access actually ends.
+
+    A paused customer (``paused_at`` set) gets no grace: their expiry is
+    frozen at the pause moment, so access has ended until they are resumed.
+    """
+    if getattr(customer, "paused_at", None) is not None:
+        return getattr(customer, "expiry", None)
     return effective_expiry_of(
         getattr(customer, "expiry", None),
         getattr(customer, "grace_period_minutes", 0),
