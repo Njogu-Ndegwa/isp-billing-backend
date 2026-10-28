@@ -2190,6 +2190,7 @@ def _scan_router_idle_credentials_sync(
     No DB writes happen here; the async caller applies the changes.
     """
     from app.services.access_credentials import (
+        _queue_target_ips,
         ensure_credential_queue_sync,
         queue_name_for_credential,
     )
@@ -2212,11 +2213,17 @@ def _scan_router_idle_credentials_sync(
                            router_info.get("name"))
             return out
         hosts_by_mac = {}
+        # Every address behind each MAC: a MAC-NAT repeater puts several
+        # devices behind one bound MAC, and the queue must cover all of them.
+        host_ips_by_mac: dict[str, list[str]] = defaultdict(list)
         if hosts_resp.get("success") and hosts_resp.get("data"):
             for h in hosts_resp["data"]:
                 hm = h.get("mac-address", "")
                 if hm:
                     hosts_by_mac[normalize_mac_address(hm)] = h
+                    h_ip = h.get("address") or h.get("to-address")
+                    if h_ip:
+                        host_ips_by_mac[normalize_mac_address(hm)].append(h_ip)
 
         # Pull bindings + queues once so per-cred release is just a lookup + remove.
         bindings_resp = api.send_command("/ip/hotspot/ip-binding/print")
@@ -2316,21 +2323,22 @@ def _scan_router_idle_credentials_sync(
                 })
                 # Unread queue table: adding blind would collide on the name.
                 if queues_read and "rate_limit" in cred:
+                    cred_ips = _queue_target_ips(host_ips_by_mac.get(wanted) or host_ip)
                     outcome = ensure_credential_queue_sync(
                         api,
                         cred_id=cred["id"],
                         username=cred.get("username") or "",
                         rate_limit=cred.get("rate_limit"),
-                        client_ip=host_ip,
+                        client_ip=cred_ips,
                         existing_queue=queues_by_name.get(queue_name_for_credential(cred["id"])),
                     )
                     if outcome in ("created", "updated", "removed"):
                         logger.warning("[REAPER] %s: %s queue %s (%s -> %s)",
                                        router_info.get("name"), outcome,
                                        queue_name_for_credential(cred["id"]),
-                                       host_ip, cred.get("rate_limit"))
-                    if outcome in ("created", "updated", "unchanged") and cred.get("rate_limit") and host_ip:
-                        limited_ips.append(host_ip)
+                                       ",".join(cred_ips), cred.get("rate_limit"))
+                    if outcome in ("created", "updated", "unchanged") and cred.get("rate_limit"):
+                        limited_ips.extend(cred_ips)
         if limited_ips:
             _ensure_credential_queue_fasttrack_bypass(api, router_info.get("name"), limited_ips)
         if pending_releases:

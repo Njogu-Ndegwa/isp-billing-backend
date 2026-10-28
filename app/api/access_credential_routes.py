@@ -17,11 +17,13 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.access_credentials import (
+    InvalidRateLimit,
     bind_mac_for_login,
     deprovision_credential,
     fetch_live_usage,
     generate_password,
     generate_username,
+    normalize_rate_limit,
     provision_credential,
     release_mac,
     serialize_credential,
@@ -36,20 +38,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/access-credentials", tags=["access-credentials"])
 
 
-_RATE_LIMIT_RE = re.compile(r"^\d+(?:\.\d+)?[kKmMgG]?/\d+(?:\.\d+)?[kKmMgG]?$")
 _USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 
 
 def _validate_rate_limit(value: Optional[str]) -> Optional[str]:
-    if value is None or value == "":
-        return None
-    value = value.strip()
-    if not _RATE_LIMIT_RE.match(value):
+    """Normalise to RouterOS ``upload/download``; bare numbers are Mbps.
+
+    "50/10" is stored as "50M/10M" (RouterOS would read it as 50 bit/s) and
+    "5m/2m" as "5M/2M" (RouterOS rejects lowercase m).
+    """
+    try:
+        return normalize_rate_limit(value)
+    except InvalidRateLimit:
         raise HTTPException(
             status_code=400,
-            detail="rate_limit must look like '5M/2M' (upload/download in K/M/G)",
+            detail=(
+                f"Invalid rate_limit '{value}'. Use upload/download in Mbps, "
+                "e.g. '5/2' or '5M/2M' (units k, M or G; one value like '5M' "
+                "sets both; leave empty for unlimited)."
+            ),
         )
-    return value
 
 
 def _validate_username(value: str) -> str:
