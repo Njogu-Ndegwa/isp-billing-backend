@@ -38,6 +38,7 @@ os.environ.setdefault("MPESA_ENVIRONMENT", "sandbox")
 # inherit pilot behaviour by accident. Pilot tests opt in explicitly.
 os.environ.setdefault("REALTIME_PILOT_ROUTER_IDS", "")
 os.environ.setdefault("REALTIME_PUSH_INSTALL_AT_SETUP", "false")  # no background router installs in tests
+os.environ.setdefault("PPPOE_RECOVERY_SWEEP_ENABLED", "false")  # no background recovery sweeps in tests
 
 from datetime import datetime
 from typing import AsyncIterator
@@ -240,6 +241,18 @@ def reset_expiry_cleanup_router_memo():
     mikrotik_background._expiry_cleanup_backoff_hydrated = False
     ops_health_problem_routers.reset_cache()
     router_diagnosis.reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_presence_probe(monkeypatch):
+    """Reconnect's live device-presence probe talks to RouterOS. Default it to
+    "could not tell" so no test dials a router; presence tests patch it."""
+    from app.services import device_entitlements
+
+    async def _unknown(_router_info, _macs):
+        return None
+
+    monkeypatch.setattr(device_entitlements, "probe_online_macs", _unknown)
 
 
 @pytest.fixture(autouse=True)

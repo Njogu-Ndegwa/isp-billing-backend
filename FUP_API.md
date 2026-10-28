@@ -52,10 +52,29 @@ PUT /api/plans/{plan_id}
 
 Pass `data_cap_mb: 0` to clear the cap (keeps the column nullable).
 
+### Daily FUP (`fup_period`)
+
+| Field | Type | Meaning |
+|---|---|---|
+| `fup_period` | `"plan"` | `"daily"` | Window the cap applies to. `"plan"` (default; every plan created before this field existed) = the whole paid period, reset on renewal. `"daily"` = usage since the last daily reset; throttled/blocked customers get full speed back at the reset. |
+
+- The reset is local midnight EAT by default (`FUP_DAILY_RESET_HOUR` env, a local hour 0-23).
+- Daily usage is the sum of the hourly `customer_usage_buckets` ledger since the reset
+  (pooled across a shared plan's devices). If the customer renewed after today's reset,
+  the window starts at the renewal instead, so paying still gives a fresh allowance.
+- At the reset, whichever path evaluates the customer first lifts yesterday's trigger
+  (usage push, cap sampler, bandwidth snapshot, or the `fup_daily_reset` sweep that runs
+  every ~2 min for customers who generate no traffic). The trigger is then re-armed, so
+  crossing the cap again the same day throttles again. Customers with no access time left
+  are not restored; renewal lifts it as before.
+- `GET /api/customers/{id}/usage` adds `plan_fup_period`, and for daily plans
+  `period.fup_window_start`, `period.fup_window_used_mb`, `period.fup_window_percent_used`
+  (the figure the cap is enforced against). `period.total_mb` stays the whole period.
+
 ### Read plan
 
 `GET /api/plans` now includes `data_cap_mb`, `fup_action`,
-`fup_throttle_profile` for every plan.
+`fup_throttle_profile`, `fup_period` for every plan.
 
 ---
 

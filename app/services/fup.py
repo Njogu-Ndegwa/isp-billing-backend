@@ -43,7 +43,8 @@ from app.services.mikrotik_api import (
     parse_speed_to_mikrotik,
 )
 from app.services.subscription_sharing import max_devices_for_customer
-from app.services.usage_tracking import pooled_period_usage_bytes
+from app.services.customer_grace import has_access_time
+from app.services.usage_tracking import fup_usage_bytes, fup_window_start
 from app.services.hotspot_mac_login import (
     block_customer as mac_login_block_customer,
     mac_login_enabled,
@@ -611,6 +612,39 @@ async def restore_normal_profile(
     )
 
 
+async def _reset_daily_trigger(
+    db: AsyncSession,
+    customer: Customer,
+    period: CustomerUsagePeriod,
+    plan: Plan,
+    now: datetime,
+) -> bool:
+    """Daily reset: restore full speed and clear yesterday's trigger.
+
+    Returns False (state untouched, retried on the next evaluation) when the
+    customer has no access time left -- restoring would re-open a hotspot
+    binding for an expired customer, and renewal lifts the trigger anyway --
+    or when the router could not be reached.
+    """
+    identifier = customer.pppoe_username or customer.mac_address or f"customer:{customer.id}"
+    if period.fup_reverted_at is None and period.fup_action_taken in (FupAction.THROTTLE, FupAction.BLOCK):
+        if not has_access_time(customer, now):
+            return False
+        logger.info(
+            f"[FUP] Daily reset for customer={customer.id} ({identifier}): "
+            f"restoring after {period.fup_action_taken.value} at {period.fup_triggered_at}"
+        )
+        res = await restore_normal_profile(db, customer, plan)
+        if res.get("error"):
+            logger.warning(f"[FUP] Daily reset restore failed for {identifier}: {res}")
+            return False
+    if period.fup_reverted_at is None:
+        period.fup_reverted_at = now
+    period.fup_triggered_at = None
+    period.fup_action_taken = None
+    return True
+
+
 async def evaluate_and_enforce(
     db: AsyncSession,
     customer: Customer,
@@ -619,6 +653,11 @@ async def evaluate_and_enforce(
     now: Optional[datetime] = None,
 ) -> Optional[FupAction]:
     """Decide whether to trigger or release FUP, taking router action as needed.
+
+    The cap is measured over the plan's FUP window (``plan.fup_period``): the
+    whole paid period by default, or usage since today's reset for a daily
+    plan. On a daily plan, a trigger left over from an earlier day is lifted
+    (full speed restored) and re-armed before today's usage is checked.
 
     Returns the action that was applied (if any), or ``None`` if no change.
     """
@@ -635,10 +674,21 @@ async def evaluate_and_enforce(
         return None
 
     now = now or datetime.utcnow()
-    used_bytes = int(period.total_bytes or 0)
-    if used_bytes < cap_bytes:
-        # A shared plan's cap covers all its devices together.
-        used_bytes = await pooled_period_usage_bytes(db, customer, period)
+    window_start = fup_window_start(period, plan, now)
+    if (
+        window_start is not None
+        and period.fup_triggered_at is not None
+        and period.fup_triggered_at < window_start
+    ):
+        # Daily FUP: this trigger belongs to an earlier day. Lift it and re-arm.
+        if not await _reset_daily_trigger(db, customer, period, plan, now):
+            return None
+
+    # Plan window: the period's usage. Daily window: usage since the reset.
+    # Either way a shared plan's cap covers all its devices together.
+    used_bytes = await fup_usage_bytes(
+        db, customer, period, plan=plan, now=now, cap_bytes=cap_bytes
+    )
     over_cap = used_bytes >= cap_bytes
 
     if over_cap and period.fup_triggered_at is None:

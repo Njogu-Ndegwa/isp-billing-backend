@@ -165,6 +165,21 @@ jobs:
             exit 1
           fi
 
+          # Recreating the container deletes its logs, so errors from just before
+          # a deploy could never be investigated (25 Oct 2026). Keep a gzipped
+          # copy of the outgoing container's full log, newest 14 only. Best
+          # effort: nothing in this block may fail or delay the deploy.
+          echo "[7b/9] Saving the outgoing container's logs..."
+          (
+            LOG_DIR=/var/log/isp-billing
+            mkdir -p "$LOG_DIR" || exit 0
+            docker inspect isp_billing_hetzner_app >/dev/null 2>&1 || { echo "No running app container; nothing to save"; exit 0; }
+            LOG_FILE="$LOG_DIR/app-$(date -u +%Y%m%dT%H%M%SZ).log.gz"
+            timeout 120 docker logs --timestamps isp_billing_hetzner_app 2>&1 | gzip -1 > "$LOG_FILE" || true
+            echo "Saved $LOG_FILE ($(du -h "$LOG_FILE" 2>/dev/null | cut -f1))"
+            ls -1t "$LOG_DIR"/app-*.log.gz 2>/dev/null | tail -n +15 | xargs -r rm -f || true
+          ) || true
+
           echo "[8/9] Recreating ONLY the web service (db/radius untouched, no compose down)..."
           dc up -d --no-deps --no-build web || { echo "ERROR: web service start failed"; exit 1; }
 

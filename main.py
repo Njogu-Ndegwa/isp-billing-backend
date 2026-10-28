@@ -51,14 +51,25 @@ async def enforce_impersonation_read_only(request: Request, call_next):
     return await _enforce_impersonation_read_only(request, call_next)
 
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
+# CORS middleware. CORS_OPTIONS is also handed to the catch-all 500 handler
+# below, so an unhandled error carries exactly the same CORS headers as any
+# other response -- one source of truth, never wider.
+CORS_OPTIONS = dict(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(CORSMiddleware, **CORS_OPTIONS)
+
+# Unhandled exceptions become a 500 in Starlette's outermost layer, OUTSIDE
+# CORSMiddleware, so the browser could not read them and resellers saw
+# "NetworkError" / "Failed to fetch" (25 Oct 2026, Generate Vouchers). This
+# returns {"detail": "Internal server error"} with the CORS headers above.
+# HTTPException and validation errors keep their own handlers.
+from app.core.error_handlers import install_unhandled_error_handler  # noqa: E402
+
+install_unhandled_error_handler(app, CORS_OPTIONS)
 
 
 @app.middleware("http")
@@ -138,6 +149,7 @@ from app.api.outage_compensation_routes import router as outage_compensation_rou
 from app.api.impersonation_routes import router as impersonation_router
 from app.api.static_ip_import_routes import router as static_ip_import_router
 from app.api.customer_device_routes import router as customer_device_router
+from app.api.admin_support_desk_routes import router as admin_support_desk_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -192,6 +204,7 @@ app.include_router(outage_compensation_router)
 app.include_router(impersonation_router)
 app.include_router(static_ip_import_router)
 app.include_router(customer_device_router)
+app.include_router(admin_support_desk_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -207,6 +220,7 @@ from app.services.mikrotik_background import (
     _cleanup_single_router_hotspot_sync,
 )
 from app.services.usage_cap_sampler import sample_capped_usage_background
+from app.services.fup_daily_reset import reset_daily_fup_background
 from app.services.mikrotik_lb_background import reconcile_lb_paid_background
 from app.services.payment_port_attribution import attribute_recent_payment_ports_background
 from app.services.router_status_alerts import scan_and_notify_offline_routers
@@ -1599,6 +1613,11 @@ async def run_fup_usage_migrations():
         await conn.execute(sa_text(
             "ALTER TABLE plans ADD COLUMN IF NOT EXISTS fup_throttle_profile VARCHAR(100) NULL"
         ))
+        # Daily FUP (opt-in per plan). The default keeps every existing plan on
+        # the original per-plan-period cap.
+        await conn.execute(sa_text(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS fup_period VARCHAR(16) NOT NULL DEFAULT 'plan'"
+        ))
 
         await conn.execute(sa_text(
             "ALTER TABLE user_bandwidth_usage "
@@ -2182,9 +2201,15 @@ async def run_c2b_migrations():
         await conn.execute(sa_text("""
             DO $$ BEGIN
                 CREATE TYPE c2btransactionstatus AS ENUM
-                    ('processed', 'unmatched', 'rejected', 'duplicate');
+                    ('processed', 'unmatched', 'rejected', 'duplicate', 'stk_echo');
             EXCEPTION WHEN duplicate_object THEN null; END $$;
         """))
+        # The production type predates 'stk_echo' and the CREATE TYPE above
+        # no-ops on it, so add the label explicitly (native enums never gain a
+        # label implicitly; see 'timeout' on b2btransactionstatus, 2026-07-18).
+        await conn.execute(sa_text(
+            "ALTER TYPE c2btransactionstatus ADD VALUE IF NOT EXISTS 'stk_echo'"
+        ))
         await conn.execute(sa_text("""
             DO $$ BEGIN
                 CREATE TYPE unmatchedc2breason AS ENUM
@@ -2342,6 +2367,12 @@ async def run_messaging_migrations():
             "ADD COLUMN IF NOT EXISTS receipt_include_hotspot BOOLEAN NOT NULL DEFAULT false, "
             "ADD COLUMN IF NOT EXISTS welcome_enabled BOOLEAN NOT NULL DEFAULT false, "
             "ADD COLUMN IF NOT EXISTS custom_templates JSON NULL"
+        ))
+        # Expiry reminders can skip hotspot customers. Existing rows default
+        # to true so nothing changes for resellers who don't touch it.
+        await conn.execute(text(
+            "ALTER TABLE customer_expiry_sms_settings "
+            "ADD COLUMN IF NOT EXISTS expiry_include_hotspot BOOLEAN NOT NULL DEFAULT true"
         ))
         # --- Per-tenant gateway accounts -------------------------------
         # A reseller on their own SMS gateway gets a row in
@@ -2769,6 +2800,32 @@ async def run_customer_device_limit_migrations():
     raise last_exc
 
 
+async def run_customer_pause_migrations():
+    """Add the customers columns for pause / resume (app/services/customer_pause.py):
+    paused_at, paused_remaining_seconds and pause_resume_at. All nullable with
+    no default, so this is a metadata-only change. Idempotent.
+
+    Same retry loop as run_customer_grace_migrations: customers is the hottest
+    table and app connections carry lock_timeout.
+    """
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(sa_text("""
+                    ALTER TABLE customers
+                    ADD COLUMN IF NOT EXISTS paused_at TIMESTAMP NULL,
+                    ADD COLUMN IF NOT EXISTS paused_remaining_seconds INTEGER NULL,
+                    ADD COLUMN IF NOT EXISTS pause_resume_at TIMESTAMP NULL
+                """))
+            return
+        except Exception as exc:  # lock_timeout under a busy table: try again
+            last_exc = exc
+            logger.warning("Customer pause migration attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise last_exc
+
+
 async def run_standard_runtime_migrations():
     """Add the routers columns the standard-runtime installer records its work
     in (app/services/standard_runtime_enrol.py): check-in applier and
@@ -2952,6 +3009,8 @@ async def run_hot_path_index_migrations():
         "ix_mpesa_txn_status_created",
         "ix_mpesa_txn_customer_created",
         "ix_customer_payments_customer_status",
+        "ix_mpesa_txn_receipt_number",
+        "ix_customer_payments_payment_reference",
     )
     async with async_engine.connect() as conn:
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -3038,6 +3097,29 @@ async def run_hot_path_index_migrations():
                     ix_customer_payments_customer_status
                 ON public.customer_payments (customer_id, status)
             """))
+
+            # Receipt lookups for the STK-echo guard: every C2B confirmation
+            # checks whether its TransID was already credited by an STK push
+            # (mpesa_transactions.mpesa_receipt_number) or recorded as a
+            # payment (customer_payments.payment_reference). Both tables are
+            # 300k+ rows in production; without these each confirmation
+            # would scan them in full.
+            for receipt_index, receipt_table, receipt_column in (
+                ("ix_mpesa_txn_receipt_number", "mpesa_transactions", "mpesa_receipt_number"),
+                ("ix_customer_payments_payment_reference", "customer_payments", "payment_reference"),
+            ):
+                result = await conn.execute(sa_text(
+                    "SELECT indisvalid FROM pg_index "
+                    f"WHERE indexrelid = to_regclass('public.{receipt_index}')"
+                ))
+                if result.scalar_one_or_none() is False:
+                    await conn.execute(sa_text(
+                        f"DROP INDEX CONCURRENTLY IF EXISTS public.{receipt_index}"
+                    ))
+                await conn.execute(sa_text(
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {receipt_index} "
+                    f"ON public.{receipt_table} ({receipt_column})"
+                ))
         finally:
             await conn.execute(sa_text("RESET max_parallel_maintenance_workers"))
             await conn.execute(sa_text("RESET maintenance_work_mem"))
@@ -3166,6 +3248,34 @@ async def run_customer_event_migrations():
             logger.info("Customer event migration: created customer_events")
 
     logger.info("Customer event migrations complete")
+
+
+async def run_support_desk_migrations():
+    """WhatsApp support desk (app/api/admin_support_desk_routes.py): two NEW
+    tables, support_desk_snapshots (single row) and support_desk_decisions
+    (Dennis's go/close decisions), via the checkfirst create_all pattern.
+    Safe to run on every startup.
+    """
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+
+        from app.db.models import SupportDeskDecision, SupportDeskSnapshot
+        # Explicit startup create_all target: support_desk_snapshots.
+        if SupportDeskSnapshot.__tablename__ not in tables:
+            await conn.run_sync(
+                lambda c: Base.metadata.create_all(c, tables=[SupportDeskSnapshot.__table__])
+            )
+            logger.info("Support desk migration: created support_desk_snapshots")
+        # Explicit startup create_all target: support_desk_decisions.
+        if SupportDeskDecision.__tablename__ not in tables:
+            await conn.run_sync(
+                lambda c: Base.metadata.create_all(c, tables=[SupportDeskDecision.__table__])
+            )
+            logger.info("Support desk migration: created support_desk_decisions")
+
+    logger.info("Support desk migrations complete")
 
 
 async def run_customer_audit_index_migrations():
@@ -3426,6 +3536,12 @@ async def startup_event():
         logger.error(f"Customer device-limit migration failed (non-fatal): {e}")
 
     try:
+        await run_customer_pause_migrations()
+        logger.info("Customer pause migration completed successfully")
+    except Exception as e:
+        logger.error(f"Customer pause migration failed (non-fatal): {e}")
+
+    try:
         await run_standard_runtime_migrations()
         logger.info("Standard-runtime migration completed successfully")
     except Exception as e:
@@ -3503,6 +3619,11 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Customer audit index migration failed (non-fatal): {e}")
 
+    try:
+        await run_support_desk_migrations()
+    except Exception as e:
+        logger.error(f"Support desk migration failed (non-fatal): {e}")
+
     from app.config import settings as app_settings
     if not scheduler_enabled():
         if scheduler.running:
@@ -3573,6 +3694,17 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
+    # Paused customers with an auto-resume date (app/services/customer_pause.py).
+    from app.services.customer_pause import auto_resume_due_customers_background
+    scheduler.add_job(
+        auto_resume_due_customers_background,
+        trigger=IntervalTrigger(minutes=2),
+        id='auto_resume_paused_customers',
+        name='Resume paused customers whose auto-resume time has come',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=120,
+    )
     scheduler.add_job(
         reconcile_inactive_pppoe_access_background,
         trigger=IntervalTrigger(minutes=10),
@@ -3616,6 +3748,14 @@ async def startup_event():
         trigger=IntervalTrigger(seconds=19),
         id='usage_cap_sampler',
         name='Lightweight capped customer usage sampler',
+        replace_existing=True,
+        max_instances=1
+    )
+    scheduler.add_job(
+        reset_daily_fup_background,
+        trigger=IntervalTrigger(seconds=127),
+        id='fup_daily_reset',
+        name='Lift daily-FUP throttles left over from before the daily reset (daily plans only)',
         replace_existing=True,
         max_instances=1
     )

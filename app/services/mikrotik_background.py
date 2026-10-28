@@ -38,6 +38,7 @@ from app.db.models import (
 )
 from app.services.mikrotik_api import (
     LANE_BACKGROUND,
+    QUEUE_FASTTRACK_BYPASS_LIST,
     MikroTikAPI,
     customer_queue_mac,
     find_conflicting_customer_queues,
@@ -2178,12 +2179,20 @@ def _scan_router_idle_credentials_sync(
       * absent from /ip/hotspot/host entirely, or
       * present with an idle-time exceeding ``idle_threshold_seconds``.
 
+    Every credential that stays bound also gets its ``cred_<id>`` rate-limit
+    queue created or re-targeted to the device's current IP. A bypassed
+    binding skips the hotspot profile's rate-limit, so without this a device
+    whose IP was unknown at login (or changed since) runs unlimited.
+
     Returns ``{"to_release": [{"id": int, "mac": str, "bytes_in": int, "bytes_out": int}, ...],
               "to_update": [{"id": int, "bytes_in": int, "bytes_out": int, "ip": str}, ...]}``.
 
     No DB writes happen here; the async caller applies the changes.
     """
-    from app.services.access_credentials import queue_name_for_credential
+    from app.services.access_credentials import (
+        ensure_credential_queue_sync,
+        queue_name_for_credential,
+    )
 
     out = {"to_release": [], "to_update": []}
     api = MikroTikAPI(
@@ -2226,13 +2235,14 @@ def _scan_router_idle_credentials_sync(
                                             normalize_mac_address(bm))].append(bid)
 
         queues_resp = api.send_command("/queue/simple/print")
-        queues_by_name: dict[str, str] = {}
+        queues_read = bool(queues_resp.get("success"))
+        queues_by_name: dict[str, dict] = {}
         if queues_resp.get("success") and queues_resp.get("data"):
             for q in queues_resp["data"]:
                 qn = q.get("name", "")
-                qid = q.get(".id")
-                if qn and qid:
-                    queues_by_name[qn] = qid
+                if qn and q.get(".id"):
+                    queues_by_name[qn] = q
+        limited_ips: list[str] = []
 
         now_utc = datetime.utcnow()
 
@@ -2297,12 +2307,32 @@ def _scan_router_idle_credentials_sync(
                     "ip": (host.get("address") or host.get("to-address")) if host else None,
                 })
             else:
+                host_ip = host.get("address") or host.get("to-address")
                 out["to_update"].append({
                     "id": cred["id"],
                     "bytes_in": int(host.get("bytes-in", 0) or 0),
                     "bytes_out": int(host.get("bytes-out", 0) or 0),
-                    "ip": host.get("address") or host.get("to-address"),
+                    "ip": host_ip,
                 })
+                # Unread queue table: adding blind would collide on the name.
+                if queues_read and "rate_limit" in cred:
+                    outcome = ensure_credential_queue_sync(
+                        api,
+                        cred_id=cred["id"],
+                        username=cred.get("username") or "",
+                        rate_limit=cred.get("rate_limit"),
+                        client_ip=host_ip,
+                        existing_queue=queues_by_name.get(queue_name_for_credential(cred["id"])),
+                    )
+                    if outcome in ("created", "updated", "removed"):
+                        logger.warning("[REAPER] %s: %s queue %s (%s -> %s)",
+                                       router_info.get("name"), outcome,
+                                       queue_name_for_credential(cred["id"]),
+                                       host_ip, cred.get("rate_limit"))
+                    if outcome in ("created", "updated", "unchanged") and cred.get("rate_limit") and host_ip:
+                        limited_ips.append(host_ip)
+        if limited_ips:
+            _ensure_credential_queue_fasttrack_bypass(api, router_info.get("name"), limited_ips)
         if pending_releases:
             verified_bindings = api.send_command("/ip/hotspot/ip-binding/print")
             verified_hosts = api.send_command("/ip/hotspot/host/print")
@@ -2328,7 +2358,7 @@ def _scan_router_idle_credentials_sync(
                     logger.warning("[REAPER] Credential %s still bypassed; keeping bound MAC",
                                    entry["id"])
                     continue
-                queue_id = queues_by_name.get(queue_name_for_credential(entry["id"]))
+                queue_id = (queues_by_name.get(queue_name_for_credential(entry["id"])) or {}).get(".id")
                 if queue_id:
                     api.send_command("/queue/simple/remove", {"numbers": queue_id})
                 entry.pop("normalized_mac")
@@ -2336,6 +2366,30 @@ def _scan_router_idle_credentials_sync(
         return out
     finally:
         api.disconnect()
+
+
+def _ensure_credential_queue_fasttrack_bypass(api, router_name, ips: list) -> None:
+    """Keep credential-queue IPs out of FastTrack, like customer queue IPs.
+
+    FastTracked connections skip simple queues entirely. Reads only our own
+    address list and calls the shared helper (which rewrites the two accept
+    rules) only when an IP is actually missing, so a steady state costs one
+    filtered print per pass.
+    """
+    listed = api.send_command_optimized(
+        "/ip/firewall/address-list/print",
+        proplist=["address"],
+        query=f"?list={QUEUE_FASTTRACK_BYPASS_LIST}",
+    )
+    if not listed.get("success"):
+        return
+    present = {str(e.get("address", "")).split("/")[0] for e in listed.get("data") or []}
+    if set(ips) <= present:
+        return
+    result = api.ensure_queue_fasttrack_bypass(ips)
+    if result.get("error"):
+        logger.warning("[REAPER] FastTrack bypass for credential queues failed on %s: %s",
+                       router_name, result.get("error"))
 
 
 def _parse_mikrotik_duration(s: str) -> int:
@@ -2409,6 +2463,8 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
             "id": c.id,
             "bound_mac_address": c.bound_mac_address,
             "bound_at": c.bound_at.isoformat() if c.bound_at else None,
+            "username": c.username,
+            "rate_limit": c.rate_limit,
         })
 
     if not by_router:

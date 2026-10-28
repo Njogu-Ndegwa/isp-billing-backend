@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, Text, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
 from sqlalchemy.ext.asyncio import AsyncAttrs
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Session, relationship
+from sqlalchemy import event
 from datetime import datetime
 import enum
 from sqlalchemy import JSON
@@ -250,6 +251,14 @@ class Customer(Base):
     # total devices including the owner's). NULL = use the plan's value.
     # See app/services/subscription_sharing.py max_devices_for_customer.
     max_devices_override = Column(Integer, nullable=True)
+    # Pause / resume (app/services/customer_pause.py). While paused the
+    # customer is INACTIVE, `expiry` is frozen at the pause moment (so nothing
+    # reads it as paid time) and the unused paid time waits in
+    # paused_remaining_seconds; resume sets expiry = now + that. NULL paused_at
+    # means not paused. pause_resume_at is an optional auto-resume time.
+    paused_at = Column(DateTime, nullable=True)
+    paused_remaining_seconds = Column(Integer, nullable=True)
+    pause_resume_at = Column(DateTime, nullable=True)
     # Nullable self-reference used by managed companion devices that share the
     # paying customer's subscription/expiry instead of buying their own plan.
     subscription_owner_id = Column(
@@ -263,6 +272,30 @@ class Customer(Base):
         remote_side=[id],
         backref="shared_subscription_customers",
     )
+
+@event.listens_for(Session, "before_flush")
+def _active_customers_are_never_paused(session, _flush_context, _instances):
+    """Invariant: an ACTIVE customer is not paused.
+
+    Pause/resume (app/services/customer_pause.py) keep this themselves. Any
+    other path that makes a paused customer ACTIVE -- in practice a payment
+    (M-Pesa, paybill, voucher, cash activation) while paused -- ends the pause
+    here and adds the paused paid time on top of the new expiry, so the
+    customer never loses time they already paid for and the pause can never
+    be left behind on a paying customer (which would deny them access).
+    """
+    for obj in list(session.new) + list(session.dirty):
+        # status first: it is what was just changed (already loaded), so
+        # paused_at is only read for customers turning ACTIVE.
+        if (
+            isinstance(obj, Customer)
+            and obj.status == CustomerStatus.ACTIVE
+            and obj.paused_at is not None
+        ):
+            from app.services.customer_pause import end_pause_on_activation
+
+            end_pause_on_activation(obj)
+
 
 class CustomerRating(Base):
     """Customer ratings/feedback after purchase - identified by phone number"""
@@ -310,6 +343,11 @@ class Plan(Base):
         nullable=True,
     )
     fup_throttle_profile = Column(String(100), nullable=True)
+    # Window the data cap applies to: "plan" = the whole paid period (resets on
+    # renewal; the original behaviour and the default for every existing plan),
+    # "daily" = usage since the last local daily reset (settings.FUP_DAILY_RESET_HOUR),
+    # with throttled/blocked customers restored at the reset.
+    fup_period = Column(String(16), nullable=False, default="plan", server_default="plan")
     # Total customers/devices allowed on one paid subscription. 1 = no sharing.
     max_shared_users = Column(Integer, nullable=False, default=1, server_default="1")
     # Routers this plan is offered on, e.g. [12, 47]. NULL means "every router the
@@ -1913,7 +1951,8 @@ class PortalSettings(Base):
 
     # ── Theme ────────────────────────────────────────────────────────────────
     # Preselected options: ocean_blue | emerald_green | sunset_orange |
-    #                      midnight_purple | rose_gold | slate_gray
+    #                      bright_violet | rose_gold | slate_gray
+    # (legacy midnight_purple is still accepted, see portal_routes.LEGACY_THEMES)
     color_theme = Column(String(50), nullable=False, default="slate_gray", server_default="slate_gray")
 
     # ── Header section ───────────────────────────────────────────────────────
@@ -1989,6 +2028,11 @@ class C2BTransactionStatus(str, enum.Enum):
     UNMATCHED = "unmatched"    # Account number unknown / amount too low — needs human attention
     REJECTED = "rejected"      # Paybill shortcode didn't resolve to anyone we know
     DUPLICATE = "duplicate"    # Safaricom retry — same TransID seen before, no-op
+    # Safaricom's C2B copy of an STK push on a paybill that has C2B URLs
+    # registered. The STK callback already credited this receipt, so the C2B
+    # copy is archived for audit only: no payment, no wallet change, never
+    # shown to the reseller as an unmatched payment.
+    STK_ECHO = "stk_echo"
 
 
 class UnmatchedC2BReason(str, enum.Enum):
@@ -2207,6 +2251,11 @@ class CustomerExpirySmsSettings(Base):
     enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     reminder_offsets_minutes = Column(JSON, nullable=False, default=lambda: [1440])
     send_at_expiry = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Expiry reminders and the at-expiry message go to hotspot customers too
+    # unless the reseller turns this off (PPPoE and static always get them).
+    # Defaults on so resellers who never touch it keep the original behaviour.
+    expiry_include_hotspot = Column(Boolean, nullable=False, default=True,
+                                    server_default="true")
     # "Payment received, active until ..." after every recorded payment.
     payment_receipt_enabled = Column(Boolean, nullable=False, default=False,
                                      server_default="false")
@@ -2788,3 +2837,44 @@ class ImpersonationSession(Base):
     ip_address = Column(String(64), nullable=True)
     user_agent = Column(String(300), nullable=True)
     request_count = Column(Integer, nullable=False, default=0, server_default="0")
+
+
+class SupportDeskSnapshot(Base):
+    """Latest WhatsApp support dashboard snapshot pushed from Dennis's laptop.
+
+    One row only (id=1), overwritten on every push to
+    POST /api/admin/support-desk/snapshot and read by the platform-admin-only
+    GET /api/admin/support-desk. ``payload`` is already privacy-masked on the
+    laptop and masked again on ingest (app/services/support_desk.py), so the
+    table never holds phone numbers, emails or WhatsApp JIDs.
+    """
+    __tablename__ = "support_desk_snapshots"
+    id = Column(Integer, primary_key=True)
+    payload = Column(JSON, nullable=False)
+    received_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    size_bytes = Column(Integer, nullable=False, default=0)
+    sha256 = Column(String(64), nullable=False)
+    masked_count = Column(Integer, nullable=False, default=0)
+
+
+class SupportDeskDecision(Base):
+    """Dennis's decision on a "Waiting on Dennis" support desk item.
+
+    Written by the platform admin from the Support desk page
+    (POST /api/admin/support-desk/decisions): ``go`` tells the support agent
+    to start on the item, ``close`` closes it as not relevant. Dennis's laptop
+    pulls unconsumed rows with the support desk machine token and stamps
+    ``consumed_at`` once it has handed them to the inbox agent.
+
+    ``item_id`` is the stable work-log entry id from the snapshot
+    ("wl-" + 12 letters, optional "-N" suffix). ``note`` is masked like the
+    snapshot (no phone numbers, emails or WhatsApp JIDs).
+    """
+    __tablename__ = "support_desk_decisions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    item_id = Column(String(64), nullable=False, index=True)
+    action = Column(String(8), nullable=False)
+    note = Column(String(500), nullable=True)
+    decided_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    consumed_at = Column(DateTime, nullable=True, index=True)

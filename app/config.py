@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # /complete), once their encrypted management tunnel answers. hAP lite/mini
     # are skipped. False = switch off (existing routers are unaffected).
     REALTIME_PUSH_INSTALL_AT_SETUP: bool = True
+    # When a router comes back online, re-add the missing PPPoE secrets of its
+    # active customers and remove secrets left by deleted/moved customers
+    # (app/services/pppoe_resync.py). False = switch the sweep off.
+    PPPOE_RECOVERY_SWEEP_ENABLED: bool = True
     # Opt-in only: selected RB951s whose exact reporter source was reviewed.
     NATIVE_STREAM_ROUTER_IDS: str = ""
     NATIVE_STREAM_REPORTER_HASHES: str = ""
@@ -181,6 +185,9 @@ class Settings(BaseSettings):
     # "today" on a dashboard means the local calendar day (00:00 EAT -> now),
     # not a rolling 24h window. Kenya/EAT = UTC+3 and has no DST.
     LOCAL_UTC_OFFSET_HOURS: int = 3
+    # Local hour (0-23, in LOCAL_UTC_OFFSET_HOURS time) at which plans with
+    # fup_period='daily' start a fresh daily allowance. 0 = local midnight.
+    FUP_DAILY_RESET_HOUR: int = 0
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
@@ -332,6 +339,16 @@ class Settings(BaseSettings):
     FEEDBACK_TRIAGE_MODEL: str = "claude-opus-4-8"
     FEEDBACK_REPLY_MODEL: str = "claude-opus-4-8"
     FEEDBACK_DAILY_POST_CAP: int = 15
+
+    # --- Support desk snapshot (platform admin only) ----------------------
+    # Dennis's laptop builds the WhatsApp support dashboard JSON and POSTs it
+    # to /api/admin/support-desk/snapshot with this bearer token. Empty (the
+    # default) or shorter than SUPPORT_DESK_INGEST_TOKEN_MIN_LENGTH means the
+    # ingest endpoint is disabled and answers 503. Server env only, never
+    # committed. Generate with: openssl rand -hex 32
+    SUPPORT_DESK_INGEST_TOKEN: str = ""
+    SUPPORT_DESK_INGEST_TOKEN_MIN_LENGTH: int = 32
+    SUPPORT_DESK_SNAPSHOT_MAX_BYTES: int = 2 * 1024 * 1024
 
     # --- Transactional email (password reset) ----------------------------
     # Credentials live in the server .env only — never committed.

@@ -1,0 +1,109 @@
+{
+  "info": {
+    "name": "Support desk snapshot and decisions",
+    "description": "WhatsApp support desk snapshot. POST is the laptop ingest (machine token SUPPORT_DESK_INGEST_TOKEN); GET is platform admin (role admin) only. Decisions: POST is platform admin only; the pending list and consume use the machine token.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8000"
+    },
+    {
+      "key": "adminToken",
+      "value": ""
+    },
+    {
+      "key": "supportDeskIngestToken",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "Push snapshot (laptop)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{supportDeskIngestToken}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"generated_at\": \"2026-10-23T11:45:20+00:00\",\n  \"customers\": {\"rows\": []},\n  \"worklog\": {\"entries\": []}\n}"
+        },
+        "url": "{{baseUrl}}/api/admin/support-desk/snapshot",
+        "description": "200 {received_at,size_bytes,sha256,masked}. 401 bad/missing token, 413 over 2 MB, 400 not a JSON object, 503 SUPPORT_DESK_INGEST_TOKEN unset."
+      }
+    },
+    {
+      "name": "Get latest snapshot (platform admin)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{adminToken}}"
+          }
+        ],
+        "url": "{{baseUrl}}/api/admin/support-desk",
+        "description": "200 {received_at,size_bytes,sha256,snapshot,decisions}. 403 for resellers and View-as sessions, 404 before the first push."
+      }
+    },
+    {
+      "name": "Decide on a Waiting-on-Dennis item (platform admin)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{adminToken}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"item_id\": \"wl-abcdefghijkm\",\n  \"action\": \"go\",\n  \"note\": \"optional, up to 500 chars\"\n}"
+        },
+        "url": "{{baseUrl}}/api/admin/support-desk/decisions",
+        "description": "201 new decision, 200 same action already pending, 409 a different action is pending, 404 not an open needs_dennis item in the latest snapshot, 422 bad body, 403 reseller/View-as, 401 anonymous."
+      }
+    },
+    {
+      "name": "Pending decisions (laptop)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{supportDeskIngestToken}}"
+          }
+        ],
+        "url": "{{baseUrl}}/api/admin/support-desk/decisions?pending=1",
+        "description": "200 {decisions:[...]} oldest first. Without pending=1: the latest 200. 401 bad token, 503 token unset."
+      }
+    },
+    {
+      "name": "Mark decision consumed (laptop)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{supportDeskIngestToken}}"
+          }
+        ],
+        "url": "{{baseUrl}}/api/admin/support-desk/decisions/1/consumed",
+        "description": "200 {id,consumed_at} (idempotent). 404 unknown id, 401 bad token."
+      }
+    }
+  ]
+}

@@ -80,6 +80,21 @@ def cap_invoice_period_start(period_start: datetime, period_end: datetime) -> da
     return max(period_start, invoice_calendar_month_start(period_end))
 
 
+def first_invoice_fallback_start(reseller: User) -> datetime:
+    """Period start for a reseller's first invoice when nothing else marks it.
+
+    Used only when the reseller has no earlier invoice and no subscriptions
+    row. The old rule (one 30-day cycle back from the expiry) puts the start
+    before the account existed for anyone billed within 30 days of signing
+    up, e.g. at the end of a 7-day trial. Charges are unaffected because no
+    sales can predate the account, so this only corrects the dates shown.
+    """
+    period_start = reseller.subscription_expires_at - timedelta(days=30)
+    if reseller.created_at and reseller.created_at > period_start:
+        period_start = reseller.created_at
+    return period_start
+
+
 async def calculate_reseller_charges(
     db: AsyncSession, user_id: int, period_start: datetime, period_end: datetime
 ) -> dict:
@@ -1044,7 +1059,7 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
                     select(Subscription).where(Subscription.user_id == reseller.id)
                 )).scalar_one_or_none()
                 period_start = sub.current_period_start if sub and sub.current_period_start else (
-                    reseller.subscription_expires_at - timedelta(days=30)
+                    first_invoice_fallback_start(reseller)
                 )
 
             period_end = now
@@ -1171,7 +1186,7 @@ async def generate_catchup_invoices(db: AsyncSession) -> dict:
                 elif reseller.created_at:
                     period_start = reseller.created_at
                 else:
-                    period_start = reseller.subscription_expires_at - timedelta(days=30)
+                    period_start = first_invoice_fallback_start(reseller)
 
             period_end = now
             period_start = cap_invoice_period_start(period_start, period_end)

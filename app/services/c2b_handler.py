@@ -14,6 +14,15 @@ portal STK flow already handles hotspot).
 
 Idempotency: trans_id is the unique anchor — Safaricom retries confirmation
 on network errors and we must never double-credit a customer.
+
+STK echoes: when a paybill has C2B URLs registered AND takes STK pushes,
+Safaricom sends the STK callback and ALSO a C2B confirmation for the same
+receipt (BillRefNumber = the STK AccountReference, i.e. the reseller's
+business name). The STK callback is what credits the customer, so the C2B
+copy is archived as STK_ECHO and never bucketed as unmatched. Either message
+can arrive first: handle_confirmation catches the echo when the STK side is
+already recorded, and the STK callbacks call mark_stk_echo_after_stk_payment
+to retire a C2B copy that beat them.
 """
 
 from __future__ import annotations
@@ -34,6 +43,8 @@ from app.db.models import (
     CollectionMode,
     ConnectionType,
     Customer,
+    CustomerPayment,
+    MpesaTransaction,
     PaymentMethod,
     Plan,
     ResellerPaymentMethod,
@@ -145,6 +156,148 @@ async def _resolve_reseller_from_shortcode(
 
 
 # ---------------------------------------------------------------------------
+# STK echo detection
+# ---------------------------------------------------------------------------
+
+# Written to unmatched_c2b_payments.notes when an echo row is retired.
+STK_ECHO_NOTE = "stk_echo"
+
+
+class ReceiptOwner:
+    """Who an already-recorded M-Pesa receipt belongs to."""
+
+    def __init__(self, customer_id: Optional[int], reseller_id: Optional[int], source: str):
+        self.customer_id = customer_id
+        self.reseller_id = reseller_id
+        self.source = source  # "mpesa_transaction" | "customer_payment"
+
+
+async def find_recorded_receipt(db: AsyncSession, receipt: Optional[str]) -> Optional[ReceiptOwner]:
+    """Return the owner of ``receipt`` if another payment path already
+    recorded it, else None.
+
+    Checks the STK side first (mpesa_transactions.mpesa_receipt_number is only
+    written on a successful STK callback), then any recorded payment carrying
+    the receipt as its reference. An M-Pesa receipt is globally unique, so a
+    hit means the money was already credited once.
+    """
+    if not receipt:
+        return None
+    row = (
+        await db.execute(
+            select(MpesaTransaction.customer_id, Customer.user_id)
+            .outerjoin(Customer, Customer.id == MpesaTransaction.customer_id)
+            .where(MpesaTransaction.mpesa_receipt_number == receipt)
+            .limit(1)
+        )
+    ).first()
+    if row is not None:
+        return ReceiptOwner(row[0], row[1], "mpesa_transaction")
+    row = (
+        await db.execute(
+            select(CustomerPayment.customer_id, CustomerPayment.reseller_id)
+            .where(CustomerPayment.payment_reference == receipt)
+            .limit(1)
+        )
+    ).first()
+    if row is not None:
+        return ReceiptOwner(row[0], row[1], "customer_payment")
+    return None
+
+
+async def retire_c2b_stk_echo(
+    db: AsyncSession,
+    receipt: Optional[str],
+    *,
+    customer_id: Optional[int],
+    reseller_id: Optional[int],
+) -> bool:
+    """Mark an UNMATCHED C2B row for ``receipt`` as STK_ECHO and resolve its
+    open unmatched_c2b_payments row. Never creates a payment and never touches
+    a wallet. Does not commit. Returns True if a row was retired.
+
+    A C2B row that was already PROCESSED (credited by account number, or
+    attributed by hand) is left alone and logged: that receipt has been
+    credited twice and needs a human, not a silent status flip.
+    """
+    if not receipt:
+        return False
+    # Lock order matches attribute_unmatched_c2b (unmatched row, then the C2B
+    # row) so the two can never deadlock on the same receipt.
+    unmatched = (
+        await db.execute(
+            select(UnmatchedC2BPayment)
+            .join(C2BTransaction, C2BTransaction.id == UnmatchedC2BPayment.c2b_transaction_id)
+            .where(C2BTransaction.trans_id == receipt)
+            .with_for_update(of=UnmatchedC2BPayment)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    txn = (
+        await db.execute(
+            select(C2BTransaction)
+            .where(C2BTransaction.trans_id == receipt)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if txn is None or txn.status == C2BTransactionStatus.STK_ECHO:
+        return False
+    if txn.status != C2BTransactionStatus.UNMATCHED:
+        if txn.status == C2BTransactionStatus.PROCESSED:
+            logger.error(
+                "[C2B] Receipt %s was credited by C2B (c2b_transactions.id=%s, customer=%s) "
+                "AND by STK (customer=%s) - possible double credit, needs review",
+                receipt, txn.id, txn.matched_customer_id, customer_id,
+            )
+        return False
+
+    now = datetime.utcnow()
+    txn.status = C2BTransactionStatus.STK_ECHO
+    txn.matched_customer_id = customer_id
+    if reseller_id is not None:
+        txn.matched_reseller_id = reseller_id
+    txn.processed_at = now
+
+    if unmatched is not None and unmatched.resolved_at is None:
+        unmatched.resolved_at = now
+        unmatched.resolution_customer_id = customer_id
+        unmatched.notes = STK_ECHO_NOTE
+    logger.info(
+        "[C2B] Retired STK echo for receipt %s (c2b_transactions.id=%s, customer=%s)",
+        receipt, txn.id, customer_id,
+    )
+    return True
+
+
+async def mark_stk_echo_after_stk_payment(
+    receipt: Optional[str],
+    *,
+    customer_id: Optional[int],
+    reseller_id: Optional[int],
+) -> bool:
+    """Called by the STK callbacks once a payment is recorded: retire any C2B
+    copy of the same receipt that arrived first. Runs in its own short session
+    so it can never roll back or stall the payment it follows; failures are
+    logged and swallowed (scripts/backfill_c2b_stk_echoes.py sweeps anything
+    missed)."""
+    if not receipt:
+        return False
+    from app.db import database as _database
+
+    try:
+        async with _database.AsyncSessionLocal() as session:
+            retired = await retire_c2b_stk_echo(
+                session, receipt, customer_id=customer_id, reseller_id=reseller_id,
+            )
+            await session.commit()
+            return retired
+    except Exception:
+        logger.exception("[C2B] Could not retire STK echo for receipt %s", receipt)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Customer lookup
 # ---------------------------------------------------------------------------
 
@@ -198,6 +351,25 @@ async def handle_confirmation(
         logger.info(
             "[C2B] Duplicate confirmation for trans_id=%s (was status=%s) — no-op",
             fields.trans_id, existing.status,
+        )
+        return SUCCESS_RESPONSE
+
+    # 1b. STK echo: the same receipt was already credited by an STK push (or
+    # recorded as a payment). Archive for audit only: no unmatched row, no
+    # payment, no wallet change.
+    owner = await find_recorded_receipt(db, fields.trans_id)
+    if owner is not None:
+        await _archive(
+            db, fields,
+            status=C2BTransactionStatus.STK_ECHO,
+            matched_customer=None,
+            matched_customer_id=owner.customer_id,
+            matched_reseller_id=owner.reseller_id,
+        )
+        await db.commit()
+        logger.info(
+            "[C2B] STK echo for trans_id=%s (already recorded via %s, customer=%s) - archived only",
+            fields.trans_id, owner.source, owner.customer_id,
         )
         return SUCCESS_RESPONSE
 
@@ -458,6 +630,7 @@ async def _archive(
     status: C2BTransactionStatus,
     matched_customer: Optional[Customer],
     matched_reseller_id: Optional[int],
+    matched_customer_id: Optional[int] = None,
     wallet_before_kes: Optional[int] = None,
     wallet_after_kes: Optional[int] = None,
 ) -> C2BTransaction:
@@ -469,7 +642,7 @@ async def _archive(
         business_shortcode=fields.business_shortcode,
         payload_json=None,  # raw stored at the route level for full audit
         status=status,
-        matched_customer_id=matched_customer.id if matched_customer else None,
+        matched_customer_id=matched_customer.id if matched_customer else matched_customer_id,
         matched_reseller_id=matched_reseller_id,
         received_at=datetime.utcnow(),
         processed_at=datetime.utcnow() if status != C2BTransactionStatus.UNMATCHED else None,

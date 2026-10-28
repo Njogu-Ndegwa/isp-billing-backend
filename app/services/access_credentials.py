@@ -72,6 +72,94 @@ def comment_for_credential(cred: AccessCredential) -> str:
     return f"{USER_COMMENT_PREFIX}|cred:{cred.id}|user:{cred.user_id}"
 
 
+def _rate_to_bps(value: str) -> Optional[int]:
+    value = (value or "").strip().upper()
+    if not value:
+        return None
+    scale = {"K": 1_000, "M": 1_000_000, "G": 1_000_000_000}.get(value[-1], 1)
+    number = value[:-1] if value[-1] in "KMG" else value
+    try:
+        return int(float(number) * scale)
+    except ValueError:
+        return None
+
+
+def rate_limits_equal(a: Optional[str], b: Optional[str]) -> bool:
+    """``5M/5M`` == ``5000000/5000000`` (RouterOS prints queue limits in bps)."""
+    def pair(v):
+        up, _, down = str(v or "").strip().partition("/")
+        return _rate_to_bps(up), _rate_to_bps(down or up)
+    pa, pb = pair(a), pair(b)
+    return None not in pa and pa == pb
+
+
+def ensure_credential_queue_sync(
+    api: MikroTikAPI,
+    *,
+    cred_id: int,
+    username: str,
+    rate_limit: Optional[str],
+    client_ip: Optional[str],
+    existing_queue: Optional[Dict[str, Any]],
+) -> str:
+    """Make the ``cred_<id>`` simple queue enforce ``rate_limit`` on ``client_ip``.
+
+    A bypassed ip-binding skips the hotspot user profile, so this queue is the
+    ONLY thing that limits a credential's device. Called at login and again by
+    the access-credential reaper on every pass, the same way the customer queue
+    sync re-creates/re-targets ``plan_<MAC>`` queues: a device whose IP was not
+    known at login, or whose DHCP address changed since, gets limited on the
+    next pass instead of running unlimited.
+
+    Returns ``created`` | ``updated`` | ``removed`` | ``unchanged`` |
+    ``no_ip`` | ``error``.
+    """
+    comment = f"{USER_COMMENT_PREFIX}|cred:{cred_id}|user:{username}"
+    queue_id = (existing_queue or {}).get(".id")
+
+    if not rate_limit:
+        # Unthrottled credential: a leftover queue would keep the old cap.
+        if not queue_id:
+            return "unchanged"
+        result = api.send_command("/queue/simple/remove", {"numbers": queue_id})
+        return "error" if result.get("error") else "removed"
+
+    if not client_ip:
+        return "no_ip"
+
+    target = f"{client_ip}/32"
+    if queue_id:
+        current_ip = str(existing_queue.get("target", "")).split("/")[0].strip()
+        disabled = str(existing_queue.get("disabled", "false")).lower() == "true"
+        if (current_ip == client_ip and not disabled
+                and rate_limits_equal(existing_queue.get("max-limit"), rate_limit)):
+            return "unchanged"
+        result = api.send_command("/queue/simple/set", {
+            "numbers": queue_id,
+            "target": target,
+            "max-limit": rate_limit,
+            "disabled": "no",
+            "comment": comment,
+        })
+        outcome = "updated"
+    else:
+        result = api.send_command("/queue/simple/add", {
+            "name": queue_name_for_credential(cred_id),
+            "target": target,
+            "max-limit": rate_limit,
+            "comment": comment,
+        })
+        outcome = "created"
+
+    if result.get("error"):
+        logger.warning(
+            "[ACCESS-CRED QUEUE] %s of %s failed: %s",
+            outcome, queue_name_for_credential(cred_id), result["error"],
+        )
+        return "error"
+    return outcome
+
+
 # ---------------------------------------------------------------------------
 # Direct API path
 # ---------------------------------------------------------------------------
@@ -350,33 +438,29 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         # 4. Per-credential simple queue (only if a rate-limit is set AND we
         #    found a client IP; without an IP there's nothing to attach the
         #    queue to, and MikroTik would reject the call).
+        #    If the IP is unknown here, the access-credential reaper creates
+        #    the queue on its next pass (see ensure_credential_queue_sync).
+        queue_outcome = None
         if rate_limit and client_ip:
             queue_name = queue_name_for_credential(cred_id)
             queues_resp = api.send_command("/queue/simple/print")
-            existing_qid = None
+            existing_queue = None
             if queues_resp.get("success") and queues_resp.get("data"):
                 for q in queues_resp["data"]:
                     if q.get("name", "") == queue_name:
-                        existing_qid = q.get(".id")
+                        existing_queue = q
                         break
-
-            target = f"{client_ip}/32"
-            if existing_qid:
+            if queues_resp.get("success"):
                 time.sleep(CMD_DELAY)
-                api.send_command("/queue/simple/set", {
-                    "numbers": existing_qid,
-                    "target": target,
-                    "max-limit": rate_limit,
-                    "comment": comment,
-                })
-            else:
-                time.sleep(CMD_DELAY)
-                api.send_command("/queue/simple/add", {
-                    "name": queue_name,
-                    "target": target,
-                    "max-limit": rate_limit,
-                    "comment": comment,
-                })
+                queue_outcome = ensure_credential_queue_sync(
+                    api, cred_id=cred_id, username=username, rate_limit=rate_limit,
+                    client_ip=client_ip, existing_queue=existing_queue,
+                )
+        elif rate_limit:
+            logger.warning(
+                "[ACCESS-CRED BIND] no client IP for mac=%s cred=%s; queue left to the reaper",
+                mac_address, cred_id,
+            )
 
         # NOTE: the "kick" step (removing /ip/hotspot/active + /ip/hotspot/host
         # entries to force MikroTik to re-evaluate against the bypass binding)
@@ -389,10 +473,10 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         # *after* the response has been delivered.
         elapsed_ms = int((time.monotonic() - bind_started) * 1000)
         logger.info(
-            "[ACCESS-CRED BIND] ok router=%s mac=%s client_ip=%s elapsed_ms=%d",
-            router_info.get("ip"), mac_address, client_ip, elapsed_ms,
+            "[ACCESS-CRED BIND] ok router=%s mac=%s client_ip=%s queue=%s elapsed_ms=%d",
+            router_info.get("ip"), mac_address, client_ip, queue_outcome, elapsed_ms,
         )
-        return {"success": True, "client_ip": client_ip}
+        return {"success": True, "client_ip": client_ip, "queue": queue_outcome}
     finally:
         api.disconnect()
 

@@ -89,6 +89,8 @@ class ExpirySettingsIn(BaseModel):
     enabled: bool
     reminder_offsets_minutes: list[int]
     send_at_expiry: bool
+    # Omitted by older dashboards: leave the saved value alone.
+    expiry_include_hotspot: Optional[bool] = None
 
 
 def _expiry_settings_payload(row: CustomerExpirySmsSettings) -> dict:
@@ -96,6 +98,10 @@ def _expiry_settings_payload(row: CustomerExpirySmsSettings) -> dict:
         "enabled": row.enabled,
         "reminder_offsets_minutes": row.reminder_offsets_minutes or [],
         "send_at_expiry": row.send_at_expiry,
+        "expiry_include_hotspot": (
+            True if row.expiry_include_hotspot is None
+            else bool(row.expiry_include_hotspot)
+        ),
     }
 
 
@@ -156,6 +162,8 @@ async def update_expiry_settings(body: ExpirySettingsIn,
     row.enabled = body.enabled
     row.reminder_offsets_minutes = offsets
     row.send_at_expiry = body.send_at_expiry
+    if body.expiry_include_hotspot is not None:
+        row.expiry_include_hotspot = body.expiry_include_hotspot
     await db.commit()
     await db.refresh(row)
     return _expiry_settings_payload(row)

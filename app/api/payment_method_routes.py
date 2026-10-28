@@ -234,6 +234,9 @@ def _serialize_payment_method(pm: ResellerPaymentMethod) -> dict:
         "is_active": pm.is_active,
         "created_at": pm.created_at.isoformat() if pm.created_at else None,
         "updated_at": pm.updated_at.isoformat() if pm.updated_at else None,
+        # Set by POST /api/payment-methods/{id}/register-c2b; the admin "C2B Active" badge and
+        # the reseller-paybill picker read it. Null until URLs are registered.
+        "c2b_registered_at": pm.c2b_registered_at.isoformat() if pm.c2b_registered_at else None,
     }
 
     if method_type_value == ResellerPaymentMethodType.BANK_ACCOUNT.value:

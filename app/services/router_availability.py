@@ -607,6 +607,7 @@ async def record_router_availability(
     """
     checked_at = checked_at or datetime.utcnow()
     notify_transition = False
+    recovered = False
     offline_since: Optional[datetime] = None
     async with database.async_session() as adb:
         router = await adb.get(Router, router_id)
@@ -668,6 +669,7 @@ async def record_router_availability(
         if update_summary and is_online:
             # Capture the offline->online transition BEFORE overwriting the
             # summary columns; the message itself is sent after this commit.
+            recovered = router.last_status is False
             notify_transition = should_consider_recovery_notification(router, checked_at)
             if notify_transition:
                 offline_since = router.last_online_at
@@ -692,6 +694,14 @@ async def record_router_availability(
             )
         )
         await adb.commit()
+
+    if recovered:
+        # Writes made while the router was down were lost: re-add missing
+        # PPPoE secrets and drop orphans. Only schedules a background task
+        # (bounded, cooled down per router); never raises.
+        from app.services.pppoe_resync import schedule_pppoe_recovery_sweep
+
+        schedule_pppoe_recovery_sweep(router_id, now=checked_at)
 
     if notify_transition:
         # DB-only, own short session, never raises (see router_status_alerts).

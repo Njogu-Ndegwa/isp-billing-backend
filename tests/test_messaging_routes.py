@@ -88,6 +88,7 @@ async def test_expiry_settings_default_and_update(db, client, monkeypatch):
         "enabled": False,
         "reminder_offsets_minutes": [1440],
         "send_at_expiry": True,
+        "expiry_include_hotspot": True,
     }
 
     updated = await client.put("/api/messaging/expiry-settings", json={
@@ -100,10 +101,35 @@ async def test_expiry_settings_default_and_update(db, client, monkeypatch):
         "enabled": True,
         "reminder_offsets_minutes": [1440, 120],
         "send_at_expiry": False,
+        "expiry_include_hotspot": True,
     }
     row = await db.get(CustomerExpirySmsSettings, reseller.id)
     await db.refresh(row)
     assert row.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_expiry_settings_include_hotspot_toggle(db, client, monkeypatch):
+    reseller = await make_reseller(db)
+    _auth_as(monkeypatch, reseller)
+    body = {
+        "enabled": True,
+        "reminder_offsets_minutes": [1440],
+        "send_at_expiry": True,
+    }
+
+    off = await client.put("/api/messaging/expiry-settings",
+                           json={**body, "expiry_include_hotspot": False})
+    assert off.status_code == 200
+    assert off.json()["expiry_include_hotspot"] is False
+
+    # An older dashboard that does not send the field leaves it alone.
+    unchanged = await client.put("/api/messaging/expiry-settings", json=body)
+    assert unchanged.json()["expiry_include_hotspot"] is False
+
+    on = await client.put("/api/messaging/expiry-settings",
+                          json={**body, "expiry_include_hotspot": True})
+    assert on.json()["expiry_include_hotspot"] is True
 
 
 @pytest.mark.asyncio

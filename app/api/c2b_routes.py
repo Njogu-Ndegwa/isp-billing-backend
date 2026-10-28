@@ -38,6 +38,7 @@ from app.db.models import (
     C2BTransactionStatus,
     ConnectionType,
     Customer,
+    CustomerPayment,
     PaymentMethod,
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
@@ -205,11 +206,16 @@ async def register_reseller_c2b(
 async def list_unmatched_c2b(
     resolved: bool = False,
     limit: int = 100,
+    include_stk_echo: bool = False,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ) -> list[dict]:
     """List unmatched C2B payments assigned to the current reseller for triage.
-    Admins see all rows (no reseller scope)."""
+    Admins see all rows (no reseller scope).
+
+    STK echoes (the C2B copy Safaricom sends of an STK hotspot payment that
+    was already credited) are left out unless include_stk_echo=true: the
+    list is for genuine paybill payments that still need a customer."""
     user = await get_current_user(token, db)
     stmt = (
         select(UnmatchedC2BPayment)
@@ -221,6 +227,12 @@ async def list_unmatched_c2b(
         stmt = stmt.where(UnmatchedC2BPayment.assigned_reseller_id == user.id)
     if not resolved:
         stmt = stmt.where(UnmatchedC2BPayment.resolved_at.is_(None))
+    if not include_stk_echo:
+        stmt = stmt.where(
+            ~UnmatchedC2BPayment.c2b_transaction.has(
+                C2BTransaction.status == C2BTransactionStatus.STK_ECHO
+            )
+        )
 
     rows = (await db.execute(stmt)).scalars().all()
     return [_serialize_unmatched(r) for r in rows]
@@ -254,6 +266,9 @@ async def attribute_unmatched_c2b(
             select(UnmatchedC2BPayment)
             .options(joinedload(UnmatchedC2BPayment.c2b_transaction))
             .where(UnmatchedC2BPayment.id == unmatched_id)
+            # Serialise against a concurrent attribution or STK-echo retirement
+            # of the same row.
+            .with_for_update(of=UnmatchedC2BPayment)
         )
     ).scalar_one_or_none()
     if unmatched is None:
@@ -262,6 +277,29 @@ async def attribute_unmatched_c2b(
         raise HTTPException(status_code=403, detail="Not your unmatched payment")
     if unmatched.resolved_at is not None:
         raise HTTPException(status_code=409, detail="Already resolved")
+
+    # Never double-credit: if a payment carrying this receipt is already
+    # recorded (normally the STK hotspot payment this C2B row echoes),
+    # attributing it would add a second revenue row and extra access for the
+    # same money.
+    receipt = unmatched.c2b_transaction.trans_id
+    already_paid = (
+        await db.execute(
+            select(CustomerPayment.id, CustomerPayment.customer_id)
+            .where(CustomerPayment.payment_reference == receipt)
+            .limit(1)
+        )
+    ).first()
+    if already_paid is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"M-Pesa receipt {receipt} is already recorded as a payment for "
+                f"customer {already_paid.customer_id} (usually the hotspot STK payment "
+                "this paybill copy belongs to). Attributing it again would credit the "
+                "same money twice, so nothing was changed."
+            ),
+        )
 
     customer = (
         await db.execute(
