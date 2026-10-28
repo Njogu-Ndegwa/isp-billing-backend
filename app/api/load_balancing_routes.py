@@ -36,7 +36,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["load-balancing"])
 
-_WAN_PORT_RE = re.compile(r"^(ether|sfp)[0-9]+$")
+# Factory RouterOS names of physical ethernet / SFP ports: ether1, sfp1,
+# sfpplus1, sfp-sfpplus1 (RB4011, RB5009, CCR2004), sfp28-1, qsfpplus1-1,
+# qsfp28-1-1, combo1. Bridges, VLANs, wlan/wifi and tunnels stay rejected, and
+# the charset stays [a-z0-9-] because port names are quoted into router scripts.
+_WAN_PORT_RE = re.compile(
+    r"^(?:ether[0-9]+"
+    r"|sfp[0-9]+"
+    r"|sfpplus[0-9]+"
+    r"|sfp-sfpplus[0-9]+"
+    r"|sfp28-[0-9]+"
+    r"|qsfpplus[0-9]+-[0-9]+"
+    r"|qsfp28-[0-9]+-[0-9]+"
+    r"|combo[0-9]+)$"
+)
 
 # Read-only / short operations.
 LB_OP_TIMEOUT_SECONDS = 120
@@ -84,7 +97,7 @@ def _validate_wan_ports(wan_ports: List[str], router_obj: Router) -> None:
     if bad:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid WAN port name(s): {', '.join(bad)} (expected etherN or sfpN)",
+            detail=f"Invalid WAN port name(s): {', '.join(bad)} (expected an ethernet or SFP port such as ether1 or sfp-sfpplus1)",
         )
     customer_ports = set(router_obj.pppoe_ports or []) \
         | set(router_obj.plain_ports or []) \

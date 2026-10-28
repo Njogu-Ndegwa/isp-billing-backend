@@ -178,6 +178,11 @@ class FakeLBAPI(MikroTikAPI):
         elif command == "/ip/route/remove":
             self._remove_by_id(self.routes, args.get(".id"))
         elif command == "/ip/firewall/address-list/add":
+            # Real RouterOS refuses a second (list, address) pair.
+            if any(a.get("list") == args.get("list")
+                   and a.get("address") == args.get("address")
+                   for a in self.address_lists):
+                return {"error": "failure: already have such entry"}
             self.address_lists.append(row)
         elif command == "/ip/firewall/address-list/remove":
             self._remove_by_id(self.address_lists, args.get(".id"))
