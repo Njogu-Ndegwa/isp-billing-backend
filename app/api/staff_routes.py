@@ -1,6 +1,7 @@
 """Staff sub-users: the owner manages logins and permissions for their staff.
 
 GET    /api/staff/me                     who am I (owner or staff) + my permissions
+PUT    /api/staff/me/password            staff change their own password (staff only)
 GET    /api/staff/permissions            catalog + presets            (owner only)
 GET    /api/staff                        list staff                   (owner only)
 POST   /api/staff                        add a staff member           (owner only)
@@ -196,6 +197,62 @@ async def staff_me(
         raise HTTPException(status_code=401, detail="Staff account not found")
     public = staff_public(staff, business_label(owner))
     return {"is_staff": True, "staff": public, "permissions": public["permissions"]}
+
+
+class StaffOwnPasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@router.put("/api/staff/me/password")
+async def change_own_staff_password(
+    body: StaffOwnPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+    token: dict = Depends(verify_token),
+):
+    """A staff member changes their own password.
+
+    Like the owner's PUT /api/profile/password: the current password is
+    required, every other session of this staff member ends (token_version
+    bump), and a fresh token for this session comes back so the caller stays
+    signed in. Owners use /api/profile/password instead.
+    """
+    staff_id = token.get("staff_id")
+    if staff_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Only staff sign-ins use this. Change your password in Profile.",
+        )
+    staff = await db.get(ResellerStaff, int(staff_id))
+    owner = await db.get(User, int(token["user_id"]))
+    if (
+        staff is None or owner is None or staff.deleted_at is not None
+        or not staff.is_active or staff.parent_reseller_id != owner.id
+    ):
+        raise HTTPException(status_code=401, detail="Staff account not found")
+    if not await asyncio.to_thread(pwd_context.verify, body.current_password, staff.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if body.current_password == body.new_password:
+        raise HTTPException(
+            status_code=400, detail="New password must differ from the current password",
+        )
+    _check_password(body.new_password)
+
+    staff.password_hash = await asyncio.to_thread(pwd_context.hash, body.new_password)
+    staff.token_version = int(staff.token_version or 0) + 1
+    staff.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(staff)
+    staff_access.invalidate_staff(staff.id)
+
+    from app.services.auth import create_access_token
+
+    return {
+        "detail": "Password updated. You were signed out on your other devices.",
+        "access_token": create_access_token(
+            staff_access.staff_token_claims(staff, owner), staff_access.token_expiry(),
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

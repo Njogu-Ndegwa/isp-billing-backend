@@ -1944,6 +1944,19 @@ async def update_router(
             from app.services.staff_access import require_permission
             require_permission("payment_methods.manage")
             router_obj.payment_methods = request.payment_methods
+        emergency_changes = (
+            request.emergency_active is not None
+            and bool(request.emergency_active) != bool(router_obj.emergency_active)
+        ) or (
+            request.emergency_message is not None
+            and request.emergency_message != router_obj.emergency_message
+        )
+        if emergency_changes:
+            # Emergency mode is a plans setting (the dedicated
+            # /api/plans/*-emergency routes need plans.manage); the router
+            # form must not be a way around that for staff.
+            from app.services.staff_access import require_permission
+            require_permission("plans.manage")
         if request.emergency_active is not None:
             router_obj.emergency_active = request.emergency_active
             if not request.emergency_active:
