@@ -259,6 +259,27 @@ class Settings(BaseSettings):
     # another device can use it.
     ACCESS_CRED_IDLE_RELEASE_MINUTES: int = 15
 
+    # PPPoE expired redirect (app/services/pppoe_expired_redirect.py), per-router
+    # opt-in. Expired customers reconnect into a walled profile; plain HTTP is
+    # redirected to this page and everything else outside the allow-list is
+    # rejected. The page must be HTTPS (port 80 is what gets redirected).
+    PPPOE_EXPIRED_PORTAL_URL: str = "https://isp-frontend-two.vercel.app/expired.html"
+    # Hosts the walled customer may still reach: the portal and the API hosts it
+    # calls. RouterOS resolves FQDN address-list entries itself.
+    PPPOE_EXPIRED_ALLOW_HOSTS: str = (
+        "isp-frontend-two.vercel.app,isp.bitwavetechnologies.com,"
+        "isp.bitwavetechnologies.net,ispp.bitwavetechnologies.com"
+    )
+    # Vercel edge ranges (same list the hotspot anti-tunnel allow-list uses), so
+    # the portal still loads when a phone resolves it to another edge IP.
+    PPPOE_EXPIRED_ALLOW_CIDRS: str = "216.198.79.0/24,64.29.17.0/24,76.76.21.0/24"
+    PPPOE_EXPIRED_RATE_LIMIT: str = "512k/1M"
+    # Port the router's web proxy listens on when we enable it (an already
+    # enabled proxy keeps its own port). One ISP's routers used 3346 too.
+    PPPOE_EXPIRED_PROXY_PORT: int = 3346
+    # DNS handed to walled CPEs when the router's PPPoE profile names none.
+    PPPOE_EXPIRED_DNS: str = "8.8.8.8,1.1.1.1"
+
     # Secondary/insurance WireGuard endpoint. The old app can use these values
     # to add a backup tunnel to an existing router while normal operations keep
     # using the current 10.0.0.0/16 management network.

@@ -472,7 +472,13 @@ async def sweep_router_pppoe(router_id: int, *, now: Optional[datetime] = None) 
     if listing.get("error"):
         return {**summary, "status": "router_unreachable", "error": listing["error"]}
     secrets = listing["secrets"]
-    present = {s.get("name") for s in secrets if s.get("name")}
+    from app.services.pppoe_expired_redirect import EXPIRED_PROFILE
+
+    # A secret still on the walled expired profile gives no internet: for a
+    # customer who should have access it counts as missing, and the push
+    # kicks the session so the CPE redials onto the plan profile.
+    walled = {s.get("name") for s in secrets if s.get("name") and s.get("profile") == EXPIRED_PROFILE}
+    present = {s.get("name") for s in secrets if s.get("name")} - walled
 
     missing_ids = [cid for username, cid in expected.items() if username not in present]
     tagged: list[tuple[str, int]] = []
@@ -537,7 +543,8 @@ async def sweep_router_pppoe(router_id: int, *, now: Optional[datetime] = None) 
                     summary["skipped"] += 1
                     continue
                 payload = build_pppoe_payload(customer, customer.router)
-                payload["disconnect"] = False  # the secret is missing; nothing to kick
+                # A missing secret has nothing to kick; a walled one does.
+                payload["disconnect"] = customer.pppoe_username in walled
                 work.append((customer.id, attempt.id if attempt is not None else None, payload))
         await db.commit()
     summary["missing"] = len(missing_ids)

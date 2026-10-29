@@ -168,6 +168,7 @@ from app.api.static_ip_import_routes import router as static_ip_import_router
 from app.api.customer_device_routes import router as customer_device_router
 from app.api.admin_support_desk_routes import router as admin_support_desk_router
 from app.api.staff_routes import router as staff_router
+from app.api.pppoe_expired_routes import router as pppoe_expired_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -224,6 +225,7 @@ app.include_router(static_ip_import_router)
 app.include_router(customer_device_router)
 app.include_router(admin_support_desk_router)
 app.include_router(staff_router)
+app.include_router(pppoe_expired_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -2927,6 +2929,19 @@ async def run_router_status_alert_migrations():
     logger.info("Router status-alert migrations complete")
 
 
+async def run_pppoe_expired_redirect_migrations():
+    """Add routers.pppoe_expired_redirect (per-router opt-in: expired PPPoE
+    customers are walled and redirected to the payment portal instead of being
+    removed) and routers.pppoe_expired_redirect_config. Idempotent."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS pppoe_expired_redirect BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS pppoe_expired_redirect_config JSON NULL
+        """))
+    logger.info("PPPoE expired-redirect migrations complete")
+
+
 async def run_router_reachability_probe_migrations():
     """Record, once, when the reachability probe went live: outages that began
     before it are not announced to resellers (router_status_alerts
@@ -3717,6 +3732,11 @@ async def startup_event():
         await run_hero_ads_migrations()
     except Exception as e:
         logger.error(f"Hero ads migration failed (non-fatal): {e}")
+
+    try:
+        await run_pppoe_expired_redirect_migrations()
+    except Exception as e:
+        logger.error(f"PPPoE expired-redirect migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
     if not scheduler_enabled():

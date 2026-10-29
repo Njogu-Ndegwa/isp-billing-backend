@@ -327,6 +327,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     (("DELETE",), "/api/routers/{router_id}", "routers.manage", "Deleted router {router_id}"),
     (("PUT",), "/api/routers/{router_id}/identity", "routers.manage",
      "Renamed router {router_id}"),
+    (("PUT",), "/api/routers/{router_id}/pppoe-expired-redirect", "routers.manage",
+     "Changed the expired PPPoE payment-page redirect on router {router_id}"),
     (("PUT",), "/api/routers/{router_id}/status-alerts", "routers.manage",
      "Changed status alerts on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/remediate-captive-portal", "routers.manage",
