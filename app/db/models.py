@@ -1098,10 +1098,12 @@ class Advertiser(Base):
 class Ad(Base):
     __tablename__ = "ads"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    advertiser_id = Column(Integer, ForeignKey("advertisers.id"), nullable=False)
+    # Optional since hero ads (2026-10): a reseller's own promo has no advertiser.
+    advertiser_id = Column(Integer, ForeignKey("advertisers.id"), nullable=True)
     title = Column(String(150), nullable=False)
     description = Column(String(500), nullable=True)
-    image_url = Column(String(500), nullable=False)
+    # Optional for a video ad, whose still frame is poster_url.
+    image_url = Column(String(500), nullable=True)
     seller_name = Column(String(100), nullable=False)
     seller_location = Column(String(200), nullable=True)
     phone_number = Column(String(20), nullable=False)
@@ -1117,7 +1119,65 @@ class Ad(Base):
     clicks_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=True, index=True)
+
+    # --- hero ads (2026-10): see app/services/ad_serving.py ---------------
+    # placement: "hero" (rotates in the portal's photo hero, plays on the
+    # M-Pesa wait and success screens) or "local" (the shops row / legacy
+    # showcase). Values are plain strings, not PG enums, so adding one later
+    # needs no type migration.
+    placement = Column(String(20), nullable=False, default="local", server_default="local")
+    media_type = Column(String(10), nullable=False, default="image", server_default="image")
+    video_url = Column(String(500), nullable=True)
+    poster_url = Column(String(500), nullable=True)
+    image_fit = Column(String(10), nullable=False, default="cover", server_default="cover")
+    bg_color = Column(String(9), nullable=True)
+    # slot: "platform" (Bitwave sells it, network-wide or targeted),
+    # "reseller" (a reseller sold it on their own routers), "house" (the
+    # reseller's own free promo).
+    slot = Column(String(10), nullable=False, default="platform", server_default="platform")
+    # NULL owner = Bitwave. A reseller only ever sees and edits their own.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    # NULL = every router of the owner (every router in the network for a
+    # Bitwave ad); otherwise only these router ids.
+    router_ids = Column(JSON, nullable=True)
+    # pending -> approved | rejected. Nothing reaches a portal unapproved.
+    # server_default "approved" only backfills ads that predate approval;
+    # every new ad is written with an explicit status.
+    status = Column(String(12), nullable=False, default="pending", server_default="approved", index=True)
+    review_note = Column(String(300), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    starts_at = Column(DateTime, nullable=True)
+
     advertiser = relationship("Advertiser", back_populates="ads")
+
+
+class AdEvent(Base):
+    """One row per ad per placement per device per day: an impression or a tap.
+
+    Append-only and de-duplicated by the unique key below (inserted with ON
+    CONFLICT DO NOTHING), so a portal load never updates a shared ads row —
+    the old views_count/clicks_count increments did, on every load, which is
+    the hot-row pattern behind the pool lock convoys. It also stops one phone
+    refreshing the portal from inflating what an advertiser is billed for.
+    """
+    __tablename__ = "ad_events"
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    ad_id = Column(Integer, nullable=False, index=True)
+    event_type = Column(String(12), nullable=False)          # impression | click
+    click_type = Column(String(20), nullable=False, default="", server_default="")
+    placement = Column(String(20), nullable=False)           # hero | wait_screen | success_page | local
+    device_key = Column(String(64), nullable=False)          # MAC when known, else the portal's device id
+    router_identity = Column(String(100), nullable=True, index=True)
+    day = Column(String(10), nullable=False)                  # UTC date, YYYY-MM-DD
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    __table_args__ = (
+        UniqueConstraint(
+            "ad_id", "event_type", "click_type", "placement", "device_key", "day",
+            name="uq_ad_event_daily",
+        ),
+        Index("ix_ad_events_day", "day"),
+    )
 
 class AdClick(Base):
     __tablename__ = "ad_clicks"

@@ -33,7 +33,7 @@ STAFF_MANAGE = "staff.manage"
 # key -> (label, description, group, sensitive)
 PERMISSIONS: dict[str, tuple[str, str, str, bool]] = {
     "dashboard.view": (
-        "View dashboard", "Revenue and usage overview on the dashboard.", "General", False),
+        "View dashboard", "Revenue and usage overview on the dashboard, and portal ad stats (read-only).", "General", False),
     "customers.view": (
         "View customers", "Customer list, details, usage, devices and history.", "Customers", False),
     "customers.manage": (
@@ -145,6 +145,10 @@ Requirement = Union[str, tuple]
 R = "GET"
 W_ALL = ("POST", "PUT", "PATCH", "DELETE")
 ALL = ("GET", "POST", "PUT", "PATCH", "DELETE")
+
+# Reading ads and their view/tap totals: whoever manages the portal, or any
+# staff member trusted with the dashboard overview.
+ADS_VIEW = ("portal.manage", "dashboard.view")
 
 _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     # --- every staff member -------------------------------------------------
@@ -484,15 +488,26 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/portal/settings", "portal.manage", None),
     (("PUT",), "/api/portal/settings", "portal.manage", "Changed portal settings"),
     (("POST",), "/api/portal/settings/reset", "portal.manage", "Reset portal settings"),
+
+    # --- hero ads -------------------------------------------------------------
+    # A staff token acts as its reseller, and the handlers already scope every
+    # ad call to that reseller's own ads (and their own routers). "Captive
+    # portal" staff get the owner's full ad rights; "View dashboard" staff can
+    # read the ad list and its view/tap totals but change nothing. Reviewing
+    # ads and the advertiser list are Bitwave-admin only, so they are left out
+    # here (deny by default) as well as refused in the handler.
     ((R,), "/api/ads", "portal.manage", None),
-    (("POST",), "/api/ads", "portal.manage", "Created a portal ad"),
-    ((R,), "/api/ads/analytics", "portal.manage", None),
-    (("PUT",), "/api/ads/{ad_id}", "portal.manage", "Edited portal ad {ad_id}"),
-    (("DELETE",), "/api/ads/{ad_id}", "portal.manage", "Deleted portal ad {ad_id}"),
+    ((R,), "/api/ads/manage", ADS_VIEW, None),
+    ((R,), "/api/ads/manage/{ad_id}", ADS_VIEW, None),
+    ((R,), "/api/ads/analytics", ADS_VIEW, None),
+    ((R,), "/api/ads/{ad_id}/stats", ADS_VIEW, None),
+    # Per-device rows (MAC addresses): managers only.
     ((R,), "/api/ads/{ad_id}/clicks", "portal.manage", None),
     ((R,), "/api/ads/{ad_id}/impressions", "portal.manage", None),
-    ((R,), "/api/advertisers", "portal.manage", None),
-    (("POST",), "/api/advertisers", "portal.manage", "Added an advertiser"),
+    (("POST",), "/api/ads", "portal.manage", "Created a portal ad"),
+    (("PUT",), "/api/ads/{ad_id}", "portal.manage", "Edited portal ad {ad_id}"),
+    (("DELETE",), "/api/ads/{ad_id}", "portal.manage", "Deleted portal ad {ad_id}"),
+    (("POST",), "/api/ads/media/upload-url", "portal.manage", "Uploaded a photo or video for a portal ad"),
 ]
 
 # Endpoints that never need a user token: a staff token sent to them grants

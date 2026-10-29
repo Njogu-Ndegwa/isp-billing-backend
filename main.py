@@ -3351,6 +3351,49 @@ async def run_customer_audit_index_migrations():
     logger.info("Customer audit index migrations complete")
 
 
+async def run_hero_ads_migrations():
+    """Hero ads (2026-10): placement, media, ownership, targeting and approval
+    columns on ads; advertiser_id and image_url made optional; and the
+    append-only ad_events table that replaces the per-load counter updates.
+
+    Ads that predate approval are backfilled as approved (the status column's
+    server default), so anything already live stays live. Idempotent: safe on
+    every startup.
+    """
+    from sqlalchemy import inspect
+    from app.db.models import AdEvent
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+        if "ad_events" not in tables:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=[AdEvent.__table__]))
+            logger.info("Hero ads migration: created ad_events")
+        if "ads" not in tables:
+            return
+        await conn.execute(sa_text(
+            "ALTER TABLE ads "
+            "ADD COLUMN IF NOT EXISTS placement VARCHAR(20) NOT NULL DEFAULT 'local', "
+            "ADD COLUMN IF NOT EXISTS media_type VARCHAR(10) NOT NULL DEFAULT 'image', "
+            "ADD COLUMN IF NOT EXISTS video_url VARCHAR(500) NULL, "
+            "ADD COLUMN IF NOT EXISTS poster_url VARCHAR(500) NULL, "
+            "ADD COLUMN IF NOT EXISTS image_fit VARCHAR(10) NOT NULL DEFAULT 'cover', "
+            "ADD COLUMN IF NOT EXISTS bg_color VARCHAR(9) NULL, "
+            "ADD COLUMN IF NOT EXISTS slot VARCHAR(10) NOT NULL DEFAULT 'platform', "
+            "ADD COLUMN IF NOT EXISTS owner_user_id INTEGER NULL REFERENCES users(id), "
+            "ADD COLUMN IF NOT EXISTS router_ids JSON NULL, "
+            "ADD COLUMN IF NOT EXISTS status VARCHAR(12) NOT NULL DEFAULT 'approved', "
+            "ADD COLUMN IF NOT EXISTS review_note VARCHAR(300) NULL, "
+            "ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP NULL, "
+            "ADD COLUMN IF NOT EXISTS reviewed_by INTEGER NULL REFERENCES users(id), "
+            "ADD COLUMN IF NOT EXISTS starts_at TIMESTAMP NULL"
+        ))
+        await conn.execute(sa_text("ALTER TABLE ads ALTER COLUMN advertiser_id DROP NOT NULL"))
+        await conn.execute(sa_text("ALTER TABLE ads ALTER COLUMN image_url DROP NOT NULL"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_ads_owner_user_id ON ads (owner_user_id)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_ads_status ON ads (status)"))
+    logger.info("Hero ads migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     if shadow_mode_enabled():
@@ -3669,6 +3712,11 @@ async def startup_event():
         await run_support_desk_migrations()
     except Exception as e:
         logger.error(f"Support desk migration failed (non-fatal): {e}")
+
+    try:
+        await run_hero_ads_migrations()
+    except Exception as e:
+        logger.error(f"Hero ads migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
     if not scheduler_enabled():
