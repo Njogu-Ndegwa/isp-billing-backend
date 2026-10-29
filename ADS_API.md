@@ -14,6 +14,16 @@ uploads in `app/services/ad_media.py`. All signed-in routes take the usual
 | Approve / reject | yes | no |
 | Advertisers list | yes | no (403) |
 
+Staff logins act as their reseller (same "own ads only" scope), limited by their
+permissions (`app/services/staff_permissions.py`):
+
+| | Captive portal (`portal.manage`) | View dashboard (`dashboard.view`) | Other staff |
+|---|---|---|---|
+| List / open ads, stats, analytics | yes | yes (read-only) | no |
+| Raw click / impression rows (device MACs) | yes | no | no |
+| Create, edit, pause, delete, upload media | yes (still pending review) | no | no |
+| Approve / reject, advertisers | no (Bitwave admin only) | no | no |
+
 A portal shows an ad only when it is active, approved, inside `starts_at`/`expires_at`,
 owned by Bitwave or by the router's reseller, and `router_ids` is null or lists the router.
 Hero ads are ordered platform → reseller → house, at most 3.
