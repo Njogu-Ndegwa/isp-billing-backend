@@ -425,6 +425,18 @@ class Settings(BaseSettings):
     # key, as in its deployment-charts APOLLO_KEY. Empty = GraphQL tab off.
     OVES_APOLLO_GRAPH_KEYS: str = ""
 
+    # Ad media (hero ad photos and videos) on Cloudflare R2, uploaded straight
+    # from the browser with a presigned PUT so the bytes never pass through
+    # this box (its container filesystem is read-only anyway). Served to
+    # portals from AD_MEDIA_PUBLIC_BASE, which must be a host already in every
+    # router's walled garden, e.g. https://isp.bitwavetechnologies.com/media
+    # routed to the bucket by Cloudflare. Any value empty = uploads disabled.
+    R2_ACCOUNT_ID: str = ""
+    R2_ACCESS_KEY_ID: str = ""
+    R2_SECRET_ACCESS_KEY: str = ""
+    R2_BUCKET: str = ""
+    AD_MEDIA_PUBLIC_BASE: str = ""
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

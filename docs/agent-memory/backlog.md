@@ -222,3 +222,34 @@ Project-level items that should survive across agent sessions.
   `dashboard_routes.py` and `app/services/admin_metrics.py`. Do it as its own change,
   not bundled: it moves money into different day buckets, so historical daily revenue
   numbers will shift by up to 3h of payments and Dennis should sign off first.
+
+## Hero Ads (portal advertising)
+
+### Hero Ads Phase 1 — What Is Left Before Go-Live
+- Status: backend + portal built on `feat/ads-foundation` (2026-10-23); not deployed.
+  Contract: `ADS_API.md`. Serving/counting: `app/services/ad_serving.py`. Uploads:
+  `app/services/ad_media.py`.
+- Problem: ad photos/videos need storage the portal can load before the customer has
+  internet. The prod container is read-only, so media goes to Cloudflare R2 via presigned
+  PUT. Until `R2_*` and `AD_MEDIA_PUBLIC_BASE` are set, uploads answer 503 and only pasted
+  https URLs work (and those load only if their host is in the walled garden).
+- Proposed next step: create the R2 bucket + an API token scoped to it, set bucket CORS to
+  allow PUT from the dashboard origin, route `isp.bitwavetechnologies.com/media/*` to the
+  bucket (Cloudflare custom domain or a Worker), then set the five env vars in `.env.hetzner`.
+  That host is already in every router's walled garden, so no router change is needed.
+- Then: push backend, portal (`isp-frontend`) and dashboard branches; turn `show_ads` on for
+  one pilot reseller first.
+
+### Hero Ads — Later Phases
+- Status: planned.
+- Video conversion: uploads are stored as sent. Add a low-priority job (ffmpeg, one at a time)
+  that makes a ~360p faststart MP4 + WebP poster and caps length at 15 s, so a 12 MB phone
+  upload doesn't cost resellers' LTE data on every portal load.
+- Selling: advertiser self-serve ("Your business here" → M-Pesa checkout), the reseller's share
+  paid through per-router payouts, weekly WhatsApp report to the advertiser. Pricing advice from
+  the layout study: the M-Pesa wait screen is worth ~3x a login-hero view; sell the shops row as
+  a flat weekly fee.
+- `ad_events` grows by one row per ad, placement, phone and day. Add a retention/rollup job
+  once it passes a few million rows.
+- The legacy `ad_impressions` / `ad_clicks` tables and `ads.views_count` / `clicks_count` are no
+  longer written; drop them once nothing reads them.
