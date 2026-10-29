@@ -681,3 +681,13 @@ async def test_second_ap_action_gets_409(client, db, patch_router):
         headers=headers(_owner_token(owner)), json={"confirm": True},
     )
     assert again.status_code == 200, again.text
+
+
+def test_ap_outside_hotspot_subnet_is_refused_without_contacting_it():
+    # A factory-fresh Tenda on 192.168.0.1: fetch would leave via the WAN.
+    tenda = FakeTenda(ip="192.168.0.1")
+    fake = FakeMikroTik(tenda)
+    for fn in (ap_control.read_status_sync, ap_control.reboot_ap_sync, ap_control.make_safe_ap_sync):
+        res = run(fake, fn, _cred(ap_ip="192.168.0.1"))
+        assert res["error"] == "not_on_hotspot_lan", (fn.__name__, res)
+    assert fake.fetches == []          # never sent anything (or the password) anywhere

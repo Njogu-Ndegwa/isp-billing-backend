@@ -184,7 +184,7 @@ def _raise_for_result(result: Dict[str, Any], router_name: str) -> None:
         raise HTTPException(status_code=502, detail=result.get("message") or "The AP rejected the saved password.")
     if error in ("on_gateway",):
         raise HTTPException(status_code=409, detail=result.get("message"))
-    if error in ("no_ip", "no_gateway", "no_free_ip", "gateway_conflict"):
+    if error in ("no_ip", "no_gateway", "no_free_ip", "gateway_conflict", "not_on_hotspot_lan"):
         raise HTTPException(status_code=409, detail=result.get("message"))
     if error in ("ap_unreachable", "verify_unreachable"):
         raise HTTPException(status_code=502, detail=result.get("message") or "The access point did not answer.")

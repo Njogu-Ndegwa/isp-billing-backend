@@ -210,6 +210,29 @@ def read_hotspot_lan(api) -> HotspotLan:
     return lan
 
 
+def _outside_hotspot_lan(ap_ip: str, lan: "HotspotLan") -> Optional[Dict[str, Any]]:
+    """Refuse an AP address outside the router's hotspot subnet.
+
+    /tool fetch to such an address would leave through the router's default
+    route (WAN) and could hand the AP password to an upstream device. A new
+    Tenda on its factory 192.168.0.1 lands here: it needs an on-site move into
+    the hotspot subnet first.
+    """
+    if not lan.subnet:
+        return {"error": "no_gateway",
+                "message": "Could not read the router's hotspot subnet; refusing to contact the AP."}
+    try:
+        inside = ipaddress.ip_address(ap_ip) in ipaddress.ip_network(lan.subnet, strict=False)
+    except ValueError:
+        inside = False
+    if inside:
+        return None
+    return {"error": "not_on_hotspot_lan",
+            "message": f"The AP answers on {ap_ip}, outside the router's hotspot network ({lan.subnet}). "
+                       f"It cannot be reached safely through the router. On-site fix needed: give it an "
+                       f"address in {lan.subnet} or set it to get one by DHCP."}
+
+
 def resolve_ap_ip(api, mac: str) -> Optional[str]:
     """Current LAN address of an AP by MAC, from ARP then DHCP leases."""
     want = str(mac or "").strip().upper().replace("-", ":")
@@ -332,6 +355,10 @@ def read_status_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fac
                                                  "it may be offline."}
         cred.ap_ip = ap_ip
         lan = read_hotspot_lan(api)
+        if lan.gateway and ap_ip != lan.gateway:
+            refused = _outside_hotspot_lan(ap_ip, lan)
+            if refused:
+                return refused
         if lan.gateway and ap_ip == lan.gateway:
             return {"error": "on_gateway", "on_gateway": True,
                     "message": f"The AP is on the router's gateway address ({lan.gateway}); it cannot be reached "
@@ -368,6 +395,10 @@ def reboot_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_facto
                                                  "it may be offline."}
         cred.ap_ip = ap_ip
         lan = read_hotspot_lan(api)
+        if lan.gateway and ap_ip != lan.gateway:
+            refused = _outside_hotspot_lan(ap_ip, lan)
+            if refused:
+                return refused
         if lan.gateway and ap_ip == lan.gateway:
             return {"error": "on_gateway", "on_gateway": True,
                     "message": f"The AP is on the router's gateway ({lan.gateway}); on-site fix needed."}
@@ -405,6 +436,9 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
             return {"error": "on_gateway", "on_gateway": True,
                     "message": f"The AP is on the router's gateway ({lan.gateway}); it is unreachable through the "
                                f"router. On-site fix needed."}
+        refused = _outside_hotspot_lan(ap_ip, lan)
+        if refused:
+            return refused
         target_ip = pick_static_ip(lan)
         if not target_ip:
             return {"error": "no_free_ip",
