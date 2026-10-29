@@ -14,7 +14,7 @@ from sqlalchemy import select
 
 from app.api.auth_routes import login_token_claims
 from app.config import settings
-from app.db.models import ResellerStaff, RouterApCredential, StaffActivityLog, User, UserRole
+from app.db.models import ResellerStaff, RouterApCredential, StaffActivityLog, UserRole
 from app.services import ap_access, ap_adapters, ap_control, ap_fetch
 from app.services import staff_access, staff_permissions as perms
 from app.services.ap_control import ApCredential
@@ -502,11 +502,7 @@ async def test_reseller_blocked_when_scope_is_admins(client, db, patch_router, m
 @pytest.mark.asyncio
 async def test_admin_allowed_when_scope_is_admins(client, db, patch_router, monkeypatch):
     monkeypatch.setattr(settings, "AP_CONTROL_ENABLED_FOR", "admins")
-    admin = User(user_code="ADMIN1", email="admin@bitwave.test", password_hash="x",
-                 role=UserRole.ADMIN, organization_name="Bitwave")
-    db.add(admin)
-    await db.commit()
-    await db.refresh(admin)
+    admin = await make_reseller(db, role=UserRole.ADMIN, organization_name="Bitwave")
     router = await make_router(db, admin, ip_address=ROUTER_IP)
     await _saved_cred(db, router.id)
     patch_router(FakeTenda())
