@@ -178,13 +178,16 @@ app.include_router(router_mgmt_router)
 app.include_router(router_ops_router)
 app.include_router(admin_router)
 app.include_router(plan_router)
+# ratings_router owns GET /api/customers/map. It must be registered before
+# customer_router, whose GET /api/customers/{customer_id} otherwise catches
+# "map" and answers 422 (the map page was dead from March to October 2026).
+app.include_router(ratings_router)
 app.include_router(customer_router)
 app.include_router(customer_audit_router)
 app.include_router(payment_router)
 app.include_router(dashboard_router)
 app.include_router(mikrotik_router)
 app.include_router(ads_router)
-app.include_router(ratings_router)
 app.include_router(voucher_router)
 app.include_router(provisioning_router)
 app.include_router(pppoe_monitor_router)
