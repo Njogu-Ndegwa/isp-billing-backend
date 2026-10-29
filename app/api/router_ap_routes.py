@@ -36,6 +36,7 @@ from app.services.router_concurrency import run_with_guard
 from app.services.router_availability import record_router_availability
 from app.services.payment_gateway import encrypt_credential, decrypt_credential
 from app.services import ap_control
+from app.services.ap_access import ap_control_allowed, ap_control_scope
 from app.services.ap_control import ApCredential
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,12 @@ def _public_credential(cred: Optional[RouterApCredential]) -> Optional[Dict[str,
 
 async def _load_router(db: AsyncSession, router_id: int, token: str) -> Router:
     user = await get_current_user(token, db)
+    if not ap_control_allowed(getattr(user, "role", None)):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "ap_control_disabled",
+                    "message": "Remote access-point control is not enabled for your account yet."},
+        )
     router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
@@ -144,7 +151,12 @@ async def _persist_outcome(router_id: int, ap_mac: str, action: str, result: Dic
             cred.last_status_at = datetime.utcnow()
             if status.get("ip"):
                 cred.last_ip = status.get("ip")
-            if status.get("model") and not cred.model:
+            # Prefer the detected adapter key (e.g. "F3") over the human model
+            # string so later actions pick the right adapter.
+            detected = status.get("detected_model")
+            if detected:
+                cred.model = detected
+            elif status.get("model") and not cred.model:
                 cred.model = status.get("model")
         if result.get("new_ip"):
             cred.last_ip = result["new_ip"]

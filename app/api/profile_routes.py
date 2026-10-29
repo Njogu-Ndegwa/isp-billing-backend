@@ -96,7 +96,18 @@ def _user_to_profile(user: User) -> dict:
         "preferred_language": user.preferred_language,
         # Currency, language and subscription terms the dashboard renders with.
         "market": market_summary(user),
+        # Feature gates the dashboard reads to show/hide UI. ap_control: who may
+        # use remote access-point control ("admins" until bench-confirmed).
+        "feature_flags": {
+            "ap_control": _ap_control_flag_for(user),
+        },
     }
+
+
+def _ap_control_flag_for(user: User) -> bool:
+    """True when this user should see the Access points UI."""
+    from app.services.ap_access import ap_control_allowed
+    return ap_control_allowed(user.role)
 
 
 # ---------------------------------------------------------------------------

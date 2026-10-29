@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from app.services import ap_adapters
-from app.services.ap_adapters import ApAdapter, ApStatus, get_adapter
+from app.services.ap_adapters import ApAdapter, ApStatus, detect_model_key, get_adapter
 from app.services.ap_fetch import RouterFetchHttpClient, parse_json_body, reply_ok
 from app.services.device_classifier import (
     classify_device, infer_hotspot_subnets, normalize_oui, vendor_from_mac,
@@ -268,6 +268,17 @@ def pick_static_ip(lan: HotspotLan) -> Optional[str]:
 # Login (with lockout)
 # ---------------------------------------------------------------------------
 
+def _read_status_body(client: RouterFetchHttpClient, adapter: ApAdapter):
+    """Try the adapter's candidate status endpoints; return (ApRequest, dict)
+    for the first that answers with a JSON object, else (None, None)."""
+    for req in adapter.status_requests():
+        resp = client.request(req)
+        parsed = parse_json_body(resp.body) if resp.ok else None
+        if isinstance(parsed, dict) and parsed:
+            return resp, adapter.parse_status(resp.body, parse_json_body)
+    return None, None
+
+
 def _login(client: RouterFetchHttpClient, adapter: ApAdapter, cred: ApCredential) -> LoginResult:
     if cred.failed_login_count >= MAX_FAILED_LOGINS:
         return LoginResult(ok=False, locked=True,
@@ -282,9 +293,8 @@ def _login(client: RouterFetchHttpClient, adapter: ApAdapter, cred: ApCredential
         _sleep(LOGIN_SETTLE_SECONDS)
         # Confirm the session by reading status; a wrong password answers with a
         # login page / error rather than a usable status body.
-        status_resp = client.request(adapter.status_request())
-        parsed = parse_json_body(status_resp.body)
-        if status_resp.ok and isinstance(parsed, dict) and parsed:
+        status_resp, _status = _read_status_body(client, adapter)
+        if status_resp is not None:
             return LoginResult(ok=True, method=attempt.method)
         last_error = "credentials did not open a session"
     return LoginResult(ok=False, error=last_error or "login failed")
@@ -331,15 +341,19 @@ def read_status_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fac
         if not login.ok:
             return {"error": "login_locked" if login.locked else "login_failed",
                     "locked": login.locked, "message": login.error, "login_ok": False}
-        resp = client.request(adapter.status_request())
-        if not resp.ok:
+        _resp, status = _read_status_body(client, adapter)
+        if status is None:
             return {"error": "ap_unreachable", "login_ok": True, "login_method": login.method,
-                    "message": resp.error or "The access point did not answer."}
-        status = adapter.parse_status(resp.body, parse_json_body)
+                    "message": "The access point did not answer."}
         if not status.ip:
             status.ip = cred.ap_ip
+        public = status.public()
+        # Detect the concrete model from what the AP reported, for future writes.
+        detected = detect_model_key(status.model)
+        if detected:
+            public["detected_model"] = detected
         return {"success": True, "login_ok": True, "login_method": login.method,
-                "status": status.public(), "_status_obj": status}
+                "status": public, "_status_obj": status}
 
     return _with_api(router_info, api_factory, run)
 
@@ -406,11 +420,16 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
             return {"error": "login_locked" if login.locked else "login_failed",
                     "locked": login.locked, "message": login.error, "login_ok": False}
 
-        # Pre-check: the AP is reachable right now.
-        pre = client.request(adapter.status_request())
-        if not pre.ok:
+        # Pre-check: the AP is reachable right now, and tells us its model.
+        _pre_resp, pre_status = _read_status_body(client, adapter)
+        if pre_status is None:
             return {"error": "ap_unreachable", "login_ok": True, "login_method": login.method,
-                    "message": pre.error or "The access point did not answer the pre-check."}
+                    "message": "The access point did not answer the pre-check."}
+
+        # Pick the write adapter for the model the AP actually reported, so an
+        # F3 is not reconfigured with OAP1200 payloads (and vice versa).
+        detected = detect_model_key(pre_status.model)
+        write_adapter = get_adapter(detected or cred.model, cred.vendor)
 
         steps: List[Dict[str, Any]] = []
 
@@ -424,17 +443,17 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
             return True, None
 
         # Mode and DHCP first (these keep the current IP, so the session holds).
-        ok, err = apply("work_mode_ap", adapter.set_ap_mode_requests())
+        ok, err = apply("work_mode_ap", write_adapter.set_ap_mode_requests())
         if not ok:
             return {"error": "apply_failed", "login_ok": True, "login_method": login.method,
                     "message": err, "steps": steps}
-        ok, err = apply("dhcp_off", adapter.set_dhcp_off_requests())
+        ok, err = apply("dhcp_off", write_adapter.set_dhcp_off_requests())
         if not ok:
             return {"error": "apply_failed", "login_ok": True, "login_method": login.method,
                     "message": err, "steps": steps}
         # LAN IP last: this one moves the AP, so we re-point the client at it.
         netmask = str(ipaddress.ip_network(f"{lan.gateway}/{lan.prefixlen}", strict=False).netmask)
-        ok, err = apply("lan_static", adapter.set_lan_static_requests(
+        ok, err = apply("lan_static", write_adapter.set_lan_static_requests(
             target_ip, netmask, lan.gateway, lan.dns or lan.gateway))
         if not ok:
             return {"error": "apply_failed", "login_ok": True, "login_method": login.method,
@@ -452,8 +471,9 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
                     "new_ip": target_ip, "steps": steps,
                     "message": f"Settings sent but the AP did not answer at its new address {target_ip}. "
                                f"Give it a minute and refresh; it may still be moving."}
-        vresp = verify_client.request(adapter.status_request())
-        status = adapter.parse_status(vresp.body, parse_json_body) if vresp.ok else ApStatus(ip=target_ip)
+        _vresp, status = _read_status_body(verify_client, adapter)
+        if status is None:
+            status = ApStatus(ip=target_ip)
         safe = status.is_safe_ap(gateway_ip=lan.gateway)
         return {"success": True, "login_ok": True, "login_method": login.method,
                 "action": ACTION_MAKE_SAFE, "new_ip": target_ip, "gateway": lan.gateway,

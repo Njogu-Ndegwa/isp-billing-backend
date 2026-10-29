@@ -167,6 +167,12 @@ class Settings(BaseSettings):
     STANDARD_RUNTIME_BATCH: int = 5
     STANDARD_RUNTIME_INSTALL_CHECKIN: bool = True
     STANDARD_RUNTIME_INSTALL_WATCHDOG: bool = True
+    # Who may use remote access-point control (app/services/ap_control.py):
+    #   "admins" (default) -> Bitwave platform admins only, so the feature can
+    #     ship and be tested in the live dashboard without exposing it to
+    #     resellers before the Tenda protocol is bench-confirmed;
+    #   "all" -> every owner/staff who already has routers.view / routers.manage.
+    AP_CONTROL_ENABLED_FOR: str = "admins"
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10

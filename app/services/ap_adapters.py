@@ -202,8 +202,11 @@ class TendaApAdapter(ApAdapter):
     model = "tenda-generic"
 
     # CONFIRMED path (marc0u/tenda-wifi). Status endpoint name on the AP build
-    # is ASSUMED; getSysStatusInfo is the common Tenda AP status goform.
+    # is ASSUMED; getSysStatusInfo is the common Tenda AP status goform and
+    # GetRouterStatus the router one, so we try both and keep whichever answers
+    # with JSON -- this is also how we detect the model before a write.
     status_path = "/goform/getSysStatusInfo"
+    status_alternates = ["/goform/GetRouterStatus"]
     reboot_path = "/goform/SysToolReboot"          # CONFIRMED on AC15 family
     workmode_path = "/goform/setWorkMode"          # ASSUMED
     dhcp_path = "/goform/setLanDhcp"               # ASSUMED (Intelligent DHCP)
@@ -220,6 +223,14 @@ class TendaApAdapter(ApAdapter):
 
     def status_request(self) -> ApRequest:
         return ApRequest("get", self.status_path)
+
+    def status_requests(self) -> List[ApRequest]:
+        """Candidate status endpoints to try in order (model varies)."""
+        seen: List[str] = []
+        for path in [self.status_path, *self.status_alternates]:
+            if path not in seen:
+                seen.append(path)
+        return [ApRequest("get", path) for path in seen]
 
     def parse_status(self, body: str, parse_json: Callable[[str], Any]) -> ApStatus:
         data = parse_json(body)
@@ -280,6 +291,63 @@ class TendaOap1200V2Adapter(TendaApAdapter):
     model = "OAP1200V2"
 
 
+class TendaF3Adapter(TendaApAdapter):
+    """Tenda F3 (N300 home router, firmware V12.01.01.x / V5.x).
+
+    Same httpd/goform family as the OAP1200 (CONFIRMED: ``/login/Auth`` md5
+    login, ``/goform/*`` JSON with ``errCode``, ``/goform/SysToolReboot``). Its
+    working modes are Router / WISP / Universal repeater / AP, so "make it a
+    safe AP" means AP mode + DHCP off + static LAN IP, exactly as for the
+    OAP1200.
+
+    ASSUMED and to be bench-confirmed on the F3: the status endpoint and the
+    work-mode / DHCP / LAN goform names and payload keys below. The F-series
+    "fast setup" wizard uses endpoints like ``fast_setting_wifi_set`` and
+    ``setWanParameterTenda``; the per-page setters differ from the OAP1200's,
+    so these are F3 guesses marked clearly, not confirmed values.
+    """
+
+    vendor = "Tenda"
+    model = "F3"
+
+    # Status page name on the F3 build (ASSUMED; GetRouterStatus is what the
+    # AC15 family exposes, GetSysStatusInfo is the AP-style one — try the
+    # router one first since the F3 is a router).
+    status_path = "/goform/GetRouterStatus"
+    status_alternates = ["/goform/getSysStatusInfo"]
+    # reboot_path inherited (CONFIRMED /goform/SysToolReboot)
+    workmode_path = "/goform/setWifiWorkMode"     # ASSUMED (Router/WISP/AP mode)
+    dhcp_path = "/goform/SetLanCfg"               # ASSUMED (LAN + DHCP page)
+    lan_path = "/goform/SetLanCfg"                # ASSUMED (same LAN page)
+
+    def set_ap_mode_requests(self) -> List[ApRequest]:
+        # ASSUMED: workMode=ap switches the F3 out of Router/WISP/Repeater.
+        return [ApRequest("post", self.workmode_path, {"workMode": "ap"})]
+
+    def set_dhcp_off_requests(self) -> List[ApRequest]:
+        # ASSUMED: the F3 LAN page carries the DHCP toggle (dhcpEnable=0).
+        return [ApRequest("post", self.dhcp_path, {"dhcpEnable": "0"})]
+
+    def set_lan_static_requests(self, ip: str, netmask: str, gateway: str, dns: str) -> List[ApRequest]:
+        # ASSUMED payload keys for the F3 LAN setup page.
+        return [ApRequest("post", self.lan_path, {
+            "lanIp": ip, "lanMask": netmask, "gateway": gateway,
+            "dns1": dns, "dhcpEnable": "0",
+        })]
+
+
+# Maps a model/device string read from an AP's status to an adapter key.
+def detect_model_key(text: Optional[str]) -> Optional[str]:
+    t = str(text or "").strip().upper().replace(" ", "").replace("-", "")
+    if not t:
+        return None
+    if "OAP1200" in t:
+        return "OAP1200V2"
+    if t == "F3" or "F3" in t:
+        return "F3"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -287,6 +355,8 @@ class TendaOap1200V2Adapter(TendaApAdapter):
 _ADAPTERS: Dict[str, Callable[[], ApAdapter]] = {
     "OAP1200V2": TendaOap1200V2Adapter,
     "OAP1200": TendaOap1200V2Adapter,
+    "F3": TendaF3Adapter,
+    "N300": TendaF3Adapter,
     "TENDA": TendaApAdapter,
 }
 

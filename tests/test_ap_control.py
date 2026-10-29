@@ -13,8 +13,9 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from app.api.auth_routes import login_token_claims
-from app.db.models import ResellerStaff, RouterApCredential, StaffActivityLog
-from app.services import ap_adapters, ap_control, ap_fetch
+from app.config import settings
+from app.db.models import ResellerStaff, RouterApCredential, StaffActivityLog, User, UserRole
+from app.services import ap_access, ap_adapters, ap_control, ap_fetch
 from app.services import staff_access, staff_permissions as perms
 from app.services.ap_control import ApCredential
 from app.services.auth import create_access_token, pwd_context
@@ -32,20 +33,22 @@ AP_PASSWORD = "letmein123"
 
 class FakeTenda:
     def __init__(self, *, ip="192.168.88.50", password=AP_PASSWORD, login_method="md5",
-                 mode="router", dhcp_on=True, move_to=None, unreachable_after_move=False):
+                 mode="router", dhcp_on=True, move_to=None, unreachable_after_move=False,
+                 model="OAP1200 V2", firmware="V2.0.0.11"):
         self.ip = ip
         self.password = password
         self.login_method = login_method
         self.mode = mode
         self.dhcp_on = dhcp_on
-        self.model = "OAP1200 V2"
-        self.firmware = "V2.0.0.11"
+        self.model = model
+        self.firmware = firmware
         self.clients = 7
         self.authed = False
         self.rebooted = False
         self.move_to = move_to                       # IP setLan actually lands on
         self.unreachable_after_move = unreachable_after_move
         self.moved = False
+        self.write_paths = []                         # goform setters we received
 
     def _status_json(self):
         return json.dumps({
@@ -66,23 +69,32 @@ class FakeTenda:
             return 302, ""       # Tenda answers login with a redirect
         if not self.authed:
             return 200, "<html>login</html>"   # not a JSON status
-        if path == ap_adapters.TendaApAdapter.status_path:
+        # Status: serve both the AP-style and router-style endpoints.
+        if path in ("/goform/getSysStatusInfo", "/goform/GetRouterStatus"):
             return 200, self._status_json()
         if path == "/goform/SysToolReboot":
             self.rebooted = True
             return 200, '{"errCode":0}'
-        if path == "/goform/setWorkMode":
+        # Work-mode setters (OAP1200 and F3 spellings).
+        if path in ("/goform/setWorkMode", "/goform/setWifiWorkMode"):
+            self.write_paths.append(path)
             self.mode = "ap"
             return 200, '{"errCode":0}'
-        if path == "/goform/setLanDhcp":
+        # DHCP-off setters.
+        if path in ("/goform/setLanDhcp", "/goform/SetLanCfg"):
+            self.write_paths.append(path)
             self.dhcp_on = False
+            new_ip = (data or {}).get("lanIp") or (data or {}).get("ip")
+            if path == "/goform/SetLanCfg" and new_ip:
+                # F3 SetLanCfg carries both DHCP and the LAN IP.
+                self.ip = "169.254.0.1" if self.unreachable_after_move else new_ip
+                self.moved = True
             return 200, '{"errCode":0}'
-        if path == "/goform/setLan":
+        # LAN static-IP setters.
+        if path in ("/goform/setLan",):
+            self.write_paths.append(path)
             new_ip = self.move_to or (data or {}).get("ip") or self.ip
-            if self.unreachable_after_move:
-                self.ip = "169.254.0.1"     # lands somewhere we can't reach
-            else:
-                self.ip = new_ip
+            self.ip = "169.254.0.1" if self.unreachable_after_move else new_ip
             self.moved = True
             return 200, '{"errCode":0}'
         return 404, "not found"
@@ -189,6 +201,9 @@ def _cred(**over):
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     monkeypatch.setattr(ap_control, "_sleep", lambda _s: None)
+    # Most tests exercise the feature as an owner; open the gate to everyone and
+    # let the dedicated gate tests tighten it back to "admins".
+    monkeypatch.setattr(settings, "AP_CONTROL_ENABLED_FOR", "all")
     ap_control.reset_claims()
     yield
     ap_control.reset_claims()
@@ -212,6 +227,27 @@ def test_login_attempts_md5_then_base64():
     assert atts[1].post_data["password"] == base64.b64encode(b"pw").decode()
     # preferred method floats to the front
     assert ad.login_attempts("admin", "pw", preferred="base64")[0].method == "base64"
+
+
+def test_f3_adapter_is_selected_and_has_its_own_write_payloads():
+    ad = ap_adapters.get_adapter("F3")
+    assert ad.model == "F3" and ad.vendor == "Tenda"
+    # shares the confirmed login + reboot paths
+    assert ad.login_path == "/login/Auth" and ad.reboot_path == "/goform/SysToolReboot"
+    # F3 tries its router status endpoint plus the AP one
+    paths = [r.path for r in ad.status_requests()]
+    assert paths[0] == "/goform/GetRouterStatus" and "/goform/getSysStatusInfo" in paths
+    # make-safe payloads differ from the OAP1200's
+    oap = ap_adapters.get_adapter("OAP1200V2")
+    assert ad.set_lan_static_requests("192.168.88.2", "255.255.255.0", "192.168.88.1", "192.168.88.1")[0].data \
+        != oap.set_lan_static_requests("192.168.88.2", "255.255.255.0", "192.168.88.1", "192.168.88.1")[0].data
+
+
+def test_model_detection_from_status_text():
+    assert ap_adapters.detect_model_key("Tenda F3") == "F3"
+    assert ap_adapters.detect_model_key("OAP1200 V2") == "OAP1200V2"
+    assert ap_adapters.detect_model_key("AC10") is None
+    assert ap_adapters.detect_model_key(None) is None
 
 
 def test_parse_status_normalises_mode_and_dhcp():
@@ -301,6 +337,18 @@ def test_make_safe_sets_mode_dhcp_and_static_ip_then_verifies():
     labels = [s["step"] for s in res["steps"]]
     assert labels == ["work_mode_ap", "dhcp_off", "lan_static"]
     assert fake.mutating_router_calls == []
+
+
+def test_make_safe_detects_f3_and_uses_its_payloads():
+    tenda = FakeTenda(model="Tenda F3", firmware="V12.01.01.09", mode="router", dhcp_on=True)
+    fake = FakeMikroTik(tenda)
+    res = run(fake, ap_control.make_safe_ap_sync, _cred(model=None))  # model unknown -> detect
+    assert res["success"], res
+    assert res["new_ip"] == "192.168.88.2" and res["verified_safe"] is True
+    # F3-specific setters were used, not the OAP1200 ones
+    assert "/goform/setWifiWorkMode" in tenda.write_paths
+    assert "/goform/SetLanCfg" in tenda.write_paths
+    assert "/goform/setWorkMode" not in tenda.write_paths
 
 
 def test_make_safe_reports_when_ap_vanishes_at_new_ip():
@@ -424,6 +472,50 @@ async def _saved_cred(db, router_id, **over):
     db.add(row)
     await db.commit()
     return row
+
+
+def test_gate_helper_admins_vs_all(monkeypatch):
+    monkeypatch.setattr(settings, "AP_CONTROL_ENABLED_FOR", "admins")
+    assert ap_access.ap_control_allowed("admin") is True
+    assert ap_access.ap_control_allowed(UserRole.ADMIN) is True
+    assert ap_access.ap_control_allowed("reseller") is False
+    monkeypatch.setattr(settings, "AP_CONTROL_ENABLED_FOR", "all")
+    assert ap_access.ap_control_allowed("reseller") is True
+
+
+@pytest.mark.asyncio
+async def test_reseller_blocked_when_scope_is_admins(client, db, patch_router, monkeypatch):
+    monkeypatch.setattr(settings, "AP_CONTROL_ENABLED_FOR", "admins")
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    await _saved_cred(db, router.id)
+    patch_router(FakeTenda())
+    for method, path, kw in [
+        ("get", f"/api/routers/{router.id}/access-points", {}),
+        ("post", f"/api/routers/{router.id}/access-points/{AP_MAC}/reboot", {"json": {"confirm": True}}),
+    ]:
+        resp = await getattr(client, method)(path, headers=headers(_owner_token(owner)), **kw)
+        assert resp.status_code == 403, (path, resp.text)
+        assert resp.json()["detail"]["code"] == "ap_control_disabled"
+
+
+@pytest.mark.asyncio
+async def test_admin_allowed_when_scope_is_admins(client, db, patch_router, monkeypatch):
+    monkeypatch.setattr(settings, "AP_CONTROL_ENABLED_FOR", "admins")
+    admin = User(user_code="ADMIN1", email="admin@bitwave.test", password_hash="x",
+                 role=UserRole.ADMIN, organization_name="Bitwave")
+    db.add(admin)
+    await db.commit()
+    await db.refresh(admin)
+    router = await make_router(db, admin, ip_address=ROUTER_IP)
+    await _saved_cred(db, router.id)
+    patch_router(FakeTenda())
+    token = create_access_token(login_token_claims(admin), timedelta(hours=1))
+    resp = await client.post(
+        f"/api/routers/{router.id}/access-points/{AP_MAC}/reboot",
+        headers=headers(token), json={"confirm": True},
+    )
+    assert resp.status_code == 200, resp.text
 
 
 def test_staff_rules():
