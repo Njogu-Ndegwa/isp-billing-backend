@@ -676,6 +676,28 @@ async def admin_earnings(
     return await svc.compute_earnings(db, period=period)
 
 
+@router.get("/api/admin/metrics/platform-earnings")
+async def admin_platform_earnings(
+    period: str = Query(
+        "month", regex="^(week|month|quarter|year|7d|30d|90d|1y)$",
+        description=(
+            "Calendar period-to-date (7d/30d/90d/1y are accepted as the "
+            "dashboard's week/month/quarter/year chips)."
+        ),
+    ),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Transaction volume (customer payments through Bitwave, the resellers'
+    money) next to Bitwave's own earnings: subscription fees split into
+    hotspot commission / per-user fees / minimum fee, plus SMS credit sales,
+    both as collected and as invoiced. See app/services/platform_earnings.py."""
+    await _require_admin(token, db)
+    from app.services.platform_earnings import compute_platform_earnings
+
+    return await compute_platform_earnings(db, period=period)
+
+
 @router.put("/api/admin/metrics/earnings/accounts")
 async def admin_set_own_reseller_accounts(
     body: OwnResellerAccountsPut,
