@@ -135,14 +135,25 @@ NOT_FOR_STAFF = {
 }
 
 
+def _walk(routes, prefix=""):
+    """Every (method, path) the app serves. FastAPI 0.14x (what CI and
+    production install) keeps each include_router() as a lazy wrapper with
+    `original_router` instead of flattening it into app.routes; older FastAPI
+    flattens. Walk both shapes so the guard never passes vacuously."""
+    for route in routes:
+        if isinstance(route, APIRoute):
+            for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+                yield method, prefix + route.path
+        elif hasattr(route, "original_router"):
+            ctx = getattr(route, "include_context", None)
+            yield from _walk(route.original_router.routes, prefix + (getattr(ctx, "prefix", "") or ""))
+
+
 def _app_routes():
     import main
-    out = []
-    for route in main.app.routes:
-        if not isinstance(route, APIRoute):
-            continue
-        for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
-            out.append((method, route.path))
+    out = sorted(set(_walk(main.app.routes)))
+    # Sanity: the walk must see the whole app, not just the top level.
+    assert len(out) > 400, f"only {len(out)} routes found; route walk is broken"
     return out
 
 
