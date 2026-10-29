@@ -2966,3 +2966,53 @@ class SupportDeskDecision(Base):
     decided_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     consumed_at = Column(DateTime, nullable=True, index=True)
+
+
+class RouterApCredential(Base):
+    """Web admin login for an access point (a Tenda) behind a router.
+
+    The reseller types the AP's admin password once on the router's
+    Diagnostics page; it is stored Fernet-encrypted with the same helper as
+    the M-Pesa keys (``app.services.payment_gateway.encrypt_credential``) and
+    is never returned by the API or written to logs. Used only for on-demand
+    actions run from the MikroTik with ``/tool fetch``
+    (``app/services/ap_control.py``): status, reboot, "make it a safe AP".
+
+    ``router_id`` is a plain int, not an FK, like ``customer_events``: a stale
+    row must never block deleting a router. One row per (router, AP MAC).
+
+    Lockout: ``failed_login_count`` counts consecutive failed logins; at
+    ``ap_control.MAX_FAILED_LOGINS`` no further login is attempted until the
+    password is replaced, so a wrong password is never retried blindly (and
+    the AP's own lockout is never triggered by us).
+
+    ``last_status`` is the last status read (mode, DHCP, IP, firmware...) with
+    no secrets; the detector uses it to flag router-mode / DHCP-on APs.
+    Startup migration: run_router_ap_credential_migrations() in main.py.
+    """
+    __tablename__ = "router_ap_credentials"
+    __table_args__ = (
+        UniqueConstraint("router_id", "ap_mac", name="uq_router_ap_credentials_router_mac"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    router_id = Column(Integer, nullable=False, index=True)
+    ap_mac = Column(String(17), nullable=False)
+    vendor = Column(String(30), nullable=False, default="Tenda", server_default="Tenda")
+    model = Column(String(40), nullable=True)
+    username = Column(String(64), nullable=False, default="admin", server_default="admin")
+    password_encrypted = Column(Text, nullable=False)
+    # base64 | md5 | plain, as detected from the AP's login page on last use
+    login_method = Column(String(16), nullable=True)
+    last_login_ok = Column(Boolean, nullable=True)
+    failed_login_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(String(255), nullable=True)
+    last_ip = Column(String(45), nullable=True)
+    last_status = Column(JSON, nullable=True)
+    last_status_at = Column(DateTime, nullable=True)
+    last_action = Column(String(32), nullable=True)
+    last_action_at = Column(DateTime, nullable=True)
+    last_reboot_at = Column(DateTime, nullable=True)
+    updated_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)

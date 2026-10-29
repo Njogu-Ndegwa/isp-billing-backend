@@ -168,6 +168,7 @@ from app.api.static_ip_import_routes import router as static_ip_import_router
 from app.api.customer_device_routes import router as customer_device_router
 from app.api.admin_support_desk_routes import router as admin_support_desk_router
 from app.api.staff_routes import router as staff_router
+from app.api.router_ap_routes import router as router_ap_router
 
 app.include_router(radius_router)
 app.include_router(radius_hotspot_router)
@@ -224,6 +225,7 @@ app.include_router(static_ip_import_router)
 app.include_router(customer_device_router)
 app.include_router(admin_support_desk_router)
 app.include_router(staff_router)
+app.include_router(router_ap_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -2757,6 +2759,18 @@ async def run_static_ip_migrations():
         """))
 
 
+async def run_router_ap_credential_migrations():
+    """Create router_ap_credentials: encrypted web-admin logins for access points
+    (Tenda) behind a router, used by the on-demand access-point actions
+    (app/services/ap_control.py). New table only; idempotent (checkfirst)."""
+    async with async_engine.begin() as conn:
+        from app.db.models import RouterApCredential
+        await conn.run_sync(
+            lambda c: RouterApCredential.__table__.create(c, checkfirst=True)
+        )
+    logger.info("Migration: Ensured router_ap_credentials table exists")
+
+
 async def run_management_tunnel_migrations():
     """Add routers.management_tunnel (e.g. "sstp") so ops health can show routers
     whose management tunnel differs from what their ip_address range implies.
@@ -3562,6 +3576,11 @@ async def startup_event():
         logger.info("Management-tunnel migration completed successfully")
     except Exception as e:
         logger.error(f"Management-tunnel migration failed (non-fatal): {e}")
+
+    try:
+        await run_router_ap_credential_migrations()
+    except Exception as e:
+        logger.error(f"Router AP credential migration failed (non-fatal): {e}")
 
     try:
         await run_expiry_reaper_migrations()
