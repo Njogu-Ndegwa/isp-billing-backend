@@ -404,28 +404,6 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     (("POST",), "/api/provision/create", "routers.manage", "Started adding a router"),
     ((R,), "/api/provision/tokens", "routers.manage", None),
 
-    # --- RADIUS (app/api/radius_endpoints.py; handlers scope to the owner) --
-    # POST /api/radius/cleanup sweeps every reseller, so it is admin-only and
-    # deliberately not listed. The captive-portal routes under
-    # /api/radius/hotspot/* and the M-Pesa callback are public and need no token.
-    ((R,), "/api/radius/routers", "routers.view", None),
-    ((R,), "/api/radius/routers/{router_id}/status", "routers.view", None),
-    (("POST",), "/api/radius/routers/{router_id}/enable", "routers.manage",
-     "Switched router {router_id} to RADIUS"),
-    (("POST",), "/api/radius/routers/{router_id}/disable", "routers.manage",
-     "Switched router {router_id} back from RADIUS"),
-    # A GET that writes: creates and deletes a throwaway RADIUS user.
-    ((R,), "/api/radius/test/{router_id}", "routers.manage", None),
-    ((R,), "/api/radius/sessions", ("routers.view", "customers.view"), None),
-    (("POST",), "/api/radius/sessions/{username}/disconnect", ("customers.manage", "routers.manage"),
-     "Disconnected RADIUS session {username}"),
-    ((R,), "/api/radius/accounting/{username}", "customers.view", None),
-    # Returns the login password, like PPPoE secrets: manage only.
-    ((R,), "/api/radius/users/{username}", "customers.manage", None),
-    (("POST",), "/api/radius/users", "customers.manage", "Created a RADIUS login"),
-    (("DELETE",), "/api/radius/users/{username}", "customers.manage",
-     "Deleted RADIUS login {username}"),
-
     # --- transactions -------------------------------------------------------
     ((R,), "/api/mpesa/transactions", "transactions.view", None),
     ((R,), "/api/mpesa/transactions/failed", "transactions.view", None),
