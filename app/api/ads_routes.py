@@ -6,15 +6,27 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from app.db.database import get_db
-from app.db.models import Ad, AdClick, AdImpression, AdClickType, Advertiser, AdBadgeType
+from app.db.models import Ad, AdClick, AdImpression, AdClickType, Advertiser, AdBadgeType, User, UserRole
 from app.services.auth import verify_token, get_current_user
-from app.services.subscription import enforce_active_subscription
 
 import logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["ads"])
+
+
+def _is_admin(user: User) -> bool:
+    return user.role == UserRole.ADMIN
+
+
+def _require_admin(user: User) -> None:
+    """Ads have no owner yet: every ad shows on every portal, so creating,
+    editing, deleting and reading the per-device analytics is Bitwave-admin
+    only. A reseller token (or a staff token, which authenticates as its
+    reseller) is refused."""
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="Only Bitwave admins can do this")
 
 
 
@@ -93,7 +105,7 @@ async def create_advertiser(
 ):
     """Create a new advertiser."""
     user = await get_current_user(token, db)
-    enforce_active_subscription(user)
+    _require_admin(user)
     try:
         advertiser = Advertiser(
             name=request.name,
@@ -125,7 +137,8 @@ async def get_advertisers(
     token: str = Depends(verify_token)
 ):
     """List all advertisers."""
-    await get_current_user(token, db)
+    user = await get_current_user(token, db)
+    _require_admin(user)
     result = await db.execute(select(Advertiser).order_by(Advertiser.created_at.desc()))
     advertisers = result.scalars().all()
     return [
@@ -154,7 +167,7 @@ async def create_ad(
 ):
     """Create a new ad."""
     user = await get_current_user(token, db)
-    enforce_active_subscription(user)
+    _require_admin(user)
     try:
         adv_result = await db.execute(select(Advertiser).where(Advertiser.id == request.advertiser_id))
         if not adv_result.scalar_one_or_none():
@@ -216,7 +229,7 @@ async def delete_ad(
 ):
     """Delete an ad by ID (cascades to clicks and impressions)."""
     user = await get_current_user(token, db)
-    enforce_active_subscription(user)
+    _require_admin(user)
     try:
         result = await db.execute(select(Ad).where(Ad.id == ad_id))
         ad = result.scalar_one_or_none()
@@ -249,7 +262,7 @@ async def update_ad(
 ):
     """Update an ad by ID."""
     user = await get_current_user(token, db)
-    enforce_active_subscription(user)
+    _require_admin(user)
     try:
         result = await db.execute(select(Ad).where(Ad.id == ad_id))
         ad = result.scalar_one_or_none()
@@ -514,7 +527,8 @@ async def get_ad_clicks(
     token: str = Depends(verify_token)
 ):
     """Get click records for a specific ad."""
-    await get_current_user(token, db)
+    user = await get_current_user(token, db)
+    _require_admin(user)
     try:
         # Verify ad exists
         ad_result = await db.execute(select(Ad).where(Ad.id == ad_id))
@@ -575,7 +589,8 @@ async def get_ad_impressions(
     token: str = Depends(verify_token)
 ):
     """Get impression records that include this ad."""
-    await get_current_user(token, db)
+    user = await get_current_user(token, db)
+    _require_admin(user)
     try:
         # Verify ad exists
         ad_result = await db.execute(select(Ad).where(Ad.id == ad_id))
@@ -632,7 +647,8 @@ async def get_ads_analytics(
     token: str = Depends(verify_token)
 ):
     """Get aggregated analytics for all ads."""
-    await get_current_user(token, db)
+    user = await get_current_user(token, db)
+    _require_admin(user)
     try:
         now = datetime.utcnow()
         since = now - timedelta(days=days)
