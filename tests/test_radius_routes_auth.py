@@ -15,10 +15,12 @@ tests pin the fix through the real app:
 The CoA disconnect is faked at RadiusCoA; nothing leaves the process.
 """
 
+import itertools
 from datetime import datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, text
 
@@ -93,10 +95,13 @@ def _bearer(user):
     return {"Authorization": f"Bearer {token}"}
 
 
+_STAFF_SEQ = itertools.count(1)
+
+
 async def _staff_headers(db, owner, permissions):
     staff = ResellerStaff(
         parent_reseller_id=owner.id, name="Staff",
-        email=f"staff{owner.id}-{'-'.join(permissions) or 'none'}@example.com",
+        email=f"staff{owner.id}-{next(_STAFF_SEQ)}@example.com",
         password_hash=pwd_context.hash("staff-password"), permissions=permissions,
     )
     db.add(staff)
@@ -263,7 +268,8 @@ async def test_lists_and_stats_only_show_the_callers_routers(client, world):
     assert sorted(s["session_id"] for s in sessions) == ["sB", "sR2"]
 
     stats = (await client.get("/api/radius/accounting/roamer", headers=hb)).json()
-    assert stats["total_sessions"] == 1 and stats["total_bytes_in"] == 7
+    # Postgres SUM(bigint) is numeric and serialises as a string; SQLite gives an int.
+    assert stats["total_sessions"] == 1 and int(stats["total_bytes_in"]) == 7
     stats_a = (await client.get("/api/radius/accounting/userA", headers=hb)).json()
     assert stats_a["total_sessions"] == 0
 
@@ -414,16 +420,24 @@ NOT_FOR_STAFF_RADIUS = {
 }
 
 
+def _walk(routes, prefix=""):
+    """(method, path) for every route. FastAPI 0.14x (CI, production) keeps each
+    include_router() as a lazy wrapper with `original_router`; older FastAPI
+    flattens. Walk both so this never passes or fails vacuously."""
+    for route in routes:
+        if isinstance(route, APIRoute):
+            for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+                yield method, prefix + route.path
+        elif hasattr(route, "original_router"):
+            ctx = getattr(route, "include_context", None)
+            yield from _walk(route.original_router.routes, prefix + (getattr(ctx, "prefix", "") or ""))
+
+
 def _app_radius_routes():
     import main
-    out = set()
-    for route in main.app.routes:
-        path = getattr(route, "path", "")
-        if path.startswith("/api/radius"):
-            for m in getattr(route, "methods", set()) or set():
-                if m not in ("HEAD", "OPTIONS"):
-                    out.add((m, path))
-    return out
+    every = set(_walk(main.app.routes))
+    assert len(every) > 400, f"only {len(every)} routes found; route walk is broken"
+    return {(m, p) for m, p in every if p.startswith("/api/radius")}
 
 
 def test_every_radius_route_is_classified_for_staff():
