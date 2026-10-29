@@ -77,6 +77,8 @@ NOT_FOR_STAFF = {
     ("GET", "/api/staff/permissions"), ("PUT", "/api/staff/{staff_id}"),
     ("DELETE", "/api/staff/{staff_id}"), ("POST", "/api/staff/{staff_id}/reset-password"),
     ("POST", "/api/impersonation/end"),
+    # Hero ads: reviewing ads and the advertiser list are Bitwave-admin only (#282).
+    ("POST", "/api/ads/{ad_id}/review"), ("GET", "/api/advertisers"), ("POST", "/api/advertisers"),
     # Bitwave -> owner inbox (owner alerts land here) and the Ideas + Bugs board.
     ("GET", "/api/messaging/inbox"), ("POST", "/api/messaging/inbox/{message_id}/read"),
     ("GET", "/api/feedback/posts"), ("POST", "/api/feedback/posts"),
