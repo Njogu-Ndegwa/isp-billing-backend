@@ -20,6 +20,7 @@ from app.db.models import (
     ProvisioningAttemptSource, DevicePairing, ReconnectionAttempt,
     FapshiTransaction, ZenoPayTransaction, MtnMomoTransaction,
     CustomerUsageBucket, C2BTransaction, UnmatchedC2BPayment, SmsMessage,
+    PlanType,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -1539,6 +1540,10 @@ def is_no_payment_activation(value: Optional[str]) -> bool:
     return (value or "").strip().lower() == NO_PAYMENT
 
 
+def is_free_trial_plan(plan: Optional[Plan]) -> bool:
+    return plan is not None and plan.plan_type == PlanType.FREE_TRIAL
+
+
 def manual_activation_ledger_row(
     customer: Customer,
     plan: Plan,
@@ -1555,17 +1560,24 @@ def manual_activation_ledger_row(
     It is also the source the provisioning attempt hangs off, so a no-payment
     activation still gets one (amount 0, not revenue)."""
     if no_payment:
+        # A free-trial plan is labelled like a portal trial claim (the ledger
+        # reads the FREE-TRIAL- prefix as source "free_trial").
+        free_trial = is_free_trial_plan(plan)
+        default_reference = (
+            f"FREE-TRIAL-{plan.id}" if free_trial else f"NO-PAYMENT-{customer.id}"
+        )
         return CustomerPayment(
             customer_id=customer.id,
             reseller_id=user.id,
             plan_id=plan.id,
             amount=0.0,
             payment_method=PaymentMethod.OTHER,
-            payment_reference=request.payment_reference or f"NO-PAYMENT-{customer.id}",
+            payment_reference=request.payment_reference or default_reference,
             days_paid_for=days_paid_for,
             status=PaymentStatus.COMPLETED,
             notes=(
-                "No payment collected: activated without payment"
+                ("Free trial: no payment collected" if free_trial
+                 else "No payment collected: activated without payment")
                 + (f" ({request.notes})" if request.notes else "")
             ),
             customer_name=customer.name,
@@ -1585,8 +1597,12 @@ def manual_activation_ledger_row(
     )
 
 
-def manual_activation_event_text(user, pm_enum: PaymentMethod, *, no_payment: bool, forced: bool) -> str:
+def manual_activation_event_text(
+    user, pm_enum: PaymentMethod, *, no_payment: bool, forced: bool, free_trial: bool = False,
+) -> str:
     confirmed = ", confirmed although already active/paid" if forced else ""
+    if free_trial:
+        return f"free trial, no payment, by {actor_label(user) or 'the reseller'}{confirmed}"
     if no_payment:
         return f"without payment by {actor_label(user) or 'the reseller'}{confirmed}"
     return f"{pm_enum.value}{confirmed}"
@@ -1687,13 +1703,18 @@ async def manual_activation_conflict(
 
 
 async def refuse_duplicate_manual_activation(
-    db: AsyncSession, customer: Customer, request: "ActivatePPPoERequest", now: datetime
+    db: AsyncSession,
+    customer: Customer,
+    request: "ActivatePPPoERequest",
+    now: datetime,
+    *,
+    no_payment: Optional[bool] = None,
 ) -> bool:
     """Raise 409 when this activation would double-renew, unless forced.
     Returns True when the reseller confirmed past a conflict (for the audit trail)."""
-    conflict = await manual_activation_conflict(
-        db, customer, now, no_payment=is_no_payment_activation(request.payment_method),
-    )
+    if no_payment is None:
+        no_payment = is_no_payment_activation(request.payment_method)
+    conflict = await manual_activation_conflict(db, customer, now, no_payment=no_payment)
     if conflict is None:
         return False
     if not request.force:
@@ -1740,13 +1761,20 @@ async def activate_pppoe_customer(
             raise HTTPException(status_code=400, detail="Customer has no router assigned")
 
         plan = customer.plan
-        no_payment = is_no_payment_activation(request.payment_method)
+        # A free-trial plan costs nothing, so activating a customer on it never
+        # records a payment, whatever method the form sent: the ledger gets the
+        # zero, non-revenue row, like a trial claimed on the hotspot portal.
+        no_payment = (
+            is_no_payment_activation(request.payment_method) or is_free_trial_plan(plan)
+        )
         pm_enum = (
             PaymentMethod.OTHER if no_payment
             else manual_activation_payment_method(request.payment_method)
         )
         now = datetime.utcnow()
-        forced = await refuse_duplicate_manual_activation(db, customer, request, now)
+        forced = await refuse_duplicate_manual_activation(
+            db, customer, request, now, no_payment=no_payment,
+        )
 
         duration_unit = plan.duration_unit.value.upper()
         duration_value = plan.duration_value
@@ -1812,14 +1840,15 @@ async def activate_pppoe_customer(
         await record_customer_event(
             customer.id, "pppoe_activated",
             f"PPPoE activated on {plan.name} until {customer.expiry:%Y-%m-%d %H:%M} UTC "
-            f"({manual_activation_event_text(user, pm_enum, no_payment=no_payment, forced=forced)}); router "
+            f"({manual_activation_event_text(user, pm_enum, no_payment=no_payment, forced=forced, free_trial=is_free_trial_plan(plan))}); router "
             + ("updated" if provision_succeeded else
                f"not updated yet: {(provision_result or {}).get('error') or 'will retry'}"),
             severity="info" if provision_succeeded else "warning",
             actor=user, user_id=user.id, router_id=customer.router_id,
             details={"payment_id": payment.id, "reference": payment.payment_reference,
                      "provision_result": "ok" if provision_succeeded else "retry_pending",
-                     "forced": forced, "no_payment": no_payment},
+                     "forced": forced, "no_payment": no_payment,
+                     "free_trial": is_free_trial_plan(plan)},
         )
 
         return {
