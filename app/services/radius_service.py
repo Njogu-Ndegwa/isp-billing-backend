@@ -27,7 +27,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text, select, delete, update
+from sqlalchemy import bindparam, text, select, delete, update
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -344,7 +344,8 @@ class RadiusService:
     async def get_active_sessions(
         self, 
         username: Optional[str] = None,
-        nas_ip: Optional[str] = None
+        nas_ip: Optional[str] = None,
+        nas_ips: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Get active sessions from accounting table.
@@ -354,6 +355,7 @@ class RadiusService:
         Args:
             username: Filter by username (optional)
             nas_ip: Filter by NAS IP address (optional)
+            nas_ips: Only sessions on these NAS IPs (optional; [] matches nothing)
             
         Returns:
             List of active session dicts
@@ -377,10 +379,19 @@ class RadiusService:
         if nas_ip:
             query += " AND nasipaddress = :nas_ip"
             params['nas_ip'] = nas_ip
+
+        if nas_ips is not None:
+            if not nas_ips:
+                return []
+            query += " AND nasipaddress IN :nas_ips"
+            params['nas_ips'] = list(nas_ips)
         
         query += " ORDER BY acctstarttime DESC"
         
-        result = await self.db.execute(text(query), params)
+        stmt = text(query)
+        if nas_ips:
+            stmt = stmt.bindparams(bindparam('nas_ips', expanding=True))
+        result = await self.db.execute(stmt, params)
         rows = result.fetchall()
         
         sessions = []
@@ -404,12 +415,14 @@ class RadiusService:
         self, 
         username: str,
         start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None
+        end_date: Optional[datetime] = None,
+        nas_ips: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Get session statistics for a user.
         
         Returns aggregate stats: total sessions, total bytes, total time.
+        ``nas_ips`` limits the count to sessions on those NAS IPs ([] counts nothing).
         """
         query = """
             SELECT 
@@ -430,8 +443,18 @@ class RadiusService:
         if end_date:
             query += " AND (acctstoptime <= :end_date OR acctstoptime IS NULL)"
             params['end_date'] = end_date
+
+        stmt = text(query)
+        if nas_ips is not None:
+            if nas_ips:
+                query += " AND nasipaddress IN :nas_ips"
+                params['nas_ips'] = list(nas_ips)
+                stmt = text(query).bindparams(bindparam('nas_ips', expanding=True))
+            else:
+                query += " AND 1 = 0"
+                stmt = text(query)
         
-        result = await self.db.execute(text(query), params)
+        result = await self.db.execute(stmt, params)
         row = result.fetchone()
         
         return {

@@ -1,11 +1,16 @@
 {
     "info": {
         "name": "RADIUS - Full Test Flow",
-        "description": "Complete test flow for RADIUS hotspot functionality.\n\nNo authentication required — matches existing /api/routers/create pattern.\n\nRun requests in order:\n1. Create Router → auto-captures router_id\n2. Enable RADIUS on router\n3. Test RADIUS connectivity\n4. Register & Pay (RADIUS hotspot flow)\n5. Poll payment status\n6. Manage users, sessions, accounting\n\nVariables are auto-set by test scripts — just run in sequence.",
+        "description": "Complete test flow for RADIUS hotspot functionality.\n\nManagement routes need a dashboard login: set {{token}} to a Bearer token from POST /api/auth/login (owner, admin, or staff with the right permission). A reseller only reaches their own routers and customers. The hotspot register-and-pay, payment-status and M-Pesa callback routes stay public.\n\nRun requests in order:\n1. Create Router → auto-captures router_id\n2. Enable RADIUS on router\n3. Test RADIUS connectivity\n4. Register & Pay (RADIUS hotspot flow)\n5. Poll payment status\n6. Manage users, sessions, accounting\n\nVariables are auto-set by test scripts — just run in sequence.",
         "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "auth": {
+        "type": "bearer",
+        "bearer": [{"key": "token", "value": "{{token}}", "type": "string"}]
     },
     "variable": [
         {"key": "baseUrl", "value": "http://localhost:8000"},
+        {"key": "token", "value": ""},
         {"key": "router_id", "value": ""},
         {"key": "customer_id", "value": ""},
         {"key": "radius_username", "value": ""},
