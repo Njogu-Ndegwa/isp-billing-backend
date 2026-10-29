@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.db.models import (
     CollectionMode,
+    ConnectionType,
     CustomerPayment,
     InvoiceStatus,
     PaymentMethod,
@@ -33,7 +34,7 @@ from app.db.models import (
 from app.services import admin_metrics, sms_credits
 from app.services import platform_earnings as svc
 from app.services.markets import PAYSTACK_PROCESSING_FEE_RATE, kes_per_unit
-from tests.factories import make_admin, make_reseller
+from tests.factories import make_admin, make_plan, make_reseller
 
 pytestmark = pytest.mark.asyncio
 
@@ -176,32 +177,79 @@ def _streams(result):
     return {s["key"]: s["total"] for s in result["earnings"]["streams"]}
 
 
-async def test_subscription_payment_splits_into_commission_per_user_and_minimum(db):
+async def test_breakdown_is_exactly_hotspot_pppoe_and_sms(db):
+    result = await svc.compute_platform_earnings(db, "month")
+
+    assert [(s["key"], s["label"]) for s in result["earnings"]["streams"]] == [
+        ("subscription_hotspot", "Hotspot"),
+        ("subscription_per_user", "PPPoE / Static"),
+        ("sms_credits", "SMS"),
+    ]
+
+
+async def test_minimum_top_up_folds_into_hotspot_and_pppoe_by_their_share(db):
     r = await make_reseller(db)
-    # 3% of 10,000 hotspot = 300, 4 users x 25 = 100, topped up to the 500 minimum.
+    # 3% of 10,000 hotspot = 300, 4 users x 25 = 100, topped up to the 500
+    # minimum. The 100 top-up splits 3:1 like the usage it tops up.
     inv = await _invoice(db, r.id, hotspot=300, per_user=100, final=500)
     await _sub_payment(db, r.id, 500, invoice=inv)
 
     result = await svc.compute_platform_earnings(db, "month")
     streams = _streams(result)
 
-    assert streams["subscription_hotspot"] == 300
-    assert streams["subscription_per_user"] == 100
-    assert streams["subscription_minimum"] == 100
+    assert streams["subscription_hotspot"] == 375
+    assert streams["subscription_per_user"] == 125
     assert result["earnings"]["subscriptions"] == 500
     assert result["earnings"]["total"] == 500
 
 
-async def test_flat_fee_invoice_is_all_minimum_fee(db):
-    r = await make_reseller(db, market_code="CM")
-    inv = await _invoice(db, r.id, final=20, currency="USD")
-    await _sub_payment(db, r.id, 20, invoice=inv, currency="USD")
+async def test_minimum_only_invoice_goes_to_hotspot_for_a_hotspot_reseller(db):
+    r = await make_reseller(db)
+    await make_plan(db, r, connection_type=ConnectionType.HOTSPOT)
+    inv = await _invoice(db, r.id, final=500)
+    await _sub_payment(db, r.id, 500, invoice=inv)
 
     streams = _streams(await svc.compute_platform_earnings(db, "month"))
 
-    assert streams["subscription_minimum"] == pytest.approx(20 * kes_per_unit("USD"))
+    assert streams == {"subscription_hotspot": 500, "subscription_per_user": 0, "sms_credits": 0}
+
+
+@pytest.mark.parametrize("kind", [ConnectionType.PPPOE, ConnectionType.STATIC_IP])
+async def test_minimum_only_invoice_goes_to_pppoe_for_a_pppoe_only_reseller(db, kind):
+    r = await make_reseller(db)
+    await make_plan(db, r, connection_type=ConnectionType.PPPOE)
+    await make_plan(db, r, connection_type=kind)
+    inv = await _invoice(db, r.id, final=500)
+    await _sub_payment(db, r.id, 500, invoice=inv)
+
+    streams = _streams(await svc.compute_platform_earnings(db, "month"))
+
+    assert streams["subscription_per_user"] == 500
     assert streams["subscription_hotspot"] == 0
-    assert streams["subscription_per_user"] == 0
+
+
+async def test_a_reseller_selling_both_without_usage_counts_as_hotspot(db):
+    r = await make_reseller(db)
+    await make_plan(db, r, connection_type=ConnectionType.PPPOE)
+    await make_plan(db, r, connection_type=ConnectionType.HOTSPOT)
+    inv = await _invoice(db, r.id, final=500)
+    await _sub_payment(db, r.id, 500, invoice=inv)
+
+    assert _streams(await svc.compute_platform_earnings(db, "month"))["subscription_hotspot"] == 500
+
+
+async def test_flat_fee_invoice_follows_the_resellers_service(db):
+    hotspot = await make_reseller(db, market_code="CM")
+    pppoe = await make_reseller(db, market_code="CM")
+    await make_plan(db, pppoe, connection_type=ConnectionType.PPPOE)
+    for r in (hotspot, pppoe):
+        inv = await _invoice(db, r.id, final=20, currency="USD")
+        await _sub_payment(db, r.id, 20, invoice=inv, currency="USD")
+
+    streams = _streams(await svc.compute_platform_earnings(db, "month"))
+
+    assert streams["subscription_hotspot"] == pytest.approx(20 * kes_per_unit("USD"))
+    assert streams["subscription_per_user"] == pytest.approx(20 * kes_per_unit("USD"))
 
 
 async def test_partial_payment_takes_its_share_of_each_line(db):
@@ -213,7 +261,6 @@ async def test_partial_payment_takes_its_share_of_each_line(db):
 
     assert streams["subscription_hotspot"] == 300
     assert streams["subscription_per_user"] == 100
-    assert streams["subscription_minimum"] == 0
 
 
 async def test_card_payments_are_counted_net_of_the_processing_fee(db):
@@ -226,26 +273,35 @@ async def test_card_payments_are_counted_net_of_the_processing_fee(db):
     assert total == pytest.approx(10 * kes_per_unit("USD") * (1 - PAYSTACK_PROCESSING_FEE_RATE), abs=0.01)
 
 
-async def test_payment_without_invoice_is_reported_as_unattributed(db):
-    r = await make_reseller(db)
-    await _sub_payment(db, r.id, 700)
+async def test_payment_without_invoice_is_attributed_by_the_resellers_service(db):
+    hotspot = await make_reseller(db)
+    pppoe = await make_reseller(db)
+    await make_plan(db, pppoe, connection_type=ConnectionType.STATIC_IP)
+    await _sub_payment(db, hotspot.id, 700)
+    await _sub_payment(db, pppoe.id, 300)
 
     result = await svc.compute_platform_earnings(db, "month")
 
-    assert _streams(result)["subscription_unattributed"] == 700
-    assert result["earnings"]["total"] == 700
+    assert _streams(result) == {
+        "subscription_hotspot": 700, "subscription_per_user": 300, "sms_credits": 0,
+    }
+    assert result["earnings"]["total"] == 1_000
 
 
-async def test_unattributed_line_is_hidden_when_empty(db):
-    r = await make_reseller(db)
-    inv = await _invoice(db, r.id, hotspot=50, final=50)
-    await _sub_payment(db, r.id, 50, invoice=inv)
+async def test_every_subscription_shilling_lands_in_a_group(db):
+    """Nothing is left in an "other" bucket: the groups add up to the total."""
+    a = await make_reseller(db)
+    b = await make_reseller(db)
+    await make_plan(db, b, connection_type=ConnectionType.PPPOE)
+    await _sub_payment(db, a.id, 123.45)
+    await _sub_payment(db, b.id, 500, invoice=await _invoice(db, b.id, final=500))
+    await _sub_payment(db, a.id, 777, invoice=await _invoice(db, a.id, hotspot=70, per_user=30, final=500))
+    await _sms_order(db, a.id, 50)
 
-    keys = set(_streams(await svc.compute_platform_earnings(db, "month")))
+    result = await svc.compute_platform_earnings(db, "month")
 
-    assert "subscription_unattributed" not in keys
-    assert {"subscription_hotspot", "subscription_per_user",
-            "subscription_minimum", "sms_credits"} <= keys
+    assert sum(_streams(result).values()) == pytest.approx(result["earnings"]["total"], abs=0.02)
+    assert result["earnings"]["total"] == pytest.approx(123.45 + 500 + 777 + 50, abs=0.02)
 
 
 async def test_pending_and_failed_subscription_payments_are_not_earnings(db):
@@ -304,9 +360,10 @@ async def test_waived_invoices_are_not_invoiced_earnings(db):
 
     assert invoiced["total"] == 500
     assert invoiced["invoices"] == 1
-    assert invoiced["subscription_hotspot"] == 200
-    assert invoiced["subscription_per_user"] == 100
-    assert invoiced["subscription_minimum"] == 200
+    # The 200 minimum top-up folds 2:1 into the two groups.
+    assert invoiced["subscription_hotspot"] == pytest.approx(333.33, abs=0.01)
+    assert invoiced["subscription_per_user"] == pytest.approx(166.67, abs=0.01)
+    assert "subscription_minimum" not in invoiced
     assert invoiced["waived"] == 900
     assert invoiced["waived_invoices"] == 1
 
@@ -369,6 +426,64 @@ async def test_own_reseller_accounts_are_volume_but_not_earnings(db):
     assert result["earnings"]["total"] == 250
     assert result["invoiced"]["total"] == 0
     assert [a["id"] for a in result["excluded_own_accounts"]] == [mine.id]
+
+
+# ---------------------------------------------------------------------------
+# My reseller business and total income
+# ---------------------------------------------------------------------------
+
+async def test_my_reseller_business_is_my_accounts_customer_payments(db):
+    mine = await make_reseller(db)
+    other = await make_reseller(db)
+    await admin_metrics.set_own_reseller_ids(db, [mine.id])
+    await _customer_payment(db, mine.id, 2_000)
+    await _customer_payment(db, mine.id, 500, mode=CollectionMode.DIRECT)
+    await _customer_payment(db, mine.id, 300, method=PaymentMethod.CASH, mode=None)
+    # Not income: free trial, refund, and other resellers' takings.
+    await _customer_payment(db, mine.id, 0, method=PaymentMethod.CASH, counts_as_revenue=False)
+    await _customer_payment(db, mine.id, 900, status=PaymentStatus.REFUNDED)
+    await _customer_payment(db, other.id, 7_000)
+
+    business = (await svc.compute_platform_earnings(db, "month"))["reseller_business"]
+
+    assert business["total"] == 2_800
+    assert business["payments"] == 3
+    assert [a["id"] for a in business["accounts"]] == [mine.id]
+
+
+async def test_total_income_is_platform_earnings_plus_my_reseller_business(db):
+    mine = await make_reseller(db)
+    other = await make_reseller(db)
+    await admin_metrics.set_own_reseller_ids(db, [mine.id])
+    await _customer_payment(db, mine.id, 3_000)
+    await _customer_payment(db, mine.id, 1_000, at=_prev_in())
+    await _sub_payment(db, mine.id, 500)  # paying ourselves: in neither figure
+    await _sub_payment(db, other.id, 400, invoice=await _invoice(db, other.id, hotspot=400, final=400))
+    await _sms_order(db, other.id, 100)
+    await _sub_payment(db, other.id, 200, at=_prev_in())
+
+    result = await svc.compute_platform_earnings(db, "month")
+
+    assert result["earnings"]["total"] == 500
+    assert result["reseller_business"]["total"] == 3_000
+    assert result["reseller_business"]["previous_total"] == 1_000
+    assert result["total_income"] == {
+        "total": 3_500, "previous_total": 1_200, "change_percent": pytest.approx(191.7, abs=0.1),
+    }
+    # Take rate stays platform earnings over volume.
+    assert result["take_rate_percent"] == pytest.approx(500 / 3_000 * 100, abs=0.01)
+
+
+async def test_no_own_accounts_means_no_reseller_business(db):
+    r = await make_reseller(db)
+    await _customer_payment(db, r.id, 5_000)
+    await _sms_order(db, r.id, 100)
+
+    result = await svc.compute_platform_earnings(db, "month")
+
+    assert result["reseller_business"]["total"] == 0
+    assert result["reseller_business"]["accounts"] == []
+    assert result["total_income"]["total"] == 100
 
 
 async def test_take_rate_is_earnings_over_volume(db):
@@ -531,3 +646,5 @@ async def test_route_returns_volume_and_earnings_for_admins(db, client):
     assert body["transaction_volume"]["total"] == 5_000
     assert body["earnings"]["total"] == 150
     assert body["take_rate_percent"] == 3.0
+    assert body["total_income"]["total"] == 150
+    assert body["reseller_business"]["total"] == 0

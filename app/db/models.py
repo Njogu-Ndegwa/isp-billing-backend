@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
+from sqlalchemy import Column, Integer, String, Text, Enum, Date, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import Session, relationship
 from sqlalchemy import event
@@ -3026,3 +3026,59 @@ class SupportDeskDecision(Base):
     decided_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     consumed_at = Column(DateTime, nullable=True, index=True)
+
+
+# ========================================
+# PLATFORM WITHDRAWALS (admin money ledger)
+# ========================================
+
+class PlatformWithdrawal(Base):
+    """Money the platform admin took out of Bitwave's earnings, as recorded by
+    the admin themselves (``app/services/platform_withdrawals.py``).
+
+    A record only: creating one moves no money and calls no payment provider.
+    Rows are never edited or deleted; a mistake is voided (``voided`` plus who,
+    when and why) and every create/void also writes a
+    ``PlatformWithdrawalEvent``. ``bucket`` is which earnings the money came
+    from: ``platform`` (platform earnings), ``reseller_business`` (the admin's
+    own reseller accounts) or ``all``. Amounts are KES.
+    Startup migration: run_platform_withdrawal_migrations() in main.py.
+    """
+    __tablename__ = "platform_withdrawals"
+    __table_args__ = (
+        Index("ix_platform_withdrawals_withdrawn_on", "withdrawn_on"),
+        CheckConstraint("amount > 0", name="ck_platform_withdrawals_amount_positive"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    amount = Column(DECIMAL(12, 2), nullable=False)
+    currency = Column(String(3), nullable=False, default="KES", server_default="KES")
+    withdrawn_on = Column(Date, nullable=False)
+    # mpesa | bank | cash
+    method = Column(String(10), nullable=False)
+    reference = Column(String(100), nullable=True)
+    note = Column(String(500), nullable=True)
+    # platform | reseller_business | all
+    bucket = Column(String(20), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    voided = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    voided_at = Column(DateTime, nullable=True)
+    voided_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    void_reason = Column(String(300), nullable=True)
+
+
+class PlatformWithdrawalEvent(Base):
+    """Append-only audit trail of the withdrawals ledger: one row per create
+    or void, with who did it and a copy of what the row said at that moment.
+    Startup migration: run_platform_withdrawal_migrations() in main.py.
+    """
+    __tablename__ = "platform_withdrawal_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    withdrawal_id = Column(Integer, ForeignKey("platform_withdrawals.id"), nullable=False, index=True)
+    # created | voided
+    action = Column(String(10), nullable=False)
+    actor_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    details = Column(JSON, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
