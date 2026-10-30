@@ -39,6 +39,8 @@ from app.services.mikrotik_api import (
     MikroTikAPI,
     multi_device_profile_kwargs,
     multi_device_profile_suffix,
+    per_session_rate_limit,
+    shares_speed,
     normalize_mac_address,
     parse_speed_to_mikrotik,
 )
@@ -136,6 +138,7 @@ def _hotspot_identity(customer: Customer) -> tuple[Optional[str], Optional[str]]
 
 def _restore_pppoe_plan_profile_sync(
     router_info: dict, username: str, bandwidth_limit: str, max_devices: int = 1,
+    shared_speed: bool = False,
 ) -> dict:
     """Point the PPP secret back at its plan's ``pppoe_<rate>`` profile and re-enable it.
 
@@ -153,7 +156,7 @@ def _restore_pppoe_plan_profile_sync(
     if not api.connect():
         return {"error": "connect_failed"}
     try:
-        ensured = ensure_plan_pppoe_profile(api, bandwidth_limit, max_devices)
+        ensured = ensure_plan_pppoe_profile(api, bandwidth_limit, max_devices, shared_speed)
         if ensured.get("error"):
             return {"error": ensured["error"]}
         result = api.send_command("/ppp/secret/set", {
@@ -169,6 +172,7 @@ def _restore_pppoe_plan_profile_sync(
 
 def _set_secret_throttle_profile_sync(
     router_info: dict, username: str, profile_name: str, rate_limit: str, max_devices: int = 1,
+    shared_speed: bool = False,
 ) -> dict:
     """Throttle a PPPoE user to ``rate_limit``.
 
@@ -176,7 +180,10 @@ def _set_secret_throttle_profile_sync(
     points the PPP secret at it, and drops the live session so the new rate
     takes effect immediately. A customer allowed several devices keeps that
     allowance while throttled (``only-one=no`` + the same session limit).
+    On a plan that shares speed across devices the throttle rate is shared
+    the same way (one ``<pppoe-USER>`` queue at ``rate_limit``).
     """
+    shared = shares_speed(max_devices, shared_speed)
     api = MikroTikAPI(
         router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
         timeout=15, connect_timeout=5,
@@ -185,10 +192,14 @@ def _set_secret_throttle_profile_sync(
         return {"error": "connect_failed"}
     try:
         ensured = api.ensure_pppoe_profile(
-            profile_name, rate_limit, **multi_device_profile_kwargs(max_devices),
+            profile_name,
+            per_session_rate_limit(rate_limit, max_devices, shared),
+            **multi_device_profile_kwargs(max_devices, rate_limit if shared else None),
         )
         if ensured.get("error"):
             return {"error": ensured["error"]}
+        if shared:
+            api.ensure_shared_speed_cleanup_scheduler()
         result = api.send_command("/ppp/secret/set", {
             "numbers": username,
             "profile": profile_name,
@@ -529,7 +540,10 @@ async def apply_throttle(
         return {"error": "no_pppoe_username"}
     rate_limit = pppoe_throttle_rate_for_plan(plan)
     max_devices = max_devices_for_customer(customer, plan)
-    profile_name = _fup_profile_name_for_rate(rate_limit) + multi_device_profile_suffix(max_devices)
+    shared_speed = bool(plan is not None and getattr(plan, "share_speed_across_devices", False))
+    profile_name = _fup_profile_name_for_rate(rate_limit) + multi_device_profile_suffix(
+        max_devices, shares_speed(max_devices, shared_speed),
+    )
     router = await _load_router(db, customer.router_id)
     if not router:
         return {"error": "no_router"}
@@ -542,6 +556,8 @@ async def apply_throttle(
         profile_name,
         rate_limit,
         max_devices,
+        # Only passed when on, so the call is unchanged for every other plan.
+        *((True,) if shared_speed else ()),
     )
 
 
@@ -600,13 +616,15 @@ async def restore_normal_profile(
         return {"error": "no_pppoe_username"}
     bandwidth_limit = (plan.speed if plan else None) or "10Mbps"
     max_devices = max_devices_for_customer(customer, plan)
+    shared_speed = bool(plan is not None and getattr(plan, "share_speed_across_devices", False))
     router = await _load_router(db, customer.router_id)
     if not router:
         return {"error": "no_router"}
     info = _router_info(router)
     await db.commit()
     return await asyncio.to_thread(
-        _restore_pppoe_plan_profile_sync, info, customer.pppoe_username, bandwidth_limit, max_devices
+        _restore_pppoe_plan_profile_sync, info, customer.pppoe_username, bandwidth_limit, max_devices,
+        *((True,) if shared_speed else ()),
     )
 
 

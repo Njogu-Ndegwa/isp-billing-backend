@@ -118,6 +118,7 @@ def _serialize_plan_sharing(plan: Plan) -> dict:
     return {
         "max_shared_users": max_shared_users,
         "sharing_enabled": max_shared_users > 1,
+        "share_speed_across_devices": bool(getattr(plan, "share_speed_across_devices", False)),
     }
 
 
@@ -208,6 +209,9 @@ class PlanCreateRequest(BaseModel):
     # covers each day and throttled customers get full speed back at the reset.
     fup_period: Optional[str] = None
     max_shared_users: Optional[int] = 1
+    # PPPoE with 2+ devices: True = the login's devices share the plan speed;
+    # False (default) = each device gets the full plan speed.
+    share_speed_across_devices: Optional[bool] = False
     # Omit or send null/[] to offer the plan on every router the reseller owns.
     router_ids: Optional[List[int]] = None
     # Free-trial plans only: True = each device may claim it once,
@@ -233,6 +237,7 @@ class PlanUpdateRequest(BaseModel):
     fup_throttle_profile: Optional[str] = None
     fup_period: Optional[str] = None
     max_shared_users: Optional[int] = None
+    share_speed_across_devices: Optional[bool] = None
     # Send null/[] to revert the plan to "all routers". Only applied when the
     # field is actually present in the request body.
     router_ids: Optional[List[int]] = None
@@ -328,6 +333,7 @@ async def create_plan_api(
             fup_throttle_profile=request.fup_throttle_profile,
             fup_period=fup_period,
             max_shared_users=max_shared_users,
+            share_speed_across_devices=bool(request.share_speed_across_devices),
             router_ids=scoped_router_ids,
             trial_once_per_customer=(
                 request.trial_once_per_customer
@@ -515,9 +521,13 @@ async def update_plan_api(
         previous_max_devices = int(plan.max_shared_users or 1)
         if request.max_shared_users is not None:
             plan.max_shared_users = _validate_max_shared_users(request.max_shared_users)
+        previous_shared_speed = bool(plan.share_speed_across_devices)
+        if request.share_speed_across_devices is not None:
+            plan.share_speed_across_devices = bool(request.share_speed_across_devices)
         is_pppoe = plan.connection_type == ConnectionType.PPPOE
         pppoe_speed_changed = is_pppoe and (plan.speed or "") != (previous_speed or "")
         pppoe_devices_changed = is_pppoe and int(plan.max_shared_users or 1) != previous_max_devices
+        pppoe_shared_speed_changed = is_pppoe and bool(plan.share_speed_across_devices) != previous_shared_speed
         if "router_ids" in fields_set:
             plan.router_ids = await _validate_router_scope(db, user.id, request.router_ids)
         if request.trial_once_per_customer is not None:
@@ -528,14 +538,18 @@ async def update_plan_api(
         await db.refresh(plan)
         await invalidate_plan_cache()
 
-        if pppoe_speed_changed or pppoe_devices_changed:
+        if pppoe_speed_changed or pppoe_devices_changed or pppoe_shared_speed_changed:
             # A PPPoE customer's speed and device count live on their router
             # (the PPP profile); push them in the background, never on this
             # request, or customers keep the old ones until they pay again.
             from app.services.pppoe_provisioning import reprovision_plan_pppoe_customers
 
             asyncio.create_task(
-                reprovision_plan_pppoe_customers(plan.id, speed_changed=pppoe_speed_changed)
+                reprovision_plan_pppoe_customers(
+                    plan.id,
+                    speed_changed=pppoe_speed_changed,
+                    **({"shared_speed_changed": True} if pppoe_shared_speed_changed else {}),
+                )
             )
 
         logger.info(f"Plan {plan_id} updated: type={plan.plan_type.value}, hidden={plan.is_hidden}")

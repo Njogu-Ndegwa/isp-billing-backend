@@ -865,6 +865,7 @@ async def pppoe_customer_presence(
             Plan.name.label("plan_name"),
             Plan.speed.label("plan_speed"),
             Plan.max_shared_users.label("plan_max_shared_users"),
+            Plan.share_speed_across_devices.label("plan_share_speed_across_devices"),
             Customer.max_devices_override.label("customer_max_devices_override"),
         )
         .outerjoin(Router, Customer.router_id == Router.id)
@@ -1057,6 +1058,9 @@ async def pppoe_customer_presence(
                 1,
                 int(row["customer_max_devices_override"] or row["plan_max_shared_users"] or 1),
             ),
+            # True: the login's sessions share one plan-speed limit on the
+            # router; False: each session gets the full plan speed.
+            "shared_speed": bool(row.get("plan_share_speed_across_devices")),
         },
         "mikrotik": presence,
         # Plain-language reading of the router's last-disconnect-reason, so

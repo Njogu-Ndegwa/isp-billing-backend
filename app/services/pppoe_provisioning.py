@@ -29,6 +29,8 @@ from app.services.mikrotik_api import (
     MikroTikAPI,
     multi_device_profile_kwargs,
     multi_device_profile_suffix,
+    per_session_rate_limit,
+    shares_speed,
 )
 from app.services.provisioning_retry_policy import (
     PAID_PROVISIONING_RETRY_MAX_ATTEMPTS,
@@ -145,7 +147,9 @@ def _local_address_from_pool(api: MikroTikAPI) -> str:
     return PPPOE_DEFAULT_LOCAL_ADDRESS
 
 
-def ensure_plan_pppoe_profile(api: MikroTikAPI, bandwidth_limit: str, max_devices: int = 1) -> dict:
+def ensure_plan_pppoe_profile(
+    api: MikroTikAPI, bandwidth_limit: str, max_devices: int = 1, shared_speed: bool = False,
+) -> dict:
     """Ensure the ``pppoe_<rate>`` profile a plan's customers normally sit on.
 
     Shared by provisioning and by FUP revert, so a customer released from a
@@ -155,14 +159,21 @@ def ensure_plan_pppoe_profile(api: MikroTikAPI, bandwidth_limit: str, max_device
     ``max_devices`` above 1 selects ``pppoe_<rate>_d<N>``: the same rate with
     ``only-one=no`` and an on-up script that keeps the login to N sessions.
     Each session gets its own dynamic queue at the full plan rate.
+
+    ``shared_speed`` (the plan's opt-in, only meaningful with 2+ devices)
+    selects ``pppoe_<rate>_shared_d<N>`` instead: no per-session rate-limit,
+    and on-up/on-down scripts that keep ONE ``<pppoe-USER>`` queue at the plan
+    rate for all of the login's sessions. Single-device logins and plans
+    without the opt-in are unchanged.
     """
     max_devices = max(1, int(max_devices or 1))
+    shared = shares_speed(max_devices, shared_speed)
     base_rate_limit = api._parse_speed_to_mikrotik(bandwidth_limit)
     headroom_factor = float(getattr(settings, "PPPOE_RATE_LIMIT_HEADROOM", 1.0) or 1.0)
     rate_limit = _apply_pppoe_headroom(base_rate_limit, headroom_factor)
     profile_name = (
         f"pppoe_{base_rate_limit.replace('/', '_')}"
-        f"{multi_device_profile_suffix(max_devices)}"
+        f"{multi_device_profile_suffix(max_devices, shared)}"
     )
 
     base_profile = api.get_active_pppoe_profile()
@@ -185,16 +196,20 @@ def ensure_plan_pppoe_profile(api: MikroTikAPI, bandwidth_limit: str, max_device
 
     profile_result = api.ensure_pppoe_profile(
         profile_name,
-        rate_limit,
+        per_session_rate_limit(rate_limit, max_devices, shared),
         local_address=local_address,
         pool_name=pool_name,
         dns_server=base_profile_data.get("dns_server", ""),
         change_tcp_mss=base_profile_data.get("change_tcp_mss", ""),
-        **multi_device_profile_kwargs(max_devices),
+        **multi_device_profile_kwargs(max_devices, rate_limit if shared else None),
     )
     if profile_result.get("error"):
         logger.error(f"[PPPoE] Profile creation failed: {profile_result['error']}")
         return {"error": f"Profile creation failed: {profile_result['error']}"}
+    if shared:
+        scheduler = api.ensure_shared_speed_cleanup_scheduler()
+        if scheduler.get("error"):
+            logger.warning(f"[PPPoE] Shared-speed cleanup scheduler: {scheduler['error']}")
 
     return {
         "profile": profile_name,
@@ -231,6 +246,7 @@ def _provision_pppoe_sync(payload: dict) -> dict:
     try:
         ensured = ensure_plan_pppoe_profile(
             api, payload["bandwidth_limit"], payload.get("max_devices", 1),
+            bool(payload.get("shared_speed")),
         )
         if ensured.get("error"):
             return ensured
@@ -259,6 +275,17 @@ def _provision_pppoe_sync(payload: dict) -> dict:
         bypass_result = api.ensure_pppoe_fasttrack_bypass(pool_name=pool_name)
         if bypass_result.get("error"):
             logger.warning(f"[PPPoE] FastTrack bypass ensure failed: {bypass_result['error']}")
+
+        # The plan stopped sharing speed: drop the login's static shared queue
+        # before the reconnect, or it would block the per-session queue that
+        # RouterOS creates under the same <pppoe-USER> name. on-down normally
+        # removes it already; this covers an on-down that did not run.
+        if payload.get("clear_shared_speed_queue") and not shares_speed(
+            payload.get("max_devices", 1), bool(payload.get("shared_speed")),
+        ):
+            cleared = api.remove_pppoe_shared_speed_queue(payload["pppoe_username"])
+            if cleared.get("error"):
+                logger.warning(f"[PPPoE] Shared-speed queue cleanup failed: {cleared['error']}")
 
         # Force the client to reconnect so any profile/rate-limit change applies immediately.
         # "disconnect": False is passed when nothing about the login changed (a
@@ -334,6 +361,12 @@ def _remove_pppoe_sync(payload: dict) -> dict:
                 "disconnect_result": disconnect_result,
                 "remove_result": remove_result,
             }
+
+        if payload.get("shared_speed"):
+            # on-down drops the shared queue with the last session; make sure.
+            cleared = api.remove_pppoe_shared_speed_queue(pppoe_username)
+            if cleared.get("error"):
+                logger.warning(f"[PPPoE] Shared-speed queue cleanup failed: {cleared['error']}")
 
         logger.info(
             f"[PPPoE] Removed {pppoe_username}: "
@@ -739,6 +772,7 @@ async def retry_pending_pppoe_provisioning_background():
                     "pppoe_password": customer.pppoe_password,
                     "bandwidth_limit": _plan.speed if _plan else "10Mbps",
                     "max_devices": _pppoe_max_devices(customer, _plan),
+                    **({"shared_speed": True} if plan_shares_speed(_plan) else {}),
                     "comment": (
                         f"CID:{customer.id}|{customer.name or customer.phone}|"
                         f"{datetime.utcnow().strftime('%Y-%m-%d')}"
@@ -767,6 +801,25 @@ def _pppoe_max_devices(customer, plan) -> int:
     return max_devices_for_customer(customer, plan)
 
 
+def plan_shares_speed(plan) -> bool:
+    """The plan's opt-in: all of a login's sessions share the plan speed."""
+    return bool(plan is not None and getattr(plan, "share_speed_across_devices", False))
+
+
+def _loaded_plan(customer):
+    """The customer's plan if already loaded; never lazy-loads (async sessions)."""
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.exc import NoInspectionAvailable
+
+    try:
+        state = sa_inspect(customer)
+    except NoInspectionAvailable:
+        return getattr(customer, "plan", None)
+    if "plan" in state.unloaded:
+        return None
+    return customer.plan
+
+
 def build_pppoe_payload(customer, router) -> dict:
     """Build the payload dict for PPPoE provisioning from ORM objects."""
     return {
@@ -774,6 +827,8 @@ def build_pppoe_payload(customer, router) -> dict:
         "pppoe_password": customer.pppoe_password,
         "bandwidth_limit": customer.plan.speed if customer.plan else "10Mbps",
         "max_devices": _pppoe_max_devices(customer, customer.plan),
+        # Plans that opted in only; the key is absent (off) for everyone else.
+        **({"shared_speed": True} if plan_shares_speed(customer.plan) else {}),
         "comment": f"CID:{customer.id}|{customer.name or customer.phone}|{datetime.utcnow().strftime('%Y-%m-%d')}",
         "router_ip": router.ip_address,
         "router_username": router.username,
@@ -784,13 +839,16 @@ def build_pppoe_payload(customer, router) -> dict:
 
 def build_pppoe_remove_payload(customer, router) -> dict:
     """Build the payload dict for PPPoE removal from ORM objects."""
-    return {
+    payload = {
         "pppoe_username": customer.pppoe_username,
         "router_ip": router.ip_address,
         "router_username": router.username,
         "router_password": router.password,
         "router_port": router.port,
     }
+    if plan_shares_speed(_loaded_plan(customer)):
+        payload["shared_speed"] = True  # also clear the login's shared queue
+    return payload
 
 
 # --------------------------------------------------------------------------
@@ -818,7 +876,9 @@ async def active_fup_restriction(db, customer_id: int):
     return None
 
 
-async def reprovision_plan_pppoe_customers(plan_id: int, *, speed_changed: bool = True) -> dict:
+async def reprovision_plan_pppoe_customers(
+    plan_id: int, *, speed_changed: bool = True, shared_speed_changed: bool = False,
+) -> dict:
     """Push a PPPoE plan's speed and device allowance to its active customers.
 
     Runs in the background after a reseller edits the plan. A PPPoE customer's
@@ -832,9 +892,16 @@ async def reprovision_plan_pppoe_customers(plan_id: int, *, speed_changed: bool 
     they return to when it ends is built from the plan as it is then. Each
     re-provision reconnects that customer's devices once.
 
+    When the plan's "share speed across devices" switch changed
+    (``shared_speed_changed``), every customer with 2+ devices is moved to or
+    off the shared profile (overrides included: the switch is about the plan's
+    speed, not its device count); single-device customers are not touched.
+    Switching it off also clears the login's shared queue.
+
     The customer list is read in one short session that is closed before any
     router I/O; routers are then updated one customer at a time.
     """
+    include_overrides = speed_changed or shared_speed_changed
     from sqlalchemy.orm import selectinload
 
     from app.db.database import async_session
@@ -850,7 +917,7 @@ async def reprovision_plan_pppoe_customers(plan_id: int, *, speed_changed: bool 
                     Customer.pppoe_username.isnot(None),
                     Customer.pppoe_password.isnot(None),
                     Customer.router_id.isnot(None),
-                    *(() if speed_changed else (Customer.max_devices_override.is_(None),)),
+                    *(() if include_overrides else (Customer.max_devices_override.is_(None),)),
                 )
             )
         ).scalars().all()
@@ -862,7 +929,12 @@ async def reprovision_plan_pppoe_customers(plan_id: int, *, speed_changed: bool 
             if await active_fup_restriction(db, customer.id):
                 skipped_fup += 1
                 continue
-            payloads.append((customer.id, build_pppoe_payload(customer, customer.router)))
+            payload = build_pppoe_payload(customer, customer.router)
+            if shared_speed_changed:
+                payload["clear_shared_speed_queue"] = not payload.get("shared_speed")
+                if not speed_changed and int(payload.get("max_devices") or 1) <= 1:
+                    continue  # one device: the switch changes nothing for them
+            payloads.append((customer.id, payload))
         await db.commit()
 
     applied = failed = 0
