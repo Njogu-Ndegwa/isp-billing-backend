@@ -861,18 +861,77 @@ All money is KES. Definitions live in `app/services/platform_earnings.py`.
   `counts_as_revenue=true`; free trials, compensation and "activate without payment" are
   excluded). This is the resellers' money, not Bitwave's income. Split into
   `mpesa_platform_collected`, `mpesa_direct_settled` and `recorded_manually`.
-- `earnings` (cash basis, `basis: "collected"`): what Bitwave received in the period.
-  Completed `subscription_payments` (card net of the assumed Paystack fee), each split across
-  its invoice into `subscription_hotspot` (the % commission), `subscription_per_user`
-  (PPPoE/static fee) and `subscription_minimum` (top-up to the minimum, or the flat fee);
-  `subscription_unattributed` when the payment has no invoice; plus completed
-  `sms_credit_orders` (`sms_credits`). Our own reseller accounts (`admin_own_reseller_ids`)
-  are excluded.
+- `earnings` (cash basis, `basis: "collected"`): platform earnings, what Bitwave received in
+  the period, in exactly three `streams`:
+  - `subscription_hotspot` ("Hotspot") and `subscription_per_user` ("PPPoE / Static"):
+    completed `subscription_payments` (card net of the assumed Paystack fee). A payment on an
+    invoice with usage charges is split by its hotspot and per-user charges, the minimum
+    top-up riding along in the same proportion. A payment with no usage to split by
+    (minimum-only invoice, flat-fee market, no invoice) goes wholly to PPPoE / Static when
+    every plan the reseller has is PPPoE or static-IP, otherwise to Hotspot. Nothing is left
+    unattributed.
+  - `sms_credits` ("SMS"): completed `sms_credit_orders`.
+  Our own reseller accounts (`admin_own_reseller_ids`) are excluded.
+- `reseller_business`: "My reseller business", the customer payments taken by our own reseller
+  accounts (same rules as transaction volume), with `previous_total`, `change_percent`,
+  `payments` and `accounts`. Our own business income, not a platform fee.
+- `total_income`: `earnings.total + reseller_business.total` (and previous / change).
 - `invoiced`: subscription invoices issued in the period (waived excluded and reported as
-  `waived`), with `paid_so_far` and `outstanding`.
+  `waived`), split into `subscription_hotspot` / `subscription_per_user` by the same rules,
+  with `paid_so_far` and `outstanding`.
 - `take_rate_percent`: `earnings.total / transaction_volume.total * 100`, `null` without volume.
 - `not_counted`: paid shop orders and reseller transaction charges (mostly B2B fee
   recovery), reported but not part of earnings.
+
+## 15. Withdrawals ledger (from 1 Oct 2026)
+
+```
+GET  /api/admin/metrics/platform-withdrawals
+POST /api/admin/metrics/platform-withdrawals
+POST /api/admin/metrics/platform-withdrawals/{id}/void
+GET  /api/admin/metrics/platform-withdrawals/{id}/audit
+```
+
+Admin only. Records withdrawals the admin already made outside the app. It moves no money and
+calls no payment provider (no M-Pesa B2C). Definitions: `app/services/platform_withdrawals.py`.
+
+`GET` returns, never cached:
+
+```json
+{
+  "start_date": "2026-10-01",
+  "currency": "KES",
+  "buckets": {
+    "platform":          { "collected": 64000, "withdrawn": 20000, "available": 44000 },
+    "reseller_business": { "collected": 90000, "withdrawn": 0,     "available": 90000 }
+  },
+  "withdrawn_from_all": 0,
+  "total": { "collected": 154000, "withdrawn": 20000, "available": 134000 },
+  "records_only": true,
+  "withdrawals": [
+    { "id": 1, "amount": 20000, "currency": "KES", "date": "2026-10-20", "method": "mpesa",
+      "reference": "QAB12CD34", "note": "October", "bucket": "platform",
+      "created_by": 1, "created_by_name": "Bitwave", "created_at": "2026-10-29T10:00:00",
+      "voided": false, "voided_at": null, "voided_by": null, "voided_by_name": null,
+      "void_reason": null }
+  ]
+}
+```
+
+- `collected`: cash received since 1 Oct 2026 by the card's rules (`platform` = Hotspot +
+  PPPoE / Static + SMS; `reseller_business` = our own accounts' customer payments).
+- `available = collected - withdrawn` (voided rows excluded). A withdrawal from bucket `all`
+  reduces only the total; each bucket's `available` is capped at the total's.
+
+`POST` body: `{ "amount": 300, "date": "2026-10-20", "method": "mpesa|bank|cash",
+"bucket": "platform|reseller_business|all", "reference": "optional, <=100",
+"note": "optional, <=500" }` → `201` with the row. `400` for bad input (date before
+2026-10-01 or in the future, unknown method/bucket, amount <= 0); `422` when the amount is
+more than the bucket's `available`.
+
+`POST .../void` body `{ "reason": "at least 3 characters" }` → the row, `voided: true`. Rows are
+never edited or deleted. `404` unknown id, `409` already voided. Every create and void also
+writes a `platform_withdrawal_events` row, listed by `GET .../audit`.
 
 ## Error Responses
 

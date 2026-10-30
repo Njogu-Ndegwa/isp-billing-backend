@@ -644,6 +644,30 @@
   "user_id",
   "valid_until"
  ],
+ "platform_withdrawal_events": [
+  "action",
+  "actor_id",
+  "created_at",
+  "details",
+  "id",
+  "withdrawal_id"
+ ],
+ "platform_withdrawals": [
+  "amount",
+  "bucket",
+  "created_at",
+  "created_by",
+  "currency",
+  "id",
+  "method",
+  "note",
+  "reference",
+  "void_reason",
+  "voided",
+  "voided_at",
+  "voided_by",
+  "withdrawn_on"
+ ],
  "portal_settings": [
   "announcement_text",
   "announcement_type",

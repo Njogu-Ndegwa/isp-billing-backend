@@ -3394,6 +3394,32 @@ async def run_hero_ads_migrations():
     logger.info("Hero ads migrations complete")
 
 
+async def run_platform_withdrawal_migrations():
+    """Withdrawals ledger (2026-10, app/services/platform_withdrawals.py): two
+    NEW tables, platform_withdrawals and its append-only audit trail
+    platform_withdrawal_events, via the checkfirst create_all pattern. Their
+    indexes and constraints are created with them. No existing table changes.
+    Idempotent: safe on every startup.
+    """
+    from sqlalchemy import inspect
+    from app.db.models import PlatformWithdrawal, PlatformWithdrawalEvent
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+        # Explicit startup create_all targets: platform_withdrawals,
+        # platform_withdrawal_events (parent first, for the FK).
+        missing = [
+            t for t in (PlatformWithdrawal.__table__, PlatformWithdrawalEvent.__table__)
+            if t.name not in tables
+        ]
+        if missing:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=missing))
+            logger.info(
+                "Platform withdrawal migration: created %s", ", ".join(t.name for t in missing)
+            )
+    logger.info("Platform withdrawal migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     if shadow_mode_enabled():
@@ -3717,6 +3743,11 @@ async def startup_event():
         await run_hero_ads_migrations()
     except Exception as e:
         logger.error(f"Hero ads migration failed (non-fatal): {e}")
+
+    try:
+        await run_platform_withdrawal_migrations()
+    except Exception as e:
+        logger.error(f"Platform withdrawal migration failed (non-fatal): {e}")
 
     from app.config import settings as app_settings
     if not scheduler_enabled():
