@@ -188,14 +188,22 @@ async def staff_me(
         all_perms = list(perms.PERMISSIONS)
         if user.role == UserRole.RESELLER:
             all_perms.append(perms.STAFF_MANAGE)
-        return {"is_staff": False, "staff": None, "permissions": all_perms}
+        return {"is_staff": False, "staff": None, "permissions": all_perms,
+                "feature_flags": _staff_feature_flags(user.role)}
 
     staff = await db.get(ResellerStaff, int(staff_id))
     owner = await db.get(User, int(token["user_id"]))
     if staff is None or owner is None:
         raise HTTPException(status_code=401, detail="Staff account not found")
     public = staff_public(staff, business_label(owner))
-    return {"is_staff": True, "staff": public, "permissions": public["permissions"]}
+    # Staff act in the owner's (reseller) scope for feature gating.
+    return {"is_staff": True, "staff": public, "permissions": public["permissions"],
+            "feature_flags": _staff_feature_flags(owner.role)}
+
+
+def _staff_feature_flags(role) -> dict:
+    from app.services.ap_access import ap_control_allowed
+    return {"ap_control": ap_control_allowed(role)}
 
 
 # ---------------------------------------------------------------------------

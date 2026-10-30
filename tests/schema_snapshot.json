@@ -838,6 +838,28 @@
   "reference",
   "reseller_id"
  ],
+ "router_ap_credentials": [
+  "ap_mac",
+  "created_at",
+  "failed_login_count",
+  "id",
+  "last_action",
+  "last_action_at",
+  "last_error",
+  "last_ip",
+  "last_login_ok",
+  "last_reboot_at",
+  "last_status",
+  "last_status_at",
+  "login_method",
+  "model",
+  "password_encrypted",
+  "router_id",
+  "updated_at",
+  "updated_by_user_id",
+  "username",
+  "vendor"
+ ],
  "router_availability_checks": [
   "checked_at",
   "id",
