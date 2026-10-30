@@ -27,6 +27,7 @@ from app.services.auth import verify_token, get_current_user
 from app.services.usage_tracking import (
     CUSTOMER_USAGE_BUCKET_RETENTION_DAYS,
     customer_bucket_start_for,
+    fup_cap_mb,
     fup_usage_bytes,
     fup_window_start,
     get_open_period,
@@ -213,6 +214,12 @@ def _serialize_usage(
     open_period: Optional[CustomerUsagePeriod],
 ) -> UsageOut:
     plan = customer.plan
+    period = _serialize_period(open_period) if open_period else None
+    if period is not None:
+        # Show the cap FUP actually enforces (a daily plan uses its current
+        # cap; a period opened before the plan had a cap has no snapshot).
+        period.cap_mb = fup_cap_mb(open_period, plan)
+        period.percent_used = _percent(open_period.total_bytes or 0, period.cap_mb)
     return UsageOut(
         customer_id=customer.id,
         connection_type=plan.connection_type.value if (plan and plan.connection_type) else None,
@@ -221,7 +228,7 @@ def _serialize_usage(
         plan_data_cap_mb=plan.data_cap_mb if plan else None,
         plan_fup_action=plan.fup_action.value if (plan and plan.fup_action) else None,
         plan_fup_period=plan_fup_period(plan) if plan else None,
-        period=_serialize_period(open_period) if open_period else None,
+        period=period,
         live=_live_for(customer),
     )
 
@@ -263,14 +270,14 @@ async def get_customer_usage(
         pooled = await pooled_period_usage_bytes(db, customer, open_period)
         if pooled != int(open_period.total_bytes or 0):
             usage.period.shared_total_mb = _bytes_to_mb(pooled)
-            usage.period.shared_percent_used = _percent(pooled, open_period.cap_mb_snapshot)
+            usage.period.shared_percent_used = _percent(pooled, usage.period.cap_mb)
         now = datetime.utcnow()
         window_start = fup_window_start(open_period, customer.plan, now)
         if window_start is not None:
             window_used = await fup_usage_bytes(db, customer, open_period, plan=customer.plan, now=now)
             usage.period.fup_window_start = window_start
             usage.period.fup_window_used_mb = _bytes_to_mb(window_used)
-            usage.period.fup_window_percent_used = _percent(window_used, open_period.cap_mb_snapshot)
+            usage.period.fup_window_percent_used = _percent(window_used, usage.period.cap_mb)
     return usage
 
 

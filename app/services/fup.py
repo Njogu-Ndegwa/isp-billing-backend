@@ -44,7 +44,7 @@ from app.services.mikrotik_api import (
 )
 from app.services.subscription_sharing import max_devices_for_customer
 from app.services.customer_grace import has_access_time
-from app.services.usage_tracking import fup_usage_bytes, fup_window_start
+from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes, fup_window_start
 from app.services.hotspot_mac_login import (
     block_customer as mac_login_block_customer,
     mac_login_enabled,
@@ -62,9 +62,7 @@ DEFAULT_HOTSPOT_FUP_THROTTLE_RATE = DEFAULT_FUP_THROTTLE_RATE
 
 def _cap_bytes(period: CustomerUsagePeriod, plan: Optional[Plan]) -> Optional[int]:
     """Return the byte cap for this period, or ``None`` if uncapped."""
-    cap_mb = period.cap_mb_snapshot if period.cap_mb_snapshot is not None else (
-        plan.data_cap_mb if plan else None
-    )
+    cap_mb = fup_cap_mb(period, plan)
     if not cap_mb or cap_mb <= 0:
         return None
     return int(cap_mb) * 1024 * 1024
