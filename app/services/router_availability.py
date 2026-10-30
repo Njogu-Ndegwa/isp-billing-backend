@@ -381,9 +381,15 @@ def uptime_outages(checks: Iterable[Any], *, now: datetime) -> Dict[str, Any]:
 
 # A router whose tunnel is down still calls us over public HTTPS: its expiry
 # reaper at least hourly (the heartbeat) and every minute or two while
-# customers are due. Inside a tunnel outage, a longer stretch than this with
-# no call still counts as the site being down.
+# customers are due. Between two calls up to this far apart the site is taken
+# to have stayed online; a longer stretch with no call counts as site downtime.
 PUBLIC_CONTACT_SILENCE = timedelta(minutes=65)
+# A router coming back from a real outage (power cut, the site's internet
+# down) calls over the internet first: the reaper runs within a minute of
+# boot, before the tunnel is up. Calls this close to the end of an outage
+# say the site came back, not that it was online all along, so they are
+# not taken as proof.
+RECOVERY_MARGIN = timedelta(minutes=10)
 
 
 def split_tunnel_outages(
@@ -394,11 +400,14 @@ def split_tunnel_outages(
     ``judged`` is uptime_outages' result. Everything it is built from reaches
     us through the management tunnel (reports, RouterOS connections), so a
     dead tunnel looks exactly like a dead site. ``contacts`` are times the
-    router called us over the public internet (RouterPublicContact): an
-    outage with any inside it was the tunnel, and only stretches of more than
-    PUBLIC_CONTACT_SILENCE without a call stay site downtime. Returns
-    ``judged`` with ``outages`` narrowed to site downtime and
-    ``tunnel_outages`` added.
+    router called us over the public internet (RouterPublicContact).
+
+    The site is only ever called online on proof. Inside an outage, ignoring
+    calls within RECOVERY_MARGIN of its end: until the first call it stays
+    site downtime (we cannot tell); from the first call it is a tunnel
+    outage, in which only a stretch of more than PUBLIC_CONTACT_SILENCE with
+    no call is site downtime. Returns ``judged`` with ``outages`` narrowed to
+    site downtime and ``tunnel_outages`` added.
     """
     times = sorted(contacts)
     site: list[Dict[str, Any]] = []
@@ -414,21 +423,25 @@ def split_tunnel_outages(
     for outage in judged["outages"]:
         start, end = _parse_outage(outage, now)
         ongoing = outage.get("ended_at") is None
-        inside = times[bisect_left(times, start):bisect_right(times, end)]
+        proof_until = end if ongoing else end - RECOVERY_MARGIN
+        inside = times[bisect_left(times, start):bisect_right(times, proof_until)] if proof_until > start else []
         if not inside:
             site.append(outage)
             continue
-        tunnel.append({
-            **piece(start, None if ongoing else end),
-            "public_contacts": len(inside),
-            "first_contact_at": inside[0].isoformat(),
-            "last_contact_at": inside[-1].isoformat(),
-        })
-        bounds = [start, *inside, end]
+        first = inside[0]
+        if first > start:
+            site.append(piece(start, first))
+        if ongoing or end - first >= MIN_REPORTED_OUTAGE:
+            tunnel.append({
+                **piece(first, None if ongoing else end),
+                "public_contacts": len(inside),
+                "first_contact_at": first.isoformat(),
+                "last_contact_at": inside[-1].isoformat(),
+            })
+        bounds = [*inside, end]
         for a, b in zip(bounds, bounds[1:]):
             if b - a > PUBLIC_CONTACT_SILENCE:
-                last = b is end
-                site.append(piece(a, None if (last and ongoing) else b))
+                site.append(piece(a, None if (b is end and ongoing) else b))
     site.sort(key=lambda o: o["started_at"])
     return {**judged, "outages": significant_outages(site, now), "tunnel_outages": tunnel}
 
