@@ -253,6 +253,12 @@ class Settings(BaseSettings):
     # for v6 bootstrap only.
     PROVISION_LEGACY_BASE_URL: str = ""
     L2TP_IPSEC_PSK: str = "BitwaveL2TP2026!Secure"
+    # Vercel anycast ranges the hotspot portal is served from. Provisioning puts
+    # them in the router's isp_portal_allow address list (with the backend IPs),
+    # the only destinations the hotspot's transparent proxy may still relay to
+    # once ISP_BILLING_PROXY_RELAY_BLOCK is in place (HTTP Injector fix).
+    # Comma-separated CIDRs.
+    HOTSPOT_PORTAL_ALLOW_CIDRS: str = "216.198.79.0/24,64.29.17.0/24,76.76.21.0/24"
 
     # Access credential idle reaper: minutes a bound MAC can be unseen on the
     # router's hotspot host table before the credential is auto-released so

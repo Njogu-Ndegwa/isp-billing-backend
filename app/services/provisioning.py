@@ -64,6 +64,22 @@ DEFAULT_WIFI_SSID = "Bitwave WiFi"
 WIFI_SECURITY_PROFILE = "bw-open"
 # Name of the hotspot bridge every LAN port must belong to.
 HOTSPOT_BRIDGE = "bridge"
+# The hotspot LAN the script configures (STEP 2 address + DHCP, STEP 4
+# hotspot-address). The anti-tunnel rules exempt exactly this LAN, so all of
+# them read from here.
+HOTSPOT_LAN = ipaddress.IPv4Interface("192.168.88.1/24")
+HOTSPOT_GATEWAY = str(HOTSPOT_LAN.ip)
+HOTSPOT_SUBNET = str(HOTSPOT_LAN.network)
+
+# Hotspot anti-tunnel (HTTP Injector) rules. The comments are what the
+# hotspot-bypass-fix skill's apply/verify scripts look for -- keep them exact.
+PORTAL_ALLOW_LIST = "isp_portal_allow"
+PORTAL_ALLOW_COMMENT = "portal/api/backend allow (anti-tunnel)"
+PROXY_RELAY_BLOCK_COMMENT = "ISP_BILLING_PROXY_RELAY_BLOCK"
+ANTI_TUNNEL_COMMENT = "ISP_BILLING_ANTI_TUNNEL"
+# Every port the hotspot hands to its transparent proxy (wproxy 64874) for
+# unauthenticated clients -- three dynamic hs-unauth redirects, not one.
+PROXY_RELAY_PORTS = "80,3128,8080"
 
 # RouterOS 7 WireGuard management tunnel to Hetzner wg2 (PROVISION_MGMT_TO_HETZNER).
 # Same name the manual migrations used (skill migrate-router-to-sstp).
@@ -848,13 +864,15 @@ def _rsc_wan_setup() -> str:
 
 
 def _rsc_lan_setup() -> str:
-    return """
+    hosts = list(HOTSPOT_LAN.network.hosts())
+    pool = f"{hosts[9]}-{hosts[-1]}"
+    return f"""
 # ---- STEP 2: LAN SETUP ----
 
-:do { /ip address add address=192.168.88.1/24 interface=bridge } on-error={}
-:do { /ip pool add name=dhcp-pool ranges=192.168.88.10-192.168.88.254 } on-error={}
-:do { /ip dhcp-server add name=dhcp1 interface=bridge address-pool=dhcp-pool disabled=no } on-error={}
-:do { /ip dhcp-server network add address=192.168.88.0/24 gateway=192.168.88.1 dns-server=8.8.8.8,8.8.4.4 } on-error={}
+:do {{ /ip address add address={HOTSPOT_LAN.with_prefixlen} interface=bridge }} on-error={{}}
+:do {{ /ip pool add name=dhcp-pool ranges={pool} }} on-error={{}}
+:do {{ /ip dhcp-server add name=dhcp1 interface=bridge address-pool=dhcp-pool disabled=no }} on-error={{}}
+:do {{ /ip dhcp-server network add address={HOTSPOT_SUBNET} gateway={HOTSPOT_GATEWAY} dns-server=8.8.8.8,8.8.4.4 }} on-error={{}}
 
 :log info "Provisioning: LAN and DHCP setup complete" """
 
@@ -1322,7 +1340,7 @@ def _rsc_hotspot(token: ProvisioningToken) -> str:
 }
 
 :do {
-    /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=$bwHtmlDir
+    /ip hotspot profile add name=hsprof1 hotspot-address=""" + HOTSPOT_GATEWAY + """ dns-name="" login-by=http-chap,http-pap html-directory=$bwHtmlDir
     :log info ("Provisioning: hotspot profile hsprof1 created with html-directory=" . $bwHtmlDir)
 } on-error={
     :do { /ip hotspot profile set hsprof1 html-directory=$bwHtmlDir } on-error={
@@ -1410,6 +1428,129 @@ def _rsc_login_page(token: ProvisioningToken) -> str:
         }}
     }}
 }}"""
+
+
+def _backend_public_ips(token: ProvisioningToken) -> list[str]:
+    """Public IPs of the backend a hotspot must reach before login: the
+    token's server, plus the insurance/Hetzner server when it differs. The
+    walled garden and the anti-tunnel allow-list both use this list."""
+    ips = [token.server_public_ip]
+    insurance_public_ip = (settings.INSURANCE_SERVER_PUBLIC_IP or "").strip()
+    if insurance_public_ip and insurance_public_ip != token.server_public_ip:
+        ips.append(insurance_public_ip)
+    return ips
+
+
+def portal_allow_entries(token: ProvisioningToken) -> list[str]:
+    """What goes in the router's isp_portal_allow list: backend IPs, then the
+    portal CIDRs from settings.HOTSPOT_PORTAL_ALLOW_CIDRS."""
+    entries = _backend_public_ips(token)
+    for raw in (settings.HOTSPOT_PORTAL_ALLOW_CIDRS or "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        # Fails loudly on a typo: a malformed entry would make RouterOS reject
+        # the add and the router would ship with a narrower allow-list.
+        cidr = str(ipaddress.IPv4Network(raw, strict=False))
+        if cidr not in entries:
+            entries.append(cidr)
+    return entries
+
+
+def _rsc_anti_tunnel_lift() -> str:
+    """Re-provisioning a router that already carries the relay block: lift it
+    for the rest of the import. RouterOS 6 fetches the login page and calls
+    /complete over plain HTTP via PROVISION_LEGACY_BASE_URL, and the block
+    rejects the router's own tcp/80 to anything outside isp_portal_allow (the
+    backend hostname is behind Cloudflare). STEP 9b puts it back."""
+    return f"""
+# ---- STEP 4b: LIFT ANY EXISTING PROXY-RELAY BLOCK UNTIL STEP 9b ----
+# The block also rejects this script's own plain-HTTP fetches (login page,
+# /complete). STEP 9b re-applies it right after the server is notified.
+
+:foreach i in=[/ip firewall filter find comment="{PROXY_RELAY_BLOCK_COMMENT}"] do={{ :do {{ /ip firewall filter remove $i }} on-error={{}} }}"""
+
+
+def _rsc_anti_tunnel(token: ProvisioningToken) -> str:
+    """Stop the hotspot's transparent web proxy being used as an open relay.
+
+    MikroTik redirects unauthenticated TCP 80/3128/8080 to its built-in proxy
+    (wproxy, port 64874), which forwards to *any* external host. HTTP Injector
+    rides that relay out and gets internet without signing in. The walled
+    garden does not stop it (a raw-IP WebSocket Upgrade carries no Host/SNI),
+    and /ip proxy access is ignored for transparently intercepted connections.
+
+    The relay is router-originated, so the cure is chain=output: the router
+    may reach only the portal/backend on those ports. Deliberately no
+    connection-state, so live tunnels are cut too. Serving the login page is
+    local and untouched.
+
+    Reseller walled-garden IP allows (e.g. radios reaching UISP) keep
+    working: RouterOS turns them into dynamic pre-hotspot NAT accepts and
+    hs-unauth returns, so that traffic is forwarded -- never relayed through
+    the proxy, never seen by chain=output -- and returns from hs-unauth
+    before the static rules below, which are appended (no place-before)
+    after the hotspot's dynamic rules.
+
+    Runs after /complete (see _rsc_anti_tunnel_lift) and before the reboot.
+    Idempotent: each rule and allow entry is removed by comment and re-added.
+    """
+    lines = [
+        "",
+        "# ---- STEP 9b: ANTI-TUNNEL (HTTP Injector / open transparent proxy) ----",
+        "# Only portal + backend may be reached through the hotspot's transparent",
+        "# proxy. See the hotspot-bypass-fix skill before changing these rules.",
+        "",
+        ":foreach i in=[/ip firewall address-list find where list=" + PORTAL_ALLOW_LIST
+        + ' and comment="' + PORTAL_ALLOW_COMMENT + '"] do={ :do { /ip firewall address-list remove $i } on-error={} }',
+    ]
+    for entry in portal_allow_entries(token):
+        lines.append(
+            ":do { /ip firewall address-list add list=" + PORTAL_ALLOW_LIST
+            + " address=" + entry + ' comment="' + PORTAL_ALLOW_COMMENT + '" } on-error={}'
+        )
+
+    rules = [
+        (
+            PROXY_RELAY_BLOCK_COMMENT,
+            "chain=output protocol=tcp dst-port=" + PROXY_RELAY_PORTS
+            + " dst-address-list=!" + PORTAL_ALLOW_LIST
+            + " dst-address=!" + HOTSPOT_SUBNET
+            + " action=reject reject-with=tcp-reset",
+        ),
+        (
+            ANTI_TUNNEL_COMMENT,
+            "chain=hs-unauth protocol=tcp dst-port=80,443 dst-address=!" + HOTSPOT_GATEWAY
+            + " dst-address-list=!" + PORTAL_ALLOW_LIST
+            + " connection-state=new action=reject reject-with=tcp-reset",
+        ),
+        (
+            ANTI_TUNNEL_COMMENT + "_OTHER",
+            "chain=hs-unauth protocol=tcp dst-port=!53,80,443 dst-address=!" + HOTSPOT_GATEWAY
+            + " action=reject reject-with=tcp-reset",
+        ),
+        (
+            ANTI_TUNNEL_COMMENT + "_DNS",
+            "chain=hs-unauth protocol=udp dst-port=53 dst-address=!" + HOTSPOT_GATEWAY
+            + " action=reject reject-with=icmp-net-prohibited",
+        ),
+    ]
+    lines.append("")
+    for comment, _ in rules:
+        lines.append(
+            ':foreach i in=[/ip firewall filter find comment="' + comment
+            + '"] do={ :do { /ip firewall filter remove $i } on-error={} }'
+        )
+    for comment, params in rules:
+        lines.append(
+            ":do { /ip firewall filter add " + params + ' comment="' + comment + '" } on-error={'
+            + ' :log error "Provisioning: could not add ' + comment + '" }'
+        )
+    lines += [
+        "",
+        ':log info "Provisioning: anti-tunnel proxy-relay rules applied"',
+    ]
+    return chr(10).join(lines)
 
 
 def _rsc_walled_garden(token: ProvisioningToken) -> str:
@@ -1505,7 +1646,7 @@ def _rsc_remove_router_command_agent() -> str:
 """
 
 
-def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
+def _rsc_notify_server(token: ProvisioningToken) -> str:
     base_url = provision_base_url_for_vpn(token.vpn_type)
     t = token.token
     cert_flag = fetch_certificate_flag_for_url(base_url, token.vpn_type)
@@ -1518,8 +1659,11 @@ def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
     :log info "Provisioning: Server notified -- router registered"
 }} on-error={{
     :log warning "Provisioning: Could not notify server (register manually via admin panel)"
-}}
+}}"""
 
+
+def _rsc_reboot() -> str:
+    return """
 # ---- STEP 10: REBOOT ----
 
 :log info "Provisioning complete! Rebooting in 5 seconds..."
@@ -1557,12 +1701,17 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
         parts.append(_rsc_backup_wireguard(token))
 
     parts.append(_rsc_hotspot(token))
+    parts.append(_rsc_anti_tunnel_lift())
     parts.append(_rsc_login_page(token))
     parts.append(_rsc_walled_garden(token))
     parts.append(_rsc_api_access_hetzner(token) if hetzner else _rsc_api_access())
     parts.append(_rsc_identity_and_user(token))
     parts.append(_rsc_remove_router_command_agent())
-    parts.append(_rsc_notify_and_reboot(token))
+    parts.append(_rsc_notify_server(token))
+    # After /complete: the relay block would reject a RouterOS 6 router's
+    # plain-HTTP /complete to the Cloudflare-fronted backend.
+    parts.append(_rsc_anti_tunnel(token))
+    parts.append(_rsc_reboot())
 
     return "\n".join(parts)
 

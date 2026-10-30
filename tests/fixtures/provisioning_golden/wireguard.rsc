@@ -282,6 +282,12 @@
 
 :log info "Provisioning: Hotspot step complete" 
 
+# ---- STEP 4b: LIFT ANY EXISTING PROXY-RELAY BLOCK UNTIL STEP 9b ----
+# The block also rejects this script's own plain-HTTP fetches (login page,
+# /complete). STEP 9b re-applies it right after the server is notified.
+
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_PROXY_RELAY_BLOCK"] do={ :do { /ip firewall filter remove $i } on-error={} }
+
 # ---- STEP 5: DOWNLOAD CUSTOM LOGIN PAGE ----
 
 :delay 2s
@@ -361,6 +367,28 @@
 } on-error={
     :log warning "Provisioning: Could not notify server (register manually via admin panel)"
 }
+
+# ---- STEP 9b: ANTI-TUNNEL (HTTP Injector / open transparent proxy) ----
+# Only portal + backend may be reached through the hotspot's transparent
+# proxy. See the hotspot-bypass-fix skill before changing these rules.
+
+:foreach i in=[/ip firewall address-list find where list=isp_portal_allow and comment="portal/api/backend allow (anti-tunnel)"] do={ :do { /ip firewall address-list remove $i } on-error={} }
+:do { /ip firewall address-list add list=isp_portal_allow address=203.0.113.10 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+:do { /ip firewall address-list add list=isp_portal_allow address=91.98.238.12 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+:do { /ip firewall address-list add list=isp_portal_allow address=216.198.79.0/24 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+:do { /ip firewall address-list add list=isp_portal_allow address=64.29.17.0/24 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+:do { /ip firewall address-list add list=isp_portal_allow address=76.76.21.0/24 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_PROXY_RELAY_BLOCK"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_ANTI_TUNNEL"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_ANTI_TUNNEL_OTHER"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_ANTI_TUNNEL_DNS"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:do { /ip firewall filter add chain=output protocol=tcp dst-port=80,3128,8080 dst-address-list=!isp_portal_allow dst-address=!192.168.88.0/24 action=reject reject-with=tcp-reset comment="ISP_BILLING_PROXY_RELAY_BLOCK" } on-error={ :log error "Provisioning: could not add ISP_BILLING_PROXY_RELAY_BLOCK" }
+:do { /ip firewall filter add chain=hs-unauth protocol=tcp dst-port=80,443 dst-address=!192.168.88.1 dst-address-list=!isp_portal_allow connection-state=new action=reject reject-with=tcp-reset comment="ISP_BILLING_ANTI_TUNNEL" } on-error={ :log error "Provisioning: could not add ISP_BILLING_ANTI_TUNNEL" }
+:do { /ip firewall filter add chain=hs-unauth protocol=tcp dst-port=!53,80,443 dst-address=!192.168.88.1 action=reject reject-with=tcp-reset comment="ISP_BILLING_ANTI_TUNNEL_OTHER" } on-error={ :log error "Provisioning: could not add ISP_BILLING_ANTI_TUNNEL_OTHER" }
+:do { /ip firewall filter add chain=hs-unauth protocol=udp dst-port=53 dst-address=!192.168.88.1 action=reject reject-with=icmp-net-prohibited comment="ISP_BILLING_ANTI_TUNNEL_DNS" } on-error={ :log error "Provisioning: could not add ISP_BILLING_ANTI_TUNNEL_DNS" }
+
+:log info "Provisioning: anti-tunnel proxy-relay rules applied"
 
 # ---- STEP 10: REBOOT ----
 
