@@ -17,6 +17,8 @@ from sqlalchemy import and_, case, select, delete, func, or_, update
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
 from app.db.database import async_session, db_pool_snapshot
+from app.services.static_ip import normalize_static_ip
+from app.services.usage_push import online_static_count
 from app.db.models import (
     Router,
     Customer,
@@ -3880,12 +3882,41 @@ async def collect_bandwidth_snapshot():
                     # stale combined total (which produced the impossible
                     # "pppoe > total" symptom users were reporting).
                     hotspot_fetch_ok = hotspot_hosts.get("success", False)
+                    active_static_users = None
+                    # Loaded at most once per pass: shared by the static-IP
+                    # count below and the per-queue usage loop.
+                    router_customers = None
                     if hotspot_fetch_ok:
                         active_hotspot_users = hotspot_hosts.get("bypassed", 0) + hotspot_hosts.get("authorized", 0)
+                        # Static-IP customers get in as bypassed hosts; count
+                        # them apart so the dashboard does not call them hotspot.
+                        router_customers = (
+                            await db.execute(
+                                select(Customer)
+                                .options(selectinload(Customer.plan))
+                                .where(Customer.router_id == router_id)
+                            )
+                        ).scalars().all()
+                        static_ips = frozenset(
+                            ip for ip in (
+                                normalize_static_ip(c.static_ip) for c in router_customers
+                                if c.static_ip and c.plan is not None
+                                and c.plan.connection_type == ConnectionType.STATIC_IP
+                            ) if ip
+                        )
+                        active_static_users = online_static_count(
+                            frozenset(
+                                h.get("ip_address") for h in hotspot_hosts.get("data", [])
+                                if h.get("bypassed") and h.get("ip_address")
+                            ),
+                            static_ips,
+                        )
+                        active_hotspot_users = max(0, active_hotspot_users - active_static_users)
                     elif prev:
                         # Carry forward the hotspot-only count, not active_queues
                         # (which already includes the previous PPPoE sample).
                         active_hotspot_users = getattr(prev, "active_hotspot_users", None)
+                        active_static_users = getattr(prev, "active_static_users", None)
                         if active_hotspot_users is None:
                             # Backfill for snapshots written before active_hotspot_users existed.
                             active_hotspot_users = max(0, (prev.active_queues or 0) - 0)
@@ -3899,7 +3930,7 @@ async def collect_bandwidth_snapshot():
                     # active_queues stays as the COMBINED hotspot+PPPoE count to
                     # preserve the historical contract for graphs and other
                     # consumers (see app/api/mikrotik_routes.py bandwidth-history).
-                    active_devices = active_hotspot_users + pppoe_active_count
+                    active_devices = active_hotspot_users + (active_static_users or 0) + pppoe_active_count
 
                     # Snapshot = router HEALTH (interface counters, throughput,
                     # session counts). The per-queue bar fields stay at their
@@ -3914,6 +3945,7 @@ async def collect_bandwidth_snapshot():
                         avg_download_bps=avg_download_bps,
                         active_queues=active_devices,
                         active_hotspot_users=active_hotspot_users,
+                        active_static_users=active_static_users,
                         active_sessions=len(active_sessions.get("data", [])),
                         interface_rx_bytes=total_rx,
                         interface_tx_bytes=total_tx,
@@ -3935,13 +3967,14 @@ async def collect_bandwidth_snapshot():
                         # selectinload plan SELECT, producing hundreds of
                         # repeated reads for larger routers and keeping this
                         # background transaction checked out much longer.
-                        router_customers = (
-                            await db.execute(
-                                select(Customer)
-                                .options(selectinload(Customer.plan))
-                                .where(Customer.router_id == router_id)
-                            )
-                        ).scalars().all()
+                        if router_customers is None:
+                            router_customers = (
+                                await db.execute(
+                                    select(Customer)
+                                    .options(selectinload(Customer.plan))
+                                    .where(Customer.router_id == router_id)
+                                )
+                            ).scalars().all()
                         # MACs the router still meters through an app-made
                         # plan_ queue; their MAC-login queue (if both exist
                         # mid-migration) must not be counted a second time.
