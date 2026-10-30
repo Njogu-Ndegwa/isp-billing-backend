@@ -1477,13 +1477,35 @@ def _rsc_api_access_hetzner(token: ProvisioningToken) -> str:
 
 
 def _rsc_identity_and_user(token: ProvisioningToken) -> str:
+    """Set the identity and add-or-update the backend's API account.
+
+    A router that was in Bitwave before (deleted, then re-provisioned on the
+    same MikroTik) still carries the old `bitwave-api` user. A bare
+    `/user add ... on-error={}` then fails silently and keeps the OLD
+    password, so the app's API login with the new token's password fails
+    (reseller 498, 2026-10-24). Update the existing user instead.
+    """
+    password = routeros_escape(token.router_admin_password)
+    params = f'password="{password}" group=full disabled=no comment="Bitwave backend API account"'
     return f"""
 # ---- STEP 8: CREATE API SERVICE ACCOUNT & SET IDENTITY ----
 
 /system identity set name={token.identity}
-:do {{ /user add name={API_USERNAME} password="{token.router_admin_password}" group=full comment="Bitwave backend API account" }} on-error={{}}
+# add-or-update: on a re-provisioned router the user already exists and must
+# take this script's password, or the backend cannot log in to the API.
+:do {{
+    :if ([:len [/user find where name="{API_USERNAME}"]] = 0) do={{
+        /user add name="{API_USERNAME}" {params}
+        :log info "Provisioning: API user {API_USERNAME} created"
+    }} else={{
+        /user set [find where name="{API_USERNAME}"] {params}
+        :log info "Provisioning: API user {API_USERNAME} already existed -- password updated"
+    }}
+}} on-error={{
+    :log warning "Provisioning: could not create or update API user {API_USERNAME}"
+}}
 
-:log info "Provisioning: Identity set to {token.identity}, API user created" """
+:log info "Provisioning: Identity set to {token.identity}, API user ready" """
 
 
 def _rsc_remove_router_command_agent() -> str:
