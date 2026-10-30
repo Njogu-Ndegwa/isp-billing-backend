@@ -40,6 +40,14 @@ def _router537(**overrides):
     return FakeLBAPI(**kwargs)
 
 
+def _router537_renumbered(**overrides):
+    """Router 537 after the fix the guard asks for: modem B moved to 192.168.101.1."""
+    kwargs = dict(hotspot_hosts=[{"mac-address": MODEM_MAC, "address": "192.168.101.1",
+                                  "to-address": "192.168.88.151"}])
+    kwargs.update(overrides)
+    return _router537(**kwargs)
+
+
 def _on_dhcp_add(api, lease):
     original = api.send_command
 
@@ -180,15 +188,15 @@ def test_rollback_on_ros6_removes_everything():
 # --- modem already on the would-be WAN port ---------------------------------------
 
 def test_preflight_treats_foreign_ip_modem_on_lan_port_as_upstream():
-    report = mikrotik_lb.lb_preflight(_router537(), ["ether1", "ether2"])
+    report = mikrotik_lb.lb_preflight(_router537_renumbered(), ["ether1", "ether2"])
     assert report["blockers"] == []
     assert report["per_port"]["ether2"]["upstream_devices"] == [
-        {"mac": MODEM_MAC, "addresses": ["192.168.100.1"]}]
+        {"mac": MODEM_MAC, "addresses": ["192.168.101.1"]}]
     assert any("modem" in w for w in report["warnings"])
 
 
 def test_modem_host_entry_blinking_out_is_retried():
-    api = _router537(hotspot_hosts=[])
+    api = _router537_renumbered(hotspot_hosts=[])
     original = api._print
     calls = {"n": 0}
 
@@ -196,7 +204,7 @@ def test_modem_host_entry_blinking_out_is_retried():
         if command == "/ip/hotspot/host/print":
             calls["n"] += 1
             if calls["n"] >= 2:  # back on the second read
-                api.hotspot_hosts = [{"mac-address": MODEM_MAC, "address": "192.168.100.1",
+                api.hotspot_hosts = [{"mac-address": MODEM_MAC, "address": "192.168.101.1",
                                       "to-address": "192.168.88.151"}]
         return original(command)
 
@@ -228,40 +236,78 @@ def test_preflight_blocks_silent_device_with_no_known_address():
 
 # --- convert on v6 ------------------------------------------------------------------
 
-def test_router537_end_to_end_shared_subnet_switches_to_direct_routes():
+def test_router537_shared_subnet_is_refused_before_any_change():
+    """Both modems answer on 192.168.100.1: the convert that cut router 537's
+    management must now stop before touching the router."""
     api = _router537()
     wans = ["ether1", "ether2"]
-    assert mikrotik_lb.lb_apply(api, wans)["route_mode"] == "recursive"
-
+    mikrotik_lb.lb_apply(api, wans)
+    before = len(api.commands)
     _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
                        "address": "192.168.100.14/24"})
     report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1",
                                          wan_ports=wans)
 
-    assert report["success"] is True, report["steps"]
+    assert report["success"] is False
+    assert report["aborted"] == (
+        "Your second line uses the same IP range as the first (192.168.100.x). "
+        "Change the second modem's LAN IP (e.g. to 192.168.101.1) and try again.")
+    assert report["subnet_clash"]["detected_by"] == "upstream_device"
+    assert report["subnet_clash"]["clashes_with"] == "ether1"
+    assert [c for c, _ in api.commands[before:] if c != "/ping"] == []
+    assert any(p["interface"] == "ether2" for p in api.bridge_ports)
+
+
+def test_preflight_blocks_router537_shared_subnet():
+    report = mikrotik_lb.lb_preflight(_router537(), ["ether1", "ether2"])
+    assert report["success"] is False
+    assert any("same IP range as the first (192.168.100.x)" in b
+               for b in report["blockers"])
+    assert report["per_port"]["ether2"]["subnet_clash"]["network"] == "192.168.100.0/24"
+
+
+def test_apply_ros6_on_router_already_sharing_a_subnet_keeps_direct_routes():
+    """Routers converted before the guard existed keep working on re-apply."""
+    api = FakeLBAPI(ros_version=V6, dhcp_clients=[
+        {"interface": "ether1", "status": "bound", "gateway": "192.168.100.1",
+         "address": "192.168.100.9/24"},
+        {"interface": "ether2", "status": "bound", "gateway": "192.168.100.1",
+         "address": "192.168.100.14/24"},
+    ])
+    report = mikrotik_lb.lb_apply(api, ["ether1", "ether2"])
     assert report["route_mode"] == "direct"
-    assert _commands(api, "/interface/bridge/port/remove") == [{".id": "*B2"}]
     routes = _managed_routes(api)
-    # no recursive probes left — both modems are 192.168.100.1, so only the
-    # interface pin tells the lines apart
     assert not [c for c in routes if c.endswith("_PROBE")]
     assert routes["ISP_BILLING_DUAL_WAN_PRIMARY_CHECKED"]["gateway"] == "192.168.100.1%ether1"
     assert routes["ISP_BILLING_DUAL_WAN_BACKUP_CHECKED"]["gateway"] == "192.168.100.1%ether2"
-    assert routes["ISP_BILLING_DUAL_WAN_BACKUP_CHECKED"]["distance"] == "2"
-    assert routes["ISP_BILLING_PCC_WAN1"]["gateway"] == "192.168.100.1%ether1"
-    assert routes["ISP_BILLING_PCC_WAN1_FALLBACK"]["gateway"] == "192.168.100.1%ether2"
     assert routes["ISP_BILLING_PCC_WAN2"]["gateway"] == "192.168.100.1%ether2"
-    assert routes["ISP_BILLING_PCC_WAN2"]["routing-mark"] == "to_wan2"
     assert routes["ISP_BILLING_PCC_WAN2_FALLBACK"]["gateway"] == "192.168.100.1%ether1"
-    assert all(r["check-gateway"] == "ping" for r in routes.values())
-    assert any("own LAN subnet" in w for w in report["warnings"])
+
+
+def test_router537_renumbered_end_to_end_keeps_recursive_failover():
+    api = _router537_renumbered()
+    wans = ["ether1", "ether2"]
+    assert mikrotik_lb.lb_apply(api, wans)["route_mode"] == "recursive"
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.101.1",
+                       "address": "192.168.101.20/24"})
+    report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1",
+                                         wan_ports=wans)
+    assert report["success"] is True, report["steps"]
+    assert report["route_mode"] == "recursive"
+    assert _commands(api, "/interface/bridge/port/remove") == [{".id": "*B2"}]
+    routes = _managed_routes(api)
+    assert routes["ISP_BILLING_DUAL_WAN_ETHER2_PROBE"]["gateway"] == "192.168.101.1"
+    assert routes["ISP_BILLING_DUAL_WAN_ETHER2_PROBE"]["dst-address"] == "1.1.1.1/32"
+    assert routes["ISP_BILLING_DUAL_WAN_BACKUP_CHECKED"]["gateway"] == "1.1.1.1"
+    assert routes["ISP_BILLING_PCC_WAN2"]["routing-mark"] == "to_wan2"
+    assert not any("own LAN subnet" in w for w in report["warnings"])
     assert _commands(api, "/interface/list/member/add") == [
         {"list": "WAN", "interface": "ether2"}]
 
     # verify maps each WAN mark to its port despite v6 proplist truncation
     api.connections = [
         {"connection-mark": "WAN1_conn", "reply-dst-address": "192.168.100.9:5000"},
-        {"connection-mark": "WAN2_conn", "reply-dst-address": "192.168.100.14:5001"},
+        {"connection-mark": "WAN2_conn", "reply-dst-address": "192.168.101.20:5001"},
     ]
     verify = mikrotik_lb.lb_verify(api)
     assert verify["flow_attribution"] == {
@@ -270,33 +316,45 @@ def test_router537_end_to_end_shared_subnet_switches_to_direct_routes():
     }
 
 
-def test_convert_ros6_separate_subnets_keeps_recursive_failover():
-    api = _router537()
-    wans = ["ether1", "ether2"]
-    mikrotik_lb.lb_apply(api, wans)
-    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.101.1",
-                       "address": "192.168.101.20/24"})
+def _free_port_537(**overrides):
+    """ether2 already out of the bridge, nothing learned on it yet."""
+    return _router537(bridge_ports=[], bridge_hosts=[], hotspot_hosts=[], **overrides)
+
+
+def test_free_port_arp_probe_refuses_before_any_change_ros6():
+    api = _free_port_537(arp_replies={("ether2", "192.168.100.1")})
     report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1",
-                                         wan_ports=wans)
-    assert report["route_mode"] == "recursive"
-    routes = _managed_routes(api)
-    assert routes["ISP_BILLING_DUAL_WAN_ETHER2_PROBE"]["gateway"] == "192.168.101.1"
-    assert routes["ISP_BILLING_DUAL_WAN_ETHER2_PROBE"]["dst-address"] == "1.1.1.1/32"
-    assert routes["ISP_BILLING_DUAL_WAN_BACKUP_CHECKED"]["gateway"] == "1.1.1.1"
-    assert not any("own LAN subnet" in w for w in report["warnings"])
+                                         wan_ports=["ether1", "ether2"])
+    assert report["subnet_clash"]["detected_by"] == "arp_probe"
+    assert "192.168.100.x" in report["aborted"]
+    assert [c for c, _ in api.commands if c != "/ping"] == []
+    probe = _commands(api, "/ping")[0]
+    assert probe["arp-ping"] == "yes" and probe["interface"] == "ether2"
 
 
-def test_convert_warns_on_identical_wan_addresses():
-    api = _router537()
+def test_lease_time_overlap_is_rolled_back_ros6():
+    """No probe answered, but the lease lands in WAN1's range: undo at once."""
+    api = _free_port_537()
     _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
-                       "address": "192.168.100.9/24"})
-    report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
-    assert any("same address" in w for w in report["warnings"])
+                       "address": "192.168.100.14/24"})
+    report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1",
+                                         wan_ports=["ether1", "ether2"])
+    assert report["success"] is False
+    assert report["subnet_clash"]["detected_by"] == "lease"
+    assert "192.168.100.x" in report["aborted"]
+    assert report["reverted"] is True
+    assert _commands(api, "/ip/dhcp-client/remove") == [{".id": "*D9"}]
+    assert not any(d["interface"] == "ether2" for d in api.dhcp_clients)
+    assert not any(m["interface"] == "ether2" for m in api.list_members)
+    assert _commands(api, "/ip/route/add") == []
+    # the DHCP client is the first thing undone
+    writes = [c for c, _ in api.commands if c != "/ping"]
+    assert writes[writes.index("/ip/dhcp-client/add") + 1] == "/ip/dhcp-client/remove"
 
 
 def test_convert_reverts_modem_port_when_dhcp_never_binds(monkeypatch):
     monkeypatch.setattr(mikrotik_lb, "LB_CONVERT_DHCP_BIND_ATTEMPTS", 2)
-    api = _router537()
+    api = _router537_renumbered()
     _on_dhcp_add(api, {"status": "searching"})
     report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
 
@@ -330,17 +388,17 @@ PIN = "ISP_BILLING_MGMT_PIN_91_98_238_12"
 
 def test_v6_dhcp_client_is_created_enabled():
     """v6 creates /ip dhcp-client entries DISABLED unless told otherwise."""
-    api = _router537()
-    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
-                       "address": "192.168.100.3/24"})
+    api = _router537_renumbered()
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.101.1",
+                       "address": "192.168.101.3/24"})
     mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
     assert _commands(api, "/ip/dhcp-client/add")[0]["disabled"] == "no"
 
 
 def test_masquerade_coverage_lands_before_the_port_gets_an_address():
-    api = _router537()
-    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
-                       "address": "192.168.100.3/24"})
+    api = _router537_renumbered()
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.101.1",
+                       "address": "192.168.101.3/24"})
     mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
     order = [c for c, _ in api.commands
              if c in ("/interface/list/member/add", "/ip/dhcp-client/add")]
@@ -348,7 +406,7 @@ def test_masquerade_coverage_lands_before_the_port_gets_an_address():
 
 
 def test_mgmt_tunnel_pinned_to_wan1_on_apply_then_gets_wan2_fallback():
-    api = _router537()
+    api = _router537_renumbered()
     wans = ["ether1", "ether2"]
     mikrotik_lb.lb_apply(api, wans)
     routes = _managed_routes(api)
@@ -357,12 +415,12 @@ def test_mgmt_tunnel_pinned_to_wan1_on_apply_then_gets_wan2_fallback():
                            "check-gateway": "ping"}
     assert PIN + "_FALLBACK" not in routes  # WAN2 not bound yet
 
-    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
-                       "address": "192.168.100.3/24"})
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.101.1",
+                       "address": "192.168.101.3/24"})
     mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1", wan_ports=wans)
     routes = _managed_routes(api)
     assert routes[PIN]["gateway"] == "192.168.100.1%ether1"
-    assert routes[PIN + "_FALLBACK"]["gateway"] == "192.168.100.1%ether2"
+    assert routes[PIN + "_FALLBACK"]["gateway"] == "192.168.101.1%ether2"
     assert routes[PIN + "_FALLBACK"]["distance"] == "2"
 
 
@@ -377,7 +435,7 @@ def test_disabled_or_hostname_tunnels_are_not_pinned():
 
 def test_revert_also_removes_the_wan_list_membership(monkeypatch):
     monkeypatch.setattr(mikrotik_lb, "LB_CONVERT_DHCP_BIND_ATTEMPTS", 2)
-    api = _router537()
+    api = _router537_renumbered()
     _on_dhcp_add(api, {"status": "searching"})
     report = mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
     assert report["reverted"] is True
@@ -385,7 +443,7 @@ def test_revert_also_removes_the_wan_list_membership(monkeypatch):
 
 
 def test_rollback_removes_mgmt_pins():
-    api = _router537()
+    api = _router537_renumbered()
     mikrotik_lb.lb_apply(api, ["ether1", "ether2"])
     assert PIN in _managed_routes(api)
     mikrotik_lb.lb_rollback(api)
