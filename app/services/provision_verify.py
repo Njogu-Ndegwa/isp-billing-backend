@@ -13,7 +13,10 @@ What happens now: /complete (the router registered) schedules
 post-registration installers go first) it logs in over the management tunnel
 and runs a read-only checklist:
 
-* hotspot enabled on the LAN bridge;
+* hotspot enabled on the LAN bridge -- or, on a router set up for PPPoE
+  (``dual_ports``/``pppoe_ports`` set, or a PPPoE server on the LAN bridge,
+  e.g. router 674 converted on 2026-10-30), the PPPoE server, its profile and
+  address pool, and the masquerade NAT instead;
 * WAN: DHCP client on ether1 bound, or an active default route;
 * DNS resolves (one plain-HTTP fetch by host name from the router);
 * management tunnel reachable (the API login itself proves it);
@@ -87,19 +90,26 @@ JOB_RESAMPLE_SECONDS = 10
 JOB_REMOVE_SETTLE_SECONDS = 5
 
 CHECK_HOTSPOT = "hotspot"
+CHECK_PPPOE_SERVER = "pppoe_server"
+CHECK_PPPOE_POOL = "pppoe_pool"
+CHECK_NAT = "nat"
 CHECK_WAN = "wan"
 CHECK_DNS = "dns"
 CHECK_TUNNEL = "mgmt_tunnel"
 CHECK_PUSH = "usage_push"
 CHECK_JOBS = "stuck_jobs"
 CHECK_CPU = "cpu"
-CHECK_ORDER = (CHECK_TUNNEL, CHECK_WAN, CHECK_DNS, CHECK_HOTSPOT, CHECK_JOBS, CHECK_CPU, CHECK_PUSH)
+CHECK_ORDER = (CHECK_TUNNEL, CHECK_WAN, CHECK_DNS, CHECK_HOTSPOT, CHECK_PPPOE_SERVER, CHECK_PPPOE_POOL,
+               CHECK_NAT, CHECK_JOBS, CHECK_CPU, CHECK_PUSH)
+MODE_HOTSPOT = "hotspot"
+MODE_PPPOE = "pppoe"
 
 # Faults the reseller can see / act on. usage_push is ours: recorded, logged,
 # never put in front of the reseller (customers work without it).
-RESELLER_CHECKS = (CHECK_TUNNEL, CHECK_WAN, CHECK_DNS, CHECK_HOTSPOT, CHECK_JOBS, CHECK_CPU)
+RESELLER_CHECKS = (CHECK_TUNNEL, CHECK_WAN, CHECK_DNS, CHECK_HOTSPOT, CHECK_PPPOE_SERVER,
+                   CHECK_PPPOE_POOL, CHECK_NAT, CHECK_JOBS, CHECK_CPU)
 # Faults that will not clear by waiting: two attempts in a row -> tell now.
-STABLE_CHECKS = (CHECK_WAN, CHECK_DNS, CHECK_HOTSPOT)
+STABLE_CHECKS = (CHECK_WAN, CHECK_DNS, CHECK_HOTSPOT, CHECK_PPPOE_SERVER, CHECK_PPPOE_POOL, CHECK_NAT)
 # The only faults the auto-fix may act on.
 AUTO_FIX_CHECKS = (CHECK_JOBS, CHECK_CPU)
 
@@ -133,6 +143,64 @@ def check_hotspot(hotspots: list) -> dict:
         return _check(False, f"hotspot on {HOTSPOT_BRIDGE} is disabled or invalid")
     others = sorted({h.get("interface") or "?" for h in hotspots})
     return _check(False, f"no hotspot on {HOTSPOT_BRIDGE}" + (f" (found on {', '.join(others)})" if others else ""))
+
+
+def access_mode(router: dict, pppoe_servers: list) -> str:
+    """PPPoE when the router was set up for it (DB ports) or serves PPPoE on the LAN bridge."""
+    if router.get("dual_ports") or router.get("pppoe_ports"):
+        return MODE_PPPOE
+    if any(p.get("interface") == HOTSPOT_BRIDGE and p.get("disabled") != "true" for p in pppoe_servers):
+        return MODE_PPPOE
+    return MODE_HOTSPOT
+
+
+def _enabled_pppoe_servers(pppoe_servers: list) -> list:
+    return [p for p in pppoe_servers if p.get("disabled") != "true"]
+
+
+def check_pppoe_server(pppoe_servers: list) -> dict:
+    live = _enabled_pppoe_servers(pppoe_servers)
+    if live:
+        desc = ", ".join(f"{p.get('service-name') or '?'} on {p.get('interface') or '?'}" for p in live[:3])
+        return _check(True, f"PPPoE server running: {desc}")
+    if pppoe_servers:
+        return _check(False, "PPPoE server is disabled")
+    return _check(False, "no PPPoE server")
+
+
+def check_pppoe_pool(pppoe_servers: list, profiles: list, pools: list) -> dict:
+    """The server's default profile must exist with a local address and a remote pool/address."""
+    live = _enabled_pppoe_servers(pppoe_servers)
+    if not live:
+        return _check(False, "no running PPPoE server to check the profile of")
+    by_name = {p.get("name"): p for p in profiles}
+    pool_names = {p.get("name") for p in pools}
+    problems = []
+    for server in live:
+        name = server.get("default-profile") or "default"
+        prof = by_name.get(name)
+        if prof is None:
+            problems.append(f"profile {name} missing")
+            continue
+        remote = prof.get("remote-address") or ""
+        mine = []
+        if not prof.get("local-address"):
+            mine.append(f"profile {name} has no local address")
+        if not remote:
+            mine.append(f"profile {name} has no remote address/pool")
+        elif remote[0].isalpha() and remote not in pool_names:
+            mine.append(f"pool {remote} (profile {name}) missing")
+        if not mine:
+            return _check(True, f"profile {name}: local {prof.get('local-address')}, remote {remote}")
+        problems.extend(mine)
+    return _check(False, "; ".join(problems) or "PPPoE profile not usable")
+
+
+def check_nat(nat_rules: list) -> dict:
+    for r in nat_rules:
+        if r.get("chain") == "srcnat" and r.get("action") == "masquerade" and r.get("disabled") != "true":
+            return _check(True, f"masquerade on {r.get('out-interface') or r.get('src-address') or 'all'}")
+    return _check(False, "no enabled masquerade NAT rule")
 
 
 def check_wan(dhcp_clients: list, routes: list) -> dict:
@@ -269,7 +337,15 @@ def check_router(router: dict, *, remediate: bool = False, allow_reboot: bool = 
         result.update(board=res.get("board-name"), ros=res.get("version"), arch=arch)
 
         jobs_first = _data(c("/system/script/job/print"))
-        checks[CHECK_HOTSPOT] = check_hotspot(_data(c("/ip/hotspot/print")))
+        pppoe_servers = _data(c("/interface/pppoe-server/server/print"))
+        result["mode"] = access_mode(router, pppoe_servers)
+        if result["mode"] == MODE_PPPOE:
+            checks[CHECK_PPPOE_SERVER] = check_pppoe_server(pppoe_servers)
+            checks[CHECK_PPPOE_POOL] = check_pppoe_pool(pppoe_servers, _data(c("/ppp/profile/print")),
+                                                        _data(c("/ip/pool/print")))
+            checks[CHECK_NAT] = check_nat(_data(c("/ip/firewall/nat/print")))
+        else:
+            checks[CHECK_HOTSPOT] = check_hotspot(_data(c("/ip/hotspot/print")))
         checks[CHECK_WAN] = check_wan(_data(c("/ip/dhcp-client/print")), _data(c("/ip/route/print")))
         checks[CHECK_DNS] = check_dns(c("/tool/fetch", {"url": DNS_PROBE_URL, "output": "user",
                                                        "as-value": ""}))
@@ -339,6 +415,12 @@ _ADVICE = {
                 "check that your internet line works, then restart the router once"),
     CHECK_HOTSPOT: ("The hotspot is not running, so customers will not see the login page",
                     "paste the setup command into the WinBox terminal again"),
+    CHECK_PPPOE_SERVER: ("The PPPoE server is not running, so PPPoE customers cannot connect",
+                         "contact Bitwave support to re-run the PPPoE setup for this router"),
+    CHECK_PPPOE_POOL: ("The PPPoE settings are incomplete (profile or address pool missing)",
+                       "contact Bitwave support to re-run the PPPoE setup for this router"),
+    CHECK_NAT: ("Customers will connect but get no internet (NAT rule missing)",
+                "contact Bitwave support to re-run the setup for this router"),
     CHECK_JOBS: ("The setup command is still stuck in the WinBox terminal",
                  "close WinBox and restart the router once"),
     CHECK_CPU: ("The router is very busy (CPU above 90%)",
@@ -349,6 +431,9 @@ _SMS_SHORT = {
     CHECK_WAN: "no internet on port 1",
     CHECK_DNS: "cannot look up websites",
     CHECK_HOTSPOT: "hotspot not running",
+    CHECK_PPPOE_SERVER: "PPPoE server not running",
+    CHECK_PPPOE_POOL: "PPPoE settings incomplete",
+    CHECK_NAT: "no internet for customers (NAT)",
     CHECK_JOBS: "setup stuck in WinBox",
     CHECK_CPU: "CPU too busy",
 }
@@ -357,7 +442,8 @@ _SMS_SHORT = {
 def render_message(name: str, status: str, result: dict) -> tuple[str, str, str]:
     """(subject, inbox body, sms body)."""
     if status in PASSED_STATUSES:
-        body = (f"Bitwave: your router '{name}' is set up correctly. Hotspot, internet and the "
+        access = "PPPoE" if result.get("mode") == MODE_PPPOE else "Hotspot"
+        body = (f"Bitwave: your router '{name}' is set up correctly. {access}, internet and the "
                 f"Bitwave connection all checked OK. Customers can now connect and pay.")
         return f"Router set up: {name}", body, body
     keys = faults(result.get("checks") or {}) or [CHECK_TUNNEL]
@@ -415,6 +501,7 @@ async def _load_router(router_id: int) -> Optional[dict]:
         info = None if r is None else {
             "id": r.id, "name": r.name, "identity": r.identity, "ip_address": r.ip_address,
             "username": r.username, "password": r.password, "port": r.port,
+            "dual_ports": r.dual_ports or [], "pppoe_ports": r.pppoe_ports or [],
         }
         await db.commit()
     return info

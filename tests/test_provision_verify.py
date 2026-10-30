@@ -158,10 +158,13 @@ def test_cpu_check_needs_every_sample_pegged():
 
 class FakeAPI:
     def __init__(self, *, up=True, identity="Router-1001", hotspot=True, wan=True, dns=True,
-                 push=True, cpu=12, stuck=False, job_removal_works=True, arch="mipsbe"):
+                 push=True, cpu=12, stuck=False, job_removal_works=True, arch="mipsbe",
+                 pppoe_servers=(), profiles=(), pools=(), nat=()):
         self.up, self.identity, self.arch = up, identity, arch
         self.hotspot, self.wan, self.dns, self.push = hotspot, wan, dns, push
         self.cpu, self.stuck, self.job_removal_works = cpu, stuck, job_removal_works
+        self.pppoe_servers, self.profiles, self.pools, self.nat = (
+            list(pppoe_servers), list(profiles), list(pools), list(nat))
         self.calls: list = []
         self.rebooted = False
 
@@ -188,7 +191,16 @@ class FakeAPI:
             return ok([{"cpu-load": str(self.cpu), "board-name": "RB951Ui-2HnD", "version": "7.12.1",
                         "architecture-name": self.arch}])
         if path == "/ip/hotspot/print":
-            return ok([{"name": "hotspot1", "interface": "bridge", "disabled": "false"}] if self.hotspot else [])
+            return ok([{"name": "hotspot1", "interface": "bridge",
+                        "disabled": "false" if self.hotspot else "true"}])
+        if path == "/interface/pppoe-server/server/print":
+            return ok(self.pppoe_servers)
+        if path == "/ppp/profile/print":
+            return ok(self.profiles)
+        if path == "/ip/pool/print":
+            return ok(self.pools)
+        if path == "/ip/firewall/nat/print":
+            return ok(self.nat)
         if path == "/ip/dhcp-client/print":
             return ok([{"interface": "ether1", "status": "bound" if self.wan else "searching..."}])
         if path == "/ip/route/print":
@@ -475,3 +487,94 @@ async def test_router_without_a_token_has_no_grace(db, sms_calls):
     router = await make_router(db, owner, status_alerts_enabled=True)
     subject, body = oa.render_cpu_alert(router.name, oa.LEVEL_WARNING, 97)
     assert await oa.send_overload_alert(router.id, oa.LEVEL_WARNING, subject, body, setup_grace=True) is True
+
+
+# ---------------------------------------------------------------------------
+# 6. PPPoE routers: check PPPoE instead of the hotspot (router 674, 2026-10-30)
+# ---------------------------------------------------------------------------
+
+PPPOE_ON_BRIDGE = [{"service-name": "pppoe-dual-bridge", "interface": "bridge", "disabled": "false",
+                    "default-profile": "bw-pppoe"}]
+PPPOE_PROFILE = [{"name": "default"}, {"name": "bw-pppoe", "local-address": "10.10.0.1",
+                                        "remote-address": "bw-pppoe-pool"}]
+PPPOE_POOL = [{"name": "dhcp-pool"}, {"name": "bw-pppoe-pool", "ranges": "10.10.0.10-10.10.3.254"}]
+MASQ = [{"chain": "srcnat", "action": "masquerade", "out-interface": "ether1", "disabled": "false"}]
+
+
+def _pppoe_api(**kw):
+    base = dict(hotspot=False, pppoe_servers=PPPOE_ON_BRIDGE, profiles=PPPOE_PROFILE, pools=PPPOE_POOL,
+                nat=MASQ)
+    base.update(kw)
+    return FakeAPI(**base)
+
+
+def test_access_mode():
+    assert pv.access_mode({"dual_ports": ["ether2", "ether3"]}, []) == pv.MODE_PPPOE
+    assert pv.access_mode({"pppoe_ports": ["ether5"]}, []) == pv.MODE_PPPOE
+    assert pv.access_mode({}, PPPOE_ON_BRIDGE) == pv.MODE_PPPOE
+    assert pv.access_mode({}, [{"interface": "bridge", "disabled": "true"}]) == pv.MODE_HOTSPOT
+    assert pv.access_mode({}, [{"interface": "ether5", "disabled": "false"}]) == pv.MODE_HOTSPOT
+    assert pv.access_mode({"dual_ports": []}, []) == pv.MODE_HOTSPOT
+
+
+def test_pppoe_checks():
+    assert pv.check_pppoe_server(PPPOE_ON_BRIDGE)["ok"] is True
+    assert pv.check_pppoe_server([{"interface": "bridge", "disabled": "true"}])["ok"] is False
+    assert pv.check_pppoe_server([])["ok"] is False
+    assert pv.check_pppoe_pool(PPPOE_ON_BRIDGE, PPPOE_PROFILE, PPPOE_POOL)["ok"] is True
+    no_pool = pv.check_pppoe_pool(PPPOE_ON_BRIDGE, PPPOE_PROFILE, [{"name": "dhcp-pool"}])
+    assert no_pool["ok"] is False and "bw-pppoe-pool" in no_pool["detail"]
+    no_local = pv.check_pppoe_pool(PPPOE_ON_BRIDGE, [{"name": "bw-pppoe", "remote-address": "bw-pppoe-pool"}],
+                                   PPPOE_POOL)
+    assert no_local["ok"] is False and "local address" in no_local["detail"]
+    assert pv.check_pppoe_pool(PPPOE_ON_BRIDGE, [{"name": "default"}], PPPOE_POOL)["ok"] is False
+    # A literal remote address needs no pool.
+    literal = [{"name": "bw-pppoe", "local-address": "10.10.0.1", "remote-address": "10.10.0.2"}]
+    assert pv.check_pppoe_pool(PPPOE_ON_BRIDGE, literal, [])["ok"] is True
+    assert pv.check_nat(MASQ)["ok"] is True
+    assert pv.check_nat([{**MASQ[0], "disabled": "true"}])["ok"] is False
+    assert pv.check_nat([{"chain": "dstnat", "action": "dst-nat"}])["ok"] is False
+
+
+def test_router_674_pppoe_conversion_passes_with_hotspot_disabled():
+    api = _pppoe_api()
+    router = {**ROUTER, "dual_ports": ["ether2", "ether3", "ether4", "ether5"]}
+    res = pv.check_router(router, api_factory=api, sleep=lambda s: None)
+    assert res["mode"] == pv.MODE_PPPOE
+    assert pv.CHECK_HOTSPOT not in res["checks"]
+    assert {pv.CHECK_PPPOE_SERVER, pv.CHECK_PPPOE_POOL, pv.CHECK_NAT} <= set(res["checks"])
+    assert pv.verdict(res) == pv.STATUS_PASSED
+    assert "/ip/hotspot/print" not in [p for p, _ in api.calls]
+    _, body, _ = pv.render_message("Kamau Net #1", pv.STATUS_PASSED, res)
+    assert "PPPoE, internet" in body
+
+
+def test_pppoe_on_bridge_is_detected_without_db_ports():
+    res = pv.check_router(ROUTER, api_factory=_pppoe_api(), sleep=lambda s: None)
+    assert res["mode"] == pv.MODE_PPPOE and pv.verdict(res) == pv.STATUS_PASSED
+
+
+def test_broken_pppoe_setup_is_reported_in_plain_language():
+    api = _pppoe_api(pools=[{"name": "dhcp-pool"}], nat=[])
+    res = pv.check_router({**ROUTER, "dual_ports": ["ether2"]}, api_factory=api, sleep=lambda s: None)
+    assert pv.faults(res["checks"]) == [pv.CHECK_PPPOE_POOL, pv.CHECK_NAT]
+    _, body, sms = pv.render_message("Kamau Net #1", pv.verdict(res), res)
+    assert "PPPoE settings are incomplete" in body and "NAT rule missing" in body
+    assert "PPPoE settings incomplete" in sms
+
+
+def test_hotspot_router_still_checks_the_hotspot():
+    res = pv.check_router(ROUTER, api_factory=FakeAPI(hotspot=False), sleep=lambda s: None)
+    assert res["mode"] == pv.MODE_HOTSPOT
+    assert pv.faults(res["checks"]) == [pv.CHECK_HOTSPOT]
+
+
+async def test_dual_ports_from_the_db_switch_the_check_to_pppoe(db, sms_calls):
+    owner, router = await _setup(db)
+    r = await db.get(Router, router.id)
+    r.dual_ports = ["ether2", "ether3", "ether4", "ether5"]
+    await db.commit()
+    api = _pppoe_api(pppoe_servers=[{**PPPOE_ON_BRIDGE[0], "interface": "pppoe-dual-bridge"}])
+    res = await pv.verify_after_provisioning(router.id, sleep=_nosleep, check=_scripted(api))
+    assert res["mode"] == pv.MODE_PPPOE and res["status"] == pv.STATUS_PASSED
+    assert "PPPoE, internet" in (await _inbox(db, owner.id))[0].body
