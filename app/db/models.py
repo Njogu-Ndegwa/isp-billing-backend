@@ -1255,6 +1255,15 @@ class ProvisioningToken(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     provisioned_at = Column(DateTime, nullable=True)
     router_id = Column(Integer, ForeignKey("routers.id"), nullable=True)
+    # Post-provision check (app/services/provision_verify.py), run over the
+    # management tunnel after /complete: "pending" | "passed" |
+    # "passed_with_warnings" | "failed" | "unreachable". NULL = never run
+    # (tokens provisioned before the check existed). setup_check_result holds
+    # the checklist, attempts, any auto-fix and whether the reseller was told.
+    # Kept here, not on the hot `routers` summary row.
+    setup_check_status = Column(String(24), nullable=True)
+    setup_check_at = Column(DateTime, nullable=True)
+    setup_check_result = Column(JSON, nullable=True)
 
 
 class RouterLogSeverity(str, enum.Enum):

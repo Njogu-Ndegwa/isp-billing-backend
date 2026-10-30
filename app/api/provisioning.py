@@ -296,6 +296,13 @@ async def complete_provision(
 
     schedule_enrol_after_provisioning(router_obj.id)
 
+    # Setup check: a few minutes later, check the router over its management
+    # tunnel (hotspot, WAN, DNS, tunnel, usage push, stuck jobs, CPU) and tell
+    # the reseller "set up correctly" or what to fix.
+    from app.services.provision_verify import schedule_verify_after_provisioning
+
+    schedule_verify_after_provisioning(router_obj.id)
+
     return {
         "status": "provisioned",
         "router_id": router_obj.id,
