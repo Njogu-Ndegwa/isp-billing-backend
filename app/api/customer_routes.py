@@ -1022,6 +1022,18 @@ async def delete_customer(
         await db.execute(delete(CustomerUsageBucket).where(CustomerUsageBucket.customer_id == customer_id))
         await db.execute(delete(UsageCapWatchState).where(UsageCapWatchState.customer_id == customer_id))
         await db.execute(delete(ProvisioningLog).where(ProvisioningLog.customer_id == customer_id))
+        # A log can point at this customer's attempt while carrying another
+        # (or no) customer_id, so the delete above misses it and the attempt
+        # delete fails on fk_provisioning_logs_attempt_id. Those logs are not
+        # this customer's to delete: keep them and drop only the attempt link,
+        # as the router delete does.
+        await db.execute(
+            update(ProvisioningLog)
+            .where(ProvisioningLog.attempt_id.in_(
+                select(ProvisioningAttempt.id).where(ProvisioningAttempt.customer_id == customer_id)
+            ))
+            .values(attempt_id=None)
+        )
         await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.customer_id == customer_id))
         await db.execute(delete(DevicePairing).where(DevicePairing.customer_id == customer_id))
         await db.execute(delete(ReconnectionAttempt).where(ReconnectionAttempt.customer_id == customer_id))
