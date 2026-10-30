@@ -981,7 +981,7 @@ def _rsc_vpn_l2tp(token: ProvisioningToken) -> str:
 # Verify L2TP connected and got the expected IP
 :local l2tpRunning [:len [/interface l2tp-client find where name=l2tp-aws running=yes]]
 :if ($l2tpRunning = 0) do={{
-    :log warning "Provisioning: L2TP tunnel not yet connected -- will retry on reboot"
+    :log warning "Provisioning: L2TP tunnel not yet connected -- it keeps retrying on its own"
 }} else={{
     :log info "Provisioning: L2TP tunnel connected"
 }}"""
@@ -1505,7 +1505,21 @@ def _rsc_remove_router_command_agent() -> str:
 """
 
 
-def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
+def _rsc_notify_and_finish(token: ProvisioningToken) -> str:
+    """Tell the server the router is set up, then let the import END.
+
+    There is deliberately no reboot here any more. The script used to finish
+    with ``:delay 5s`` + ``/system reboot``, but the reseller runs this import
+    from the WinBox terminal, and in that interactive context the reboot never
+    happened: the import stayed a running ``/system script job`` owned by admin
+    and the console sat at ~95% CPU (routers 673 RB951Ui-2HnD 7.12.1 and 674
+    hEX lite 7.16.1, 2026-10-30), which then fired the "CPU above 90%, please
+    restart" SMS. Nothing in the script needs a reboot: every step (bridge,
+    DHCP, WiFi, WireGuard/SSTP/L2TP, hotspot, API, identity) takes effect
+    live, and the tunnels keep retrying on their own. The reboot also cut
+    short the post-registration installers that /complete starts. The server
+    now checks the router after it registers instead (provision_verify).
+    """
     base_url = provision_base_url_for_vpn(token.vpn_type)
     t = token.token
     cert_flag = fetch_certificate_flag_for_url(base_url, token.vpn_type)
@@ -1520,11 +1534,12 @@ def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
     :log warning "Provisioning: Could not notify server (register manually via admin panel)"
 }}
 
-# ---- STEP 10: REBOOT ----
+# ---- STEP 10: DONE ----
+# No reboot: everything above is already live. The import ends here so the
+# terminal gets its prompt back; the server checks the router over the
+# management tunnel in a few minutes and tells the reseller the result.
 
-:log info "Provisioning complete! Rebooting in 5 seconds..."
-:delay 5s
-/system reboot
+:log info "Provisioning complete! No reboot needed -- Bitwave will check the router in a few minutes."
 """
 
 
@@ -1562,7 +1577,7 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     parts.append(_rsc_api_access_hetzner(token) if hetzner else _rsc_api_access())
     parts.append(_rsc_identity_and_user(token))
     parts.append(_rsc_remove_router_command_agent())
-    parts.append(_rsc_notify_and_reboot(token))
+    parts.append(_rsc_notify_and_finish(token))
 
     return "\n".join(parts)
 
