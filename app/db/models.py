@@ -657,6 +657,13 @@ class Router(Base):
     snmp_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     cpu_load = Column(Integer, nullable=True)
     cpu_checked_at = Column(DateTime, nullable=True)
+    # Expired PPPoE customers stay connected in a walled state and every web
+    # page redirects to the payment portal (app/services/pppoe_expired_redirect.py).
+    # Off by default; toggled per router by the owner, which applies or removes
+    # the RouterOS side. _config holds what was applied (pool, proxy port, the
+    # proxy-access syntax this RouterOS accepts, whether we enabled /ip proxy).
+    pppoe_expired_redirect = Column(Boolean, nullable=False, default=False, server_default="false")
+    pppoe_expired_redirect_config = Column(JSON, nullable=True)
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 

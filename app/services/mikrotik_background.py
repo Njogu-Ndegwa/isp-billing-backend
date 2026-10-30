@@ -1172,6 +1172,8 @@ def _cleanup_single_router_pppoe_sync(router_info: dict, customers_data: list) -
     results["connected"] = True
 
     try:
+        if router_info.get("pppoe_expired_redirect"):
+            customers_data = _wall_expired_pppoe_customers(api, router_info, customers_data, results)
         for cust in customers_data:
             try:
                 pppoe_user = cust["pppoe_username"]
@@ -1227,6 +1229,105 @@ def _cleanup_single_router_pppoe_sync(router_info: dict, customers_data: list) -
         api.disconnect()
 
     return results
+
+
+def _expired_redirect_router_fields(router, *, create_missing: bool = True) -> dict:
+    """router_info keys the PPPoE cleanup needs for the expired redirect."""
+    if not getattr(router, "pppoe_expired_redirect", False):
+        return {}
+    return {
+        "pppoe_expired_redirect": True,
+        "pppoe_expired_redirect_config": dict(router.pppoe_expired_redirect_config or {}),
+        "create_missing_walled": create_missing,
+    }
+
+
+async def _persist_redirect_configs(items) -> None:
+    """Store a changed walled-state config reported by a PPPoE cleanup run."""
+    from app.services.pppoe_expired_redirect import config_changed, persist_router_config
+
+    for router_info, outcome in items:
+        if not isinstance(outcome, dict) or not router_info.get("pppoe_expired_redirect"):
+            continue
+        new = outcome.get("redirect_config")
+        err = outcome.get("redirect_error")
+        if new and config_changed(router_info.get("pppoe_expired_redirect_config"), new):
+            await persist_router_config(router_info["id"], new)
+        elif err:
+            await persist_router_config(router_info["id"], {}, error=err)
+
+
+def _wall_expired_pppoe_customers(api, router_info: dict, customers_data: list, results: dict) -> list:
+    """Routers with the PPPoE expired redirect: keep the secret, move it to the
+    walled profile, kick the session (app/services/pppoe_expired_redirect.py).
+
+    Walled customers go into results["removed"] with details.walled, which the
+    caller treats exactly like a removal (they have no internet any more).
+    Returns the customers still to be removed the old way: paused customers
+    (a pause is not an expiry), and everyone when the walled state could not
+    be ensured on this router, so a failure never leaves expired customers
+    with access. ``create_missing_walled`` False (the inactive safety net)
+    walls only secrets that still exist.
+    """
+    from app.services.pppoe_expired_redirect import ensure_expired_infra, wall_pppoe_users
+
+    to_wall = [c for c in customers_data if not c.get("paused")]
+    rest = [c for c in customers_data if c.get("paused")]
+    if not to_wall:
+        return rest
+
+    ensured = ensure_expired_infra(
+        api,
+        router_id=router_info.get("id"),
+        config=router_info.get("pppoe_expired_redirect_config") or {},
+    )
+    if ensured.get("error"):
+        logger.error(
+            "[CRON-PPPoE] Expired redirect unavailable on router %s (%s); removing "
+            "expired customers the old way",
+            router_info.get("name"), ensured["error"],
+        )
+        results["redirect_error"] = ensured["error"]
+        return customers_data
+    results["redirect_config"] = ensured["config"]
+
+    try:
+        outcome = wall_pppoe_users(
+            api,
+            [
+                {
+                    "id": c["id"],
+                    "pppoe_username": c["pppoe_username"],
+                    "pppoe_password": c.get("pppoe_password"),
+                    "comment": f"CID:{c['id']}|{c.get('name') or ''}|expired"[:120],
+                }
+                for c in to_wall
+            ],
+            create_missing=router_info.get("create_missing_walled", True),
+        )
+    except Exception as exc:
+        logger.error("[CRON-PPPoE] Walling failed on router %s: %s", router_info.get("name"), exc)
+        return customers_data
+
+    for cust in to_wall:
+        res = outcome.get(cust["id"]) or {"ok": False, "error": "not processed"}
+        if res.get("ok"):
+            results["removed"].append({
+                "id": cust["id"],
+                "details": {
+                    "walled": res.get("action") != "absent",
+                    "action": res.get("action"),
+                    "disconnected": res.get("disconnected", 0),
+                },
+            })
+            logger.info(
+                "[CRON-PPPoE] Expired PPPoE user %s (customer %s): %s",
+                cust["pppoe_username"], cust["id"], res.get("action"),
+            )
+        else:
+            # Same retry contract as a failed removal: row stays ACTIVE.
+            results["failed"].append({"id": cust["id"], "error": res.get("error")})
+    return rest
 
 
 def _cleanup_pppoe_customers_sync(router_pppoe_map: dict) -> dict:
@@ -1334,6 +1435,7 @@ async def _load_inactive_pppoe_reconcile_batch() -> list[dict]:
                 "pppoe_username": customer.pppoe_username,
                 "expiry": customer.expiry,
                 "router_id": router.id,
+                "paused": customer.paused_at is not None,
                 "router": {
                     "id": router.id,
                     "ip": router.ip_address,
@@ -1341,6 +1443,9 @@ async def _load_inactive_pppoe_reconcile_batch() -> list[dict]:
                     "password": router.password,
                     "port": router.port,
                     "name": router.name,
+                    # The safety net walls a leftover secret but never
+                    # re-creates one that is already gone.
+                    **_expired_redirect_router_fields(router, create_missing=False),
                 },
             })
         await db.commit()
@@ -1405,7 +1510,7 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
             )
             group["customers"].append({
                 key: candidate[key]
-                for key in ("id", "name", "pppoe_username", "expiry", "router_id")
+                for key in ("id", "name", "pppoe_username", "expiry", "router_id", "paused")
             })
 
         async def _cleanup_group(router_key: str, group: dict):
@@ -1422,7 +1527,11 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
             return_exceptions=True,
         )
 
+        await _persist_redirect_configs(
+            (group["router"], outcome) for (_rk, group), outcome in zip(group_items, outcomes)
+        )
         removed_ids: set[int] = set()
+        walled_ids: set[int] = set()
         failed = 0
         for (router_key, group), outcome in zip(group_items, outcomes):
             if isinstance(outcome, Exception):
@@ -1434,6 +1543,10 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
                 )
                 continue
             removed_ids.update(row["id"] for row in outcome.get("removed", []))
+            walled_ids.update(
+                row["id"] for row in outcome.get("removed", [])
+                if (row.get("details") or {}).get("walled")
+            )
             failed += len(outcome.get("failed", []))
 
         restore_payloads = []
@@ -1456,7 +1569,11 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
                             router_id=customer.router_id,
                             action="pppoe_deactivation",
                             status="success",
-                            details="Inactive PPPoE safety net confirmed session and secret absent",
+                            details=(
+                                "Inactive PPPoE safety net moved the secret to the walled expired profile"
+                                if customer.id in walled_ids
+                                else "Inactive PPPoE safety net confirmed session and secret absent"
+                            ),
                         ))
                         durable_removed += 1
                     elif (
@@ -1713,13 +1830,16 @@ async def cleanup_expired_users_background():
                             "router": {
                                 "id": c.router.id,
                                 "ip": c.router.ip_address, "username": c.router.username,
-                                "password": c.router.password, "port": c.router.port, "name": c.router.name
+                                "password": c.router.password, "port": c.router.port, "name": c.router.name,
+                                **_expired_redirect_router_fields(c.router),
                             },
                             "customers": []
                         }
                     router_pppoe_map[router_key]["customers"].append({
                         "id": c.id, "name": c.name, "pppoe_username": c.pppoe_username,
-                        "expiry": c.expiry, "router_id": c.router_id
+                        "expiry": c.expiry, "router_id": c.router_id,
+                        "pppoe_password": c.pppoe_password,
+                        "paused": c.paused_at is not None,
                     })
                     continue
 
@@ -1860,6 +1980,9 @@ async def cleanup_expired_users_background():
                     *[_pppoe_task(rk, rd) for rk, rd in pppoe_items],
                     return_exceptions=True,
                 )
+                await _persist_redirect_configs(
+                    (rd["router"], outcome) for (_rk, rd), outcome in zip(pppoe_items, pppoe_outcomes)
+                )
                 for (_rk, rd), outcome in zip(pppoe_items, pppoe_outcomes):
                     if isinstance(outcome, Exception):
                         logger.error("[CRON] PPPoE cleanup task error: %s", outcome)
@@ -1891,6 +2014,10 @@ async def cleanup_expired_users_background():
             )
             pppoe_successful_ids = {
                 r["id"] for r in pppoe_results["removed"]
+            }
+            pppoe_walled_ids = {
+                r["id"] for r in pppoe_results["removed"]
+                if (r.get("details") or {}).get("walled")
             }
             all_failed_ids = set(
                 [r["id"] for r in mikrotik_results["failed"]] +
@@ -1946,6 +2073,7 @@ async def cleanup_expired_users_background():
             post_cleanup_deactivated_count = 0
             skipped_repaid_count = 0
             hotspot_renewal_repairs: list[tuple[int, int, dict]] = []
+            pppoe_renewal_repairs: list[dict] = []
             newly_deactivated_ids = set(directly_deactivated_ids)
             for router_id in offline_router_ids:
                 try:
@@ -1971,6 +2099,16 @@ async def cleanup_expired_users_background():
                             "(expiry=%s > now=%s), skipping deactivation",
                             customer.id, customer.expiry, now_after_cleanup,
                         )
+                        if (
+                            customer.id in pppoe_walled_ids
+                            and customer.router
+                            and customer.pppoe_username
+                        ):
+                            # Walled while the payment landed: put the plan
+                            # profile back now instead of waiting for a sweep.
+                            from app.services.pppoe_provisioning import build_pppoe_payload
+
+                            pppoe_renewal_repairs.append(build_pppoe_payload(customer, customer.router))
                         if (
                             customer.id not in pppoe_successful_ids
                             and customer.router
@@ -2002,7 +2140,12 @@ async def cleanup_expired_users_background():
                                 router_id=customer.router_id,
                                 action="pppoe_deactivation",
                                 status="success",
-                                details="Expiry cleanup confirmed session and secret absent",
+                                details=(
+                                    "Expiry cleanup moved the secret to the walled expired profile "
+                                    "(payment page) and kicked the session"
+                                    if customer.id in pppoe_walled_ids
+                                    else "Expiry cleanup confirmed session and secret absent"
+                                ),
                             ))
                         else:
                             # Confirmed RouterOS removal only (all_successful_ids);
@@ -2052,6 +2195,18 @@ async def cleanup_expired_users_background():
                         failed_repairs,
                         len(hotspot_renewal_repairs),
                     )
+
+            if pppoe_renewal_repairs:
+                from app.services.pppoe_provisioning import call_pppoe_provision
+
+                for payload in pppoe_renewal_repairs:
+                    repaired = await call_pppoe_provision(payload)
+                    if not (isinstance(repaired, dict) and repaired.get("success")):
+                        logger.error(
+                            "[CRON] Could not restore walled PPPoE user %s who renewed during "
+                            "cleanup: %s", payload.get("pppoe_username"),
+                            (repaired or {}).get("error"),
+                        )
 
             # Expiry SMS is deliberately downstream of successful enforcement
             # and the INACTIVE commit. It uses its own short DB sessions and

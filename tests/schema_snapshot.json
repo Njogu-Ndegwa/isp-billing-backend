@@ -956,6 +956,8 @@
   "payment_methods",
   "plain_ports",
   "port",
+  "pppoe_expired_redirect",
+  "pppoe_expired_redirect_config",
   "pppoe_ports",
   "pull_channel_enabled",
   "radius_nas_identifier",

@@ -1325,6 +1325,7 @@ async def get_routers(
             "emergency_message": getattr(router_obj, "emergency_message", None),
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
             "status_alerts_enabled": getattr(router_obj, "status_alerts_enabled", False),
+            "pppoe_expired_redirect": bool(getattr(router_obj, "pppoe_expired_redirect", False)),
             "lb_enabled": bool(router_obj.lb_enabled),
             "lb_config": router_obj.lb_config,
         }
@@ -1972,6 +1973,7 @@ async def update_router(
             "emergency_message": router_obj.emergency_message,
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
             "status_alerts_enabled": getattr(router_obj, "status_alerts_enabled", False),
+            "pppoe_expired_redirect": bool(getattr(router_obj, "pppoe_expired_redirect", False)),
             "updated_at": datetime.utcnow().isoformat()
         }
         
