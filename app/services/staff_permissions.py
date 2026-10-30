@@ -153,11 +153,14 @@ ADS_VIEW = ("portal.manage", "dashboard.view")
 _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     # --- every staff member -------------------------------------------------
     ((R,), "/api/staff/me", ANY_STAFF, None),
+    (("PUT",), "/api/staff/me/password", ANY_STAFF, "Changed own password"),
     ((R,), "/api/profile", ANY_STAFF, None),
     ((R,), "/api/subscription", ANY_STAFF, None),
-    ((R,), "/api/plans", ("plans.manage", "customers.view", "customers.manage", "vouchers.generate", "routers.view", "routers.manage", "portal.manage"), None),
+    # SMS compose filters recipients by plan.
+    ((R,), "/api/plans", ("plans.manage", "customers.view", "customers.manage", "vouchers.generate", "routers.view", "routers.manage", "portal.manage", "messaging.send"), None),
     ((R,), "/api/plans/by-router/{router_id}", ("plans.manage", "customers.view", "customers.manage", "vouchers.generate", "routers.view", "routers.manage", "portal.manage"), None),
-    ((R,), "/api/routers", ("routers.view", "routers.manage", "customers.view", "customers.manage", "plans.manage", "vouchers.generate", "messaging.send", "portal.manage", "dashboard.view"), None),
+    # Payment methods assigns a method per router; SMS alerts toggle per router.
+    ((R,), "/api/routers", ("routers.view", "routers.manage", "customers.view", "customers.manage", "plans.manage", "vouchers.generate", "messaging.send", "messaging.settings", "portal.manage", "dashboard.view", "payment_methods.manage"), None),
 
     # --- dashboard ----------------------------------------------------------
     ((R,), "/api/dashboard/overview", "dashboard.view", None),
@@ -187,6 +190,11 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/session-monitor", "customers.view", None),
     ((R,), "/api/session-monitor/customer/{customer_id}", "customers.view", None),
     ((R,), "/api/realtime/customers/online", "customers.view", None),
+    # Who is online right now, per router: the customer list's live dot polls
+    # these. Same presence data /api/session-monitor already gives customers.view.
+    ((R,), "/api/realtime/routers", ("routers.view", "customers.view"), None),
+    ((R,), "/api/pppoe/{router_id}/users", ("routers.view", "customers.view"), None),
+    ((R,), "/api/hotspot/{router_id}/users", ("routers.view", "customers.view"), None),
     ((R,), "/api/resellers/me/usage/top", "customers.view", None),
     ((R,), "/api/ratings", "customers.view", None),
     ((R,), "/api/ratings/by-location", "customers.view", None),
@@ -304,12 +312,10 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/routers/by-identity/{identity}/hotspot-diagnostics", "routers.view", None),
     ((R,), "/api/hotspot/{router_id}/logs", "routers.view", None),
     ((R,), "/api/hotspot/{router_id}/overview", "routers.view", None),
-    ((R,), "/api/hotspot/{router_id}/users", "routers.view", None),
     ((R,), "/api/pppoe/{router_id}/client-details/{username}", "routers.view", None),
     ((R,), "/api/pppoe/{router_id}/diagnose/{username}", "routers.view", None),
     ((R,), "/api/pppoe/{router_id}/logs", "routers.view", None),
     ((R,), "/api/pppoe/{router_id}/overview", "routers.view", None),
-    ((R,), "/api/pppoe/{router_id}/users", "routers.view", None),
     ((R,), "/api/mikrotik/active-sessions", "routers.view", None),
     ((R,), "/api/mikrotik/bandwidth-history", "routers.view", None),
     ((R,), "/api/mikrotik/health", "routers.view", None),
@@ -318,7 +324,6 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/mikrotik/walled-garden", "routers.view", None),
     ((R,), "/api/mikrotik/{router_id}/pppoe/active", "routers.view", None),
     ((R,), "/api/dashboard/mikrotik", "routers.view", None),
-    ((R,), "/api/realtime/routers", "routers.view", None),
     ((R,), "/api/session-monitor/router/{router_id}", "routers.view", None),
 
     # --- routers: write (includes diagnostics that change things, WebFig) --
