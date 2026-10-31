@@ -412,6 +412,29 @@ def plan_fup_period(plan: Optional[Plan]) -> str:
     return value if value in FUP_PERIODS else FUP_PERIOD_PLAN
 
 
+def fup_cap_mb(
+    period: Optional[CustomerUsagePeriod], plan: Optional[Plan]
+) -> Optional[int]:
+    """The data cap (MB) FUP enforces for this period, or None/<=0 for no cap.
+
+    A "plan" window uses the cap snapshotted when the period opened, so a
+    reseller lowering a plan's cap does not move the line under a customer
+    mid-period (raising or removing it is carried over by the plan route).
+
+    A daily window uses the plan's cap as it is now. Each day is a fresh
+    window, and the snapshot can belong to a different setup: a reseller who
+    turns a 70 GB monthly plan into a 5 GB daily one leaves every customer
+    already inside their month with a 70 GB snapshot, which then served as
+    their *daily* cap until they renewed -- up to a month of heavy users
+    never being throttled (seen on prod 2026-10-30).
+    """
+    if plan is not None and plan_fup_period(plan) == FUP_PERIOD_DAILY:
+        return plan.data_cap_mb
+    if period is not None and period.cap_mb_snapshot is not None:
+        return period.cap_mb_snapshot
+    return plan.data_cap_mb if plan is not None else None
+
+
 def daily_fup_reset_utc(now: datetime) -> datetime:
     """UTC instant of the most recent daily FUP reset at or before ``now``.
 

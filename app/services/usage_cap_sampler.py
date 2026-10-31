@@ -42,7 +42,7 @@ from app.services.fup import evaluate_and_enforce
 from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI, normalize_mac_address
 from app.services.realtime_state import host_metered_router_ids
 from app.services.usage_counters import parse_queue_bytes, record_queue_usage_sample
-from app.services.usage_tracking import fup_usage_bytes
+from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -428,7 +428,7 @@ def _poll_schedule_for(
     ``used_bytes`` overrides the period's own total; callers pass the pooled
     figure so every device on a shared plan speeds up as the group nears its cap.
     """
-    cap_mb = period.cap_mb_snapshot if (period and period.cap_mb_snapshot is not None) else plan.data_cap_mb
+    cap_mb = fup_cap_mb(period, plan)
     if not cap_mb or cap_mb <= 0:
         return 300, "uncapped"
     if used_bytes is not None:
@@ -545,7 +545,7 @@ async def _persist_samples(samples: list[QueueSample], now: datetime) -> list[in
                     download_bytes,
                 )
 
-            cap_mb = update.period.cap_mb_snapshot if (update.period and update.period.cap_mb_snapshot is not None) else plan.data_cap_mb
+            cap_mb = fup_cap_mb(update.period, plan)
             cap_bytes = int(cap_mb or 0) * 1024 * 1024
             used_bytes: Optional[int] = None
             if update.period:
