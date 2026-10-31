@@ -113,8 +113,8 @@ async def enforce_shadow_mode(request: Request, call_next):
     return response
 
 # --- Router registrations ---
-from app.api.radius_endpoints import router as radius_router
-from app.api.radius_hotspot import router as radius_hotspot_router
+# /api/radius/* (management + RADIUS hotspot pay flow) was removed on 29 Oct 2026:
+# RADIUS is unused, and those routes were unauthenticated. FreeRADIUS tables stay.
 from app.api.session_monitor import router as session_monitor_router
 from app.api.auth_routes import router as auth_router
 from app.api.public_routes import router as public_router
@@ -169,8 +169,6 @@ from app.api.customer_device_routes import router as customer_device_router
 from app.api.admin_support_desk_routes import router as admin_support_desk_router
 from app.api.staff_routes import router as staff_router
 
-app.include_router(radius_router)
-app.include_router(radius_hotspot_router)
 app.include_router(session_monitor_router)
 app.include_router(auth_router)
 app.include_router(public_router)
