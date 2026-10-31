@@ -252,17 +252,21 @@ async def test_eligibility_reports_used_trials(db, no_background_provisioning):
     assert after[repeat.id]["eligible"] is True
 
 
-async def test_plan_validation_forces_free_hotspot_trials():
+async def test_plan_validation_forces_free_hotspot_or_pppoe_trials():
     from app.api.plan_routes import _validate_free_trial_plan
     from app.db.models import Plan
 
     _validate_free_trial_plan(Plan(plan_type=PlanType.FREE_TRIAL, price=0, connection_type=ConnectionType.HOTSPOT))
     _validate_free_trial_plan(Plan(plan_type=PlanType.REGULAR, price=50, connection_type=ConnectionType.PPPOE))
+    # PPPoE trials are given by the reseller (register + activate), not claimed.
+    _validate_free_trial_plan(Plan(plan_type=PlanType.FREE_TRIAL, price=0, connection_type=ConnectionType.PPPOE))
 
     with pytest.raises(HTTPException):
         _validate_free_trial_plan(Plan(plan_type=PlanType.FREE_TRIAL, price=20, connection_type=ConnectionType.HOTSPOT))
     with pytest.raises(HTTPException):
-        _validate_free_trial_plan(Plan(plan_type=PlanType.FREE_TRIAL, price=0, connection_type=ConnectionType.PPPOE))
+        _validate_free_trial_plan(Plan(plan_type=PlanType.FREE_TRIAL, price=20, connection_type=ConnectionType.PPPOE))
+    with pytest.raises(HTTPException):
+        _validate_free_trial_plan(Plan(plan_type=PlanType.FREE_TRIAL, price=0, connection_type=ConnectionType.STATIC_IP))
     # A trial may cover several devices, like any hotspot plan.
     _validate_free_trial_plan(Plan(
         plan_type=PlanType.FREE_TRIAL, price=0, connection_type=ConnectionType.HOTSPOT, max_shared_users=3,

@@ -848,6 +848,32 @@ const updated = await adminFetch<AdminGrowthTargetsResponse>(
 
 ---
 
+## 14. Transaction volume vs Bitwave earnings
+
+```
+GET /api/admin/metrics/platform-earnings?period=month   # week|month|quarter|year, or 7d|30d|90d|1y
+```
+
+Admin only. Calendar period-to-date, compared with the same point in the previous period.
+All money is KES. Definitions live in `app/services/platform_earnings.py`.
+
+- `transaction_volume`: customer payments through Bitwave for every reseller (completed,
+  `counts_as_revenue=true`; free trials, compensation and "activate without payment" are
+  excluded). This is the resellers' money, not Bitwave's income. Split into
+  `mpesa_platform_collected`, `mpesa_direct_settled` and `recorded_manually`.
+- `earnings` (cash basis, `basis: "collected"`): what Bitwave received in the period.
+  Completed `subscription_payments` (card net of the assumed Paystack fee), each split across
+  its invoice into `subscription_hotspot` (the % commission), `subscription_per_user`
+  (PPPoE/static fee) and `subscription_minimum` (top-up to the minimum, or the flat fee);
+  `subscription_unattributed` when the payment has no invoice; plus completed
+  `sms_credit_orders` (`sms_credits`). Our own reseller accounts (`admin_own_reseller_ids`)
+  are excluded.
+- `invoiced`: subscription invoices issued in the period (waived excluded and reported as
+  `waived`), with `paid_so_far` and `outstanding`.
+- `take_rate_percent`: `earnings.total / transaction_volume.total * 100`, `null` without volume.
+- `not_counted`: paid shop orders and reseller transaction charges (mostly B2B fee
+  recovery), reported but not part of earnings.
+
 ## Error Responses
 
 All endpoints return standard error shapes:

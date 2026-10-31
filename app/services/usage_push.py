@@ -64,7 +64,7 @@ from app.services.pppoe_sessions import resolve_extra_session_customer
 from app.services.static_ip import STATIC_KEY_PREFIX, normalize_static_ip
 from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
-from app.services.usage_tracking import fup_usage_bytes
+from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes
 from app.services.customer_grace import has_access_time
 
 logger = logging.getLogger(__name__)
@@ -307,13 +307,9 @@ async def _latest_period_is_closed(db, customer_id: int) -> bool:
 
 
 def _cap_bytes_for(period: Optional[CustomerUsagePeriod], plan: Optional[Plan]) -> int:
-    """Cap in bytes, preferring the period's snapshot so a mid-period plan change
-    cannot retroactively move the line (same rule the sampler applies)."""
-    cap_mb = None
-    if period is not None and period.cap_mb_snapshot is not None:
-        cap_mb = period.cap_mb_snapshot
-    elif plan is not None:
-        cap_mb = plan.data_cap_mb
+    """Cap in bytes: the period's snapshot for a plan window, the plan's current
+    cap for a daily one (same rule as FUP enforcement and the sampler)."""
+    cap_mb = fup_cap_mb(period, plan)
     return int(cap_mb) * 1024 * 1024 if cap_mb and int(cap_mb) > 0 else 0
 
 

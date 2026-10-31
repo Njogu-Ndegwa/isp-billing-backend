@@ -1,7 +1,15 @@
 # Free Trial Plans API
 
-Resellers can offer hotspot customers free internet for a limited time. A free trial is an
-ordinary plan with `plan_type: "free_trial"`, claimed from the captive portal with no payment.
+Resellers can offer customers free internet for a limited time. A free trial is an ordinary
+plan with `plan_type: "free_trial"` and price 0, on hotspot or PPPoE:
+
+- **Hotspot:** the customer claims it from the captive portal with no payment (below).
+- **PPPoE:** there is no portal. The reseller registers the customer on the trial plan and
+  activates them (`POST /api/customers/{id}/activate-pppoe`). The customer gets the plan's
+  PPPoE speed and device limit for its duration. The activation never records money, whatever
+  `payment_method` is sent: it writes the same KES 0, `counts_as_revenue = false` row a portal
+  claim does (reference `FREE-TRIAL-{plan_id}`), and the response has `payment_recorded: false`.
+  The portal trial endpoints never list or grant a PPPoE trial.
 
 ## Reseller: creating a trial plan
 
@@ -11,9 +19,9 @@ ordinary plan with `plan_type: "free_trial"`, claimed from the captive portal wi
 |---|---|
 | `plan_type` | `"free_trial"` |
 | `price` | must be `0` (400 otherwise) |
-| `connection_type` | must be `"hotspot"` (400 otherwise) |
-| `max_shared_users` | must be `1`: a trial covers only the device that claimed it (400 otherwise). A data cap / FUP is allowed. |
-| `trial_once_per_customer` | `true` (default): each device can claim this trial once. `false`: it can claim again once its previous trial has ended. |
+| `connection_type` | `"hotspot"` or `"pppoe"` (400 for `"static_ip"`) |
+| `max_shared_users` | Hotspot: how many devices one claimed trial covers (default 1). PPPoE: the usual PPPoE device limit (logins with the same username). A data cap / FUP is allowed. |
+| `trial_once_per_customer` | Hotspot only. `true` (default): each device can claim this trial once. `false`: it can claim again once its previous trial has ended. Ignored for PPPoE, where the reseller decides who gets activated. |
 
 Every plan response now includes `trial_once_per_customer`.
 
