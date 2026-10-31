@@ -575,6 +575,16 @@ async def run_radius_migrations():
             ADD COLUMN IF NOT EXISTS management_tunnel VARCHAR(20) NULL
         """))
 
+        # --- Provisioning tokens: post-provision check result ---
+        # Written by app/services/provision_verify.py after the router
+        # registers; read by the CPU-alert setup grace.
+        await conn.execute(sa_text("""
+            ALTER TABLE provisioning_tokens
+            ADD COLUMN IF NOT EXISTS setup_check_status VARCHAR(24) NULL,
+            ADD COLUMN IF NOT EXISTS setup_check_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS setup_check_result JSON NULL
+        """))
+
         # --- PPPoE columns on customers table ---
         result = await conn.execute(sa_text("""
             SELECT column_name
@@ -4244,6 +4254,13 @@ async def startup_event():
     from app.services.realtime_push_installer import schedule_catch_up_after_restart
 
     schedule_catch_up_after_restart()
+
+    # Post-provision setup check: same in-memory caveat, same one-shot catch-up.
+    from app.services.provision_verify import (
+        schedule_catch_up_after_restart as schedule_setup_check_catch_up,
+    )
+
+    schedule_setup_check_catch_up()
     try:
         from app.services.native_router_stream import start as start_native_streams
         start_native_streams()
