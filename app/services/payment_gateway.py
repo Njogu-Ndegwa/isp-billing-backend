@@ -11,6 +11,7 @@ import hashlib
 import logging
 import uuid
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Optional
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -586,9 +587,18 @@ async def _initiate_fapshi(
     phone_local = normalize_cameroon_phone(phone)
     amount_xaf = normalize_xaf_amount(amount)
 
-    # A double tap must not create a second phone prompt. Reuse a recent
-    # provider transaction for this customer, just like the M-Pesa guard.
-    recent_cutoff = datetime.utcnow() - timedelta(minutes=5)
+    # Serialize phone prompts for this target. All contract data is persisted
+    # before external I/O, and no uncertain accepted request is ever re-issued.
+    await db.flush()
+    customer = await db.scalar(select(Customer).where(Customer.id == customer.id)
+                               .with_for_update().execution_options(populate_existing=True))
+    if customer.user_id != pm.user_id:
+        raise ValueError("Fapshi payment method does not own this customer")
+    from app.services.fapshi_reconciliation import capture_purchase_snapshot
+    snapshot = await capture_purchase_snapshot(db, customer, amount=amount_xaf)
+
+    # An unresolved collection blocks another prompt even after the browser
+    # times out. Only a terminal status or explicit review resolves it.
     existing = (
         await db.execute(
             select(FapshiTransaction)
@@ -598,13 +608,16 @@ async def _initiate_fapshi(
                     FapshiTransactionStatus.CREATED,
                     FapshiTransactionStatus.PENDING,
                 ]),
-                FapshiTransaction.created_at >= recent_cutoff,
             )
             .order_by(FapshiTransaction.created_at.desc())
             .limit(1)
         )
     ).scalar_one_or_none()
     if existing:
+        if existing.review_reason == "initiation_outcome_unknown":
+            raise ValueError("The previous payment request needs confirmation; do not pay again")
+        if existing.purchase_snapshot != snapshot or Decimal(str(existing.amount)) != Decimal(str(amount_xaf)):
+            raise ValueError("A different purchase is still pending; confirm it before paying again")
         if not existing.trans_id:
             raise ValueError("A Fapshi payment is already being initiated. Please wait.")
         return {
@@ -629,6 +642,8 @@ async def _initiate_fapshi(
         phone=phone_local,
         status=FapshiTransactionStatus.PENDING,
         environment=environment,
+        purchase_snapshot=snapshot,
+        next_check_at=datetime.utcnow() + timedelta(seconds=15),
     )
     db.add(txn)
     await db.commit()
@@ -645,17 +660,42 @@ async def _initiate_fapshi(
             external_id=external_id,
             message=(f"Internet package: {plan_name}" if plan_name else reference),
         )
-    except Exception:
-        # No provider transaction was accepted. Remove the provisional local
-        # row; the caller restores the customer's pre-attempt state.
-        await db.delete(txn)
+    except Exception as exc:
+        # HTTP timeout/5xx may follow an accepted charge. Fapshi has no
+        # idempotency keys: retain correlation and block a second prompt.
+        from app.services.fapshi import FapshiAPIError
+        await db.refresh(txn)
+        if txn.customer_payment_id and txn.status == FapshiTransactionStatus.SUCCESSFUL and txn.trans_id:
+            # A fast authoritative callback already committed this purchase.
+            # Return its accepted identity so outer handlers cannot restore the
+            # pre-payment customer state after an initiation transport timeout.
+            await db.commit()
+            return {
+                "gateway": "fapshi", "collection_mode": CollectionMode.DIRECT,
+                "trans_id": txn.trans_id, "external_id": txn.external_id,
+                "environment": txn.environment,
+            }
+        if isinstance(exc, FapshiAPIError) and exc.status_code == 400:
+            txn.status = FapshiTransactionStatus.FAILED
+            txn.failure_reason = "Provider rejected payment initiation"
+        else:
+            txn.review_reason = "initiation_outcome_unknown"
+            txn.last_check_error = "initiation_outcome_unknown"
         await db.commit()
         raise
 
     # Reload in case a sandbox/fast webhook already updated the row by
     # externalId while Direct Pay was returning. Only attach the provider ID.
     await db.refresh(txn)
+    if txn.trans_id and txn.trans_id != result["transId"]:
+        txn.review_reason = "initiation_transaction_id_mismatch"
+        await db.commit()
+        raise ValueError("Payment confirmation requires review")
     txn.trans_id = result["transId"]
+    if txn.review_reason == "initiation_outcome_unknown":
+        # A slow but definite initiation response resolved the provisional ID.
+        txn.review_reason = None
+        txn.last_check_error = None
     await db.commit()
 
     return {

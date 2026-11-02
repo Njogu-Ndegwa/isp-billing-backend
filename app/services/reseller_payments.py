@@ -65,6 +65,8 @@ async def record_customer_payment(
     duration_unit: str = None,
     collection_mode: CollectionMode = None,
     counts_as_revenue: bool = True,
+    commit: bool = True,
+    defer_router_io: bool = False,
 ) -> CustomerPayment:
     """Record a payment made by customer to reseller
 
@@ -73,13 +75,15 @@ async def record_customer_payment(
         duration_unit: Override plan duration unit (MINUTES, HOURS, DAYS)
         collection_mode: DIRECT if reseller collected, SYSTEM_COLLECTED if platform collected
     """
+    if not commit and not defer_router_io:
+        raise ValueError("Atomic payment callers must defer renewal router I/O")
     
     # Load customer with plan to calculate proper expiry
     stmt = select(Customer).options(joinedload(Customer.plan)).where(
         Customer.id == customer_id,
         Customer.user_id == reseller_id
     )
-    result = await db.execute(stmt)
+    result = await db.execute(stmt.with_for_update(of=Customer))
     customer = result.scalar_one_or_none()
     
     if not customer:
@@ -143,8 +147,11 @@ async def record_customer_payment(
     try:
         from app.services.usage_tracking import on_renewal
 
-        await on_renewal(db, customer, plan=customer.plan, now=now)
+        await on_renewal(db, customer, plan=customer.plan, now=now,
+                         **({"defer_router_io": True} if defer_router_io else {}))
     except Exception as renew_err:
+        if not commit:
+            raise
         import logging
 
         logging.getLogger(__name__).error(
@@ -183,6 +190,7 @@ async def record_customer_payment(
                 db,
                 owner_customer=customer,
                 plan=customer.plan,
+                **({"defer_router_io": True} if defer_router_io else {}),
             )
             if synced_devices:
                 logger.info(
@@ -191,6 +199,8 @@ async def record_customer_payment(
                     customer.id,
                 )
         except Exception as share_err:
+            if not commit:
+                raise
             logger.error(
                 "[SUBSCRIPTION-SHARE] Failed to sync shared devices for customer %s: %s",
                 customer.id,
@@ -200,10 +210,16 @@ async def record_customer_payment(
     # NOTE: Removed duplicate Payment record creation
     # CustomerPayment is the primary payment record - no need for both
 
+    await db.flush()
     await update_reseller_financials(db, reseller_id)
 
-    await db.commit()
-    await db.refresh(payment)
+    if commit:
+        await db.commit()
+        await db.refresh(payment)
+    else:
+        # The caller owns the atomic ledger/entitlement/provider transaction.
+        # It must defer router I/O, including renewal's FUP restoration.
+        await db.flush()
 
     return payment
 
