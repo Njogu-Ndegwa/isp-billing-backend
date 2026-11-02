@@ -553,6 +553,7 @@ async def on_renewal(
     customer: Customer,
     plan: Optional[Plan] = None,
     now: Optional[datetime] = None,
+    defer_router_io: bool = False,
 ) -> Optional[CustomerUsagePeriod]:
     """Renewal hook: close current period, open a new one, and lift any FUP.
 
@@ -570,18 +571,23 @@ async def on_renewal(
     try:
         previous = await close_open_period(db, customer.id, now=now)
     except Exception as e:
+        if defer_router_io:
+            raise
         logger.error(f"[USAGE] close_open_period failed for customer {customer.id}: {e}")
         previous = None
 
     try:
         from app.services.fup import revert as fup_revert
 
-        await fup_revert(db, customer, plan=plan, period=previous, now=now)
+        if not defer_router_io:
+            await fup_revert(db, customer, plan=plan, period=previous, now=now)
     except Exception as e:
         logger.error(f"[USAGE] FUP revert failed for customer {customer.id}: {e}")
 
     try:
         return await get_or_open_current_period(db, customer, plan=plan, now=now)
     except Exception as e:
+        if defer_router_io:
+            raise
         logger.error(f"[USAGE] open new period failed for customer {customer.id}: {e}")
         return None

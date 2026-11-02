@@ -831,6 +831,31 @@ async def run_payment_method_migrations():
         await conn.run_sync(
             lambda c: FapshiTransaction.__table__.create(c, checkfirst=True)
         )
+        # Durable confirmation queue and immutable purchase contract. Legacy
+        # rows intentionally retain a NULL snapshot and are review-held.
+        await conn.execute(sa_text("""
+            ALTER TABLE fapshi_transactions
+            ADD COLUMN IF NOT EXISTS purchase_snapshot JSON,
+            ADD COLUMN IF NOT EXISTS customer_payment_id INTEGER REFERENCES customer_payments(id),
+            ADD COLUMN IF NOT EXISTS provider_status VARCHAR(20),
+            ADD COLUMN IF NOT EXISTS review_reason VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS check_attempts INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS check_lease_until TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS check_lease_token VARCHAR(64),
+            ADD COLUMN IF NOT EXISTS last_check_error VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS fulfillment_pending BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS applied_expiry TIMESTAMP
+        """))
+        await conn.execute(sa_text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_fapshi_customer_payment
+            ON fapshi_transactions (customer_payment_id)
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_fapshi_confirmation_due
+            ON fapshi_transactions (next_check_at, id)
+            WHERE review_reason IS NULL
+        """))
 
         # Buy Goods till payouts (2026-07-21): the pre-existing enum type
         # no-ops the CREATE TYPE above via duplicate_object, so new values
@@ -3742,6 +3767,16 @@ async def startup_event():
         name='Remove expired hotspot users from MikroTik',
         replace_existing=True,
         max_instances=1
+    )
+    from app.services.fapshi_reconciliation import recheck_pending_fapshi_background
+    scheduler.add_job(
+        recheck_pending_fapshi_background,
+        trigger=IntervalTrigger(seconds=30),
+        id='fapshi_confirmation_recheck',
+        name='Confirm delayed Fapshi collections and retry durable delivery',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=30,
     )
     # Safety-net bypass scan + idle-credential reaper. Split out of the job
     # above so the 5-6 min fleet scan no longer pauses removals; each keeps its

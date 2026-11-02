@@ -168,6 +168,7 @@ async def sync_shared_subscription_devices_after_owner_renewal(
     *,
     owner_customer: Customer,
     plan: Plan | None,
+    defer_router_io: bool = False,
 ) -> list[dict]:
     """Extend active companion devices to the paying owner's new expiry.
 
@@ -226,8 +227,11 @@ async def sync_shared_subscription_devices_after_owner_renewal(
         try:
             from app.services.usage_tracking import on_renewal
 
-            await on_renewal(db, shared_customer, plan=plan, now=now)
+            await on_renewal(db, shared_customer, plan=plan, now=now,
+                             **({"defer_router_io": True} if defer_router_io else {}))
         except Exception as exc:
+            if defer_router_io:
+                raise
             logger.error(
                 "[SUBSCRIPTION-SHARE] Failed to renew usage period for shared customer %s: %s",
                 shared_customer.id,
@@ -245,6 +249,8 @@ async def sync_shared_subscription_devices_after_owner_renewal(
                         expires_at=owner_customer.expiry,
                     )
             except Exception as exc:
+                if defer_router_io:
+                    raise
                 logger.warning(
                     "[SUBSCRIPTION-SHARE] Failed to refresh RADIUS expiry for shared customer %s: %s",
                     shared_customer.id,

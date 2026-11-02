@@ -1180,6 +1180,8 @@ async def get_payment_status(
                 max_devices = max_devices_for_customer(customer, customer.plan)
                 await db.commit()
 
+        from app.api.fapshi_routes import customer_payment_flags
+        confirmation = await customer_payment_flags(db, customer.id)
         return {
             "customer_id": customer.id,
             "status": customer.status.value,
@@ -1187,6 +1189,7 @@ async def get_payment_status(
             "plan_id": customer.plan_id,
             "plan_name": customer.plan.name if customer.plan else None,
             "delivery": serialize_delivery_attempt(attempt),
+            **confirmation,
             "access_code": access_code,
             "max_devices": max_devices,
         }

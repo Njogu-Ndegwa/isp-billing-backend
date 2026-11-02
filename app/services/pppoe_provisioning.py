@@ -35,6 +35,7 @@ from app.services.provisioning_retry_policy import (
     retry_due_clause,
     retryable_connectivity_error_clause,
 )
+from app.services.fapshi_reconciliation import non_fapshi_attempt_clause
 from app.config import settings
 from app.services.router_availability import record_router_availability
 
@@ -586,6 +587,7 @@ async def retry_pending_pppoe_provisioning_background():
                     .join(Customer, ProvisioningAttempt.customer_id == Customer.id)
                     .join(Plan, Customer.plan_id == Plan.id)
                     .where(
+                        non_fapshi_attempt_clause(),
                         Customer.pppoe_username.isnot(None),
                         Plan.connection_type == ConnectionType.PPPOE,
                         ProvisioningAttempt.provisioning_state.in_(
@@ -618,6 +620,7 @@ async def retry_pending_pppoe_provisioning_background():
                     .join(Plan, Customer.plan_id == Plan.id)
                     .join(Router, Customer.router_id == Router.id)
                     .where(
+                        non_fapshi_attempt_clause(),
                         Customer.status == CustomerStatus.ACTIVE,
                         Customer.pppoe_username.isnot(None),
                         Customer.expiry.isnot(None),

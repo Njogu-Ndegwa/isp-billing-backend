@@ -1523,6 +1523,19 @@ class FapshiTransaction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     confirmed_at = Column(DateTime, nullable=True)
+    # Immutable contract/baseline captured before Direct Pay; NULL legacy rows
+    # require review rather than guessing what a later plan change purchased.
+    purchase_snapshot = Column(JSON, nullable=True)
+    customer_payment_id = Column(Integer, ForeignKey("customer_payments.id"), nullable=True, unique=True)
+    provider_status = Column(String(20), nullable=True)
+    review_reason = Column(String(100), nullable=True)
+    next_check_at = Column(DateTime, nullable=True)
+    check_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    check_lease_until = Column(DateTime, nullable=True)
+    check_lease_token = Column(String(64), nullable=True)
+    last_check_error = Column(String(100), nullable=True)
+    fulfillment_pending = Column(Boolean, nullable=False, default=False, server_default="false")
+    applied_expiry = Column(DateTime, nullable=True)
 
     customer = relationship("Customer")
     reseller = relationship("User")
