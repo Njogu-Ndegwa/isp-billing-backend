@@ -1,10 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
 
 from app.db.database import get_db
 from app.db.models import Customer, CustomerRating, CustomerStatus
@@ -17,10 +16,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["ratings"])
 
 
-class UpdateLocationRequest(BaseModel):
-    latitude: float
-    longitude: float
-
 class SubmitRatingRequest(BaseModel):
     phone: str  # Identify customer by phone number
     rating: int  # 1-5 stars
@@ -31,102 +26,11 @@ class SubmitRatingRequest(BaseModel):
     latitude: Optional[float] = None  # Optional location at time of rating
     longitude: Optional[float] = None
 
-class CaptureLocationRequest(BaseModel):
-    phone: str  # Identify customer by phone number
-    latitude: float
-    longitude: float
-
-
-@router.post("/api/customers/{customer_id}/location")
-async def update_customer_location(
-    customer_id: int,
-    request: UpdateLocationRequest,
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(verify_token)
-):
-    """
-    Update customer location (lat/long) - for use when staff/technician is at customer premises
-    """
-    try:
-        user = await get_current_user(token, db)
-        stmt = select(Customer).where(Customer.id == customer_id, Customer.user_id == user.id)
-        result = await db.execute(stmt)
-        customer = result.scalar_one_or_none()
-        
-        if not customer:
-            raise HTTPException(status_code=404, detail="Customer not found")
-        
-        customer.latitude = request.latitude
-        customer.longitude = request.longitude
-        customer.location_captured_at = datetime.utcnow()
-        
-        await db.commit()
-        
-        return {
-            "success": True,
-            "message": "Location updated successfully",
-            "customer_id": customer_id,
-            "latitude": request.latitude,
-            "longitude": request.longitude
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error updating customer location: {e}")
-        raise HTTPException(status_code=500, detail="Failed to update location")
-
-
-@router.post("/api/customers/location/by-phone")
-async def capture_location_by_phone(
-    request: CaptureLocationRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Capture customer location by phone number.
-    Works for both existing customers and new phone numbers.
-    For new numbers, creates a customer record with the location.
-    """
-    try:
-        # Find customer by phone number (get most recent)
-        stmt = select(Customer).where(Customer.phone == request.phone).order_by(Customer.created_at.desc())
-        result = await db.execute(stmt)
-        customer = result.scalar_one_or_none()
-        
-        is_new_customer = False
-        
-        if not customer:
-            # Create new customer with just phone and location
-            customer = Customer(
-                phone=request.phone,
-                latitude=request.latitude,
-                longitude=request.longitude,
-                location_captured_at=datetime.utcnow()
-            )
-            db.add(customer)
-            is_new_customer = True
-        else:
-            # Update existing customer's location
-            customer.latitude = request.latitude
-            customer.longitude = request.longitude
-            customer.location_captured_at = datetime.utcnow()
-        
-        await db.commit()
-        await db.refresh(customer)
-        
-        return {
-            "success": True,
-            "message": "Location captured successfully",
-            "customer_id": customer.id,
-            "customer_name": customer.name,
-            "latitude": request.latitude,
-            "longitude": request.longitude,
-            "is_new_customer": is_new_customer
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error capturing location by phone: {e}")
-        raise HTTPException(status_code=500, detail="Failed to capture location")
+# Customer location writes live in customer_routes.py
+# (POST /api/customers/{customer_id}/location: authenticated, owner-scoped).
+# The unauthenticated POST /api/customers/location/by-phone that used to sit
+# here was removed: anyone could overwrite any customer's coordinates by phone
+# number or create ownerless customer rows, and nothing called it.
 
 
 @router.post("/api/ratings/submit")
@@ -153,9 +57,17 @@ async def submit_customer_rating(
                 raise HTTPException(status_code=400, detail=f"{field_name} must be between 1 and 5")
         
         # Try to find customer by phone number (optional - ratings work for non-customers too)
-        stmt = select(Customer).where(Customer.phone == request.phone).order_by(Customer.created_at.desc())
+        # Phones are not unique (one person can be a customer of several
+        # resellers), so take the most recent row instead of 500ing on
+        # scalar_one_or_none().
+        stmt = (
+            select(Customer)
+            .where(Customer.phone == request.phone)
+            .order_by(Customer.created_at.desc())
+            .limit(1)
+        )
         result = await db.execute(stmt)
-        customer = result.scalar_one_or_none()
+        customer = result.scalars().first()
         
         # Use provided location, or fallback to customer's stored location if customer exists
         lat = request.latitude
@@ -209,7 +121,7 @@ async def get_ratings(
     """
     Get all customer ratings with optional location data.
     Filter by rating range and paginate results.
-    Includes ratings from non-customers (anonymous ratings by phone).
+    Only ratings on the caller's own customers.
     """
     try:
         user = await get_current_user(token, db)
@@ -219,14 +131,10 @@ async def get_ratings(
             .order_by(CustomerRating.created_at.desc())
         )
         
-        # Filter by authenticated user's ID
-        stmt = stmt.where(
-            or_(
-                Customer.user_id == user.id,
-                CustomerRating.customer_id.is_(None),
-                Customer.user_id.is_(None)
-            )
-        )
+        # Only ratings attached to the caller's own customers. Anonymous
+        # ratings (no customer) and ratings on ownerless customer rows belong
+        # to no tenant, so no reseller sees them.
+        stmt = stmt.where(Customer.user_id == user.id)
         
         if min_rating:
             stmt = stmt.where(CustomerRating.rating >= min_rating)
@@ -284,7 +192,7 @@ async def get_ratings_summary(
 ):
     """
     Get ratings summary with averages and distribution.
-    Includes ratings from non-customers (anonymous ratings by phone).
+    Only ratings on the caller's own customers.
     """
     try:
         user = await get_current_user(token, db)
@@ -293,14 +201,10 @@ async def get_ratings_summary(
             .outerjoin(Customer, CustomerRating.customer_id == Customer.id)
         )
         
-        # Filter by authenticated user's ID
-        stmt = stmt.where(
-            or_(
-                Customer.user_id == user.id,
-                CustomerRating.customer_id.is_(None),
-                    Customer.user_id.is_(None)
-                )
-            )
+        # Only ratings attached to the caller's own customers. Anonymous
+        # ratings (no customer) and ratings on ownerless customer rows belong
+        # to no tenant, so no reseller sees them.
+        stmt = stmt.where(Customer.user_id == user.id)
         
         result = await db.execute(stmt)
         ratings = result.scalars().all()
@@ -348,7 +252,9 @@ async def get_customers_map_data(
     Get all customers with location data for map visualization.
     Returns only customers that have latitude/longitude set.
     Optionally include their average rating.
-    Includes customers without user_id (created via location capture).
+    Only the caller's own customers (staff tokens authenticate as the owning
+    reseller). Ownerless rows (user_id NULL) belong to no tenant and are never
+    returned.
     """
     try:
         user = await get_current_user(token, db)
@@ -361,13 +267,7 @@ async def get_customers_map_data(
             )
         )
         
-        # Filter by authenticated user's ID
-        stmt = stmt.where(
-            or_(
-                Customer.user_id == user.id,
-                Customer.user_id.is_(None)
-            )
-        )
+        stmt = stmt.where(Customer.user_id == user.id)
         
         if status:
             stmt = stmt.where(Customer.status == CustomerStatus(status))
@@ -426,7 +326,7 @@ async def get_ratings_by_location(
     """
     Get ratings filtered by geographic area (bounding box).
     Useful for seeing ratings in specific locations/zones.
-    Includes ratings from non-customers (anonymous ratings by phone).
+    Only ratings on the caller's own customers.
     """
     try:
         user = await get_current_user(token, db)
@@ -439,14 +339,10 @@ async def get_ratings_by_location(
             )
         )
         
-        # Filter by authenticated user's ID
-        stmt = stmt.where(
-            or_(
-                Customer.user_id == user.id,
-                CustomerRating.customer_id.is_(None),
-                Customer.user_id.is_(None)
-            )
-        )
+        # Only ratings attached to the caller's own customers. Anonymous
+        # ratings (no customer) and ratings on ownerless customer rows belong
+        # to no tenant, so no reseller sees them.
+        stmt = stmt.where(Customer.user_id == user.id)
         
         if min_lat is not None:
             stmt = stmt.where(CustomerRating.latitude >= min_lat)

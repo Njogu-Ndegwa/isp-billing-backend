@@ -227,8 +227,6 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Reset session for customer {customer_id}"),
     (("POST",), "/api/customers/{customer_id}/location", "customers.manage",
      "Set location for customer {customer_id}"),
-    (("POST",), "/api/customers/location/by-phone", "customers.manage",
-     "Set a customer location by phone"),
     (("PUT",), "/api/customers/{customer_id}/device-limit", "customers.manage",
      "Changed device limit for customer {customer_id}"),
     (("PUT",), "/api/customers/{customer_id}/grace-period", "customers.manage",
