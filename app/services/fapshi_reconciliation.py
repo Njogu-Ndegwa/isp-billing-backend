@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import selectinload
 
 from app.db import database
@@ -33,6 +33,49 @@ LEASE_TIME = timedelta(minutes=5)
 MAX_AGE = timedelta(days=7)
 MAX_ATTEMPTS = 720
 BATCH_SIZE = 10
+OPEN_STATUSES = (FapshiTransactionStatus.CREATED, FapshiTransactionStatus.PENDING)
+# A Direct Pay prompt lives on the payer's phone for a few minutes. Only an
+# attempt this recent can still be "in flight" and block a second prompt; an
+# older unresolved row keeps being reconciled but must not lock the customer out.
+IN_FLIGHT_WINDOW = timedelta(minutes=30)
+# Holds raised by initiation itself (no provider ID yet) may still have a live
+# prompt on the phone, so they block inside the in-flight window like a normal
+# pending attempt. Every other review hold is an operator matter, never a lock.
+IN_FLIGHT_HOLDS = ("initiation_outcome_unknown",)
+REVIEW_HOLD_STATUS = "review_hold"
+
+
+def in_flight_clause(now=None):
+    """SQL filter for an attempt that may genuinely still be on the payer's phone."""
+    now = now or datetime.utcnow()
+    return and_(
+        FapshiTransaction.status.in_(OPEN_STATUSES),
+        FapshiTransaction.created_at >= now - IN_FLIGHT_WINDOW,
+        or_(FapshiTransaction.review_reason.is_(None),
+            FapshiTransaction.review_reason.in_(IN_FLIGHT_HOLDS)),
+    )
+
+
+def is_review_hold(txn):
+    """Unresolved locally and parked for manual review (not in flight, not failed)."""
+    return bool(txn is not None and txn.review_reason
+                and txn.status not in FINAL_STATUSES)
+
+
+def _terminal_check_allowed_clause():
+    """Held rows that a provider status check may still close as FAILED/EXPIRED.
+
+    Never credited, have a provider ID, and Fapshi has not already said
+    SUCCESSFUL (a provider success is final and needs a human, not a re-query).
+    """
+    return and_(
+        FapshiTransaction.review_reason.isnot(None),
+        FapshiTransaction.customer_payment_id.is_(None),
+        FapshiTransaction.status.in_(OPEN_STATUSES),
+        FapshiTransaction.trans_id.isnot(None),
+        or_(FapshiTransaction.provider_status.is_(None),
+            FapshiTransaction.provider_status != "SUCCESSFUL"),
+    )
 
 
 def _json_value(value):
@@ -150,7 +193,14 @@ async def _review_reason(db, txn, customer, plan):
     return None
 
 
-async def apply_remote_status(db, transaction_id, remote, *, token=None, provider_trans_id=None):
+async def apply_remote_status(db, transaction_id, remote, *, token=None, provider_trans_id=None,
+                              hold_reason=None):
+    """Apply an authoritative provider response.
+
+    ``hold_reason`` marks a check made outside the automatic window: a provider
+    FAILED/EXPIRED still closes the row, but SUCCESSFUL/PENDING only park it for
+    review. A row already under review is never credited from here either.
+    """
     txn = await db.scalar(select(FapshiTransaction).where(
         FapshiTransaction.id == transaction_id,
     ).with_for_update().execution_options(populate_existing=True))
@@ -167,6 +217,21 @@ async def apply_remote_status(db, transaction_id, remote, *, token=None, provide
     txn.provider_status = status
     txn.updated_at = datetime.utcnow()
     txn.last_check_error = None
+    if status in ("FAILED", "EXPIRED"):
+        # Terminal at the provider: close it whatever hold it was parked on, so
+        # it neither blocks the customer nor sits in the review list. No money
+        # moved, and a failed attempt never revokes another paid entitlement.
+        txn.status = mapping[status]
+        txn.review_reason = None
+        txn.failure_reason = txn.failure_reason or f"Fapshi reported {status}"
+        await db.commit()
+        return txn
+    if txn.review_reason or hold_reason:
+        # Outside the automatic credit path: record the provider's answer and
+        # keep (or raise) the review hold. Crediting a held row is a manual call.
+        txn.review_reason = txn.review_reason or hold_reason
+        await db.commit()
+        return txn
     if status == "SUCCESSFUL":
         customer = await db.scalar(select(Customer).where(
             Customer.id == txn.customer_id,
@@ -218,7 +283,6 @@ async def apply_remote_status(db, transaction_id, remote, *, token=None, provide
         from app.api.fapshi_routes import _parse_provider_datetime
         txn.confirmed_at = _parse_provider_datetime(remote.get("dateConfirmed")) or datetime.utcnow()
     else:
-        # A failed attempt is not authority to revoke another paid entitlement.
         txn.status = mapping[status]
     await db.commit()
     return txn
@@ -230,9 +294,12 @@ async def _claim(transaction_id):
     async with database.async_session() as db:
         result = await db.execute(update(FapshiTransaction).where(
             FapshiTransaction.id == transaction_id,
-            FapshiTransaction.review_reason.is_(None),
-            or_(FapshiTransaction.status.notin_(list(FINAL_STATUSES)),
-                FapshiTransaction.fulfillment_pending.is_(True)),
+            or_(and_(FapshiTransaction.review_reason.is_(None),
+                     or_(FapshiTransaction.status.notin_(list(FINAL_STATUSES)),
+                         FapshiTransaction.fulfillment_pending.is_(True))),
+                # Explicit checks (webhook, status poll) may still learn that a
+                # held row failed. The background sweep never selects these.
+                _terminal_check_allowed_clause()),
             or_(FapshiTransaction.next_check_at.is_(None), FapshiTransaction.next_check_at <= now),
             or_(FapshiTransaction.check_lease_until.is_(None), FapshiTransaction.check_lease_until <= now),
         ).values(check_lease_token=token, check_lease_until=now + LEASE_TIME,
@@ -251,9 +318,9 @@ async def _finish(transaction_id, token, *, error=None):
         if txn:
             txn.check_lease_until = None
             txn.check_lease_token = None
-            if error:
-                # Persist bounded diagnostic codes, never provider body/credentials.
-                txn.last_check_error = error
+            # Persist bounded diagnostic codes, never provider body/credentials;
+            # a clean pass clears a stale one so it doesn't read as a live fault.
+            txn.last_check_error = error
             if error or txn.status not in FINAL_STATUSES or txn.fulfillment_pending:
                 # Pending confirmations also back off: bounded requests over days,
                 # not an exhausted budget after a few minutes with no browser.
@@ -271,6 +338,10 @@ async def _delivery_is_current(db, txn, customer):
         and customer.expiry == txn.applied_expiry
         and customer.expiry > datetime.utcnow()
         and await _latest_payment_id(db, customer.id) == txn.customer_payment_id)
+
+
+def _router_user_missing(result):
+    return "not found" in str(result.get("error") or "").lower()
 
 
 async def deliver_confirmed_payment(transaction_id, *, token=None):
@@ -299,8 +370,10 @@ async def deliver_confirmed_payment(transaction_id, *, token=None):
             # This helper releases its own DB transaction before router I/O;
             # no ledger/customer/provider row locks remain here.
             restored = await restore_normal_profile(db, customer, customer.plan)
-            if restored.get("error"):
+            if restored.get("error") and not _router_user_missing(restored):
                 raise RuntimeError("fup_restore_pending")
+            # A user already removed on expiry carries no throttle; delivery
+            # below re-creates it on the plan's normal rate.
             previous.fup_reverted_at = datetime.utcnow()
         plan, router = customer.plan, customer.router
         args = dict(customer_id=customer.id, router_id=router.id, attempt_id=attempt.id)
@@ -360,23 +433,48 @@ async def deliver_confirmed_payment(transaction_id, *, token=None):
         await db.commit()
 
 
+_ERROR_CODES = {"credentials_unavailable", "delivery_target_missing",
+    "delivery_identity_missing", "fup_restore_pending", "radius_delivery_pending",
+    "router_delivery_pending", "transaction_id_mismatch", "external_id_mismatch",
+    "transaction_type_mismatch", "invalid_provider_amount", "amount_mismatch",
+    "purchase_amount_mismatch", "provider_customer_mismatch", "unknown_provider_status",
+    "invalid_provider_response"}
+
+
+async def _hold_if_unresolved(transaction_id, token, reason):
+    async with database.async_session() as db:
+        txn = await db.scalar(select(FapshiTransaction).where(
+            FapshiTransaction.id == transaction_id,
+            FapshiTransaction.check_lease_token == token,
+        ).with_for_update())
+        if txn and txn.status not in FINAL_STATUSES and not txn.review_reason:
+            txn.review_reason = reason
+        await db.commit()
+
+
 async def reconcile_transaction(transaction_id, *, provider_trans_id=None):
     token = await _claim(transaction_id)
     if not token:
         return
     error = None
+    exhausted_reason = None
     try:
         async with database.async_session() as db:
             txn = await db.get(FapshiTransaction, transaction_id)
-            if (datetime.utcnow() - txn.created_at > MAX_AGE or txn.check_attempts > MAX_ATTEMPTS):
-                txn.review_reason = ("delivery_window_exhausted" if txn.customer_payment_id
-                                     else "reconciliation_window_exhausted")
-                await db.commit()
-                return
+            exhausted = (datetime.utcnow() - txn.created_at > MAX_AGE
+                         or txn.check_attempts > MAX_ATTEMPTS)
+            held = bool(txn.review_reason)
+            credentials = None
             if txn.customer_payment_id:
-                needs_query = False
+                if exhausted:
+                    txn.review_reason = "delivery_window_exhausted"
+                    await db.commit()
+                    return
             else:
-                needs_query = True
+                if exhausted and not held:
+                    # One last authoritative look before parking the row: a
+                    # provider FAILED/EXPIRED closes it instead of holding it.
+                    exhausted_reason = "reconciliation_window_exhausted"
                 pm = await db.get(ResellerPaymentMethod, txn.payment_method_id)
                 if (not pm or pm.user_id != txn.reseller_id
                         or not pm.fapshi_api_user or not pm.fapshi_api_key_encrypted):
@@ -386,26 +484,27 @@ async def reconcile_transaction(transaction_id, *, provider_trans_id=None):
                     api_key=decrypt_credential(pm.fapshi_api_key_encrypted),
                     environment=txn.environment, trans_id=txn.trans_id or provider_trans_id)
                 if not credentials["trans_id"]:
-                    txn.review_reason = "initiation_outcome_unknown"
+                    if not held:
+                        txn.review_reason = exhausted_reason or "initiation_outcome_unknown"
                     await db.commit()
                     return
             await db.commit()
-        if needs_query:
+        if credentials:
             from app.services.fapshi import get_payment_status
             remote = await get_payment_status(**credentials)
             async with database.async_session() as db:
                 await apply_remote_status(db, transaction_id, remote, token=token,
-                                          provider_trans_id=provider_trans_id)
-        await deliver_confirmed_payment(transaction_id, token=token)
+                                          provider_trans_id=provider_trans_id,
+                                          hold_reason=exhausted_reason)
+        if not held and not exhausted_reason:
+            await deliver_confirmed_payment(transaction_id, token=token)
     except Exception as exc:
         error = (str(exc) if isinstance(exc, (ValueError, RuntimeError))
-                 and str(exc) in {"credentials_unavailable", "delivery_target_missing",
-                    "delivery_identity_missing", "fup_restore_pending", "radius_delivery_pending",
-                    "router_delivery_pending", "transaction_id_mismatch", "external_id_mismatch",
-                    "transaction_type_mismatch", "invalid_provider_amount", "amount_mismatch",
-                    "purchase_amount_mismatch", "provider_customer_mismatch", "unknown_provider_status",
-                    "invalid_provider_response"} else "provider_or_reconciliation_error")
+                 and str(exc) in _ERROR_CODES else "provider_or_reconciliation_error")
         logger.warning("Fapshi reconciliation deferred for local transaction %s (%s)", transaction_id, error)
+        if exhausted_reason:
+            # The final look failed; park it rather than retry forever.
+            await _hold_if_unresolved(transaction_id, token, exhausted_reason)
     finally:
         await _finish(transaction_id, token, error=error)
 
@@ -429,3 +528,70 @@ async def recheck_pending_fapshi_background():
         if time.monotonic() - started >= 45:
             break  # remaining persisted rows stay due for the next tick
         await reconcile_transaction(transaction_id)
+
+
+async def close_provider_terminal_rows(transaction_ids, *, apply=False):
+    """Close unresolved local rows that Fapshi itself reports FAILED/EXPIRED.
+
+    Operator tool for rows parked before the final check existed. Each row is
+    re-confirmed with the read-only provider status call first; anything the
+    provider does not report as FAILED/EXPIRED is left exactly as it is. Never
+    credits, never deletes, and re-running is a no-op for rows already closed.
+    """
+    from app.services.fapshi import get_payment_status
+    from app.services.payment_gateway import decrypt_credential
+    results = []
+    for transaction_id in transaction_ids:
+        row = {"id": transaction_id}
+        results.append(row)
+        async with database.async_session() as db:
+            txn = await db.get(FapshiTransaction, transaction_id)
+            if txn is None:
+                row["outcome"] = "not_found"
+                await db.commit()
+                continue
+            row.update(customer_id=txn.customer_id, reseller_id=txn.reseller_id,
+                       local_status=txn.status.value, review_reason=txn.review_reason)
+            if txn.status in FINAL_STATUSES:
+                row["outcome"] = "already_final"
+                await db.commit()
+                continue
+            if txn.customer_payment_id or not txn.trans_id:
+                row["outcome"] = "skipped_not_closable"
+                await db.commit()
+                continue
+            pm = await db.get(ResellerPaymentMethod, txn.payment_method_id)
+            if (not pm or pm.user_id != txn.reseller_id
+                    or not pm.fapshi_api_user or not pm.fapshi_api_key_encrypted):
+                row["outcome"] = "skipped_credentials_unavailable"
+                await db.commit()
+                continue
+            credentials = dict(api_user=pm.fapshi_api_user,
+                               api_key=decrypt_credential(pm.fapshi_api_key_encrypted),
+                               environment=txn.environment, trans_id=txn.trans_id)
+            await db.commit()
+        try:
+            remote = await get_payment_status(**credentials)
+        except Exception as exc:  # provider body/credentials never printed
+            row["outcome"] = f"skipped_provider_error:{type(exc).__name__}"
+            continue
+        provider_status = str((remote or {}).get("status") or "").upper()
+        row["provider_status"] = provider_status
+        if provider_status not in ("FAILED", "EXPIRED"):
+            row["outcome"] = "left_unchanged"
+            continue
+        async with database.async_session() as db:
+            txn = await db.get(FapshiTransaction, transaction_id)
+            try:
+                validate_remote_transaction(txn, remote)
+            except ValueError as exc:
+                row["outcome"] = f"skipped_{exc}"
+                await db.commit()
+                continue
+            await db.commit()
+            if not apply:
+                row["outcome"] = f"would_close_as_{provider_status.lower()}"
+                continue
+            txn = await apply_remote_status(db, transaction_id, remote)
+            row["outcome"] = f"closed_as_{txn.status.value}"
+    return results
