@@ -12,7 +12,7 @@ from app.api.ad_sales_routes import router as ad_sales_router
 from app.api.ads_routes import router as ads_router
 from app.db.database import get_db
 from app.db.models import PortalSettings, SubscriptionStatus
-from app.services import ad_review
+from app.services import ad_review, ad_sales
 from app.services.ad_serving import invalidate_ad_cache
 from app.services.auth import verify_token
 from tests.factories import make_admin, make_reseller
@@ -21,6 +21,14 @@ HOUSE = {
     "title": "Fast WiFi, KES 20 an hour", "seller_name": "Anything", "phone_number": "0712345678",
     "image_url": "https://media.example/wifi.webp", "placement": "hero",
 }
+
+
+@pytest.fixture(autouse=True)
+def _selling_open(monkeypatch):
+    """The pilot switch has its own tests in test_ad_selling_access.py."""
+    async def yes(db, reseller_id):
+        return True
+    monkeypatch.setattr(ad_sales, "selling_allowed", yes)
 
 
 @pytest_asyncio.fixture(autouse=True)
