@@ -94,9 +94,15 @@ def _router_info(router: Router) -> dict:
     }
 
 
-def hotspot_throttle_rate_for_plan(plan: Optional[Plan]) -> str:
-    """Return the RouterOS rate string used when a hotspot plan is throttled."""
-    return parse_speed_to_mikrotik(
+def hotspot_throttle_speed_for_plan(plan: Optional[Plan]) -> str:
+    """The speed a throttled hotspot plan gets, in PLAN format (download/upload).
+
+    Queue sync and the MAC-login functions take plan-format speeds and convert
+    them themselves, so hand them this, not the converted rate: converting
+    twice swaps the direction back. Until 2026-11-04 that made a TV BUNDLE
+    throttle of "2M/0.5M" (2 Mbps down) reach the router as 2M up / 500k DOWN.
+    """
+    return (
         (plan.fup_throttle_profile if plan else None)
         or DEFAULT_HOTSPOT_FUP_THROTTLE_RATE
     )
@@ -481,11 +487,12 @@ def _restore_hotspot_sync(router_info: dict, mac_address: str, normal_rate_limit
         api.disconnect()
 
 
-def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, rate_limit: str = "") -> dict:
+def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, plan_speed: str = "") -> dict:
     """FUP on a MAC-login router: move the user between profiles, or disable it.
 
     The router owns the session queue there, so there is no plan_ queue to
-    re-limit; the user's profile carries the rate.
+    re-limit; the user's profile carries the rate. ``plan_speed`` is in plan
+    format (download/upload); ``set_customer_rate`` converts it.
     """
     api = MikroTikAPI(
         router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
@@ -496,7 +503,7 @@ def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, rate_li
     try:
         if action == "block":
             return mac_login_block_customer(api, normalized_mac)
-        return mac_login_set_customer_rate(api, normalized_mac, rate_limit)
+        return mac_login_set_customer_rate(api, normalized_mac, plan_speed)
     finally:
         api.disconnect()
 
@@ -517,12 +524,12 @@ async def apply_throttle(
         if not router:
             return {"error": "no_router"}
         info = _router_info(router)
-        rate_limit = hotspot_throttle_rate_for_plan(plan)
+        throttle_speed = hotspot_throttle_speed_for_plan(plan)
         await db.commit()
         if mac_login_enabled(info["id"]):
-            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, rate_limit)
+            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, throttle_speed)
         return await asyncio.to_thread(
-            _set_hotspot_queue_limit_sync, info, normalized_mac, rate_limit
+            _set_hotspot_queue_limit_sync, info, normalized_mac, parse_speed_to_mikrotik(throttle_speed)
         )
 
     if not customer.pppoe_username:
@@ -588,12 +595,12 @@ async def restore_normal_profile(
         if not router:
             return {"error": "no_router"}
         info = _router_info(router)
-        rate_limit = parse_speed_to_mikrotik(plan.speed if plan else "")
+        plan_speed = plan.speed if plan else ""
         await db.commit()
         if mac_login_enabled(info["id"]):
-            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, rate_limit)
+            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, plan_speed)
         return await asyncio.to_thread(
-            _restore_hotspot_sync, info, normalized_mac, rate_limit
+            _restore_hotspot_sync, info, normalized_mac, parse_speed_to_mikrotik(plan_speed)
         )
 
     if not customer.pppoe_username:

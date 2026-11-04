@@ -611,7 +611,12 @@ def verify_customer(api, mac_address: str) -> Dict[str, Any]:
 
 
 def set_customer_rate(api, mac_address: str, bandwidth_limit: str) -> Dict[str, Any]:
-    """Move an existing MAC-login user to another rate (FUP throttle/restore)."""
+    """Move an existing MAC-login user to another rate (FUP throttle/restore).
+
+    ``bandwidth_limit`` is a plan-format speed (download/upload), as in
+    ``provision_customer``. Never pass an already-converted RouterOS rate:
+    converting it again swaps upload and download.
+    """
     mac = mac_login_username(mac_address)
     rate_limit = parse_speed_to_mikrotik(bandwidth_limit)
     profile_result = _ensure_profile(api, rate_limit)
