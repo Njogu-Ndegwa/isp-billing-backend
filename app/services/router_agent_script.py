@@ -40,6 +40,11 @@ def render_router_agent_source(
     The server controls the successful next-poll interval in the idle response.
     Transport/server failures back off locally to five minutes, protecting both
     the router and the small production server.
+
+    No bare ``:return``: RouterOS 7.19+ rejects it ("missing value(s) of
+    argument(s) value"), which made every skipped tick log a script error
+    (router 446, 2026-11-04). Early exits clear ``bwRun`` instead, the same
+    approach as the check-in applier and the expiry reaper.
     """
 
     identity = _require(identity, _IDENTITY_RE, "identity")
@@ -77,34 +82,41 @@ def render_router_agent_source(
 :if ([:typeof $bitwaveAgentFailures] = "nil") do={{ :set bitwaveAgentFailures 0 }}
 :if ([:typeof $bitwaveFailureSkips] = "nil") do={{ :set bitwaveFailureSkips 0 }}
 :if ([:typeof $bitwavePollSkips] = "nil") do={{ :set bitwavePollSkips 0 }}
+:local bwRun true
 :if ([:typeof $bitwaveAgentRunning] = "bool" and $bitwaveAgentRunning) do={{
     :set bitwaveAgentLockTicks ($bitwaveAgentLockTicks + 1)
     :if ($bitwaveAgentLockTicks < 3) do={{
         :log info "bitwave-agent: previous poll still running"
-        :return
+        :set bwRun false
+    }} else={{
+        :log warning "bitwave-agent: recovered stale poll lock"
+        :set bitwaveAgentRunning false
+        :set bitwaveAgentLockTicks 0
     }}
-    :log warning "bitwave-agent: recovered stale poll lock"
-    :set bitwaveAgentRunning false
-    :set bitwaveAgentLockTicks 0
 }}
-:set bitwaveAgentRunning true
-:set bitwaveAgentLockTicks 0
-:if ($bitwaveFailureSkips > 0) do={{
-    :set bitwaveFailureSkips ($bitwaveFailureSkips - 1)
-    :set bitwaveAgentRunning false
+:if ($bwRun) do={{
+    :set bitwaveAgentRunning true
     :set bitwaveAgentLockTicks 0
-    :return
+    :if ($bitwaveFailureSkips > 0) do={{
+        :set bitwaveFailureSkips ($bitwaveFailureSkips - 1)
+        :set bitwaveAgentRunning false
+        :set bitwaveAgentLockTicks 0
+        :set bwRun false
+    }}
 }}
 :local tunnel "down"
-:do {{
-    {tunnel_probe}
-}} on-error={{}}
-:if ($tunnel = "up" and $bitwavePollSkips > 0) do={{
-    :set bitwavePollSkips ($bitwavePollSkips - 1)
-    :set bitwaveAgentRunning false
-    :set bitwaveAgentLockTicks 0
-    :return
+:if ($bwRun) do={{
+    :do {{
+        {tunnel_probe}
+    }} on-error={{}}
+    :if ($tunnel = "up" and $bitwavePollSkips > 0) do={{
+        :set bitwavePollSkips ($bitwavePollSkips - 1)
+        :set bitwaveAgentRunning false
+        :set bitwaveAgentLockTicks 0
+        :set bwRun false
+    }}
 }}
+:if ($bwRun) do={{
 :if ($tunnel = "down") do={{ :set bitwavePollSkips 0 }}
 :local url ("{endpoint}/api/router/agent/poll?identity={identity}&tunnel=" . $tunnel . "&version={AGENT_VERSION}")
 :local fileName "{COMMAND_FILE}"
@@ -131,6 +143,7 @@ def render_router_agent_source(
 :do {{ /file remove [find name=$fileName] }} on-error={{}}
 :set bitwaveAgentRunning false
 :set bitwaveAgentLockTicks 0
+}}
 """)
 
 
