@@ -1570,6 +1570,21 @@ async def reconnect_self_service(
             await db.commit()
             return result
 
+    # A plan already carrying more devices than its current limit (a group
+    # whose plan was swapped by a single-device voucher) is a FULL multi-device
+    # plan: nothing is added, and its main device may only move under the
+    # rules below (never when online or paired to a TV).
+    if device_limit_exc is None:
+        from app.api.access_code_routes import attached_devices_full_exc
+
+        for c in candidates:
+            if c.plan and not sharing_enabled_for_customer(c, c.plan):
+                device_limit_exc = await attached_devices_full_exc(
+                    db, owner=c, normalized_mac=normalized_mac,
+                )
+                if device_limit_exc is not None:
+                    break
+
     # (3) Move a purchase whose device is not in use (a phone whose randomized
     # MAC rotated, a replaced phone, a plan never bound to a device).
     # (4) Otherwise refuse: never revoke a device that is in use.

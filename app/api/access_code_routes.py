@@ -44,6 +44,7 @@ from app.services.code_attempt_limiter import check_code_attempts, record_code_f
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.router_helpers import get_router_by_id
 from app.services.subscription_sharing import (
+    active_shared_device_count,
     max_devices_for_customer,
     sharing_enabled_for_customer,
 )
@@ -193,6 +194,10 @@ async def redeem_code_on_device(
             )
             return {**result, **_plan_summary(own), "outcome": "main_device"}
 
+        full = await attached_devices_full_exc(db, owner=owner, normalized_mac=normalized_mac)
+        if full is not None:
+            raise full
+
         from app.api.public_routes import _move_idle_purchase_or_refuse
 
         result = await _move_idle_purchase_or_refuse(
@@ -247,6 +252,43 @@ async def _own_purchase_on_device(
     return None
 
 
+async def attached_devices_full_exc(
+    db: AsyncSession,
+    *,
+    owner: Customer,
+    normalized_mac: str,
+) -> Optional[HTTPException]:
+    """409 ``device_limit_reached`` for a plan that already carries more devices
+    than its current limit allows, else None.
+
+    A shared plan's device limit comes from ``max_devices_override`` or the
+    current plan's ``max_shared_users``. Redeeming a single-device voucher on
+    the owner's device swaps the plan and with it the limit, while the shared
+    devices stay attached: router 446, customer 50758 (2 Nov 2026), a 10-device
+    240 GB group with 5 shared phones became a 1-device "TV BUNDLE". A reconnect
+    then treated it as a single-device plan and moved it off its TV. Such a plan
+    is a full multi-device plan: no slot is free, nothing is moved by a code.
+    """
+    limit = max_devices_for_customer(owner, owner.plan)
+    shares = await active_shared_device_count(db, owner.id)
+    if shares == 0 or shares + 1 < limit:
+        return None
+    devices = await list_subscription_devices(db, owner=owner, current_mac=normalized_mac)
+    in_use = shares + 1
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "device_limit_reached",
+            "message": (
+                f"This plan is in use on all its {in_use} devices. "
+                "Remove one to connect this device."
+            ),
+            "max_devices": in_use,
+            "devices": devices,
+        },
+    )
+
+
 async def add_device_to_owner_plan(
     db: AsyncSession,
     *,
@@ -285,7 +327,7 @@ async def add_device_to_owner_plan(
             detail={
                 "error": "device_limit_reached",
                 "message": (
-                    f"This plan is already in use on {exc.max_shared_users} devices. "
+                    f"This plan is in use on all its {exc.max_shared_users} devices. "
                     "Remove one to connect this device."
                 ),
                 "max_devices": exc.max_shared_users,
