@@ -6,7 +6,7 @@ disabled; values above 1 allow ``max_shared_users - 1`` extra devices/customers.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +29,9 @@ from app.services.hotspot_provisioning import (
 from app.services.mikrotik_api import normalize_mac_address
 
 logger = logging.getLogger(__name__)
+
+# A reused delivery attempt older than this starts a fresh retry window.
+SHARE_ATTEMPT_REUSE_RESET_AFTER = timedelta(minutes=5)
 
 
 def max_shared_users_for_plan(plan: Plan | None) -> int:
@@ -110,6 +113,19 @@ async def schedule_shared_device_delivery(
         external_reference=f"share:{owner_customer.id}:{pairing.id}",
         entrypoint=ProvisioningAttemptEntrypoint.SUBSCRIPTION_SHARE,
     )
+    # One attempt row per pairing, reused on every renewal. Its retry window is
+    # measured from created_at, so without a reset a renewal re-scheduled a
+    # weeks-old row and the retry job failed it on its next tick ("retry window
+    # exhausted") before pushing anything: the device only came back if the
+    # router ran the check-in applier.
+    now = datetime.utcnow()
+    if attempt.created_at is None or now - attempt.created_at > SHARE_ATTEMPT_REUSE_RESET_AFTER:
+        attempt.created_at = now
+        attempt.attempt_count = 0
+        attempt.last_attempt_at = None
+        attempt.router_updated_at = None
+        attempt.delivered_via = None
+        attempt.access_seen_at = None
     await schedule_provisioning_attempt(db, attempt)
     return attempt
 
@@ -161,6 +177,41 @@ async def update_radius_shared_device_expiry(
             "updated_at": now,
         },
     )
+
+
+async def carry_owner_edit_to_shared_devices(
+    db: AsyncSession,
+    *,
+    owner_customer: Customer,
+) -> list[int]:
+    """Copy an edited owner's expiry and plan onto its active shared devices.
+
+    Renewals do this through sync_shared_subscription_devices_after_owner_renewal.
+    A reseller editing the owner directly does not renew anything, so usage
+    periods stay open; only the fields every device must agree on move. Returns
+    the shared customer ids changed. The caller owns the transaction.
+    """
+    rows = (
+        await db.execute(
+            select(DevicePairing, Customer)
+            .join(Customer, DevicePairing.customer_id == Customer.id)
+            .where(
+                DevicePairing.subscription_owner_customer_id == owner_customer.id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+                DevicePairing.is_active == True,  # noqa: E712
+            )
+        )
+    ).all()
+    changed: list[int] = []
+    for pairing, shared in rows:
+        if shared.expiry == owner_customer.expiry and shared.plan_id == owner_customer.plan_id:
+            continue
+        shared.expiry = owner_customer.expiry
+        shared.plan_id = owner_customer.plan_id
+        pairing.expires_at = owner_customer.expiry
+        pairing.plan_id = owner_customer.plan_id
+        changed.append(shared.id)
+    return changed
 
 
 async def sync_shared_subscription_devices_after_owner_renewal(
