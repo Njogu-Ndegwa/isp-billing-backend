@@ -492,3 +492,93 @@ async def test_live_probe_unreachable_router_is_unknown(monkeypatch):
     assert probe_online_macs_sync(
         {"ip": "10.0.0.2", "username": "a", "password": "b", "port": 8728}, [TV_MAC],
     ) is None
+
+
+# ------------------------------------------------------------ paired devices
+# Router 446, 4 Nov 2026: a TV paired with a "Device pairing voucher" was off
+# for over a day; a phone typing the voucher code took its purchase, and the
+# TV came back to "connected, no internet".
+
+from app.db.models import DeviceType  # noqa: E402
+
+
+async def _pair(db, customer, *, device_type=DeviceType.TV, mac=None, active=True,
+                expires_at=None):
+    db.add(DevicePairing(
+        customer_id=customer.id,
+        device_mac=mac or customer.mac_address,
+        device_name="Living room TV",
+        device_type=device_type,
+        router_id=customer.router_id,
+        plan_id=customer.plan_id,
+        is_active=active,
+        expires_at=expires_at or customer.expiry,
+        is_subscription_share=False,
+    ))
+    await db.commit()
+
+
+async def test_paired_tv_unseen_for_days_is_not_taken_by_a_phone(db, router_io):
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _pair(db, tv)
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(days=2))
+
+    with pytest.raises(HTTPException) as exc:
+        await _reconnect(db, router, OTHER_PHONE_MAC)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == PLAN_IN_USE_ERROR
+    assert "paired to a TV" in exc.value.detail["message"]
+    assert await _mac_of(db, tv) == TV_MAC
+    assert router_io.cleaned == [] and router_io.provisioned == []
+    attempt = (await db.execute(select(ReconnectionAttempt))).scalars().all()[-1]
+    assert attempt.failure_reason == "plan_in_use:paired_device"
+    # A pinned device needs no live probe: it is in use by definition.
+    assert TV_MAC not in sum(router_io.probed, [])
+
+
+async def test_paired_tv_is_not_taken_by_code_either(db, router_io):
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _pair(db, tv)
+    await _receipt(db, tv, "SIGTV00446")
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(days=2))
+
+    with pytest.raises(HTTPException) as exc:
+        await _reconnect(db, router, OTHER_PHONE_MAC, code="SIGTV00446")
+
+    assert exc.value.status_code == 409
+    assert await _mac_of(db, tv) == TV_MAC
+
+
+async def test_paired_tv_still_reconnects_itself(db, router_io):
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _pair(db, tv)
+
+    result = await _reconnect(db, router, TV_MAC)
+
+    assert result["customer_name"] == "Vivian TV"
+    assert await _mac_of(db, tv) == TV_MAC
+
+
+@pytest.mark.parametrize("pairing", [
+    {"active": False},
+    {"expires_at": datetime.utcnow() - timedelta(minutes=1)},
+    {"mac": "3C:5A:B4:99:99:99"},          # stale pairing on another MAC
+    {"device_type": DeviceType.OTHER},     # shared phones are not pinned
+])
+async def test_pairing_that_does_not_pin_keeps_old_rule(db, router_io, pairing):
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _pair(db, tv, **pairing)
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(hours=2))
+
+    result = await _reconnect(db, router, NEW_LAPTOP_MAC)
+
+    assert result["customer_name"] == "Vivian TV"
+    assert await _mac_of(db, tv) == NEW_LAPTOP_MAC
+
+
+async def test_classification_paired_device():
+    now = datetime.utcnow()
+    use = classify_device_use(customer_id=1, mac=TV_MAC, last_seen=None,
+                              online_now=False, now=now, paired_device=True)
+    assert use.in_use and use.reason == "paired_device"
