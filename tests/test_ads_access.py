@@ -71,7 +71,8 @@ async def _staff_headers(db, owner, permissions):
 
 
 async def _reseller(db):
-    return await make_reseller(db, subscription_status=SubscriptionStatus.ACTIVE)
+    # A support number: a reseller's own promo must show it (house-ad lock).
+    return await make_reseller(db, subscription_status=SubscriptionStatus.ACTIVE, support_phone="0712345678")
 
 
 async def _ad(db, **overrides) -> Ad:
@@ -100,7 +101,7 @@ async def test_reseller_cannot_create_a_network_wide_ad(client, db):
     r = await client.post("/api/ads", json=AD_BODY, headers=_bearer(reseller))
     assert r.status_code == 200, r.text
     assert r.json()["owner_user_id"] == reseller.id
-    assert r.json()["status"] == "pending"
+    assert r.json()["status"] == "approved"   # own promo: live after the automatic checks
 
 
 @pytest.mark.asyncio
@@ -162,7 +163,7 @@ async def test_portal_staff_manage_the_owners_ads(client, db):
     created = await client.post("/api/ads", json=AD_BODY, headers=h)
     assert created.status_code == 200, created.text
     assert created.json()["owner_user_id"] == owner.id
-    assert created.json()["status"] == "pending"
+    assert created.json()["status"] == "approved"
     ad_id = created.json()["id"]
 
     assert (await client.get("/api/ads/manage", headers=h)).json()["pagination"]["total"] == 1
@@ -220,7 +221,10 @@ async def test_staff_without_portal_or_dashboard_rights_get_no_ads(client, db):
 def test_every_ads_route_is_mapped_or_deliberately_admin_only():
     """Deny by default: a new ads route must be added to the staff map on purpose."""
     import main
-    admin_only = {("POST", "/api/ads/{ad_id}/review"), ("GET", "/api/advertisers"), ("POST", "/api/advertisers")}
+    admin_only = {
+        ("POST", "/api/ads/{ad_id}/review"), ("POST", "/api/ads/{ad_id}/takedown"),
+        ("GET", "/api/advertisers"), ("POST", "/api/advertisers"),
+    }
     public = {("POST", "/api/ads/click"), ("POST", "/api/ads/impression")}
     for route in main.app.routes:
         path = getattr(route, "path", "")

@@ -106,3 +106,93 @@ top 20% and bottom 30%), videos ≤ 15 s, start with the offer, assume no sound.
   `POST /api/ads/click` `{ad_id, click_type: call|whatsapp|view_details, placement, …}`.
   Placements: `hero`, `wait_screen`, `success_page`, `local`. Counted once per ad, placement,
   phone and UTC day; always answer 200.
+
+## Selling ads through Bitwave (Dennis, 4 Nov 2026)
+
+Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, review rules in
+`app/services/ad_review.py`. Tests: `tests/test_ad_sales.py`, `tests/test_ad_review_rules.py`.
+
+### Rules
+
+- **Own promo (`house`) is free** and goes live at once after the automatic checks. Its
+  `seller_name` is always the reseller's network name (`business_name`, else
+  `organization_name`); its phone and WhatsApp must be one of the reseller's support numbers
+  (`users.support_phone`, portal support phone/WhatsApp). Anything else is refused with
+  "choose An ad I sold".
+- **An ad I sold (`reseller`)** is created only through `POST /api/ad-sales` (the old
+  `POST /api/ads` refuses `slot: "reseller"` for resellers). Price per week ≥ KES 200
+  (≤ 12,500), 1–12 whole weeks. Kenyan (M-Pesa) resellers only for now.
+- **Money**: the business pays the total by STK push to Bitwave's own paybill (the system
+  shortcode), also for direct-settlement resellers. `bitwave_fee = floor(amount × 20 / 100)`,
+  `reseller_share = amount − bitwave_fee` (rounding favours the reseller: KES 1,005 → 201 / 804).
+- **Paid period starts at go-live**: weeks paid before approval are banked and start when the ad
+  is approved. A renewal paid while live extends the end date; paid after the end, it starts now.
+  A sold ad never runs without a paid period (`ad_serving` refuses a `reseller` ad with no
+  `expires_at`) and stops by itself at `expires_at`.
+- **Payout**: the reseller's 80% is credited when the paid weeks start running and is a separate
+  term of the payout balance (`mpesa_b2b.get_unpaid_balance`), so the normal B2B payout pays it.
+  It is never written to `customer_payments` (hotspot revenue, GMV and the 3% hotspot commission
+  don't include it). Bitwave's 20% is the `ad_commission` stream in
+  `/api/admin/metrics/platform-earnings`; paid-but-not-running money and refunds due are under
+  `not_counted`.
+- **Review**: sold ads need a Bitwave admin's approval until the reseller has 3 sold ads approved
+  by an admin and no rejection (a rejection of a sold ad, or a takedown of any of their ads);
+  then they are approved automatically. An ad that was taken down always waits for an admin
+  after an edit. Automatic checks on every submit: blocked words (admin-editable, whole words),
+  a valid Kenyan mobile number, media present.
+- **Refunds are never automatic**: rejected after payment, ad deleted before it ran, or a second
+  payment for the same order → `refund_status: "due"`, listed for an admin, who refunds by hand
+  and records it.
+
+### Prompt guards
+
+- One prompt at a time: a prompt still waiting (< 3 min old) blocks another (409). Before a new
+  one, a waiting prompt older than 90 s is checked with Safaricom's STK query; if it turns out
+  paid, nothing is sent.
+- At most 3 prompts per ad in 10 minutes (429).
+- Statuses on the newest prompt (`sale.prompt.status`): `sending`, `waiting_for_pin`, `paid`,
+  `cancelled` (ResultCode 1032), `timed_out` (1037/1019, or no answer in 30 min), `failed`, with
+  M-Pesa's `reason`. A success callback after a timeout still counts.
+- Callbacks, the reconciler (every 60 s) and the business's link can all report one payment; it
+  is applied and credited once (sale row lock, paid-state check, unique receipt).
+
+### Endpoints
+
+| Method & path | Who | Body / query | Notes |
+|---|---|---|---|
+| `GET /api/ad-sales/quote` | any | `?weeks&price_per_week` | `{amount, bitwave_fee, reseller_share, fee_percent}` |
+| `POST /api/ad-sales` | reseller, staff `portal.manage` | Ad fields + `business_name`, `business_phone`, `weeks`, `price_per_week` | `{ad, sale}`; sends the prompt at once |
+| `GET /api/ad-sales` | reseller (own), admin (all) | `?state&payout_status&owner_user_id&page&per_page` | `{sales, totals, pagination}`; reseller also gets `review` (auto-approve progress). `payout_status=refund_due` is the refund queue |
+| `GET /api/ads/{id}/sale` | owner, admin | | the sale summary with `payments`; poll every few seconds while a prompt is out |
+| `POST /api/ads/{id}/sale` | owner | `business_name, business_phone, weeks, price_per_week` | put an older sold ad up for payment |
+| `POST /api/ads/{id}/sale/prompt` | owner | `{phone?, weeks?, price_per_week?}` | (re)send the prompt for what is due |
+| `POST /api/ads/{id}/sale/renew` | owner | `{phone?, weeks?, price_per_week?}` | renewal prompt (default same price and length) |
+| `POST /api/ads/{id}/takedown` | admin | `{note}` | any ad, off every portal now |
+| `POST /api/ad-sales/payments/{id}/refund` | admin | `{note?}` | records a hand refund; moves no money |
+| `GET/PUT /api/ad-review/rules` | admin | `{blocked_words: [...]}` | |
+| `POST /api/mpesa/ad-sales/callback` | Safaricom | | always `ResultCode 0` |
+| `GET /api/public/promo/{token}` | anyone with the link | | the business's report: title, dates, views, taps, daily, amount due. No fees, phones or device data |
+| `POST /api/public/promo/{token}/pay` | anyone with the link | `{phone?}` | the business sends itself the prompt (same guards) |
+
+Sale summary (`ad.sale` on `/api/ads/manage` rows, and the routes above):
+
+```json
+{
+  "sale_id": 3, "business_name": "Mama Njeri Bakery", "business_phone": "254722111222",
+  "price_per_week": 250, "weeks": 2, "fee_percent": 20,
+  "state": "awaiting_payment",   // awaiting_payment | payment_failed | in_review | live | paused | ended | rejected | taken_down | deleted
+  "amount_due": 500, "due_kind": "initial", "payment_status": "awaiting_payment",
+  "prompt": {"payment_id": 9, "status": "waiting_for_pin", "amount": 500, "phone": "254722111222",
+             "kind": "initial", "reason": null, "sent_at": "…", "retry_after": "…"},
+  "can_resend": false, "paid_total": 0, "bitwave_fee_total": 0, "reseller_share_total": 0,
+  "credited_total": 0, "refund_due_total": 0,
+  "payout_status": "none",       // none | waiting_to_run | credited | refund_due | refunded
+  "weeks_banked": 0, "live_from": null, "live_until": null,
+  "renewal_due": false, "can_renew": false,
+  "share_url": "https://bitwavetechnologies.com/promo/<token>"
+}
+```
+
+The reseller's Account Statement (`/api/reseller/account-statement`) lists each credited ad
+payment as an `ad_revenue` entry and reports `balance.total_ad_revenue` and
+`period_summary.ad_revenue`.

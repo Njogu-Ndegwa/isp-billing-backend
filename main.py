@@ -128,6 +128,7 @@ from app.api.payment_routes import router as payment_router
 from app.api.dashboard_routes import router as dashboard_router
 from app.api.mikrotik_routes import router as mikrotik_router
 from app.api.ads_routes import router as ads_router
+from app.api.ad_sales_routes import router as ad_sales_router
 from app.api.ratings_routes import router as ratings_router
 from app.api.voucher_routes import router as voucher_router
 from app.api.provisioning import router as provisioning_router
@@ -182,6 +183,7 @@ app.include_router(payment_router)
 app.include_router(dashboard_router)
 app.include_router(mikrotik_router)
 app.include_router(ads_router)
+app.include_router(ad_sales_router)
 app.include_router(ratings_router)
 app.include_router(voucher_router)
 app.include_router(provisioning_router)
@@ -3417,6 +3419,27 @@ async def run_hero_ads_migrations():
     logger.info("Hero ads migrations complete")
 
 
+async def run_ad_sales_migrations():
+    """Selling ads through Bitwave (2026-11): creates the new tables ad_sales,
+    ad_sale_payments and ad_review_events if they are missing. Additive only:
+    no existing table or column changes. Idempotent: safe on every startup.
+    """
+    from sqlalchemy import inspect
+    from app.db.models import AdReviewEvent, AdSale, AdSalePayment
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+        missing = [
+            model.__table__
+            for model in (AdSale, AdSalePayment, AdReviewEvent)
+            if model.__tablename__ not in tables
+        ]
+        if missing:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=missing))
+            logger.info("Ad sales migration: created %s", ", ".join(t.name for t in missing))
+    logger.info("Ad sales migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     if shadow_mode_enabled():
@@ -3741,6 +3764,11 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Hero ads migration failed (non-fatal): {e}")
 
+    try:
+        await run_ad_sales_migrations()
+    except Exception as e:
+        logger.error(f"Ad sales migration failed (non-fatal): {e}")
+
     from app.config import settings as app_settings
     if not scheduler_enabled():
         if scheduler.running:
@@ -3767,6 +3795,18 @@ async def startup_event():
         name='Remove expired hotspot users from MikroTik',
         replace_existing=True,
         max_instances=1
+    )
+    # Sold ads: confirm M-Pesa prompts whose callback never came, and time
+    # out the ones nobody answered (app/services/ad_sales.py).
+    from app.services.ad_sales import reconcile_ad_sale_payments_background
+    scheduler.add_job(
+        reconcile_ad_sale_payments_background,
+        trigger=IntervalTrigger(seconds=60),
+        id='ad_sale_payment_reconcile',
+        name='Confirm or time out M-Pesa prompts for sold ads',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,
     )
     from app.services.fapshi_reconciliation import recheck_pending_fapshi_background
     scheduler.add_job(

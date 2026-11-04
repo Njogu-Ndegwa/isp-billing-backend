@@ -1058,12 +1058,23 @@ async def _balance_correction(db: AsyncSession, reseller_id: int) -> float:
     return float(val or 0)
 
 
+async def _ad_credits(db: AsyncSession, reseller_id: int) -> float:
+    """The reseller's 80% of ads they sold through Bitwave, credited once the
+    paid weeks started running (app/services/ad_sales.py). Bitwave collected
+    that money on its own paybill, so it owes it like platform-collected
+    hotspot money; it is kept out of customer_payments so hotspot revenue,
+    GMV and the hotspot commission never include it."""
+    from app.services.ad_sales import ad_credit_total
+    return await ad_credit_total(db, reseller_id)
+
+
 async def get_unpaid_balance(db: AsyncSession, reseller_id: int) -> float:
     mpesa_rev = await _mpesa_revenue(db, reseller_id)
+    ad_credits = await _ad_credits(db, reseller_id)
     paid = await _total_payouts(db, reseller_id)
     charges = await _total_charges(db, reseller_id)
     correction = await _balance_correction(db, reseller_id)
-    return round(mpesa_rev + correction - paid - charges, 2)
+    return round(mpesa_rev + ad_credits + correction - paid - charges, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -1109,13 +1120,15 @@ async def get_unpaid_balance_by_router(db: AsyncSession, reseller_id: int) -> di
     paid = await _payouts_by_router(db, reseller_id)
     charges = await _total_charges(db, reseller_id)
     correction = await _balance_correction(db, reseller_id)
+    ad_credits = await _ad_credits(db, reseller_id)
 
     buckets = {}
     for key in set(revenue) | set(paid):
         buckets[key] = revenue.get(key, 0.0) - paid.get(key, 0.0)
 
-    # Reseller-wide adjustments settle against the default bucket.
-    buckets[None] = buckets.get(None, 0.0) + correction - charges
+    # Reseller-wide adjustments, and ad money (which belongs to no router),
+    # settle against the default bucket.
+    buckets[None] = buckets.get(None, 0.0) + correction + ad_credits - charges
 
     return {key: round(value, 2) for key, value in buckets.items()}
 
