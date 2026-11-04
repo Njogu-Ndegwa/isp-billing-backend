@@ -50,6 +50,30 @@ def public_media_base() -> str:
     return (settings.AD_MEDIA_PUBLIC_BASE or "").rstrip("/")
 
 
+# New uploads are stored and served under c/. Until 4 Nov 2026 the key began
+# with ads/, so photos were served from /media/ads/..., and EasyList (Adblock
+# Plus, uBlock Origin, AdGuard, Brave Shields) has the generic rule
+# "/media/ads/*$image": the upload worked, but the dashboard thumbnail, the
+# preview and the portal hero never loaded in a browser with an ad blocker.
+# Keep words like ad, ads, advert, banner, sponsor and promo out of media
+# paths. The media Worker serves /media/c/<path> from c/<path>, falling back to
+# the old ads/<path> object, so old links are rewritten rather than migrated.
+KEY_PREFIX = "c/"
+LEGACY_KEY_PREFIX = "ads/"
+
+
+def public_media_url(url: Optional[str]) -> Optional[str]:
+    """A stored media link in its ad-blocker-safe form. Links saved before the
+    c/ prefix existed are rewritten; anything else is returned unchanged."""
+    base = public_media_base()
+    if not url or not base:
+        return url
+    legacy = f"{base}/{LEGACY_KEY_PREFIX}"
+    if url.startswith(legacy):
+        return f"{base}/{KEY_PREFIX}{url[len(legacy):]}"
+    return url
+
+
 def _hmac(key: bytes, msg: str) -> bytes:
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
 
@@ -131,8 +155,8 @@ def create_upload(content_type: str, size: int, owner_label: str, now: Optional[
         raise MediaRejected(f"The file is larger than {limit // (1024 * 1024)} MB")
 
     now = now or datetime.utcnow()
-    safe_owner = "".join(c for c in owner_label if c.isalnum() or c in "-_")[:40] or "ad"
-    key = f"ads/{now:%Y/%m}/{safe_owner}-{uuid.uuid4().hex[:16]}.{ext}"
+    safe_owner = "".join(c for c in owner_label if c.isalnum() or c in "-_")[:40] or "media"
+    key = f"{KEY_PREFIX}{now:%Y/%m}/{safe_owner}-{uuid.uuid4().hex[:16]}.{ext}"
     host = f"{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     path = "/" + quote(f"{settings.R2_BUCKET}/{key}", safe="/-_.~")
     url = presign_url(

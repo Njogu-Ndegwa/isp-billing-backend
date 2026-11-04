@@ -44,6 +44,7 @@ router = APIRouter(tags=["ads"])
 
 _BADGES = {"hot": AdBadgeType.HOT, "new": AdBadgeType.NEW, "sale": AdBadgeType.SALE}
 _COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_MEDIA_FIELDS = ("image_url", "video_url", "poster_url")
 _PHONE_RE = re.compile(r"^\+?[0-9 ]{9,16}$")
 # Content edits that send a reseller's approved ad back for review.
 _REVIEWED_FIELDS = {
@@ -191,6 +192,7 @@ def _check_media_url(url: Optional[str], field: str) -> Optional[str]:
     if base:
         if not url.startswith(base + "/"):
             raise HTTPException(status_code=400, detail=f"{field} must be uploaded through the dashboard")
+        url = ad_media.public_media_url(url)
     elif not url.startswith("https://"):
         raise HTTPException(status_code=400, detail=f"{field} must be an https:// link")
     return url[:500]
@@ -243,7 +245,7 @@ def _serialize_manage(ad: Ad, stats: Optional[dict] = None, owner_name: Optional
         "advertiser_id": ad.advertiser_id,
         "title": ad.title,
         "description": ad.description,
-        "image_url": ad.image_url,
+        "image_url": ad_media.public_media_url(ad.image_url),
         "seller_name": ad.seller_name,
         "seller_location": ad.seller_location,
         "phone_number": ad.phone_number,
@@ -257,8 +259,8 @@ def _serialize_manage(ad: Ad, stats: Optional[dict] = None, owner_name: Optional
         "priority": ad.priority,
         "placement": ad.placement,
         "media_type": ad.media_type,
-        "video_url": ad.video_url,
-        "poster_url": ad.poster_url,
+        "video_url": ad_media.public_media_url(ad.video_url),
+        "poster_url": ad_media.public_media_url(ad.poster_url),
         "image_fit": ad.image_fit,
         "bg_color": ad.bg_color,
         "slot": ad.slot,
@@ -339,7 +341,7 @@ def _apply_fields(ad: Ad, data: dict) -> None:
         ad.media_type = _check_choice(data["media_type"], MEDIA_TYPES, "media_type")
     if "image_fit" in data and data["image_fit"] is not None:
         ad.image_fit = _check_choice(data["image_fit"], IMAGE_FITS, "image_fit")
-    for field in ("image_url", "video_url", "poster_url"):
+    for field in _MEDIA_FIELDS:
         if field in data:
             setattr(ad, field, _check_media_url(data[field], field))
     if "bg_color" in data:
@@ -546,7 +548,10 @@ async def update_ad(
         data.pop("priority", None)
     is_active = data.pop("is_active", None)
 
+    # Media links saved before the /m/ path compare equal to their new form.
     before = {f: getattr(ad, f) for f in _REVIEWED_FIELDS}
+    for f in _MEDIA_FIELDS:
+        before[f] = ad_media.public_media_url(before[f])
     _apply_fields(ad, data)
     _check_media_complete(ad)
     if is_active is not None:

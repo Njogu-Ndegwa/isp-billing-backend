@@ -38,6 +38,7 @@ from sqlalchemy import select
 from app.core.cache import cache
 from app.db import database as db_module
 from app.db.models import Ad, AdEvent
+from app.services.ad_media import public_media_url
 from app.services.plan_cache import normalize_router_ids
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,7 @@ def serialize_portal_ad(ad: Ad) -> dict:
         "id": ad.id,
         "title": ad.title,
         "description": ad.description,
-        "image_url": ad.image_url,
+        "image_url": public_media_url(ad.image_url),
         "seller_name": ad.seller_name,
         "seller_location": ad.seller_location,
         "phone_number": ad.phone_number,
@@ -90,8 +91,8 @@ def serialize_portal_ad(ad: Ad) -> dict:
         "category": ad.category,
         "placement": ad.placement or "local",
         "media_type": ad.media_type or "image",
-        "video_url": ad.video_url,
-        "poster_url": ad.poster_url,
+        "video_url": public_media_url(ad.video_url),
+        "poster_url": public_media_url(ad.poster_url),
         "image_fit": ad.image_fit or "cover",
         "bg_color": ad.bg_color,
         "slot": ad.slot or "platform",
