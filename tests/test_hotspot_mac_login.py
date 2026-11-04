@@ -3,6 +3,8 @@
 import itertools
 import time
 
+from datetime import datetime
+
 import pytest
 
 from app.services import checkin_delivery, hotspot_mac_login as ml, hotspot_provisioning, mikrotik_background
@@ -616,3 +618,112 @@ def test_queue_sync_items_carry_the_expiry():
     c = SimpleNamespace(id=1, mac_address=MAC, expiry=datetime(2026, 10, 1),
                         plan=SimpleNamespace(speed="5M/5M", fup_action=None))
     assert mikrotik_background._queue_sync_customer_item(c, None)["expiry"] == datetime(2026, 10, 1)
+
+
+# ---------------------------------------------------------------- FUP direction
+# Router 446, 4 Nov 2026: TV BUNDLE throttle "2M/0.5M" (2 Mbps down, 0.5 up) was
+# converted twice, reached the router as plan_2M_500K (2M UP, 500k DOWN), and
+# throttled TVs sat at 500 kbps download.
+
+@pytest.mark.parametrize("speed,profile,rate", [
+    ("2M/0.5M", "plan_500k_2M", "500k/2M"),
+    ("0.7M/0.6M", "plan_600k_700k", "600k/700k"),
+    ("5M/2M", "plan_2M_5M", "2M/5M"),
+    ("1M/1M", "plan_1M_1M", "1M/1M"),
+])
+def test_set_customer_rate_keeps_download_upload_direction(speed, profile, rate):
+    router = FakeRouter()
+    ml.provision_customer(router.api(), MAC, "5M/2M")
+
+    assert ml.set_customer_rate(router.api(), MAC, speed)["success"] is True
+
+    assert router.user(MAC)["profile"] == profile
+    stored = next(p for p in router.tables["/ip/hotspot/user/profile"] if p["name"] == profile)
+    assert stored["rate-limit"] == rate
+
+
+def _plan(**kw):
+    from types import SimpleNamespace
+    return SimpleNamespace(**{"speed": "5M/2M", "fup_throttle_profile": "2M/0.5M",
+                              "fup_action": None, **kw})
+
+
+def test_queue_sync_item_carries_throttle_in_plan_format():
+    from types import SimpleNamespace
+
+    from app.db.models import FupAction
+    from app.services import mikrotik_background
+
+    customer = SimpleNamespace(id=1, mac_address=MAC, plan=_plan(), expiry=datetime(2030, 1, 1),
+                               grace_period_minutes=0)
+    period = SimpleNamespace(fup_action_taken=FupAction.THROTTLE, fup_action_snapshot=None)
+
+    item = mikrotik_background._queue_sync_customer_item(customer, period)
+
+    assert item["plan_speed"] == "2M/0.5M"
+
+
+def test_reconcile_throttled_customer_ends_with_2m_down_and_stays_put():
+    from types import SimpleNamespace
+
+    from app.db.models import FupAction
+    from app.services import mikrotik_background
+
+    router = FakeRouter()
+    ml.provision_customer(router.api(), MAC, "5M/2M")
+    customer = SimpleNamespace(id=1, mac_address=MAC, plan=_plan(), expiry=datetime(2030, 1, 1),
+                               grace_period_minutes=0)
+    period = SimpleNamespace(fup_action_taken=FupAction.THROTTLE, fup_action_snapshot=None)
+    item = mikrotik_background._queue_sync_customer_item(customer, period)
+
+    ml.reconcile_router(router.api(), [item])
+    assert router.user(MAC)["profile"] == "plan_500k_2M"
+
+    # Second pass: already right, so no further writes or kicks.
+    router.writes.clear()
+    summary = ml.reconcile_router(router.api(), [item])
+    assert summary["already_ok"] == 1 and summary["provisioned"] == 0
+
+
+def test_reconcile_repairs_a_user_left_on_the_reversed_throttle():
+    router = FakeRouter()
+    ml.provision_customer(router.api(), MAC, "2M/0.5M")
+    router.user(MAC)["profile"] = "plan_2M_500K"   # what the old double conversion wrote
+
+    summary = ml.reconcile_router(router.api(), [
+        {"mac_address": MAC, "plan_speed": "2M/0.5M", "fup_action": "throttle"},
+    ])
+
+    assert summary["provisioned"] == 1
+    assert router.user(MAC)["profile"] == "plan_500k_2M"
+
+
+@pytest.mark.asyncio
+async def test_fup_throttle_and_restore_pass_plan_format_to_mac_login(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.db.models import ConnectionType
+    from app.services import fup
+
+    calls = []
+    monkeypatch.setattr(fup, "_mac_login_sync",
+                        lambda info, action, mac, speed="": calls.append((action, speed)) or {"success": True})
+    monkeypatch.setattr(fup, "mac_login_enabled", lambda _rid: True)
+    monkeypatch.setattr(fup, "_hotspot_identity", lambda _c: (MAC, MAC.replace(":", "")))
+    monkeypatch.setattr(fup, "_router_info", lambda _r: {"id": 1})
+
+    async def router(_db, _rid):
+        return SimpleNamespace(id=1)
+
+    monkeypatch.setattr(fup, "_load_router", router)
+
+    class DB:
+        async def commit(self):
+            return None
+
+    plan = _plan(connection_type=ConnectionType.HOTSPOT)
+    customer = SimpleNamespace(plan=plan, router_id=1)
+    await fup.apply_throttle(DB(), customer, plan)
+    await fup.restore_normal_profile(DB(), customer, plan)
+
+    assert calls == [("rate", "2M/0.5M"), ("rate", "5M/2M")]
