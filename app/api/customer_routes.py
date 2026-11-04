@@ -219,12 +219,28 @@ async def _payment_paybills(db: AsyncSession, user, router_ids) -> dict:
     failure here returns {} instead of failing the customer list.
     """
     from app.services.customer_expiry_notifications import resolve_paybills
+    from app.services.customer_pay_by_mpesa import matchable_paybills
 
     try:
-        return await resolve_paybills(db, user, set(router_ids) or {None})
+        paybills = await resolve_paybills(db, user, set(router_ids) or {None})
+        # Only a paybill the C2B handler would match for this reseller.
+        return await matchable_paybills(db, user.id, paybills)
     except Exception:
         logger.exception("Could not resolve payment paybills for user %s", getattr(user, "id", None))
         return {}
+
+
+async def _pay_by_mpesa_map(db: AsyncSession, customers, paybills: dict) -> dict:
+    """{customer_id: Pay by M-Pesa card} (paybill, account, amount or why not)."""
+    from app.services.customer_pay_by_mpesa import pay_by_mpesa, pending_plans
+
+    customers = list(customers)
+    try:
+        plans = await pending_plans(db, customers)
+    except Exception:
+        logger.exception("Could not load pending plans for the Pay by M-Pesa card")
+        plans = {}
+    return {c.id: pay_by_mpesa(c, paybills.get(c.router_id), plans) for c in customers}
 
 
 router = APIRouter(tags=["customers"])
@@ -1280,6 +1296,7 @@ async def get_customers_api(
         result = await db.execute(stmt)
         rows = result.all()
         paybills = await _payment_paybills(db, user, {c.router_id for c, _ in rows})
+        pay_cards = await _pay_by_mpesa_map(db, (c for c, _ in rows), paybills)
 
         return [
             {
@@ -1298,6 +1315,7 @@ async def get_customers_api(
                 "router_id": c.router_id,
                 "account_number": c.account_number,
                 "payment_paybill": paybills.get(c.router_id),
+                "pay_by_mpesa": pay_cards[c.id],
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
                 **pause_fields(c),
@@ -1358,6 +1376,7 @@ async def get_active_customers(
         result = await db.execute(stmt)
         rows = result.all()
         paybills = await _payment_paybills(db, user, {c.router_id for c, _ in rows})
+        pay_cards = await _pay_by_mpesa_map(db, (c for c, _ in rows), paybills)
 
         return [
             {
@@ -1377,6 +1396,7 @@ async def get_active_customers(
                 "router_id": c.router_id,
                 "account_number": c.account_number,
                 "payment_paybill": paybills.get(c.router_id),
+                "pay_by_mpesa": pay_cards[c.id],
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
                 **pause_fields(c),
@@ -1420,6 +1440,7 @@ async def get_customer_detail(
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
         paybills = await _payment_paybills(db, user, {customer.router_id})
+        pay_cards = await _pay_by_mpesa_map(db, [customer], paybills)
 
         return {
             "id": customer.id,
@@ -1437,6 +1458,7 @@ async def get_customer_detail(
             "router_id": customer.router_id,
             "account_number": customer.account_number,
             "payment_paybill": paybills.get(customer.router_id),
+            "pay_by_mpesa": pay_cards[customer.id],
             "wallet_credit_kes": customer.wallet_credit_kes,
             **grace_fields(customer, datetime.utcnow()),
             **pause_fields(customer),

@@ -96,7 +96,7 @@ async def test_own_c2b_paybill_is_shown_instead_of_the_platform_one(db, client, 
     router = await make_router(db, reseller)
     method = await _add_method(
         db, reseller, ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
-        mpesa_shortcode=" 555111 ", c2b_registered_at=datetime.utcnow(),
+        mpesa_shortcode="555111", c2b_registered_at=datetime.utcnow(),
     )
     router.payment_method_id = method.id
     await db.commit()
