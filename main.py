@@ -3567,6 +3567,20 @@ async def startup_event():
         logger.error(f"FUP / usage tracking migration failed (non-fatal): {e}")
 
     try:
+        # Once-only in effect: repaired rows no longer match, and periods opened
+        # after the fix are excluded by date. Loosens caps, never tightens.
+        from app.db.database import AsyncSessionLocal
+        from app.services.usage_tracking import repair_stale_cap_snapshots
+
+        async with AsyncSessionLocal() as repair_db:
+            repaired_caps = await repair_stale_cap_snapshots(repair_db)
+            await repair_db.commit()
+        if repaired_caps:
+            logger.warning("[FUP] Repaired stale usage caps: %s", repaired_caps)
+    except Exception as e:
+        logger.error(f"Stale usage cap repair failed (non-fatal): {e}")
+
+    try:
         await run_payment_history_migrations()
         logger.info("Payment history migrations completed successfully")
     except Exception as e:

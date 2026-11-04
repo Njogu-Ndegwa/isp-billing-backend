@@ -553,6 +553,24 @@ async def _get_or_create_shared_customer(
 
     customer_name = name or f"Shared Device {normalized_mac[-8:]}"
     if customer:
+        # An expired owner coming back as someone else's shared device must not
+        # stay the owner of its own devices: a chain of owners is never renewed
+        # (owner -> shared -> shared) and those rows drift apart.
+        children = (
+            await db.execute(
+                select(DevicePairing)
+                .options(selectinload(DevicePairing.customer))
+                .where(
+                    DevicePairing.subscription_owner_customer_id == customer.id,
+                    DevicePairing.is_subscription_share == True,  # noqa: E712
+                    DevicePairing.is_active == True,  # noqa: E712
+                )
+            )
+        ).scalars().all()
+        for child in children:
+            child.is_active = False
+            if child.customer is not None:
+                child.customer.subscription_owner_id = None
         customer.name = name or customer.name or customer_name
         customer.phone = phone
         customer.status = CustomerStatus.ACTIVE

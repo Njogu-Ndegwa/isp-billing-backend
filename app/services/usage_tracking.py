@@ -399,6 +399,103 @@ async def pooled_period_usage_bytes(
     return own_bytes + int(others or 0)
 
 
+# Periods opened after this were opened with the right plan (reseller_payments fix).
+STALE_CAP_REPAIR_BEFORE = datetime(2026, 11, 6)
+
+
+async def repair_stale_cap_snapshots(db: AsyncSession, *, now: Optional[datetime] = None) -> list[dict]:
+    """Give customers the cap of the plan they paid for, where a renewal missed it.
+
+    Until Nov 2026 a voucher bought in a session that had already loaded the
+    customer's previous plan opened the new usage period with that previous
+    plan's cap: an owner who paid for 200 GB was throttled at 2 GB.
+
+    Only ever loosens, and only when the record proves it: the open period was
+    opened by the latest payment, that payment is for the customer's current
+    plan, and the snapshot equals the previous payment's plan cap. A snapshot
+    that differs for any other reason is a reseller's later plan edit, which is
+    kept on purpose (see ``fup_cap_mb``). Shared devices still holding the same
+    stale cap move with their owner. The cap sampler then lifts any throttle no
+    longer over the cap. Idempotent; the caller commits.
+    """
+    from app.db.models import Customer, CustomerPayment, CustomerStatus
+
+    now = now or datetime.utcnow()
+    rows = (
+        await db.execute(
+            select(CustomerUsagePeriod, Customer, Plan)
+            .join(Customer, Customer.id == CustomerUsagePeriod.customer_id)
+            .join(Plan, Plan.id == Customer.plan_id)
+            .where(
+                CustomerUsagePeriod.closed_at.is_(None),
+                CustomerUsagePeriod.cap_mb_snapshot.isnot(None),
+                CustomerUsagePeriod.period_start < STALE_CAP_REPAIR_BEFORE,
+                Customer.status == CustomerStatus.ACTIVE,
+                Customer.expiry > now,
+                Customer.subscription_owner_id.is_(None),
+                or_(
+                    Plan.data_cap_mb.is_(None),
+                    CustomerUsagePeriod.cap_mb_snapshot < Plan.data_cap_mb,
+                ),
+            )
+        )
+    ).all()
+
+    repaired: list[dict] = []
+    for period, customer, plan in rows:
+        payments = (
+            await db.execute(
+                select(CustomerPayment.plan_id, CustomerPayment.payment_date)
+                .where(CustomerPayment.customer_id == customer.id)
+                .order_by(CustomerPayment.id.desc())
+                .limit(2)
+            )
+        ).all()
+        if len(payments) < 2:
+            continue
+        (last_plan_id, last_date), (previous_plan_id, _previous_date) = payments
+        if (
+            last_plan_id != customer.plan_id
+            or previous_plan_id is None
+            or previous_plan_id == customer.plan_id
+            or last_date is None
+            or abs((period.period_start - last_date).total_seconds()) >= 5
+        ):
+            continue
+        previous_cap = (
+            await db.execute(select(Plan.data_cap_mb).where(Plan.id == previous_plan_id))
+        ).scalar_one_or_none()
+        if previous_cap != period.cap_mb_snapshot:
+            continue
+
+        stale_cap = period.cap_mb_snapshot
+        members = (
+            await db.execute(
+                select(CustomerUsagePeriod)
+                .join(Customer, Customer.id == CustomerUsagePeriod.customer_id)
+                .where(
+                    Customer.subscription_owner_id == customer.id,
+                    CustomerUsagePeriod.closed_at.is_(None),
+                    CustomerUsagePeriod.cap_mb_snapshot == stale_cap,
+                )
+            )
+        ).scalars().all()
+        for row in [period, *members]:
+            row.cap_mb_snapshot = plan.data_cap_mb
+            row.fup_action_snapshot = plan.fup_action
+        repaired.append(
+            {
+                "customer_id": customer.id,
+                "router_id": customer.router_id,
+                "plan_id": plan.id,
+                "from_cap_mb": stale_cap,
+                "to_cap_mb": plan.data_cap_mb,
+                "periods": 1 + len(members),
+            }
+        )
+    return repaired
+
+
 # --------------------------- FUP window (plan vs daily) ---------------------------
 
 FUP_PERIOD_PLAN = "plan"

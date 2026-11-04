@@ -10,6 +10,7 @@ from app.db.models import (
     MpesaTransaction,
     PaymentMethod,
     PaymentStatus,
+    Plan,
     ResellerFinancials,
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
@@ -52,6 +53,16 @@ async def resolve_mpesa_collection_mode(
         return CollectionMode.DIRECT
     return CollectionMode.SYSTEM_COLLECTED
 
+def _plan_gives_less(new_plan: Plan | None, old_plan: Plan) -> bool:
+    """True when ``new_plan`` allows fewer devices or a lower data cap."""
+    if new_plan is None:
+        return True
+    if (new_plan.max_shared_users or 1) < (old_plan.max_shared_users or 1):
+        return True
+    new_cap, old_cap = new_plan.data_cap_mb, old_plan.data_cap_mb
+    return new_cap is not None and (old_cap is None or new_cap < old_cap)
+
+
 async def record_customer_payment(
     db: AsyncSession,
     customer_id: int,
@@ -88,7 +99,32 @@ async def record_customer_payment(
     
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found or not owned by reseller")
-    
+
+    # Callers set ``customer.plan_id`` to the plan being bought just before
+    # calling this (voucher redemption, device-pairing vouchers). If the same
+    # session had already loaded ``customer.plan``, the joinedload above does
+    # not replace it, so it would still be the PREVIOUS plan: the new usage
+    # period then snapshots the old plan's data cap and the shared devices are
+    # synced against the old plan's device limit. That throttled the owner of a
+    # 200 GB plan at 2 GB for 17 days (router 446, Oct 2026).
+    #
+    # Deliberately only corrected when the new plan gives at least as much. A
+    # smaller voucher on a bigger live plan keeps today's outcome (plan_id
+    # changes; cap and devices stay until the next payment) until Dennis decides
+    # whether it should be refused or stacked. See docs/shared-plans.md.
+    if customer.plan_id is not None and (
+        customer.plan is None or customer.plan.id != customer.plan_id
+    ):
+        bought = await db.get(Plan, customer.plan_id)
+        if customer.plan is None or not _plan_gives_less(bought, customer.plan):
+            customer.plan = bought
+        else:
+            logger.warning(
+                "[PLAN-SWAP] Customer %s bought plan %s on live plan %s with fewer devices or "
+                "a lower cap; keeping the old limits for this period",
+                customer.id, customer.plan_id, customer.plan.id,
+            )
+
     payment = CustomerPayment(
         customer_id=customer_id,
         reseller_id=reseller_id,

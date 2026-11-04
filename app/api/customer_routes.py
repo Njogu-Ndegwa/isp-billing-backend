@@ -641,6 +641,15 @@ async def edit_customer(
                 or customer.router_id != old_router_id
             )
 
+        shared_devices_changed: list[int] = []
+        if ("expiry" in update_fields or "plan_id" in update_fields) and not customer.subscription_owner_id:
+            # Every device on a shared plan runs on the owner's expiry and plan.
+            from app.services.subscription_sharing import carry_owner_edit_to_shared_devices
+
+            shared_devices_changed = await carry_owner_edit_to_shared_devices(
+                db, owner_customer=customer
+            )
+
         await db.commit()
         await db.refresh(customer, attribute_names=["plan", "router"])
 
@@ -668,7 +677,7 @@ async def edit_customer(
             # deadline in the binding: move it later if the edit extended it.
             from app.services.expiry_tag_sync import schedule_expiry_tag_sync
 
-            schedule_expiry_tag_sync([customer.id], "admin expiry edit")
+            schedule_expiry_tag_sync([customer.id, *shared_devices_changed], "admin expiry edit")
 
         provision_status = None
         provision_error = None
