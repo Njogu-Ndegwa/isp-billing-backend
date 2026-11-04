@@ -122,6 +122,9 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
 - **An ad I sold (`reseller`)** is created only through `POST /api/ad-sales` (the old
   `POST /api/ads` refuses `slot: "reseller"` for resellers). Price per week ≥ KES 200
   (≤ 12,500), 1–12 whole weeks. Kenyan (M-Pesa) resellers only for now.
+- **The reseller's Show Ads portal switch must be on.** It is off by default and a portal with it
+  off shows no ads, so every prompt (create, resend, renew, the shop's link) is refused with a 400
+  until it is on. Switching it off later hides a running ad; its paid days keep counting.
 - **Money**: the business pays the total by STK push to Bitwave's own paybill (the system
   shortcode), also for direct-settlement resellers. `bitwave_fee = floor(amount × 20 / 100)`,
   `reseller_share = amount − bitwave_fee` (rounding favours the reseller: KES 1,005 → 201 / 804).

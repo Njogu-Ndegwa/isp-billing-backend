@@ -91,6 +91,18 @@ def _require_kenyan_reseller(user) -> None:
         )
 
 
+ADS_OFF_MESSAGE = (
+    "Ads are switched off on your portal, so this ad wouldn't show. Turn on "
+    "Show Ads in Portal customization, then send the prompt."
+)
+
+
+async def _require_portal_ads_on(db: AsyncSession, reseller_id: int, message: str = ADS_OFF_MESSAGE) -> None:
+    """Never ask a shop to pay for an ad the reseller's portals won't show."""
+    if not await ad_review.portal_shows_ads(db, reseller_id):
+        raise HTTPException(status_code=400, detail=message)
+
+
 async def _sale_payload(db: AsyncSession, ad: Optional[Ad], sale: AdSale, prompt=None) -> dict:
     payments = await ad_sales._payments(db, sale.id)
     taken = await ad_review.was_taken_down(db, sale.ad_id)
@@ -128,6 +140,7 @@ async def create_sold_ad(
     user = await get_current_user(token, db)
     enforce_active_subscription(user)
     _require_kenyan_reseller(user)
+    await _require_portal_ads_on(db, user.id)
     ad_sales.validate_terms(request.weeks, request.price_per_week)
 
     ad = Ad(owner_user_id=user.id, slot="reseller", status="pending", is_active=True, priority=0)
@@ -190,6 +203,7 @@ async def attach_sale(
     ad = await ar._load_owned_ad(db, user, ad_id)
     if ad.slot != "reseller":
         raise HTTPException(status_code=400, detail="Only an ad you sold is paid for")
+    await _require_portal_ads_on(db, ad.owner_user_id)
     if await ad_sales.get_sale_for_ad(db, ad.id) is not None:
         raise HTTPException(status_code=400, detail="This ad already has a sale; send the prompt again instead")
     ad.starts_at = None
@@ -210,6 +224,7 @@ async def _prompt(db, user, ad_id: int, body: PromptRequest, renew: bool) -> dic
     ad, sale = await _owned_sale(db, user, ad_id)
     if ad.status == "rejected":
         raise HTTPException(status_code=400, detail="This ad was rejected; fix it and resubmit before asking for payment")
+    await _require_portal_ads_on(db, sale.reseller_user_id)
     sale_id = sale.id
     await db.commit()  # release before asking Safaricom about an earlier prompt
 
@@ -467,6 +482,10 @@ async def public_pay(token: str, request: PublicPayRequest, db: AsyncSession = D
     ad = await db.get(Ad, sale.ad_id)
     if ad is None or ad.status == "rejected":
         raise HTTPException(status_code=400, detail="This ad can't be paid for")
+    await _require_portal_ads_on(
+        db, sale.reseller_user_id,
+        "This WiFi network has ads switched off right now. Ask the owner to turn them on, then pay.",
+    )
     sale_id = sale.id
     await db.commit()
     if await ad_sales.settle_in_flight(sale_id) == "paid":
