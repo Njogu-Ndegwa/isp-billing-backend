@@ -46,6 +46,15 @@ Payments
   payment, ad deleted, duplicate payment) is listed for an admin, who refunds
   by hand and marks it done.
 
+Who can sell
+------------
+A Bitwave admin controls this in app_settings: ads_selling_mode is off,
+allowlist or everyone, and ads_selling_allowlist holds the reseller ids. With
+nothing saved the mode is allowlist with DEFAULT_SELLING_ALLOWLIST only, so
+selling stays a pilot until an admin opens it. An unrecognised mode counts as
+off. The switch stops new sold ads and new prompts only: a callback for a
+prompt already sent is still applied, because that money is real.
+
 Database Session Discipline: the STK push and the STK query run with no
 session open; reads and writes around them are short sessions.
 """
@@ -117,8 +126,53 @@ def status_for_result_code(code: Optional[int]) -> str:
 REFUND_DUE = "due"
 REFUNDED = "refunded"
 
+SELLING_MODE_KEY = "ads_selling_mode"
+SELLING_ALLOWLIST_KEY = "ads_selling_allowlist"
+MODE_OFF = "off"
+MODE_ALLOWLIST = "allowlist"
+MODE_EVERYONE = "everyone"
+SELLING_MODES = (MODE_OFF, MODE_ALLOWLIST, MODE_EVERYONE)
+DEFAULT_SELLING_MODE = MODE_ALLOWLIST
+# Dennis's test reseller (Acme Internet Service) until the end-to-end test passes.
+DEFAULT_SELLING_ALLOWLIST = (20,)
+
 # Shown to the business on its M-Pesa prompt (Safaricom allows 12 characters).
 ACCOUNT_REFERENCE = "Bitwave Ad"
+
+
+# ---------------------------------------------------------------------------
+# Who can sell: the kill switch and the pilot list
+# ---------------------------------------------------------------------------
+
+def parse_allowlist(raw: Optional[str]) -> list[int]:
+    """Reseller ids from the saved setting. None (never saved) is the default
+    list; an empty string is a list an admin emptied."""
+    if raw is None:
+        return list(DEFAULT_SELLING_ALLOWLIST)
+    ids: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit() and int(part) not in ids:
+            ids.append(int(part))
+    return ids
+
+
+async def selling_settings(db: AsyncSession) -> tuple[str, list[int]]:
+    from app.services.app_settings import get_setting
+    mode = await get_setting(db, SELLING_MODE_KEY)
+    if mode is None:
+        mode = DEFAULT_SELLING_MODE
+    elif mode not in SELLING_MODES:
+        logger.warning("Unrecognised %s value %r: treating selling as off", SELLING_MODE_KEY, mode)
+        mode = MODE_OFF
+    return mode, parse_allowlist(await get_setting(db, SELLING_ALLOWLIST_KEY))
+
+
+async def selling_allowed(db: AsyncSession, reseller_id: int) -> bool:
+    mode, ids = await selling_settings(db)
+    if mode == MODE_EVERYONE:
+        return True
+    return mode == MODE_ALLOWLIST and reseller_id in ids
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +960,11 @@ async def report_for_token(db: AsyncSession, token: str, now: Optional[datetime]
         )).all():
             row = daily.setdefault(day, {"day": day, "views": 0, "taps": 0})
             row["views" if event_type == "impression" else "taps"] += n
-    payable = pending is not None and state not in ("rejected", "taken_down", "deleted")
+    payable = (
+        pending is not None
+        and state not in ("rejected", "taken_down", "deleted")
+        and await selling_allowed(db, sale.reseller_user_id)
+    )
     return {
         "title": ad.title if ad else None,
         "business_name": sale.business_name,

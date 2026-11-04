@@ -35,6 +35,14 @@ SOLD = {
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _selling_open(monkeypatch):
+    """The pilot switch has its own tests in test_ad_selling_access.py."""
+    async def yes(db, reseller_id):
+        return True
+    monkeypatch.setattr(ad_sales, "selling_allowed", yes)
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _fresh_ad_cache():
     await invalidate_ad_cache()

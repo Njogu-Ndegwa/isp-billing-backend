@@ -122,6 +122,10 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
 - **An ad I sold (`reseller`)** is created only through `POST /api/ad-sales` (the old
   `POST /api/ads` refuses `slot: "reseller"` for resellers). Price per week ≥ KES 200
   (≤ 12,500), 1–12 whole weeks. Kenyan (M-Pesa) resellers only for now.
+- **Selling is a pilot until an admin opens it.** `ads_selling_mode` is `off`, `allowlist` or
+  `everyone`; with nothing saved it is `allowlist` with reseller 20 only. Outside it, creating a sold
+  ad and sending any prompt (reseller or shop link) answer 403 "coming soon". Own promos, reviews,
+  callbacks for prompts already sent, payouts and the shop's report keep working.
 - **The reseller's Show Ads portal switch must be on.** It is off by default and a portal with it
   off shows no ads, so every prompt (create, resend, renew, the shop's link) is refused with a 400
   until it is on. Switching it off later hides a running ad; its paid days keep counting.
@@ -163,6 +167,7 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
 
 | Method & path | Who | Body / query | Notes |
 |---|---|---|---|
+| `GET /api/ad-sales/access` | signed in | | `{allowed}`: may this reseller sell yet |
 | `GET /api/ad-sales/quote` | any | `?weeks&price_per_week` | `{amount, bitwave_fee, reseller_share, fee_percent}` |
 | `POST /api/ad-sales` | reseller, staff `portal.manage` | Ad fields + `business_name`, `business_phone`, `weeks`, `price_per_week` | `{ad, sale}`; sends the prompt at once |
 | `GET /api/ad-sales` | reseller (own), admin (all) | `?state&payout_status&owner_user_id&page&per_page` | `{sales, totals, pagination}`; reseller also gets `review` (auto-approve progress). `payout_status=refund_due` is the refund queue |
@@ -172,10 +177,10 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
 | `POST /api/ads/{id}/sale/renew` | owner | `{phone?, weeks?, price_per_week?}` | renewal prompt (default same price and length) |
 | `POST /api/ads/{id}/takedown` | admin | `{note}` | any ad, off every portal now |
 | `POST /api/ad-sales/payments/{id}/refund` | admin | `{note?}` | records a hand refund; moves no money |
-| `GET/PUT /api/ad-review/rules` | admin | `{blocked_words: [...]}` | |
+| `GET/PUT /api/ad-review/rules` | admin | any of `{blocked_words: [...], selling_mode, selling_allowlist: [ids]}` | |
 | `POST /api/mpesa/ad-sales/callback` | Safaricom | | always `ResultCode 0` |
 | `GET /api/public/promo/{token}` | anyone with the link | | the business's report: title, dates, views, taps, daily, amount due. No fees, phones or device data |
-| `POST /api/public/promo/{token}/pay` | anyone with the link | `{phone?}` | the business sends itself the prompt (same guards) |
+| `POST /api/public/promo/{token}/pay` | anyone with the link | none | prompt for what is due, only ever to the number saved on the sale (same guards) |
 
 Sale summary (`ad.sale` on `/api/ads/manage` rows, and the routes above):
 

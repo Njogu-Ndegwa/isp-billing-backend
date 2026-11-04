@@ -5,6 +5,7 @@ rules in app/services/ad_review.py.
 
 Reseller (and "Captive portal" staff):
   POST /api/ad-sales                      create "An ad I sold" and prompt the shop
+  GET  /api/ad-sales/access               may this reseller sell yet?
   GET  /api/ad-sales/quote                total, Bitwave fee, what the reseller gets
   GET  /api/ad-sales                      their sold ads with payment status (admin: all)
   GET  /api/ads/{ad_id}/sale              one sold ad: status, prompts, link (poll this)
@@ -15,12 +16,12 @@ Reseller (and "Captive portal" staff):
 Bitwave admin:
   POST /api/ads/{ad_id}/takedown          take any ad off every portal now
   POST /api/ad-sales/payments/{id}/refund record a refund made by hand
-  GET/PUT /api/ad-review/rules            blocked words, auto-approve threshold
+  GET/PUT /api/ad-review/rules            blocked words, selling switch and pilot list
 
 Public:
   POST /api/mpesa/ad-sales/callback       Safaricom STK callback
   GET  /api/public/promo/{token}          the business's read-only report
-  POST /api/public/promo/{token}/pay      the business sends itself the prompt
+  POST /api/public/promo/{token}/pay      prompt to the business's saved number
 """
 
 import logging
@@ -34,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import ads_routes as ar
 from app.db.database import get_db
-from app.db.models import Ad, AdSale, AdSalePayment
+from app.db.models import Ad, AdSale, AdSalePayment, User, UserRole
 from app.services import ad_review, ad_sales
 from app.services.ad_serving import invalidate_ad_cache
 from app.services.auth import get_current_user, verify_token
@@ -71,11 +72,9 @@ class RefundRequest(BaseModel):
 
 
 class ReviewRulesRequest(BaseModel):
-    blocked_words: list[str]
-
-
-class PublicPayRequest(BaseModel):
-    phone: Optional[str] = None
+    blocked_words: Optional[list[str]] = None
+    selling_mode: Optional[str] = None
+    selling_allowlist: Optional[list[int]] = None
 
 
 _SALE_FIELDS = {"business_name", "business_phone", "weeks", "price_per_week"}
@@ -89,6 +88,18 @@ def _require_kenyan_reseller(user) -> None:
             status_code=400,
             detail="Selling ads through Bitwave works with M-Pesa, so it is only open to Kenyan networks for now.",
         )
+
+
+COMING_SOON_MESSAGE = (
+    "Selling ads through Bitwave is coming soon. It's being tested with a few "
+    "networks first. Your own promos work as usual."
+)
+
+
+async def _require_selling_open(db: AsyncSession, reseller_id: int, message: str = COMING_SOON_MESSAGE) -> None:
+    """The kill switch and pilot list. No new sold ad, and no new prompt."""
+    if not await ad_sales.selling_allowed(db, reseller_id):
+        raise HTTPException(status_code=403, detail=message)
 
 
 ADS_OFF_MESSAGE = (
@@ -125,6 +136,22 @@ async def _owned_sale(db: AsyncSession, user, ad_id: int) -> tuple[Ad, AdSale]:
 # Reseller: sell, prompt, renew
 # ---------------------------------------------------------------------------
 
+@router.get("/api/ad-sales/access")
+async def selling_access(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Whether this reseller may sell yet. The dashboard shows "coming soon"
+    in place of the selling form when not."""
+    user = await get_current_user(token, db)
+    allowed = (
+        not ar._is_admin(user)
+        and ad_review.is_kenyan(user)
+        and await ad_sales.selling_allowed(db, user.id)
+    )
+    return {"allowed": allowed}
+
+
 @router.get("/api/ad-sales/quote")
 async def quote(weeks: int, price_per_week: int):
     return ad_sales.quote(weeks, price_per_week)
@@ -140,6 +167,7 @@ async def create_sold_ad(
     user = await get_current_user(token, db)
     enforce_active_subscription(user)
     _require_kenyan_reseller(user)
+    await _require_selling_open(db, user.id)
     await _require_portal_ads_on(db, user.id)
     ad_sales.validate_terms(request.weeks, request.price_per_week)
 
@@ -167,6 +195,7 @@ async def create_sold_ad(
     logger.info("Sold ad #%s created by reseller %s (%s)", ad_id, user.id, ad.status)
 
     prompt = await ad_sales.send_prompt(payment_id)
+    db.expire_all()  # send_prompt wrote through its own session
     ad = await db.get(Ad, ad_id)
     sale = await db.get(AdSale, sale_id)
     totals = await ar._event_totals(db, [ad_id])
@@ -203,6 +232,7 @@ async def attach_sale(
     ad = await ar._load_owned_ad(db, user, ad_id)
     if ad.slot != "reseller":
         raise HTTPException(status_code=400, detail="Only an ad you sold is paid for")
+    await _require_selling_open(db, ad.owner_user_id)
     await _require_portal_ads_on(db, ad.owner_user_id)
     if await ad_sales.get_sale_for_ad(db, ad.id) is not None:
         raise HTTPException(status_code=400, detail="This ad already has a sale; send the prompt again instead")
@@ -216,14 +246,19 @@ async def attach_sale(
     await db.commit()
     await invalidate_ad_cache()
     prompt = await ad_sales.send_prompt(payment_id)
+    db.expire_all()  # send_prompt wrote through its own session
     return await _sale_payload(db, await db.get(Ad, ad_id), await db.get(AdSale, sale_id), prompt)
 
 
 async def _prompt(db, user, ad_id: int, body: PromptRequest, renew: bool) -> dict:
     enforce_active_subscription(user)
+    # A plain value: db.expire_all() below also expires `user`, and reading an
+    # expired attribute on an AsyncSession raises MissingGreenlet (a 500).
+    user_id = user.id
     ad, sale = await _owned_sale(db, user, ad_id)
     if ad.status == "rejected":
         raise HTTPException(status_code=400, detail="This ad was rejected; fix it and resubmit before asking for payment")
+    await _require_selling_open(db, sale.reseller_user_id)
     await _require_portal_ads_on(db, sale.reseller_user_id)
     sale_id = sale.id
     await db.commit()  # release before asking Safaricom about an earlier prompt
@@ -241,12 +276,12 @@ async def _prompt(db, user, ad_id: int, body: PromptRequest, renew: bool) -> dic
     if renew:
         payment = await ad_sales.prepare_renewal(
             db, sale, ad, weeks=body.weeks, price_per_week=body.price_per_week,
-            phone=body.phone, requested_by=user.id,
+            phone=body.phone, requested_by=user_id,
         )
     else:
         payment = await ad_sales.prepare_resend(
             db, sale, phone=body.phone, weeks=body.weeks, price_per_week=body.price_per_week,
-            requested_by=user.id,
+            requested_by=user_id,
         )
     payment_id = payment.id
     await db.commit()
@@ -414,13 +449,9 @@ async def mark_refunded(
     return ad_sales._payment_dict(payment)
 
 
-@router.get("/api/ad-review/rules")
-async def get_review_rules(
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(verify_token),
-):
-    user = await get_current_user(token, db)
-    ar._require_admin(user)
+async def _rules_payload(db: AsyncSession) -> dict:
+    mode, ids = await ad_sales.selling_settings(db)
+    names = await ar._owner_names(db, ids)
     return {
         "blocked_words": await ad_review.get_blocked_words(db),
         "default_blocked_words": list(ad_review.DEFAULT_BLOCKED_WORDS),
@@ -428,7 +459,20 @@ async def get_review_rules(
         "fee_percent": ad_sales.FEE_PERCENT,
         "min_price_per_week": ad_sales.MIN_PRICE_PER_WEEK,
         "max_weeks": ad_sales.MAX_WEEKS,
+        "selling_mode": mode,
+        "selling_modes": list(ad_sales.SELLING_MODES),
+        "selling_allowlist": [{"id": i, "name": names.get(i)} for i in ids],
     }
+
+
+@router.get("/api/ad-review/rules")
+async def get_review_rules(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    user = await get_current_user(token, db)
+    ar._require_admin(user)
+    return await _rules_payload(db)
 
 
 @router.put("/api/ad-review/rules")
@@ -440,9 +484,35 @@ async def put_review_rules(
     user = await get_current_user(token, db)
     ar._require_admin(user)
     from app.services.app_settings import set_setting
-    value = ad_review.serialize_blocked_words(request.blocked_words)
-    await set_setting(db, ad_review.BLOCKED_WORDS_KEY, value)
-    return {"blocked_words": ad_review.parse_blocked_words(value)}
+    if request.selling_mode is not None and request.selling_mode not in ad_sales.SELLING_MODES:
+        raise HTTPException(status_code=400, detail="selling_mode must be off, allowlist or everyone")
+    allowlist = None
+    if request.selling_allowlist is not None:
+        allowlist = list(dict.fromkeys(request.selling_allowlist))
+        found = set()
+        if allowlist:
+            found = set((await db.execute(
+                select(User.id).where(User.id.in_(allowlist), User.role == UserRole.RESELLER)
+            )).scalars().all())
+        unknown = [i for i in allowlist if i not in found]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not a reseller account: {', '.join(map(str, unknown))}",
+            )
+        allowlist = ",".join(map(str, allowlist))
+    blocked = None
+    if request.blocked_words is not None:
+        blocked = ad_review.serialize_blocked_words(request.blocked_words)
+    # Everything is checked above, so a bad value can't leave half a change saved.
+    if blocked is not None:
+        await set_setting(db, ad_review.BLOCKED_WORDS_KEY, blocked)
+    if allowlist is not None:
+        await set_setting(db, ad_sales.SELLING_ALLOWLIST_KEY, allowlist)
+    if request.selling_mode is not None:
+        await set_setting(db, ad_sales.SELLING_MODE_KEY, request.selling_mode)
+        logger.info("Ad selling mode set to %s by admin %s", request.selling_mode, user.id)
+    return await _rules_payload(db)
 
 
 # ---------------------------------------------------------------------------
@@ -471,9 +541,11 @@ async def public_report(token: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/api/public/promo/{token}/pay")
-async def public_pay(token: str, request: PublicPayRequest, db: AsyncSession = Depends(get_db)):
-    """The business sends itself the prompt for what is due. Same in-flight
-    guard and rate limit as the reseller's button."""
+async def public_pay(token: str, db: AsyncSession = Depends(get_db)):
+    """The business asks for the prompt for what is due. It only ever goes to
+    the number saved on the sale: anyone holding this link must not be able to
+    send a prompt to another phone, so the request takes no number at all.
+    Same in-flight guard and rate limit as the reseller's button."""
     if not token or len(token) > 48:
         raise HTTPException(status_code=404, detail="Link not found")
     sale = (await db.execute(select(AdSale).where(AdSale.share_token == token))).scalar_one_or_none()
@@ -482,6 +554,10 @@ async def public_pay(token: str, request: PublicPayRequest, db: AsyncSession = D
     ad = await db.get(Ad, sale.ad_id)
     if ad is None or ad.status == "rejected":
         raise HTTPException(status_code=400, detail="This ad can't be paid for")
+    await _require_selling_open(
+        db, sale.reseller_user_id,
+        "Paying for ads here isn't open yet. Please ask the WiFi owner.",
+    )
     await _require_portal_ads_on(
         db, sale.reseller_user_id,
         "This WiFi network has ads switched off right now. Ask the owner to turn them on, then pay.",
@@ -492,7 +568,7 @@ async def public_pay(token: str, request: PublicPayRequest, db: AsyncSession = D
         return {"sent": False, "message": "Already paid. Thank you!"}
     db.expire_all()
     sale = await db.get(AdSale, sale_id)
-    payment = await ad_sales.prepare_resend(db, sale, phone=request.phone, requested_by=None)
+    payment = await ad_sales.prepare_resend(db, sale, phone=sale.business_phone, requested_by=None)
     payment_id = payment.id
     await db.commit()
     prompt = await ad_sales.send_prompt(payment_id)

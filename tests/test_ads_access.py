@@ -224,15 +224,17 @@ def test_every_ads_route_is_mapped_or_deliberately_admin_only():
     admin_only = {
         ("POST", "/api/ads/{ad_id}/review"), ("POST", "/api/ads/{ad_id}/takedown"),
         ("GET", "/api/advertisers"), ("POST", "/api/advertisers"),
+        ("POST", "/api/ad-sales/payments/{payment_id}/refund"),
+        ("GET", "/api/ad-review/rules"), ("PUT", "/api/ad-review/rules"),
     }
     public = {("POST", "/api/ads/click"), ("POST", "/api/ads/impression")}
     for route in main.app.routes:
         path = getattr(route, "path", "")
-        if not (path.startswith("/api/ads") or path.startswith("/api/advertisers")):
+        if not path.startswith(("/api/ads", "/api/advertisers", "/api/ad-sales", "/api/ad-review")):
             continue
         for method in getattr(route, "methods", set()) - {"HEAD", "OPTIONS"}:
             key = (method, path)
-            rule, _ = perms.match_rule(method, path.replace("{ad_id}", "7"))
+            rule, _ = perms.match_rule(method, path.replace("{ad_id}", "7").replace("{payment_id}", "7"))
             if key in admin_only or key in public:
                 assert rule is None, key
             else:

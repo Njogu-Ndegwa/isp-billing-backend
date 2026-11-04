@@ -508,6 +508,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     # Takedown, refunds and review rules are Bitwave-admin only (left out).
     ((R,), "/api/ad-sales", ADS_VIEW, None),
     ((R,), "/api/ad-sales/quote", ADS_VIEW, None),
+    ((R,), "/api/ad-sales/access", ADS_VIEW, None),
     ((R,), "/api/ads/{ad_id}/sale", ADS_VIEW, None),
     (("POST",), "/api/ad-sales", "portal.manage", "Sold a portal ad and sent the business an M-Pesa prompt"),
     (("POST",), "/api/ads/{ad_id}/sale", "portal.manage", "Put sold portal ad {ad_id} up for payment"),
