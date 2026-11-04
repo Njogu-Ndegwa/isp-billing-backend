@@ -27,6 +27,7 @@ from app.db.models import (
     ConnectionType,
     CustomerStatus,
     CustomerUsagePeriod,
+    FupAction,
     UserBandwidthUsage,
 )
 from app.services import usage_push
@@ -495,3 +496,45 @@ async def test_push_and_poll_can_run_together_without_double_counting(db, sessio
     assert period.upload_bytes == 5 * MB
     assert period.download_bytes == 20 * MB
     assert period.total_bytes == 25 * MB
+
+
+async def _throttled(db, session_factory, *, used_mb, cap_mb):
+    """A customer whose open period was throttled, then given ``cap_mb``."""
+    _reseller, router, plan, customer = await _hotspot_setup(db, cap_mb=100)
+    now = datetime.utcnow()
+    period = CustomerUsagePeriod(
+        customer_id=customer.id,
+        period_start=now - timedelta(days=1),
+        period_end=customer.expiry,
+        upload_bytes=0,
+        download_bytes=used_mb * MB,
+        total_bytes=used_mb * MB,
+        cap_mb_snapshot=cap_mb,
+        fup_triggered_at=now - timedelta(hours=2),
+        fup_action_taken=FupAction.THROTTLE,
+    )
+    db.add(period)
+    await db.commit()
+    result = await usage_push.ingest_usage_reports(
+        router.id,
+        [UsageReport(queue_key=customer.mac_address, upload_bytes=0, download_bytes=0)],
+        now=now,
+        session_factory=session_factory,
+    )
+    return customer, result
+
+
+@pytest.mark.asyncio
+async def test_push_asks_to_lift_a_throttle_no_longer_over_the_cap(db, session_factory):
+    customer, result = await _throttled(db, session_factory, used_mb=150, cap_mb=1000)
+
+    assert result.release_fup_customer_ids == [customer.id]
+    assert result.over_cap_customer_ids == []
+
+
+@pytest.mark.asyncio
+async def test_push_keeps_a_throttle_still_over_the_cap(db, session_factory):
+    _customer, result = await _throttled(db, session_factory, used_mb=150, cap_mb=100)
+
+    assert result.release_fup_customer_ids == []
+    assert result.over_cap_customer_ids == []
