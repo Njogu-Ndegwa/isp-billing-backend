@@ -15,7 +15,7 @@ import app.api.ads_routes as ar
 from app.api.ad_sales_routes import router as ad_sales_router
 from app.api.ads_routes import router as ads_router
 from app.db.database import get_db
-from app.db.models import Ad, AdReviewEvent, AdSale, AdSalePayment, SubscriptionStatus
+from app.db.models import Ad, AdReviewEvent, AdSale, AdSalePayment, PortalSettings, SubscriptionStatus
 from app.services import ad_sales, mpesa
 from app.services.ad_serving import get_live_ads_cached, invalidate_ad_cache
 from app.services.auth import verify_token
@@ -93,7 +93,10 @@ async def _reseller(db, **kw):
     kw.setdefault("subscription_status", SubscriptionStatus.ACTIVE)
     kw.setdefault("support_phone", "0712345678")
     kw.setdefault("business_name", "Acme WiFi")
-    return await make_reseller(db, **kw)
+    reseller = await make_reseller(db, **kw)
+    db.add(PortalSettings(user_id=reseller.id, show_ads=True))
+    await db.commit()
+    return reseller
 
 
 def _callback(checkout_id, code=0, receipt="RKX1", amount=500, desc="ok"):
@@ -194,6 +197,41 @@ async def test_minimum_price_is_enforced_on_create(client, db, monkeypatch, stk)
 # ---------------------------------------------------------------------------
 # Selling: prompt goes to the shop from Bitwave's paybill
 # ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_no_shop_is_prompted_while_the_portal_has_ads_switched_off(client, db, monkeypatch, stk):
+    reseller = await _reseller(db)
+    out = await _sell(client, monkeypatch, reseller)
+    ad_id = out["ad"]["id"]
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1", code=1032))
+    sale = (await db.execute(select(AdSale).where(AdSale.ad_id == ad_id))).scalar_one()
+    settings = (await db.execute(
+        select(PortalSettings).where(PortalSettings.user_id == reseller.id)
+    )).scalar_one()
+    settings.show_ads = False
+    await db.commit()
+    sent = len(stk)
+
+    _auth_as(monkeypatch, reseller)
+    for path, body in (
+        ("/api/ad-sales", SOLD),
+        (f"/api/ads/{ad_id}/sale/prompt", {}),
+        (f"/api/ads/{ad_id}/sale/renew", {}),
+        (f"/api/public/promo/{sale.share_token}/pay", {}),
+    ):
+        r = await client.post(path, json=body)
+        assert r.status_code == 400 and "switched off" in r.json()["detail"], path
+    assert len(stk) == sent
+
+
+@pytest.mark.asyncio
+async def test_a_reseller_with_no_portal_settings_counts_as_ads_off(client, db, monkeypatch, stk):
+    reseller = await make_reseller(db, subscription_status=SubscriptionStatus.ACTIVE)
+    _auth_as(monkeypatch, reseller)
+    r = await client.post("/api/ad-sales", json=SOLD)
+    assert r.status_code == 400 and "switched off" in r.json()["detail"]
+    assert stk == []
+
 
 @pytest.mark.asyncio
 async def test_selling_an_ad_prompts_the_shop_on_bitwaves_paybill(client, db, monkeypatch, stk):

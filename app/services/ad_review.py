@@ -173,6 +173,14 @@ def network_name(user: User) -> str:
     return ((user.business_name or "").strip() or (user.organization_name or "").strip())[:100]
 
 
+async def portal_shows_ads(db: AsyncSession, reseller_id: int) -> bool:
+    """The reseller's "Show ads" portal switch. Off (the default) means their
+    portals show no ads at all, whatever is approved and paid."""
+    return bool((await db.execute(
+        select(PortalSettings.show_ads).where(PortalSettings.user_id == reseller_id)
+    )).scalar_one_or_none())
+
+
 async def support_numbers(db: AsyncSession, user: User) -> list[str]:
     """The reseller's own support numbers, as typed, first one preferred."""
     numbers = [user.support_phone]

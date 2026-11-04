@@ -143,7 +143,10 @@ def test_blocked_words_match_whole_words_only(text, hits):
 
 @pytest.mark.asyncio
 async def test_a_betting_ad_is_refused_on_create_edit_and_sale(client, db, monkeypatch):
-    _auth_as(monkeypatch, await _reseller(db))
+    reseller = await _reseller(db)
+    db.add(PortalSettings(user_id=reseller.id, show_ads=True))
+    await db.commit()
+    _auth_as(monkeypatch, reseller)
     r = await client.post("/api/ads", json={**HOUSE, "description": "Jackpot every Friday"})
     assert r.status_code == 400 and "jackpot" in r.json()["detail"]
     ad = (await client.post("/api/ads", json=HOUSE)).json()
@@ -153,7 +156,7 @@ async def test_a_betting_ad_is_refused_on_create_edit_and_sale(client, db, monke
         **HOUSE, "title": "Instant loans", "business_name": "Pesa Fast",
         "business_phone": "0722111222", "weeks": 1, "price_per_week": 300,
     })
-    assert r.status_code == 400
+    assert r.status_code == 400 and "loans" in r.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -174,7 +177,10 @@ async def test_the_blocked_list_is_admin_editable(client, db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_kenyan_resellers_need_a_kenyan_mobile_number(client, db, monkeypatch):
-    _auth_as(monkeypatch, await _reseller(db))
+    reseller = await _reseller(db)
+    db.add(PortalSettings(user_id=reseller.id, show_ads=True))
+    await db.commit()
+    _auth_as(monkeypatch, reseller)
     r = await client.post("/api/ad-sales", json={
         **HOUSE, "phone_number": "+237677123456", "business_name": "Shop",
         "business_phone": "0722111222", "weeks": 1, "price_per_week": 300,
