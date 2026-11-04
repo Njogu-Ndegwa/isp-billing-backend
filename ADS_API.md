@@ -83,6 +83,13 @@ Hero ads are ordered platform → reseller → house, at most 3.
    sets Content-Length; it must equal the declared `size`). No auth header.
 3. Save `public_url` as the ad's `image_url` / `video_url` / `poster_url`.
 
+Media paths must not contain words ad blockers match. New keys are `c/<yyyy>/<mm>/<owner>-<hex>.<ext>`,
+served at `AD_MEDIA_PUBLIC_BASE/c/...`. Keys made before 4 Nov 2026 start with `ads/`, and
+EasyList's generic `/media/ads/*$image` rule hid those photos in every browser with an ad blocker.
+The media Worker serves `/media/c/<path>` from `c/<path>` and falls back to the old `ads/<path>`
+object. The API returns old `/media/ads/` links rewritten to `/media/c/` and stores the new form
+when an ad is saved, so no stored data needed migrating.
+
 Media must come from `AD_MEDIA_PUBLIC_BASE` once it is configured (portals load it before the
 customer has internet, so it has to be a walled-garden host); until then any `https://` URL is
 accepted.
