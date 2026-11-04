@@ -102,3 +102,22 @@ def test_idle_and_command_responses_never_retune_scheduler_interval():
     assert ":set bitwavePollSkips 1" in command
     assert "/system scheduler set" not in idle
     assert "/system scheduler set" not in command
+
+
+@pytest.mark.parametrize("tunnel", ["wireguard", "l2tp"])
+def test_agent_has_no_bare_return(tunnel):
+    # RouterOS 7.19+ rejects a bare ":return" ("missing value(s) of argument(s)
+    # value"): router 446 (7.24.3) logged a script error on every skipped tick.
+    source = render_router_agent_source(
+        identity="Router-0001", endpoint_base_url=URL, tunnel_type=tunnel,
+    )
+    assert ":return" not in source
+    # Every early exit clears the run flag instead, and the poll only runs
+    # while it is still set.
+    assert source.count(":set bwRun false") == 3
+    assert ":local bwRun true" in source
+    poll = source.index("/tool fetch")
+    assert source.rindex(":if ($bwRun) do={", 0, poll) > source.index(":local tunnel")
+    # Blocks balance (an unclosed do={ would break the whole script).
+    body = source[source.index(":global bitwaveAgentRuntimeVersion"):]
+    assert body.count("{") == body.count("}")
