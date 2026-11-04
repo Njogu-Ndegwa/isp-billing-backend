@@ -15,13 +15,27 @@ Bitwave itself earns is much smaller and comes from these streams:
     - the per-user fee for every active PPPoE / static-IP customer;
     - the minimum-charge top-up (``final_charge - hotspot - per-user``), which
       is also the whole charge in flat-fee markets.
-  A payment is split across those three lines in proportion to its invoice,
-  so a half-paid invoice contributes half of each line. A payment with no
-  invoice (or a zero-charge invoice) is reported as "unattributed".
-  Card payments are counted net of the assumed Paystack fee, as MRR is.
+  The card shows exactly two subscription groups, Hotspot and PPPoE / Static,
+  so every payment is attributed to one or both of them (``_attribution``):
+    1. the invoice has usage charges: the payment is split in proportion to
+       its hotspot and per-user charges. The minimum top-up rides along in
+       the same proportion, so a half-paid invoice gives half to each side;
+    2. otherwise (minimum-only invoice, flat-fee market, zero-charge invoice,
+       or no invoice at all) there is no usage to split by, so the whole
+       payment goes to the service the reseller sells: PPPoE / Static when
+       all of their plans are PPPoE or static-IP, Hotspot in every other case
+       (a hotspot reseller, a mixed one, or one with no plans yet).
+  Nothing is left unattributed. Card payments are counted net of the assumed
+  Paystack fee, as MRR is.
 * SMS credit sales (``sms_credit_orders`` with status completed). Credits an
   admin grants and credits refunded for failed sends are ledger moves, not
   sales, so they are not counted.
+
+Those three groups add up to "Platform earnings". Separately, "My reseller
+business" is the customer payments taken by the reseller accounts the admin
+runs personally (``admin_own_reseller_ids``, set on the Earnings page). That
+is the admin's own business income, not a platform fee, so it is shown on its
+own line and only joins platform earnings in "Total income".
 
 "Collected" is cash received in the window. "Invoiced" is what the invoices
 issued in the window billed (waived invoices excluded and shown on their own),
@@ -35,10 +49,10 @@ Not counted as earnings, but reported so nothing is hidden:
   M-Pesa B2B fee passed back to the reseller, which recovers a cost Bitwave
   already paid Safaricom.
 
-Subscription and SMS payments made by the reseller accounts the admin runs
-personally (``admin_own_reseller_ids``) are excluded, as in the Earnings page:
-paying ourselves is not income. Their customer payments still count towards
-transaction volume, because that money really did flow through the platform.
+Subscription and SMS payments made by the admin's own reseller accounts are
+excluded from platform earnings, as in the Earnings page: paying ourselves is
+not income. Their customer payments count towards transaction volume (that
+money really did flow through the platform) and are "My reseller business".
 """
 
 from __future__ import annotations
@@ -47,16 +61,18 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.cache import cache
 from app.db.models import (
     CollectionMode,
+    ConnectionType,
     CustomerPayment,
     InvoiceStatus,
     PaymentMethod,
     PaymentStatus,
+    Plan,
     ResellerTransactionCharge,
     ShopOrder,
     ShopOrderPaymentStatus,
@@ -77,13 +93,13 @@ PLATFORM_EARNINGS_CACHE_TTL = 90
 # calendar names. Both mean the same calendar period-to-date.
 PERIOD_ALIASES = {"7d": "week", "30d": "month", "90d": "quarter", "1y": "year"}
 
-# Ordered as the breakdown lists them.
+# Ordered as the breakdown lists them. The keys are kept from the first
+# version of the card so a dashboard that predates the regrouping still shows
+# the right figures under its old labels.
 EARNING_STREAMS: list[dict[str, str]] = [
-    {"key": "subscription_hotspot", "label": "Hotspot commission", "group": "subscriptions"},
-    {"key": "subscription_per_user", "label": "PPPoE / static per-user fees", "group": "subscriptions"},
-    {"key": "subscription_minimum", "label": "Minimum / flat subscription fee", "group": "subscriptions"},
-    {"key": "subscription_unattributed", "label": "Subscription payments without an invoice", "group": "subscriptions"},
-    {"key": "sms_credits", "label": "SMS credit sales", "group": "sms"},
+    {"key": "subscription_hotspot", "label": "Hotspot", "group": "subscriptions"},
+    {"key": "subscription_per_user", "label": "PPPoE / Static", "group": "subscriptions"},
+    {"key": "sms_credits", "label": "SMS", "group": "sms"},
 ]
 _SUBSCRIPTION_KEYS = tuple(s["key"] for s in EARNING_STREAMS if s["group"] == "subscriptions")
 
@@ -122,16 +138,43 @@ def _excluding(column, own_ids: list[int]):
     return [column.notin_(own_ids)] if own_ids else []
 
 
-def _invoice_shares():
-    """(hotspot, per-user, minimum) share of an invoice, each 0..1.
+def _sells_only_pppoe(user_id_column):
+    """True when every plan the reseller has is PPPoE or static-IP.
 
-    Valid only where ``final_charge > 0``; callers guard on that."""
-    final = SubscriptionInvoice.final_charge
+    A reseller with no plans, or with any hotspot plan, is a hotspot seller."""
+    pppoe = exists().where(
+        Plan.user_id == user_id_column,
+        Plan.connection_type.in_([ConnectionType.PPPOE, ConnectionType.STATIC_IP]),
+    )
+    hotspot = exists().where(
+        Plan.user_id == user_id_column,
+        Plan.connection_type == ConnectionType.HOTSPOT,
+    )
+    return and_(pppoe, ~hotspot)
+
+
+def _attribution(user_id_column):
+    """(hotspot, PPPoE / static) share of a subscription payment or invoice.
+
+    The two shares always add up to 1, so nothing is left unattributed. See
+    the module docstring for the rules. Needs ``subscription_invoices``
+    (outer-)joined; a missing invoice reads as one without usage charges."""
     hotspot = func.coalesce(SubscriptionInvoice.hotspot_charge, 0.0)
     per_user = func.coalesce(SubscriptionInvoice.pppoe_charge, 0.0)
-    rest = final - hotspot - per_user
-    minimum = case((rest > 0, rest), else_=0.0)
-    return hotspot / final, per_user / final, minimum / final
+    usage = hotspot + per_user
+    has_usage = and_(SubscriptionInvoice.id.is_not(None), usage > 0)
+    pppoe_seller = _sells_only_pppoe(user_id_column)
+    hot_share = case(
+        (has_usage, hotspot / usage),
+        (pppoe_seller, 0.0),
+        else_=1.0,
+    )
+    per_user_share = case(
+        (has_usage, per_user / usage),
+        (pppoe_seller, 1.0),
+        else_=0.0,
+    )
+    return hot_share, per_user_share
 
 
 async def _transaction_volume(db: AsyncSession, w: Windows) -> dict[str, Any]:
@@ -186,15 +229,10 @@ async def _collected_subscriptions(
 ) -> tuple[dict[str, float], dict[str, float]]:
     ts = SubscriptionPayment.created_at
     net = metrics._sub_kes()
-    hot, per_user, minimum = _invoice_shares()
-    has_invoice = and_(
-        SubscriptionInvoice.id.is_not(None), SubscriptionInvoice.final_charge > 0,
-    )
+    hot, per_user = _attribution(SubscriptionPayment.user_id)
     parts = {
-        "subscription_hotspot": case((has_invoice, net * hot), else_=0.0),
-        "subscription_per_user": case((has_invoice, net * per_user), else_=0.0),
-        "subscription_minimum": case((has_invoice, net * minimum), else_=0.0),
-        "subscription_unattributed": case((has_invoice, 0.0), else_=net),
+        "subscription_hotspot": net * hot,
+        "subscription_per_user": net * per_user,
     }
     current = _in_window(ts, w.cur_start, w.cur_end)
     previous = _in_window(ts, w.prev_start, w.prev_end)
@@ -239,10 +277,45 @@ async def _collected_sms(
     return float(row.cur or 0), float(row.prev or 0), int(row.orders or 0)
 
 
+async def _reseller_business(
+    db: AsyncSession, w: Windows, own_ids: list[int],
+) -> tuple[float, float, int]:
+    """Customer payments taken by the admin's own reseller accounts.
+
+    Same rules as transaction volume (completed, counts as revenue), limited
+    to the accounts flagged on the Earnings page. Gross: what their customers
+    paid, before any of the business's own costs."""
+    if not own_ids:
+        return 0.0, 0.0, 0
+    ts = CustomerPayment.created_at
+    amount = sql_kes_by_market(CustomerPayment.amount, User.market_code)
+    current = _in_window(ts, w.cur_start, w.cur_end)
+    row = (await db.execute(
+        select(
+            _sum_in(amount, current).label("cur"),
+            _sum_in(amount, _in_window(ts, w.prev_start, w.prev_end)).label("prev"),
+            func.count(case((current, CustomerPayment.id))).label("payments"),
+        )
+        .select_from(CustomerPayment)
+        .outerjoin(User, User.id == CustomerPayment.reseller_id)
+        .where(
+            CustomerPayment.reseller_id.in_(own_ids),
+            ts >= w.prev_start,
+            ts < w.cur_end,
+            CustomerPayment.counts_as_revenue == True,  # noqa: E712
+            or_(
+                CustomerPayment.status.is_(None),
+                CustomerPayment.status == PaymentStatus.COMPLETED,
+            ),
+        )
+    )).one()
+    return float(row.cur or 0), float(row.prev or 0), int(row.payments or 0)
+
+
 async def _invoiced(db: AsyncSession, w: Windows, own_ids: list[int]) -> dict[str, Any]:
     """What the invoices issued in the current window billed."""
     final_kes = sql_kes_by_currency(SubscriptionInvoice.final_charge, SubscriptionInvoice.currency)
-    hot, per_user, minimum = _invoice_shares()
+    hot, per_user = _attribution(SubscriptionInvoice.user_id)
     billable = and_(
         SubscriptionInvoice.status != InvoiceStatus.WAIVED,
         SubscriptionInvoice.final_charge > 0,
@@ -258,7 +331,6 @@ async def _invoiced(db: AsyncSession, w: Windows, own_ids: list[int]) -> dict[st
             _sum_in(final_kes, billable).label("total"),
             _sum_in(final_kes * hot, billable).label("hotspot"),
             _sum_in(final_kes * per_user, billable).label("per_user"),
-            _sum_in(final_kes * minimum, billable).label("minimum"),
             func.count(case((billable, SubscriptionInvoice.id))).label("count"),
             _sum_in(final_kes, waived).label("waived"),
             func.count(case((waived, SubscriptionInvoice.id))).label("waived_count"),
@@ -283,7 +355,6 @@ async def _invoiced(db: AsyncSession, w: Windows, own_ids: list[int]) -> dict[st
         "total": total,
         "subscription_hotspot": round(float(row.hotspot or 0), 2),
         "subscription_per_user": round(float(row.per_user or 0), 2),
-        "subscription_minimum": round(float(row.minimum or 0), 2),
         "invoices": int(row.count or 0),
         "paid_so_far": paid,
         "outstanding": round(total - paid, 2),
@@ -320,7 +391,7 @@ def _cache_key(period: str, own_ids: list[int]) -> str:
 async def compute_platform_earnings(db: AsyncSession, period: str = "month") -> dict[str, Any]:
     """Transaction volume vs Bitwave's own earnings for a calendar period-to-date.
 
-    Seven aggregate queries on a cache miss, each one row, none per reseller.
+    Eight aggregate queries on a cache miss, each one row, none per reseller.
     """
     period = normalize_period(period)
     own_ids = await metrics.get_own_reseller_ids(db)
@@ -334,6 +405,7 @@ async def compute_platform_earnings(db: AsyncSession, period: str = "month") -> 
     volume = await _transaction_volume(db, w)
     subs_cur, subs_prev = await _collected_subscriptions(db, w, own_ids)
     sms_cur, sms_prev, sms_orders = await _collected_sms(db, w, own_ids)
+    business_cur, business_prev, business_payments = await _reseller_business(db, w, own_ids)
     invoiced = await _invoiced(db, w, own_ids)
     not_counted = await _not_counted(db, w)
     accounts = await metrics.own_reseller_accounts(db, own_ids)
@@ -353,10 +425,12 @@ async def compute_platform_earnings(db: AsyncSession, period: str = "month") -> 
             "previous_total": round(previous[stream["key"]], 2),
         }
         for stream in EARNING_STREAMS
-        # An empty "unattributed" line is noise; every other line is a real
-        # price component and stays visible at zero.
-        if stream["key"] != "subscription_unattributed" or current[stream["key"]] > 0
     ]
+
+    business = round(business_cur, 2)
+    business_previous = round(business_prev, 2)
+    income = round(total + business, 2)
+    income_previous = round(previous_total + business_previous, 2)
 
     take_rate = (
         round(total / volume["total"] * 100, 2) if volume["total"] > 0 else None
@@ -380,6 +454,20 @@ async def compute_platform_earnings(db: AsyncSession, period: str = "month") -> 
             "sms_credits": round(sms_cur, 2),
             "sms_orders": sms_orders,
             "streams": streams,
+        },
+        # The admin's own reseller accounts: their own business income, kept
+        # apart from platform earnings and joined only in total_income.
+        "reseller_business": {
+            "total": business,
+            "previous_total": business_previous,
+            "change_percent": metrics._pct_change(business, business_previous),
+            "payments": business_payments,
+            "accounts": accounts,
+        },
+        "total_income": {
+            "total": income,
+            "previous_total": income_previous,
+            "change_percent": metrics._pct_change(income, income_previous),
         },
         "invoiced": invoiced,
         "take_rate_percent": take_rate,

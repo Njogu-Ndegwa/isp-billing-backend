@@ -6,7 +6,7 @@ All routes require admin role (same auth as /api/admin/* endpoints).
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import date as date_type, datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -721,6 +721,103 @@ async def admin_set_own_reseller_accounts(
         "reseller_ids": saved,
         "accounts": await svc.own_reseller_accounts(db, saved),
     }
+
+
+# ---------------------------------------------------------------------------
+# Withdrawals ledger (records only; see app/services/platform_withdrawals.py)
+# ---------------------------------------------------------------------------
+
+class PlatformWithdrawalCreate(BaseModel):
+    amount: float
+    date: date_type
+    method: str
+    bucket: str = "platform"
+    reference: Optional[str] = None
+    note: Optional[str] = None
+
+
+class PlatformWithdrawalVoid(BaseModel):
+    reason: str
+
+
+def _withdrawal_error(exc) -> HTTPException:
+    return HTTPException(status_code=exc.status, detail=exc.message)
+
+
+@router.get("/api/admin/metrics/platform-withdrawals")
+async def admin_list_platform_withdrawals(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Since 1 Oct 2026, per bucket (platform earnings / my reseller business)
+    and in total: collected, withdrawn, available to withdraw; plus the
+    recorded withdrawals, voided ones included. Never cached."""
+    await _require_admin(token, db)
+    from app.services import platform_withdrawals as ledger
+
+    return await ledger.list_withdrawals(db)
+
+
+@router.post("/api/admin/metrics/platform-withdrawals", status_code=201)
+async def admin_create_platform_withdrawal(
+    body: PlatformWithdrawalCreate,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Record a withdrawal the admin already made. Moves no money and calls no
+    payment provider. Refused (422) when it exceeds what is available."""
+    admin = await _require_admin(token, db)
+    from app.services import platform_withdrawals as ledger
+
+    try:
+        row = await ledger.create_withdrawal(
+            db, actor=admin, amount=body.amount, withdrawn_on=body.date,
+            method=body.method, bucket=body.bucket,
+            reference=body.reference, note=body.note,
+        )
+    except ledger.WithdrawalError as exc:
+        await db.rollback()
+        raise _withdrawal_error(exc)
+    logger.info(
+        "Platform withdrawal %s recorded by admin %s: KES %.2f from %s",
+        row["id"], admin.id, row["amount"], row["bucket"],
+    )
+    return row
+
+
+@router.post("/api/admin/metrics/platform-withdrawals/{withdrawal_id}/void")
+async def admin_void_platform_withdrawal(
+    withdrawal_id: int,
+    body: PlatformWithdrawalVoid,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Void a withdrawal recorded by mistake. The row is kept and marked voided."""
+    admin = await _require_admin(token, db)
+    from app.services import platform_withdrawals as ledger
+
+    try:
+        row = await ledger.void_withdrawal(
+            db, actor=admin, withdrawal_id=withdrawal_id, reason=body.reason,
+        )
+    except ledger.WithdrawalError as exc:
+        await db.rollback()
+        raise _withdrawal_error(exc)
+    logger.info("Platform withdrawal %s voided by admin %s", withdrawal_id, admin.id)
+    return row
+
+
+@router.get("/api/admin/metrics/platform-withdrawals/{withdrawal_id}/audit")
+async def admin_platform_withdrawal_audit(
+    withdrawal_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Every create / void of one withdrawal, oldest first."""
+    await _require_admin(token, db)
+    from app.services import platform_withdrawals as ledger
+
+    return {"withdrawal_id": withdrawal_id, "events": await ledger.audit_trail(db, withdrawal_id)}
 
 
 @router.get("/api/admin/oves-health/graphql/graphs")
