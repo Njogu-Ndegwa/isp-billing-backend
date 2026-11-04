@@ -22,6 +22,12 @@ Bitwave itself earns is much smaller and comes from these streams:
 * SMS credit sales (``sms_credit_orders`` with status completed). Credits an
   admin grants and credits refunded for failed sends are ledger moves, not
   sales, so they are not counted.
+* Ad commission: Bitwave's 20% of ads resellers sell to local businesses
+  through the platform (``ad_sale_payments.bitwave_fee``), counted when the
+  paid weeks start running (``credited_at``), the same moment the reseller's
+  80% joins their payout. Money paid for ads that have not started yet, and
+  refunds due, are shown under not_counted. Ad money is never part of the
+  transaction volume above (that is hotspot/PPPoE customer payments).
 
 "Collected" is cash received in the window. "Invoiced" is what the invoices
 issued in the window billed (waived invoices excluded and shown on their own),
@@ -84,6 +90,7 @@ EARNING_STREAMS: list[dict[str, str]] = [
     {"key": "subscription_minimum", "label": "Minimum / flat subscription fee", "group": "subscriptions"},
     {"key": "subscription_unattributed", "label": "Subscription payments without an invoice", "group": "subscriptions"},
     {"key": "sms_credits", "label": "SMS credit sales", "group": "sms"},
+    {"key": "ad_commission", "label": "Ad commission (20% of ads sold)", "group": "ads"},
 ]
 _SUBSCRIPTION_KEYS = tuple(s["key"] for s in EARNING_STREAMS if s["group"] == "subscriptions")
 
@@ -336,12 +343,17 @@ async def compute_platform_earnings(db: AsyncSession, period: str = "month") -> 
     sms_cur, sms_prev, sms_orders = await _collected_sms(db, w, own_ids)
     invoiced = await _invoiced(db, w, own_ids)
     not_counted = await _not_counted(db, w)
+    from app.services.ad_sales import ad_commission_totals, ad_money_not_earned
+    ads_cur, ads_prev, ads_payments = await ad_commission_totals(
+        db, w.cur_start, w.cur_end, w.prev_start, w.prev_end,
+    )
+    not_counted.update(await ad_money_not_earned(db))
     accounts = await metrics.own_reseller_accounts(db, own_ids)
     # Every read is done; don't sit idle in transaction while serialising.
     await db.commit()
 
-    current = {**subs_cur, "sms_credits": sms_cur}
-    previous = {**subs_prev, "sms_credits": sms_prev}
+    current = {**subs_cur, "sms_credits": sms_cur, "ad_commission": ads_cur}
+    previous = {**subs_prev, "sms_credits": sms_prev, "ad_commission": ads_prev}
     total = round(sum(current.values()), 2)
     previous_total = round(sum(previous.values()), 2)
     subscriptions = round(sum(current[k] for k in _SUBSCRIPTION_KEYS), 2)
@@ -379,6 +391,8 @@ async def compute_platform_earnings(db: AsyncSession, period: str = "month") -> 
             "subscriptions": subscriptions,
             "sms_credits": round(sms_cur, 2),
             "sms_orders": sms_orders,
+            "ad_commission": round(ads_cur, 2),
+            "ad_payments": ads_payments,
             "streams": streams,
         },
         "invoiced": invoiced,

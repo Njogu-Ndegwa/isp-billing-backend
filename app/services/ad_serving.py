@@ -8,7 +8,8 @@ So a portal load costs no ad query at all on a warm cache, and an ad edit
 shows up within a minute (sooner: every write path calls invalidate_ad_cache).
 
 An ad reaches a router when:
-  * it is active, approved, and inside its starts_at / expires_at window;
+  * it is active, approved, and inside its starts_at / expires_at window
+    (a sold ad, slot "reseller", must have one: its paid period);
   * its owner is Bitwave (owner_user_id NULL) or the reseller who owns the
     router; and
   * its router_ids is NULL (all of the owner's routers, or the whole network
@@ -114,6 +115,9 @@ async def _load_live_ads(db) -> list[dict]:
         .where(Ad.status == "approved")
         .where((Ad.starts_at == None) | (Ad.starts_at <= now))  # noqa: E711
         .where((Ad.expires_at == None) | (Ad.expires_at > now))  # noqa: E711
+        # A sold ad runs only inside a paid period (app/services/ad_sales.py
+        # sets starts_at/expires_at when paid weeks start): never open-ended.
+        .where((Ad.slot != "reseller") | (Ad.expires_at != None))  # noqa: E711
         .order_by(Ad.priority.desc(), Ad.created_at.desc(), Ad.id.desc())
     )
     return [serialize_portal_ad(ad) for ad in result.scalars().all()]

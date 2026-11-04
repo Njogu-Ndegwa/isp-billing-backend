@@ -65,7 +65,8 @@ def _auth_as(monkeypatch, user):
 
 
 async def _reseller(db):
-    return await make_reseller(db, subscription_status=SubscriptionStatus.ACTIVE)
+    # A support number: a reseller's own promo must show it (house-ad lock).
+    return await make_reseller(db, subscription_status=SubscriptionStatus.ACTIVE, support_phone="0712345678")
 
 
 async def _ad(db, **overrides) -> Ad:
@@ -164,13 +165,15 @@ AD_BODY = {
 
 
 @pytest.mark.asyncio
-async def test_reseller_ad_starts_pending_and_is_theirs(client, db, monkeypatch):
+async def test_reseller_own_promo_goes_live_at_once_and_is_theirs(client, db, monkeypatch):
+    # Review rules, 4 Nov 2026: a house ad passes the automatic checks and is
+    # approved straight away (sold ads still wait: see test_ad_sales.py).
     reseller = await _reseller(db)
     _auth_as(monkeypatch, reseller)
     r = await client.post("/api/ads", json=AD_BODY)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["status"] == "pending"
+    assert body["status"] == "approved"
     assert body["owner_user_id"] == reseller.id
     assert body["slot"] == "house"
 
@@ -212,7 +215,7 @@ async def test_reseller_cannot_see_edit_or_delete_another_resellers_ad(client, d
 @pytest.mark.asyncio
 async def test_editing_content_sends_an_approved_ad_back_for_review(client, db, monkeypatch):
     reseller = await _reseller(db)
-    ad = await _ad(db, owner_user_id=reseller.id, slot="house", status="approved")
+    ad = await _ad(db, owner_user_id=reseller.id, slot="reseller", status="approved")
     _auth_as(monkeypatch, reseller)
 
     r = await client.put(f"/api/ads/{ad.id}", json={"is_active": False})
@@ -432,7 +435,7 @@ async def test_resaving_unchanged_values_keeps_the_ad_live(client, db, monkeypat
 @pytest.mark.asyncio
 async def test_moving_an_ad_into_the_hero_is_reviewed(client, db, monkeypatch):
     reseller = await _reseller(db)
-    ad = await _ad(db, owner_user_id=reseller.id, slot="house", status="approved", placement="local")
+    ad = await _ad(db, owner_user_id=reseller.id, slot="reseller", status="approved", placement="local")
     _auth_as(monkeypatch, reseller)
     r = await client.put(f"/api/ads/{ad.id}", json={"placement": "hero"})
     assert r.json()["status"] == "pending"

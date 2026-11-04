@@ -1179,6 +1179,98 @@ class AdEvent(Base):
         Index("ix_ad_events_day", "day"),
     )
 
+
+class AdSale(Base):
+    """An ad a reseller sold to a local business, paid through Bitwave.
+
+    One row per sold ad (slot "reseller"). The business pays Bitwave's own
+    paybill by STK push; Bitwave keeps 20% and the reseller's 80% joins their
+    normal payout balance once the paid weeks start running. See
+    app/services/ad_sales.py.
+
+    ad_id has no foreign key on purpose (like ad_events): money records must
+    outlive an ad that is later deleted.
+    """
+    __tablename__ = "ad_sales"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ad_id = Column(Integer, nullable=False, unique=True, index=True)
+    reseller_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    business_name = Column(String(150), nullable=False)
+    # Normalised 2547XXXXXXXX / 2541XXXXXXXX: who gets the M-Pesa prompt.
+    business_phone = Column(String(20), nullable=False)
+    price_per_week = Column(Integer, nullable=False)       # whole KES
+    weeks = Column(Integer, nullable=False)                # weeks in the first order
+    # Paid weeks that have not started running yet (paid before approval).
+    weeks_banked = Column(Integer, nullable=False, default=0, server_default="0")
+    # The shop's read-only link: report, and the pay button while a payment is due.
+    share_token = Column(String(48), nullable=False, unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdSalePayment(Base):
+    """One M-Pesa prompt for a sold ad, and the money it brought in.
+
+    Prompts for the same order (the first sale, or one renewal) share
+    order_key: resending a prompt adds a row with the same key. The first
+    paid row of an order is the payment; a later paid row on the same key is
+    a duplicate and is flagged for refund, never credited.
+
+    Money is whole KES. bitwave_fee = floor(amount * 20 / 100) and
+    reseller_share = amount - bitwave_fee (the remainder goes to the reseller).
+    credited_at is set when the paid weeks start running; only then does
+    reseller_share count towards the reseller's payout balance and
+    bitwave_fee towards Bitwave's earnings.
+    """
+    __tablename__ = "ad_sale_payments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sale_id = Column(Integer, ForeignKey("ad_sales.id"), nullable=False, index=True)
+    ad_id = Column(Integer, nullable=False, index=True)
+    reseller_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    kind = Column(String(10), nullable=False)               # initial | renewal
+    order_key = Column(String(40), nullable=False, index=True)
+    weeks = Column(Integer, nullable=False)
+    price_per_week = Column(Integer, nullable=False)
+    amount = Column(Integer, nullable=False)
+    bitwave_fee = Column(Integer, nullable=False)
+    reseller_share = Column(Integer, nullable=False)
+    phone = Column(String(20), nullable=False)
+    # awaiting_payment -> paid | failed | timed_out (a late success callback
+    # still turns failed/timed_out into paid: the money is real).
+    status = Column(String(20), nullable=False, default="awaiting_payment", index=True)
+    checkout_request_id = Column(String(128), nullable=True, unique=True)
+    merchant_request_id = Column(String(128), nullable=True)
+    mpesa_receipt = Column(String(64), nullable=True, unique=True)
+    result_desc = Column(String(255), nullable=True)
+    paid_at = Column(DateTime, nullable=True)
+    is_duplicate = Column(Boolean, nullable=False, default=False, server_default="false")
+    credited_at = Column(DateTime, nullable=True, index=True)
+    # None | due | refunded. Never automatic: an admin refunds by hand and
+    # records it here.
+    refund_status = Column(String(10), nullable=True, index=True)
+    refund_reason = Column(String(300), nullable=True)
+    refunded_at = Column(DateTime, nullable=True)
+    refunded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdReviewEvent(Base):
+    """Append-only history of what happened to an ad in review: approve,
+    reject, auto_approve, takedown. Counts the auto-approve threshold (a
+    reseller's sold ads approved by Bitwave, and any rejection or takedown)
+    and remembers takedowns so an edit can't put an ad straight back live."""
+    __tablename__ = "ad_review_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ad_id = Column(Integer, nullable=False, index=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    slot = Column(String(10), nullable=False)
+    action = Column(String(20), nullable=False)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    note = Column(String(300), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
 class AdClick(Base):
     __tablename__ = "ad_clicks"
     id = Column(Integer, primary_key=True, autoincrement=True)

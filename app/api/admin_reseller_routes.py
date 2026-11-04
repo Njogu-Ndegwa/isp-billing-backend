@@ -1346,7 +1346,13 @@ async def admin_dashboard(
             CustomerPayment.collection_mode == CollectionMode.DIRECT,
         )
     )).scalar()), 2)
-    total_unpaid = round(platform_collected_revenue - total_payouts - total_charges, 2)
+    # Resellers' 80% of ads sold through Bitwave is owed like collected money
+    # (and is part of every payout), so it belongs on the owed side too.
+    from app.services.ad_sales import all_ad_credits_total
+    total_ad_credits = await all_ad_credits_total(db)
+    total_unpaid = round(
+        platform_collected_revenue + total_ad_credits - total_payouts - total_charges, 2
+    )
 
     # B2B payout totals
     b2b_total_sent = float((await db.execute(
@@ -2431,7 +2437,15 @@ async def _compute_repair(db: AsyncSession, reseller_id: int) -> dict:
         )).scalar()
     )
 
-    true_unpaid = max(0.0, round(payments_since - charges_since, 2))
+    # Ad money (the reseller's 80% of ads sold through Bitwave) is a term of
+    # get_unpaid_balance and is paid out with everything else, so the repair
+    # must count it on both sides or a payout that included it would look
+    # like lost revenue and be "corrected" into an overpayment.
+    from app.services.ad_sales import ad_credit_total
+    ad_since = await ad_credit_total(db, reseller_id, start=last_payout_date)
+    ad_all_time = await ad_credit_total(db, reseller_id)
+
+    true_unpaid = max(0.0, round(payments_since + ad_since - charges_since, 2))
 
     # Raw balance: canonical revenue minus total payouts minus total charges
     # (no correction term — this is what the correction gets computed against)
@@ -2453,7 +2467,7 @@ async def _compute_repair(db: AsyncSession, reseller_id: int) -> dict:
             .where(ResellerTransactionCharge.reseller_id == reseller_id)
         )).scalar()
     )
-    raw_balance = round(mpesa_rev - total_paid - total_charges, 2)
+    raw_balance = round(mpesa_rev + ad_all_time - total_paid - total_charges, 2)
 
     # Existing correction already applied (to avoid double-applying)
     existing_correction = float(
