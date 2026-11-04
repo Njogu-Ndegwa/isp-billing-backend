@@ -555,6 +555,9 @@ async def _initiate_mtn_momo(
 # Fapshi (Cameroon Mobile Money / Orange Money)
 # ---------------------------------------------------------------------------
 
+FAPSHI_MIN_AMOUNT_XAF = 100
+
+
 async def _initiate_fapshi(
     db: AsyncSession,
     pm: ResellerPaymentMethod,
@@ -585,6 +588,17 @@ async def _initiate_fapshi(
     api_key = decrypt_credential(pm.fapshi_api_key_encrypted)
     environment = normalize_environment(pm.fapshi_environment)
     phone_local = normalize_cameroon_phone(phone)
+    try:
+        below_minimum = Decimal(str(amount)) < FAPSHI_MIN_AMOUNT_XAF
+    except (ArithmeticError, TypeError, ValueError):
+        below_minimum = False
+    if below_minimum:
+        # Fapshi rejects these outright; say so before any row or prompt exists.
+        raise ValueError(
+            f"This package costs {Decimal(str(amount)).normalize():f} XAF, but Fapshi "
+            f"mobile money only accepts payments of {FAPSHI_MIN_AMOUNT_XAF} XAF or more. "
+            "Please choose another package or ask the Wi-Fi provider to update the price."
+        )
     amount_xaf = normalize_xaf_amount(amount)
 
     # Serialize phone prompts for this target. All contract data is persisted
@@ -594,20 +608,19 @@ async def _initiate_fapshi(
                                .with_for_update().execution_options(populate_existing=True))
     if customer.user_id != pm.user_id:
         raise ValueError("Fapshi payment method does not own this customer")
-    from app.services.fapshi_reconciliation import capture_purchase_snapshot
+    from app.services.fapshi_reconciliation import capture_purchase_snapshot, in_flight_clause
     snapshot = await capture_purchase_snapshot(db, customer, amount=amount_xaf)
 
-    # An unresolved collection blocks another prompt even after the browser
-    # times out. Only a terminal status or explicit review resolves it.
+    # Only an attempt that may still be on the payer's phone blocks another
+    # prompt. Older unresolved rows keep reconciling in the background, and
+    # review holds (legacy, window exhausted, paid-not-credited) wait for an
+    # operator; neither may lock the customer out of paying again.
     existing = (
         await db.execute(
             select(FapshiTransaction)
             .where(
                 FapshiTransaction.customer_id == customer.id,
-                FapshiTransaction.status.in_([
-                    FapshiTransactionStatus.CREATED,
-                    FapshiTransactionStatus.PENDING,
-                ]),
+                in_flight_clause(),
             )
             .order_by(FapshiTransaction.created_at.desc())
             .limit(1)

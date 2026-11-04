@@ -252,7 +252,8 @@ async def test_uncertain_initiation_survives_timeout_and_blocks_second_prompt(db
     held = await db.scalar(select(FapshiTransaction))
     assert held.purchase_snapshot and held.external_id
     assert held.review_reason == "initiation_outcome_unknown" and not held.trans_id
-    held.created_at=datetime.utcnow()-timedelta(days=1)
+    # Still inside the in-flight window: the first prompt may be on the phone.
+    held.created_at=datetime.utcnow()-timedelta(minutes=10)
     await db.commit()
     with pytest.raises(ValueError, match="do not pay again"):
         await _initiate_fapshi(db, pm, customer, customer.phone, 500, "test")
@@ -322,6 +323,8 @@ async def test_router_retry_is_durable_and_does_not_query_provider_again(db, mon
     await service.recheck_pending_fapshi_background()
     await db.refresh(txn)
     assert not txn.fulfillment_pending and provider.await_count == 1 and deliver.await_count == 2
+    # A clean pass clears the earlier diagnostic instead of leaving it stale.
+    assert txn.last_check_error is None
     assert await db.scalar(select(func.count(CustomerPayment.id))) == 1
 
 async def test_fapshi_owns_attempt_retry_and_bypasses_checkin_deferral(db):

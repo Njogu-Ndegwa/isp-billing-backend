@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.database import get_db
 from app.db.models import Customer, FapshiTransaction
 from app.services.fapshi_reconciliation import (
-    FINAL_STATUSES as _FINAL_STATUSES, apply_remote_status as _apply_remote_status,
+    FINAL_STATUSES as _FINAL_STATUSES, REVIEW_HOLD_STATUS, apply_remote_status as _apply_remote_status,
+    is_review_hold,
     reconcile_transaction, validate_remote_transaction as _validate_remote_transaction,
 )
 router = APIRouter(tags=["fapshi"])
@@ -30,6 +31,10 @@ def payment_flags(txn):
     if txn is None:
         return {}
     status = txn.status.value if hasattr(txn.status, "value") else txn.status
+    if is_review_hold(txn):
+        # Not in flight and not failed: parked for manual review. Say so rather
+        # than report an attempt that stopped moving days ago as "pending".
+        status = REVIEW_HOLD_STATUS
     fulfillment = ("review_required" if txn.review_reason else
                    "pending" if txn.fulfillment_pending else
                    "delivered" if txn.customer_payment_id else None)
