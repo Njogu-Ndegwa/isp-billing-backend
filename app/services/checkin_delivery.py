@@ -206,7 +206,13 @@ HARD_MAX_LINES_PER_REPLY = 20  # ~1.3 KB; well under any v6 fetch limit
 # --- field whitelists -------------------------------------------------------
 _MAC_RE = re.compile(r"^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
 # Raw bps ("10000000/10000000") is a valid push rate too, hence 10 digits.
-_RATE_PART = r"\d{1,10}(?:\.\d{1,3})?[KMG]?"
+# Kilo is lowercase "k": that is how RouterOS spells it and what
+# parse_speed_to_mikrotik emits for fractional speeds ("2M/0.5" -> "500k/2M").
+# Until 2026-11-04 only "K" was accepted, so every customer on a plan with a
+# fractional speed was silently skipped here ("fails whitelist") and the
+# check-in never re-delivered their binding or queue (router 446, plan
+# "Elvis Original TV" 2M/0.5). Lowercase "m" stays out: RouterOS rejects it.
+_RATE_PART = r"\d{1,10}(?:\.\d{1,3})?[kKMG]?"
 _RATE_RE = re.compile(rf"^{_RATE_PART}/{_RATE_PART}$")
 _EPOCH_RE = re.compile(r"^\d{10}$")
 _REF_RE = re.compile(r"^[0-9A-F]{12}$")

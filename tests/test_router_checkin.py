@@ -193,6 +193,32 @@ def test_desired_entry_uses_push_rate_and_ref():
     assert svc.desired_entry("not-a-mac", "5M/5M", datetime(2026, 10, 1)) is None
 
 
+@pytest.mark.parametrize("speed,rate", [
+    ("2M/0.5", "500k/2M"),        # router 446 "Elvis Original TV"
+    ("0.5M/0.5M", "500k/500k"),
+    ("1.5M/1M", "1M/1500k"),
+    ("512Kbps", "512K/512K"),
+])
+def test_desired_entry_accepts_fractional_plan_speeds(speed, rate):
+    # parse_speed_to_mikrotik spells kilo "k", as RouterOS does. These plans
+    # used to be dropped as "fails whitelist", so the check-in never
+    # re-delivered them.
+    e = svc.desired_entry("aa:bb:cc:00:00:01", speed, datetime(2026, 10, 1))
+    assert e is not None and e.rate == rate
+    for line in (svc.format_add_line(e), svc.format_queue_line(e),
+                 svc.format_user_line(e, 1790000000)):
+        assert line is not None and f",{rate}," in line
+
+
+@pytest.mark.parametrize("rate", ["5m/2m", "5M/2M;", "5M/2M ", "$x/2M", "5M/2M\n"])
+def test_rate_whitelist_still_rejects_unsafe_or_invalid_rates(rate):
+    e = svc.DesiredEntry(mac="AA:BB:CC:00:00:01", rate=rate, expiry_epoch=1790000000,
+                         ref="AABBCC000001")
+    assert svc.format_add_line(e) is None
+    assert svc.format_queue_line(e) is None
+    assert svc.format_user_line(e, 1790000000) is None
+
+
 # ---------------------------------------------------------------------------
 # Token namespace
 # ---------------------------------------------------------------------------
