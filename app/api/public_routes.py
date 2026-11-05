@@ -1575,7 +1575,32 @@ async def reconnect_self_service(
     # plan: nothing is added, and its main device may only move under the
     # rules below (never when online or paired to a TV).
     if device_limit_exc is None:
-        from app.api.access_code_routes import attached_devices_full_exc
+        from app.api.access_code_routes import add_device_to_owner_plan, attached_devices_full_exc
+        from app.api.device_pairing import device_is_attached
+
+        for c in candidates:
+            # A device already holding a slot on such a plan comes back, the
+            # same as on a healthy group.
+            if (
+                c.plan
+                and c.plan.connection_type == ConnectionType.HOTSPOT
+                and c.expiry > now
+                and not sharing_enabled_for_customer(c, c.plan)
+                and await device_is_attached(
+                    db, owner_id=c.id, router_id=request.router_id, normalized_mac=normalized_mac,
+                )
+            ):
+                owner_id = c.id
+                result = await add_device_to_owner_plan(
+                    db, owner=c, router_id=request.router_id, normalized_mac=normalized_mac,
+                )
+                db.add(ReconnectionAttempt(
+                    phone=phone_raw, mac_address=normalized_mac,
+                    router_id=request.router_id, customer_id=owner_id,
+                    success=True, created_at=datetime.utcnow(),
+                ))
+                await db.commit()
+                return result
 
         for c in candidates:
             if c.plan and not sharing_enabled_for_customer(c, c.plan):

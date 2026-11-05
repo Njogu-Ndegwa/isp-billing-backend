@@ -32,6 +32,7 @@ from app.api.device_pairing import (
     _parse_device_type,
     _share_subscription_for_owner,
     _validate_device_mac,
+    device_is_attached,
     disconnect_shared_pairing,
     list_subscription_devices,
     load_access_code_owner,
@@ -197,6 +198,21 @@ async def redeem_code_on_device(
                 background_tasks=background_tasks,
             )
             return {**result, **_plan_summary(own), "outcome": "main_device"}
+
+        # Holding a slot on a plan whose limit dropped below its devices: this
+        # device comes back, the same as on a healthy group.
+        if await device_is_attached(
+            db, owner_id=owner.id, router_id=router_id, normalized_mac=normalized_mac,
+        ):
+            return await add_device_to_owner_plan(
+                db,
+                owner=owner,
+                router_id=router_id,
+                normalized_mac=normalized_mac,
+                device_type=device_type,
+                device_name=device_name,
+                summary=summary,
+            )
 
         full = await attached_devices_full_exc(db, owner=owner, normalized_mac=normalized_mac)
         if full is not None:

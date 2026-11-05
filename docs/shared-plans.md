@@ -35,7 +35,8 @@ schedules delivery.
 | Legacy one-time code | `/api/public/device/share-subscription/code/redeem` | Old portals. |
 
 - **At the limit:** 409 `device_limit_reached` with the device list. Nobody is kicked.
-- **Same device again:** no extra slot or row, it is just re-delivered.
+- **Same device again:** no extra slot or row, it is just re-delivered, even if the limit has
+  since dropped below the devices attached. It keeps its device type.
 - **Single-device plans:** the code moves the plan only if its device is idle. See
   `app/services/device_entitlements.py` and PR #300 (paired TV/console/IoT never moves).
 
