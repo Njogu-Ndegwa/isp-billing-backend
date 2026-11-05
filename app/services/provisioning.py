@@ -31,6 +31,13 @@ WG_SERVER_IP = ipaddress.IPv4Address("10.0.0.1")
 WG_IP_RANGE = (ipaddress.IPv4Address("10.0.0.2"), ipaddress.IPv4Address("10.0.99.255"))
 L2TP_IP_RANGE = (ipaddress.IPv4Address("10.0.100.0"), ipaddress.IPv4Address("10.0.199.255"))
 TOKEN_EXPIRY_HOURS = 24
+
+# What a v7 router's device-mode has to allow for provisioning. `home` mode
+# blocks all three and `basic` blocks hotspot, so naming hotspot alone leaves a
+# home-mode router stuck on the next attempt.
+DEVICE_MODE_UPDATE_COMMAND = (
+    "/system/device-mode/update fetch=yes scheduler=yes hotspot=yes"
+)
 INSURANCE_KEY_CONTEXT = b"bitwave-insurance-wireguard-v1"
 
 LOGIN_PAGE_PATH = os.path.join(
@@ -664,11 +671,13 @@ def _rsc_preflight_hotspot(token: ProvisioningToken) -> str:
         )
     else:
         remedy = (
-            "this is usually device-mode blocking hotspot (newer RouterBOARDs "
-            "ship this way). Run: /system/device-mode/update hotspot=yes  -- "
-            "then press the physical reset button briefly (or power-cycle) "
+            "this is usually device-mode blocking hotspot (home mode also blocks "
+            f"fetch and scheduler). Run: {DEVICE_MODE_UPDATE_COMMAND}  -- "
+            "then press the physical reset or mode button briefly (or power-cycle) "
             "within 5 minutes when prompted, wait for the router to come back, "
-            "then re-run this provisioning command"
+            "then re-run this same provisioning command to connect the router to "
+            "the billing system (the code stays valid until it is completed or "
+            f"expires after {TOKEN_EXPIRY_HOURS} hours)"
         )
     # smips builds (hAP lite, hAP mini, cAP lite) on RouterOS 7.20+ ship
     # without hotspot in the main package -- it is a separate
@@ -1355,10 +1364,10 @@ def _rsc_hotspot(token: ProvisioningToken) -> str:
 :do {
     :set hsCount [:len [/ip hotspot find where name=hotspot1]]
 } on-error={
-    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode hotspot is enabled: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode allows it: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 }
 :if ($hsCount = 0) do={
-    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 } else={
     :log info "Provisioning: hotspot1 confirmed running"
 }

@@ -17,7 +17,7 @@
     $bwHsProbe
     :log info "Provisioning: hotspot feature available"
 } on-error={
-    :local bwRemedy "this is usually device-mode blocking hotspot (newer RouterBOARDs ship this way). Run: /system/device-mode/update hotspot=yes  -- then press the physical reset button briefly (or power-cycle) within 5 minutes when prompted, wait for the router to come back, then re-run this provisioning command"
+    :local bwRemedy "this is usually device-mode blocking hotspot (home mode also blocks fetch and scheduler). Run: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes  -- then press the physical reset or mode button briefly (or power-cycle) within 5 minutes when prompted, wait for the router to come back, then re-run this same provisioning command to connect the router to the billing system (the code stays valid until it is completed or expires after 24 hours)"
     # smips (hAP lite / hAP mini / cAP lite) on RouterOS 7.20+: hotspot is a
     # separate extra package, so device-mode cannot fix it. Message only.
     :do {
@@ -270,10 +270,10 @@
 :do {
     :set hsCount [:len [/ip hotspot find where name=hotspot1]]
 } on-error={
-    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode hotspot is enabled: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode allows it: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 }
 :if ($hsCount = 0) do={
-    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 } else={
     :log info "Provisioning: hotspot1 confirmed running"
 }
