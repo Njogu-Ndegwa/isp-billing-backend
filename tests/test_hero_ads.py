@@ -213,16 +213,16 @@ async def test_reseller_cannot_see_edit_or_delete_another_resellers_ad(client, d
 
 
 @pytest.mark.asyncio
-async def test_editing_content_sends_an_approved_ad_back_for_review(client, db, monkeypatch):
+async def test_editing_a_live_ad_keeps_it_live(client, db, monkeypatch):
     reseller = await _reseller(db)
     ad = await _ad(db, owner_user_id=reseller.id, slot="reseller", status="approved")
     _auth_as(monkeypatch, reseller)
 
     r = await client.put(f"/api/ads/{ad.id}", json={"is_active": False})
-    assert r.json()["status"] == "approved"      # pausing needs no review
+    assert r.json()["status"] == "approved"
 
     r = await client.put(f"/api/ads/{ad.id}", json={"title": "New offer"})
-    assert r.json()["status"] == "pending"
+    assert r.json()["status"] == "approved"
 
 
 @pytest.mark.asyncio
@@ -433,12 +433,12 @@ async def test_resaving_unchanged_values_keeps_the_ad_live(client, db, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_moving_an_ad_into_the_hero_is_reviewed(client, db, monkeypatch):
+async def test_moving_an_ad_into_the_hero_keeps_it_live(client, db, monkeypatch):
     reseller = await _reseller(db)
     ad = await _ad(db, owner_user_id=reseller.id, slot="reseller", status="approved", placement="local")
     _auth_as(monkeypatch, reseller)
     r = await client.put(f"/api/ads/{ad.id}", json={"placement": "hero"})
-    assert r.json()["status"] == "pending"
+    assert r.json()["status"] == "approved"
 
 
 @pytest.mark.asyncio

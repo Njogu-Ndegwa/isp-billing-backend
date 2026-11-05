@@ -5,18 +5,17 @@ Ownership (hero ads, 2026-10):
   * Bitwave (an admin) creates "platform" ads. They are approved on creation
     and run network-wide or on the routers listed in router_ids.
   * A reseller creates ads only for their own routers: "house" (their own
-    promo) or "reseller" (one they sold). Every reseller ad starts pending and
-    needs an admin's approval before any portal shows it; editing its content
-    sends it back to pending.
+    promo) or "reseller" (one they sold).
   * A reseller sees, edits and deletes only their own ads. Before this, any
     reseller could edit or delete any ad and publish to every portal.
 
-Review rules (Dennis, 4 Nov 2026; app/services/ad_review.py): every
-reseller submit runs automatic checks (blocked words, a valid phone, media).
-A "house" ad is locked to the reseller's own network name and support number
-and goes live at once; a sold ad ("reseller" slot) is created through
-/api/ad-sales, is paid by the business through Bitwave, and needs an admin's
-approval until the reseller has had 3 sold ads approved and none rejected.
+Review rules (Dennis, 5 Nov 2026; app/services/ad_review.py): nobody reviews
+an ad first. Every reseller submit runs automatic checks (blocked words, a
+valid phone, media). A "house" ad is locked to the reseller's own network name
+and support number and goes live at once; a sold ad ("reseller" slot) is created
+through /api/ad-sales, is paid by the business through Bitwave, and goes live
+when that payment is confirmed. An edit keeps a live ad live. An admin's
+takedown is the safety net.
 
 Serving and counting live in app/services/ad_serving.py; selling and payment
 in app/services/ad_sales.py and app/api/ad_sales_routes.py.
@@ -54,7 +53,7 @@ _BADGES = {"hot": AdBadgeType.HOT, "new": AdBadgeType.NEW, "sale": AdBadgeType.S
 _COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _MEDIA_FIELDS = ("image_url", "video_url", "poster_url")
 _PHONE_RE = re.compile(r"^\+?[0-9 ]{9,16}$")
-# Content edits that send a reseller's approved ad back for review.
+# Content edits: what the automatic checks run again for.
 _REVIEWED_FIELDS = {
     "title", "description", "image_url", "seller_name", "seller_location",
     "phone_number", "whatsapp_number", "price", "media_type", "video_url",
@@ -428,14 +427,16 @@ async def list_manage_ads(
     placement: Optional[str] = None,
     owner_user_id: Optional[int] = None,
     bitwave_only: bool = False,
+    newly_live: bool = False,
     page: int = 1,
     per_page: int = 50,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Admins see every ad; a reseller sees their own. ?status=pending is the
-    review queue. Admins can narrow to one reseller (?owner_user_id=) or to
-    Bitwave's own ads (?bitwave_only=true)."""
+    """Admins see every ad; a reseller sees their own. Admins can narrow to one
+    reseller (?owner_user_id=) or to Bitwave's own ads (?bitwave_only=true).
+    ?newly_live=true lists resellers' ads on portals now, newest go-live first,
+    for an admin to check after the fact (nothing waits for this)."""
     user = await get_current_user(token, db)
     page, per_page = max(page, 1), min(max(per_page, 1), 100)
     q = select(Ad)
@@ -449,9 +450,20 @@ async def list_manage_ads(
         q = q.where(Ad.status == _check_choice(status, STATUSES, "status"))
     if placement:
         q = q.where(Ad.placement == _check_choice(placement, PLACEMENTS, "placement"))
+    order = (Ad.created_at.desc(), Ad.id.desc())
+    if newly_live:
+        now = datetime.utcnow()
+        q = q.where(
+            Ad.owner_user_id != None,  # noqa: E711
+            Ad.status == "approved",
+            Ad.is_active == True,  # noqa: E712
+            (Ad.expires_at == None) | (Ad.expires_at > now),  # noqa: E711
+            (Ad.slot != "reseller") | (Ad.expires_at != None),  # noqa: E711
+        )
+        order = (func.coalesce(Ad.starts_at, Ad.reviewed_at, Ad.created_at).desc(), Ad.id.desc())
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
     ads = (await db.execute(
-        q.order_by(Ad.created_at.desc(), Ad.id.desc()).offset((page - 1) * per_page).limit(per_page)
+        q.order_by(*order).offset((page - 1) * per_page).limit(per_page)
     )).scalars().all()
     totals = await _event_totals(db, [a.id for a in ads])
     names = await _owner_names(db, [a.owner_user_id for a in ads])
@@ -609,22 +621,15 @@ async def update_ad(
     if is_active is not None:
         ad.is_active = bool(is_active)
 
-    # A reseller changing what customers see is checked and reviewed again: a
-    # house ad goes straight back live after the automatic checks, a sold ad
-    # waits for Bitwave unless the reseller is trusted, and an ad Bitwave took
-    # down always waits. Compared by value, so re-saving the form unchanged
-    # keeps it as it was.
+    # A reseller changing what customers see runs the automatic checks again.
+    # A live ad stays live. An ad still marked pending or rejected goes live
+    # now, unless Bitwave took it down: that stays down until an admin says so.
+    # Compared by value, so re-saving the form unchanged keeps it as it was.
     changed = any(getattr(ad, f) != before[f] for f in _REVIEWED_FIELDS)
     if not admin and changed:
         await ad_review.run_submit_checks(db, ad, user)
-        if await ad_review.decide_status(db, ad, user) == "approved":
-            if ad.status != "approved":
-                await _auto_approve(db, ad)
-        elif ad.status != "pending":
-            ad.status = "pending"
-            ad.review_note = None
-            ad.reviewed_at = None
-            ad.reviewed_by = None
+        if ad.status != "approved" and await ad_review.decide_status(db, ad, user) == "approved":
+            await _auto_approve(db, ad)
 
     await db.commit()
     await db.refresh(ad)
@@ -674,8 +679,10 @@ async def review_ad(
             db, ad, ad_review.ACTION_APPROVE if action == "approve" else ad_review.ACTION_REJECT,
             user.id, note,
         )
-    # A paid sold ad goes live now (its paid weeks start at approval); one
-    # rejected after payment never runs and its payment waits for a refund.
+    # Nothing waits for this route any more. It handles rows from before the
+    # review was removed, and an admin undoing a takedown. A paid sold ad goes
+    # live now (its paid weeks start here, once); one rejected after payment
+    # never runs and its payment waits for a refund.
     if action == "approve":
         await ad_sales.on_approved(db, ad)
     else:

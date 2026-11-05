@@ -9,9 +9,9 @@ uploads in `app/services/ad_media.py`. All signed-in routes take the usual
 | | Bitwave admin | Reseller |
 |---|---|---|
 | See ads | every ad | only their own |
-| Create | `slot: "platform"`, approved at once, any routers or network-wide | `slot: "house"` (own promo, default) or `"reseller"` (an ad they sold), **pending** until an admin approves, only their own routers |
-| Edit | anything; status unchanged | own ads; changing what customers see (title, photo, video, phone, price…) sends an approved ad back to **pending**; pausing (`is_active`) does not |
-| Approve / reject | yes | no |
+| Create | `slot: "platform"`, approved at once, any routers or network-wide | `slot: "house"` (own promo, default) or `"reseller"` (an ad they sold), approved at once after the automatic checks, only their own routers |
+| Edit | anything; status unchanged | own ads; a live ad stays live and the automatic checks run again on a change |
+| Take down | yes | no |
 | Advertisers list | yes | no (403) |
 
 Staff logins act as their reseller (same "own ads only" scope), limited by their
@@ -21,8 +21,8 @@ permissions (`app/services/staff_permissions.py`):
 |---|---|---|---|
 | List / open ads, stats, analytics | yes | yes (read-only) | no |
 | Raw click / impression rows (device MACs) | yes | no | no |
-| Create, edit, pause, delete, upload media | yes (still pending review) | no | no |
-| Approve / reject, advertisers | no (Bitwave admin only) | no | no |
+| Create, edit, pause, delete, upload media | yes | no | no |
+| Take down, approve / reject old rows, advertisers | no (Bitwave admin only) | no | no |
 
 A portal shows an ad only when it is active, approved, inside `starts_at`/`expires_at`,
 owned by Bitwave or by the router's reseller, and `router_ids` is null or lists the router.
@@ -61,12 +61,12 @@ Hero ads are ordered platform → reseller → house, at most 3.
 
 | Method & path | Body / query | Notes |
 |---|---|---|
-| `GET /api/ads/manage` | `?status=pending&placement=hero&owner_user_id=7&bitwave_only=true&page=1&per_page=50` | `{ads: [Ad], pagination}`. `status=pending` is the admin review queue; `owner_user_id` / `bitwave_only` are admin filters. |
+| `GET /api/ads/manage` | `?status=approved&placement=hero&owner_user_id=7&bitwave_only=true&newly_live=true&page=1&per_page=50` | `{ads: [Ad], pagination}`. `owner_user_id` / `bitwave_only` are admin filters. `newly_live=true` is resellers' ads on portals now, newest go-live first, for an admin to check afterwards. |
 | `GET /api/ads/manage/{id}` | | one Ad; 404 for someone else's |
 | `POST /api/ads` | Ad fields: required `title`, `seller_name`, `phone_number`; a photo ad needs `image_url`, a video ad `video_url` (+ `poster_url`). Optional `slot`, `router_ids`, `starts_at`, `expires_at` (ISO), `advertiser_id` (admin only), `priority` (admin only) | returns the Ad |
-| `PUT /api/ads/{id}` | any subset of the create fields, plus `is_active`; `advertiser_id` (admin, Bitwave ads only) | returns the Ad. A reseller's ad goes back to pending only when a customer-visible value actually changes (placement included). |
+| `PUT /api/ads/{id}` | any subset of the create fields, plus `is_active`; `advertiser_id` (admin, Bitwave ads only) | returns the Ad. A live ad stays live. A customer-visible change (placement included) runs the automatic checks again, and puts an ad still marked pending or rejected live, unless Bitwave took it down. |
 | `DELETE /api/ads/{id}` | | |
-| `POST /api/ads/{id}/review` | `{action: "approve" \| "reject", note}` | admin only; `reject` needs a `note` (shown to the reseller) |
+| `POST /api/ads/{id}/review` | `{action: "approve" \| "reject", note}` | admin only, and nothing waits on it: for rows from before review was removed, and to undo a takedown. `reject` needs a `note` (shown to the reseller). Approving a paid ad starts its weeks and credits the reseller once; repeating it changes nothing. |
 | `GET /api/ads/{id}/stats` | `?days=30` | `{impressions, clicks, by_placement: {hero: {impressions, clicks}, wait_screen…}, daily: [{day, impressions, clicks}]}` |
 | `GET /api/ads/analytics` | `?days=30` | totals over the caller's ads (admin: all), plus `by_placement` |
 | `GET /api/ads/{id}/clicks`, `/impressions` | `?page&per_page` | raw event lists |
@@ -129,11 +129,21 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
 - **The reseller's Show Ads portal switch must be on.** It is off by default and a portal with it
   off shows no ads, so every prompt (create, resend, renew, the shop's link) is refused with a 400
   until it is on. Switching it off later hides a running ad; its paid days keep counting.
+- **Nobody reviews an ad first** (Dennis, 5 Nov 2026). A sold ad is approved at creation but has no
+  paid period, so no portal shows it until the shop pays. When the payment is confirmed it goes live
+  on its own: the paid weeks start and the reseller's 80% is credited at that moment. An edit keeps a
+  live ad live, with the automatic checks run again. Admins check afterwards with
+  `GET /api/ads/manage?newly_live=true` and take down anything wrong.
+- **Rows from before that rule are left as they are.** No migration publishes them. An own promo
+  still marked `pending` shows nowhere until its owner changes it or an admin approves it. An unpaid
+  sold ad still marked `pending` goes live if its shop pays. A paid ad stuck in `pending` goes live,
+  and credits once, when an admin calls `POST /api/ads/{id}/review` with `{"action": "approve"}`.
 - **Money**: the business pays the total by STK push to Bitwave's own paybill (the system
   shortcode), also for direct-settlement resellers. `bitwave_fee = floor(amount × 20 / 100)`,
   `reseller_share = amount − bitwave_fee` (rounding favours the reseller: KES 1,005 → 201 / 804).
-- **Paid period starts at go-live**: weeks paid before approval are banked and start when the ad
-  is approved. A renewal paid while live extends the end date; paid after the end, it starts now.
+- **Paid period starts when the payment is confirmed.** A renewal paid while live extends the end
+  date; paid after the end, it starts now. `weeks_banked` is only non-zero on old rows that can't go
+  live by themselves (paid while pending under the old review, or pending after a takedown).
   A sold ad never runs without a paid period (`ad_serving` refuses a `reseller` ad with no
   `expires_at`) and stops by itself at `expires_at`.
 - **Payout**: the reseller's 80% is credited when the paid weeks start running and is a separate
@@ -142,11 +152,10 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
   don't include it). Bitwave's 20% is the `ad_commission` stream in
   `/api/admin/metrics/platform-earnings`; paid-but-not-running money and refunds due are under
   `not_counted`.
-- **Review**: sold ads need a Bitwave admin's approval until the reseller has 3 sold ads approved
-  by an admin and no rejection (a rejection of a sold ad, or a takedown of any of their ads);
-  then they are approved automatically. An ad that was taken down always waits for an admin
-  after an edit. Automatic checks on every submit: blocked words (admin-editable, whole words),
-  a valid Kenyan mobile number, media present.
+- **Automatic checks on every submit**: blocked words (admin-editable, whole words), a valid Kenyan
+  mobile number, media present. Own promos are also locked to the network's name and support number.
+- **Takedown is the safety net**: an admin takes any ad off every portal at once. An ad taken down
+  stays down whatever its owner edits; only an admin can put it back.
 - **Refunds are never automatic**: rejected after payment, ad deleted before it ran, or a second
   payment for the same order → `refund_status: "due"`, listed for an admin, who refunds by hand
   and records it.
@@ -170,7 +179,7 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
 | `GET /api/ad-sales/access` | signed in | | `{allowed}`: may this reseller sell yet |
 | `GET /api/ad-sales/quote` | any | `?weeks&price_per_week` | `{amount, bitwave_fee, reseller_share, fee_percent}` |
 | `POST /api/ad-sales` | reseller, staff `portal.manage` | Ad fields + `business_name`, `business_phone`, `weeks`, `price_per_week` | `{ad, sale}`; sends the prompt at once |
-| `GET /api/ad-sales` | reseller (own), admin (all) | `?state&payout_status&owner_user_id&page&per_page` | `{sales, totals, pagination}`; reseller also gets `review` (auto-approve progress). `payout_status=refund_due` is the refund queue |
+| `GET /api/ad-sales` | reseller (own), admin (all) | `?state&payout_status&owner_user_id&page&per_page` | `{sales, totals, pagination}`. `payout_status=refund_due` is the refund queue |
 | `GET /api/ads/{id}/sale` | owner, admin | | the sale summary with `payments`; poll every few seconds while a prompt is out |
 | `POST /api/ads/{id}/sale` | owner | `business_name, business_phone, weeks, price_per_week` | put an older sold ad up for payment |
 | `POST /api/ads/{id}/sale/prompt` | owner | `{phone?, weeks?, price_per_week?}` | (re)send the prompt for what is due |
