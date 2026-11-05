@@ -5,6 +5,7 @@ subscription, including the paying owner's device. A value of 1 keeps sharing
 disabled; values above 1 allow ``max_shared_users - 1`` extra devices/customers.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
@@ -23,6 +24,7 @@ from app.db.models import (
     RouterAuthMethod,
 )
 from app.services.hotspot_provisioning import (
+    build_hotspot_payload,
     get_or_create_provisioning_attempt,
     schedule_provisioning_attempt,
 )
@@ -269,6 +271,92 @@ async def carry_owner_edit_to_shared_devices(
         pairing.plan_id = owner_customer.plan_id
         changed.append(shared.id)
     return changed
+
+
+async def push_plan_edit_to_router(
+    db: AsyncSession,
+    *,
+    customer: Customer,
+    plan: Plan | None,
+    router: Router | None,
+) -> dict | None:
+    """Put an edited plan's speed on the router now, for the customer and any
+    devices sharing their plan. Commits, then delivers in the background.
+
+    Delivery drops the session for a moment, so the caller only asks when the
+    speed changed. It also writes the plan's full speed, so a device under a FUP
+    throttle or block is left alone. If a push fails, the fleet queue sync still
+    applies the plan and any throttle. Returns None when nothing applies.
+    """
+    from app.services import hotspot_provisioning
+    from app.services.customer_grace import has_access_time
+    from app.services.pppoe_provisioning import active_fup_restriction
+
+    if (
+        plan is None
+        or router is None
+        or plan.connection_type != ConnectionType.HOTSPOT
+        or getattr(router, "auth_method", None) == RouterAuthMethod.RADIUS
+    ):
+        return None
+
+    now = datetime.utcnow()
+
+    def _live(row: Customer) -> bool:
+        return bool(
+            row.mac_address
+            and row.status == CustomerStatus.ACTIVE
+            and row.expiry
+            and has_access_time(row, now)
+        )
+
+    if not _live(customer):
+        return None
+
+    targets: list[tuple[Customer, DevicePairing | None]] = [(customer, None)]
+    if not customer.subscription_owner_id:
+        rows = (
+            await db.execute(
+                select(DevicePairing, Customer)
+                .join(Customer, DevicePairing.customer_id == Customer.id)
+                .where(
+                    DevicePairing.subscription_owner_customer_id == customer.id,
+                    DevicePairing.is_subscription_share == True,  # noqa: E712
+                    DevicePairing.is_active == True,  # noqa: E712
+                )
+            )
+        ).all()
+        targets.extend((shared, pairing) for pairing, shared in rows if _live(shared))
+
+    deliveries = []
+    held = 0
+    for row, pairing in targets:
+        if await active_fup_restriction(db, row.id) is not None:
+            held += 1
+            continue
+        attempt_id = None
+        if pairing is not None:
+            attempt = await schedule_shared_device_delivery(
+                db, shared_customer=row, owner_customer=customer, pairing=pairing, router=router,
+            )
+            attempt_id = attempt.id
+        payload = build_hotspot_payload(
+            row, plan, router, comment=f"Plan edit: {(plan.name or '').strip()} | MAC: {row.mac_address}",
+        )
+        deliveries.append((row.id, payload, attempt_id))
+    await db.commit()
+
+    for customer_id, payload, attempt_id in deliveries:
+        asyncio.create_task(
+            hotspot_provisioning.provision_hotspot_customer(
+                customer_id, router.id, payload, "plan_edit", attempt_id,
+            )
+        )
+    logger.info(
+        "[PLAN-EDIT] Customer %s moved to plan %s: pushing %d device(s), %d held by FUP",
+        customer.id, plan.id, len(deliveries), held,
+    )
+    return {"pushed": len(deliveries), "held_by_fup": held}
 
 
 async def sync_shared_subscription_devices_after_owner_renewal(

@@ -1081,6 +1081,110 @@ async def test_reseller_editing_owner_expiry_moves_every_device(db, router_os):
     assert (await _shares(db, owner))[0].expires_at == new_expiry
 
 
+async def _edit_plan(db, reseller, owner, plan, fake):
+    from app.api import customer_routes
+
+    response = await customer_routes.edit_customer(
+        owner.id,
+        customer_routes.CustomerEditRequest(plan_id=plan.id),
+        db,
+        {"user_id": reseller.id, "role": reseller.role.value},
+    )
+    await fake.drain()
+    return response
+
+
+async def test_dashboard_plan_edit_pushes_the_new_speed_to_every_device(db, router_os):
+    """Found on router 563: the dashboard showed the new plan while the router
+    kept the old speed until the next fleet sync, 3.5 to 14 minutes later."""
+    reseller, router, _plan, owner = await _buy_group(db, router_os, devices=3)
+    await _enter_code(db, router, PHONE_2, "11110001", router_os)
+    await _enter_code(db, router, PHONE_3, "11110001", router_os)
+    faster = await make_plan(db, reseller, name="Faster", speed="20M/20M", max_shared_users=3)
+
+    response = await _edit_plan(db, reseller, owner, faster, router_os)
+
+    assert {mac: b["rate"] for mac, b in router_os.bindings.items()} == {
+        OWNER: "20M/20M", PHONE_2: "20M/20M", PHONE_3: "20M/20M",
+    }
+    assert response["plan_push"] == {"pushed": 3, "held_by_fup": 0}
+
+
+async def test_dashboard_plan_edit_with_the_same_speed_does_not_disturb_anyone(db, router_os):
+    """Re-delivering drops the session for a moment, so only a real change does it."""
+    reseller, router, plan, owner = await _buy_group(db, router_os, devices=2)
+    await _enter_code(db, router, PHONE_2, "11110001", router_os)
+    same_speed = await make_plan(db, reseller, name="Same", speed=plan.speed, max_shared_users=2)
+    pushes = dict(router_os.pushes)
+
+    response = await _edit_plan(db, reseller, owner, same_speed, router_os)
+
+    assert dict(router_os.pushes) == pushes
+    assert response["plan_push"] is None
+
+
+async def test_editing_something_else_does_not_push(db, router_os):
+    from app.api import customer_routes
+
+    reseller, _router, _plan, owner = await _buy_group(db, router_os, devices=2)
+    pushes = dict(router_os.pushes)
+
+    response = await customer_routes.edit_customer(
+        owner.id,
+        customer_routes.CustomerEditRequest(name="New name"),
+        db,
+        {"user_id": reseller.id, "role": reseller.role.value},
+    )
+    await router_os.drain()
+
+    assert dict(router_os.pushes) == pushes
+    assert response["plan_push"] is None
+
+
+async def test_dashboard_plan_edit_does_not_lift_a_throttle(db, router_os):
+    """Delivery writes the plan's full speed, so a throttled device is left to the
+    fleet sync, which applies the throttled speed."""
+    reseller, router, plan, owner = await _buy_group(db, router_os, devices=2, cap_mb=100)
+    await _enter_code(db, router, PHONE_2, "11110001", router_os)
+    period = await _meter(db, owner, 150)
+    assert await fup.evaluate_and_enforce(db, owner, period, plan=plan) == FupAction.THROTTLE
+    await db.commit()
+    faster = await make_plan(db, reseller, name="Faster", speed="20M/20M", max_shared_users=2)
+
+    response = await _edit_plan(db, reseller, owner, faster, router_os)
+
+    assert OWNER in router_os.throttled
+    assert router_os.bindings[OWNER]["rate"] != "20M/20M"
+    assert router_os.bindings[PHONE_2]["rate"] == "20M/20M"
+    assert response["plan_push"] == {"pushed": 1, "held_by_fup": 1}
+
+
+async def test_dashboard_plan_edit_keeps_the_old_cap_until_the_next_payment(db, router_os):
+    """Pinned as it is: moving to a bigger cap keeps the old cap. Dennis is deciding."""
+    reseller, _router, _plan, owner = await _buy_group(db, router_os, devices=2, cap_mb=100)
+    bigger = await make_plan(
+        db, reseller, name="Bigger", speed="20M/20M", max_shared_users=2, data_cap_mb=1000,
+        fup_action=FupAction.THROTTLE, fup_throttle_profile="1M/1M",
+    )
+
+    await _edit_plan(db, reseller, owner, bigger, router_os)
+
+    assert (await _open_period(db, owner)).cap_mb_snapshot == 100
+
+
+async def test_plan_edit_on_an_expired_customer_pushes_nothing(db, router_os):
+    reseller, _router, _plan, owner = await _buy_group(db, router_os, devices=2)
+    owner.expiry = datetime.utcnow() - timedelta(minutes=1)
+    await db.commit()
+    router_os.bindings.clear()
+    faster = await make_plan(db, reseller, name="Faster", speed="20M/20M", max_shared_users=2)
+
+    response = await _edit_plan(db, reseller, owner, faster, router_os)
+
+    assert router_os.macs() == set()
+    assert response["plan_push"] is None
+
+
 async def test_expired_owner_added_to_another_plan_lets_go_of_its_own_devices(db, router_os):
     """An expired owner reused as someone else's shared device used to stay the
     owner of its own devices: an owner -> shared -> shared chain that renewals
