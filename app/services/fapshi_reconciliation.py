@@ -125,6 +125,9 @@ def _target_baseline(customer):
 
 
 async def capture_purchase_snapshot(db, customer, *, amount):
+    from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+    drop_unpaid_page_plan(customer, amount)
     pending = customer.pending_update_data
     if isinstance(pending, str):
         pending = json.loads(pending)

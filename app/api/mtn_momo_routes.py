@@ -175,6 +175,9 @@ async def _record_successful_payment(
         return
 
     # Resolve the plan (respect pending plan-change data, same as ZenoPay handler)
+    from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+    drop_unpaid_page_plan(customer, txn.amount)
     pending_data = None
     if customer.pending_update_data:
         try:

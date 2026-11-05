@@ -86,6 +86,9 @@ def _pending_plan_id(customer) -> Optional[int]:
         return None
     if not isinstance(data, dict):
         return None
+    if data.get("source") == "pppoe_expired_page":
+        # Only counts for its own prompt, so paybill renews the customer's plan.
+        return None
     plan_id = data.get("plan_id")
     if isinstance(plan_id, str) and plan_id.isdigit():
         plan_id = int(plan_id)

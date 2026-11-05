@@ -258,6 +258,33 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
 - Invariant enforced by a `before_flush` hook in `app/db/models.py`: an ACTIVE customer is never
   paused. A payment while paused ends the pause and adds the paused time to the new expiry.
 
+## PPPoE Expired Redirect (payment page for expired PPPoE customers)
+
+- Per-router opt-in `routers.pppoe_expired_redirect` (admin: Edit Router switch,
+  `PUT /api/routers/{id}/pppoe-expired-redirect`, staff `routers.manage`). Code:
+  `app/services/pppoe_expired_redirect.py`, routes `app/api/pppoe_expired_routes.py`.
+- With it on, expiry (and the inactive safety net) keeps the PPP secret, moves it to the
+  `bw-pppoe-expired` profile (own /22 pool, address list `BW_PPPOE_EXPIRED`) and kicks the
+  session. DNS + portal/API hosts are allowed, tcp/80 is redirected to the router's web
+  proxy whose access list redirects to the portal's `expired.html`, everything else is
+  rejected (tcp-reset). Every router object is tagged `ISP_BILLING_PPPOE_EXPIRED*`; apply
+  is idempotent and runs again on each expiry batch, so a reset router self-repairs.
+- If the walled state can't be ensured, expiry falls back to removing the secret: an
+  expired customer never keeps access. Paused customers are always removed, never walled.
+- Any normal PPPoE provisioning (STK/C2B/Activate/resume) puts the plan profile back and
+  kicks: no special restore path. The recovery sweep treats a walled secret of a paying
+  customer as missing. Turning the switch off removes walled secrets (old behaviour) and
+  every walled-state object.
+- Walled sessions are real PPP sessions: they appear in the router's active PPPoE list.
+- Those sessions have queues and traffic, so the usage jobs reach `fup.evaluate_and_enforce`. It
+  takes no router action for an expired customer on a router with the switch on: a throttle or
+  restore points the secret at a real profile, which would give an unpaid customer internet.
+- The public page endpoints go through `app/services/pppoe_expired_guards.py`: lookup misses are
+  capped per caller and per router (so usernames can't be tested), prompts per customer and per
+  phone. A plan picked on the page goes in `pending_update_data` tagged `source` and `amount`;
+  payment sites call `drop_unpaid_page_plan` first, so it only counts for a payment of exactly
+  that amount. Any new payment-confirmation path that reads `pending_update_data` must do the same.
+
 ## Customer Audit Log
 
 - `GET /api/customers/{id}/audit-log` (`app/api/customer_audit_routes.py`) merges, at read

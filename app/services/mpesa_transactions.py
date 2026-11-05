@@ -539,6 +539,9 @@ async def _handle_successful_reconciliation(
             return
 
         # --- Handle pending plan change ---
+        from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+        drop_unpaid_page_plan(customer, mpesa_txn.amount)
         pending_data = None
         if customer.pending_update_data:
             try:
