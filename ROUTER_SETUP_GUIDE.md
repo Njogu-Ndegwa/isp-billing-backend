@@ -2,6 +2,8 @@
 
 ## For Bitwave ISP Billing System
 
+> **Scope:** Bitwave connects your router to the billing system remotely. We do not set up hotspots or networks on the ground.
+
 > **Tested on:** RouterOS 7.18.2
 > **Last updated:** March 2026
 
@@ -20,9 +22,17 @@ Before starting, ensure you have:
 
 ## STEP 0: DEVICE MODE (RouterOS v7 — CRITICAL)
 
-RouterOS v7 ships with `device-mode=home` which **blocks hotspot functionality**.
-You must enable hotspot in device-mode **before** running the hotspot wizard.
-This requires physical access to the router (button press).
+RouterOS 7.13 and newer have a device-mode that can **block what the router needs to reach the billing system**.
+The factory mode depends on the model, not on RouterOS v7 as a whole ([MikroTik docs](https://help.mikrotik.com/docs/spaces/ROS/pages/93749258/Device-mode)):
+
+| Factory mode | Devices | Blocks |
+|--------------|---------|--------|
+| `home` | Home routers | `fetch`, `scheduler` and `hotspot` |
+| `basic` | Other devices | `hotspot` |
+| `advanced` (called `enterprise` before 7.17) | CCR and 1100 series, and devices from before factory modes existed | None of these three |
+
+You must allow all three in device-mode **before** running the hotspot wizard.
+This requires physical access to the router (button press or power cycle).
 
 ### 0.1 Check Current Device Mode
 
@@ -30,15 +40,19 @@ This requires physical access to the router (button press).
 /system/device-mode/print
 ```
 
-If `hotspot: no`, it must be changed.
+If the mode is `home` or `basic`, or `fetch`, `scheduler` or `hotspot` shows `no`, it must be changed.
 
-### 0.2 Enable Hotspot in Device Mode
+### 0.2 Allow Fetch, Scheduler and Hotspot in Device Mode
 
 ```routeros
-/system/device-mode/update hotspot=yes
+/system/device-mode/update fetch=yes scheduler=yes hotspot=yes
 ```
 
-The router will prompt you to **press the physical reset button** within ~60 seconds.
+To switch to the `advanced` preset instead, use `mode=advanced` on RouterOS 7.17 and newer, or `mode=enterprise` on older versions.
+
+You then have **5 minutes** to confirm: **press the physical reset or mode button once**, or unplug the power and plug it back in. The router restarts once confirmed.
+
+A normal reboot cancels the change, and so does running out of time. If either happens, run the command again.
 
 > **WARNING:** Quickly tap and release the reset button. Do NOT hold it down — a long press will factory reset the router.
 
@@ -48,7 +62,7 @@ The router will prompt you to **press the physical reset button** within ~60 sec
 /system/device-mode/print
 ```
 
-Confirm `hotspot: yes` before proceeding.
+Confirm `fetch: yes`, `scheduler: yes` and `hotspot: yes` before proceeding.
 
 > **Why this matters:** Without this step, the hotspot setup wizard will appear to succeed
 > but the hotspot will show `I` (INVALID) with the comment "inactivated, not allowed by device-mode"
@@ -434,13 +448,13 @@ Run this block to get a full status snapshot:
 
 ### Hotspot shows "inactivated, not allowed by device-mode"
 
-**Cause:** RouterOS v7 `device-mode=home` blocks hotspot.
+**Cause:** Device-mode blocks hotspot. Both `home` and `basic` do.
 
 **Fix:**
 ```routeros
-/system/device-mode/update hotspot=yes
+/system/device-mode/update fetch=yes scheduler=yes hotspot=yes
 ```
-Press the physical reset button on the router within 60 seconds (quick tap, don't hold).
+Within 5 minutes, press the physical reset or mode button on the router (quick tap, don't hold) or unplug the power and plug it back in. A normal reboot cancels the change.
 
 ### Hotspot files not generated after setup wizard
 

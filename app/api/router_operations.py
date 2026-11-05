@@ -49,6 +49,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
 import uuid
 
@@ -6183,7 +6184,12 @@ async def get_hotspot_diagnostics_by_identity(
 # result; someone on site must finish the physical step.
 # ---------------------------------------------------------------------------
 
-ALLOWED_DEVICE_MODES = {"home", "enterprise", "basic"}
+ALLOWED_DEVICE_MODES = {"home", "advanced", "enterprise", "basic"}
+
+# RouterOS 7.17 renamed the `enterprise` preset to `advanced`. Callers may ask
+# for either name; the router only understands the one its version uses.
+_ADVANCED_MODE_NAMES = {"advanced", "enterprise"}
+_ADVANCED_MODE_SINCE = (7, 17)
 
 # Per-feature flags accepted by /system/device-mode/update on RouterOS 7.13+.
 # We keep an allowlist so a bad key doesn't get passed straight through to
@@ -6197,12 +6203,27 @@ ALLOWED_DEVICE_MODE_FLAGS = {
 
 
 class DeviceModeUpdateRequest(BaseModel):
-    # Use either `mode` (a preset like "enterprise") OR `flags` (per-feature
+    # Use either `mode` (a preset like "advanced") OR `flags` (per-feature
     # toggles, e.g. {"hotspot": "yes"}). Newer RouterOS builds only accept
     # the flags form — the response message tells you which one this device
     # expects.
     mode: Optional[str] = None
     flags: Optional[dict] = None
+
+
+def _device_mode_name_for_version(mode: Optional[str], version: Optional[str]) -> Optional[str]:
+    """The name this RouterOS version uses for `mode`.
+
+    Only `advanced`/`enterprise` differ by version. An unreadable version keeps
+    the caller's name, and the router's own reply reports any mismatch.
+    """
+    if mode not in _ADVANCED_MODE_NAMES:
+        return mode
+    match = re.match(r"\s*(\d+)\.(\d+)", version or "")
+    if not match:
+        return mode
+    parsed = (int(match.group(1)), int(match.group(2)))
+    return "advanced" if parsed >= _ADVANCED_MODE_SINCE else "enterprise"
 
 
 def _get_device_mode_sync(router_info: dict) -> dict:
@@ -6246,13 +6267,20 @@ def _update_device_mode_sync(
         before = (before_resp.get("data") or [{}])[0] if before_resp.get("success") else {}
         current_mode = before.get("mode", "")
 
+        sent_mode = mode
+        if mode in _ADVANCED_MODE_NAMES:
+            resource_resp = api.send_command("/system/resource/print")
+            resource = (resource_resp.get("data") or [{}])[0] if resource_resp.get("success") else {}
+            sent_mode = _device_mode_name_for_version(mode, resource.get("version"))
+
         # If the caller asked for a preset that's already active and didn't
         # also pass per-feature flags, there's nothing to do.
-        if mode and current_mode == mode and not flags:
+        if mode and current_mode == sent_mode and not flags:
             return {
                 "success": True,
                 "status": "already_in_mode",
-                "message": f"Router is already in device-mode '{mode}'. Nothing to do.",
+                "sent_mode": None,
+                "message": f"Router is already in device-mode '{sent_mode}'. Nothing to do.",
                 "device_mode_before": before,
                 "device_mode_after": before,
             }
@@ -6261,8 +6289,8 @@ def _update_device_mode_sync(
         # `flags` switches the router into the per-feature ("flagged") form
         # and toggles individual capabilities.
         args: dict = {}
-        if mode:
-            args["mode"] = mode
+        if sent_mode:
+            args["mode"] = sent_mode
         if flags:
             args["flagged"] = "yes"
             for key, value in flags.items():
@@ -6314,15 +6342,15 @@ def _update_device_mode_sync(
         elif "does not match any value of mode" in raw_router_message_lower:
             status = "mode_value_rejected"
             human_message = (
-                "This RouterOS build does not accept a preset for `mode` — it "
-                "expects per-feature flags. Retry with body "
-                "{\"flags\": {\"hotspot\": \"yes\"}} (add other features as "
-                "needed). That puts the router into `flagged` device-mode and "
-                "enables only what you list."
+                f"This RouterOS build did not accept mode '{sent_mode}'. Retry "
+                "with per-feature flags, body {\"flags\": {\"fetch\": \"yes\", "
+                "\"scheduler\": \"yes\", \"hotspot\": \"yes\"}} (add other "
+                "features as needed). That puts the router into `flagged` "
+                "device-mode and enables only what you list."
             )
         elif update_resp.get("success") and not raw_router_message:
             status = "applied"
-            human_message = f"Device-mode changed to '{mode}' without requiring confirmation."
+            human_message = f"Device-mode changed to '{sent_mode}' without requiring confirmation."
         else:
             status = "router_responded_unrecognised"
             human_message = (
@@ -6341,6 +6369,7 @@ def _update_device_mode_sync(
         return {
             "success": True,
             "status": status,
+            "sent_mode": sent_mode,
             "message": human_message,
             "router_response_message": raw_router_message or None,
             "router_response_raw": update_resp,
@@ -6408,6 +6437,10 @@ async def update_device_mode(
     at the site to press the reset button briefly or power-cycle the router
     within ~5 minutes to physically confirm the change. Poll the GET
     endpoint afterwards to see whether the mode flipped.
+
+    `advanced` and `enterprise` are the same preset: `sent_mode` in the
+    response is the name this router's RouterOS version was actually sent
+    (`advanced` on 7.17 and newer, `enterprise` before).
     """
     mode = (request.mode or "").strip().lower() or None
     flags = request.flags or None

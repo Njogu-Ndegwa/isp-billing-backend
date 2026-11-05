@@ -278,10 +278,10 @@
 :do {
     :set hsCount [:len [/ip hotspot find where name=hotspot1]]
 } on-error={
-    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode hotspot is enabled: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode allows it: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 }
 :if ($hsCount = 0) do={
-    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 } else={
     :log info "Provisioning: hotspot1 confirmed running"
 }
