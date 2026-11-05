@@ -977,7 +977,7 @@ async def test_voucher_after_expiry_keeps_the_newest_devices_it_has_room_for(db,
 
 
 async def _add_device(db, reseller, owner, mac, device_type, fake):
-    """A reseller adds a device from the dashboard, the way a TV gets on a group."""
+    """Add a device of this type through the dashboard route."""
     await customer_device_routes.add_customer_device(
         owner.id,
         customer_device_routes.AddDeviceRequest(mac_address=mac, device_type=device_type),

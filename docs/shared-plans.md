@@ -86,7 +86,8 @@ applies to every renewal, M-Pesa included. With room for all of them, nothing ch
 So with more paired devices than slots, the newest paired devices stay, and a phone goes even if
 it is the newest device of all. A voucher for 1 device has no slots, so a shared TV goes too.
 A released device keeps its row, loses its slot and isn't re-delivered. The type comes from the
-pairing, so a TV added as `other` gets no priority.
+pairing, so a TV added as `other` gets no priority. The dashboard's add-device panel sends no type,
+so every device added there is `other` until it can send one. The share page lets you pick.
 
 A voucher on the owner's MAC follows the same rules, with these exceptions:
 
