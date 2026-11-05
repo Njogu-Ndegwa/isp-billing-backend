@@ -11,7 +11,7 @@ import math
 from datetime import datetime, timedelta, date
 from typing import Any
 
-from sqlalchemy import select, func, text, and_, or_, case
+from sqlalchemy import select, func, text, and_, or_, not_, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -24,6 +24,7 @@ from app.db.models import (
     GrowthTarget,
 )
 from app.services.app_settings import get_setting, set_setting
+from app.services.subscription import FREE_SETUP_DAYS
 from app.services.markets import (
     PAY_CARD,
     PAYSTACK_PROCESSING_FEE_RATE,
@@ -204,6 +205,20 @@ def _aligned_previous_window(
     return prev_start, min(prev_start + elapsed, prev_end)
 
 
+def _not_just_free_setup(now: datetime):
+    """False for a reseller whose only cover is an admin Free setup window.
+
+    That window is help, not a sale or a trial starting, so pressing the button
+    must not move a paying, trial or conversion figure. A reseller who has paid
+    past the window has an end date after it and counts as normal.
+    """
+    return or_(
+        User.free_setup_until.is_(None),
+        User.free_setup_until <= now,
+        User.subscription_expires_at > User.free_setup_until,
+    )
+
+
 def _paid_before(moment: datetime):
     """EXISTS clause: this reseller completed a subscription payment before `moment`."""
     return (
@@ -247,6 +262,13 @@ async def _subscribers_at(
         or_(
             User.subscription_status.notin_(_LAPSED_STATUSES),
             User.subscription_expires_at < now,
+        ),
+        # Free setup days are never cover: only moments before the press count,
+        # and for those the old expiry is the evidence, as above.
+        or_(
+            User.free_setup_until.is_(None),
+            User.subscription_expires_at > User.free_setup_until,
+            User.free_setup_until > moment + timedelta(days=FREE_SETUP_DAYS),
         ),
     ]
     if paying_only:
@@ -405,6 +427,7 @@ async def compute_mrr(db: AsyncSession) -> dict[str, Any]:
             User.subscription_status.in_([
                 SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL,
             ]),
+            _not_just_free_setup(datetime.utcnow()),
         )
         .group_by(User.subscription_status)
     )).all()
@@ -919,6 +942,7 @@ async def compute_trial_conversion(db: AsyncSession) -> dict[str, Any]:
                     User.created_at < month_start,
                 ),
             ),
+            _not_just_free_setup(now),
         )
     )).scalar() or 0
 
@@ -967,6 +991,7 @@ async def compute_trial_conversion(db: AsyncSession) -> dict[str, Any]:
         select(func.count(User.id)).where(
             User.role == UserRole.RESELLER,
             User.subscription_status == SubscriptionStatus.TRIAL,
+            _not_just_free_setup(now),
         )
     )).scalar() or 0
 
@@ -983,13 +1008,20 @@ async def compute_trial_conversion(db: AsyncSession) -> dict[str, Any]:
         select(func.count(User.id)).where(
             User.role == UserRole.RESELLER,
             or_(
-                User.subscription_status == SubscriptionStatus.TRIAL,
                 and_(
-                    User.subscription_status.in_([
-                        SubscriptionStatus.ACTIVE,
-                        SubscriptionStatus.INACTIVE,
-                        SubscriptionStatus.SUSPENDED,
-                    ]),
+                    User.subscription_status == SubscriptionStatus.TRIAL,
+                    _not_just_free_setup(now),
+                ),
+                and_(
+                    or_(
+                        User.subscription_status.in_([
+                            SubscriptionStatus.ACTIVE,
+                            SubscriptionStatus.INACTIVE,
+                            SubscriptionStatus.SUSPENDED,
+                        ]),
+                        # Counted as the lapsed account it was before the press.
+                        not_(_not_just_free_setup(now)),
+                    ),
                     User.created_at < prev_end,
                 ),
             ),
@@ -1476,6 +1508,7 @@ async def _compute_target_current(db: AsyncSession, target_id: str) -> float:
                 User.subscription_status.in_([
                     SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL,
                 ]),
+                _not_just_free_setup(datetime.utcnow()),
             )
         )).scalar()
         return float(val or 0)
