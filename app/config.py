@@ -204,6 +204,11 @@ class Settings(BaseSettings):
     # default: it is router I/O across the fleet. The per-customer "pull router
     # logs" button works either way.
     CUSTOMER_LOG_COLLECTOR_ENABLED: bool = False
+    # When a new device enters a full shared plan's code, free one slot held by a
+    # randomized MAC unseen for this many days (minimum 7) and not on the Wi-Fi now.
+    # See app/services/shared_slot_release.py.
+    SHARED_SLOT_IDLE_RELEASE_ENABLED: bool = False
+    SHARED_SLOT_IDLE_RELEASE_DAYS: int = 7
     CUSTOMER_LOG_COLLECTOR_ROUTERS_PER_TICK: int = 4
     # A router is read at most this often by the collector.
     CUSTOMER_LOG_COLLECTOR_MIN_REVISIT_SECONDS: int = 900

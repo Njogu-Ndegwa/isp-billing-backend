@@ -47,6 +47,7 @@ schedules delivery.
 - `release_main_device`: detaches the owner's MAC, for a phone whose MAC rotated on a full
   plan. The next device to enter the code becomes the main device.
 - `unpair_device`: separately paid devices only.
+- Idle slot release (off by default): see open question 2.
 
 ## Data cap and FUP
 
@@ -117,4 +118,6 @@ router profile, so changing it needs a re-provision and devices reconnect once t
    to TV BUNDLE) was repaired back to plan 3000 on 5 Nov 2026. `GROUP_OVER_LIMIT` in the
    `shared-plan-consistency` detector finds any others.
 2. **Randomized MACs use up slots.** A rotated phone takes a new slot and the old one stays
-   until someone removes it. Options: leave it manual, or auto-free idle randomized slots.
+   until someone removes it. `SHARED_SLOT_IDLE_RELEASE_ENABLED` (off) frees one slot when a new
+   device enters a full plan's code. See `app/services/shared_slot_release.py`. Turning it on
+   applies to every reseller.
