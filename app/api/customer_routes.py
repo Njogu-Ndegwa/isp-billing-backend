@@ -737,7 +737,9 @@ async def edit_customer(
                 # has their secret (the customer page says "Re-save the
                 # customer to provision it again"), through the attempt path
                 # so an unreachable router is retried. Only a real login
-                # change reconnects the customer's devices.
+                # change reconnects the customer's devices. A real change on a
+                # customer FUP is holding down also has to settle that hold, or
+                # the write gives them full speed for the rest of the period.
                 from app.services.pppoe_resync import push_active_pppoe_customer
 
                 delivered = await push_active_pppoe_customer(
@@ -745,6 +747,7 @@ async def edit_customer(
                     action="pppoe_edit" if pppoe_changed else "pppoe_resave",
                     disconnect=pppoe_changed,
                     skip_if_fup_restricted=not pppoe_changed,
+                    settle_fup_hold=pppoe_changed,
                 )
                 delivered = {
                     "provision_result": delivered.get("result"),

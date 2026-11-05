@@ -211,11 +211,16 @@ async def push_active_pppoe_customer(
     action: str = "pppoe_resave",
     disconnect: bool = True,
     skip_if_fup_restricted: bool = False,
+    settle_fup_hold: bool = False,
 ) -> dict[str, Any]:
     """Write one ACTIVE customer's secret to their router, with retries.
 
     ``disconnect=False`` leaves a connected device alone (nothing about the
     login changed; this only makes sure the secret exists).
+
+    ``settle_fup_hold=True`` is for a login or plan change on a customer FUP is
+    holding down: after the write, the hold goes back on or is lifted, whichever
+    the period's cap calls for, and that step does the one reconnect.
 
     Returns ``{"result": ...}`` where result is ``ok``, ``retry_pending``
     (push failed, the retry worker will try again), ``failed`` (push failed
@@ -240,17 +245,19 @@ async def push_active_pppoe_customer(
         if customer is None or not _customer_can_have_pppoe_access(customer, now):
             await db.commit()
             return {"result": "not_eligible"}
-        if skip_if_fup_restricted and await active_fup_restriction(db, customer.id):
+        fup_hold = await active_fup_restriction(db, customer.id)
+        if skip_if_fup_restricted and fup_hold:
             # Re-provisioning would put the secret back on its normal profile
             # and silently lift this period's FUP throttle/block.
             await db.commit()
             return {"result": "fup_restricted"}
+        settle_hold = bool(settle_fup_hold and fup_hold)
         router_id = customer.router.id
         attempt, status = await arm_pppoe_delivery_attempt(
             db, customer_id=customer.id, router_id=router_id, interactive=True, now=now,
         )
         payload = build_pppoe_payload(customer, customer.router)
-        payload["disconnect"] = disconnect
+        payload["disconnect"] = disconnect and not settle_hold
         attempt_id = attempt.id if attempt is not None else None
         await db.commit()
 
@@ -266,6 +273,10 @@ async def push_active_pppoe_customer(
     )
     if result and result.get("success"):
         outcome = "ok"
+        if settle_hold:
+            from app.services.fup import settle_pppoe_hold_after_delivery
+
+            await settle_pppoe_hold_after_delivery(customer_id)
     else:
         outcome = "retry_pending" if attempt_id is not None else "failed"
     return {

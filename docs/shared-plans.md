@@ -124,6 +124,13 @@ No shared rows or pairings. One login, several sessions: profiles named `..._d<N
 `only-one=no` and an on-up script that drops sessions beyond N. The limit lives on the
 router profile, so changing it needs a re-provision and devices reconnect once to pick it up.
 
+A dashboard change to a PPPoE customer's plan, login or router writes the secret onto the plan's
+normal profile. If FUP is holding that customer down, the write doesn't reconnect them.
+`settle_pppoe_hold_after_delivery` then puts the throttle or block back, or lifts it if the cap now
+allows, and does the one reconnect. The test is the same as for any cap: a bigger cap above the usage
+or no cap lifts, anything else stays until the next period. The retry worker does the same if the
+first push failed. A re-save that changes none of these leaves the customer alone.
+
 ## Detectors
 
 - `paid-not-delivered` skill: `PAID_NOT_DELIVERED`, `PAIRED_DEVICE_WITHOUT_PLAN`.

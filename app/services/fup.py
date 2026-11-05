@@ -799,6 +799,90 @@ async def lift_restrictions_after_cap_raise(customer_ids: list[int]) -> None:
             logger.error(f"[FUP] Lift after cap raise failed for customer={customer_id}: {exc}")
 
 
+async def _pppoe_action_to_keep(
+    db: AsyncSession,
+    customer: Customer,
+    period: CustomerUsagePeriod,
+    plan: Optional[Plan],
+    now: datetime,
+) -> Optional[FupAction]:
+    """The throttle or block this period's cap still calls for, or None to lift it.
+
+    Same test as :func:`evaluate_and_enforce`: usage against the period's cap, so a
+    bigger cap still under the usage keeps it and a smaller cap waits for the next
+    period. None too when the plan's rule for going over is only to notify.
+    """
+    cap_bytes = _cap_bytes(period, plan)
+    if cap_bytes is None:
+        return None
+    used_bytes = await fup_usage_bytes(
+        db, customer, period, plan=plan, now=now, cap_bytes=cap_bytes
+    )
+    if used_bytes < cap_bytes:
+        return None
+    action = _effective_action(period, plan)
+    return action if action in (FupAction.THROTTLE, FupAction.BLOCK) else None
+
+
+async def settle_pppoe_hold_after_delivery(customer_id: int) -> None:
+    """Finish a delivery that just wrote a FUP-held customer's secret.
+
+    Delivery leaves the secret on the plan's normal profile, and a recorded trigger
+    is never applied again by anything else, so the customer would keep full speed
+    for the rest of the period. The delivery must not have kicked the session: each
+    branch here does that, so the customer reconnects once.
+
+    If the router drops now, a hold to keep re-arms the cap so the next evaluation
+    applies it, and a lift stays recorded so the next evaluation retries it.
+    """
+    from app.db.database import async_session
+
+    async with async_session() as db:
+        customer = (
+            await db.execute(
+                select(Customer)
+                .options(selectinload(Customer.plan))
+                .where(Customer.id == customer_id)
+            )
+        ).scalar_one_or_none()
+        period = await get_open_period(db, customer_id)
+        if (
+            customer is None
+            or period is None
+            or period.fup_triggered_at is None
+            or period.fup_reverted_at is not None
+            or period.fup_action_taken not in (FupAction.THROTTLE, FupAction.BLOCK)
+        ):
+            await db.commit()
+            return
+
+        now = datetime.utcnow()
+        plan = customer.plan
+        keep = await _pppoe_action_to_keep(db, customer, period, plan, now)
+        try:
+            if keep == FupAction.THROTTLE:
+                result = await apply_throttle(db, customer, plan)
+            elif keep == FupAction.BLOCK:
+                result = await apply_block(db, customer, plan)
+            else:
+                result = await restore_normal_profile(db, customer, plan)
+        except Exception as exc:  # the edit is saved; don't fail it over the router
+            result = {"error": str(exc)}
+
+        if keep is None:
+            if result.get("error"):
+                logger.warning(f"[FUP] Lift after delivery failed for customer={customer_id}: {result}")
+            else:
+                _mark_lifted(period, now)
+        elif result.get("error"):
+            logger.warning(f"[FUP] Re-applying {keep.value} failed for customer={customer_id}: {result}")
+            period.fup_triggered_at = None
+            period.fup_action_taken = None
+        else:
+            period.fup_action_taken = keep
+        await db.commit()
+
+
 async def revert(
     db: AsyncSession,
     customer: Customer,
