@@ -277,16 +277,20 @@ async def test_a_renewal_paid_after_the_takedown_is_a_full_refund_with_nothing_t
 
 @pytest.mark.asyncio
 async def test_earnings_and_reports_take_the_refund_off(client, db, monkeypatch, stk):
-    from app.services.platform_earnings import compute_platform_earnings
     from app.core.cache import cache
+    from app.services.platform_earnings import PLATFORM_EARNINGS_CACHE_PREFIX, compute_platform_earnings
 
     reseller, admin = await _reseller(db), await make_admin(db)
     ad_id = await _live(client, db, monkeypatch, stk, reseller)
     await _used(db, ad_id, 3.5)
     _auth_as(monkeypatch, admin)
     await client.post(f"/api/ads/{ad_id}/takedown", json={"note": "Misleading"})
-    await cache.clear_pattern("")
-    result = await compute_platform_earnings(db, "month")
+    await cache.clear_pattern(PLATFORM_EARNINGS_CACHE_PREFIX)
+    try:
+        result = await compute_platform_earnings(db, "month")
+    finally:
+        # The cache outlives the test; another test must not read these numbers.
+        await cache.clear_pattern(PLATFORM_EARNINGS_CACHE_PREFIX)
     streams = {s["key"]: s["total"] for s in result["earnings"]["streams"]}
     assert streams["ad_commission"] == 40 - 17
     assert result["not_counted"]["ad_refunds_due"] == 85
