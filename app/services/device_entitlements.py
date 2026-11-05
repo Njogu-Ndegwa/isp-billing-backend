@@ -400,29 +400,41 @@ def pick_blocker(
 
 
 def plan_in_use_detail(use: DeviceUse) -> dict:
-    """409 body the captive portal shows when every purchase is in use."""
+    """409 body the captive portal shows when every purchase is in use.
+
+    Whoever gets this holds a valid plan, so it never tells them to buy: SwapNet
+    (router 624, 5 Nov 2026) had a paid user refused 90 seconds before the old
+    MAC logged out, and one user paid while an earlier plan was still running.
+
+    Each wait stated here is the real one for that kind of device. "About 2
+    minutes" is the hotspot keepalive that drops a phone's old session
+    (DEFAULT_HOTSPOT_KEEPALIVE_TIMEOUT). A vendor MAC stays held for
+    FIXED_DEVICE_RECENT_WINDOW after it goes offline, so 2 minutes would be false
+    there, and a paired device never moves on its own.
+    """
     tail = mac_tail(use.mac)
     if use.reason == "paired_device":
         message = (
-            f"This plan is paired to a TV or other device (MAC ending {tail}). "
-            "Buy a plan for this device, or ask your provider to move it."
+            f"Your plan is already paid and paired to a TV or other device (MAC ending {tail}). "
+            "Ask your provider to move it to this device."
         )
     elif use.randomized:
         message = (
-            f"This plan is in use on another phone right now (MAC ending {tail}). "
-            "If that was this phone, wait a minute and try again. "
-            "Otherwise, buy a plan for this device."
+            f"Your plan is already paid and in use on another device (MAC ending {tail}). "
+            "Wait about 2 minutes and try again. "
+            "It can't move here while that device is online."
         )
     else:
         message = (
-            f"This plan is in use on another device (MAC ending {tail}). "
-            "Buy a plan for this device."
+            f"Your plan is already paid and stays on another device (MAC ending {tail}), "
+            "such as a TV or laptop. It can move here once that device has been off "
+            "for a full day, or your provider can move it sooner."
         )
     return {
         "error": PLAN_IN_USE_ERROR,
         "message": message,
         "device_mac_tail": tail,
-        "offer_purchase": True,
+        "offer_purchase": False,
     }
 
 
