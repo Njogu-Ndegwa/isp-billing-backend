@@ -106,6 +106,9 @@ top 20% and bottom 30%), videos ≤ 15 s, start with the offer, assume no sound.
   `POST /api/ads/click` `{ad_id, click_type: call|whatsapp|view_details, placement, …}`.
   Placements: `hero`, `wait_screen`, `success_page`, `local`. Counted once per ad, placement,
   phone and UTC day; always answer 200.
+- Neutral paths for the same three handlers, which is what the portal calls because ad blockers
+  block `/ads` URLs: `GET /api/public/spots`, `POST /api/public/spots/seen` (impression),
+  `POST /api/public/spots/tap` (click). The `/api/ads` paths stay for portal pages cached on phones.
 
 ## Selling ads through Bitwave (Dennis, 4 Nov 2026)
 
