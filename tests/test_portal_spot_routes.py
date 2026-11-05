@@ -49,8 +49,7 @@ async def _ad(db) -> Ad:
 
 
 def _handler(method, path):
-    import main
-    for route in main.app.routes:
+    for route in ads_routes.router.routes:
         if getattr(route, "path", None) == path and method in getattr(route, "methods", ()):
             return route.endpoint
     raise AssertionError(f"{method} {path} is not registered")
