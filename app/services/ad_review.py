@@ -13,21 +13,25 @@ runs the automatic checks first:
   * media present (a photo for a photo ad, a video for a video ad) - checked
     in ads_routes._check_media_complete.
 
-Then the review decision:
+Nobody reviews an ad before it runs (Dennis, 5 Nov 2026: "ensure ads dont need
+my review"). After the automatic checks:
 
   * "house" (the reseller's own promo) is free and goes live at once. To stop
     it being used to sell other businesses' ads for free, its seller name is
     locked to the reseller's network name and its phone numbers must be the
     reseller's own support numbers (``apply_house_lock``).
-  * "reseller" (an ad they sold) needs a Bitwave admin's approval until the
-    reseller has had TRUST_THRESHOLD sold ads approved by an admin and no
-    rejection or takedown; after that it is approved automatically.
-  * An ad Bitwave took down never goes straight back live: any edit to it
-    waits for an admin, whatever its slot.
+  * "reseller" (an ad they sold) is approved at once but has no paid period
+    until the shop pays, so no portal shows it before then. The paid weeks
+    start when the payment is confirmed (ad_sales.confirm_payment).
+  * Editing a live ad keeps it live: the automatic checks run again, but it
+    does not wait for anybody.
+  * An admin's takedown is the safety net. An ad Bitwave took down stays down
+    whatever its owner edits; only an admin can put it back.
 
-What counts as a rejection: an admin rejecting one of the reseller's sold
-ads, or taking down any of their ads (house or sold). Approvals are counted
-per ad, so approving the same ad twice counts once.
+Rows from before this rule can still say "pending" (nothing bulk-publishes
+them). Such an ad goes live when its owner changes it, when its shop pays, or
+when an admin approves it. Admins check new ads afterwards with
+GET /api/ads/manage?newly_live=true.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ import re
 from typing import Iterable, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AdReviewEvent, PortalSettings, User
@@ -50,8 +54,6 @@ DEFAULT_BLOCKED_WORDS = (
 # app_settings.value is VARCHAR(500).
 BLOCKED_WORDS_MAX_CHARS = 500
 
-TRUST_THRESHOLD = 3
-
 # Ad text a customer sees on the portal.
 TEXT_FIELDS = (
     "title", "description", "seller_name", "seller_location", "price",
@@ -62,7 +64,6 @@ ACTION_APPROVE = "approve"
 ACTION_REJECT = "reject"
 ACTION_AUTO_APPROVE = "auto_approve"
 ACTION_TAKEDOWN = "takedown"
-NEGATIVE_ACTIONS = (ACTION_REJECT, ACTION_TAKEDOWN)
 
 _GENERIC_PHONE_RE = re.compile(r"^\+?[0-9 ]{9,16}$")
 
@@ -235,44 +236,8 @@ async def apply_house_lock(db: AsyncSession, ad, user: User) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Review decision and history
+# Review status and history
 # ---------------------------------------------------------------------------
-
-async def review_counts(db: AsyncSession, reseller_id: int) -> tuple[int, int]:
-    """(sold ads approved by Bitwave, rejections + takedowns) for a reseller."""
-    approved = (await db.execute(
-        select(func.count(func.distinct(AdReviewEvent.ad_id))).where(
-            AdReviewEvent.owner_user_id == reseller_id,
-            AdReviewEvent.slot == "reseller",
-            AdReviewEvent.action == ACTION_APPROVE,
-        )
-    )).scalar() or 0
-    rejected = (await db.execute(
-        select(func.count(AdReviewEvent.id)).where(
-            AdReviewEvent.owner_user_id == reseller_id,
-            (
-                ((AdReviewEvent.slot == "reseller") & (AdReviewEvent.action == ACTION_REJECT))
-                | (AdReviewEvent.action == ACTION_TAKEDOWN)
-            ),
-        )
-    )).scalar() or 0
-    return int(approved), int(rejected)
-
-
-async def is_trusted_seller(db: AsyncSession, reseller_id: int) -> bool:
-    approved, rejected = await review_counts(db, reseller_id)
-    return approved >= TRUST_THRESHOLD and rejected == 0
-
-
-async def trust_summary(db: AsyncSession, reseller_id: int) -> dict:
-    approved, rejected = await review_counts(db, reseller_id)
-    return {
-        "approved_sold_ads": approved,
-        "rejections": rejected,
-        "threshold": TRUST_THRESHOLD,
-        "auto_approve": approved >= TRUST_THRESHOLD and rejected == 0,
-    }
-
 
 async def was_taken_down(db: AsyncSession, ad_id: int) -> bool:
     if ad_id is None:
@@ -286,14 +251,11 @@ async def was_taken_down(db: AsyncSession, ad_id: int) -> bool:
 
 
 async def decide_status(db: AsyncSession, ad, user: User) -> str:
-    """Review status for a reseller's new or changed ad."""
+    """Status for a reseller's new or changed ad: approved at once, unless
+    Bitwave took it down, which only an admin can undo."""
     if await was_taken_down(db, ad.id):
-        return "pending"
-    if ad.slot == "house":
-        return "approved"
-    if ad.slot == "reseller" and await is_trusted_seller(db, user.id):
-        return "approved"
-    return "pending"
+        return "rejected"
+    return "approved"
 
 
 def record_event(db: AsyncSession, ad, action: str, actor_id: Optional[int], note: Optional[str] = None) -> None:

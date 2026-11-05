@@ -55,6 +55,7 @@ from app.services.plan_cache import FREE_TRIAL_NOT_PURCHASABLE, plan_model_allow
 from app.services.reseller_payments import record_customer_payment
 from app.services.subscription_sharing import (
     active_shared_device_count,
+    apply_voucher_plan_if_plan_ended,
     max_devices_for_customer,
     schedule_shared_device_delivery,
     shared_device_limit_for_customer,
@@ -1804,6 +1805,8 @@ async def pair_device_with_voucher(
         if refusal:
             await db.commit()
             raise HTTPException(status_code=400, detail=refusal)
+        if existing_customer:
+            apply_voucher_plan_if_plan_ended(existing_customer, plan)
 
         customer = await _get_or_create_device_customer(
             db, normalized_mac, voucher.user_id, request.router_id,
