@@ -722,7 +722,16 @@ async def create_media_upload(
 # Public: the portal's legacy feed and its view/tap beacons
 # ========================================
 
+# The same three handlers under neutral paths. EasyList and friends block URLs
+# like /ads and /ads/click, so the portal calls these instead. The old paths stay
+# for portal pages still cached on phones. Keep words like ad, ads, banner,
+# sponsor, promo, click and impression out of these paths.
+PORTAL_LIST_PATH = "/api/public/spots"
+PORTAL_TAP_PATH = "/api/public/spots/tap"
+PORTAL_SEEN_PATH = "/api/public/spots/seen"
+
 @router.get("/api/ads")
+@router.get(PORTAL_LIST_PATH)
 async def get_ads(
     page: int = 1,
     per_page: int = 20,
@@ -753,6 +762,7 @@ async def _live_ad_ids(db: AsyncSession) -> set:
 
 
 @router.post("/api/ads/click")
+@router.post(PORTAL_TAP_PATH)
 async def record_ad_click(
     request: AdClickRequest,
     db: AsyncSession = Depends(get_db),
@@ -779,6 +789,7 @@ async def record_ad_click(
 
 
 @router.post("/api/ads/impression")
+@router.post(PORTAL_SEEN_PATH)
 async def record_ad_impression(
     request: AdImpressionRequest,
     db: AsyncSession = Depends(get_db),
