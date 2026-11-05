@@ -117,7 +117,7 @@ class ApCredential:
     ap_mac: str
     ap_ip: Optional[str]
     username: str
-    password: str
+    password: str = field(repr=False)   # decrypted: must never reach a log line
     vendor: str = "Tenda"
     model: Optional[str] = None
     login_method: Optional[str] = None
@@ -129,6 +129,7 @@ class LoginResult:
     ok: bool
     method: Optional[str] = None
     locked: bool = False
+    unreachable: bool = False
     error: Optional[str] = None
 
 
@@ -199,8 +200,6 @@ def read_hotspot_lan(api) -> HotspotLan:
         if pool_name and pool.get("name") == pool_name:
             lan.pool_ranges = pool.get("ranges", "") or ""
             break
-    if not lan.pool_ranges and pools:
-        lan.pool_ranges = pools[0].get("ranges", "") or ""
 
     for net in networks:
         if lan.gateway and str(net.get("gateway", "")).strip() == lan.gateway:
@@ -233,17 +232,91 @@ def _outside_hotspot_lan(ap_ip: str, lan: "HotspotLan") -> Optional[Dict[str, An
                        f"address in {lan.subnet} or set it to get one by DHCP."}
 
 
-def resolve_ap_ip(api, mac: str) -> Optional[str]:
-    """Current LAN address of an AP by MAC, from ARP then DHCP leases."""
+def _addresses_for_mac(api, mac: str) -> List[str]:
+    """Every address the router's tables currently tie to this MAC, ARP first."""
     want = str(mac or "").strip().upper().replace("-", ":")
+    found: List[str] = []
     if not want:
-        return None
+        return found
     for cmd in ("/ip/arp/print", "/ip/dhcp-server/lease/print", "/ip/hotspot/host/print"):
         for row in _rows(api.send_command(cmd)):
             row_mac = str(row.get("mac-address", "")).strip().upper().replace("-", ":")
-            if row_mac == want and row.get("address"):
-                return str(row.get("address")).strip()
-    return None
+            if row_mac != want or not row.get("address"):
+                continue
+            # A dead ARP entry or an unused lease does not prove where the AP is.
+            if str(row.get("status", "")).lower() in ("failed", "incomplete", "waiting", "offered"):
+                continue
+            address = str(row.get("address")).strip()
+            if address not in found:
+                found.append(address)
+    return found
+
+
+def resolve_ap_ip(api, mac: str, prefer: Optional[str] = None) -> Optional[str]:
+    """Where this MAC is right now, according to the router.
+
+    The address saved on the credential is only a hint: DHCP may have given it
+    to someone else since, and we are about to send that address the AP's
+    password. It is used only when the router still ties it to this MAC.
+    """
+    found = _addresses_for_mac(api, mac)
+    if not found and prefer:
+        # A static AP that has been quiet has no ARP entry; one ping refreshes it.
+        api.send_command("/ping", {"address": prefer, "count": "1"})
+        found = _addresses_for_mac(api, mac)
+    if prefer and prefer in found:
+        return prefer
+    return found[0] if found else None
+
+
+def _locate_ap(api, cred: "ApCredential"):
+    """Find the AP by MAC and apply the "safe to contact" rules, BEFORE any
+    request (and so before the password) is sent anywhere.
+
+    Returns ``(lan, None)`` with ``cred.ap_ip`` set, or ``(lan, refusal)``.
+    """
+    lan = read_hotspot_lan(api)
+    hint = cred.ap_ip
+    try:
+        if hint and (not lan.subnet or ipaddress.ip_address(hint)
+                     not in ipaddress.ip_network(lan.subnet, strict=False)):
+            hint = None   # never ping out through the WAN on a stale hint
+    except ValueError:
+        hint = None
+    ap_ip = resolve_ap_ip(api, cred.ap_mac, prefer=hint)
+    if not ap_ip:
+        return lan, {"error": "no_ip", "message": "The router does not know an IP address for this access point (no "
+                                                  "DHCP lease or ARP entry). It may be offline, or on a fixed address "
+                                                  "outside the hotspot network."}
+    cred.ap_ip = ap_ip
+    if lan.gateway and ap_ip == lan.gateway:
+        return lan, {"error": "on_gateway", "on_gateway": True,
+                     "message": f"The AP is on the router's gateway address ({lan.gateway}); it cannot be reached "
+                                f"through the router. On-site fix needed."}
+    # Unconditional: with no readable hotspot subnet we cannot prove the address
+    # is on the LAN, so nothing is sent.
+    return lan, _outside_hotspot_lan(ap_ip, lan)
+
+
+def _addresses_in_use(api) -> set:
+    """Addresses a new static AP must not take: anything the router knows about."""
+    used = set()
+    tables = (
+        ("/ip/arp/print", ("address",)),
+        ("/ip/dhcp-server/lease/print", ("address",)),
+        ("/ip/hotspot/host/print", ("address",)),
+        ("/ip/hotspot/ip-binding/print", ("address", "to-address")),
+        ("/ip/address/print", ("address",)),
+    )
+    for cmd, keys in tables:
+        for row in _rows(api.send_command(cmd)):
+            for key in keys:
+                text = str(row.get(key, "") or "").split("/")[0].strip()
+                try:
+                    used.add(ipaddress.ip_address(text))
+                except ValueError:
+                    continue
+    return used
 
 
 def _pool_addresses(pool_ranges: str):
@@ -269,8 +342,9 @@ def _pool_addresses(pool_ranges: str):
     return out
 
 
-def pick_static_ip(lan: HotspotLan) -> Optional[str]:
-    """A LAN address for the AP: in-subnet, not the gateway, outside the pool."""
+def pick_static_ip(lan: HotspotLan, used=None) -> Optional[str]:
+    """A LAN address for the AP: in-subnet, not the gateway, outside the pool,
+    and not already held by another device (``used``)."""
     if not lan.gateway:
         return None
     try:
@@ -279,9 +353,10 @@ def pick_static_ip(lan: HotspotLan) -> Optional[str]:
     except ValueError:
         return None
     pool = _pool_addresses(lan.pool_ranges)
+    used = used or set()
     # Prefer the low host addresses just above the gateway (admins expect .2/.3).
     for host in network.hosts():
-        if host == gateway or host in pool:
+        if host == gateway or host in pool or host in used:
             continue
         return str(host)
     return None
@@ -308,19 +383,31 @@ def _login(client: RouterFetchHttpClient, adapter: ApAdapter, cred: ApCredential
                            error=f"Locked after {cred.failed_login_count} failed logins; replace the password.")
     attempts = adapter.login_attempts(cred.username, cred.password, preferred=cred.login_method)
     last_error = None
+    answered = False
     for attempt in attempts:
         resp = client.login(attempt.post_data, adapter.login_path, attempt.cookie)
         if not resp.ok:
             last_error = resp.error or "login request failed"
             continue
+        answered = True
         _sleep(LOGIN_SETTLE_SECONDS)
         # Confirm the session by reading status; a wrong password answers with a
         # login page / error rather than a usable status body.
         status_resp, _status = _read_status_body(client, adapter)
         if status_resp is not None:
             return LoginResult(ok=True, method=attempt.method)
-        last_error = "credentials did not open a session"
-    return LoginResult(ok=False, error=last_error or "login failed")
+        last_error = "The AP answered, but the saved password did not open a session."
+    # No answer at all says nothing about the password, so it must not count
+    # towards the lockout.
+    return LoginResult(ok=False, unreachable=not answered, error=last_error or "login failed")
+
+
+def _login_refusal(login: LoginResult) -> Dict[str, Any]:
+    if login.unreachable:
+        return {"error": "ap_unreachable",
+                "message": f"The access point did not answer through the router: {login.error}"}
+    return {"error": "login_locked" if login.locked else "login_failed",
+            "locked": login.locked, "message": login.error, "login_ok": False}
 
 
 # ---------------------------------------------------------------------------
@@ -349,25 +436,13 @@ def read_status_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fac
     adapter = get_adapter(cred.model, cred.vendor)
 
     def run(api):
-        ap_ip = cred.ap_ip or resolve_ap_ip(api, cred.ap_mac)
-        if not ap_ip:
-            return {"error": "no_ip", "message": "This access point is not currently visible on the router; "
-                                                 "it may be offline."}
-        cred.ap_ip = ap_ip
-        lan = read_hotspot_lan(api)
-        if lan.gateway and ap_ip != lan.gateway:
-            refused = _outside_hotspot_lan(ap_ip, lan)
-            if refused:
-                return refused
-        if lan.gateway and ap_ip == lan.gateway:
-            return {"error": "on_gateway", "on_gateway": True,
-                    "message": f"The AP is on the router's gateway address ({lan.gateway}); it cannot be reached "
-                               f"through the router. On-site fix needed."}
+        _lan, refused = _locate_ap(api, cred)
+        if refused:
+            return refused
         client = _client_for(router_info, cred, api)
         login = _login(client, adapter, cred)
         if not login.ok:
-            return {"error": "login_locked" if login.locked else "login_failed",
-                    "locked": login.locked, "message": login.error, "login_ok": False}
+            return _login_refusal(login)
         _resp, status = _read_status_body(client, adapter)
         if status is None:
             return {"error": "ap_unreachable", "login_ok": True, "login_method": login.method,
@@ -389,24 +464,13 @@ def reboot_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_facto
     adapter = get_adapter(cred.model, cred.vendor)
 
     def run(api):
-        ap_ip = cred.ap_ip or resolve_ap_ip(api, cred.ap_mac)
-        if not ap_ip:
-            return {"error": "no_ip", "message": "This access point is not currently visible on the router; "
-                                                 "it may be offline."}
-        cred.ap_ip = ap_ip
-        lan = read_hotspot_lan(api)
-        if lan.gateway and ap_ip != lan.gateway:
-            refused = _outside_hotspot_lan(ap_ip, lan)
-            if refused:
-                return refused
-        if lan.gateway and ap_ip == lan.gateway:
-            return {"error": "on_gateway", "on_gateway": True,
-                    "message": f"The AP is on the router's gateway ({lan.gateway}); on-site fix needed."}
+        _lan, refused = _locate_ap(api, cred)
+        if refused:
+            return refused
         client = _client_for(router_info, cred, api)
         login = _login(client, adapter, cred)
         if not login.ok:
-            return {"error": "login_locked" if login.locked else "login_failed",
-                    "locked": login.locked, "message": login.error, "login_ok": False}
+            return _login_refusal(login)
         resp = client.request(adapter.reboot_request())
         if not resp.ok or not (resp.redirected or reply_ok(resp.body)):
             return {"error": "reboot_failed", "login_ok": True, "login_method": login.method,
@@ -423,23 +487,18 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
     adapter = get_adapter(cred.model, cred.vendor)
 
     def run(api):
-        ap_ip = cred.ap_ip or resolve_ap_ip(api, cred.ap_mac)
-        if not ap_ip:
-            return {"error": "no_ip", "message": "This access point is not currently visible on the router; "
-                                                 "it may be offline."}
-        cred.ap_ip = ap_ip
-        lan = read_hotspot_lan(api)
-        if not lan.gateway:
-            return {"error": "no_gateway",
-                    "message": "Could not read the router's hotspot gateway; cannot place the AP safely."}
-        if ap_ip == lan.gateway:
-            return {"error": "on_gateway", "on_gateway": True,
-                    "message": f"The AP is on the router's gateway ({lan.gateway}); it is unreachable through the "
-                               f"router. On-site fix needed."}
-        refused = _outside_hotspot_lan(ap_ip, lan)
+        lan, refused = _locate_ap(api, cred)
         if refused:
             return refused
-        target_ip = pick_static_ip(lan)
+        # With the AP's DHCP off, its Wi-Fi users depend on the router's DHCP, and
+        # the pool is what tells us which addresses are free to take.
+        if not lan.pool_ranges:
+            return {"error": "no_hotspot_dhcp",
+                    "message": "Could not read a DHCP pool on the router's hotspot network. Turning this AP's DHCP "
+                               "off could leave its users without addresses, so nothing was changed."}
+        used = _addresses_in_use(api)
+        used.discard(ipaddress.ip_address(cred.ap_ip))   # the AP keeping its own address is fine
+        target_ip = pick_static_ip(lan, used)
         if not target_ip:
             return {"error": "no_free_ip",
                     "message": "No free LAN address outside the hotspot DHCP pool to give the AP."}
@@ -451,14 +510,26 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
         client = _client_for(router_info, cred, api)
         login = _login(client, adapter, cred)
         if not login.ok:
-            return {"error": "login_locked" if login.locked else "login_failed",
-                    "locked": login.locked, "message": login.error, "login_ok": False}
+            return _login_refusal(login)
 
         # Pre-check: the AP is reachable right now, and tells us its model.
         _pre_resp, pre_status = _read_status_body(client, adapter)
         if pre_status is None:
             return {"error": "ap_unreachable", "login_ok": True, "login_method": login.method,
                     "message": "The access point did not answer the pre-check."}
+
+        # A client / repeater / WISP unit may depend on its radio link (it can be
+        # the very link we reach it over). Forcing AP mode would drop that link
+        # and strand the box until someone visits. Unknown mode: same answer,
+        # because we cannot rule it out.
+        if pre_status.mode in (ap_adapters.MODE_CLIENT, ap_adapters.MODE_REPEATER, ap_adapters.MODE_WISP):
+            return {"error": "ap_link_mode", "login_ok": True, "login_method": login.method,
+                    "message": f"This AP is in {pre_status.mode} mode and may depend on that wireless link. "
+                               f"Nothing was changed. Change it on site."}
+        if pre_status.mode == ap_adapters.MODE_UNKNOWN:
+            return {"error": "ap_mode_unknown", "login_ok": True, "login_method": login.method,
+                    "message": "Could not read this AP's working mode, so it is not safe to reconfigure it remotely. "
+                               "Nothing was changed."}
 
         # Pick the write adapter for the model the AP actually reported, so an
         # F3 is not reconfigured with OAP1200 payloads (and vice versa).
@@ -471,9 +542,15 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
             for req in requests:
                 resp = client.request(req)
                 good = resp.ok and (resp.redirected or reply_ok(resp.body))
-                steps.append({"step": label, "ok": bool(good)})
                 if not good:
-                    return False, resp.error or f"{label} was rejected by the AP"
+                    applied = [s["step"] for s in steps if s["ok"]]
+                    steps.append({"step": label, "ok": False})
+                    reason = resp.error or f"{label} was rejected by the AP"
+                    if applied:
+                        reason += (f". Already applied: {', '.join(applied)}, so the AP is partly changed; "
+                                   f"refresh status before retrying")
+                    return False, reason
+                steps.append({"step": label, "ok": True})
             return True, None
 
         # Mode and DHCP first (these keep the current IP, so the session holds).
@@ -504,7 +581,8 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
             return {"error": "verify_unreachable", "login_ok": True, "login_method": login.method,
                     "new_ip": target_ip, "steps": steps,
                     "message": f"Settings sent but the AP did not answer at its new address {target_ip}. "
-                               f"Give it a minute and refresh; it may still be moving."}
+                               f"Give it a minute and refresh; it may still be moving. If it stays gone, someone "
+                               f"on site has to reset it."}
         _vresp, status = _read_status_body(verify_client, adapter)
         if status is None:
             status = ApStatus(ip=target_ip)
@@ -513,8 +591,10 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
                 "action": ACTION_MAKE_SAFE, "new_ip": target_ip, "gateway": lan.gateway,
                 "dns": lan.dns or lan.gateway, "steps": steps,
                 "verified_safe": bool(safe), "status": status.public(), "_status_obj": status,
-                "message": f"AP set to pure AP mode, DHCP off, static IP {target_ip} "
-                           f"(gateway/DNS {lan.gateway})."}
+                "message": (f"AP set to pure AP mode, DHCP off, static IP {target_ip} "
+                            f"(gateway/DNS {lan.gateway}).") if safe else (
+                            f"AP answers at {target_ip}, but it does not report plain AP mode with DHCP off. "
+                            f"Check it before relying on it.")}
 
     return _with_api(router_info, api_factory, run)
 
@@ -535,6 +615,7 @@ def discover_aps_sync(router_info: Dict[str, Any], *, api_factory=None) -> Dict[
         arp = _rows(api.send_command("/ip/arp/print"))
         hosts = _rows(api.send_command("/ip/hotspot/host/print"))
         neighbors = _rows(api.send_command("/ip/neighbor/print"))
+        bridge_hosts = _rows(api.send_command("/interface/bridge/host/print"))
         lan = read_hotspot_lan(api)
 
         all_ips = [r.get("address") for r in (leases + arp + hosts)]
@@ -575,6 +656,11 @@ def discover_aps_sync(router_info: Dict[str, Any], *, api_factory=None) -> Dict[
             note(row.get("mac-address"), row.get("address"), row.get("host-name"), "hotspot_host")
         for row in neighbors:
             note(row.get("mac-address"), row.get("address"), row.get("identity"), "neighbor")
+        # A box on a fixed address that is outside the LAN has no lease or ARP
+        # entry; the bridge still sees its MAC, so it shows up instead of vanishing.
+        for row in bridge_hosts:
+            if str(row.get("local", "")).lower() != "true":
+                note(row.get("mac-address"), None, None, "bridge_host")
 
         devices = []
         for entry in found.values():

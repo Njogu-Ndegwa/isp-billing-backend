@@ -140,6 +140,8 @@ class FakeMikroTik:
         self.connected = False
         self.last_connect_error = None
         self.fetches = []
+        self.commands = []
+        self.fetch_progress_rows = False
         self.mutating_router_calls = []
 
     def factory(self, *_a, **_k):
@@ -156,10 +158,13 @@ class FakeMikroTik:
         return self.send_command(command)
 
     def send_command(self, command, arguments=None):
+        self.commands.append(command)
         if command == "/tool/fetch":
             return self._fetch(arguments or {})
         if command.endswith("/print"):
             return {"success": True, "data": copy.deepcopy(self.tables.get(command, []))}
+        if command == "/ping":
+            return {"success": True, "data": []}
         # Any non-print, non-fetch command would be a router mutation -> record it
         # so the tests can assert we never change the MikroTik's own config.
         self.mutating_router_calls.append((command, dict(arguments or {})))
@@ -185,7 +190,10 @@ class FakeMikroTik:
             return {"error": f"closing connection: <{status} found>"}
         if status >= 400:
             return {"error": f"closing connection: <{status}>"}
-        return {"success": True, "data": [{"data": body, "status": "finished"}]}
+        final = {"data": body, "status": "finished"}
+        if self.fetch_progress_rows:
+            return {"success": True, "data": [{"status": "connecting"}, {"status": "downloading"}, final]}
+        return {"success": True, "data": [final]}
 
 
 ROUTER_INFO = {"ip": ROUTER_IP, "username": "admin", "password": "x", "port": 8728}
@@ -371,12 +379,12 @@ def test_ap_on_gateway_is_on_site_fix():
 
 
 def test_make_safe_unreachable_precheck():
-    tenda = FakeTenda()
+    # The router still lists the AP at .50, but nothing answers there.
+    tenda = FakeTenda(ip="192.168.88.77")
     fake = FakeMikroTik(tenda)
-    # Make the AP answer login (redirect) but then be unreachable for status:
-    # simulate by pointing discovery at an IP the AP is not serving.
-    res = run(fake, ap_control.make_safe_ap_sync, _cred(ap_ip="192.168.88.99"))
-    assert res["error"] in ("login_failed", "ap_unreachable")
+    res = run(fake, ap_control.make_safe_ap_sync, _cred())
+    assert res["error"] == "ap_unreachable"
+    assert tenda.write_paths == []
 
 
 def test_discovery_lists_tenda_and_flags_router_mode_suspect():
@@ -653,14 +661,20 @@ async def test_other_reseller_gets_404(client, db, patch_router):
     router = await make_router(db, owner, ip_address=ROUTER_IP)
     await _saved_cred(db, router.id)
     other = await make_reseller(db)
-    patch_router(FakeTenda())
-    resp = await client.post(
-        f"/api/routers/{router.id}/access-points/{AP_MAC}/reboot",
-        headers=headers(_owner_token(other)), json={"confirm": True},
-    )
-    assert resp.status_code == 404
-    listing = await client.get(f"/api/routers/{router.id}/access-points", headers=headers(_owner_token(other)))
-    assert listing.status_code == 404
+    fake = patch_router(FakeTenda())
+    token = headers(_owner_token(other))
+    base = f"/api/routers/{router.id}/access-points"
+    for method, path, kw in [
+        ("post", f"{base}/{AP_MAC}/reboot", {"json": {"confirm": True}}),
+        ("post", f"{base}/{AP_MAC}/make-safe", {"json": {"confirm": True}}),
+        ("get", f"{base}/{AP_MAC}/status", {}),
+        ("get", base, {}),
+        ("put", f"{base}/{AP_MAC}/credential", {"json": {"password": "stolen"}}),
+        ("delete", f"{base}/{AP_MAC}/credential", {}),
+    ]:
+        resp = await getattr(client, method)(path, headers=token, **kw)
+        assert resp.status_code == 404, (method, path, resp.text)
+    assert fake.commands == []
 
 
 @pytest.mark.asyncio
@@ -687,7 +701,319 @@ def test_ap_outside_hotspot_subnet_is_refused_without_contacting_it():
     # A factory-fresh Tenda on 192.168.0.1: fetch would leave via the WAN.
     tenda = FakeTenda(ip="192.168.0.1")
     fake = FakeMikroTik(tenda)
+    fake.tables["/ip/arp/print"][0]["address"] = "192.168.0.1"
+    fake.tables["/ip/dhcp-server/lease/print"][0]["address"] = "192.168.0.1"
     for fn in (ap_control.read_status_sync, ap_control.reboot_ap_sync, ap_control.make_safe_ap_sync):
         res = run(fake, fn, _cred(ap_ip="192.168.0.1"))
         assert res["error"] == "not_on_hotspot_lan", (fn.__name__, res)
     assert fake.fetches == []          # never sent anything (or the password) anywhere
+
+
+# ---------------------------------------------------------------------------
+# Safety: where the password may go, and what may never happen to the router
+# ---------------------------------------------------------------------------
+
+READ_ONLY_OR_FETCH = ("/print", "/tool/fetch", "/ping")
+
+
+@pytest.mark.parametrize("tenda_kw", [
+    {},                                  # success
+    {"password": "different"},           # wrong password
+    {"ip": "192.168.88.77"},             # AP not answering
+    {"unreachable_after_move": True},    # AP lost after the move
+])
+def test_router_only_ever_gets_reads_and_fetches(tenda_kw):
+    # No NAT, scheduler, script or any other router change on any path, so there
+    # is nothing to clean up after a failure or a server restart mid-action.
+    for fn in (ap_control.read_status_sync, ap_control.reboot_ap_sync, ap_control.make_safe_ap_sync):
+        fake = FakeMikroTik(FakeTenda(**tenda_kw))
+        run(fake, fn, _cred())
+        assert fake.mutating_router_calls == []
+        assert all(c.endswith(READ_ONLY_OR_FETCH) for c in fake.commands), fake.commands
+
+
+def test_saved_address_now_held_by_someone_else_gets_no_password():
+    # DHCP gave the AP's old address to a phone. The MAC decides, not the saved IP.
+    tenda = FakeTenda()
+    fake = FakeMikroTik(tenda)
+    res = run(fake, ap_control.reboot_ap_sync, _cred(ap_ip="192.168.88.60"))
+    assert res["success"] and tenda.rebooted
+    assert all("192.168.88.60" not in f["url"] for f in fake.fetches)
+
+
+def test_mac_no_longer_on_router_gets_no_password():
+    fake = FakeMikroTik(FakeTenda())
+    fake.tables["/ip/arp/print"] = []
+    fake.tables["/ip/dhcp-server/lease/print"] = []
+    fake.tables["/ip/hotspot/host/print"] = []
+    res = run(fake, ap_control.reboot_ap_sync, _cred(ap_ip="192.168.88.50"))
+    assert res["error"] == "no_ip"
+    assert fake.fetches == []
+    assert "/ping" in fake.commands      # gave a quiet static AP one chance to show up
+
+
+def test_stale_saved_address_outside_the_lan_is_not_even_pinged():
+    fake = FakeMikroTik(FakeTenda())
+    fake.tables["/ip/arp/print"] = []
+    fake.tables["/ip/dhcp-server/lease/print"] = []
+    run(fake, ap_control.read_status_sync, _cred(ap_ip="8.8.8.8"))
+    assert "/ping" not in fake.commands and fake.fetches == []
+
+
+def test_saved_address_is_kept_while_the_router_ties_it_to_this_mac():
+    # Just after a move ARP lists both the old and the new address for the MAC.
+    tenda = FakeTenda(ip="192.168.88.2")
+    fake = FakeMikroTik(tenda)
+    fake.tables["/ip/arp/print"].append({"mac-address": AP_MAC, "address": "192.168.88.2"})
+    res = run(fake, ap_control.read_status_sync, _cred(ap_ip="192.168.88.2"))
+    assert res["success"], res
+
+
+def test_unreadable_hotspot_lan_means_no_request_is_sent():
+    # Without a known subnet a fetch could leave through the WAN with the password.
+    for fn in (ap_control.read_status_sync, ap_control.reboot_ap_sync, ap_control.make_safe_ap_sync):
+        fake = FakeMikroTik(FakeTenda())
+        fake.tables["/ip/hotspot/print"] = []
+        res = run(fake, fn, _cred())
+        assert res["error"] == "no_gateway", (fn.__name__, res)
+        assert fake.fetches == []
+
+
+def test_make_safe_never_takes_an_address_already_in_use():
+    tenda = FakeTenda(mode="router", dhcp_on=True)
+    fake = FakeMikroTik(tenda)
+    fake.tables["/ip/arp/print"].append({"mac-address": "AA:BB:CC:00:00:03", "address": "192.168.88.2"})
+    fake.tables["/ip/hotspot/ip-binding/print"] = [{"mac-address": "AA:BB:CC:00:00:04", "address": "192.168.88.3"}]
+    res = run(fake, ap_control.make_safe_ap_sync, _cred())
+    assert res["success"], res
+    assert res["new_ip"] == "192.168.88.4"
+
+
+def test_make_safe_on_a_second_ap_does_not_reuse_the_first_ones_address():
+    fake = FakeMikroTik(FakeTenda(mode="router", dhcp_on=True))
+    first = run(fake, ap_control.make_safe_ap_sync, _cred())
+    assert first["new_ip"] == "192.168.88.2"
+    fake.tables["/ip/arp/print"].append({"mac-address": AP_MAC, "address": "192.168.88.2"})
+    second_mac = "C8:3A:35:44:55:66"
+    fake.tenda = FakeTenda(ip="192.168.88.70", mode="router", dhcp_on=True)
+    fake.tables["/ip/arp/print"].append({"mac-address": second_mac, "address": "192.168.88.70"})
+    second = run(fake, ap_control.make_safe_ap_sync, _cred(ap_mac=second_mac))
+    assert second["new_ip"] == "192.168.88.3"
+
+
+@pytest.mark.parametrize("mode,error", [
+    ("repeater", "ap_link_mode"),
+    ("client", "ap_link_mode"),
+    ("wisp", "ap_link_mode"),
+    ("something-new", "ap_mode_unknown"),
+])
+def test_make_safe_refuses_a_box_that_may_depend_on_its_radio_link(mode, error):
+    tenda = FakeTenda(mode=mode)
+    fake = FakeMikroTik(tenda)
+    res = run(fake, ap_control.make_safe_ap_sync, _cred())
+    assert res["error"] == error
+    assert tenda.write_paths == [] and tenda.ip == "192.168.88.50"
+
+
+def test_make_safe_refuses_when_the_router_has_no_hotspot_dhcp():
+    # The AP's DHCP may be the only one its users have.
+    tenda = FakeTenda(mode="router", dhcp_on=True)
+    fake = FakeMikroTik(tenda)
+    fake.tables["/ip/dhcp-server/print"] = []
+    res = run(fake, ap_control.make_safe_ap_sync, _cred())
+    assert res["error"] == "no_hotspot_dhcp"
+    assert fake.fetches == []
+
+
+def test_make_safe_says_so_when_it_stops_half_way():
+    class HalfWay(FakeTenda):
+        def handle(self, host, method, path, data, cookie):
+            if path == "/goform/setLanDhcp":
+                return 404, "not found"
+            return super().handle(host, method, path, data, cookie)
+
+    tenda = HalfWay(mode="router", dhcp_on=True)
+    res = run(FakeMikroTik(tenda), ap_control.make_safe_ap_sync, _cred())
+    assert res["error"] == "apply_failed"
+    assert "work_mode_ap" in res["message"] and "partly changed" in res["message"]
+    assert tenda.ip == "192.168.88.50"      # the address never moved
+
+
+def test_make_safe_does_not_claim_success_when_the_ap_does_not_report_safe():
+    class StaysRouter(FakeTenda):
+        def _status_json(self):
+            return json.dumps({"deviceName": self.model, "workMode": "router" if self.moved else self.mode,
+                               "dhcpEnable": 1})
+
+    res = run(FakeMikroTik(StaysRouter(mode="router", dhcp_on=True)), ap_control.make_safe_ap_sync, _cred())
+    assert res["verified_safe"] is False
+    assert "does not report" in res["message"]
+
+
+def test_fetch_reads_the_final_row_when_routeros_streams_progress():
+    tenda = FakeTenda()
+    fake = FakeMikroTik(tenda)
+    fake.fetch_progress_rows = True
+    res = run(fake, ap_control.read_status_sync, _cred())
+    assert res["success"] and res["status"]["model"] == "OAP1200 V2"
+
+
+def test_decrypted_password_is_not_in_the_credential_repr():
+    assert AP_PASSWORD not in repr(_cred())
+
+
+def test_real_api_client_does_not_log_fetch_replies(caplog):
+    from app.services.mikrotik_api import MikroTikAPI
+
+    api = MikroTikAPI("10.0.0.1", "u", "p", 8728)
+    api.connected = True
+    api.send_sentence = lambda words: None
+    replies = iter([["!re", "=data=wifi-secret", "=status=finished"], ["!done"]])
+    api.read_sentence = lambda: next(replies)
+    with caplog.at_level("INFO"):
+        res = api.send_command("/tool/fetch", {"url": "http://192.168.88.50/x", "http-data": "password=abc"})
+    assert res["data"][0]["data"] == "wifi-secret"
+    assert "wifi-secret" not in caplog.text and "password=abc" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_password_never_reaches_logs_or_any_response(client, db, patch_router, caplog):
+    import base64
+    import hashlib
+
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    patch_router(FakeTenda())
+    token = headers(_owner_token(owner))
+    base = f"/api/routers/{router.id}/access-points"
+    secrets = [AP_PASSWORD, hashlib.md5(AP_PASSWORD.encode()).hexdigest(),
+               base64.b64encode(AP_PASSWORD.encode()).decode()]
+    with caplog.at_level("DEBUG"):
+        saved = await client.put(f"{base}/{AP_MAC}/credential", headers=token, json={"password": AP_PASSWORD})
+        status = await client.get(f"{base}/{AP_MAC}/status", headers=token)
+        listing = await client.get(base, headers=token)
+        reboot = await client.post(f"{base}/{AP_MAC}/reboot", headers=token, json={"confirm": True})
+    for resp in (saved, status, listing, reboot):
+        assert resp.status_code == 200, resp.text
+        for secret in secrets:
+            assert secret not in resp.text
+    row = (await db.execute(select(RouterApCredential))).scalar_one()
+    assert AP_PASSWORD not in row.password_encrypted
+    for secret in secrets:
+        assert secret not in caplog.text
+    activity = (await db.execute(select(StaffActivityLog))).scalars().all()
+    for entry in activity:
+        assert AP_PASSWORD not in (entry.summary or "")
+
+
+@pytest.mark.asyncio
+async def test_ap_that_does_not_answer_does_not_count_towards_lockout(client, db, patch_router):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    await _saved_cred(db, router.id)
+    patch_router(FakeTenda(ip="192.168.88.77"))
+    resp = await client.get(
+        f"/api/routers/{router.id}/access-points/{AP_MAC}/status",
+        headers=headers(_owner_token(owner)),
+    )
+    assert resp.status_code == 502
+    assert "did not answer" in resp.json()["detail"]
+    row = (await db.execute(select(RouterApCredential))).scalar_one()
+    await db.refresh(row)
+    assert row.failed_login_count == 0
+
+
+@pytest.mark.asyncio
+async def test_long_error_from_the_router_does_not_break_saving_the_outcome(client, db, patch_router, monkeypatch):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    await _saved_cred(db, router.id)
+    patch_router(FakeTenda())
+    monkeypatch.setattr(ap_control, "reboot_ap_sync",
+                        lambda info, cred: {"error": "reboot_failed", "message": "x" * 400})
+    resp = await client.post(
+        f"/api/routers/{router.id}/access-points/{AP_MAC}/reboot",
+        headers=headers(_owner_token(owner)), json={"confirm": True},
+    )
+    assert resp.status_code == 502
+    row = (await db.execute(select(RouterApCredential))).scalar_one()
+    await db.refresh(row)
+    assert len(row.last_error) == 255
+
+
+@pytest.mark.asyncio
+async def test_saved_ap_address_must_be_an_address(client, db, patch_router):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    resp = await client.put(
+        f"/api/routers/{router.id}/access-points/{AP_MAC}/credential",
+        headers=headers(_owner_token(owner)), json={"password": "pw", "ap_ip": "evil.example.com"},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_claim_is_held_while_a_timed_out_write_is_still_running(client, db, patch_router, monkeypatch):
+    import asyncio
+    import threading
+    from app.api import router_ap_routes
+
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    await _saved_cred(db, router.id)
+    patch_router(FakeTenda())
+    finish = threading.Event()
+
+    def slow_reboot(info, cred):
+        finish.wait(10)
+        return {"success": True, "login_ok": True}
+
+    monkeypatch.setattr(ap_control, "reboot_ap_sync", slow_reboot)
+    monkeypatch.setattr(router_ap_routes, "_AP_WRITE_TIMEOUT", 0.05)
+    token = headers(_owner_token(owner))
+    url = f"/api/routers/{router.id}/access-points/{AP_MAC}/reboot"
+    try:
+        timed_out = await client.post(url, headers=token, json={"confirm": True})
+        assert timed_out.status_code == 504
+        assert ap_control.ap_write_in_progress(router.id)
+        second = await client.post(url, headers=token, json={"confirm": True})
+        assert second.status_code == 409
+    finally:
+        finish.set()
+    for _ in range(100):
+        if not ap_control.ap_write_in_progress(router.id):
+            break
+        await asyncio.sleep(0.01)
+    assert not ap_control.ap_write_in_progress(router.id)
+
+
+def test_nothing_runs_against_a_router_at_startup_or_on_a_schedule():
+    # Only the HTTP routes reach the AP-control code: no job or startup step can.
+    import pathlib
+    import re
+
+    pattern = re.compile(r"ap_control.*import|import.*ap_control")
+    files = [pathlib.Path("main.py"), *pathlib.Path("app").rglob("*.py")]
+    importers = {str(f.as_posix()) for f in files
+                 if f.name != "ap_control.py" and pattern.search(f.read_text(encoding="utf-8"))}
+    assert importers == {"app/api/router_ap_routes.py"}
+
+
+def test_tenda_seen_only_on_the_bridge_is_listed_but_gets_no_password():
+    # Fixed address, no lease, no ARP entry: visible on a port and nothing more.
+    mac = "D8:32:14:03:B5:58"
+    fake = FakeMikroTik(FakeTenda())
+    fake.tables["/interface/bridge/host/print"] = [
+        {"mac-address": mac, "on-interface": "ether2", "local": "false"},
+        {"mac-address": "D8:32:14:00:00:01", "on-interface": "bridge", "local": "true"},
+        {"mac-address": "AA:BB:CC:00:00:09", "on-interface": "ether3", "local": "false"},
+    ]
+    listed = ap_control.discover_aps_sync(ROUTER_INFO, api_factory=fake.factory)
+    by_mac = {d["mac"]: d for d in listed["devices"]}
+    assert by_mac[mac]["vendor"] == "Tenda" and by_mac[mac]["ip"] is None
+    assert by_mac[mac]["sources"] == ["bridge_host"]
+    assert "D8:32:14:00:00:01" not in by_mac and "AA:BB:CC:00:00:09" not in by_mac
+
+    res = run(fake, ap_control.reboot_ap_sync, _cred(ap_mac=mac))
+    assert res["error"] == "no_ip" and "fixed address" in res["message"]
+    assert fake.fetches == []

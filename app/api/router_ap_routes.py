@@ -18,12 +18,13 @@ outcome is persisted in a fresh short session.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,9 +53,10 @@ _AP_READ_TIMEOUT = 45
 
 class SaveApCredentialRequest(BaseModel):
     password: str
-    username: str = "admin"
-    vendor: str = "Tenda"
-    model: Optional[str] = None
+    username: str = Field(default="admin", max_length=64)
+    vendor: str = Field(default="Tenda", max_length=30)
+    model: Optional[str] = Field(default=None, max_length=40)
+    # Only a hint: every action finds the AP by MAC on the router first.
     ap_ip: Optional[str] = None
 
 
@@ -150,19 +152,19 @@ async def _persist_outcome(router_id: int, ap_mac: str, action: str, result: Dic
             cred.last_status = status
             cred.last_status_at = datetime.utcnow()
             if status.get("ip"):
-                cred.last_ip = status.get("ip")
+                cred.last_ip = str(status.get("ip"))[:45]
             # Prefer the detected adapter key (e.g. "F3") over the human model
             # string so later actions pick the right adapter.
             detected = status.get("detected_model")
             if detected:
                 cred.model = detected
             elif status.get("model") and not cred.model:
-                cred.model = status.get("model")
+                cred.model = str(status.get("model"))[:40]
         if result.get("new_ip"):
             cred.last_ip = result["new_ip"]
         cred.last_action = action
         cred.last_action_at = datetime.utcnow()
-        cred.last_error = None if result.get("success") else (result.get("message") or result.get("error"))
+        cred.last_error = None if result.get("success") else str(result.get("message") or result.get("error"))[:255]
         if action == ap_control.ACTION_REBOOT and result.get("success"):
             cred.last_reboot_at = datetime.utcnow()
         await session.commit()
@@ -184,7 +186,8 @@ def _raise_for_result(result: Dict[str, Any], router_name: str) -> None:
         raise HTTPException(status_code=502, detail=result.get("message") or "The AP rejected the saved password.")
     if error in ("on_gateway",):
         raise HTTPException(status_code=409, detail=result.get("message"))
-    if error in ("no_ip", "no_gateway", "no_free_ip", "gateway_conflict", "not_on_hotspot_lan"):
+    if error in ("no_ip", "no_gateway", "no_free_ip", "gateway_conflict", "not_on_hotspot_lan",
+                 "no_hotspot_dhcp", "ap_link_mode", "ap_mode_unknown"):
         raise HTTPException(status_code=409, detail=result.get("message"))
     if error in ("ap_unreachable", "verify_unreachable"):
         raise HTTPException(status_code=502, detail=result.get("message") or "The access point did not answer.")
@@ -274,6 +277,11 @@ async def save_ap_credential(
     ap_mac = _normalise_mac(ap_mac)
     if len(ap_mac) != 17:
         raise HTTPException(status_code=400, detail="Invalid AP MAC address")
+    if body.ap_ip:
+        try:
+            ipaddress.ip_address(body.ap_ip)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid AP address")
     router_obj = await _load_router(db, router_id, token)
 
     cred = await _get_cred_row(db, router_id, ap_mac)
@@ -368,9 +376,20 @@ async def _run_write(request, db, router_id, ap_mac, token, action, sync_fn):
         _set_activity_summary(request, f"AP {action} on {cred.ap_mac} (router {router_id}) refused: another AP action running")
         raise HTTPException(status_code=409,
                             detail="Another access-point action is running on this router. Wait for it to finish.")
+
+    def worker(info, credential):
+        # Holds the claim for as long as the thread runs, even past the HTTP
+        # timeout, so a retry can't send a second write to the same AP meanwhile.
+        if not ap_control.begin_claim(claim):
+            return {"error": "cancelled", "message": "The request expired before it started."}
+        try:
+            return sync_fn(info, credential)
+        finally:
+            ap_control.release_claim(claim)
+
     try:
         result = await run_with_guard(
-            router_id, sync_fn, router_info, cred,
+            router_id, worker, router_info, cred,
             acquire_timeout_seconds=5, timeout_seconds=_AP_WRITE_TIMEOUT,
         )
     finally:

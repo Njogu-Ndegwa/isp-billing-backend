@@ -122,8 +122,10 @@ class RouterFetchHttpClient:
             return FetchResponse(ok=False, status=_status_from_error(message),
                                  body="", error=message)
 
+        # RouterOS may stream progress rows (connecting, downloading) before the
+        # one that carries the result, so the last row is the outcome.
         rows = result.get("data") or []
-        row = rows[0] if rows else {}
+        row = rows[-1] if rows else {}
         body = row.get("data", "") or ""
         status_text = str(row.get("status", "")).lower()
         ok = status_text in ("", "finished", "finished.") or "finish" in status_text
