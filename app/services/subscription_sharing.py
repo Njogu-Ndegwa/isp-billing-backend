@@ -16,6 +16,7 @@ from app.db.models import (
     ConnectionType,
     Customer,
     CustomerStatus,
+    CustomerUsagePeriod,
     DevicePairing,
     Plan,
     ProvisioningAttemptEntrypoint,
@@ -290,6 +291,52 @@ async def carry_owner_edit_to_shared_devices(
         pairing.plan_id = owner_customer.plan_id
         changed.append(shared.id)
     return changed
+
+
+async def raise_open_caps_after_plan_edit(
+    db: AsyncSession,
+    *,
+    customer: Customer,
+    plan: Plan,
+) -> list[int]:
+    """Carry a bigger or removed cap into the open usage periods of an edited plan.
+
+    Periods snapshot the cap when they open, so without this a customer moved to a
+    bigger cap stays throttled on the old one until they next pay. Covers the
+    customer and any devices sharing their plan, and only ever loosens: a smaller
+    cap still waits for the next period. A period with no snapshot already follows
+    the plan. Returns the customer ids changed. The caller owns the transaction.
+    """
+    customer_ids = [customer.id]
+    if not customer.subscription_owner_id:
+        customer_ids.extend(
+            (
+                await db.execute(
+                    select(DevicePairing.customer_id).where(
+                        DevicePairing.subscription_owner_customer_id == customer.id,
+                        DevicePairing.is_subscription_share == True,  # noqa: E712
+                        DevicePairing.is_active == True,  # noqa: E712
+                    )
+                )
+            ).scalars().all()
+        )
+    periods = (
+        await db.execute(
+            select(CustomerUsagePeriod).where(
+                CustomerUsagePeriod.customer_id.in_(customer_ids),
+                CustomerUsagePeriod.closed_at.is_(None),
+                CustomerUsagePeriod.cap_mb_snapshot > 0,
+            )
+        )
+    ).scalars().all()
+    new_cap = _cap_or_none(plan)
+    raised: list[int] = []
+    for period in periods:
+        if new_cap is None or period.cap_mb_snapshot < new_cap:
+            period.cap_mb_snapshot = new_cap
+            period.fup_action_snapshot = plan.fup_action
+            raised.append(period.customer_id)
+    return raised
 
 
 async def push_plan_edit_to_router(

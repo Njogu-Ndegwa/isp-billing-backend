@@ -1517,7 +1517,28 @@ async def test_editing_something_else_does_not_push(db, router_os):
     assert response["plan_push"] is None
 
 
-async def test_dashboard_plan_edit_does_not_lift_a_throttle(db, router_os):
+async def _capped_plan(db, reseller, cap_mb, *, name="Other cap", speed="20M/20M", devices=2):
+    return await make_plan(
+        db, reseller, name=name, speed=speed, max_shared_users=devices, data_cap_mb=cap_mb,
+        fup_action=FupAction.THROTTLE, fup_throttle_profile="1M/1M",
+    )
+
+
+async def _throttled_group(db, fake, *, cap_mb=100, used_mb=150):
+    """A two-device group over its cap, with both devices throttled."""
+    reseller, router, plan, owner = await _buy_group(db, fake, devices=2, cap_mb=cap_mb)
+    await _enter_code(db, router, PHONE_2, "11110001", fake)
+    members = await _members(db, owner)
+    await _meter(db, members[0], used_mb)
+    for member in members:
+        period = await _open_period(db, member)
+        assert await fup.evaluate_and_enforce(db, member, period, plan=plan) == FupAction.THROTTLE
+    await db.commit()
+    assert set(fake.throttled) == {OWNER, PHONE_2}
+    return reseller, plan, owner, members
+
+
+async def test_dashboard_plan_edit_with_the_same_cap_does_not_lift_a_throttle(db, router_os):
     """Delivery writes the plan's full speed, so a throttled device is left to the
     fleet sync, which applies the throttled speed."""
     reseller, router, plan, owner = await _buy_group(db, router_os, devices=2, cap_mb=100)
@@ -1525,7 +1546,7 @@ async def test_dashboard_plan_edit_does_not_lift_a_throttle(db, router_os):
     period = await _meter(db, owner, 150)
     assert await fup.evaluate_and_enforce(db, owner, period, plan=plan) == FupAction.THROTTLE
     await db.commit()
-    faster = await make_plan(db, reseller, name="Faster", speed="20M/20M", max_shared_users=2)
+    faster = await _capped_plan(db, reseller, 100, name="Faster")
 
     response = await _edit_plan(db, reseller, owner, faster, router_os)
 
@@ -1535,16 +1556,167 @@ async def test_dashboard_plan_edit_does_not_lift_a_throttle(db, router_os):
     assert response["plan_push"] == {"pushed": 1, "held_by_fup": 1}
 
 
-async def test_dashboard_plan_edit_keeps_the_old_cap_until_the_next_payment(db, router_os):
-    """Pinned as it is: moving to a bigger cap keeps the old cap. Dennis is deciding."""
+async def test_dashboard_plan_edit_to_a_smaller_cap_waits_for_the_next_payment(db, router_os):
     reseller, _router, _plan, owner = await _buy_group(db, router_os, devices=2, cap_mb=100)
-    bigger = await make_plan(
-        db, reseller, name="Bigger", speed="20M/20M", max_shared_users=2, data_cap_mb=1000,
-        fup_action=FupAction.THROTTLE, fup_throttle_profile="1M/1M",
-    )
+    smaller = await _capped_plan(db, reseller, 50, name="Smaller")
+
+    await _edit_plan(db, reseller, owner, smaller, router_os)
+
+    assert (await _open_period(db, owner)).cap_mb_snapshot == 100
+    await db.refresh(owner)
+    assert owner.plan_id == smaller.id
+
+
+async def test_dashboard_plan_edit_to_a_smaller_cap_leaves_a_throttle_alone(db, router_os):
+    reseller, _plan, owner, _devices = await _throttled_group(db, router_os)
+    smaller = await _capped_plan(db, reseller, 50, name="Smaller")
+
+    await _edit_plan(db, reseller, owner, smaller, router_os)
+
+    assert set(router_os.throttled) == {OWNER, PHONE_2}
+    assert (await _open_period(db, owner)).cap_mb_snapshot == 100
+
+
+async def test_dashboard_plan_edit_to_a_bigger_cap_applies_to_every_device_at_once(db, router_os):
+    reseller, router, _plan, owner = await _buy_group(db, router_os, devices=2, cap_mb=100)
+    await _enter_code(db, router, PHONE_2, "11110001", router_os)
+    bigger = await _capped_plan(db, reseller, 1000, name="Bigger")
 
     await _edit_plan(db, reseller, owner, bigger, router_os)
 
+    for member in await _members(db, owner):
+        assert (await _open_period(db, member)).cap_mb_snapshot == 1000
+
+
+async def test_dashboard_plan_edit_to_a_bigger_cap_lifts_the_throttle(db, router_os):
+    reseller, _plan, owner, members = await _throttled_group(db, router_os)
+    bigger = await _capped_plan(db, reseller, 1000, name="Bigger")
+
+    response = await _edit_plan(db, reseller, owner, bigger, router_os)
+
+    assert router_os.throttled == {}
+    for member in members:
+        period = await _open_period(db, member)
+        assert period.fup_triggered_at is None
+        assert period.fup_reverted_at is not None
+    # The push held both for FUP, so the lift alone touches them: nobody drops twice.
+    assert response["plan_push"] == {"pushed": 0, "held_by_fup": 2}
+
+
+async def test_lifted_device_is_throttled_again_over_the_bigger_cap(db, router_os):
+    reseller, _plan, owner, _devices = await _throttled_group(db, router_os)
+    bigger = await _capped_plan(db, reseller, 1000, name="Bigger")
+    await _edit_plan(db, reseller, owner, bigger, router_os)
+
+    period = await _meter(db, owner, 1200)
+
+    assert await fup.evaluate_and_enforce(db, owner, period, plan=bigger) == FupAction.THROTTLE
+    assert OWNER in router_os.throttled
+
+
+async def test_bigger_cap_with_the_same_speed_lifts_without_a_push(db, router_os):
+    reseller, plan, owner, _devices = await _throttled_group(db, router_os)
+    bigger = await _capped_plan(db, reseller, 1000, name="Bigger", speed=plan.speed)
+    pushes_before = sum(router_os.pushes.values())
+
+    response = await _edit_plan(db, reseller, owner, bigger, router_os)
+
+    assert response["plan_push"] is None
+    assert router_os.throttled == {}
+    assert sum(router_os.pushes.values()) == pushes_before
+
+
+async def test_bigger_cap_still_under_the_usage_keeps_the_throttle(db, router_os):
+    reseller, _plan, owner, members = await _throttled_group(db, router_os)
+    slightly_bigger = await _capped_plan(db, reseller, 120, name="Slightly bigger")
+
+    await _edit_plan(db, reseller, owner, slightly_bigger, router_os)
+
+    assert set(router_os.throttled) == {OWNER, PHONE_2}
+    for member in members:
+        period = await _open_period(db, member)
+        assert period.cap_mb_snapshot == 120
+        assert period.fup_triggered_at is not None
+
+
+async def test_pooled_usage_decides_the_lift_not_one_devices_share(db, router_os):
+    """80 + 70 MB: a 120 MB cap is still too small for the group, though neither
+    device reaches it alone."""
+    reseller, _plan, owner, members = await _throttled_group(db, router_os)
+    await _meter(db, members[0], 80)
+    await _meter(db, members[1], 70)
+    slightly_bigger = await _capped_plan(db, reseller, 120, name="Slightly bigger")
+
+    await _edit_plan(db, reseller, owner, slightly_bigger, router_os)
+
+    assert set(router_os.throttled) == {OWNER, PHONE_2}
+
+
+async def test_dashboard_plan_edit_to_no_cap_lifts_the_throttle(db, router_os):
+    reseller, _plan, owner, members = await _throttled_group(db, router_os)
+    uncapped = await make_plan(db, reseller, name="Uncapped", speed="20M/20M", max_shared_users=2)
+
+    await _edit_plan(db, reseller, owner, uncapped, router_os)
+
+    assert router_os.throttled == {}
+    for member in members:
+        period = await _open_period(db, member)
+        assert period.cap_mb_snapshot is None
+        assert period.fup_triggered_at is None
+
+
+@pytest.mark.parametrize(
+    "new_cap", [pytest.param(1000, id="bigger_cap"), pytest.param(None, id="no_cap")],
+)
+async def test_a_failed_lift_stays_recorded_so_it_is_retried(db, router_os, monkeypatch, new_cap):
+    reseller, _plan, owner, _devices = await _throttled_group(db, router_os)
+    bigger = await _capped_plan(db, reseller, new_cap, name="Bigger")
+    restore = fup._restore_hotspot_sync
+    monkeypatch.setattr(fup, "_restore_hotspot_sync", lambda *_a: {"error": "connect_failed"})
+
+    await _edit_plan(db, reseller, owner, bigger, router_os)
+
+    period = await _open_period(db, owner)
+    assert period.cap_mb_snapshot == new_cap
+    assert period.fup_triggered_at is not None
+    assert period.fup_reverted_at is None
+    assert OWNER in router_os.throttled
+
+    monkeypatch.setattr(fup, "_restore_hotspot_sync", restore)
+    await fup.evaluate_and_enforce(db, owner, period, plan=bigger)
+    assert OWNER not in router_os.throttled
+    assert period.fup_triggered_at is None
+
+
+async def test_bigger_cap_on_an_expired_customer_does_not_put_them_back_online(db, router_os):
+    """Restoring writes a bypass binding, which would reconnect them for free."""
+    reseller, _plan, owner, members = await _throttled_group(db, router_os)
+    past = datetime.utcnow() - timedelta(minutes=1)
+    for member in members:
+        member.expiry = past
+    await db.commit()
+    bigger = await _capped_plan(db, reseller, 1000, name="Bigger")
+
+    await _edit_plan(db, reseller, owner, bigger, router_os)
+
+    assert set(router_os.throttled) == {OWNER, PHONE_2}
+    assert (await _open_period(db, owner)).fup_triggered_at is not None
+
+
+async def test_editing_a_field_other_than_the_plan_does_not_touch_the_cap(db, router_os):
+    from app.api import customer_routes
+
+    reseller, _plan, owner, _devices = await _throttled_group(db, router_os)
+
+    await customer_routes.edit_customer(
+        owner.id,
+        customer_routes.CustomerEditRequest(name="New name"),
+        db,
+        {"user_id": reseller.id, "role": reseller.role.value},
+    )
+    await router_os.drain()
+
+    assert set(router_os.throttled) == {OWNER, PHONE_2}
     assert (await _open_period(db, owner)).cap_mb_snapshot == 100
 
 
