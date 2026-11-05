@@ -113,9 +113,8 @@ router profile, so changing it needs a re-provision and devices reconnect once t
 
 ## Open questions
 
-1. **Groups swapped before the refusal shipped.** Router 446, customer 50758: NKIENDEM 240GB
-   (limit 10) became TV BUNDLE (limit 1). The group runs at TV BUNDLE speed with 6 devices
-   attached, new devices are refused, and the next non-voucher payment releases the devices.
-   The data was left as it is.
+1. **Groups swapped before the refusal shipped.** Router 446, customer 50758 (NKIENDEM 240GB
+   to TV BUNDLE) was repaired back to plan 3000 on 5 Nov 2026. `GROUP_OVER_LIMIT` in the
+   `shared-plan-consistency` detector finds any others.
 2. **Randomized MACs use up slots.** A rotated phone takes a new slot and the old one stays
    until someone removes it. Options: leave it manual, or auto-free idle randomized slots.
