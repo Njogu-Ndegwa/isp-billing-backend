@@ -59,6 +59,7 @@ from app.services.subscription_sharing import (
     schedule_shared_device_delivery,
     shared_device_limit_for_customer,
     sharing_enabled_for_customer,
+    smaller_voucher_refusal,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,9 @@ SHARE_CODE_EXPIRED = "expired"
 # Multi-use code handed to the paying customer. It works on every device up to
 # the plan's device limit and stays valid for as long as the owner's plan does.
 SHARE_CODE_ACCESS = "access"
+
+
+SHARING_NOT_ALLOWED = "This plan does not allow subscription sharing"
 
 
 class DeviceLimitReached(HTTPException):
@@ -399,6 +403,7 @@ async def _load_active_share_owner_stats(
     *,
     owner: Customer,
     router_id: int,
+    require_sharing: bool = True,
 ) -> tuple[Plan, Router, int, int, int]:
     plan = owner.plan
     router_obj = owner.router
@@ -408,8 +413,8 @@ async def _load_active_share_owner_stats(
         raise HTTPException(status_code=400, detail="Subscription does not belong to this router")
     if not owner.expiry or owner.expiry <= datetime.utcnow() or owner.status != CustomerStatus.ACTIVE:
         raise HTTPException(status_code=404, detail="No active hotspot subscription found for this phone on this router")
-    if not sharing_enabled_for_customer(owner, plan):
-        raise HTTPException(status_code=403, detail="This plan does not allow subscription sharing")
+    if require_sharing and not sharing_enabled_for_customer(owner, plan):
+        raise HTTPException(status_code=403, detail=SHARING_NOT_ALLOWED)
 
     max_shared_users = max_devices_for_customer(owner, plan)
     max_companion_devices = shared_device_limit_for_customer(owner, plan)
@@ -431,6 +436,28 @@ def _mark_share_code_redeemed(
     share_code.redeemed_pairing_id = pairing.id
     share_code.redeemed_at = now
     share_code.updated_at = now
+
+
+async def device_is_attached(
+    db: AsyncSession,
+    *,
+    owner_id: int,
+    router_id: int,
+    normalized_mac: str,
+) -> bool:
+    """True when this MAC already holds a slot on the owner's plan."""
+    pairing_id = (
+        await db.execute(
+            select(DevicePairing.id).where(
+                DevicePairing.device_mac == normalized_mac,
+                DevicePairing.router_id == router_id,
+                DevicePairing.subscription_owner_customer_id == owner_id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+                DevicePairing.is_active == True,  # noqa: E712
+            )
+        )
+    ).scalar_one_or_none()
+    return pairing_id is not None
 
 
 def _existing_pairing_blocks_share(pairing: DevicePairing | None, owner: Customer) -> bool:
@@ -553,6 +580,24 @@ async def _get_or_create_shared_customer(
 
     customer_name = name or f"Shared Device {normalized_mac[-8:]}"
     if customer:
+        # An expired owner coming back as someone else's shared device must not
+        # stay the owner of its own devices: a chain of owners is never renewed
+        # (owner -> shared -> shared) and those rows drift apart.
+        children = (
+            await db.execute(
+                select(DevicePairing)
+                .options(selectinload(DevicePairing.customer))
+                .where(
+                    DevicePairing.subscription_owner_customer_id == customer.id,
+                    DevicePairing.is_subscription_share == True,  # noqa: E712
+                    DevicePairing.is_active == True,  # noqa: E712
+                )
+            )
+        ).scalars().all()
+        for child in children:
+            child.is_active = False
+            if child.customer is not None:
+                child.customer.subscription_owner_id = None
         customer.name = name or customer.name or customer_name
         customer.phone = phone
         customer.status = CustomerStatus.ACTIVE
@@ -593,7 +638,9 @@ async def _share_subscription_for_owner(
     share_code: SubscriptionShareCode | None = None,
 ) -> dict:
     plan, router_obj, max_shared_users, max_companion_devices, _active_shared_count = (
-        await _load_active_share_owner_stats(db, owner=owner, router_id=router_id)
+        await _load_active_share_owner_stats(
+            db, owner=owner, router_id=router_id, require_sharing=False,
+        )
     )
 
     # Serialize concurrent adds for the same subscription so two devices
@@ -634,8 +681,17 @@ async def _share_subscription_for_owner(
         owner.id,
         exclude_pairing_id=existing_pairing_id,
     )
-    if active_shared_count >= max_companion_devices:
-        raise DeviceLimitReached(max_shared_users)
+    # A device already on this plan holds its slot, so it comes back even when the
+    # limit has since dropped below the devices attached (a swapped or lowered
+    # plan). It also keeps what it was paired as, instead of the request's default.
+    if same_owner_active_pairing:
+        if device_type == DeviceType.OTHER:
+            device_type = existing_pairing.device_type
+    else:
+        if not sharing_enabled_for_customer(owner, plan):
+            raise HTTPException(status_code=403, detail=SHARING_NOT_ALLOWED)
+        if active_shared_count >= max_companion_devices:
+            raise DeviceLimitReached(max_shared_users)
 
     shared_phone = (device_owner_phone or owner.phone or "").strip()
     shared_customer = await _get_or_create_shared_customer(
@@ -1736,6 +1792,18 @@ async def pair_device_with_voucher(
         plan = voucher.plan
         if not plan:
             raise HTTPException(status_code=400, detail="Voucher plan is no longer available")
+
+        existing_customer = (
+            await db.execute(
+                select(Customer)
+                .options(selectinload(Customer.plan))
+                .where(Customer.mac_address == normalized_mac, Customer.user_id == voucher.user_id)
+            )
+        ).scalar_one_or_none()
+        refusal = await smaller_voucher_refusal(db, customer=existing_customer, new_plan=plan)
+        if refusal:
+            await db.commit()
+            raise HTTPException(status_code=400, detail=refusal)
 
         customer = await _get_or_create_device_customer(
             db, normalized_mac, voucher.user_id, request.router_id,

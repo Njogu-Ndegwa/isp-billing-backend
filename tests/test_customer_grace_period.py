@@ -6,7 +6,6 @@ import pytest
 from fastapi import HTTPException
 
 from app.api import customer_routes
-from app.api.radius_hotspot import _is_customer_active
 from app.db.models import Customer, CustomerStatus
 from app.services import customer_grace, mikrotik_background
 from app.services.hotspot_provisioning import build_hotspot_payload
@@ -150,7 +149,6 @@ async def test_router_deadline_and_liveness_use_effective_expiry(db):
     # The reaper EXP tag and LB_PAID timeout come from this deadline.
     assert payload["customer_expiry"] == customer.expiry + timedelta(days=1)
     assert _customer_is_live(customer, now)
-    assert _is_customer_active(customer)
 
 
 # --- reseller endpoint -----------------------------------------------------

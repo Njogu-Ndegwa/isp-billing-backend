@@ -64,7 +64,7 @@ from app.services.pppoe_sessions import resolve_extra_session_customer
 from app.services.static_ip import STATIC_KEY_PREFIX, normalize_static_ip
 from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
-from app.services.usage_tracking import fup_usage_bytes
+from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes
 from app.services.customer_grace import has_access_time
 
 logger = logging.getLogger(__name__)
@@ -161,6 +161,8 @@ class IngestResult:
     accepted: int = 0
     rejected: int = 0
     over_cap_customer_ids: list[int] = field(default_factory=list)
+    # Throttled or blocked, but no longer over the cap.
+    release_fup_customer_ids: list[int] = field(default_factory=list)
     # canonical hotspot MAC -> customer id, for customers live on this router.
     live_hotspot_customers: dict[str, int] = field(default_factory=dict)
     # "pppoe:<username>" -> customer id, for PPPoE customers live on this router.
@@ -307,13 +309,9 @@ async def _latest_period_is_closed(db, customer_id: int) -> bool:
 
 
 def _cap_bytes_for(period: Optional[CustomerUsagePeriod], plan: Optional[Plan]) -> int:
-    """Cap in bytes, preferring the period's snapshot so a mid-period plan change
-    cannot retroactively move the line (same rule the sampler applies)."""
-    cap_mb = None
-    if period is not None and period.cap_mb_snapshot is not None:
-        cap_mb = period.cap_mb_snapshot
-    elif plan is not None:
-        cap_mb = plan.data_cap_mb
+    """Cap in bytes: the period's snapshot for a plan window, the plan's current
+    cap for a daily one (same rule as FUP enforcement and the sampler)."""
+    cap_mb = fup_cap_mb(period, plan)
     return int(cap_mb) * 1024 * 1024 if cap_mb and int(cap_mb) > 0 else 0
 
 
@@ -617,6 +615,20 @@ async def ingest_usage_reports(
                 )
                 if used_bytes >= cap_bytes:
                     result.over_cap_customer_ids.append(customer.id)
+            elif (
+                period is not None
+                and period.fup_triggered_at is not None
+                and period.fup_reverted_at is None
+                and customer.id not in result.release_fup_customer_ids
+            ):
+                # Cap removed or raised above usage. Real-time routers are not
+                # watched by the cap sampler, so nothing else lifts the throttle
+                # before the next renewal.
+                still_over = cap_bytes > 0 and await fup_usage_bytes(
+                    db, customer, period, plan=plan, now=now, cap_bytes=cap_bytes
+                ) >= cap_bytes
+                if not still_over:
+                    result.release_fup_customer_ids.append(customer.id)
 
             if pending >= PUSH_COMMIT_CHUNK:
                 await db.commit()

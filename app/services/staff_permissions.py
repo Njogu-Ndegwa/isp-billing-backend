@@ -505,6 +505,17 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     (("PUT",), "/api/ads/{ad_id}", "portal.manage", "Edited portal ad {ad_id}"),
     (("DELETE",), "/api/ads/{ad_id}", "portal.manage", "Deleted portal ad {ad_id}"),
     (("POST",), "/api/ads/media/upload-url", "portal.manage", "Uploaded a photo or video for a portal ad"),
+    # Selling ads through Bitwave (the business pays Bitwave by M-Pesa): the
+    # same split, managers sell and prompt, dashboard viewers only read.
+    # Takedown, refunds and review rules are Bitwave-admin only (left out).
+    ((R,), "/api/ad-sales", ADS_VIEW, None),
+    ((R,), "/api/ad-sales/quote", ADS_VIEW, None),
+    ((R,), "/api/ad-sales/access", ADS_VIEW, None),
+    ((R,), "/api/ads/{ad_id}/sale", ADS_VIEW, None),
+    (("POST",), "/api/ad-sales", "portal.manage", "Sold a portal ad and sent the business an M-Pesa prompt"),
+    (("POST",), "/api/ads/{ad_id}/sale", "portal.manage", "Put sold portal ad {ad_id} up for payment"),
+    (("POST",), "/api/ads/{ad_id}/sale/prompt", "portal.manage", "Sent an M-Pesa prompt for sold portal ad {ad_id}"),
+    (("POST",), "/api/ads/{ad_id}/sale/renew", "portal.manage", "Sent a renewal prompt for sold portal ad {ad_id}"),
 ]
 
 # Endpoints that never need a user token: a staff token sent to them grants

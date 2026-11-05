@@ -44,7 +44,7 @@ from app.services.mikrotik_api import (
 )
 from app.services.subscription_sharing import max_devices_for_customer
 from app.services.customer_grace import has_access_time
-from app.services.usage_tracking import fup_usage_bytes, fup_window_start
+from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes, fup_window_start
 from app.services.hotspot_mac_login import (
     block_customer as mac_login_block_customer,
     mac_login_enabled,
@@ -62,9 +62,7 @@ DEFAULT_HOTSPOT_FUP_THROTTLE_RATE = DEFAULT_FUP_THROTTLE_RATE
 
 def _cap_bytes(period: CustomerUsagePeriod, plan: Optional[Plan]) -> Optional[int]:
     """Return the byte cap for this period, or ``None`` if uncapped."""
-    cap_mb = period.cap_mb_snapshot if period.cap_mb_snapshot is not None else (
-        plan.data_cap_mb if plan else None
-    )
+    cap_mb = fup_cap_mb(period, plan)
     if not cap_mb or cap_mb <= 0:
         return None
     return int(cap_mb) * 1024 * 1024
@@ -96,9 +94,15 @@ def _router_info(router: Router) -> dict:
     }
 
 
-def hotspot_throttle_rate_for_plan(plan: Optional[Plan]) -> str:
-    """Return the RouterOS rate string used when a hotspot plan is throttled."""
-    return parse_speed_to_mikrotik(
+def hotspot_throttle_speed_for_plan(plan: Optional[Plan]) -> str:
+    """The speed a throttled hotspot plan gets, in PLAN format (download/upload).
+
+    Queue sync and the MAC-login functions take plan-format speeds and convert
+    them themselves, so hand them this, not the converted rate: converting
+    twice swaps the direction back. Until 2026-11-04 that made a TV BUNDLE
+    throttle of "2M/0.5M" (2 Mbps down) reach the router as 2M up / 500k DOWN.
+    """
+    return (
         (plan.fup_throttle_profile if plan else None)
         or DEFAULT_HOTSPOT_FUP_THROTTLE_RATE
     )
@@ -483,11 +487,12 @@ def _restore_hotspot_sync(router_info: dict, mac_address: str, normal_rate_limit
         api.disconnect()
 
 
-def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, rate_limit: str = "") -> dict:
+def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, plan_speed: str = "") -> dict:
     """FUP on a MAC-login router: move the user between profiles, or disable it.
 
     The router owns the session queue there, so there is no plan_ queue to
-    re-limit; the user's profile carries the rate.
+    re-limit; the user's profile carries the rate. ``plan_speed`` is in plan
+    format (download/upload); ``set_customer_rate`` converts it.
     """
     api = MikroTikAPI(
         router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
@@ -498,7 +503,7 @@ def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, rate_li
     try:
         if action == "block":
             return mac_login_block_customer(api, normalized_mac)
-        return mac_login_set_customer_rate(api, normalized_mac, rate_limit)
+        return mac_login_set_customer_rate(api, normalized_mac, plan_speed)
     finally:
         api.disconnect()
 
@@ -519,12 +524,12 @@ async def apply_throttle(
         if not router:
             return {"error": "no_router"}
         info = _router_info(router)
-        rate_limit = hotspot_throttle_rate_for_plan(plan)
+        throttle_speed = hotspot_throttle_speed_for_plan(plan)
         await db.commit()
         if mac_login_enabled(info["id"]):
-            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, rate_limit)
+            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, throttle_speed)
         return await asyncio.to_thread(
-            _set_hotspot_queue_limit_sync, info, normalized_mac, rate_limit
+            _set_hotspot_queue_limit_sync, info, normalized_mac, parse_speed_to_mikrotik(throttle_speed)
         )
 
     if not customer.pppoe_username:
@@ -590,12 +595,12 @@ async def restore_normal_profile(
         if not router:
             return {"error": "no_router"}
         info = _router_info(router)
-        rate_limit = parse_speed_to_mikrotik(plan.speed if plan else "")
+        plan_speed = plan.speed if plan else ""
         await db.commit()
         if mac_login_enabled(info["id"]):
-            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, rate_limit)
+            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, plan_speed)
         return await asyncio.to_thread(
-            _restore_hotspot_sync, info, normalized_mac, rate_limit
+            _restore_hotspot_sync, info, normalized_mac, parse_speed_to_mikrotik(plan_speed)
         )
 
     if not customer.pppoe_username:
@@ -645,6 +650,18 @@ async def _reset_daily_trigger(
     return True
 
 
+def _mark_lifted(period: CustomerUsagePeriod, now: datetime) -> None:
+    """Record a lift inside a running period and re-arm the cap.
+
+    Every path that applies a cap requires an empty ``fup_triggered_at``, so one
+    left filled means this device can never be throttled again this period, even
+    if its group later goes over. ``fup_reverted_at`` keeps when it was lifted.
+    """
+    period.fup_reverted_at = now
+    period.fup_triggered_at = None
+    period.fup_action_taken = None
+
+
 async def evaluate_and_enforce(
     db: AsyncSession,
     customer: Customer,
@@ -670,7 +687,7 @@ async def evaluate_and_enforce(
         # Uncapped plan: if a stale trigger exists, clear it.
         if period.fup_triggered_at and not period.fup_reverted_at:
             await restore_normal_profile(db, customer, plan)
-            period.fup_reverted_at = now or datetime.utcnow()
+            _mark_lifted(period, now or datetime.utcnow())
         return None
 
     now = now or datetime.utcnow()
@@ -724,8 +741,13 @@ async def evaluate_and_enforce(
             f"used={used_bytes} < cap={cap_bytes}"
         )
         if period.fup_action_taken in (FupAction.THROTTLE, FupAction.BLOCK):
-            await restore_normal_profile(db, customer, plan)
-        period.fup_reverted_at = now
+            res = await restore_normal_profile(db, customer, plan)
+            if res.get("error"):
+                # Still throttled on the router, so stay recorded and retry on
+                # the next evaluation.
+                logger.warning(f"[FUP] Auto-revert failed for {identifier}: {res}")
+                return None
+        _mark_lifted(period, now)
         return None
 
     return None

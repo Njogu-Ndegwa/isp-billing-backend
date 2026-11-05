@@ -10,6 +10,7 @@ from app.db.models import (
     MpesaTransaction,
     PaymentMethod,
     PaymentStatus,
+    Plan,
     ResellerFinancials,
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
@@ -52,6 +53,16 @@ async def resolve_mpesa_collection_mode(
         return CollectionMode.DIRECT
     return CollectionMode.SYSTEM_COLLECTED
 
+def _plan_gives_less(new_plan: Plan | None, old_plan: Plan) -> bool:
+    """True when ``new_plan`` allows fewer devices or a lower data cap."""
+    if new_plan is None:
+        return True
+    if (new_plan.max_shared_users or 1) < (old_plan.max_shared_users or 1):
+        return True
+    new_cap, old_cap = new_plan.data_cap_mb, old_plan.data_cap_mb
+    return new_cap is not None and (old_cap is None or new_cap < old_cap)
+
+
 async def record_customer_payment(
     db: AsyncSession,
     customer_id: int,
@@ -65,6 +76,8 @@ async def record_customer_payment(
     duration_unit: str = None,
     collection_mode: CollectionMode = None,
     counts_as_revenue: bool = True,
+    commit: bool = True,
+    defer_router_io: bool = False,
 ) -> CustomerPayment:
     """Record a payment made by customer to reseller
 
@@ -73,18 +86,44 @@ async def record_customer_payment(
         duration_unit: Override plan duration unit (MINUTES, HOURS, DAYS)
         collection_mode: DIRECT if reseller collected, SYSTEM_COLLECTED if platform collected
     """
+    if not commit and not defer_router_io:
+        raise ValueError("Atomic payment callers must defer renewal router I/O")
     
     # Load customer with plan to calculate proper expiry
     stmt = select(Customer).options(joinedload(Customer.plan)).where(
         Customer.id == customer_id,
         Customer.user_id == reseller_id
     )
-    result = await db.execute(stmt)
+    result = await db.execute(stmt.with_for_update(of=Customer))
     customer = result.scalar_one_or_none()
     
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found or not owned by reseller")
-    
+
+    # Callers set ``customer.plan_id`` to the plan being bought just before
+    # calling this (voucher redemption, device-pairing vouchers). If the same
+    # session had already loaded ``customer.plan``, the joinedload above does
+    # not replace it, so it would still be the PREVIOUS plan: the new usage
+    # period then snapshots the old plan's data cap and the shared devices are
+    # synced against the old plan's device limit. That throttled the owner of a
+    # 200 GB plan at 2 GB for 17 days (router 446, Oct 2026).
+    #
+    # Only corrected when the new plan gives at least as much. Vouchers refuse a
+    # smaller plan on a live group before reaching this point
+    # (smaller_voucher_refusal); anything else keeps the old limits for the period.
+    if customer.plan_id is not None and (
+        customer.plan is None or customer.plan.id != customer.plan_id
+    ):
+        bought = await db.get(Plan, customer.plan_id)
+        if customer.plan is None or not _plan_gives_less(bought, customer.plan):
+            customer.plan = bought
+        else:
+            logger.warning(
+                "[PLAN-SWAP] Customer %s bought plan %s on live plan %s with fewer devices or "
+                "a lower cap; keeping the old limits for this period",
+                customer.id, customer.plan_id, customer.plan.id,
+            )
+
     payment = CustomerPayment(
         customer_id=customer_id,
         reseller_id=reseller_id,
@@ -143,8 +182,11 @@ async def record_customer_payment(
     try:
         from app.services.usage_tracking import on_renewal
 
-        await on_renewal(db, customer, plan=customer.plan, now=now)
+        await on_renewal(db, customer, plan=customer.plan, now=now,
+                         **({"defer_router_io": True} if defer_router_io else {}))
     except Exception as renew_err:
+        if not commit:
+            raise
         import logging
 
         logging.getLogger(__name__).error(
@@ -183,6 +225,7 @@ async def record_customer_payment(
                 db,
                 owner_customer=customer,
                 plan=customer.plan,
+                **({"defer_router_io": True} if defer_router_io else {}),
             )
             if synced_devices:
                 logger.info(
@@ -191,6 +234,8 @@ async def record_customer_payment(
                     customer.id,
                 )
         except Exception as share_err:
+            if not commit:
+                raise
             logger.error(
                 "[SUBSCRIPTION-SHARE] Failed to sync shared devices for customer %s: %s",
                 customer.id,
@@ -200,10 +245,16 @@ async def record_customer_payment(
     # NOTE: Removed duplicate Payment record creation
     # CustomerPayment is the primary payment record - no need for both
 
+    await db.flush()
     await update_reseller_financials(db, reseller_id)
 
-    await db.commit()
-    await db.refresh(payment)
+    if commit:
+        await db.commit()
+        await db.refresh(payment)
+    else:
+        # The caller owns the atomic ledger/entitlement/provider transaction.
+        # It must defer router I/O, including renewal's FUP restoration.
+        await db.flush()
 
     return payment
 

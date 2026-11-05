@@ -65,7 +65,8 @@ def _auth_as(monkeypatch, user):
 
 
 async def _reseller(db):
-    return await make_reseller(db, subscription_status=SubscriptionStatus.ACTIVE)
+    # A support number: a reseller's own promo must show it (house-ad lock).
+    return await make_reseller(db, subscription_status=SubscriptionStatus.ACTIVE, support_phone="0712345678")
 
 
 async def _ad(db, **overrides) -> Ad:
@@ -164,13 +165,15 @@ AD_BODY = {
 
 
 @pytest.mark.asyncio
-async def test_reseller_ad_starts_pending_and_is_theirs(client, db, monkeypatch):
+async def test_reseller_own_promo_goes_live_at_once_and_is_theirs(client, db, monkeypatch):
+    # Review rules, 4 Nov 2026: a house ad passes the automatic checks and is
+    # approved straight away (sold ads still wait: see test_ad_sales.py).
     reseller = await _reseller(db)
     _auth_as(monkeypatch, reseller)
     r = await client.post("/api/ads", json=AD_BODY)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["status"] == "pending"
+    assert body["status"] == "approved"
     assert body["owner_user_id"] == reseller.id
     assert body["slot"] == "house"
 
@@ -212,7 +215,7 @@ async def test_reseller_cannot_see_edit_or_delete_another_resellers_ad(client, d
 @pytest.mark.asyncio
 async def test_editing_content_sends_an_approved_ad_back_for_review(client, db, monkeypatch):
     reseller = await _reseller(db)
-    ad = await _ad(db, owner_user_id=reseller.id, slot="house", status="approved")
+    ad = await _ad(db, owner_user_id=reseller.id, slot="reseller", status="approved")
     _auth_as(monkeypatch, reseller)
 
     r = await client.put(f"/api/ads/{ad.id}", json={"is_active": False})
@@ -347,10 +350,73 @@ def test_upload_slot_checks_type_and_size(monkeypatch):
     with pytest.raises(ad_media.MediaRejected):
         ad_media.create_upload("video/mp4", 50 * 1024 * 1024, "r1")
     ticket = ad_media.create_upload("video/mp4", 1_000_000, "r12")
-    assert ticket.upload_url.startswith("https://acct.r2.cloudflarestorage.com/ads/ads/")
+    assert ticket.upload_url.startswith("https://acct.r2.cloudflarestorage.com/ads/c/")
     assert "X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost" in ticket.upload_url
-    assert ticket.public_url.startswith("https://isp.example.com/media/ads/")
+    assert ticket.key.startswith("c/")
+    assert ticket.public_url == f"https://isp.example.com/media/{ticket.key}"
     assert ticket.public_url.endswith(".mp4")
+
+
+# EasyList's generic "/media/ads/*$image" rule (Adblock Plus, uBlock Origin,
+# AdGuard, Brave) blocked every uploaded photo: the PUT worked, but the
+# thumbnail, preview and portal hero never loaded in a browser with a blocker.
+MEDIA_BASE = "https://isp.example.com/media"
+LEGACY = f"{MEDIA_BASE}/ads/2026/11/r7-0123456789abcdef.jpg"
+SAFE = f"{MEDIA_BASE}/c/2026/11/r7-0123456789abcdef.jpg"
+
+
+@pytest.fixture
+def media_storage(monkeypatch):
+    for key, value in {
+        "R2_ACCOUNT_ID": "acct", "R2_ACCESS_KEY_ID": "AK", "R2_SECRET_ACCESS_KEY": "SK",
+        "R2_BUCKET": "bitwave-ad-media", "AD_MEDIA_PUBLIC_BASE": MEDIA_BASE,
+    }.items():
+        monkeypatch.setattr(ad_media.settings, key, value)
+
+
+def test_uploaded_photos_get_a_link_ad_blockers_do_not_block(media_storage):
+    for content_type in ("image/jpeg", "image/png", "image/webp", "video/mp4"):
+        ticket = ad_media.create_upload(content_type, 1000, "r7")
+        assert ticket.public_url.startswith(f"{MEDIA_BASE}/c/")
+        for word in ("/ads/", "/ad/", "advert", "banner", "sponsor", "promo"):
+            assert word not in ticket.public_url
+            assert word not in ticket.upload_url.split("?")[0]
+
+
+def test_links_saved_before_the_change_are_rewritten(media_storage):
+    assert ad_media.public_media_url(LEGACY) == SAFE
+    assert ad_media.public_media_url(SAFE) == SAFE
+    assert ad_media.public_media_url(None) is None
+    other = "https://res.cloudinary.com/x/ads/onions.png"
+    assert ad_media.public_media_url(other) == other
+
+
+@pytest.mark.asyncio
+async def test_saved_ads_serve_the_blocker_safe_link(client, db, monkeypatch, media_storage):
+    reseller = await _reseller(db)
+    router = await make_router(db, reseller)
+    ad = await _ad(db, owner_user_id=reseller.id, slot="house", image_url=LEGACY,
+                   media_type="video", video_url=LEGACY.replace(".jpg", ".mp4"), poster_url=LEGACY)
+    portal = await ads_for_router(db, router.id, reseller.id, show_ads=True)
+    assert [(a["image_url"], a["poster_url"]) for a in portal] == [(SAFE, SAFE)]
+    assert portal[0]["video_url"] == SAFE.replace(".jpg", ".mp4")
+    _auth_as(monkeypatch, reseller)
+    managed = (await client.get(f"/api/ads/manage/{ad.id}")).json()
+    assert (managed["image_url"], managed["poster_url"]) == (SAFE, SAFE)
+
+
+@pytest.mark.asyncio
+async def test_saving_an_old_link_stores_the_new_one_without_a_review(client, db, monkeypatch, media_storage):
+    reseller = await _reseller(db)
+    ad = await _ad(db, owner_user_id=reseller.id, slot="house", status="approved", image_url=LEGACY)
+    _auth_as(monkeypatch, reseller)
+    r = await client.put(f"/api/ads/{ad.id}", json={"image_url": SAFE, "title": ad.title})
+    assert r.status_code == 200
+    assert r.json()["status"] == "approved"
+    assert r.json()["image_url"] == SAFE
+    r = await client.post("/api/ads", json={**AD_BODY, "image_url": LEGACY})
+    assert r.status_code == 200
+    assert r.json()["image_url"] == SAFE
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +435,7 @@ async def test_resaving_unchanged_values_keeps_the_ad_live(client, db, monkeypat
 @pytest.mark.asyncio
 async def test_moving_an_ad_into_the_hero_is_reviewed(client, db, monkeypatch):
     reseller = await _reseller(db)
-    ad = await _ad(db, owner_user_id=reseller.id, slot="house", status="approved", placement="local")
+    ad = await _ad(db, owner_user_id=reseller.id, slot="reseller", status="approved", placement="local")
     _auth_as(monkeypatch, reseller)
     r = await client.put(f"/api/ads/{ad.id}", json={"placement": "hero"})
     assert r.json()["status"] == "pending"

@@ -1041,7 +1041,7 @@ async def compute_activation_funnel(db: AsyncSession) -> dict[str, Any]:
         {"stage": "signed_up", "label": "Signed Up", "count": signed_up, "percent": 100 if signed_up else 0},
         {"stage": "added_router", "label": "Added Router", "count": added_router, "percent": _pct(added_router)},
         {"stage": "first_customer", "label": "First Customer", "count": first_customer, "percent": _pct(first_customer)},
-        {"stage": "first_revenue", "label": "First Revenue", "count": first_revenue, "percent": _pct(first_revenue)},
+        {"stage": "first_revenue", "label": "First Payment", "count": first_revenue, "percent": _pct(first_revenue)},
     ]
 
     signup_to_router = _safe_div(added_router * 100, signed_up)
@@ -1154,8 +1154,8 @@ async def compute_smart_alerts(db: AsyncSession) -> dict[str, Any]:
                 "id": f"milestone_rev_{milestone}",
                 "type": "milestone",
                 "severity": "success",
-                "title": "Revenue Milestone",
-                "message": f"Platform revenue crossed KES {milestone:,.0f} this month!",
+                "title": "Transaction Volume Milestone",
+                "message": f"Transaction volume through Bitwave crossed KES {milestone:,.0f} this month!",
                 "timestamp": now.isoformat(),
                 "dismissed": False,
             })
@@ -1524,8 +1524,8 @@ def _earnings_cache_key(period: str, own_ids: list[int]) -> str:
 # Ordered as they stack in the chart, ground up.
 EARNING_STREAMS: list[dict[str, str]] = [
     {"key": "saas_hotspot", "label": "Hotspot commission", "group": "system"},
-    {"key": "saas_pppoe", "label": "PPPoE user fees", "group": "system"},
-    {"key": "saas_other", "label": "Other system charges", "group": "system"},
+    {"key": "saas_pppoe", "label": "PPPoE / static per-user fees", "group": "system"},
+    {"key": "saas_other", "label": "Subscription payments without an invoice", "group": "system"},
     {"key": "reseller", "label": "My reseller collections", "group": "reseller"},
 ]
 _SYSTEM_KEYS = ("saas_hotspot", "saas_pppoe", "saas_other")
@@ -1635,7 +1635,11 @@ def _earnings_windows(period: str) -> tuple[date, date, date, date]:
         )
 
     elapsed = (cur_end - cur_start).days
-    return prev_start, prev_start + timedelta(days=elapsed), cur_start, cur_end
+    # Never past the current window's start: on the 31st, 31 elapsed days from
+    # the 1st of a 28/30-day month would run into this month and count its
+    # first days in both windows.
+    prev_end = min(prev_start + timedelta(days=elapsed), cur_start)
+    return prev_start, prev_end, cur_start, cur_end
 
 
 def _earnings_granularity(period: str) -> str:

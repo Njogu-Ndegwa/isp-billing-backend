@@ -84,3 +84,15 @@ jobs:
           name: pytest-report
           path: pytest-report.xml
           if-no-files-found: ignore
+
+  # The ad media Cloudflare Worker. Nothing here deploys it.
+  media-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run Worker tests
+        run: node --test workers/ad-media/

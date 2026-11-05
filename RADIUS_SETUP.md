@@ -1,5 +1,11 @@
 # RADIUS Server Setup Guide for ISP Billing
 
+> **The `/api/radius/*` HTTP routes were removed on 29 Oct 2026.** RADIUS is not used in
+> production (only the admin test router 4 was ever switched to it), and the routes had no
+> authentication. The FreeRADIUS container, its config under `radius/` and the `radius_*`
+> tables are still in place and can be dropped once router 4 is retired. The API steps
+> below are kept for history and no longer work.
+
 This guide explains how to set up and use RADIUS authentication for your MikroTik hotspot routers. RADIUS allows the router to handle session expiry and bandwidth limits natively, eliminating the need for polling-based expiry management.
 
 ## Table of Contents

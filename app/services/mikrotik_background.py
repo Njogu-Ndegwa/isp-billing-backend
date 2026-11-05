@@ -53,7 +53,7 @@ from app.services.router_availability import (
 from app.services.usage_tracking import record_usage
 from app.services.pppoe_sessions import resolve_extra_session_customer
 from app.services.usage_counters import clamp_to_line_rate, record_queue_usage_sample
-from app.services.fup import hotspot_throttle_rate_for_plan
+from app.services.fup import hotspot_throttle_speed_for_plan
 from app.services import customer_expiry_notifications
 from app.services.customer_grace import (
     access_floor,
@@ -2716,7 +2716,8 @@ def _queue_sync_customer_item(c, fup_period) -> dict:
         else None
     )
     if fup_action == FupAction.THROTTLE:
-        plan_speed = hotspot_throttle_rate_for_plan(c.plan)
+        # Plan format, like c.plan.speed above: every consumer converts it.
+        plan_speed = hotspot_throttle_speed_for_plan(c.plan)
     return {
         "id": c.id,
         "mac_address": c.mac_address,

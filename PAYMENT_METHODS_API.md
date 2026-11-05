@@ -814,6 +814,8 @@ New fields: `gateway` = `"zenopay"`, `order_id`. Frontend should poll `GET /api/
 
 ### 10. RADIUS Hotspot Register and Pay
 
+> **Removed 29 Oct 2026.** The `/api/radius/*` routes no longer exist (RADIUS is unused). Kept for history only.
+
 `POST /api/radius/hotspot/register-and-pay`
 
 **No auth needed** — called from captive portal for RADIUS routers.

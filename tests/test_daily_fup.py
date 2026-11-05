@@ -438,3 +438,89 @@ async def test_plan_api_defaults_to_plan_period_and_accepts_daily(db, monkeypatc
         daily["id"], plan_routes.PlanUpdateRequest(price=150), db=db, token="t"
     )
     assert untouched["fup_period"] == "plan"
+
+
+# ------------------------------ stale cap snapshot (prod 2026-10-30) ------------------------------
+#
+# "Daily FUP is not working ... users continue to use it even after it's hit."
+# A reseller turned 70 GB monthly plans into 5 GB daily plans. Customers already
+# inside their month kept the 70 GB cap snapshotted when their period opened,
+# and that snapshot was then used as their *daily* cap, so nobody was throttled.
+
+
+async def _use_with_snapshot(db, customer, plan, mb, at, snapshot_mb):
+    period = await _use(db, customer, plan, 0, at - timedelta(hours=1))
+    period.cap_mb_snapshot = snapshot_mb      # what the plan's cap was when the period opened
+    await db.commit()
+    return await _use(db, customer, plan, mb, at)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connection_type", CONNECTION_TYPES)
+async def test_daily_plan_enforces_current_cap_over_stale_snapshot(db, monkeypatch, connection_type):
+    customer, plan, _router, _ = await _setup(db, connection_type=connection_type, cap_mb=100)
+    calls = _patch_router(monkeypatch)
+    period = await _use_with_snapshot(
+        db, customer, plan, 150, NOW - timedelta(hours=1), snapshot_mb=70 * 1024
+    )
+    assert period.cap_mb_snapshot == 70 * 1024
+
+    action = await fup.evaluate_and_enforce(db, customer, period, plan=plan, now=NOW)
+
+    assert action == FupAction.THROTTLE
+    assert [c[0] for c in calls] == ["throttle"]
+
+
+@pytest.mark.asyncio
+async def test_plan_window_still_honours_its_snapshot(db, monkeypatch):
+    """Unchanged for "plan" plans: a lowered cap waits for the next period."""
+    customer, plan, _router, _ = await _setup(db, fup_period="plan", cap_mb=100)
+    calls = _patch_router(monkeypatch)
+    period = await _use_with_snapshot(
+        db, customer, plan, 150, NOW - timedelta(hours=1), snapshot_mb=70 * 1024
+    )
+
+    action = await fup.evaluate_and_enforce(db, customer, period, plan=plan, now=NOW)
+
+    assert action is None
+    assert calls == []
+
+
+def test_push_and_sampler_use_the_same_cap_as_enforcement():
+    from types import SimpleNamespace
+
+    from app.services.usage_cap_sampler import _poll_schedule_for
+    from app.services.usage_push import _cap_bytes_for
+    from app.services.usage_tracking import fup_cap_mb
+
+    daily = SimpleNamespace(data_cap_mb=100, fup_period="daily")
+    monthly = SimpleNamespace(data_cap_mb=100, fup_period="plan")
+    stale = SimpleNamespace(cap_mb_snapshot=70 * 1024, total_bytes=150 * MB)
+    unsnapped = SimpleNamespace(cap_mb_snapshot=None, total_bytes=150 * MB)
+
+    assert fup_cap_mb(stale, daily) == 100
+    assert fup_cap_mb(stale, monthly) == 70 * 1024
+    assert fup_cap_mb(unsnapped, monthly) == 100
+    assert fup_cap_mb(stale, SimpleNamespace(data_cap_mb=None, fup_period="daily")) is None
+
+    assert _cap_bytes_for(stale, daily) == 100 * MB
+    assert _cap_bytes_for(stale, monthly) == 70 * 1024 * MB
+    assert _poll_schedule_for(stale, daily, used_bytes=150 * MB) == (300, "over_cap")
+    assert _poll_schedule_for(stale, monthly, used_bytes=150 * MB) == (300, "normal")
+
+
+@pytest.mark.asyncio
+async def test_usage_api_shows_the_enforced_daily_cap(db, monkeypatch):
+    from app.api.usage_routes import _serialize_usage
+
+    monkeypatch.setattr("app.api.usage_routes._live_for", lambda customer: None)
+    customer, plan, _router, _ = await _setup(db, cap_mb=100)
+    period = await _use_with_snapshot(
+        db, customer, plan, 50, NOW - timedelta(hours=1), snapshot_mb=70 * 1024
+    )
+    customer.plan = plan
+
+    usage = _serialize_usage(customer, period)
+
+    assert usage.period.cap_mb == 100
+    assert usage.period.percent_used == 50.0
