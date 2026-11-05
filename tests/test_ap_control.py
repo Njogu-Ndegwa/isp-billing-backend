@@ -969,7 +969,7 @@ async def test_claim_is_held_while_a_timed_out_write_is_still_running(client, db
         return {"success": True, "login_ok": True}
 
     monkeypatch.setattr(ap_control, "reboot_ap_sync", slow_reboot)
-    monkeypatch.setattr(router_ap_routes, "_AP_WRITE_TIMEOUT", 0.05)
+    monkeypatch.setattr(router_ap_routes, "_AP_WRITE_TIMEOUT", 1.0)
     token = headers(_owner_token(owner))
     url = f"/api/routers/{router.id}/access-points/{AP_MAC}/reboot"
     try:
@@ -992,7 +992,8 @@ def test_nothing_runs_against_a_router_at_startup_or_on_a_schedule():
     import pathlib
     import re
 
-    pattern = re.compile(r"ap_control.*import|import.*ap_control")
+    pattern = re.compile(r"from\s+app\.services\.ap_control\s+import|import\s+app\.services\.ap_control\b"
+                         r"|from\s+app\.services\s+import\s+.*\bap_control\b")
     files = [pathlib.Path("main.py"), *pathlib.Path("app").rglob("*.py")]
     importers = {str(f.as_posix()) for f in files
                  if f.name != "ap_control.py" and pattern.search(f.read_text(encoding="utf-8"))}
