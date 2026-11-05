@@ -651,6 +651,14 @@ async def edit_customer(
                 db, owner_customer=customer
             )
 
+        cap_raised_customer_ids: list[int] = []
+        if customer.plan_id != old_plan_id and target_plan:
+            from app.services.subscription_sharing import raise_open_caps_after_plan_edit
+
+            cap_raised_customer_ids = await raise_open_caps_after_plan_edit(
+                db, customer=customer, plan=target_plan
+            )
+
         await db.commit()
         await db.refresh(customer, attribute_names=["plan", "router"])
 
@@ -755,6 +763,13 @@ async def edit_customer(
                 old_ip=old_static_ip, old_router=old_static_router,
                 pin_cleared=bool(old_static_mac) and not customer.static_mac,
             )
+
+        if cap_raised_customer_ids:
+            # After the router pushes above: a device they held for FUP gets the new
+            # plan's speed from this lift, so nobody drops twice.
+            from app.services.fup import lift_restrictions_after_cap_raise
+
+            asyncio.create_task(lift_restrictions_after_cap_raise(cap_raised_customer_ids))
 
         return {
             "success": True,

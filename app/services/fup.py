@@ -26,6 +26,7 @@ from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.db.models import (
     ConnectionType,
@@ -45,7 +46,7 @@ from app.services.mikrotik_api import (
 )
 from app.services.subscription_sharing import max_devices_for_customer
 from app.services.customer_grace import has_access_time
-from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes, fup_window_start
+from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes, fup_window_start, get_open_period
 from app.services.hotspot_mac_login import (
     block_customer as mac_login_block_customer,
     mac_login_enabled,
@@ -708,7 +709,12 @@ async def evaluate_and_enforce(
     if cap_bytes is None:
         # Uncapped plan: if a stale trigger exists, clear it.
         if period.fup_triggered_at and not period.fup_reverted_at:
-            await restore_normal_profile(db, customer, plan)
+            res = await restore_normal_profile(db, customer, plan)
+            if res.get("error"):
+                # Still restricted on the router, so stay recorded and retry on
+                # the next evaluation.
+                logger.warning(f"[FUP] Uncapped revert failed for customer={customer.id}: {res}")
+                return None
             _mark_lifted(period, now or datetime.utcnow())
         return None
 
@@ -773,6 +779,45 @@ async def evaluate_and_enforce(
         return None
 
     return None
+
+
+async def lift_restrictions_after_cap_raise(customer_ids: list[int]) -> None:
+    """Lift a throttle or block that a just-raised cap no longer justifies.
+
+    Runs in the background after a dashboard plan edit, so the reseller isn't kept
+    waiting on the router. Only re-checks a device that is restricted right now, so
+    it can never restrict one. A device still over the bigger cap stays as it is. If
+    this fails the trigger stays recorded and the next evaluation retries. A device
+    with no access time is skipped, because restoring would re-open its binding.
+    """
+    from app.db.database import async_session
+
+    for customer_id in customer_ids:
+        try:
+            async with async_session() as db:
+                customer = (
+                    await db.execute(
+                        select(Customer)
+                        .options(selectinload(Customer.plan))
+                        .where(Customer.id == customer_id)
+                    )
+                ).scalar_one_or_none()
+                period = await get_open_period(db, customer_id)
+                now = datetime.utcnow()
+                if (
+                    customer is None
+                    or period is None
+                    or period.fup_triggered_at is None
+                    or period.fup_reverted_at is not None
+                    or customer.status != CustomerStatus.ACTIVE
+                    or not has_access_time(customer, now)
+                ):
+                    await db.commit()
+                    continue
+                await evaluate_and_enforce(db, customer, period, plan=customer.plan, now=now)
+                await db.commit()
+        except Exception as exc:
+            logger.error(f"[FUP] Lift after cap raise failed for customer={customer_id}: {exc}")
 
 
 async def revert(
