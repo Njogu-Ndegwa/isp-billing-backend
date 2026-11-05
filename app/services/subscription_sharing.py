@@ -23,6 +23,7 @@ from app.db.models import (
     Router,
     RouterAuthMethod,
 )
+from app.services.device_entitlements import PINNED_DEVICE_TYPES
 from app.services.hotspot_provisioning import (
     build_hotspot_payload,
     get_or_create_provisioning_attempt,
@@ -152,6 +153,24 @@ async def smaller_voucher_refusal(
         "this device, so we did not use it. It is still valid. Use it after this plan ends, "
         "or on another device."
     )
+
+
+def apply_voucher_plan_if_plan_ended(
+    customer: Customer,
+    new_plan: Plan,
+    now: datetime | None = None,
+) -> None:
+    """Give a voucher's own limits to a customer with no paid time left.
+
+    ``record_customer_payment`` keeps the old plan's cap and device limit when the
+    new plan gives less and the old one is still loaded. That protects a live plan
+    but not an ended one, where nothing is being taken away (router 563: a voucher
+    for 1 device and 50 MB left a group on 3 devices and 200 MB). Vouchers only:
+    other payments keep that rule. ``customer.plan`` must already be loaded.
+    """
+    now = now or datetime.utcnow()
+    if customer.expiry is None or customer.expiry <= now:
+        customer.plan = new_plan
 
 
 async def schedule_shared_device_delivery(
@@ -359,6 +378,23 @@ async def push_plan_edit_to_router(
     return {"pushed": len(deliveries), "held_by_fup": held}
 
 
+def _split_for_device_limit(rows: list, limit: int) -> tuple[list, list]:
+    """Split shared-device rows, given newest first, into (kept, released).
+
+    With room for all of them nothing moves. Otherwise paired devices (TV, console,
+    IoT) stay before anything else, newest first within each group: they can't enter
+    a code to get back on, and a phone can. The type is read from the row, not
+    ``pinned_device_customers``, which skips expired pairings, and a slot's pairing
+    has expired whenever a plan has ended.
+    """
+    if len(rows) <= limit:
+        return rows, []
+    paired = [row for row in rows if row[0].device_type in PINNED_DEVICE_TYPES]
+    others = [row for row in rows if row[0].device_type not in PINNED_DEVICE_TYPES]
+    ranked = paired + others
+    return ranked[:limit], ranked[limit:]
+
+
 async def sync_shared_subscription_devices_after_owner_renewal(
     db: AsyncSession,
     *,
@@ -368,9 +404,10 @@ async def sync_shared_subscription_devices_after_owner_renewal(
 ) -> list[dict]:
     """Extend active companion devices to the paying owner's new expiry.
 
-    Only as many devices as the (possibly new) plan allows come back, newest
-    first; the rest are released so a downgrade from a 5-device plan to a
-    2-device plan doesn't silently keep 4 extra devices online.
+    Only as many devices as the (possibly new) plan allows come back; the rest
+    are released so a downgrade from a 5-device plan to a 2-device plan doesn't
+    silently keep 4 extra devices online. See ``_split_for_device_limit`` for
+    which ones stay.
 
     Direct-API routers get a scheduled provisioning attempt. The scheduler or
     caller can deliver it after the current DB transaction is committed.
@@ -393,8 +430,9 @@ async def sync_shared_subscription_devices_after_owner_renewal(
     ).all()
 
     limit = shared_device_limit_for_customer(owner_customer, plan)
+    kept, released = _split_for_device_limit(rows, limit)
     now = datetime.utcnow()
-    for pairing, shared_customer, _router in rows[limit:]:
+    for pairing, shared_customer, _router in released:
         pairing.is_active = False
         pairing.expires_at = now
         shared_customer.subscription_owner_id = None
@@ -407,7 +445,7 @@ async def sync_shared_subscription_devices_after_owner_renewal(
         )
 
     synced: list[dict] = []
-    for pairing, shared_customer, router in rows[:limit]:
+    for pairing, shared_customer, router in kept:
         if not shared_customer.mac_address:
             continue
 

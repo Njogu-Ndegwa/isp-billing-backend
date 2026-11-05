@@ -294,7 +294,10 @@ async def redeem_voucher(
     )
     customer = cust_result.scalar_one_or_none()
 
-    from app.services.subscription_sharing import smaller_voucher_refusal
+    from app.services.subscription_sharing import (
+        apply_voucher_plan_if_plan_ended,
+        smaller_voucher_refusal,
+    )
 
     refusal = await smaller_voucher_refusal(db, customer=customer, new_plan=plan)
     if refusal:
@@ -302,6 +305,7 @@ async def redeem_voucher(
         return {"success": False, "error": refusal}
 
     if customer:
+        apply_voucher_plan_if_plan_ended(customer, plan)
         customer.plan_id = plan.id
         customer.router_id = router_id
         customer.user_id = voucher.user_id

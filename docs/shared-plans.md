@@ -72,14 +72,33 @@ Every purchase goes through `record_customer_payment`:
 - The usage period closes and a new one opens with the new plan's cap. Unused data from the
   old period is not carried over.
 - `sync_shared_subscription_devices_after_owner_renewal` copies expiry and plan onto every
-  shared device, renews each usage period, lifts FUP, and schedules delivery. If the new plan
-  allows fewer devices, the newest stay and the oldest are released, whatever their type.
+  shared device, renews each usage period, lifts FUP, and schedules delivery.
 
-A voucher on the owner's MAC follows the same rules, with one exception: on a group with paid
-time left, a voucher giving fewer devices or a lower cap is refused and stays unused
-(`smaller_voucher_refusal`). A device limit too small for the devices attached counts as fewer.
-Single-device plans top up as normal, and a customer in grace is never refused. Owner edits in the dashboard carry
-expiry and plan to shared devices. Grace periods and outage compensation also propagate.
+**When the new limit is too small for the devices attached** (`_split_for_device_limit`). This
+applies to every renewal, M-Pesa included. With room for all of them, nothing changes.
+
+| Order | Device | Why |
+|---|---|---|
+| 1 | Owner's main device | Always stays. It isn't a slot. |
+| 2 | Paired shared devices (`tv`, `console`, `iot`), newest first | Can't enter a code to get back on. |
+| 3 | Everything else (`other`, `laptop`), newest first | Can enter the code again if a slot is free. |
+
+So with more paired devices than slots, the newest paired devices stay, and a phone goes even if
+it is the newest device of all. A voucher for 1 device has no slots, so a shared TV goes too.
+A released device keeps its row, loses its slot and isn't re-delivered. The type comes from the
+pairing, so a TV added as `other` gets no priority.
+
+A voucher on the owner's MAC follows the same rules, with these exceptions:
+
+- On a group with paid time left, a voucher giving fewer devices or a lower cap is refused and
+  stays unused (`smaller_voucher_refusal`). A device limit too small for the devices attached
+  counts as fewer. Single-device plans top up as normal, and a customer in grace is never refused.
+- With no paid time left, including grace, the voucher applies its own cap and device limit
+  (`apply_voucher_plan_if_plan_ended`). Other payments still keep the old limits if the plan they
+  bought gives less and the old plan object is loaded, which is rare on M-Pesa (open question 3).
+
+Owner edits in the dashboard carry expiry and plan to shared devices. Grace periods and outage
+compensation also propagate.
 
 ## Router delivery
 
@@ -125,3 +144,8 @@ router profile, so changing it needs a re-provision and devices reconnect once t
    until someone removes it. `SHARED_SLOT_IDLE_RELEASE_ENABLED` (off) frees one slot when a new
    device enters a full plan's code. See `app/services/shared_slot_release.py`. Turning it on
    applies to every reseller.
+3. **Non-voucher payments on an ended plan.** `record_customer_payment` keeps the old cap and
+   device limit when the bought plan gives less and the old plan object is still loaded, even
+   if the old plan has ended. On M-Pesa that needs a pending plan that differs from the
+   customer's current plan, such as a reseller editing the plan mid-payment. Left as it is so
+   vouchers don't change M-Pesa.
