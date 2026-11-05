@@ -24,6 +24,7 @@ from app.db.models import (
     CustomerStatus,
     CustomerUsagePeriod,
     DevicePairing,
+    DeviceType,
     FupAction,
     PaymentMethod,
     ProvisioningAttempt,
@@ -741,6 +742,117 @@ async def test_swapped_group_refuses_a_new_device_and_keeps_the_tv(db, router_os
     await db.refresh(owner)
     assert owner.mac_address == TV
     assert router_os.macs() == {TV, PHONE_2, PHONE_3}
+
+
+async def test_attached_device_gets_back_on_a_swapped_group_with_the_code(db, router_os):
+    """Found on router 563: on a healthy group a device already attached gets
+    re-delivered, on a swapped group it was refused as if it were new."""
+    _reseller, router, _group, _single, owner = await _swapped_group(db, router_os)
+    await _age_device(db, owner)
+    router_os.bindings.pop(PHONE_2)
+
+    result = await _enter_code(db, router, PHONE_2, "22220001", router_os)
+
+    assert result["outcome"] == "device_added"
+    assert router_os.macs() == {TV, PHONE_2, PHONE_3}
+    assert len(await _shares(db, owner)) == 2
+    await db.refresh(owner)
+    assert owner.mac_address == TV
+    rows = (await db.execute(select(Customer).where(Customer.mac_address == PHONE_2))).scalars().all()
+    assert len(rows) == 1
+
+
+async def test_attached_device_gets_back_on_a_group_over_its_limit(db, router_os):
+    """A reseller lowered the plan's limit below the devices attached: the plan
+    still allows sharing, and the device already holds a slot."""
+    _reseller, router, plan, owner = await _buy_group(db, router_os, devices=3)
+    await _enter_code(db, router, PHONE_2, "11110001", router_os)
+    await _enter_code(db, router, PHONE_3, "11110001", router_os)
+    plan.max_shared_users = 2
+    await db.commit()
+    await db.refresh(owner, ["plan"])
+    router_os.bindings.pop(PHONE_3)
+
+    result = await _enter_code(db, router, PHONE_3, "11110001", router_os)
+
+    assert result["outcome"] == "device_added"
+    assert router_os.macs() == {OWNER, PHONE_2, PHONE_3}
+    assert len(await _shares(db, owner)) == 2
+
+
+async def test_attached_device_gets_back_on_a_swapped_group_by_phone(db, router_os):
+    _reseller, router, _group, _single, owner = await _swapped_group(db, router_os)
+    owner.phone = "254700007001"
+    await db.commit()
+    await _age_device(db, owner)
+    router_os.bindings.pop(PHONE_2)
+    tasks = BackgroundTasks()
+
+    result = await public_routes.reconnect_self_service(
+        public_routes.ReconnectRequest(phone="0700007001", mac_address=PHONE_2, router_id=router.id),
+        tasks,
+        db,
+    )
+    await tasks()
+    await router_os.drain()
+
+    assert result["outcome"] == "device_added"
+    assert router_os.macs() == {TV, PHONE_2, PHONE_3}
+    await db.refresh(owner)
+    assert owner.mac_address == TV
+    assert len(await _shares(db, owner)) == 2
+
+
+async def test_a_shared_tv_entering_the_code_again_stays_a_tv(db, router_os):
+    """The portal sends "other". A TV must not lose what it was paired as, or the
+    rules protecting paired devices stop applying to it."""
+    reseller, router, _plan, owner = await _buy_group(db, router_os, devices=3)
+    token = {"user_id": reseller.id, "role": reseller.role.value}
+    await customer_device_routes.add_customer_device(
+        owner.id,
+        customer_device_routes.AddDeviceRequest(mac_address=TV, device_type="tv"),
+        db,
+        token,
+    )
+    await router_os.drain()
+
+    await _enter_code(db, router, TV, "11110001", router_os)
+
+    pairing = (await _shares(db, owner))[0]
+    await db.refresh(pairing)
+    assert pairing.device_type == DeviceType.TV
+
+
+async def test_a_released_device_on_a_swapped_group_is_still_refused(db, router_os):
+    """Holding a slot is what counts, not having held one."""
+    _reseller, router, _group, _single, owner = await _swapped_group(db, router_os)
+    pairing = next(p for p in await _shares(db, owner) if p.device_mac == PHONE_2)
+    await device_pairing.disconnect_shared_pairing(
+        db, owner=owner, router_id=router.id, pairing_id=pairing.id,
+    )
+    await _age_device(db, owner)
+
+    with pytest.raises(HTTPException) as refused:
+        await _enter_code(db, router, PHONE_2, "22220001", router_os)
+
+    assert refused.value.status_code == 409
+    assert refused.value.detail["error"] == "device_limit_reached"
+    assert router_os.macs() == {TV, PHONE_3}
+
+
+async def test_a_new_device_is_still_refused_on_a_group_over_its_limit(db, router_os):
+    _reseller, router, plan, owner = await _buy_group(db, router_os, devices=3)
+    await _enter_code(db, router, PHONE_2, "11110001", router_os)
+    await _enter_code(db, router, PHONE_3, "11110001", router_os)
+    plan.max_shared_users = 2
+    await db.commit()
+    await db.refresh(owner, ["plan"])
+
+    with pytest.raises(HTTPException) as refused:
+        await _enter_code(db, router, PHONE_4, "11110001", router_os)
+
+    assert refused.value.status_code == 409
+    assert router_os.macs() == {OWNER, PHONE_2, PHONE_3}
 
 
 async def test_paired_tv_on_a_single_device_plan_is_never_moved(db, router_os):
