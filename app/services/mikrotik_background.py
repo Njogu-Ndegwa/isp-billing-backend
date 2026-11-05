@@ -1212,6 +1212,16 @@ def _cleanup_single_router_pppoe_sync(router_info: dict, customers_data: list) -
                         f"{cust['id']} ACTIVE for retry"
                     )
                 else:
+                    if cust.get("shared_speed"):
+                        # Only plans that share speed across devices have a
+                        # static <pppoe-USER> queue; on-down removes it with the
+                        # last session, this makes sure. Other customers: no call.
+                        cleared = api.remove_pppoe_shared_speed_queue(pppoe_user)
+                        if cleared.get("error"):
+                            logger.warning(
+                                f"[CRON-PPPoE] Shared-speed queue cleanup failed for "
+                                f"{pppoe_user}: {cleared['error']}"
+                            )
                     results["removed"].append({
                         "id": cust["id"],
                         "details": {
@@ -1719,7 +1729,12 @@ async def cleanup_expired_users_background():
                         }
                     router_pppoe_map[router_key]["customers"].append({
                         "id": c.id, "name": c.name, "pppoe_username": c.pppoe_username,
-                        "expiry": c.expiry, "router_id": c.router_id
+                        "expiry": c.expiry, "router_id": c.router_id,
+                        # Plans sharing speed across devices only (absent = off).
+                        **({"shared_speed": True} if (
+                            c.plan is not None
+                            and getattr(c.plan, "share_speed_across_devices", False)
+                        ) else {}),
                     })
                     continue
 

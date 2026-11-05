@@ -22,6 +22,8 @@ from app.services.mikrotik_api import (
     MikroTikAPI,
     multi_device_profile_kwargs,
     multi_device_profile_suffix,
+    per_session_rate_limit,
+    shares_speed,
 )
 from app.services.subscription_sharing import max_devices_for_customer
 from app.services.pppoe_provisioning import (
@@ -111,6 +113,7 @@ def _target_provision_item(customer: Customer, target_router: Router) -> dict[st
         "pppoe_password": customer.pppoe_password,
         "bandwidth_limit": plan.speed if plan else "10Mbps",
         "max_devices": max_devices_for_customer(customer, plan),
+        **({"shared_speed": True} if plan is not None and getattr(plan, "share_speed_across_devices", False) else {}),
         "comment": f"CID:{customer.id}|{customer.name or customer.phone}|{datetime.utcnow().strftime('%Y-%m-%d')}",
         "router_id": target_router.id,
     }
@@ -185,26 +188,29 @@ def _provision_target_router_sync(router_info: dict[str, Any], items: list[dict[
                 base_rate_limit = api._parse_speed_to_mikrotik(item["bandwidth_limit"])
                 rate_limit = _apply_pppoe_headroom(base_rate_limit, headroom_factor)
                 max_devices = max(1, int(item.get("max_devices") or 1))
+                shared = shares_speed(max_devices, bool(item.get("shared_speed")))
                 profile_name = (
                     f"pppoe_{base_rate_limit.replace('/', '_')}"
-                    f"{multi_device_profile_suffix(max_devices)}"
+                    f"{multi_device_profile_suffix(max_devices, shared)}"
                 )
 
                 if not ensured_profiles.get(profile_name):
                     profile_result = api.ensure_pppoe_profile(
                         profile_name,
-                        rate_limit,
+                        per_session_rate_limit(rate_limit, max_devices, shared),
                         local_address=local_address,
                         pool_name=pool_name,
                         dns_server=base_profile_data.get("dns_server", ""),
                         change_tcp_mss=base_profile_data.get("change_tcp_mss", ""),
-                        **multi_device_profile_kwargs(max_devices),
+                        **multi_device_profile_kwargs(max_devices, rate_limit if shared else None),
                     )
                     if profile_result.get("error"):
                         failed.append(
                             _failure(customer_id, username, f"Profile creation failed: {profile_result['error']}")
                         )
                         continue
+                    if shared:
+                        api.ensure_shared_speed_cleanup_scheduler()
                     ensured_profiles[profile_name] = True
 
                 secret_result = api.add_pppoe_secret(

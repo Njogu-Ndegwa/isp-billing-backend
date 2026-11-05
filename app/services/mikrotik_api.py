@@ -51,17 +51,134 @@ DEFAULT_PPPOE_PROFILE_ONLY_ONE = "yes"
 MULTI_DEVICE_PROFILE_RE = re.compile(r"_d(?P<n>\d{1,2})$")
 
 
-def multi_device_profile_suffix(max_devices: int) -> str:
-    """Profile-name suffix for a device limit; empty for a single device."""
-    return f"_d{int(max_devices)}" if int(max_devices or 1) > 1 else ""
+# Opt-in per plan (Plan.share_speed_across_devices): every session of one login
+# shares ONE plan-speed limit instead of each getting the full speed. The
+# profile (pppoe_<rate>_shared_d<N>) then has no per-session rate-limit, so
+# RouterOS makes no dynamic queue; its on-up/on-down scripts keep one static
+# simple queue named <pppoe-USER> (the name a dynamic queue would have, so
+# usage push, the cap sampler and the monitor credit it unchanged) whose target
+# is the login's live session interfaces. Interface targets can only ever match
+# this login's own traffic. The queue is tagged with this comment so a startup
+# scheduler can drop leftovers after a reboot (no on-down runs then).
+SHARED_SPEED_QUEUE_COMMENT = "bitwave-shared-speed"
+SHARED_SPEED_CLEANUP_SCHEDULER = "bitwave-shared-speed-cleanup"
 
 
-def multi_device_profile_kwargs(max_devices: int) -> dict:
-    """Extra ``ensure_pppoe_profile`` arguments for a device limit; none for one device."""
+def shares_speed(max_devices: int, shared_speed: bool) -> bool:
+    """True when this login's sessions share one limit (needs 2+ devices)."""
+    return bool(shared_speed) and int(max_devices or 1) > 1
+
+
+def multi_device_profile_suffix(max_devices: int, shared_speed: bool = False) -> str:
+    """Profile-name suffix for a device limit; empty for a single device.
+
+    Shared-speed profiles still end in ``_d<N>`` so the access-defaults
+    re-stamp of only-one=yes skips them like every multi-device profile.
+    """
+    n = int(max_devices or 1)
+    if n <= 1:
+        return ""
+    return f"_shared_d{n}" if shared_speed else f"_d{n}"
+
+
+def multi_device_profile_kwargs(max_devices: int, shared_rate: Optional[str] = None) -> dict:
+    """Extra ``ensure_pppoe_profile`` arguments for a device limit; none for one device.
+
+    ``shared_rate`` (a RouterOS max-limit such as ``30M/30M``) selects the
+    shared-speed scripts; the caller must then omit the per-session rate-limit
+    (see :func:`per_session_rate_limit`).
+    """
     n = int(max_devices or 1)
     if n <= 1:
         return {}
+    if shared_rate:
+        return {
+            "only_one": "no",
+            "on_up": shared_speed_on_up_script(n, shared_rate),
+            "on_down": shared_speed_on_down_script(),
+        }
     return {"only_one": "no", "on_up": multi_device_on_up_script(n)}
+
+
+def per_session_rate_limit(rate_limit: str, max_devices: int, shared_speed: bool) -> str:
+    """The profile's per-session rate-limit: none when sessions share one queue."""
+    return "" if shares_speed(max_devices, shared_speed) else rate_limit
+
+
+def shared_speed_queue_name(username: str) -> str:
+    return f"<pppoe-{username}>"
+
+
+def _shared_speed_max_limit(rate_limit: str) -> str:
+    """``max-limit`` for the shared queue: the plain rx/tx pair of a rate-limit."""
+    return (rate_limit or "").split()[0] if rate_limit else ""
+
+
+def _shared_speed_sync_script(max_limit: Optional[str], *, coming_up: bool) -> str:
+    """Rebuild ``<pppoe-$user>``'s target from the login's live sessions.
+
+    on-up (``coming_up``) adds the session's own interface even if it is not
+    listed yet and creates the queue at ``max_limit``; on-down leaves the
+    session going down out and removes the queue once no session is left.
+    Errors are logged, never raised: an on-up/on-down failure must not stop
+    the login.
+    """
+    c = SHARED_SPEED_QUEUE_COMMENT
+    head = (
+        ':do { :local q ("<pppoe-" . $user . ">"); :local t [:toarray ""]; :local seen false; '
+        ':foreach i in=[/interface pppoe-server find where user=$user] do={ '
+        ':local n [/interface pppoe-server get $i name]; '
+    )
+    if coming_up:
+        body = (
+            ':if ($n = $interface) do={ :set seen true }; :set t ($t, $n) }; '
+            ':if (!$seen) do={ :set t ($t, $interface) }; '
+            ':local f [/queue simple find where name=$q and dynamic=no]; '
+            ':if ([:len $f] = 0) do={ :local top [:pick [/queue simple find] 0]; '
+            f':do {{ /queue simple add name=$q target=$t max-limit={max_limit} comment="{c}" place-before=$top }} '
+            f'on-error={{ /queue simple add name=$q target=$t max-limit={max_limit} comment="{c}" }} }} '
+            f'else={{ /queue simple set $f target=$t max-limit={max_limit} comment="{c}" }} '
+        )
+    else:
+        body = (
+            ':if ($n != $interface) do={ :set t ($t, $n) } }; '
+            f':local f [/queue simple find where name=$q and comment="{c}"]; '
+            ':if ([:len $f] > 0) do={ :if ([:len $t] = 0) do={ /queue simple remove $f } '
+            'else={ /queue simple set $f target=$t } } '
+        )
+    return head + body + (
+        '} on-error={ :log warning ("bitwave: could not update the shared speed queue for " . $user) }'
+    )
+
+
+def shared_speed_on_up_script(max_devices: int, max_limit: str) -> str:
+    """on-up for a shared-speed profile: the device limit, then the shared queue.
+
+    When the limit drops a session, the queue is left alone: the dropped
+    session's on-down rebuilds it from the sessions that survived.
+    """
+    n = int(max_devices)
+    limit = _shared_speed_max_limit(max_limit)
+    return (
+        ':local dropped false; '
+        + multi_device_on_up_script(n).replace(
+            ':do { /ppp active remove $newest } on-error={} }',
+            ':set dropped true; :do { /ppp active remove $newest } on-error={} }',
+        )
+        + '; :if (!$dropped) do={ '
+        + _shared_speed_sync_script(limit, coming_up=True)
+        + ' }'
+    )
+
+
+def shared_speed_on_down_script() -> str:
+    """on-down for a shared-speed profile: shrink or remove the shared queue."""
+    return _shared_speed_sync_script(None, coming_up=False)
+
+
+def shared_speed_cleanup_on_event() -> str:
+    """Scheduler (start-time=startup) body: drop shared queues left by a reboot."""
+    return f'/queue simple remove [find where comment="{SHARED_SPEED_QUEUE_COMMENT}"]'
 
 
 def is_multi_device_profile(profile_name: str) -> bool:
@@ -2782,11 +2899,13 @@ class MikroTikAPI:
         change_tcp_mss: str = "",
         only_one: str = DEFAULT_PPPOE_PROFILE_ONLY_ONE,
         on_up: Optional[str] = None,
+        on_down: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Ensure a PPPoE profile exists with the specified rate limit.
         Creates or updates /ppp/profile. ``on_up`` (when given) replaces the
         profile's on-up script; multi-device profiles use it for their limit.
+        ``on_down`` likewise; shared-speed profiles use it to shrink their queue.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -2823,6 +2942,8 @@ class MikroTikAPI:
                 profile_args["only-one"] = only_one
             if on_up is not None:
                 profile_args["on-up"] = on_up
+            if on_down is not None:
+                profile_args["on-down"] = on_down
 
             if profile_exists:
                 profile_args["numbers"] = profile_id
@@ -3453,6 +3574,72 @@ class MikroTikAPI:
             return result
         except Exception as e:
             logger.error(f"Error adding PPPoE secret for '{username}': {e}")
+            return {"error": str(e)}
+
+    def ensure_shared_speed_cleanup_scheduler(self) -> Dict[str, Any]:
+        """Make sure shared-speed queues left over by a reboot are removed at startup.
+
+        A reboot ends every PPPoE session without running on-down, so the
+        static ``<pppoe-USER>`` queues of shared-speed logins would linger with
+        stale targets. Only added on routers that use shared speed.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            found = self.send_command_optimized(
+                "/system/scheduler/print",
+                proplist=[".id", "name"],
+                query=f"?name={SHARED_SPEED_CLEANUP_SCHEDULER}",
+            )
+            if found.get("success") and any(
+                row.get("name") == SHARED_SPEED_CLEANUP_SCHEDULER for row in found.get("data") or []
+            ):
+                return {"success": True, "action": "exists"}
+            result = self.send_command("/system/scheduler/add", {
+                "name": SHARED_SPEED_CLEANUP_SCHEDULER,
+                "start-time": "startup",
+                "on-event": shared_speed_cleanup_on_event(),
+                "comment": "Bitwave: drop shared-speed PPPoE queues left by a reboot",
+            })
+            if result.get("error"):
+                return {"error": result["error"]}
+            return {"success": True, "action": "added"}
+        except Exception as e:
+            logger.error(f"Error ensuring shared-speed cleanup scheduler: {e}")
+            return {"error": str(e)}
+
+    def remove_pppoe_shared_speed_queue(self, username: str) -> Dict[str, Any]:
+        """Remove a login's static shared-speed queue, if it has one.
+
+        Only the static queue this app tagged is touched; a dynamic
+        ``<pppoe-USER>`` queue (a normal per-session limit) is left alone.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        try:
+            name = shared_speed_queue_name(username)
+            found = self.send_command_optimized(
+                "/queue/simple/print",
+                proplist=[".id", "name", "comment", "dynamic"],
+                query=f"?name={name}",
+            )
+            if not found.get("success"):
+                return {"error": found.get("error") or "Failed to list queues"}
+            removed = 0
+            for row in found.get("data") or []:
+                if (
+                    row.get("name") == name
+                    and row.get("comment") == SHARED_SPEED_QUEUE_COMMENT
+                    and str(row.get("dynamic", "false")).lower() != "true"
+                    and row.get(".id")
+                ):
+                    result = self.send_command("/queue/simple/remove", {"numbers": row[".id"]})
+                    if result.get("error"):
+                        return {"error": result["error"], "removed": removed}
+                    removed += 1
+            return {"success": True, "removed": removed}
+        except Exception as e:
+            logger.error(f"Error removing shared-speed queue for '{username}': {e}")
             return {"error": str(e)}
 
     def remove_pppoe_secret(self, username: str) -> Dict[str, Any]:
