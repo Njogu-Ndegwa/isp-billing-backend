@@ -613,7 +613,10 @@ class MikroTikAPI:
             error_msg = ""
             while True:
                 sentence = self.read_sentence()
-                logger.info(f"Raw sentence received for command {command}: {sentence}")  # Debug log
+                # /tool/fetch replies carry whatever the far end answered (an AP's
+                # settings page, for one), so they never go in the logs.
+                if command != "/tool/fetch":
+                    logger.info(f"Raw sentence received for command {command}: {sentence}")  # Debug log
                 if not sentence:
                     if not self.connected:
                         connection_lost = True
