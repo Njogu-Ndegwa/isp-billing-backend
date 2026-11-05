@@ -1199,6 +1199,21 @@
   "stage",
   "user_id"
  ],
+ "subscription_free_setup_grants": [
+  "created_at",
+  "free_until",
+  "granted_by_email",
+  "granted_by_id",
+  "id",
+  "is_override",
+  "new_expires_at",
+  "new_status",
+  "override_reason",
+  "previous_expires_at",
+  "previous_status",
+  "user_id",
+  "waived_invoices"
+ ],
  "subscription_invoices": [
   "created_at",
   "currency",
@@ -1327,6 +1342,7 @@
   "created_at",
   "created_by",
   "email",
+  "free_setup_until",
   "id",
   "last_login_at",
   "market_code",

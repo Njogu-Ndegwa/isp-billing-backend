@@ -1598,7 +1598,10 @@ async def run_subscription_migrations():
     await _run_sql("Reset expired trial dates",
         "UPDATE users SET subscription_expires_at = NOW() + INTERVAL '7 days' "
         "WHERE role::text = 'reseller' AND subscription_status::text = 'trial' "
-        "AND subscription_expires_at < NOW()"
+        "AND subscription_expires_at < NOW() "
+        # A used Free setup window must end when it ends, not get 7 more days
+        # because a deploy landed before the next suspension run.
+        "AND free_setup_until IS NULL"
     )
     # Step 7: Fix legacy columns that may have been created with NOT NULL
     for col in ("is_active", "paid_on", "expires_on", "plan_type", "cost"):
@@ -2720,6 +2723,25 @@ async def run_staff_migrations():
         ))
 
 
+async def run_free_setup_column_migration():
+    """Add users.free_setup_until (nullable, so the previous release still runs).
+
+    Every User query reads this column, login included, so like the staff
+    migration it must succeed before serving rather than fail quietly.
+    """
+    async with async_engine.begin() as conn:
+        if conn.dialect.name == "sqlite":
+            columns = (await conn.execute(sa_text("PRAGMA table_info(users)"))).all()
+            if "free_setup_until" not in {row[1] for row in columns}:
+                await conn.execute(sa_text(
+                    "ALTER TABLE users ADD COLUMN free_setup_until TIMESTAMP NULL"
+                ))
+        else:
+            await conn.execute(sa_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_setup_until TIMESTAMP NULL"
+            ))
+
+
 async def run_settlement_mode_migrations():
     """Add users.settlement_mode ('platform' | 'direct').
 
@@ -3038,6 +3060,17 @@ async def run_subscription_reminder_migrations():
             lambda c: SubscriptionExpiryReminder.__table__.create(c, checkfirst=True)
         )
     logger.info("Migration: subscription_expiry_reminders table ready")
+
+
+async def run_subscription_free_setup_migrations():
+    """Create the Free setup time audit table. Idempotent."""
+    from app.db.models import SubscriptionFreeSetupGrant
+
+    async with async_engine.begin() as conn:
+        await conn.run_sync(
+            lambda c: SubscriptionFreeSetupGrant.__table__.create(c, checkfirst=True)
+        )
+    logger.info("Migration: subscription_free_setup_grants table ready")
 
 
 async def run_feedback_migrations():
@@ -3531,6 +3564,7 @@ async def startup_event():
 
     # Auth queries below include users.token_version; migrate before any user reads.
     await run_staff_migrations()
+    await run_free_setup_column_migration()
 
     try:
         await run_password_reset_migrations()
@@ -3784,6 +3818,12 @@ async def startup_event():
         logger.info("Subscription reminder migrations completed successfully")
     except Exception as e:
         logger.error(f"Subscription reminder migration failed (non-fatal): {e}")
+
+    try:
+        await run_subscription_free_setup_migrations()
+        logger.info("Free setup time migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Free setup time migration failed (non-fatal): {e}")
 
     try:
         await run_hot_path_index_migrations()

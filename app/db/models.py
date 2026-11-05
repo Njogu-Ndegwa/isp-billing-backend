@@ -158,6 +158,10 @@ class User(Base):
         server_default="trial"
     )
     subscription_expires_at = Column(DateTime, nullable=True)
+    # End of an admin "Free setup time" window (SubscriptionFreeSetupGrant has
+    # who pressed it). Until then the invoice, reminder and suspension jobs leave
+    # this account alone; afterwards normal billing resumes. NULL = never granted.
+    free_setup_until = Column(DateTime, nullable=True)
     # Country market (app/services/markets.py): fixes the reseller's operating
     # currency (plan prices, customer payments, revenue), how the platform
     # bills them and how they pay, plus language/timezone defaults. Plain
@@ -2599,6 +2603,31 @@ class SubscriptionExpiryReminder(Base):
     phone = Column(String(20), nullable=True)
     inbox_sent = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class SubscriptionFreeSetupGrant(Base):
+    """One row per press of the admin "Free setup time" button: the audit trail.
+
+    Waivers have no other record, so this keeps who pressed it, what the account
+    looked like before, and each invoice waived with its amounts. Also the
+    one-use guard: an account with a row needs a deliberate override to get
+    another window. ``waived_invoices`` is a copy, not a link, so a later change
+    to an invoice never rewrites what was waived.
+    """
+    __tablename__ = "subscription_free_setup_grants"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    granted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    granted_by_email = Column(String, nullable=False)
+    free_until = Column(DateTime, nullable=False)
+    previous_status = Column(String(20), nullable=False)
+    new_status = Column(String(20), nullable=False)
+    previous_expires_at = Column(DateTime, nullable=True)
+    new_expires_at = Column(DateTime, nullable=False)
+    waived_invoices = Column(JSON, nullable=False, default=list)
+    is_override = Column(Boolean, nullable=False, default=False, server_default="false")
+    override_reason = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class FeedbackKind(str, enum.Enum):

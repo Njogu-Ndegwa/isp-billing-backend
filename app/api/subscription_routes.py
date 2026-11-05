@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 
 from app.db.database import get_db
 from app.db.models import (
-    User, UserRole, Subscription, SubscriptionInvoice, SubscriptionPayment,
-    SubscriptionStatus, InvoiceStatus, SubscriptionPaymentStatus,
+    User, UserRole, Subscription, SubscriptionFreeSetupGrant, SubscriptionInvoice,
+    SubscriptionPayment, SubscriptionStatus, InvoiceStatus, SubscriptionPaymentStatus,
     B2BTransaction, B2BTransactionStatus, ResellerPaymentMethod,
     ResellerPaymentMethodType,
 )
@@ -25,7 +25,8 @@ from app.services.subscription import (
     get_invoice_alert_for_user,
     verify_subscription_payments_for_reseller,
     _complete_subscription_payment,
-    cap_invoice_period_start,
+    cap_invoice_period_start, billable_period_start, in_free_setup,
+    grant_free_setup, free_setup_grant_dict, FreeSetupRefused,
     TRIAL_DAYS, GRACE_PERIOD_DAYS, PRE_EXPIRY_DAYS,
     BASE_CURRENCY, reprice_unpaid_invoice,
 )
@@ -215,6 +216,15 @@ async def request_my_invoice(
     expires = user.subscription_expires_at
     now = datetime.utcnow()
 
+    if in_free_setup(user, now):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Your account is on free setup time, so there is nothing to pay "
+                "yet. Your next invoice comes when it ends."
+            ),
+        )
+
     status = (
         user.subscription_status.value
         if hasattr(user.subscription_status, "value")
@@ -247,6 +257,7 @@ async def request_my_invoice(
             expires - timedelta(days=30)
         )
 
+    period_start = billable_period_start(user, period_start)
     period_end = now
     period_start = cap_invoice_period_start(period_start, period_end)
     if period_start >= period_end:
@@ -1524,6 +1535,12 @@ async def admin_get_subscription_detail(
         .limit(50)
     )).scalars().all()
 
+    free_setup_grants = (await db.execute(
+        select(SubscriptionFreeSetupGrant)
+        .where(SubscriptionFreeSetupGrant.user_id == reseller_id)
+        .order_by(SubscriptionFreeSetupGrant.created_at.desc())
+    )).scalars().all()
+
     return {
         "reseller": {
             "id": user.id,
@@ -1555,6 +1572,12 @@ async def admin_get_subscription_detail(
             }
             for p in payments
         ],
+        # Admin only: the reseller's own summary stays as it was.
+        "free_setup": {
+            "until": user.free_setup_until.isoformat() if user.free_setup_until else None,
+            "active": in_free_setup(user),
+            "grants": [free_setup_grant_dict(g) for g in free_setup_grants],
+        },
     }
 
 
@@ -1827,6 +1850,34 @@ async def admin_waive_invoice(
         "invoice_id": invoice.id,
         "reseller_id": reseller_id,
     }
+
+
+class FreeSetupRequest(BaseModel):
+    # Accounts that already had it need override=true and a reason.
+    override: bool = False
+    override_reason: Optional[str] = Field(None, max_length=500)
+
+
+@router.post("/api/admin/subscriptions/{reseller_id}/free-setup")
+async def admin_grant_free_setup(
+    reseller_id: int,
+    body: Optional[FreeSetupRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Free setup time: waive unpaid invoices, lift the suspension, free for 7 days."""
+    admin = await _require_admin(token, db)
+    body = body or FreeSetupRequest()
+    try:
+        grant = await grant_free_setup(
+            db, reseller_id, admin,
+            override=body.override, override_reason=body.override_reason,
+        )
+    except FreeSetupRefused as refused:
+        await db.rollback()
+        raise HTTPException(status_code=refused.status_code, detail=refused.detail)
+    await db.commit()
+    return {"message": "Free setup time given", "grant": free_setup_grant_dict(grant)}
 
 
 @router.post("/api/admin/subscriptions/generate-invoices")
