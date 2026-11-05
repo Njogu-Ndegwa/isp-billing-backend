@@ -77,6 +77,9 @@ SHARE_CODE_EXPIRED = "expired"
 SHARE_CODE_ACCESS = "access"
 
 
+SHARING_NOT_ALLOWED = "This plan does not allow subscription sharing"
+
+
 class DeviceLimitReached(HTTPException):
     """The subscription already has its full number of devices."""
 
@@ -400,6 +403,7 @@ async def _load_active_share_owner_stats(
     *,
     owner: Customer,
     router_id: int,
+    require_sharing: bool = True,
 ) -> tuple[Plan, Router, int, int, int]:
     plan = owner.plan
     router_obj = owner.router
@@ -409,8 +413,8 @@ async def _load_active_share_owner_stats(
         raise HTTPException(status_code=400, detail="Subscription does not belong to this router")
     if not owner.expiry or owner.expiry <= datetime.utcnow() or owner.status != CustomerStatus.ACTIVE:
         raise HTTPException(status_code=404, detail="No active hotspot subscription found for this phone on this router")
-    if not sharing_enabled_for_customer(owner, plan):
-        raise HTTPException(status_code=403, detail="This plan does not allow subscription sharing")
+    if require_sharing and not sharing_enabled_for_customer(owner, plan):
+        raise HTTPException(status_code=403, detail=SHARING_NOT_ALLOWED)
 
     max_shared_users = max_devices_for_customer(owner, plan)
     max_companion_devices = shared_device_limit_for_customer(owner, plan)
@@ -432,6 +436,28 @@ def _mark_share_code_redeemed(
     share_code.redeemed_pairing_id = pairing.id
     share_code.redeemed_at = now
     share_code.updated_at = now
+
+
+async def device_is_attached(
+    db: AsyncSession,
+    *,
+    owner_id: int,
+    router_id: int,
+    normalized_mac: str,
+) -> bool:
+    """True when this MAC already holds a slot on the owner's plan."""
+    pairing_id = (
+        await db.execute(
+            select(DevicePairing.id).where(
+                DevicePairing.device_mac == normalized_mac,
+                DevicePairing.router_id == router_id,
+                DevicePairing.subscription_owner_customer_id == owner_id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+                DevicePairing.is_active == True,  # noqa: E712
+            )
+        )
+    ).scalar_one_or_none()
+    return pairing_id is not None
 
 
 def _existing_pairing_blocks_share(pairing: DevicePairing | None, owner: Customer) -> bool:
@@ -612,7 +638,9 @@ async def _share_subscription_for_owner(
     share_code: SubscriptionShareCode | None = None,
 ) -> dict:
     plan, router_obj, max_shared_users, max_companion_devices, _active_shared_count = (
-        await _load_active_share_owner_stats(db, owner=owner, router_id=router_id)
+        await _load_active_share_owner_stats(
+            db, owner=owner, router_id=router_id, require_sharing=False,
+        )
     )
 
     # Serialize concurrent adds for the same subscription so two devices
@@ -653,8 +681,17 @@ async def _share_subscription_for_owner(
         owner.id,
         exclude_pairing_id=existing_pairing_id,
     )
-    if active_shared_count >= max_companion_devices:
-        raise DeviceLimitReached(max_shared_users)
+    # A device already on this plan holds its slot, so it comes back even when the
+    # limit has since dropped below the devices attached (a swapped or lowered
+    # plan). It also keeps what it was paired as, instead of the request's default.
+    if same_owner_active_pairing:
+        if device_type == DeviceType.OTHER:
+            device_type = existing_pairing.device_type
+    else:
+        if not sharing_enabled_for_customer(owner, plan):
+            raise HTTPException(status_code=403, detail=SHARING_NOT_ALLOWED)
+        if active_shared_count >= max_companion_devices:
+            raise DeviceLimitReached(max_shared_users)
 
     shared_phone = (device_owner_phone or owner.phone or "").strip()
     shared_customer = await _get_or_create_shared_customer(
