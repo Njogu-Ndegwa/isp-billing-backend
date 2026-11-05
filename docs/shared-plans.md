@@ -60,6 +60,11 @@ schedules delivery.
   each one throttles as it is next sampled, so expect a short spread, not one instant.
 - A `plan`-window cap snapshot does not follow a lowered plan cap (`fup_cap_mb`). Raised
   caps are carried over by `_loosen_open_period_caps`.
+- Moving a customer to another plan from the dashboard follows the same rule. A bigger or removed
+  cap applies at once to the owner and shared devices (`raise_open_caps_after_plan_edit`), and a
+  throttle or block it no longer justifies is lifted straight away. A smaller cap waits for the
+  next period, unless the open period had no cap (the plan's cap applies at once) or the new plan
+  is daily (a daily plan always uses the plan's cap).
 
 ## Renewal, top-up and stacking
 
@@ -105,7 +110,7 @@ compensation also propagate.
 
 - **Dashboard plan edit:** a speed change is pushed at once to the owner and shared devices,
   except any under a FUP throttle or block (`push_plan_edit_to_router`). Devices drop for a
-  moment. The fleet queue sync stays the fallback. The open period keeps its cap.
+  moment. The fleet queue sync stays the fallback. For the cap, see "Data cap and FUP".
 - **Push:** `provision_hotspot_customer` for each device, with an attempt keyed by pairing.
 - **Retry:** `retry_pending_hotspot_provisioning_background`. A renewal resets the reused
   attempt's window.
