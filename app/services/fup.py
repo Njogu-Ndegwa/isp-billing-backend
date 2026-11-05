@@ -650,6 +650,18 @@ async def _reset_daily_trigger(
     return True
 
 
+def _mark_lifted(period: CustomerUsagePeriod, now: datetime) -> None:
+    """Record a lift inside a running period and re-arm the cap.
+
+    Every path that applies a cap requires an empty ``fup_triggered_at``, so one
+    left filled means this device can never be throttled again this period, even
+    if its group later goes over. ``fup_reverted_at`` keeps when it was lifted.
+    """
+    period.fup_reverted_at = now
+    period.fup_triggered_at = None
+    period.fup_action_taken = None
+
+
 async def evaluate_and_enforce(
     db: AsyncSession,
     customer: Customer,
@@ -675,7 +687,7 @@ async def evaluate_and_enforce(
         # Uncapped plan: if a stale trigger exists, clear it.
         if period.fup_triggered_at and not period.fup_reverted_at:
             await restore_normal_profile(db, customer, plan)
-            period.fup_reverted_at = now or datetime.utcnow()
+            _mark_lifted(period, now or datetime.utcnow())
         return None
 
     now = now or datetime.utcnow()
@@ -729,8 +741,13 @@ async def evaluate_and_enforce(
             f"used={used_bytes} < cap={cap_bytes}"
         )
         if period.fup_action_taken in (FupAction.THROTTLE, FupAction.BLOCK):
-            await restore_normal_profile(db, customer, plan)
-        period.fup_reverted_at = now
+            res = await restore_normal_profile(db, customer, plan)
+            if res.get("error"):
+                # Still throttled on the router, so stay recorded and retry on
+                # the next evaluation.
+                logger.warning(f"[FUP] Auto-revert failed for {identifier}: {res}")
+                return None
+        _mark_lifted(period, now)
         return None
 
     return None

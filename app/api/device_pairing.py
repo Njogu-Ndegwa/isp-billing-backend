@@ -59,6 +59,7 @@ from app.services.subscription_sharing import (
     schedule_shared_device_delivery,
     shared_device_limit_for_customer,
     sharing_enabled_for_customer,
+    smaller_voucher_refusal,
 )
 
 logger = logging.getLogger(__name__)
@@ -1754,6 +1755,18 @@ async def pair_device_with_voucher(
         plan = voucher.plan
         if not plan:
             raise HTTPException(status_code=400, detail="Voucher plan is no longer available")
+
+        existing_customer = (
+            await db.execute(
+                select(Customer)
+                .options(selectinload(Customer.plan))
+                .where(Customer.mac_address == normalized_mac, Customer.user_id == voucher.user_id)
+            )
+        ).scalar_one_or_none()
+        refusal = await smaller_voucher_refusal(db, customer=existing_customer, new_plan=plan)
+        if refusal:
+            await db.commit()
+            raise HTTPException(status_code=400, detail=refusal)
 
         customer = await _get_or_create_device_customer(
             db, normalized_mac, voucher.user_id, request.router_id,
