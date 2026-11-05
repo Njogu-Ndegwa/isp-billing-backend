@@ -95,6 +95,63 @@ async def active_shared_device_count(
     return int((await db.execute(stmt)).scalar() or 0)
 
 
+def _cap_or_none(plan: Plan) -> int | None:
+    cap = plan.data_cap_mb
+    return cap if cap and cap > 0 else None
+
+
+async def smaller_voucher_refusal(
+    db: AsyncSession,
+    *,
+    customer: Customer | None,
+    new_plan: Plan,
+    now: datetime | None = None,
+) -> str | None:
+    """Why this voucher must not replace a live group plan, or None if it may.
+
+    A purchase replaces the plan for all remaining time. On a group that drops
+    the device limit and the cap for everyone (router 446: a 2,500 XAF voucher
+    turned an 18,000 XAF plan for 10 devices into a plan for 1). So a voucher
+    giving fewer devices or a lower cap is refused while the plan has paid time
+    left, and stays unused. ``customer.plan`` must already be loaded.
+
+    Only groups: a plan for one device changing to another is the ordinary
+    top-up, such as an unlimited hour followed by a capped week. Paid time only:
+    a customer in grace is renewing, so they are never refused here.
+    """
+    if customer is None or customer.subscription_owner_id is not None:
+        return None
+    current = customer.plan
+    if current is None or current.connection_type != ConnectionType.HOTSPOT:
+        return None
+    now = now or datetime.utcnow()
+    if customer.status != CustomerStatus.ACTIVE or not customer.expiry or customer.expiry <= now:
+        return None
+
+    shared_devices = await active_shared_device_count(db, customer.id)
+    current_devices = max_devices_for_customer(customer, current)
+    if current_devices <= 1 and shared_devices == 0:
+        return None
+
+    new_devices = max_devices_for_customer(customer, new_plan)
+    fewer_devices = new_devices < current_devices or new_devices - 1 < shared_devices
+    current_cap, new_cap = _cap_or_none(current), _cap_or_none(new_plan)
+    lower_cap = new_cap is not None and (current_cap is None or new_cap < current_cap)
+    if not fewer_devices and not lower_cap:
+        return None
+
+    logger.info(
+        "[VOUCHER] Refused plan %s on customer %s: live plan %s (devices %d -> %d, shared %d, cap %s -> %s)",
+        new_plan.id, customer.id, current.id, current_devices, new_devices,
+        shared_devices, current_cap, new_cap,
+    )
+    return (
+        f"This voucher is for a smaller plan than the {(current.name or '').strip()} plan on "
+        "this device, so we did not use it. It is still valid. Use it after this plan ends, "
+        "or on another device."
+    )
+
+
 async def schedule_shared_device_delivery(
     db: AsyncSession,
     *,
