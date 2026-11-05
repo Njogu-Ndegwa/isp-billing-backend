@@ -262,8 +262,16 @@ async def update_portal_settings(
             changed.append(field)
 
     settings.updated_at = datetime.utcnow()
+    # Show Ads off stops the clock on the reseller's sold ads; on moves their
+    # end dates out by the time it was off.
+    if "show_ads" in changed:
+        from app.services.ad_sales import on_show_ads_changed
+        await on_show_ads_changed(db, user.id, bool(settings.show_ads))
     await db.commit()
     await db.refresh(settings)
+    if "show_ads" in changed:
+        from app.services.ad_serving import invalidate_ad_cache
+        await invalidate_ad_cache()
 
     logger.info("Portal settings updated for user %s: %s", user.id, changed)
 
@@ -294,9 +302,11 @@ async def reset_portal_settings(
         await db.delete(settings)
         await db.commit()
 
-    # Re-create with all defaults
+    # Re-create with all defaults. That turns Show Ads off (see update above).
     settings = PortalSettings(user_id=user.id)
     db.add(settings)
+    from app.services.ad_sales import on_show_ads_changed
+    await on_show_ads_changed(db, user.id, False)
     await db.commit()
     await db.refresh(settings)
 

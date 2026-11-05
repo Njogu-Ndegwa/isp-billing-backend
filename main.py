@@ -3435,8 +3435,10 @@ async def run_hero_ads_migrations():
 
 async def run_ad_sales_migrations():
     """Selling ads through Bitwave (2026-11): creates the new tables ad_sales,
-    ad_sale_payments and ad_review_events if they are missing. Additive only:
-    no existing table or column changes. Idempotent: safe on every startup.
+    ad_sale_payments and ad_review_events if they are missing, then adds the
+    columns for time off and refunds of unused days. Additive only: every new
+    column is nullable or has a default, and no row is changed. Idempotent:
+    safe on every startup.
     """
     from sqlalchemy import inspect
     from app.db.models import AdReviewEvent, AdSale, AdSalePayment
@@ -3451,6 +3453,19 @@ async def run_ad_sales_migrations():
         if missing:
             await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=missing))
             logger.info("Ad sales migration: created %s", ", ".join(t.name for t in missing))
+        await conn.execute(sa_text(
+            "ALTER TABLE ad_sales "
+            "ADD COLUMN IF NOT EXISTS off_since TIMESTAMP NULL, "
+            "ADD COLUMN IF NOT EXISTS off_seconds_total INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE ad_sale_payments "
+            "ADD COLUMN IF NOT EXISTS refund_amount INTEGER NULL, "
+            "ADD COLUMN IF NOT EXISTS refund_unused_days INTEGER NULL, "
+            "ADD COLUMN IF NOT EXISTS reseller_recovery INTEGER NULL, "
+            "ADD COLUMN IF NOT EXISTS bitwave_refund_part INTEGER NULL, "
+            "ADD COLUMN IF NOT EXISTS recovery_charge_id INTEGER NULL"
+        ))
     logger.info("Ad sales migrations complete")
 
 

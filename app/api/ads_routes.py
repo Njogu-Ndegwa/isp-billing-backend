@@ -579,6 +579,8 @@ async def update_ad(
     enforce_active_subscription(user)
     ad = await _load_owned_ad(db, user, ad_id)
     admin = _is_admin(user)
+    # Before anything on the ad changes: see ad_sales.lock_sale_for_ad.
+    sale = await ad_sales.lock_sale_for_ad(db, ad)
 
     data = request.model_dump(exclude_unset=True)
     if "advertiser_id" in data:
@@ -630,6 +632,9 @@ async def update_ad(
         await ad_review.run_submit_checks(db, ad, user)
         if ad.status != "approved" and await ad_review.decide_status(db, ad, user) == "approved":
             await _auto_approve(db, ad)
+    # Paused or back on: the paid time stops or the end date moves out.
+    if sale is not None:
+        await ad_sales.sync_off_state(db, sale, ad)
 
     await db.commit()
     await db.refresh(ad)
@@ -670,6 +675,7 @@ async def review_ad(
     note = (request.note or "").strip()[:300] or None
     if action == "reject" and not note:
         raise HTTPException(status_code=400, detail="Say why the ad was rejected, so the reseller can fix it")
+    await ad_sales.lock_sale_for_ad(db, ad)
     ad.status = "approved" if action == "approve" else "rejected"
     ad.review_note = note
     ad.reviewed_at = datetime.utcnow()
@@ -681,12 +687,12 @@ async def review_ad(
         )
     # Nothing waits for this route any more. It handles rows from before the
     # review was removed, and an admin undoing a takedown. A paid sold ad goes
-    # live now (its paid weeks start here, once); one rejected after payment
-    # never runs and its payment waits for a refund.
+    # live now (its paid weeks start here, once). One rejected before it ran
+    # waits for a full refund; one that has run is refunded its unused days.
     if action == "approve":
         await ad_sales.on_approved(db, ad)
     else:
-        await ad_sales.on_rejected(db, ad, note or "")
+        await ad_sales.on_rejected(db, ad, note or "", actor_id=user.id)
     await db.commit()
     await db.refresh(ad)
     await invalidate_ad_cache()

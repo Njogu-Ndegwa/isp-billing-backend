@@ -131,7 +131,7 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
   callbacks for prompts already sent, payouts and the shop's report keep working.
 - **The reseller's Show Ads portal switch must be on.** It is off by default and a portal with it
   off shows no ads, so every prompt (create, resend, renew, the shop's link) is refused with a 400
-  until it is on. Switching it off later hides a running ad; its paid days keep counting.
+  until it is on. Switching it off later hides a running ad and stops its paid days counting.
 - **Nobody reviews an ad first** (Dennis, 5 Nov 2026). A sold ad is approved at creation but has no
   paid period, so no portal shows it until the shop pays. When the payment is confirmed it goes live
   on its own: the paid weeks start and the reseller's 80% is credited at that moment. An edit keeps a
@@ -144,6 +144,17 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
 - **Money**: the business pays the total by STK push to Bitwave's own paybill (the system
   shortcode), also for direct-settlement resellers. `bitwave_fee = floor(amount × 20 / 100)`,
   `reseller_share = amount − bitwave_fee` (rounding favours the reseller: KES 1,005 → 201 / 804).
+  The split is on the gross amount. Safaricom's collection fee comes out of Bitwave's 20%, and the
+  reseller's normal payout transfer fee still applies when money is sent.
+- **Time off doesn't use up paid time**: while a running ad is paused or Show Ads is off, its paid
+  days stop counting and `live_until` keeps moving. When it shows again `expires_at` moves out by the
+  time it was off. Overlapping reasons count once.
+- **Price changes**: the weekly price is capped at KES 12,500. A new price applies from the next
+  renewal only: a paid period keeps its price, and `price_per_week` on the sale changes when the
+  renewal is paid. A renewal at a new price answers 409 until `confirm_new_price: true` says the
+  reseller told the shop. While it is due, the sale shows `due_price_per_week` and
+  `price_changed_from`, and the shop's link shows `payment_due.previous_price_per_week`. The M-Pesa
+  prompt itself shows the amount.
 - **Paid period starts when the payment is confirmed.** A renewal paid while live extends the end
   date; paid after the end, it starts now. `weeks_banked` is only non-zero on old rows that can't go
   live by themselves (paid while pending under the old review, or pending after a takedown).
@@ -159,9 +170,17 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
   mobile number, media present. Own promos are also locked to the network's name and support number.
 - **Takedown is the safety net**: an admin takes any ad off every portal at once. An ad taken down
   stays down whatever its owner edits; only an admin can put it back.
-- **Refunds are never automatic**: rejected after payment, ad deleted before it ran, or a second
-  payment for the same order → `refund_status: "due"`, listed for an admin, who refunds by hand
-  and records it.
+- **Refunds are never automatic**: rejected before it ran, ad deleted before it ran, or a second
+  payment for the same order → `refund_status: "due"` for the whole amount, listed for an admin,
+  who refunds by hand and records it.
+- **Taking down an ad that has run** (or rejecting one): the unused whole days are refunded, and the
+  paid period ends now. A day already started counts as used. Unused days come off the newest paid
+  weeks first, per payment: `refund_amount = floor(amount × unused / paid_days)`. What is kept is split
+  80/20 as usual, so `reseller_recovery + bitwave_refund_part = refund_amount` to the shilling. The
+  reseller's part is a `reseller_transaction_charges` row (reference `ad-refund:<payment id>`) that the
+  payout balance subtracts and the Account Statement lists. It can take the balance below zero;
+  nothing is paid out until later earnings cover it. Repeating a takedown, rejection or callback adds
+  nothing. Bitwave's part comes off `ad_commission`.
 
 ### Prompt guards
 
@@ -185,8 +204,8 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
 | `GET /api/ad-sales` | reseller (own), admin (all) | `?state&payout_status&owner_user_id&page&per_page` | `{sales, totals, pagination}`. `payout_status=refund_due` is the refund queue |
 | `GET /api/ads/{id}/sale` | owner, admin | | the sale summary with `payments`; poll every few seconds while a prompt is out |
 | `POST /api/ads/{id}/sale` | owner | `business_name, business_phone, weeks, price_per_week` | put an older sold ad up for payment |
-| `POST /api/ads/{id}/sale/prompt` | owner | `{phone?, weeks?, price_per_week?}` | (re)send the prompt for what is due |
-| `POST /api/ads/{id}/sale/renew` | owner | `{phone?, weeks?, price_per_week?}` | renewal prompt (default same price and length) |
+| `POST /api/ads/{id}/sale/prompt` | owner | `{phone?, weeks?, price_per_week?, confirm_new_price?}` | (re)send the prompt for what is due |
+| `POST /api/ads/{id}/sale/renew` | owner | `{phone?, weeks?, price_per_week?, confirm_new_price?}` | renewal prompt (default same price and length) |
 | `POST /api/ads/{id}/takedown` | admin | `{note}` | any ad, off every portal now |
 | `POST /api/ad-sales/payments/{id}/refund` | admin | `{note?}` | records a hand refund; moves no money |
 | `GET/PUT /api/ad-review/rules` | admin | any of `{blocked_words: [...], selling_mode, selling_allowlist: [ids]}` | |
@@ -209,6 +228,11 @@ Sale summary (`ad.sale` on `/api/ads/manage` rows, and the routes above):
   "payout_status": "none",       // none | waiting_to_run | credited | refund_due | refunded
   "weeks_banked": 0, "live_from": null, "live_until": null,
   "renewal_due": false, "can_renew": false,
+  "due_weeks": 2, "due_price_per_week": 250, "price_changed_from": null,
+  "refunded_total": 0, "reseller_recovered_total": 0, "bitwave_refund_part_total": 0,
+  "shop_net_total": 0, "bitwave_fee_net_total": 0, "reseller_share_net_total": 0,
+  "clock_stopped": false, "off_reason": null,   // paused | not_approved | show_ads_off
+  "off_seconds_total": 0,
   "share_url": "https://bitwavetechnologies.com/promo/<token>"
 }
 ```
