@@ -30,6 +30,7 @@ from app.services.device_entitlements import (
     PLAN_IN_USE_ERROR,
     classify_device_use,
     is_randomized_mac,
+    plan_in_use_detail,
     probe_online_macs_sync,
 )
 from tests.factories import make_customer, make_plan, make_reseller, make_router
@@ -196,9 +197,10 @@ async def test_device_without_own_plan_is_refused_while_tv_in_use(db, router_io)
 
     assert exc.value.status_code == 409
     assert exc.value.detail["error"] == PLAN_IN_USE_ERROR
-    assert exc.value.detail["offer_purchase"] is True
+    assert exc.value.detail["offer_purchase"] is False
     assert "F3:3F" in exc.value.detail["message"]
-    assert "Buy a plan for this device" in exc.value.detail["message"]
+    assert "already paid" in exc.value.detail["message"]
+    assert "buy" not in exc.value.detail["message"].lower()
     assert await _mac_of(db, tv) == TV_MAC
     assert router_io.cleaned == []
     assert router_io.provisioned == []
@@ -250,7 +252,12 @@ async def test_rotated_phone_whose_old_mac_is_still_live_waits(db, router_io):
         await _reconnect(db, router, PHONE_MAC_ROTATED)
 
     assert exc.value.status_code == 409
-    assert "wait a minute" in exc.value.detail["message"]
+    assert "already paid" in exc.value.detail["message"]
+    assert "wait about 2 minutes" in exc.value.detail["message"].lower()
+    assert "buy" not in exc.value.detail["message"].lower()
+    assert exc.value.detail["offer_purchase"] is False
+    attempt = (await db.execute(select(ReconnectionAttempt))).scalars().one()
+    assert attempt.failure_reason == "plan_in_use:online_now"
     assert await _mac_of(db, phone) == PHONE_MAC
     assert await _mac_of(db, tv) == TV_MAC
     assert router_io.cleaned == []
@@ -582,6 +589,72 @@ async def test_classification_paired_device():
     use = classify_device_use(customer_id=1, mac=TV_MAC, last_seen=None,
                               online_now=False, now=now, paired_device=True)
     assert use.in_use and use.reason == "paired_device"
+
+
+# ------------------------------------------------- refusal text (SwapNet, 5 Nov)
+# Whoever is refused holds a valid plan: no reason may push them to buy, and each
+# reason states the wait that is true for it.
+
+
+def _refusal(mac, *, online_now=False, recent=False, paired_device=False, reason):
+    now = datetime.utcnow()
+    use = classify_device_use(
+        customer_id=1, mac=mac,
+        last_seen=now - timedelta(hours=3) if recent else None,
+        online_now=online_now, now=now, paired_device=paired_device,
+    )
+    assert use.in_use and use.reason == reason
+    return plan_in_use_detail(use)
+
+
+@pytest.mark.parametrize("mac,kwargs,reason", [
+    (PHONE_MAC, {"online_now": True}, "online_now"),
+    (TV_MAC, {"online_now": True}, "online_now"),
+    (TV_MAC, {"recent": True}, "fixed_device_recent"),
+    (TV_MAC, {"paired_device": True}, "paired_device"),
+    (PHONE_MAC, {"paired_device": True}, "paired_device"),
+])
+async def test_no_refusal_reason_pushes_a_purchase(mac, kwargs, reason):
+    detail = _refusal(mac, reason=reason, **kwargs)
+    message = detail["message"]
+
+    assert detail["error"] == PLAN_IN_USE_ERROR
+    assert detail["offer_purchase"] is False
+    assert detail["device_mac_tail"] == mac[-5:]
+    assert mac[-5:] in message
+    assert "already paid" in message
+    for push in ("buy", "purchase", "pay "):
+        assert push not in message.lower()
+
+
+async def test_phone_refusal_states_the_keepalive_wait():
+    message = _refusal(PHONE_MAC, online_now=True, reason="online_now")["message"]
+
+    assert "another device" in message
+    assert "Wait about 2 minutes and try again." in message
+    assert "a minute" not in message
+
+
+@pytest.mark.parametrize("kwargs,reason", [
+    ({"online_now": True}, "online_now"),
+    ({"recent": True}, "fixed_device_recent"),
+])
+async def test_fixed_device_refusal_does_not_promise_a_short_wait(kwargs, reason):
+    # A vendor MAC is held for a day after it goes offline: 2 minutes would be false.
+    message = _refusal(TV_MAC, reason=reason, **kwargs)["message"]
+
+    assert "minute" not in message
+    assert "full day" in message
+    assert "provider" in message
+
+
+async def test_paired_device_refusal_sends_them_to_the_provider_only():
+    # A paired device never moves by itself, however long it waits.
+    message = _refusal(TV_MAC, paired_device=True, reason="paired_device")["message"]
+
+    assert "paired to a TV" in message
+    assert "provider" in message
+    assert "minute" not in message and "day" not in message
 
 
 # --------------------------------------------------- group plans (Dennis, 4 Nov)
