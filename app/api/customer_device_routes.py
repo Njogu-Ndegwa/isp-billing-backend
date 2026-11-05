@@ -34,6 +34,8 @@ from app.db.models import (
     Customer,
     CustomerStatus,
     CustomerUsagePeriod,
+    DevicePairing,
+    DeviceType,
     FupAction,
     RouterAuthMethod,
     UserRole,
@@ -67,6 +69,10 @@ class AddDeviceRequest(BaseModel):
     mac_address: str
     device_name: Optional[str] = Field(default=None, max_length=100)
     device_type: str = "other"
+
+
+class DeviceTypeRequest(BaseModel):
+    device_type: DeviceType
 
 
 class DeviceLimitRequest(BaseModel):
@@ -353,6 +359,40 @@ async def remove_customer_device(
     return await disconnect_shared_pairing(
         db, owner=owner, router_id=owner.router_id, pairing_id=pairing_id,
     )
+
+
+@router.patch("/api/customers/{customer_id}/devices/{pairing_id}")
+async def set_customer_device_type(
+    customer_id: int,
+    pairing_id: int,
+    body: DeviceTypeRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Correct what an extra device is. Nothing on the router changes.
+
+    The type decides who stays when a smaller plan forces devices off, and whether
+    the plan can move off this device (see ``PINNED_DEVICE_TYPES``).
+    """
+    user = await get_current_user(token, db)
+    owner = await _load_owner_scoped(db, customer_id, user)
+    _require_hotspot(owner)
+    pairing = (
+        await db.execute(
+            select(DevicePairing).where(
+                DevicePairing.id == pairing_id,
+                DevicePairing.router_id == owner.router_id,
+                DevicePairing.subscription_owner_customer_id == owner.id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+                DevicePairing.is_active == True,  # noqa: E712
+            )
+        )
+    ).scalar_one_or_none()
+    if not pairing:
+        raise HTTPException(status_code=404, detail="Shared device not found for this subscription")
+    pairing.device_type = body.device_type
+    await db.commit()
+    return {"success": True, "pairing_id": pairing_id, "device_type": body.device_type.value}
 
 
 @router.put("/api/customers/{customer_id}/device-limit")
