@@ -625,7 +625,8 @@ async def _enforce_over_cap_customers(customer_ids: list[int], now: datetime) ->
 
             try:
                 action = await evaluate_and_enforce(db, customer, period, plan=plan, now=now)
-                if action is not None or period.fup_triggered_at is not None:
+                # fup_reverted_at == now: lifted just now, which also clears the trigger.
+                if action is not None or period.fup_triggered_at is not None or period.fup_reverted_at == now:
                     enforced += 1
                     if state:
                         state.last_enforcement_error = None
