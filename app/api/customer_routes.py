@@ -12,6 +12,7 @@ import string
 
 from app.db.database import get_db
 from app.db.models import (
+    RouterAuthMethod,
     Router, Customer, Plan, CustomerStatus, ConnectionType,
     CustomerPayment, PaymentMethod, PaymentStatus, DurationUnit,
     Payment, CustomerRating, ProvisioningLog, MpesaTransaction,
