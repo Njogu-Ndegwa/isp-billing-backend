@@ -108,10 +108,9 @@ async def record_customer_payment(
     # synced against the old plan's device limit. That throttled the owner of a
     # 200 GB plan at 2 GB for 17 days (router 446, Oct 2026).
     #
-    # Deliberately only corrected when the new plan gives at least as much. A
-    # smaller voucher on a bigger live plan keeps today's outcome (plan_id
-    # changes; cap and devices stay until the next payment) until Dennis decides
-    # whether it should be refused or stacked. See docs/shared-plans.md.
+    # Only corrected when the new plan gives at least as much. Vouchers refuse a
+    # smaller plan on a live group before reaching this point
+    # (smaller_voucher_refusal); anything else keeps the old limits for the period.
     if customer.plan_id is not None and (
         customer.plan is None or customer.plan.id != customer.plan_id
     ):

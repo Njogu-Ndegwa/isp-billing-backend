@@ -20,6 +20,7 @@ from app.api.access_code_routes import redeem_code_on_device
 from app.api.device_pairing import DevicePairVoucherRequest, pair_device_with_voucher
 from app.db.models import (
     Customer,
+    CustomerPayment,
     CustomerStatus,
     CustomerUsagePeriod,
     DevicePairing,
@@ -556,36 +557,175 @@ async def test_pair_voucher_for_a_bigger_plan_applies_its_cap_not_the_old_one(db
 
 
 async def _swapped_group(db, fake):
-    """Router 446, customer 50758: a TV owns a group plan with phones on it, then
-    a 1-device voucher is redeemed on the TV 38 minutes later."""
+    """Router 446, customer 50758: a TV owns a group plan with phones on it, and
+    a 1-device voucher swapped the plan. Vouchers are refused now, so the rows
+    are set directly: groups swapped before the refusal shipped still exist."""
     reseller, router, group, owner = await _tv_group(db, fake, devices=4, cap_mb=245760)
     await _enter_code(db, router, PHONE_2, "22220001", fake)
     await _enter_code(db, router, PHONE_3, "22220001", fake)
     single = await _group_plan(db, reseller, devices=1, cap_mb=2048, name="TV bundle")
-    await _voucher(db, reseller, single, router, "22220002")
-    await pair_device_with_voucher(
-        DevicePairVoucherRequest(
-            device_mac=TV, voucher_code="22220002", router_id=router.id, device_type="tv",
-        ),
-        db,
-    )
-    await fake.drain()
+    for member in await _members(db, owner):
+        member.plan_id = single.id
+    await db.commit()
+    await db.refresh(owner, ["plan"])
     return reseller, router, group, single, owner
 
 
-async def test_smaller_voucher_on_a_live_group_keeps_todays_behaviour(db, router_os):
-    """Pins current behaviour, which is a known open bug: the plan is overwritten
-    while the cap and the devices stay. Dennis decides refuse vs stack. Change
-    this test when he does, see docs/shared-plans.md "Open questions"."""
-    _reseller, _router, group, single, owner = await _swapped_group(db, router_os)
+async def _refused_voucher_state(db, voucher_code):
+    voucher = (
+        await db.execute(
+            select(Voucher)
+            .where(Voucher.code == voucher_code)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    payments = (
+        await db.execute(
+            select(CustomerPayment).where(CustomerPayment.payment_reference == f"VOUCHER-{voucher_code}")
+        )
+    ).scalars().all()
+    return voucher, payments
 
+
+async def test_smaller_voucher_on_a_live_group_is_refused_with_a_clear_message(db, router_os):
+    """The customer sees why, the voucher stays usable, and nothing moves."""
+    reseller, router, group, owner = await _tv_group(db, router_os, devices=4, cap_mb=245760)
+    await _enter_code(db, router, PHONE_2, "22220001", router_os)
+    single = await _group_plan(db, reseller, devices=1, cap_mb=2048, name="TV bundle")
+    await _voucher(db, reseller, single, router, "22220002")
+    before = owner.expiry
+    pushes = sum(router_os.pushes.values())
+
+    with pytest.raises(HTTPException) as refused:
+        await pair_device_with_voucher(
+            DevicePairVoucherRequest(
+                device_mac=TV, voucher_code="22220002", router_id=router.id, device_type="tv",
+            ),
+            db,
+        )
+    await router_os.drain()
+
+    assert refused.value.status_code == 400
+    assert refused.value.detail == (
+        "This voucher is for a smaller plan than the Group plan on this device, so we did "
+        "not use it. It is still valid. Use it after this plan ends, or on another device."
+    )
+    voucher, payments = await _refused_voucher_state(db, "22220002")
+    assert voucher.status == VoucherStatus.AVAILABLE
+    assert voucher.redeemed_by is None
+    assert payments == []
+    await db.refresh(owner)
+    assert owner.plan_id == group.id
+    assert owner.expiry == before
+    assert (await _open_period(db, owner)).cap_mb_snapshot == group.data_cap_mb
+    assert len(await _shares(db, owner)) == 1
+    assert sum(router_os.pushes.values()) == pushes
+
+
+async def test_portal_code_path_returns_the_same_refusal(db, router_os):
+    reseller, router, group, owner = await _buy_group(db, router_os, devices=3, cap_mb=1000)
+    small = await _group_plan(db, reseller, devices=3, cap_mb=100, name="Small")
+    await _voucher(db, reseller, small, router, "11110009")
+
+    with pytest.raises(HTTPException) as refused:
+        await _enter_code(db, router, OWNER, "11110009", router_os)
+
+    assert refused.value.status_code == 400
+    assert "smaller plan than the Group plan" in refused.value.detail
+    assert "still valid" in refused.value.detail
+    voucher, payments = await _refused_voucher_state(db, "11110009")
+    assert voucher.status == VoucherStatus.AVAILABLE
+    assert payments == []
+    await db.refresh(owner)
+    assert owner.plan_id == group.id
+
+
+async def test_public_voucher_route_returns_the_same_refusal(db, router_os):
+    reseller, router, group, owner = await _buy_group(db, router_os, devices=3)
+    single = await _group_plan(db, reseller, devices=1, name="One device")
+    await _voucher(db, reseller, single, router, "11110010")
+
+    with pytest.raises(HTTPException) as refused:
+        await public_routes.redeem_voucher_public(
+            {"code": "11110010", "mac_address": OWNER, "router_id": router.id}, db,
+        )
+
+    assert refused.value.status_code == 400
+    assert "still valid" in refused.value.detail
+    await db.refresh(owner)
+    assert owner.plan_id == group.id
+
+
+async def test_same_or_bigger_voucher_on_a_live_group_still_works(db, router_os):
+    reseller, router, _group, owner = await _buy_group(db, router_os, devices=3, cap_mb=1000)
+    bigger = await _group_plan(db, reseller, devices=5, cap_mb=2000, name="Bigger")
+    await _voucher(db, reseller, bigger, router, "11110011")
+
+    result = await _enter_code(db, router, OWNER, "11110011", router_os)
+
+    assert result["outcome"] == "plan_started"
+    await db.refresh(owner)
+    assert owner.plan_id == bigger.id
+
+
+async def test_smaller_voucher_is_allowed_once_the_plan_has_ended(db, router_os):
+    reseller, router, _group, owner = await _buy_group(db, router_os, devices=3, cap_mb=1000)
+    single = await _group_plan(db, reseller, devices=1, cap_mb=100, name="One device")
+    await _voucher(db, reseller, single, router, "11110012")
+    owner.expiry = datetime.utcnow() - timedelta(minutes=1)
+    await db.commit()
+
+    result = await _enter_code(db, router, OWNER, "11110012", router_os)
+
+    assert result["outcome"] == "plan_started"
     await db.refresh(owner)
     assert owner.plan_id == single.id
-    assert (await _open_period(db, owner)).cap_mb_snapshot == group.data_cap_mb
+
+
+async def test_single_device_top_up_with_a_capped_plan_is_not_refused(db, router_os):
+    """An unlimited hour followed by a capped week is the ordinary top-up."""
+    reseller, router, _plan, owner = await _buy_group(db, router_os, devices=1)
+    week = await _group_plan(db, reseller, devices=1, cap_mb=20480, name="Week")
+    await _voucher(db, reseller, week, router, "11110013")
+
+    result = await _enter_code(db, router, OWNER, "11110013", router_os)
+
+    assert result["outcome"] == "plan_started"
+    await db.refresh(owner)
+    assert owner.plan_id == week.id
+
+
+async def test_customer_override_keeps_their_device_limit(db, router_os):
+    """The reseller's per-customer limit wins over either plan, so a plan with a
+    lower allowance takes no devices away."""
+    reseller, router, _group, owner = await _buy_group(db, router_os, devices=4)
+    owner.max_devices_override = 4
+    await db.commit()
+    smaller = await _group_plan(db, reseller, devices=2, name="Two devices")
+    await _voucher(db, reseller, smaller, router, "11110014")
+
+    result = await _enter_code(db, router, OWNER, "11110014", router_os)
+
+    assert result["outcome"] == "plan_started"
+
+
+async def test_group_already_swapped_to_one_device_refuses_the_same_voucher_again(db, router_os):
+    """Another TV bundle on a swapped group would release all its devices."""
+    reseller, router, _group, single, owner = await _swapped_group(db, router_os)
+    await _voucher(db, reseller, single, router, "22220003")
+
+    with pytest.raises(HTTPException) as refused:
+        await pair_device_with_voucher(
+            DevicePairVoucherRequest(
+                device_mac=TV, voucher_code="22220003", router_id=router.id, device_type="tv",
+            ),
+            db,
+        )
+
+    assert refused.value.status_code == 400
     assert len(await _shares(db, owner)) == 2
-    assert router_os.macs() == {TV, PHONE_2, PHONE_3}
-    members = await _members(db, owner)
-    assert {m.expiry for m in members} == {owner.expiry}
+    voucher, _payments = await _refused_voucher_state(db, "22220003")
+    assert voucher.status == VoucherStatus.AVAILABLE
 
 
 async def test_swapped_group_refuses_a_new_device_and_keeps_the_tv(db, router_os):
@@ -617,6 +757,13 @@ async def test_paired_tv_on_a_single_device_plan_is_never_moved(db, router_os):
 
 
 # ------------------------------------------------------------- data cap and FUP
+
+
+async def _pay_after_switching(db, reseller, owner, plan):
+    owner.plan_id = plan.id
+    await db.commit()
+    await db.refresh(owner, ["plan"])
+    await _pay(db, reseller, owner.id, plan, reference="switch")
 
 
 async def _meter(db, customer, mb):
@@ -929,7 +1076,8 @@ async def test_repair_never_tightens(db, router_os):
     await _voucher(db, reseller, small, router, "77770002")
     first = await _enter_code(db, router, TV, "77770001", router_os)
     owner = await db.get(Customer, first["customer_id"])
-    await _enter_code(db, router, TV, "77770002", router_os)
+    # Written directly: vouchers can no longer produce this, but rows from before can.
+    await _pay_after_switching(db, reseller, owner, small)
     period = await _open_period(db, owner)
     period.cap_mb_snapshot = 245760
     await db.commit()

@@ -73,10 +73,10 @@ Every purchase goes through `record_customer_payment`:
   shared device, renews each usage period, lifts FUP, and schedules delivery. If the new plan
   allows fewer devices, the extras are released, newest first.
 
-A voucher on the owner's MAC follows the same rules, with one exception: a voucher for a
-plan with fewer devices or a lower cap overwrites `plan_id`, but the new period keeps the old
-cap and no devices are released until the next payment. That is open question 1. Owner edits
-in the dashboard carry
+A voucher on the owner's MAC follows the same rules, with one exception: on a group with paid
+time left, a voucher giving fewer devices or a lower cap is refused and stays unused
+(`smaller_voucher_refusal`). A device limit too small for the devices attached counts as fewer.
+Single-device plans top up as normal, and a customer in grace is never refused. Owner edits in the dashboard carry
 expiry and plan to shared devices. Grace periods and outage compensation also propagate.
 
 ## Router delivery
@@ -113,10 +113,9 @@ router profile, so changing it needs a re-provision and devices reconnect once t
 
 ## Open questions
 
-1. **A smaller voucher redeemed on a live group (Dennis decides: refuse or stack).** Router
-   446, customer 50758: NKIENDEM 240GB (limit 10, 18,000 XAF) became TV BUNDLE (limit 1) when
-   a 2,500 XAF voucher was redeemed 38 minutes later. Time stacked. The group now reads as
-   1 device with 6 attached, new devices are refused, and the next payment releases the
-   devices. `tests/test_shared_plan_lifecycle.py` pins this behaviour until it is decided.
+1. **Groups swapped before the refusal shipped.** Router 446, customer 50758: NKIENDEM 240GB
+   (limit 10) became TV BUNDLE (limit 1). The group runs at TV BUNDLE speed with 6 devices
+   attached, new devices are refused, and the next non-voucher payment releases the devices.
+   The data was left as it is.
 2. **Randomized MACs use up slots.** A rotated phone takes a new slot and the old one stays
    until someone removes it. Options: leave it manual, or auto-free idle randomized slots.
