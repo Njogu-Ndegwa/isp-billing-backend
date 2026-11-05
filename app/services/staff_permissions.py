@@ -237,6 +237,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Added a device to customer {customer_id}"),
     (("DELETE",), "/api/customers/{customer_id}/devices/{pairing_id}", "customers.manage",
      "Removed a device from customer {customer_id}"),
+    (("PATCH",), "/api/customers/{customer_id}/devices/{pairing_id}", "customers.manage",
+     "Changed a device's type for customer {customer_id}"),
     ((R,), "/api/customers/{customer_id}/pppoe-credentials", "customers.manage", None),
     ((R, "POST", "DELETE"), "/api/remove-user/{router_id}/{mac_address}", "customers.manage",
      "Removed device {mac_address} from router {router_id}"),

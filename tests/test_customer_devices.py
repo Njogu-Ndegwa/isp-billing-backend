@@ -8,8 +8,8 @@ from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import select
 
 from app.api import customer_device_routes, device_pairing, public_routes
-from app.api.customer_device_routes import AddDeviceRequest, DeviceLimitRequest
-from app.db.models import Customer, CustomerStatus, DevicePairing
+from app.api.customer_device_routes import AddDeviceRequest, DeviceLimitRequest, DeviceTypeRequest
+from app.db.models import Customer, CustomerStatus, DevicePairing, DeviceType
 from app.services.code_attempt_limiter import reset_code_attempt_limiter
 from app.services.subscription_sharing import (
     max_devices_for_customer,
@@ -221,6 +221,83 @@ async def test_dashboard_lists_add_and_remove_devices(db, stub_router, monkeypat
     assert removed["cleanup_status"] == "removed"
     assert stub_router["removed"] == [TV_MAC]
     assert await _active_pairings(db, owner) == []
+
+
+async def test_dashboard_add_saves_the_device_type_it_is_sent(db, stub_router):
+    reseller, _plan, _router, owner = await _owner(db)
+    await customer_device_routes.add_customer_device(
+        owner.id, AddDeviceRequest(mac_address=TV_MAC, device_type="tv"), db, _token(reseller),
+    )
+    await stub_router["drain"]()
+
+    (pairing,) = await _active_pairings(db, owner)
+    assert pairing.device_type == DeviceType.TV
+
+
+async def test_dashboard_corrects_a_device_type_without_touching_the_router(db, stub_router):
+    reseller, _plan, _router, owner = await _owner(db)
+    token = _token(reseller)
+    await customer_device_routes.add_customer_device(
+        owner.id, AddDeviceRequest(mac_address=TV_MAC), db, token,
+    )
+    await stub_router["drain"]()
+    (pairing,) = await _active_pairings(db, owner)
+    assert pairing.device_type == DeviceType.OTHER
+    delivered = list(stub_router["provisioned"])
+
+    result = await customer_device_routes.set_customer_device_type(
+        owner.id, pairing.id, DeviceTypeRequest(device_type="tv"), db, token,
+    )
+    await stub_router["drain"]()
+
+    assert result == {"success": True, "pairing_id": pairing.id, "device_type": "tv"}
+    listing = await customer_device_routes._devices_payload(db, owner, live=False)
+    assert [d["device_type"] for d in listing["devices"]] == ["other", "tv"]
+    assert stub_router["provisioned"] == delivered
+    assert stub_router["removed"] == []
+
+    # And back: a phone marked as a TV by mistake can lose the priority too.
+    await customer_device_routes.set_customer_device_type(
+        owner.id, pairing.id, DeviceTypeRequest(device_type="other"), db, token,
+    )
+    listing = await customer_device_routes._devices_payload(db, owner, live=False)
+    assert listing["devices"][1]["device_type"] == "other"
+
+
+async def test_device_type_correction_stays_inside_this_customer(db, stub_router):
+    reseller, _plan, _router, owner = await _owner(db)
+    await customer_device_routes.add_customer_device(
+        owner.id, AddDeviceRequest(mac_address=TV_MAC), db, _token(reseller),
+    )
+    await stub_router["drain"]()
+    (pairing,) = await _active_pairings(db, owner)
+
+    stranger = await make_reseller(db)
+    with pytest.raises(HTTPException) as hidden:
+        await customer_device_routes.set_customer_device_type(
+            owner.id, pairing.id, DeviceTypeRequest(device_type="tv"), db, _token(stranger),
+        )
+    assert hidden.value.status_code == 404
+
+    other_plan = await make_plan(db, reseller, name="Other", max_shared_users=3)
+    other_router = await make_router(db, reseller)
+    other_owner = await make_customer(
+        db, reseller, other_plan, other_router, status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(days=5), mac_address=LAPTOP_MAC, phone="254700002002",
+    )
+    with pytest.raises(HTTPException) as elsewhere:
+        await customer_device_routes.set_customer_device_type(
+            other_owner.id, pairing.id, DeviceTypeRequest(device_type="tv"), db, _token(reseller),
+        )
+    assert elsewhere.value.status_code == 404
+
+    (unchanged,) = await _active_pairings(db, owner)
+    assert unchanged.device_type == DeviceType.OTHER
+
+
+async def test_device_type_request_refuses_a_type_that_does_not_exist():
+    with pytest.raises(ValueError):
+        DeviceTypeRequest(device_type="fridge")
 
 
 async def test_dashboard_add_refuses_when_full_or_inactive(db, stub_router):
