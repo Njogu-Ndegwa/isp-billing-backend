@@ -125,6 +125,9 @@ async def zenopay_webhook(
         logger.info("[ZENOPAY WEBHOOK] Payment CONFIRMED for customer %s", customer.id)
 
         # Resolve the plan (check pending_update_data for plan changes)
+        from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+        drop_unpaid_page_plan(customer, txn.amount)
         pending_data = None
         if customer.pending_update_data:
             try:

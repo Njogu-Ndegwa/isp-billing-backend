@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import (
     ConnectionType,
     Customer,
+    CustomerStatus,
     CustomerUsagePeriod,
     FupAction,
     Plan,
@@ -662,6 +663,25 @@ def _mark_lifted(period: CustomerUsagePeriod, now: datetime) -> None:
     period.fup_action_taken = None
 
 
+async def _is_walled_expired_pppoe(
+    db: AsyncSession, customer: Customer, plan: Plan, now: datetime
+) -> bool:
+    """An expired customer on a PPPoE expired-redirect router: hands off.
+
+    Their walled session has a queue and traffic, so the usage jobs get here.
+    Throttling or restoring points the secret at a real profile and kicks the
+    session, which would take an unpaid customer out of the wall onto working
+    internet. Renewal lifts the trigger anyway. Routers without the switch have
+    no such session and are decided as before.
+    """
+    if plan.connection_type != ConnectionType.PPPOE:
+        return False
+    if customer.status == CustomerStatus.ACTIVE and has_access_time(customer, now):
+        return False
+    router = await _load_router(db, customer.router_id)
+    return bool(router and getattr(router, "pppoe_expired_redirect", False))
+
+
 async def evaluate_and_enforce(
     db: AsyncSession,
     customer: Customer,
@@ -680,6 +700,8 @@ async def evaluate_and_enforce(
     """
     plan = plan if plan is not None else customer.plan
     if not plan or plan.connection_type not in (ConnectionType.PPPOE, ConnectionType.HOTSPOT):
+        return None
+    if await _is_walled_expired_pppoe(db, customer, plan, now or datetime.utcnow()):
         return None
 
     cap_bytes = _cap_bytes(period, plan)

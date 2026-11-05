@@ -633,9 +633,11 @@ def wall_pppoe_users(api, customers: List[Dict[str, Any]], *, create_missing: bo
         secret = secrets.get(username)
         try:
             if secret is not None:
-                if secret.get("profile") != EXPIRED_PROFILE:
+                if secret.get("profile") != EXPIRED_PROFILE or _truthy(secret.get("disabled")):
+                    # A FUP block leaves the secret disabled: it could never
+                    # redial into the wall, and nothing else would enable it.
                     _write(api, "/ppp/secret/set", {"numbers": secret.get(".id") or username,
-                                                    "profile": EXPIRED_PROFILE})
+                                                    "profile": EXPIRED_PROFILE, "disabled": "no"})
                     action = "walled"
                 else:
                     action = "already_walled"

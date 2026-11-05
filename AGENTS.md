@@ -276,6 +276,14 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   customer as missing. Turning the switch off removes walled secrets (old behaviour) and
   every walled-state object.
 - Walled sessions are real PPP sessions: they appear in the router's active PPPoE list.
+- Those sessions have queues and traffic, so the usage jobs reach `fup.evaluate_and_enforce`. It
+  takes no router action for an expired customer on a router with the switch on: a throttle or
+  restore points the secret at a real profile, which would give an unpaid customer internet.
+- The public page endpoints go through `app/services/pppoe_expired_guards.py`: lookup misses are
+  capped per caller and per router (so usernames can't be tested), prompts per customer and per
+  phone. A plan picked on the page goes in `pending_update_data` tagged `source` and `amount`;
+  payment sites call `drop_unpaid_page_plan` first, so it only counts for a payment of exactly
+  that amount. Any new payment-confirmation path that reads `pending_update_data` must do the same.
 
 ## Customer Audit Log
 

@@ -44,6 +44,18 @@ async def _async_none(*_a, **_k):
     return None
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def clean_process_state():
+    from app.services import pppoe_expired_guards
+    from app.services.plan_cache import invalidate_plan_cache
+
+    pppoe_expired_guards.reset_limits()
+    await invalidate_plan_cache()
+    yield
+    pppoe_expired_guards.reset_limits()
+    await invalidate_plan_cache()
+
+
 @pytest.fixture
 def fake(monkeypatch):
     api = FakeRouterOS(typical_router_menus())

@@ -16,14 +16,13 @@ not become a lookup of names and phone numbers by username.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -44,6 +43,7 @@ from app.db.models import (
     User,
 )
 from app.services.auth import get_current_user, verify_token
+from app.services import pppoe_expired_guards as guards
 from app.services.plan_cache import get_plans_cached, plan_model_allows_router, sort_portal_plans
 from app.services.pppoe_expired_redirect import (
     ensure_expired_infra,
@@ -326,14 +326,24 @@ async def _pending_txn(db: AsyncSession, customer_id: int, now: datetime) -> Opt
 
 
 @router.get("/api/public/pppoe/expired/{router_id}")
-async def expired_page_data(router_id: int, u: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+async def expired_page_data(
+    router_id: int,
+    http_request: Request,
+    u: Optional[str] = Query(None, max_length=128),
+    db: AsyncSession = Depends(get_db),
+):
     from app.api.portal_routes import _build_public_response
     from app.db.models import PortalSettings
     from app.services.customer_expiry_notifications import resolve_paybills
 
+    caller = guards.caller_key(http_request)
+    guards.check_request_rate(caller)
     router_obj = await _enabled_router(db, router_id)
     reseller = await db.get(User, router_obj.user_id)
+    guards.check_lookups(router_id, caller)
     customer = await _find_customer(db, router_id, u)
+    if u and customer is None:
+        guards.record_lookup_miss(router_id, caller)
     now = datetime.utcnow()
     plans = await _router_plans(db, router_obj, customer)
     paybill = None
@@ -366,14 +376,19 @@ async def expired_page_data(router_id: int, u: Optional[str] = None, db: AsyncSe
 @router.get("/api/public/pppoe/expired/{router_id}/status")
 async def expired_page_status(
     router_id: int,
+    http_request: Request,
     background_tasks: BackgroundTasks,
-    u: str,
+    u: str = Query(..., max_length=128),
     db: AsyncSession = Depends(get_db),
 ):
     """The page's poll: back online yet, and how the last prompt went."""
+    caller = guards.caller_key(http_request)
+    guards.check_request_rate(caller)
     await _enabled_router(db, router_id)
+    guards.check_lookups(router_id, caller)
     customer = await _find_customer(db, router_id, u)
     if customer is None:
+        guards.record_lookup_miss(router_id, caller)
         raise HTTPException(status_code=404, detail="Account not found on this network")
     now = datetime.utcnow()
     txn = await _pending_txn(db, customer.id, now)
@@ -396,28 +411,35 @@ async def expired_page_status(
 
 class ExpiredPayRequest(BaseModel):
     router_id: int
-    username: str
+    username: str = Field(max_length=128)
     plan_id: Optional[int] = None
-    phone: Optional[str] = None  # blank = the phone on file
+    phone: Optional[str] = Field(default=None, max_length=32)  # blank = the phone on file
 
 
 @router.post("/api/public/pppoe/expired/pay")
-async def expired_page_pay(request: ExpiredPayRequest, db: AsyncSession = Depends(get_db)):
+async def expired_page_pay(
+    request: ExpiredPayRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """Send an M-Pesa prompt to renew this PPPoE customer.
 
-    The amount is always the plan's price from the database. A different plan
-    is held in pending_update_data and applied by the payment callback, so a
-    prompt the customer ignores changes nothing. Provisioning on payment is the
-    normal PPPoE path, which takes the customer off the walled profile.
+    The amount is always the plan's price from the database, and only a plan the
+    page offers this customer can be chosen. A different plan is held in
+    pending_update_data and applied by the payment callback, and only for a
+    payment of exactly that amount (pppoe_expired_guards), so a prompt that is
+    ignored changes nothing. Provisioning on payment is the normal PPPoE path,
+    which takes the customer off the walled profile.
     """
-    from app.services.mpesa import initiate_stk_push
-    from app.services.payment_gateway import initiate_customer_payment, resolve_collection_payment_method
-
+    caller = guards.caller_key(http_request)
+    guards.check_request_rate(caller)
     router_obj = await _enabled_router(db, request.router_id)
     if "mpesa" not in (router_obj.payment_methods or ["mpesa"]):
         raise HTTPException(status_code=400, detail="Mobile money is not enabled on this network")
+    guards.check_lookups(request.router_id, caller)
     customer = await _find_customer(db, request.router_id, request.username)
     if customer is None:
+        guards.record_lookup_miss(request.router_id, caller)
         raise HTTPException(status_code=404, detail="Account not found on this network")
     if customer.paused_at is not None:
         raise HTTPException(status_code=409, detail="This account is paused. Contact your provider to resume it.")
@@ -437,11 +459,16 @@ async def expired_page_pay(request: ExpiredPayRequest, db: AsyncSession = Depend
         or plan.plan_type == PlanType.FREE_TRIAL
         or float(plan.price or 0) <= 0
         or not plan_model_allows_router(plan, router_obj.id)
+        # What the page offers: a plan hidden from it may be another customer's
+        # private price, and an id in the request must not reach it.
+        or (plan.id != customer.plan_id and (
+            plan.is_hidden or (plan.valid_until is not None and plan.valid_until <= datetime.utcnow())
+        ))
     ):
         raise HTTPException(status_code=400, detail="Pick one of the plans shown")
 
     phone = normalize_phone(request.phone) or normalize_phone(customer.phone)
-    if not phone or len(phone) < 9:
+    if not phone or not 9 <= len(phone) <= 15:
         raise HTTPException(status_code=400, detail="Enter the M-Pesa phone number to send the prompt to")
 
     now = datetime.utcnow()
@@ -456,23 +483,36 @@ async def expired_page_pay(request: ExpiredPayRequest, db: AsyncSession = Depend
             "message": "A prompt was just sent. Check your phone, or wait a moment before trying again.",
         })
 
+    claimed_customer_id = customer.id
+    guards.claim_prompt(claimed_customer_id, phone, caller)
+    try:
+        return await _send_prompt(db, router_obj, reseller, customer, plan, phone, now)
+    finally:
+        guards.release_prompt(claimed_customer_id)
+
+
+async def _send_prompt(db, router_obj, reseller, customer, plan, phone, now) -> dict:
+    from app.services.mpesa import initiate_stk_push
+    from app.services.payment_gateway import initiate_customer_payment, resolve_collection_payment_method
+
     amount = float(plan.price)
     reference = f"PPPOE-EXP-{customer.id}-{now.strftime('%Y%m%d%H%M%S')}"
     account_reference = (reseller.business_name or reseller.organization_name) if reseller else None
     if plan.id != customer.plan_id:
-        customer.pending_update_data = json.dumps({
-            "requested_at": now.isoformat(),
-            "plan_id": plan.id,
-            "plan_name": plan.name,
-            "duration_value": plan.duration_value,
-            "duration_unit": plan.duration_unit.value,
-            "payment_method": "mobile_money",
-            "router_id": router_obj.id,
-            "phone": phone,
-            "source": "pppoe_expired_page",
-        })
+        guards.set_page_plan(
+            customer,
+            requested_at=now.isoformat(),
+            plan_id=plan.id,
+            plan_name=plan.name,
+            duration_value=plan.duration_value,
+            duration_unit=plan.duration_unit.value,
+            payment_method="mobile_money",
+            router_id=router_obj.id,
+            phone=phone,
+            amount=amount,
+        )
     else:
-        customer.pending_update_data = None
+        guards.clear_page_plan(customer)
 
     payment_method = await resolve_collection_payment_method(db, router_obj.id)
     if payment_method:
