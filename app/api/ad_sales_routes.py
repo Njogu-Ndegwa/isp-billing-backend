@@ -1,7 +1,8 @@
 """Selling ads through Bitwave: the reseller sells an ad to a local business,
 the business pays Bitwave by M-Pesa, Bitwave keeps 20% and the reseller's 80%
-joins their payout. Money rules live in app/services/ad_sales.py, review
-rules in app/services/ad_review.py.
+joins their payout. Money rules live in app/services/ad_sales.py, the automatic
+checks in app/services/ad_review.py. Nobody reviews a sold ad first: it goes live
+when the shop's payment is confirmed.
 
 Reseller (and "Captive portal" staff):
   POST /api/ad-sales                      create "An ad I sold" and prompt the shop
@@ -327,7 +328,7 @@ async def list_sales(
 ):
     """Sold ads with payment status, amount, Bitwave's 20% and payout status.
     Admins see every reseller's (?payout_status=refund_due is the refund
-    queue); a reseller sees their own and their auto-approve progress."""
+    queue); a reseller sees their own."""
     user = await get_current_user(token, db)
     admin = ar._is_admin(user)
     q = select(AdSale).order_by(AdSale.created_at.desc(), AdSale.id.desc()).limit(1000)
@@ -376,7 +377,7 @@ async def list_sales(
         for key in ("paid_total", "bitwave_fee_total", "reseller_share_total", "credited_total", "refund_due_total")
     }
     page, per_page = max(page, 1), min(max(per_page, 1), 100)
-    out = {
+    return {
         "sales": items[(page - 1) * per_page: page * per_page],
         "totals": totals,
         "pagination": {
@@ -387,9 +388,6 @@ async def list_sales(
         "min_price_per_week": ad_sales.MIN_PRICE_PER_WEEK,
         "max_weeks": ad_sales.MAX_WEEKS,
     }
-    if not admin:
-        out["review"] = await ad_review.trust_summary(db, user.id)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +453,6 @@ async def _rules_payload(db: AsyncSession) -> dict:
     return {
         "blocked_words": await ad_review.get_blocked_words(db),
         "default_blocked_words": list(ad_review.DEFAULT_BLOCKED_WORDS),
-        "auto_approve_after": ad_review.TRUST_THRESHOLD,
         "fee_percent": ad_sales.FEE_PERCENT,
         "min_price_per_week": ad_sales.MIN_PRICE_PER_WEEK,
         "max_weeks": ad_sales.MAX_WEEKS,

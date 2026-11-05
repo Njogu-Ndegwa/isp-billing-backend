@@ -1,5 +1,6 @@
 """Selling ads through Bitwave: the split, the M-Pesa prompt and its guards,
-idempotent callbacks, review timing, expiry, renewal, refunds and payouts.
+idempotent callbacks, going live on payment with nobody reviewing it, expiry,
+renewal, refunds and payouts.
 """
 
 from datetime import datetime, timedelta
@@ -252,7 +253,8 @@ async def test_selling_an_ad_prompts_the_shop_on_bitwaves_paybill(client, db, mo
     assert push["amount"] == 500
     assert "party_b" not in push and "shortcode" not in push   # system paybill = Bitwave's
     assert push["callback_url"].endswith("/api/mpesa/ad-sales/callback")
-    assert out["ad"]["slot"] == "reseller" and out["ad"]["status"] == "pending"
+    assert out["ad"]["slot"] == "reseller" and out["ad"]["status"] == "approved"
+    assert out["ad"]["expires_at"] is None             # no paid period: not on any portal yet
     assert out["sale"]["state"] == "awaiting_payment"
     assert out["sale"]["prompt"]["status"] == "waiting_for_pin"
     assert out["sale"]["amount_due"] == 500
@@ -284,58 +286,140 @@ async def test_an_approved_sold_ad_without_payment_never_runs(client, db, monkey
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_paid_then_approved_goes_live_for_the_paid_weeks_from_approval(client, db, monkeypatch, stk):
-    reseller, admin = await _reseller(db), await make_admin(db)
+async def test_a_paid_ad_goes_live_at_once_and_credits_the_reseller(client, db, monkeypatch, stk):
+    reseller = await _reseller(db)
     out = await _sell(client, monkeypatch, reseller)
     ad_id = out["ad"]["id"]
+    assert ad_id not in await _live_ids(db)
+    assert await get_unpaid_balance(db, reseller.id) == 0
 
+    before = datetime.utcnow()
     r = await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
     assert r.json()["ResultCode"] == 0
     p = (await _payments(db, ad_id))[0]
     assert p.status == "paid" and p.mpesa_receipt == "RKX1"
     assert p.bitwave_fee == 100 and p.reseller_share == 400
-    assert p.credited_at is None                       # not running yet: nothing credited
-    assert await get_unpaid_balance(db, reseller.id) == 0
-    assert ad_id not in await _live_ids(db)
+    assert p.credited_at is not None
 
-    _auth_as(monkeypatch, reseller)
-    assert (await client.get(f"/api/ads/{ad_id}/sale")).json()["state"] == "in_review"
-
-    before = datetime.utcnow()
-    await _approve(client, monkeypatch, admin, ad_id)
     ad = await _ad(db, ad_id)
-    assert ad.starts_at >= before
+    assert ad.status == "approved" and ad.starts_at >= before
     assert ad.expires_at - ad.starts_at == timedelta(weeks=2)
     assert ad_id in await _live_ids(db)
-    p = (await _payments(db, ad_id))[0]
-    assert p.credited_at is not None
     assert await get_unpaid_balance(db, reseller.id) == 400
     buckets = await get_unpaid_balance_by_router(db, reseller.id)
     assert round(sum(buckets.values()), 2) == 400 and buckets[None] == 400
 
+    _auth_as(monkeypatch, reseller)
+    sale = (await client.get(f"/api/ads/{ad_id}/sale")).json()
+    assert sale["state"] == "live" and sale["weeks_banked"] == 0
+
 
 @pytest.mark.asyncio
-async def test_duplicate_callbacks_never_double_credit(client, db, monkeypatch, stk):
+async def test_callback_retries_never_restart_the_weeks_or_credit_again(client, db, monkeypatch, stk):
     reseller = await _reseller(db)
-    for _ in range(3):
-        await _approve_trust(db, reseller)
     out = await _sell(client, monkeypatch, reseller)
     ad_id = out["ad"]["id"]
-    assert out["ad"]["status"] == "approved"           # trusted: auto-approved
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
+    first = await _ad(db, ad_id)
+    started, ends = first.starts_at, first.expires_at
+    credited = (await _payments(db, ad_id))[0].credited_at
 
     for _ in range(3):
         r = await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
         assert r.json()["ResultCode"] == 0
+
     ad = await _ad(db, ad_id)
-    assert ad.expires_at - ad.starts_at == timedelta(weeks=2)   # not 6 weeks
+    assert (ad.starts_at, ad.expires_at) == (started, ends)
+    assert (await _payments(db, ad_id))[0].credited_at == credited
     assert await get_unpaid_balance(db, reseller.id) == 400
+
+
+async def _paid_and_stuck_in_review(db, client, monkeypatch, reseller, body=None):
+    """A row as the old review flow left it: paid, not credited, weeks banked,
+    still pending. That is ad 27 on production."""
+    out = await _sell(client, monkeypatch, reseller, body)
+    ad_id = out["ad"]["id"]
+    p = (await _payments(db, ad_id))[0]
+    p.status, p.paid_at, p.mpesa_receipt = "paid", datetime.utcnow(), f"OLD{p.id}"
+    sale = (await db.execute(select(AdSale).where(AdSale.ad_id == ad_id))).scalar_one()
+    sale.weeks_banked = p.weeks
+    ad = await _ad(db, ad_id)
+    ad.status, ad.review_note, ad.reviewed_at = "pending", None, None
+    await db.commit()
+    return ad_id
+
+
+@pytest.mark.asyncio
+async def test_an_ad_paid_before_review_went_away_goes_live_once_by_the_admin_route(client, db, monkeypatch, stk):
+    """The live test's ad 27: KES 200 for 1 week must credit KES 160 once only."""
+    reseller, admin = await _reseller(db), await make_admin(db)
+    ad_id = await _paid_and_stuck_in_review(
+        db, client, monkeypatch, reseller, {**SOLD, "weeks": 1, "price_per_week": 200},
+    )
+    assert ad_id not in await _live_ids(db)
+    assert await get_unpaid_balance(db, reseller.id) == 0
+
+    before = datetime.utcnow()
+    await _approve(client, monkeypatch, admin, ad_id)
+    ad = await _ad(db, ad_id)
+    assert ad.status == "approved" and ad.starts_at >= before
+    assert ad.expires_at - ad.starts_at == timedelta(weeks=1)
+    assert ad_id in await _live_ids(db)
+    assert await get_unpaid_balance(db, reseller.id) == 160
+    started, ends = ad.starts_at, ad.expires_at
+
+    # Calling it again, and a late Safaricom retry, change nothing.
+    await _approve(client, monkeypatch, admin, ad_id)
+    p = (await _payments(db, ad_id))[0]
+    assert await ad_sales.confirm_payment(db, p.id, receipt=p.mpesa_receipt) == "already_paid"
+    ad = await _ad(db, ad_id)
+    assert (ad.starts_at, ad.expires_at) == (started, ends)
+    assert await get_unpaid_balance(db, reseller.id) == 160
+    sale = (await db.execute(
+        select(AdSale).where(AdSale.ad_id == ad_id).execution_options(populate_existing=True)
+    )).scalar_one()
+    assert sale.weeks_banked == 0
+
+
+@pytest.mark.asyncio
+async def test_an_old_pending_unpaid_sold_ad_goes_live_when_its_shop_pays(client, db, monkeypatch, stk):
+    reseller = await _reseller(db)
+    out = await _sell(client, monkeypatch, reseller)
+    ad_id = out["ad"]["id"]
+    ad = await _ad(db, ad_id)
+    ad.status = "pending"
+    await db.commit()
+    assert ad_id not in await _live_ids(db)
+
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
+    ad = await _ad(db, ad_id)
+    assert ad.status == "approved" and ad.expires_at is not None
+    assert ad_id in await _live_ids(db)
+    assert await get_unpaid_balance(db, reseller.id) == 400
+
+
+@pytest.mark.asyncio
+async def test_a_payment_doesnt_bring_back_an_ad_bitwave_took_down(client, db, monkeypatch, stk):
+    reseller, admin = await _reseller(db), await make_admin(db)
+    out = await _sell(client, monkeypatch, reseller)
+    ad_id = out["ad"]["id"]
+    _auth_as(monkeypatch, admin)
+    await client.post(f"/api/ads/{ad_id}/takedown", json={"note": "Misleading"})
+    # Pending after a takedown is a row from before this rule.
+    ad = await _ad(db, ad_id)
+    ad.status = "pending"
+    await db.commit()
+
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
+    ad = await _ad(db, ad_id)
+    assert ad.status == "pending" and ad.expires_at is None
+    assert ad_id not in await _live_ids(db)
+    assert await get_unpaid_balance(db, reseller.id) == 0
 
 
 @pytest.mark.asyncio
 async def test_reconciler_and_callback_together_credit_once(client, db, monkeypatch, stk):
     reseller = await _reseller(db)
-    for _ in range(3):
-        await _approve_trust(db, reseller)
     out = await _sell(client, monkeypatch, reseller)
     ad_id = out["ad"]["id"]
     await _age_prompts(db, ad_id, 5)
@@ -504,10 +588,10 @@ async def test_two_paid_prompts_for_one_order_credit_once_and_flag_a_refund(clie
 
 @pytest.mark.asyncio
 async def test_rejected_after_payment_never_runs_and_waits_for_an_admin_refund(client, db, monkeypatch, stk):
+    """Rule 2 still holds for the one path that can reject: an admin rejecting a
+    row from before review was removed. Full refund, nothing credited."""
     reseller, admin = await _reseller(db), await make_admin(db)
-    out = await _sell(client, monkeypatch, reseller)
-    ad_id = out["ad"]["id"]
-    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
+    ad_id = await _paid_and_stuck_in_review(db, client, monkeypatch, reseller)
 
     _auth_as(monkeypatch, admin)
     r = await client.post(f"/api/ads/{ad_id}/review", json={"action": "reject", "note": "Blurry photo"})
@@ -521,11 +605,31 @@ async def test_rejected_after_payment_never_runs_and_waits_for_an_admin_refund(c
     assert [s["ad_id"] for s in queue["sales"]] == [ad_id]
     assert queue["totals"]["refund_due_total"] == 500
 
+    # Repeating the rejection adds nothing.
+    await client.post(f"/api/ads/{ad_id}/review", json={"action": "reject", "note": "Blurry photo"})
+    queue = (await client.get("/api/ad-sales?payout_status=refund_due")).json()
+    assert queue["totals"]["refund_due_total"] == 500
+
     r = await client.post(f"/api/ad-sales/payments/{p.id}/refund", json={"note": "Sent back by M-Pesa"})
     assert r.status_code == 200 and r.json()["refund_status"] == "refunded"
     # Approving it later doesn't revive refunded money.
     await _approve(client, monkeypatch, admin, ad_id)
     assert ad_id not in await _live_ids(db)
+
+
+@pytest.mark.asyncio
+async def test_a_payment_landing_after_a_rejection_is_a_full_refund(client, db, monkeypatch, stk):
+    reseller, admin = await _reseller(db), await make_admin(db)
+    out = await _sell(client, monkeypatch, reseller)
+    ad_id = out["ad"]["id"]
+    _auth_as(monkeypatch, admin)
+    await client.post(f"/api/ads/{ad_id}/review", json={"action": "reject", "note": "No"})
+
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
+    p = (await _payments(db, ad_id))[0]
+    assert p.refund_status == "due" and p.credited_at is None
+    assert ad_id not in await _live_ids(db)
+    assert await get_unpaid_balance(db, reseller.id) == 0
 
 
 @pytest.mark.asyncio
@@ -540,10 +644,8 @@ async def test_only_admins_record_refunds_or_take_ads_down(client, db, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_takedown_stops_a_live_ad_and_ends_auto_approval(client, db, monkeypatch, stk):
+async def test_takedown_stops_a_live_ad_and_an_edit_doesnt_bring_it_back(client, db, monkeypatch, stk):
     reseller, admin = await _reseller(db), await make_admin(db)
-    for _ in range(3):
-        await _approve_trust(db, reseller)
     out = await _sell(client, monkeypatch, reseller)
     ad_id = out["ad"]["id"]
     await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
@@ -554,12 +656,14 @@ async def test_takedown_stops_a_live_ad_and_ends_auto_approval(client, db, monke
     assert r.status_code == 200 and r.json()["status"] == "rejected"
     assert ad_id not in await _live_ids(db)
 
-    # An edit doesn't put it back live, and the reseller is no longer trusted.
+    # Stays down, and nothing lands in a queue for a person. The reseller's
+    # other ads aren't held back by it.
     _auth_as(monkeypatch, reseller)
     r = await client.put(f"/api/ads/{ad_id}", json={"title": "Fresh mandazi daily"})
-    assert r.json()["status"] == "pending"
+    assert r.json()["status"] == "rejected"
+    assert ad_id not in await _live_ids(db)
     out2 = await _sell(client, monkeypatch, reseller, {**SOLD, "title": "Chapati"})
-    assert out2["ad"]["status"] == "pending"
+    assert out2["ad"]["status"] == "approved"
 
 
 @pytest.mark.asyncio
@@ -576,50 +680,76 @@ async def test_admin_can_take_down_bitwaves_own_and_house_ads(client, db, monkey
     assert r.json()["status"] == "rejected"
     _auth_as(monkeypatch, reseller)
     r = await client.put(f"/api/ads/{house['id']}", json={"title": "Our WiFi, fast"})
-    assert r.json()["status"] == "pending"          # waits for an admin after a takedown
+    assert r.json()["status"] == "rejected"         # stays down until an admin puts it back
+    _auth_as(monkeypatch, admin)
+    r = await client.post(f"/api/ads/{house['id']}/review", json={"action": "approve"})
+    assert r.json()["status"] == "approved"
 
 
 # ---------------------------------------------------------------------------
-# Auto-approve threshold
+# No review: a live edit stays live, old rows are left alone, admins look after
 # ---------------------------------------------------------------------------
 
-async def _approve_trust(db, reseller):
-    """One sold ad approved by an admin, as the review history records it."""
-    ad = Ad(title="t", seller_name="s", phone_number="0712345678", image_url="https://m/x.webp",
-            slot="reseller", owner_user_id=reseller.id, status="approved")
-    db.add(ad)
-    await db.flush()
-    db.add(AdReviewEvent(ad_id=ad.id, owner_user_id=reseller.id, slot="reseller", action="approve"))
-    await db.commit()
-    return ad
+@pytest.mark.asyncio
+async def test_editing_a_live_paid_ad_keeps_it_live_and_keeps_its_dates(client, db, monkeypatch, stk):
+    reseller = await _reseller(db)
+    out = await _sell(client, monkeypatch, reseller)
+    ad_id = out["ad"]["id"]
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
+    ad = await _ad(db, ad_id)
+    ends = ad.expires_at
+
+    _auth_as(monkeypatch, reseller)
+    r = await client.put(f"/api/ads/{ad_id}", json={"title": "Mandazi, now with chai"})
+    assert r.status_code == 200 and r.json()["status"] == "approved"
+    assert ad_id in await _live_ids(db)
+    assert (await _ad(db, ad_id)).expires_at == ends
+    # The automatic checks still run on the edit.
+    r = await client.put(f"/api/ads/{ad_id}", json={"title": "Betting tips"})
+    assert r.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_sold_ads_auto_approve_after_three_approvals_and_no_rejections(client, db, monkeypatch, stk):
-    reseller, admin = await _reseller(db), await make_admin(db)
-    for i in range(3):
-        out = await _sell(client, monkeypatch, reseller, {**SOLD, "title": f"Offer {i}"})
-        assert out["ad"]["status"] == "pending"
-        await _approve(client, monkeypatch, admin, out["ad"]["id"])
-    out = await _sell(client, monkeypatch, reseller, {**SOLD, "title": "Offer 4"})
-    assert out["ad"]["status"] == "approved"
-    ad_id = out["ad"]["id"]
-    # Paid -> live with no step for anyone.
-    await client.post("/api/mpesa/ad-sales/callback", json=_callback(f"ws_CO_{len(stk)}"))
+async def test_old_pending_ads_stay_as_they_are_until_their_owner_acts(client, db, monkeypatch, stk):
+    reseller = await _reseller(db)
+    ad = Ad(title="Our packages", seller_name="Acme WiFi", phone_number="0712345678",
+            image_url="https://media.example/w.webp", slot="house",
+            owner_user_id=reseller.id, status="pending")
+    db.add(ad)
+    await db.commit()
+    ad_id = ad.id
+
+    _auth_as(monkeypatch, reseller)
+    assert (await client.get("/api/ads/manage")).status_code == 200
+    r = await client.put(f"/api/ads/{ad_id}", json={"title": "Our packages"})   # unchanged re-save
+    assert r.json()["status"] == "pending"
+    r = await client.put(f"/api/ads/{ad_id}", json={"is_active": True})
+    assert r.json()["status"] == "pending"
+    assert ad_id not in await _live_ids(db)
+
+    r = await client.put(f"/api/ads/{ad_id}", json={"title": "Our weekly packages"})
+    assert r.json()["status"] == "approved"
     assert ad_id in await _live_ids(db)
 
 
 @pytest.mark.asyncio
-async def test_one_rejection_keeps_sold_ads_in_review(client, db, monkeypatch, stk):
+async def test_admins_get_a_list_of_newly_live_ads_newest_first(client, db, monkeypatch, stk):
     reseller, admin = await _reseller(db), await make_admin(db)
-    for _ in range(4):
-        await _approve_trust(db, reseller)
-    rejected = await _sell(client, monkeypatch, reseller)
-    assert rejected["ad"]["status"] == "approved"
-    db.add(AdReviewEvent(ad_id=rejected["ad"]["id"], owner_user_id=reseller.id, slot="reseller", action="reject"))
+    first = (await _sell(client, monkeypatch, reseller))["ad"]["id"]
+    second = (await _sell(client, monkeypatch, reseller, {**SOLD, "title": "Chapati"}))["ad"]["id"]
+    unpaid = (await _sell(client, monkeypatch, reseller, {**SOLD, "title": "Unpaid"}))["ad"]["id"]
+    # The later ad is paid first, so the earlier one is the newest to go live.
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_2", receipt="R2"))
+    ad = await _ad(db, second)
+    ad.starts_at = datetime.utcnow() - timedelta(hours=1)
     await db.commit()
-    out = await _sell(client, monkeypatch, reseller, {**SOLD, "title": "Next"})
-    assert out["ad"]["status"] == "pending"
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1", receipt="R1"))
+
+    _auth_as(monkeypatch, admin)
+    body = (await client.get("/api/ads/manage?newly_live=true")).json()
+    ids = [a["id"] for a in body["ads"]]
+    assert ids == [first, second] and unpaid not in ids
+    assert body["ads"][0]["owner_name"] == "Acme WiFi"
 
 
 # ---------------------------------------------------------------------------
@@ -627,8 +757,6 @@ async def test_one_rejection_keeps_sold_ads_in_review(client, db, monkeypatch, s
 # ---------------------------------------------------------------------------
 
 async def _live_sold_ad(client, db, monkeypatch, stk, reseller):
-    for _ in range(3):
-        await _approve_trust(db, reseller)
     out = await _sell(client, monkeypatch, reseller)
     ad_id = out["ad"]["id"]
     await client.post("/api/mpesa/ad-sales/callback", json=_callback(f"ws_CO_{len(stk)}"))
@@ -766,7 +894,7 @@ async def test_admin_list_shows_amount_fee_and_payout_status(client, db, monkeyp
     assert row["owner_name"] == "Acme WiFi"
     _auth_as(monkeypatch, reseller)
     mine = (await client.get("/api/ad-sales")).json()
-    assert mine["review"]["auto_approve"] is True
+    assert "review" not in mine
 
 
 @pytest.mark.asyncio

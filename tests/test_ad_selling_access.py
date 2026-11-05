@@ -448,9 +448,9 @@ async def test_admin_takedown_reject_refund_and_lists_work_with_a_real_login(cli
     h_owner, h_admin = _bearer(reseller), _bearer(admin)
 
     paid = (await client.post("/api/ad-sales", json=SOLD, headers=h_owner)).json()["ad"]["id"]
-    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
     r = await client.post(f"/api/ads/{paid}/review", json={"action": "reject", "note": "Blurry"}, headers=h_admin)
     assert r.status_code == 200, r.text
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback("ws_CO_1"))
     queue = (await client.get("/api/ad-sales?payout_status=refund_due", headers=h_admin)).json()
     assert [row["ad_id"] for row in queue["sales"]] == [paid]
     detail = (await client.get(f"/api/ads/{paid}/sale", headers=h_admin)).json()
