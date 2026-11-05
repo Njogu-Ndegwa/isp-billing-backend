@@ -108,14 +108,21 @@ async def record_customer_payment(
     # synced against the old plan's device limit. That throttled the owner of a
     # 200 GB plan at 2 GB for 17 days (router 446, Oct 2026).
     #
-    # Only corrected when the new plan gives at least as much. Vouchers refuse a
-    # smaller plan on a live group before reaching this point
-    # (smaller_voucher_refusal); anything else keeps the old limits for the period.
+    # Corrected when the new plan gives at least as much, or when the old plan has
+    # no paid time left, since nothing is being taken away from a plan that ended.
+    # Vouchers refuse a smaller plan on a live group before reaching this point
+    # (smaller_voucher_refusal); anything else on a live plan keeps the old limits
+    # for the period.
     if customer.plan_id is not None and (
         customer.plan is None or customer.plan.id != customer.plan_id
     ):
         bought = await db.get(Plan, customer.plan_id)
-        if customer.plan is None or not _plan_gives_less(bought, customer.plan):
+        plan_is_live = (
+            customer.status == CustomerStatus.ACTIVE
+            and customer.expiry is not None
+            and customer.expiry > datetime.utcnow()
+        )
+        if customer.plan is None or not plan_is_live or not _plan_gives_less(bought, customer.plan):
             customer.plan = bought
         else:
             logger.warning(

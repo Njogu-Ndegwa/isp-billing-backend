@@ -73,7 +73,7 @@ Every purchase goes through `record_customer_payment`:
   old period is not carried over.
 - `sync_shared_subscription_devices_after_owner_renewal` copies expiry and plan onto every
   shared device, renews each usage period, lifts FUP, and schedules delivery. If the new plan
-  allows fewer devices, the extras are released, newest first.
+  allows fewer devices, the newest stay and the oldest are released, whatever their type.
 
 A voucher on the owner's MAC follows the same rules, with one exception: on a group with paid
 time left, a voucher giving fewer devices or a lower cap is refused and stays unused

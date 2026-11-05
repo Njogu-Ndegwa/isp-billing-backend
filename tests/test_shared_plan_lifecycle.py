@@ -871,6 +871,208 @@ async def test_paired_tv_on_a_single_device_plan_is_never_moved(db, router_os):
 # ------------------------------------------------------------- data cap and FUP
 
 
+async def _ended_group(db, fake, *, devices=3, cap_mb=200, phones=(PHONE_2, PHONE_3)):
+    """A group whose plan ended and whose devices were taken off the router."""
+    reseller, router, plan, owner = await _buy_group(db, fake, devices=devices, cap_mb=cap_mb)
+    for mac in phones:
+        await _enter_code(db, router, mac, "11110001", fake)
+    past = datetime.utcnow() - timedelta(days=1)
+    for member in await _members(db, owner):
+        member.expiry = past
+        member.status = CustomerStatus.INACTIVE
+    await db.commit()
+    fake.bindings.clear()
+    return reseller, router, plan, owner
+
+
+async def _attempts_scheduled_for(db, owner):
+    """MACs the renewal asked the delivery job to put back on the router."""
+    rows = (
+        await db.execute(
+            select(Customer.mac_address)
+            .join(ProvisioningAttempt, ProvisioningAttempt.customer_id == Customer.id)
+            .where(
+                Customer.subscription_owner_id == owner.id,
+                ProvisioningAttempt.provisioning_state == ProvisioningState.SCHEDULED,
+            )
+        )
+    ).scalars().all()
+    return set(rows)
+
+
+async def test_smaller_voucher_after_expiry_applies_its_own_plan_and_releases_extras(db, router_os):
+    """Router 563: voucher D (1 device, 50 MB) on a group last on plan B (3 devices,
+    200 MB). Rows said plan D, but the cap stayed 200 and all 3 devices came back."""
+    reseller, router, _plan, owner = await _ended_group(db, router_os)
+    d = await _group_plan(db, reseller, devices=1, cap_mb=50, name="D")
+    await _voucher(db, reseller, d, router, "88880001")
+
+    result = await _enter_code(db, router, OWNER, "88880001", router_os)
+
+    assert result["outcome"] == "plan_started"
+    await db.refresh(owner)
+    assert owner.plan_id == d.id
+    assert owner.status == CustomerStatus.ACTIVE
+    assert (await _open_period(db, owner)).cap_mb_snapshot == 50
+    assert await _shares(db, owner) == []
+    assert await _attempts_scheduled_for(db, owner) == set()
+    assert router_os.macs() == {OWNER}
+    # Released, not deleted: they can buy their own plan or be added again.
+    released = (
+        await db.execute(select(Customer).where(Customer.mac_address.in_([PHONE_2, PHONE_3])))
+    ).scalars().all()
+    assert len(released) == 2
+    assert all(row.subscription_owner_id is None for row in released)
+    assert all(row.status == CustomerStatus.INACTIVE for row in released)
+
+
+async def test_voucher_after_expiry_with_room_for_the_devices_keeps_them_on_its_cap(db, router_os):
+    """Router 563: voucher A (3 devices, 100 MB) on the same group."""
+    reseller, router, _plan, owner = await _ended_group(db, router_os)
+    a = await _group_plan(db, reseller, devices=3, cap_mb=100, name="A")
+    await _voucher(db, reseller, a, router, "88880002")
+
+    await _enter_code(db, router, OWNER, "88880002", router_os)
+
+    members = await _members(db, owner)
+    assert len(members) == 3
+    assert {m.plan_id for m in members} == {a.id}
+    assert all(m.status == CustomerStatus.ACTIVE for m in members)
+    assert len(await _shares(db, owner)) == 2
+    assert await _attempts_scheduled_for(db, owner) == {PHONE_2, PHONE_3}
+    for member in members:
+        assert (await _open_period(db, member)).cap_mb_snapshot == 100
+
+
+async def test_group_does_not_disagree_on_its_cap_after_a_voucher_after_expiry(db, router_os):
+    """Router 563: devices re-added after voucher A got cap 100 while the owner
+    stayed on 200, so one group measured itself against two caps."""
+    reseller, router, _plan, owner = await _ended_group(db, router_os, phones=(PHONE_2,))
+    a = await _group_plan(db, reseller, devices=3, cap_mb=100, name="A")
+    await _voucher(db, reseller, a, router, "88880003")
+    await _enter_code(db, router, OWNER, "88880003", router_os)
+
+    await _enter_code(db, router, PHONE_3, "88880003", router_os)
+
+    caps = {(await _open_period(db, m)).cap_mb_snapshot for m in await _members(db, owner)}
+    assert caps == {100}
+
+
+async def test_voucher_after_expiry_keeps_the_newest_devices_it_has_room_for(db, router_os):
+    reseller, router, _plan, owner = await _ended_group(
+        db, router_os, devices=4, phones=(PHONE_2, PHONE_3, PHONE_4),
+    )
+    two = await _group_plan(db, reseller, devices=2, cap_mb=50, name="Two")
+    await _voucher(db, reseller, two, router, "88880004")
+
+    await _enter_code(db, router, OWNER, "88880004", router_os)
+
+    assert [p.device_mac for p in await _shares(db, owner)] == [PHONE_4]
+    assert await _attempts_scheduled_for(db, owner) == {PHONE_4}
+
+
+async def test_voucher_after_expiry_can_release_a_paired_tv_before_newer_phones(db, router_os):
+    """Pins the release order as it is: age only, not device type. A TV can't enter a
+    code, so once released it stays off until a reseller adds it back."""
+    reseller, router, _plan, owner = await _buy_group(db, router_os, devices=3, cap_mb=200)
+    await customer_device_routes.add_customer_device(
+        owner.id,
+        customer_device_routes.AddDeviceRequest(mac_address=TV, device_type="tv"),
+        db,
+        {"user_id": reseller.id, "role": reseller.role.value},
+    )
+    await router_os.drain()
+    await _enter_code(db, router, PHONE_2, "11110001", router_os)
+    past = datetime.utcnow() - timedelta(days=1)
+    for member in await _members(db, owner):
+        member.expiry = past
+        member.status = CustomerStatus.INACTIVE
+    await db.commit()
+    two = await _group_plan(db, reseller, devices=2, cap_mb=50, name="Two")
+    await _voucher(db, reseller, two, router, "88880007")
+
+    await _enter_code(db, router, OWNER, "88880007", router_os)
+
+    assert [p.device_mac for p in await _shares(db, owner)] == [PHONE_2]
+
+
+async def test_pair_voucher_after_expiry_applies_its_own_plan_too(db, router_os):
+    reseller, router, _group, owner = await _tv_group(db, router_os, devices=3, cap_mb=200)
+    await _enter_code(db, router, PHONE_2, "22220001", router_os)
+    past = datetime.utcnow() - timedelta(days=1)
+    for member in await _members(db, owner):
+        member.expiry = past
+        member.status = CustomerStatus.INACTIVE
+    await db.commit()
+    d = await _group_plan(db, reseller, devices=1, cap_mb=50, name="D")
+    await _voucher(db, reseller, d, router, "22220009")
+
+    await pair_device_with_voucher(
+        DevicePairVoucherRequest(
+            device_mac=TV, voucher_code="22220009", router_id=router.id, device_type="tv",
+        ),
+        db,
+    )
+    await router_os.drain()
+
+    await db.refresh(owner)
+    assert owner.plan_id == d.id
+    assert (await _open_period(db, owner)).cap_mb_snapshot == 50
+    assert await _shares(db, owner) == []
+
+
+async def test_expired_single_device_customer_gets_the_vouchers_own_cap(db, router_os):
+    reseller, router, _plan, owner = await _ended_group(db, router_os, devices=1, cap_mb=200, phones=())
+    small = await _group_plan(db, reseller, devices=1, cap_mb=50, name="Small")
+    await _voucher(db, reseller, small, router, "88880005")
+
+    await _enter_code(db, router, OWNER, "88880005", router_os)
+
+    assert (await _open_period(db, owner)).cap_mb_snapshot == 50
+
+
+async def test_smaller_purchase_on_a_live_plan_keeps_the_old_limits(db, router_os):
+    """Unchanged on purpose, Dennis's open decision: a path other than a group
+    voucher that lands here on a live plan keeps the old limits for the period."""
+    reseller, router, big, owner = await _buy_group(db, router_os, devices=3, cap_mb=200)
+    await _enter_code(db, router, PHONE_2, "11110001", router_os)
+    small = await _group_plan(db, reseller, devices=1, cap_mb=50, name="Small")
+    await db.refresh(owner, ["plan"])
+    assert owner.plan.id == big.id
+    owner.plan_id = small.id
+    await db.flush()
+
+    await _pay(db, reseller, owner.id, small)
+
+    await db.refresh(owner)
+    assert owner.plan_id == small.id
+    assert (await _open_period(db, owner)).cap_mb_snapshot == 200
+    assert len(await _shares(db, owner)) == 1
+
+
+async def test_smaller_voucher_in_grace_applies_its_own_plan(db, router_os):
+    """Paid time has ended, so the plan has ended, the same rule as the voucher
+    refusal. Grace only delays the cut-off."""
+    reseller, router, _plan, owner = await _buy_group(db, router_os, devices=3, cap_mb=200)
+    await _enter_code(db, router, PHONE_2, "11110001", router_os)
+    for member in await _members(db, owner):
+        member.expiry = datetime.utcnow() - timedelta(minutes=5)
+        member.grace_period_minutes = 60
+    await db.commit()
+    d = await _group_plan(db, reseller, devices=1, cap_mb=50, name="D")
+    await _voucher(db, reseller, d, router, "88880006")
+
+    await _enter_code(db, router, OWNER, "88880006", router_os)
+
+    assert (await _open_period(db, owner)).cap_mb_snapshot == 50
+    assert await _shares(db, owner) == []
+    # Grace still applies to the released device: it stays active until grace ends,
+    # when the expiry job removes it.
+    released = (await db.execute(select(Customer).where(Customer.mac_address == PHONE_2))).scalar_one()
+    assert released.status == CustomerStatus.ACTIVE
+    assert released.subscription_owner_id is None
+
+
 async def _pay_after_switching(db, reseller, owner, plan):
     owner.plan_id = plan.id
     await db.commit()
