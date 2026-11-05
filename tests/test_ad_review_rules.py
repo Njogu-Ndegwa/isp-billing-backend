@@ -174,7 +174,7 @@ async def test_the_blocked_list_is_admin_editable(client, db, monkeypatch):
     assert (await client.get("/api/ad-review/rules")).status_code == 403
     _auth_as(monkeypatch, admin)
     r = await client.get("/api/ad-review/rules")
-    assert "betting" in r.json()["blocked_words"] and r.json()["auto_approve_after"] == 3
+    assert "betting" in r.json()["blocked_words"]
     r = await client.put("/api/ad-review/rules", json={"blocked_words": ["Shisha", " herbal cure ", "shisha"]})
     assert r.json()["blocked_words"] == ["shisha", "herbal cure"]
 

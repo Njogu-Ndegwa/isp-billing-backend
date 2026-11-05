@@ -11,9 +11,9 @@ Money
   ``reseller_share = amount - bitwave_fee``. Any odd shilling from the
   rounding goes to the reseller (KES 1,005 -> Bitwave 201, reseller 804).
 * The reseller's 80% is credited when the paid weeks start running (go-live,
-  or an extension of a live ad), never at payment: an ad rejected after
-  payment never ran, so nothing was credited and the whole payment waits in
-  the admin refund queue. Credited shares are summed by ad_credit_total(),
+  or an extension of a live ad). Nobody reviews an ad first, so that is the
+  moment the payment is confirmed. An old ad rejected before it ran was never
+  credited, and the whole payment waits in the admin refund queue. Credited shares are summed by ad_credit_total(),
   which the payout balance (mpesa_b2b.get_unpaid_balance) adds as its own
   term, so ad money is paid out by the normal B2B payout and is never mixed
   into hotspot revenue (customer_payments). Bitwave's 20% is reported as the
@@ -21,10 +21,13 @@ Money
 
 Timing
 ------
-* The paid period starts at go-live, not at payment: weeks paid before
-  approval are banked on the sale (weeks_banked) and start when an admin (or
-  auto-approval) approves the ad. A renewal paid while the ad is live extends
-  its end date; paid after it ended, it starts a new period now.
+* The paid period starts when the payment is confirmed: a sold ad goes live by
+  itself at that point, even one still marked pending from before review was
+  removed (Dennis, 5 Nov 2026). Weeks are banked on the sale (weeks_banked) only
+  for rows that can't go live by themselves: paid and marked pending before this
+  rule, or pending after a takedown. Those start when an admin approves the ad.
+  A renewal paid while the ad is live extends its end date; paid after it ended,
+  it starts a new period now.
 * The ad stops by itself at expires_at: ad_serving refuses a sold ad without
   a paid period (expires_at NULL), and the live-ads query drops anything past
   expires_at.
@@ -508,6 +511,18 @@ async def _flag_refund(payment: AdSalePayment, reason: str) -> None:
     payment.refund_reason = reason[:300]
 
 
+async def _go_live_on_payment(db: AsyncSession, ad: Ad, now: datetime) -> None:
+    """A paid ad needs nobody's approval. Only an ad Bitwave took down waits."""
+    from app.services import ad_review
+    if ad.status != "pending" or await ad_review.was_taken_down(db, ad.id):
+        return
+    ad.status = "approved"
+    ad.review_note = "Approved automatically"
+    ad.reviewed_at = now
+    ad.reviewed_by = None
+    ad_review.record_event(db, ad, ad_review.ACTION_AUTO_APPROVE, None)
+
+
 async def confirm_payment(db: AsyncSession, payment_id: int, *, receipt: Optional[str],
                           now: Optional[datetime] = None) -> str:
     """Record a successful payment exactly once. Commits. Returns what happened:
@@ -566,6 +581,7 @@ async def confirm_payment(db: AsyncSession, payment_id: int, *, receipt: Optiona
         result = "refund_due"
     else:
         sale.weeks_banked = (sale.weeks_banked or 0) + payment.weeks
+        await _go_live_on_payment(db, ad, now)
         await activate_banked(db, sale, ad, now)
     await db.commit()
     if result == "applied":
@@ -629,7 +645,8 @@ async def handle_callback(db: AsyncSession, body: dict) -> str:
 async def on_approved(db: AsyncSession, ad: Ad, now: Optional[datetime] = None) -> None:
     """After an ad is approved (by an admin or automatically). Not committed.
 
-    A sold ad goes live with its banked weeks. One that was never paid gets no
+    A sold ad goes live with any banked weeks and credits them, exactly once: a
+    second call finds no banked weeks and no uncredited payment. One that was never paid gets no
     period at all (start/end cleared), so approving it can't make it run free."""
     if ad.slot != "reseller":
         return

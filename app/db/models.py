@@ -1257,10 +1257,8 @@ class AdSalePayment(Base):
 
 
 class AdReviewEvent(Base):
-    """Append-only history of what happened to an ad in review: approve,
-    reject, auto_approve, takedown. Counts the auto-approve threshold (a
-    reseller's sold ads approved by Bitwave, and any rejection or takedown)
-    and remembers takedowns so an edit can't put an ad straight back live."""
+    """Append-only history of an ad's status: approve, reject, auto_approve,
+    takedown. Remembers takedowns so an edit can't put an ad back live."""
     __tablename__ = "ad_review_events"
     id = Column(Integer, primary_key=True, autoincrement=True)
     ad_id = Column(Integer, nullable=False, index=True)
