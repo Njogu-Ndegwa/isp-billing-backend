@@ -1202,6 +1202,12 @@ class AdSale(Base):
     weeks = Column(Integer, nullable=False)                # weeks in the first order
     # Paid weeks that have not started running yet (paid before approval).
     weeks_banked = Column(Integer, nullable=False, default=0, server_default="0")
+    # When the running paid period last stopped showing (paused, Show Ads off, or
+    # an old pending status). NULL = the clock is running. Coming back moves
+    # ads.expires_at out by the time it was off (app/services/ad_sales.py).
+    off_since = Column(DateTime, nullable=True)
+    # Total time given back so far, in seconds.
+    off_seconds_total = Column(Integer, nullable=False, default=0, server_default="0")
     # The shop's read-only link: report, and the pay button while a payment is due.
     share_token = Column(String(48), nullable=False, unique=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -1249,6 +1255,16 @@ class AdSalePayment(Base):
     # records it here.
     refund_status = Column(String(10), nullable=True, index=True)
     refund_reason = Column(String(300), nullable=True)
+    # What the shop gets back. NULL = the whole amount (a payment that never ran).
+    # Otherwise refund_amount = reseller_recovery + bitwave_refund_part, set once
+    # when an ad that has run is stopped with whole days unused.
+    refund_amount = Column(Integer, nullable=True)
+    refund_unused_days = Column(Integer, nullable=True)
+    reseller_recovery = Column(Integer, nullable=True)
+    bitwave_refund_part = Column(Integer, nullable=True)
+    # The reseller_transaction_charges row that recovers reseller_recovery. No
+    # foreign key, like ad_id: money records outlive what they point at.
+    recovery_charge_id = Column(Integer, nullable=True)
     refunded_at = Column(DateTime, nullable=True)
     refunded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)

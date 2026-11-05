@@ -62,6 +62,8 @@ class PromptRequest(BaseModel):
     phone: Optional[str] = None
     weeks: Optional[int] = None
     price_per_week: Optional[int] = None
+    # The reseller told the shop a renewal's new price before this prompt.
+    confirm_new_price: bool = False
 
 
 class TakedownRequest(BaseModel):
@@ -277,12 +279,12 @@ async def _prompt(db, user, ad_id: int, body: PromptRequest, renew: bool) -> dic
     if renew:
         payment = await ad_sales.prepare_renewal(
             db, sale, ad, weeks=body.weeks, price_per_week=body.price_per_week,
-            phone=body.phone, requested_by=user_id,
+            phone=body.phone, requested_by=user_id, confirm_new_price=body.confirm_new_price,
         )
     else:
         payment = await ad_sales.prepare_resend(
             db, sale, phone=body.phone, weeks=body.weeks, price_per_week=body.price_per_week,
-            requested_by=user_id,
+            requested_by=user_id, confirm_new_price=body.confirm_new_price,
         )
     payment_id = payment.id
     await db.commit()
@@ -374,7 +376,11 @@ async def list_sales(
         items.append(summary)
     totals = {
         key: sum(i[key] for i in items)
-        for key in ("paid_total", "bitwave_fee_total", "reseller_share_total", "credited_total", "refund_due_total")
+        for key in (
+            "paid_total", "bitwave_fee_total", "reseller_share_total", "credited_total", "refund_due_total",
+            "refunded_total", "reseller_recovered_total", "bitwave_refund_part_total",
+            "shop_net_total", "bitwave_fee_net_total", "reseller_share_net_total",
+        )
     }
     page, per_page = max(page, 1), min(max(per_page, 1), 100)
     return {
@@ -402,25 +408,27 @@ async def take_down_ad(
     token: str = Depends(verify_token),
 ):
     """Take any ad off every portal at once. Paid weeks that never started are
-    flagged for refund; a running ad's paid time is not refunded automatically."""
+    flagged for a full refund. Whole days not used yet are flagged for refund and
+    the reseller's part of them is recorded as a debit. Sends no money, and a
+    repeat adds nothing."""
     user = await get_current_user(token, db)
     ar._require_admin(user)
     ad = await ar._load_owned_ad(db, user, ad_id)
     note = (request.note or "").strip()[:250]
     if not note:
         raise HTTPException(status_code=400, detail="Say why the ad was taken down")
+    await ad_sales.lock_sale_for_ad(db, ad)
     ad.status = "rejected"
     ad.review_note = f"Taken down by Bitwave: {note}"
     ad.reviewed_at = datetime.utcnow()
     ad.reviewed_by = user.id
     ad_review.record_event(db, ad, ad_review.ACTION_TAKEDOWN, user.id, note)
-    flagged = await ad_sales.on_rejected(db, ad, f"taken down: {note}")
+    flagged = await ad_sales.on_rejected(db, ad, note, actor_id=user.id, takedown=True)
     await db.commit()
     await invalidate_ad_cache()
     logger.info("Ad #%s taken down by admin %s (%s refunds flagged)", ad_id, user.id, flagged)
-    totals = await ar._event_totals(db, [ad.id])
-    names = await ar._owner_names(db, [ad.owner_user_id])
-    return ar._serialize_manage(ad, totals.get(ad.id), names.get(ad.owner_user_id))
+    await db.refresh(ad)
+    return await ar._manage_view(db, ad)
 
 
 @router.post("/api/ad-sales/payments/{payment_id}/refund")

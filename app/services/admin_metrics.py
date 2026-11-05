@@ -849,6 +849,11 @@ async def compute_arpu(db: AsyncSession) -> dict[str, Any]:
             .where(
                 ResellerTransactionCharge.created_at >= start,
                 ResellerTransactionCharge.created_at < end,
+                # Taking back an ad refund isn't revenue (app/services/ad_sales.py).
+                or_(
+                    ResellerTransactionCharge.reference.is_(None),
+                    ~ResellerTransactionCharge.reference.startswith("ad-refund:"),
+                ),
             )
         )).scalar())
 

@@ -90,7 +90,7 @@ EARNING_STREAMS: list[dict[str, str]] = [
     {"key": "subscription_minimum", "label": "Minimum / flat subscription fee", "group": "subscriptions"},
     {"key": "subscription_unattributed", "label": "Subscription payments without an invoice", "group": "subscriptions"},
     {"key": "sms_credits", "label": "SMS credit sales", "group": "sms"},
-    {"key": "ad_commission", "label": "Ad commission (20% of ads sold)", "group": "ads"},
+    {"key": "ad_commission", "label": "Ad commission (20% of ads sold, before the M-Pesa collection fee)", "group": "ads"},
 ]
 _SUBSCRIPTION_KEYS = tuple(s["key"] for s in EARNING_STREAMS if s["group"] == "subscriptions")
 
@@ -312,7 +312,14 @@ async def _not_counted(db: AsyncSession, w: Windows) -> dict[str, float]:
         ), 0))
         .select_from(ResellerTransactionCharge)
         .outerjoin(User, User.id == ResellerTransactionCharge.reseller_id)
-        .where(_in_window(ResellerTransactionCharge.created_at, w.cur_start, w.cur_end))
+        .where(
+            _in_window(ResellerTransactionCharge.created_at, w.cur_start, w.cur_end),
+            # Taking back an ad refund isn't a charge Bitwave recovered.
+            or_(
+                ResellerTransactionCharge.reference.is_(None),
+                ~ResellerTransactionCharge.reference.startswith("ad-refund:"),
+            ),
+        )
     )).scalar() or 0)
     return {"shop_sales": round(shop, 2), "reseller_transaction_charges": round(charges, 2)}
 
