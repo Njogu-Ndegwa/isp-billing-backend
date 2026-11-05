@@ -680,6 +680,21 @@ async def edit_customer(
 
             schedule_expiry_tag_sync([customer.id, *shared_devices_changed], "admin expiry edit")
 
+        plan_push = None
+        if customer.plan_id != old_plan_id and customer.plan and not customer.pppoe_username:
+            old_speed = (
+                await db.execute(select(Plan.speed).where(Plan.id == old_plan_id))
+            ).scalar_one_or_none()
+            if old_speed != customer.plan.speed:
+                # Without this the customer stays on the old speed until the next
+                # fleet queue sync, while the dashboard already shows the new plan.
+                from app.services.subscription_sharing import push_plan_edit_to_router
+
+                plan_push = await push_plan_edit_to_router(
+                    db, customer=customer, plan=customer.plan, router=customer.router,
+                )
+            await db.commit()
+
         provision_status = None
         provision_error = None
         if (
@@ -774,6 +789,8 @@ async def edit_customer(
             "pppoe_provision_error": provision_error,
             "activated_paid_until": activating,
             "static_reprovisioned": static_status,
+            # {"pushed": n, "held_by_fup": n} when a hotspot plan edit changed the speed.
+            "plan_push": plan_push,
         }
     except HTTPException:
         raise

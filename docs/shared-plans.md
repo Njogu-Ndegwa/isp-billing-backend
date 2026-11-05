@@ -82,6 +82,9 @@ expiry and plan to shared devices. Grace periods and outage compensation also pr
 
 ## Router delivery
 
+- **Dashboard plan edit:** a speed change is pushed at once to the owner and shared devices,
+  except any under a FUP throttle or block (`push_plan_edit_to_router`). Devices drop for a
+  moment. The fleet queue sync stays the fallback. The open period keeps its cap.
 - **Push:** `provision_hotspot_customer` for each device, with an attempt keyed by pairing.
 - **Retry:** `retry_pending_hotspot_provisioning_background`. A renewal resets the reused
   attempt's window.
