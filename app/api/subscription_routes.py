@@ -1185,6 +1185,12 @@ async def admin_create_owner_bank_destination(
 
     if method_type not in OWNER_DESTINATION_TYPES:
         raise HTTPException(status_code=400, detail="method_type must be bank_account or mpesa_paybill")
+    from app.services.payment_numbers import InvalidNumber, normalize_fields
+
+    try:
+        normalize_fields(request, ("bank_paybill_number", "bank_account_number", "mpesa_paybill_number"))
+    except InvalidNumber as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if method_type == ResellerPaymentMethodType.BANK_ACCOUNT:
         if not request.bank_paybill_number or not request.bank_account_number:
             raise HTTPException(

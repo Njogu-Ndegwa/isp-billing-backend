@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable
 
 from sqlalchemy import and_, not_, or_, select, text
 
+from app.services.fapshi_reconciliation import non_fapshi_attempt_clause
 from app.config import settings
 from app.db.database import async_session, db_pool_snapshot
 from app.services.router_availability import record_router_availability
@@ -1031,7 +1032,7 @@ async def _load_waiting_push_context(
                 .join(Customer, ProvisioningAttempt.customer_id == Customer.id)
                 .join(Plan, Customer.plan_id == Plan.id)
                 .join(Router, Customer.router_id == Router.id)
-                .where(ProvisioningAttempt.id == attempt_id)
+                .where(ProvisioningAttempt.id == attempt_id, non_fapshi_attempt_clause())
             )
         ).first()
         ctx = None
@@ -1141,6 +1142,7 @@ async def rearm_checkin_only_fallbacks(now: datetime | None = None) -> int:
                     ProvisioningAttempt.created_at,
                 )
                 .where(
+                    non_fapshi_attempt_clause(),
                     ProvisioningAttempt.provisioning_state == ProvisioningState.SCHEDULED,
                     ProvisioningAttempt.router_id.in_(sorted(router_ids)),
                     ProvisioningAttempt.entrypoint.in_(entrypoints),
@@ -1521,6 +1523,7 @@ async def retry_pending_hotspot_provisioning_background():
             terminal_candidates = (
                 await db.execute(
                     select(ProvisioningAttempt).where(
+                        non_fapshi_attempt_clause(),
                         ProvisioningAttempt.provisioning_state.in_(
                             [
                                 ProvisioningState.SCHEDULED,
@@ -1551,6 +1554,7 @@ async def retry_pending_hotspot_provisioning_background():
                     .join(Plan, Customer.plan_id == Plan.id)
                     .join(Router, Customer.router_id == Router.id)
                     .where(
+                        non_fapshi_attempt_clause(),
                         Customer.status == CustomerStatus.ACTIVE,
                         Customer.mac_address.isnot(None),
                         Customer.expiry.isnot(None),

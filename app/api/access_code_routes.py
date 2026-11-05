@@ -8,8 +8,10 @@ A customer types the same code on each device they want online:
 
 The plan's ``max_shared_users`` caps how many devices can hold it at once.
 At the cap, the new device is refused and shown the plan's devices so the
-owner can remove one; nobody is kicked automatically. The same code is the
-only credential that can list or remove the plan's devices.
+owner can remove one. Nobody is kicked automatically, except that a reseller
+fleet may opt in to freeing a slot held by a long-gone randomized MAC (see
+app/services/shared_slot_release.py). The same code is the only credential that
+can list or remove the plan's devices.
 """
 
 import logging
@@ -30,6 +32,7 @@ from app.api.device_pairing import (
     _parse_device_type,
     _share_subscription_for_owner,
     _validate_device_mac,
+    device_is_attached,
     disconnect_shared_pairing,
     list_subscription_devices,
     load_access_code_owner,
@@ -41,9 +44,12 @@ from app.api.device_pairing import (
 from app.db.database import get_db
 from app.db.models import Customer, CustomerStatus, Router
 from app.services.code_attempt_limiter import check_code_attempts, record_code_failure
+from app.services.customer_events import record_customer_event
 from app.services.mikrotik_api import normalize_mac_address
 from app.services.router_helpers import get_router_by_id
+from app.services.shared_slot_release import pick_slot_to_release
 from app.services.subscription_sharing import (
+    active_shared_device_count,
     max_devices_for_customer,
     sharing_enabled_for_customer,
 )
@@ -193,6 +199,25 @@ async def redeem_code_on_device(
             )
             return {**result, **_plan_summary(own), "outcome": "main_device"}
 
+        # Holding a slot on a plan whose limit dropped below its devices: this
+        # device comes back, the same as on a healthy group.
+        if await device_is_attached(
+            db, owner_id=owner.id, router_id=router_id, normalized_mac=normalized_mac,
+        ):
+            return await add_device_to_owner_plan(
+                db,
+                owner=owner,
+                router_id=router_id,
+                normalized_mac=normalized_mac,
+                device_type=device_type,
+                device_name=device_name,
+                summary=summary,
+            )
+
+        full = await attached_devices_full_exc(db, owner=owner, normalized_mac=normalized_mac)
+        if full is not None:
+            raise full
+
         from app.api.public_routes import _move_idle_purchase_or_refuse
 
         result = await _move_idle_purchase_or_refuse(
@@ -213,6 +238,7 @@ async def redeem_code_on_device(
         device_type=device_type,
         device_name=device_name,
         summary=summary,
+        free_idle_slot=True,
     )
 
 
@@ -247,6 +273,43 @@ async def _own_purchase_on_device(
     return None
 
 
+async def attached_devices_full_exc(
+    db: AsyncSession,
+    *,
+    owner: Customer,
+    normalized_mac: str,
+) -> Optional[HTTPException]:
+    """409 ``device_limit_reached`` for a plan that already carries more devices
+    than its current limit allows, else None.
+
+    A shared plan's device limit comes from ``max_devices_override`` or the
+    current plan's ``max_shared_users``. Redeeming a single-device voucher on
+    the owner's device swaps the plan and with it the limit, while the shared
+    devices stay attached: router 446, customer 50758 (2 Nov 2026), a 10-device
+    240 GB group with 5 shared phones became a 1-device "TV BUNDLE". A reconnect
+    then treated it as a single-device plan and moved it off its TV. Such a plan
+    is a full multi-device plan: no slot is free, nothing is moved by a code.
+    """
+    limit = max_devices_for_customer(owner, owner.plan)
+    shares = await active_shared_device_count(db, owner.id)
+    if shares == 0 or shares + 1 < limit:
+        return None
+    devices = await list_subscription_devices(db, owner=owner, current_mac=normalized_mac)
+    in_use = shares + 1
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "device_limit_reached",
+            "message": (
+                f"This plan is in use on all its {in_use} devices. "
+                "Remove one to connect this device."
+            ),
+            "max_devices": in_use,
+            "devices": devices,
+        },
+    )
+
+
 async def add_device_to_owner_plan(
     db: AsyncSession,
     *,
@@ -256,19 +319,24 @@ async def add_device_to_owner_plan(
     device_type: str = "other",
     device_name: Optional[str] = None,
     summary: Optional[dict] = None,
+    free_idle_slot: bool = False,
 ) -> dict:
     """Add ``normalized_mac`` as another device on ``owner``'s plan.
 
     Shared by the code path above and phone-number reconnect. When every slot
     is taken this raises 409 ``device_limit_reached`` with the plan's devices,
     which the captive portal shows so the customer can remove one.
+
+    ``free_idle_slot``: first try freeing a slot held by a long-gone randomized
+    MAC. Only for someone holding the plan's code, never for a phone number.
     """
     summary = summary if summary is not None else _plan_summary(owner)
     owner_id = owner.id
-    try:
-        result = await _share_subscription_for_owner(
+
+    async def _add(target: Customer) -> dict:
+        return await _share_subscription_for_owner(
             db,
-            owner=owner,
+            owner=target,
             router_id=router_id,
             normalized_mac=normalized_mac,
             device_type=_parse_device_type(device_type),
@@ -276,6 +344,17 @@ async def add_device_to_owner_plan(
             device_owner_phone=None,
             device_owner_name=None,
         )
+
+    try:
+        try:
+            result = await _add(owner)
+        except DeviceLimitReached:
+            await db.rollback()
+            owner = await load_access_code_owner(db, owner_customer_id=owner_id, router_id=router_id)
+            if not free_idle_slot or not await _release_idle_slot(db, owner=owner, router_id=router_id):
+                raise
+            owner = await load_access_code_owner(db, owner_customer_id=owner_id, router_id=router_id)
+            result = await _add(owner)
     except DeviceLimitReached as exc:
         await db.rollback()
         owner = await load_access_code_owner(db, owner_customer_id=owner_id, router_id=router_id)
@@ -285,7 +364,7 @@ async def add_device_to_owner_plan(
             detail={
                 "error": "device_limit_reached",
                 "message": (
-                    f"This plan is already in use on {exc.max_shared_users} devices. "
+                    f"This plan is in use on all its {exc.max_shared_users} devices. "
                     "Remove one to connect this device."
                 ),
                 "max_devices": exc.max_shared_users,
@@ -299,6 +378,42 @@ async def add_device_to_owner_plan(
         "outcome": "device_added",
         "message": "You're connected. This device now shares the plan.",
     }
+
+
+async def _release_idle_slot(db: AsyncSession, *, owner: Customer, router_id: int) -> bool:
+    """Free one slot held by a long-gone randomized MAC. True if one was freed."""
+    slot = await pick_slot_to_release(db, owner=owner, router_id=router_id)
+    if slot is None:
+        return False
+    try:
+        outcome = await disconnect_shared_pairing(
+            db, owner=owner, router_id=router_id, pairing_id=slot.pairing_id,
+        )
+    except HTTPException:  # another request released it first
+        await db.rollback()
+        return False
+    logger.warning(
+        "[SHARED-SLOT] Released idle device %s (pairing %s, customer %s) from owner %s on router %s: "
+        "last seen %s, router cleanup %s",
+        slot.mac, slot.pairing_id, slot.customer_id, owner.id, router_id,
+        slot.last_seen.isoformat(), outcome.get("cleanup_status"),
+    )
+    await record_customer_event(
+        owner.id,
+        "shared_device_auto_released",
+        f"Device {slot.mac} released from this plan: not seen since {slot.last_seen:%Y-%m-%d} (UTC)",
+        source="system",
+        user_id=owner.user_id,
+        router_id=router_id,
+        details={
+            "pairing_id": slot.pairing_id,
+            "customer_id": slot.customer_id,
+            "mac": slot.mac,
+            "last_seen": slot.last_seen.isoformat(),
+            "cleanup_status": outcome.get("cleanup_status"),
+        },
+    )
+    return True
 
 
 @router.post("/api/public/access-code/redeem")

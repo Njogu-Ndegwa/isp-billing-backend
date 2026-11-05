@@ -109,7 +109,6 @@ When a reseller's subscription is `suspended` or `inactive`, the following exist
 | `POST /api/mpesa/payment` | Initiating customer payments |
 | `POST /api/hotspot/register-and-pay` | Hotspot registration + payment |
 | `POST /api/routers` | Adding new routers |
-| `POST /api/radius/register-and-pay` | RADIUS hotspot payment (returns 503) |
 
 ### 403 Response body
 

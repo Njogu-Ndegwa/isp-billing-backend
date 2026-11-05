@@ -113,8 +113,8 @@ async def enforce_shadow_mode(request: Request, call_next):
     return response
 
 # --- Router registrations ---
-from app.api.radius_endpoints import router as radius_router
-from app.api.radius_hotspot import router as radius_hotspot_router
+# /api/radius/* (management + RADIUS hotspot pay flow) was removed on 29 Oct 2026:
+# RADIUS is unused, and those routes were unauthenticated. FreeRADIUS tables stay.
 from app.api.session_monitor import router as session_monitor_router
 from app.api.auth_routes import router as auth_router
 from app.api.public_routes import router as public_router
@@ -128,6 +128,7 @@ from app.api.payment_routes import router as payment_router
 from app.api.dashboard_routes import router as dashboard_router
 from app.api.mikrotik_routes import router as mikrotik_router
 from app.api.ads_routes import router as ads_router
+from app.api.ad_sales_routes import router as ad_sales_router
 from app.api.ratings_routes import router as ratings_router
 from app.api.voucher_routes import router as voucher_router
 from app.api.provisioning import router as provisioning_router
@@ -170,8 +171,6 @@ from app.api.admin_support_desk_routes import router as admin_support_desk_route
 from app.api.staff_routes import router as staff_router
 from app.api.router_ap_routes import router as router_ap_router
 
-app.include_router(radius_router)
-app.include_router(radius_hotspot_router)
 app.include_router(session_monitor_router)
 app.include_router(auth_router)
 app.include_router(public_router)
@@ -185,6 +184,7 @@ app.include_router(payment_router)
 app.include_router(dashboard_router)
 app.include_router(mikrotik_router)
 app.include_router(ads_router)
+app.include_router(ad_sales_router)
 app.include_router(ratings_router)
 app.include_router(voucher_router)
 app.include_router(provisioning_router)
@@ -835,6 +835,31 @@ async def run_payment_method_migrations():
         await conn.run_sync(
             lambda c: FapshiTransaction.__table__.create(c, checkfirst=True)
         )
+        # Durable confirmation queue and immutable purchase contract. Legacy
+        # rows intentionally retain a NULL snapshot and are review-held.
+        await conn.execute(sa_text("""
+            ALTER TABLE fapshi_transactions
+            ADD COLUMN IF NOT EXISTS purchase_snapshot JSON,
+            ADD COLUMN IF NOT EXISTS customer_payment_id INTEGER REFERENCES customer_payments(id),
+            ADD COLUMN IF NOT EXISTS provider_status VARCHAR(20),
+            ADD COLUMN IF NOT EXISTS review_reason VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS check_attempts INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS check_lease_until TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS check_lease_token VARCHAR(64),
+            ADD COLUMN IF NOT EXISTS last_check_error VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS fulfillment_pending BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS applied_expiry TIMESTAMP
+        """))
+        await conn.execute(sa_text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_fapshi_customer_payment
+            ON fapshi_transactions (customer_payment_id)
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_fapshi_confirmation_due
+            ON fapshi_transactions (next_check_at, id)
+            WHERE review_reason IS NULL
+        """))
 
         # Buy Goods till payouts (2026-07-21): the pre-existing enum type
         # no-ops the CREATE TYPE above via duplicate_object, so new values
@@ -3365,6 +3390,70 @@ async def run_customer_audit_index_migrations():
     logger.info("Customer audit index migrations complete")
 
 
+async def run_hero_ads_migrations():
+    """Hero ads (2026-10): placement, media, ownership, targeting and approval
+    columns on ads; advertiser_id and image_url made optional; and the
+    append-only ad_events table that replaces the per-load counter updates.
+
+    Ads that predate approval are backfilled as approved (the status column's
+    server default), so anything already live stays live. Idempotent: safe on
+    every startup.
+    """
+    from sqlalchemy import inspect
+    from app.db.models import AdEvent
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+        if "ad_events" not in tables:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=[AdEvent.__table__]))
+            logger.info("Hero ads migration: created ad_events")
+        if "ads" not in tables:
+            return
+        await conn.execute(sa_text(
+            "ALTER TABLE ads "
+            "ADD COLUMN IF NOT EXISTS placement VARCHAR(20) NOT NULL DEFAULT 'local', "
+            "ADD COLUMN IF NOT EXISTS media_type VARCHAR(10) NOT NULL DEFAULT 'image', "
+            "ADD COLUMN IF NOT EXISTS video_url VARCHAR(500) NULL, "
+            "ADD COLUMN IF NOT EXISTS poster_url VARCHAR(500) NULL, "
+            "ADD COLUMN IF NOT EXISTS image_fit VARCHAR(10) NOT NULL DEFAULT 'cover', "
+            "ADD COLUMN IF NOT EXISTS bg_color VARCHAR(9) NULL, "
+            "ADD COLUMN IF NOT EXISTS slot VARCHAR(10) NOT NULL DEFAULT 'platform', "
+            "ADD COLUMN IF NOT EXISTS owner_user_id INTEGER NULL REFERENCES users(id), "
+            "ADD COLUMN IF NOT EXISTS router_ids JSON NULL, "
+            "ADD COLUMN IF NOT EXISTS status VARCHAR(12) NOT NULL DEFAULT 'approved', "
+            "ADD COLUMN IF NOT EXISTS review_note VARCHAR(300) NULL, "
+            "ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP NULL, "
+            "ADD COLUMN IF NOT EXISTS reviewed_by INTEGER NULL REFERENCES users(id), "
+            "ADD COLUMN IF NOT EXISTS starts_at TIMESTAMP NULL"
+        ))
+        await conn.execute(sa_text("ALTER TABLE ads ALTER COLUMN advertiser_id DROP NOT NULL"))
+        await conn.execute(sa_text("ALTER TABLE ads ALTER COLUMN image_url DROP NOT NULL"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_ads_owner_user_id ON ads (owner_user_id)"))
+        await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_ads_status ON ads (status)"))
+    logger.info("Hero ads migrations complete")
+
+
+async def run_ad_sales_migrations():
+    """Selling ads through Bitwave (2026-11): creates the new tables ad_sales,
+    ad_sale_payments and ad_review_events if they are missing. Additive only:
+    no existing table or column changes. Idempotent: safe on every startup.
+    """
+    from sqlalchemy import inspect
+    from app.db.models import AdReviewEvent, AdSale, AdSalePayment
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+        missing = [
+            model.__table__
+            for model in (AdSale, AdSalePayment, AdReviewEvent)
+            if model.__tablename__ not in tables
+        ]
+        if missing:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=missing))
+            logger.info("Ad sales migration: created %s", ", ".join(t.name for t in missing))
+    logger.info("Ad sales migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     if shadow_mode_enabled():
@@ -3490,6 +3579,20 @@ async def startup_event():
         logger.info("FUP / usage tracking migrations completed successfully")
     except Exception as e:
         logger.error(f"FUP / usage tracking migration failed (non-fatal): {e}")
+
+    try:
+        # Once-only in effect: repaired rows no longer match, and periods opened
+        # after the fix are excluded by date. Loosens caps, never tightens.
+        from app.db.database import AsyncSessionLocal
+        from app.services.usage_tracking import repair_stale_cap_snapshots
+
+        async with AsyncSessionLocal() as repair_db:
+            repaired_caps = await repair_stale_cap_snapshots(repair_db)
+            await repair_db.commit()
+        if repaired_caps:
+            logger.warning("[FUP] Repaired stale usage caps: %s", repaired_caps)
+    except Exception as e:
+        logger.error(f"Stale usage cap repair failed (non-fatal): {e}")
 
     try:
         await run_payment_history_migrations()
@@ -3689,6 +3792,16 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Support desk migration failed (non-fatal): {e}")
 
+    try:
+        await run_hero_ads_migrations()
+    except Exception as e:
+        logger.error(f"Hero ads migration failed (non-fatal): {e}")
+
+    try:
+        await run_ad_sales_migrations()
+    except Exception as e:
+        logger.error(f"Ad sales migration failed (non-fatal): {e}")
+
     from app.config import settings as app_settings
     if not scheduler_enabled():
         if scheduler.running:
@@ -3715,6 +3828,28 @@ async def startup_event():
         name='Remove expired hotspot users from MikroTik',
         replace_existing=True,
         max_instances=1
+    )
+    # Sold ads: confirm M-Pesa prompts whose callback never came, and time
+    # out the ones nobody answered (app/services/ad_sales.py).
+    from app.services.ad_sales import reconcile_ad_sale_payments_background
+    scheduler.add_job(
+        reconcile_ad_sale_payments_background,
+        trigger=IntervalTrigger(seconds=60),
+        id='ad_sale_payment_reconcile',
+        name='Confirm or time out M-Pesa prompts for sold ads',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,
+    )
+    from app.services.fapshi_reconciliation import recheck_pending_fapshi_background
+    scheduler.add_job(
+        recheck_pending_fapshi_background,
+        trigger=IntervalTrigger(seconds=30),
+        id='fapshi_confirmation_recheck',
+        name='Confirm delayed Fapshi collections and retry durable delivery',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=30,
     )
     # Safety-net bypass scan + idle-credential reaper. Split out of the job
     # above so the 5-6 min fleet scan no longer pauses removals; each keeps its

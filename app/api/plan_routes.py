@@ -133,17 +133,28 @@ def _serialize_plan_trial(plan: Plan) -> dict:
     return {"trial_once_per_customer": bool(plan.trial_once_per_customer)}
 
 
+# Connection types a free trial can be on. Hotspot trials are claimed by the
+# customer from the captive portal; PPPoE trials are given by the reseller,
+# who registers the customer on the plan and activates them (no portal, no
+# payment). Static IP has no trial flow.
+FREE_TRIAL_CONNECTION_TYPES = (ConnectionType.HOTSPOT, ConnectionType.PPPOE)
+
+
 def _validate_free_trial_plan(plan: Plan) -> None:
-    """Free trials are claimed from the captive portal at no charge, so the
-    plan must be free and must be a hotspot plan (PPPoE customers have no
-    portal to claim from). Like any hotspot plan, ``max_shared_users`` sets how
-    many devices the claimed trial covers."""
+    """A free trial must cost 0 and be a hotspot or PPPoE plan.
+
+    Hotspot: claimed from the captive portal; ``max_shared_users`` sets how
+    many devices the claimed trial covers. PPPoE: the reseller activates the
+    customer on it, ``max_shared_users`` is the usual PPPoE device limit, and
+    the activation is recorded as a zero, non-revenue payment."""
     if plan.plan_type != PlanType.FREE_TRIAL:
         return
     if plan.price:
         raise HTTPException(status_code=400, detail="A free trial plan must have a price of 0")
-    if plan.connection_type != ConnectionType.HOTSPOT:
-        raise HTTPException(status_code=400, detail="Free trial plans are only available for hotspot")
+    if plan.connection_type not in FREE_TRIAL_CONNECTION_TYPES:
+        raise HTTPException(
+            status_code=400, detail="Free trial plans are only available for hotspot and PPPoE"
+        )
 
 
 async def _validate_router_scope(

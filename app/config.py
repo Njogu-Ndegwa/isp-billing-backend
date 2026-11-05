@@ -210,6 +210,11 @@ class Settings(BaseSettings):
     # default: it is router I/O across the fleet. The per-customer "pull router
     # logs" button works either way.
     CUSTOMER_LOG_COLLECTOR_ENABLED: bool = False
+    # When a new device enters a full shared plan's code, free one slot held by a
+    # randomized MAC unseen for this many days (minimum 7) and not on the Wi-Fi now.
+    # See app/services/shared_slot_release.py.
+    SHARED_SLOT_IDLE_RELEASE_ENABLED: bool = False
+    SHARED_SLOT_IDLE_RELEASE_DAYS: int = 7
     CUSTOMER_LOG_COLLECTOR_ROUTERS_PER_TICK: int = 4
     # A router is read at most this often by the collector.
     CUSTOMER_LOG_COLLECTOR_MIN_REVISIT_SECONDS: int = 900
@@ -430,6 +435,18 @@ class Settings(BaseSettings):
     # comma-separated "Graph-Id=service:Graph-Id:..." -- each subgraph's own
     # key, as in its deployment-charts APOLLO_KEY. Empty = GraphQL tab off.
     OVES_APOLLO_GRAPH_KEYS: str = ""
+
+    # Ad media (hero ad photos and videos) on Cloudflare R2, uploaded straight
+    # from the browser with a presigned PUT so the bytes never pass through
+    # this box (its container filesystem is read-only anyway). Served to
+    # portals from AD_MEDIA_PUBLIC_BASE, which must be a host already in every
+    # router's walled garden, e.g. https://isp.bitwavetechnologies.com/media
+    # routed to the bucket by Cloudflare. Any value empty = uploads disabled.
+    R2_ACCOUNT_ID: str = ""
+    R2_ACCESS_KEY_ID: str = ""
+    R2_SECRET_ACCESS_KEY: str = ""
+    R2_BUCKET: str = ""
+    AD_MEDIA_PUBLIC_BASE: str = ""
 
     class Config:
         env_file = ".env"

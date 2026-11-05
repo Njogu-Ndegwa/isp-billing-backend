@@ -444,7 +444,7 @@ async def receive_usage_push(
 
     if pilot:
         _record_live_state(router_row.id, payload, result, via_tunnel)
-        _spawn(_enforce_caps(result.over_cap_customer_ids))
+        _spawn(_enforce_caps(result.over_cap_customer_ids + result.release_fup_customer_ids))
 
     if result.over_cap_customer_ids:
         # Enforcement does RouterOS I/O, so it must not run inside this request

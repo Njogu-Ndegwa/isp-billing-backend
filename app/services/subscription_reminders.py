@@ -1,7 +1,7 @@
 """Pre-expiry subscription reminders for resellers (admin-funded SMS + inbox).
 
 Why this exists: when a reseller's subscription lapses they are suspended, and
-suspension is not just a locked admin panel — ``radius_hotspot`` refuses hotspot
+suspension is not just a locked admin panel — the hotspot pay flow refuses
 payments for a suspended owner, so their *customers* cannot buy internet either.
 A reseller who forgets to renew loses revenue, and so do we. These texts are sent
 on the platform's own SMS account (``SmsMessageKind.ADMIN_TO_RESELLER``, the same

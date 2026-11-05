@@ -15,6 +15,7 @@ from app.db.models import (
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
 from app.services.customer_grace import access_floor, effective_expiry, has_access_time
+from app.services.ad_serving import ads_for_router, network_ads
 from app.services.plan_cache import (
     get_plans_cached,
     select_portal_plans,
@@ -797,7 +798,6 @@ async def get_portal_data(
     )
     emergency_active = bool(getattr(router_obj, "emergency_active", False))
     plans = select_portal_plans(visible_plans, all_plans_for_flags, emergency_active)
-    ads_data = await _fetch_active_ads(db)
     portal_settings_result = await db.execute(
         select(PortalSettings).where(PortalSettings.user_id == router_obj.user_id)
     )
@@ -817,6 +817,13 @@ async def get_portal_data(
     ) if any(p.get("plan_type") == "regular" for p in all_plans_for_flags) else False
 
     portal_settings = portal_settings_result.scalar_one_or_none()
+    # This router's ads only (Bitwave's plus its owner's own, approved and
+    # in date), from a cache shared by every portal load. None when the
+    # reseller has ads switched off.
+    ads_data = await ads_for_router(
+        db, router_obj.id, router_obj.user_id,
+        show_ads=bool(getattr(portal_settings, "show_ads", False)),
+    )
 
     # Order the packages the way this reseller asked for. The portal applies the
     # same order client-side; sorting here as well means any client that renders
@@ -851,36 +858,6 @@ async def get_portal_data(
         },
         "portal_settings": _build_public_response(portal_settings, reseller),
     }
-
-
-async def _fetch_active_ads(db: AsyncSession, limit: int = 20):
-    stmt = (
-        select(Ad)
-        .where(Ad.is_active == True)
-        .where(or_(Ad.expires_at == None, Ad.expires_at > datetime.utcnow()))
-        .order_by(Ad.priority.desc(), Ad.created_at.desc())
-        .limit(limit)
-    )
-    result = await db.execute(stmt)
-    ads = result.scalars().all()
-    return [
-        {
-            "id": ad.id,
-            "title": ad.title,
-            "description": ad.description,
-            "image_url": ad.image_url,
-            "seller_name": ad.seller_name,
-            "seller_location": ad.seller_location,
-            "phone_number": ad.phone_number,
-            "whatsapp_number": ad.whatsapp_number,
-            "price": ad.price,
-            "price_value": ad.price_value,
-            "badge_type": ad.badge_type.value if ad.badge_type else None,
-            "badge_text": ad.badge_text,
-            "category": ad.category,
-        }
-        for ad in ads
-    ]
 
 
 @router.post("/api/public/voucher/redeem")
@@ -1593,6 +1570,46 @@ async def reconnect_self_service(
             await db.commit()
             return result
 
+    # A plan already carrying more devices than its current limit (a group
+    # whose plan was swapped by a single-device voucher) is a FULL multi-device
+    # plan: nothing is added, and its main device may only move under the
+    # rules below (never when online or paired to a TV).
+    if device_limit_exc is None:
+        from app.api.access_code_routes import add_device_to_owner_plan, attached_devices_full_exc
+        from app.api.device_pairing import device_is_attached
+
+        for c in candidates:
+            # A device already holding a slot on such a plan comes back, the
+            # same as on a healthy group.
+            if (
+                c.plan
+                and c.plan.connection_type == ConnectionType.HOTSPOT
+                and c.expiry > now
+                and not sharing_enabled_for_customer(c, c.plan)
+                and await device_is_attached(
+                    db, owner_id=c.id, router_id=request.router_id, normalized_mac=normalized_mac,
+                )
+            ):
+                owner_id = c.id
+                result = await add_device_to_owner_plan(
+                    db, owner=c, router_id=request.router_id, normalized_mac=normalized_mac,
+                )
+                db.add(ReconnectionAttempt(
+                    phone=phone_raw, mac_address=normalized_mac,
+                    router_id=request.router_id, customer_id=owner_id,
+                    success=True, created_at=datetime.utcnow(),
+                ))
+                await db.commit()
+                return result
+
+        for c in candidates:
+            if c.plan and not sharing_enabled_for_customer(c, c.plan):
+                device_limit_exc = await attached_devices_full_exc(
+                    db, owner=c, normalized_mac=normalized_mac,
+                )
+                if device_limit_exc is not None:
+                    break
+
     # (3) Move a purchase whose device is not in use (a phone whose randomized
     # MAC rotated, a replaced phone, a plan never bound to a device).
     # (4) Otherwise refuse: never revoke a device that is in use.
@@ -1955,59 +1972,23 @@ async def get_public_ads(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Fetch active ads for captive portal display (public, no auth required).
-    Returns paginated active ads sorted by priority then created_at.
+    Network-wide Bitwave ads for captive portal display (public, no auth).
+    Router-scoped and reseller ads only reach a portal through
+    /api/public/portal/{identity}, which knows the router.
     """
     try:
+        ads = await network_ads(db, limit=100)
+        if category:
+            ads = [a for a in ads if a.get("category") == category]
+        page, per_page = max(page, 1), min(max(per_page, 1), 50)
+        total = len(ads)
         offset = (page - 1) * per_page
-
-        stmt = (
-            select(Ad)
-            .where(Ad.is_active == True)
-            .where(or_(Ad.expires_at == None, Ad.expires_at > datetime.utcnow()))
-            .order_by(Ad.priority.desc(), Ad.created_at.desc())
-            .offset(offset)
-            .limit(per_page)
-        )
-
-        if category:
-            stmt = stmt.where(Ad.category == category)
-
-        result = await db.execute(stmt)
-        ads = result.scalars().all()
-
-        count_stmt = select(func.count(Ad.id)).where(
-            Ad.is_active == True,
-            or_(Ad.expires_at == None, Ad.expires_at > datetime.utcnow())
-        )
-        if category:
-            count_stmt = count_stmt.where(Ad.category == category)
-        total_result = await db.execute(count_stmt)
-        total = total_result.scalar() or 0
-
         return {
-            "ads": [
-                {
-                    "id": ad.id,
-                    "title": ad.title,
-                    "description": ad.description,
-                    "image_url": ad.image_url,
-                    "seller_name": ad.seller_name,
-                    "seller_location": ad.seller_location,
-                    "phone_number": ad.phone_number,
-                    "whatsapp_number": ad.whatsapp_number,
-                    "price": ad.price,
-                    "price_value": ad.price_value,
-                    "badge_type": ad.badge_type.value if ad.badge_type else None,
-                    "badge_text": ad.badge_text,
-                    "category": ad.category,
-                }
-                for ad in ads
-            ],
+            "ads": ads[offset:offset + per_page],
             "total": total,
             "page": page,
             "per_page": per_page,
-            "pages": (total + per_page - 1) // per_page if per_page > 0 else 0,
+            "pages": (total + per_page - 1) // per_page,
         }
     except Exception as e:
         logger.error(f"Error fetching public ads: {e}")
