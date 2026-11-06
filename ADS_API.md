@@ -123,8 +123,11 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
   (`users.support_phone`, portal support phone/WhatsApp). Anything else is refused with
   "choose An ad I sold".
 - **An ad I sold (`reseller`)** is created only through `POST /api/ad-sales` (the old
-  `POST /api/ads` refuses `slot: "reseller"` for resellers). Price per week ≥ KES 200
-  (≤ 12,500), 1–12 whole weeks. Kenyan (M-Pesa) resellers only for now.
+  `POST /api/ads` refuses `slot: "reseller"` for resellers). The reseller sets any weekly price
+  (Dennis, 6 Nov 2026): a whole number of shillings, KES 1 or more, for 1–12 whole weeks. Price ×
+  weeks has to fit in one M-Pesa payment: Safaricom allows KES 250,000 per transaction
+  (`ad_sales.MAX_TOTAL`), and a bigger total is refused with a 400 before any prompt goes out.
+  Kenyan (M-Pesa) resellers only for now.
 - **Selling is a pilot until an admin opens it.** `ads_selling_mode` is `off`, `allowlist` or
   `everyone`; with nothing saved it is `allowlist` with reseller 20 only. Outside it, creating a sold
   ad and sending any prompt (reseller or shop link) answer 403 "coming soon". Own promos, reviews,
@@ -144,13 +147,13 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
 - **Money**: the business pays the total by STK push to Bitwave's own paybill (the system
   shortcode), also for direct-settlement resellers. `bitwave_fee = floor(amount × 20 / 100)`,
   `reseller_share = amount − bitwave_fee` (rounding favours the reseller: KES 1,005 → 201 / 804).
+  There is no minimum fee: on KES 1–4 `bitwave_fee` is 0 and the reseller gets all of it.
   The split is on the gross amount. Safaricom's collection fee comes out of Bitwave's 20%, and the
   reseller's normal payout transfer fee still applies when money is sent.
 - **Time off doesn't use up paid time**: while a running ad is paused or Show Ads is off, its paid
   days stop counting and `live_until` keeps moving. When it shows again `expires_at` moves out by the
   time it was off. Overlapping reasons count once.
-- **Price changes**: the weekly price is capped at KES 12,500. A new price applies from the next
-  renewal only: a paid period keeps its price, and `price_per_week` on the sale changes when the
+- **Price changes**: a new price applies from the next renewal only: a paid period keeps its price, and `price_per_week` on the sale changes when the
   renewal is paid. A renewal at a new price answers 409 until `confirm_new_price: true` says the
   reseller told the shop. While it is due, the sale shows `due_price_per_week` and
   `price_changed_from`, and the shop's link shows `payment_due.previous_price_per_week`. The M-Pesa
@@ -175,7 +178,8 @@ Code: `app/api/ad_sales_routes.py`, money rules in `app/services/ad_sales.py`, r
   who refunds by hand and records it.
 - **Taking down an ad that has run** (or rejecting one): the unused whole days are refunded, and the
   paid period ends now. A day already started counts as used. Unused days come off the newest paid
-  weeks first, per payment: `refund_amount = floor(amount × unused / paid_days)`. What is kept is split
+  weeks first, per payment: `refund_amount = floor(amount × unused / paid_days)`, which can round to 0
+  on a very small payment (KES 1 with 3 of 7 days unused: nothing is refunded). What is kept is split
   80/20 as usual, so `reseller_recovery + bitwave_refund_part = refund_amount` to the shilling. The
   reseller's part is a `reseller_transaction_charges` row (reference `ad-refund:<payment id>`) that the
   payout balance subtracts and the Account Statement lists. It can take the balance below zero;
