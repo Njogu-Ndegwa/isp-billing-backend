@@ -89,7 +89,7 @@ import logging
 import asyncio
 import time
 import re
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -745,6 +745,7 @@ async def proxy_router_webfig_root_escape(
         escaped_path,
         session,
         refresh_access_cookies=False,
+        shared_url=True,
     )
 
 
@@ -783,6 +784,7 @@ async def proxy_router_webfig_jsproxy_escape(
         escaped_path,
         session,
         refresh_access_cookies=False,
+        shared_url=True,
     )
 
 
@@ -832,8 +834,14 @@ async def _proxy_webfig_request(
     proxy_path: str,
     session,
     refresh_access_cookies: bool,
+    shared_url: bool = False,
 ) -> Response:
-    """Proxy a request to RouterOS WebFig using an already validated session."""
+    """Proxy a request to RouterOS WebFig using an already validated session.
+
+    ``shared_url`` is True for the root-escape routes (/webfig, /jsproxy). Those URLs are
+    the same for every router, so a router-specific rewritten body served there must never
+    be cached by the browser (see _WEBFIG_CACHE_HEADERS).
+    """
 
     if getattr(session, "staff_id", None) is not None:
         from app.services.staff_access import webfig_staff_session_valid
@@ -900,7 +908,25 @@ async def _proxy_webfig_request(
     content = upstream.content
     content_type = upstream.headers.get("content-type", "")
     if _should_rewrite_webfig_content(content_type):
-        content = _rewrite_webfig_content(content, content_type, router_id)
+        content = _rewrite_webfig_content(
+            content,
+            content_type,
+            router_id,
+            upstream_path=proxy_path,
+        )
+        if shared_url:
+            # RouterOS serves WebFig's scripts with max-age=31536000. Once the proxy
+            # has baked "/api/admin/routers/<id>/webfig" into such a body, caching it
+            # at a router-agnostic URL like /webfig/master-<hash>.js pins that router
+            # id in the browser for a year: every other router on the same RouterOS
+            # build then fetches the wrong router's path, gets 403 (which also clears
+            # the root cookie) and WebFig hangs on "Connecting...".
+            response_headers = {
+                key: value
+                for key, value in response_headers.items()
+                if key.lower() not in _WEBFIG_CACHE_HEADERS
+            }
+            response_headers["cache-control"] = "no-store"
 
     response = Response(
         content=content,
@@ -924,6 +950,8 @@ _WEBFIG_HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+_WEBFIG_CACHE_HEADERS = {"cache-control", "expires", "etag", "last-modified"}
 
 _WEBFIG_DROP_RESPONSE_HEADERS = _WEBFIG_HOP_BY_HOP_HEADERS | {
     "content-encoding",
@@ -1146,6 +1174,15 @@ def _rewrite_webfig_set_cookie(cookie: str, router_id: int) -> str:
     return "; ".join(rewritten)
 
 
+def _is_relative_webfig_ref(url: str) -> bool:
+    url = (url or "").strip()
+    if not url or url[0] in "/#?":
+        return False
+    # Anything with a scheme (https:, data:, javascript:, mailto:) is not a path.
+    first_sep = min((i for i in (url.find("/"), url.find("?"), url.find("#")) if i >= 0), default=len(url))
+    return ":" not in url[:first_sep]
+
+
 def _should_rewrite_webfig_content(content_type: str) -> bool:
     content_type = (content_type or "").lower()
     return any(
@@ -1154,7 +1191,12 @@ def _should_rewrite_webfig_content(content_type: str) -> bool:
     )
 
 
-def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -> bytes:
+def _rewrite_webfig_content(
+    content: bytes,
+    content_type: str,
+    router_id: int,
+    upstream_path: str | None = None,
+) -> bytes:
     encoding = "utf-8"
     lower = (content_type or "").lower()
     if "charset=" in lower:
@@ -1182,6 +1224,26 @@ def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -
         lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
         text,
     )
+
+    if upstream_path is not None and "text/html" in lower:
+        # RouterOS /webfig/ loads its engine with relative paths
+        # (<script src="master-<hash>.js">). When that page is reached through the
+        # root-escape route the browser resolves them to /webfig/master-<hash>.js, a URL
+        # shared by every router. Anchor relative src/href to the router-scoped proxy
+        # prefix instead, so each router's rewritten scripts live at their own URL.
+        base = "/" + upstream_path.lstrip("/")
+
+        def anchor_relative(m: re.Match) -> str:
+            url = m.group("url")
+            if not _is_relative_webfig_ref(url):
+                return m.group(0)
+            resolved = urljoin(base, url)
+            return f"{m.group('lead')}{m.group('quote')}{prefix}{resolved}{m.group('quote')}"
+
+        relative_attr = re.compile(
+            r"(?i)(?P<lead>\b(?:href|src)\s*=\s*)(?P<quote>[\"'])(?P<url>[^\"']+)(?P=quote)"
+        )
+        text = relative_attr.sub(anchor_relative, text)
 
     unquoted_attr = re.compile(
         r"(?i)(?P<lead>\b(?:href|src|action|data-url)\s*=\s*)"

@@ -809,6 +809,179 @@ async def test_webfig_activity_refreshes_proxy_session_cookie(monkeypatch):
     router_remote_access.revoke_webfig_proxy_sessions(84)
 
 
+_ROUTEROS7_WEBFIG_HTML = (
+    b'<html><head><link href="/assets/style-ae67df160dad.css" rel="stylesheet">'
+    b'<script src="curve255-541e54a862be.js"></script></head><body>'
+    b'<a href="#Quick_Set">Quick Set</a><a href="https://help.mikrotik.com">Help</a>'
+    b'<script src="master-61ed6e5ae60d.js"></script></body></html>'
+)
+
+
+def _webfig_fake_client(responses, captured):
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def request(self, method, url, headers=None, content=None):
+            captured.append(url)
+            return responses[url.rsplit("/", 1)[-1] or "index"]
+
+    return FakeAsyncClient
+
+
+@pytest.mark.asyncio
+async def test_webfig_root_escape_anchors_relative_engine_scripts_to_router_prefix(monkeypatch):
+    """RouterOS /webfig/ loads master-<hash>.js by a relative path.
+
+    Through the /webfig root escape that resolved to /webfig/master-<hash>.js, one URL for
+    every router. The proxy baked the first router's id into it and RouterOS's one-year
+    max-age kept it in the browser, so WebFig on any other router of the same RouterOS
+    build fetched the wrong router's path and hung on "Connecting..." (router 648, which
+    kept requesting /api/admin/routers/670/webfig/webfig, 2026-10-29).
+    """
+    session = router_remote_access.create_webfig_proxy_session(
+        router_id=648,
+        router_name="Router-648",
+        router_ip="10.0.0.246",
+        created_by_user_id=1,
+    )
+    captured = []
+    responses = {
+        "index": httpx.Response(
+            200,
+            headers={"content-type": "text/html", "cache-control": "no-store"},
+            content=_ROUTEROS7_WEBFIG_HTML,
+        ),
+    }
+    monkeypatch.setattr(
+        router_management.httpx, "AsyncClient", _webfig_fake_client(responses, captured)
+    )
+
+    response = await router_management.proxy_router_webfig_root_escape(
+        _request(
+            "/webfig/",
+            headers=[
+                (b"host", b"testserver"),
+                (b"cookie", f"webfig_active_proxy=648:{session.token}".encode()),
+            ],
+        ),
+        "",
+    )
+
+    body = response.body.decode()
+    assert captured == ["http://10.0.0.246/webfig/"]
+    assert response.status_code == 200
+    assert 'src="/api/admin/routers/648/webfig/webfig/master-61ed6e5ae60d.js"' in body
+    assert 'src="/api/admin/routers/648/webfig/webfig/curve255-541e54a862be.js"' in body
+    assert 'href="/api/admin/routers/648/webfig/assets/style-ae67df160dad.css"' in body
+    assert 'href="#Quick_Set"' in body
+    assert 'src="master-61ed6e5ae60d.js"' not in body
+    router_remote_access.revoke_webfig_proxy_sessions(648)
+
+
+@pytest.mark.asyncio
+async def test_webfig_root_escape_rewritten_script_is_never_cached(monkeypatch):
+    session = router_remote_access.create_webfig_proxy_session(
+        router_id=670,
+        router_name="Router-670",
+        router_ip="10.0.0.248",
+        created_by_user_id=1,
+    )
+    captured = []
+    responses = {
+        "master-61ed6e5ae60d.js": httpx.Response(
+            200,
+            headers={
+                "content-type": "application/x-javascript",
+                "cache-control": "max-age=31536000",
+                "expires": "Fri, 29 Oct 2027 17:28:34 GMT",
+            },
+            content=b'rt.innerText="Connecting";const r=await window.fetch("/webfig");',
+        ),
+    }
+    monkeypatch.setattr(
+        router_management.httpx, "AsyncClient", _webfig_fake_client(responses, captured)
+    )
+
+    response = await router_management.proxy_router_webfig_root_escape(
+        _request(
+            "/webfig/master-61ed6e5ae60d.js",
+            headers=[
+                (b"host", b"testserver"),
+                (b"cookie", f"webfig_active_proxy=670:{session.token}".encode()),
+            ],
+        ),
+        "master-61ed6e5ae60d.js",
+    )
+
+    assert response.status_code == 200
+    assert b'fetch("/api/admin/routers/670/webfig/webfig")' in response.body
+    assert response.headers["cache-control"] == "no-store"
+    assert "expires" not in response.headers
+    router_remote_access.revoke_webfig_proxy_sessions(670)
+
+
+@pytest.mark.asyncio
+async def test_webfig_router_scoped_script_keeps_upstream_caching(monkeypatch):
+    session = router_remote_access.create_webfig_proxy_session(
+        router_id=671,
+        router_name="Router-671",
+        router_ip="10.0.6.71",
+        created_by_user_id=1,
+    )
+    captured = []
+    responses = {
+        "master-61ed6e5ae60d.js": httpx.Response(
+            200,
+            headers={
+                "content-type": "application/x-javascript",
+                "cache-control": "max-age=31536000",
+            },
+            content=b'const r=await window.fetch("/webfig");',
+        ),
+    }
+    monkeypatch.setattr(
+        router_management.httpx, "AsyncClient", _webfig_fake_client(responses, captured)
+    )
+
+    response = await router_management.proxy_router_webfig(
+        671,
+        _request(
+            "/api/admin/routers/671/webfig/webfig/master-61ed6e5ae60d.js",
+            headers=[
+                (b"host", b"testserver"),
+                (b"cookie", f"webfig_access_671={session.token}".encode()),
+            ],
+        ),
+        "webfig/master-61ed6e5ae60d.js",
+    )
+
+    assert captured == ["http://10.0.6.71/webfig/master-61ed6e5ae60d.js"]
+    assert b'fetch("/api/admin/routers/671/webfig/webfig")' in response.body
+    assert response.headers["cache-control"] == "max-age=31536000"
+    router_remote_access.revoke_webfig_proxy_sessions(671)
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("master-61ed6e5ae60d.js", True),
+        ("assets/style.css", True),
+        ("../logo.png", True),
+        ("/assets/style.css", False),
+        ("#Quick_Set", False),
+        ("?x=1", False),
+        ("https://help.mikrotik.com", False),
+        ("//cdn.example.com/x.js", False),
+        ("data:image/png;base64,AAAA", False),
+        ("javascript:void(0)", False),
+        ("", False),
+    ],
+)
+def test_is_relative_webfig_ref(url, expected):
+    assert router_management._is_relative_webfig_ref(url) is expected
+
+
 @pytest.mark.asyncio
 async def test_webfig_root_with_active_session_redirects_back_to_proxy():
     session = router_remote_access.create_webfig_proxy_session(

@@ -15,9 +15,10 @@ TDD order:
 """
 
 import json
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 import pytest
+import time_machine
 
 from app.db.models import (
     CustomerPayment,
@@ -375,11 +376,29 @@ async def test_month_window_starts_on_the_first_not_thirty_days_back(db):
     assert result["days"] == today.day
 
 
-async def test_previous_window_is_clipped_to_the_elapsed_span(db):
-    """Comparing a part-month against a whole one makes deltas swing with the date."""
-    prev_start, prev_end, cur_start, cur_end = svc._earnings_windows("month")
+@pytest.mark.parametrize(
+    "period,today,expected",
+    [
+        ("month", "2026-10-15", ("2026-09-01", "2026-09-16", "2026-10-01", "2026-10-16")),
+        ("month", "2026-10-31", ("2026-09-01", "2026-10-01", "2026-10-01", "2026-11-01")),
+        ("month", "2027-03-31", ("2027-02-01", "2027-03-01", "2027-03-01", "2027-04-01")),
+        ("month", "2028-03-31", ("2028-02-01", "2028-03-01", "2028-03-01", "2028-04-01")),
+        ("month", "2026-11-01", ("2026-10-01", "2026-10-02", "2026-11-01", "2026-11-02")),
+        ("month", "2027-01-01", ("2026-12-01", "2026-12-02", "2027-01-01", "2027-01-02")),
+        ("quarter", "2026-06-30", ("2026-01-01", "2026-04-01", "2026-04-01", "2026-07-01")),
+        ("quarter", "2028-06-30", ("2028-01-01", "2028-04-01", "2028-04-01", "2028-07-01")),
+        ("year", "2028-12-31", ("2027-01-01", "2028-01-01", "2028-01-01", "2029-01-01")),
+        ("week", "2026-11-01", ("2026-10-19", "2026-10-26", "2026-10-26", "2026-11-02")),
+    ],
+)
+async def test_previous_window_is_clipped_to_the_elapsed_span(period, today, expected):
+    """Clip to elapsed days, but never spill a shorter previous period into this one."""
+    with time_machine.travel(f"{today}T12:00:00Z", tick=False):
+        windows = svc._earnings_windows(period)
 
-    assert (prev_end - prev_start).days == (cur_end - cur_start).days
+    assert windows == tuple(date.fromisoformat(value) for value in expected)
+    prev_start, prev_end, cur_start, cur_end = windows
+    assert prev_start < prev_end <= cur_start < cur_end
 
 
 async def test_unknown_period_falls_back_to_month(db):
