@@ -24,6 +24,14 @@ device in the house, and all of them must work at the same time. Reconnecting
   within ``FIXED_DEVICE_RECENT_WINDOW`` (usage credited, provisioned, or
   reconnected), which covers a TV switched off overnight or during the working
   day. After a full day unseen, the device is treated as gone or replaced.
+* Paired device: a purchase the reseller paired to a TV, console or IoT device
+  (an active ``device_pairings`` row of that type on the purchase's own MAC,
+  e.g. a "Device pairing voucher"). It is never moved by a reconnect from
+  another MAC, however long the device has been off: such devices cannot open
+  a captive portal, so losing the purchase leaves them offline until someone
+  re-pairs them. Router 446, 4 Nov 2026: a TV switched off for over a day had
+  its 240 GB purchase taken by a phone typing the voucher code; the TV came
+  back to "connected, no internet". A replaced TV is re-paired by the reseller.
 
 The MAC kind is only a heuristic for "could this be the same device?"; it never
 locks out a phone whose randomized MAC rotated, which is the common recovery.
@@ -42,6 +50,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import (
     Customer,
     CustomerUsageBucket,
+    DevicePairing,
+    DeviceType,
     ProvisioningAttempt,
     ReconnectionAttempt,
 )
@@ -57,6 +67,10 @@ LIVE_ONLINE_IDLE_SECONDS = 60
 REALTIME_ONLINE_FRESH_SECONDS = 120
 
 PLAN_IN_USE_ERROR = "plan_in_use_on_another_device"
+
+# Pairing types whose purchase stays on the paired MAC: devices that never
+# change MAC and cannot log in through a captive portal themselves.
+PINNED_DEVICE_TYPES = (DeviceType.TV, DeviceType.CONSOLE, DeviceType.IOT)
 
 
 def is_randomized_mac(mac: Optional[str]) -> bool:
@@ -84,7 +98,7 @@ class DeviceUse:
     customer_id: int
     mac: Optional[str]
     in_use: bool
-    reason: str               # online_now | fixed_device_recent | no_device | idle
+    reason: str               # online_now | paired_device | fixed_device_recent | no_device | idle
     last_seen: Optional[datetime] = None
 
     @property
@@ -161,6 +175,39 @@ async def device_last_seen(
     return seen
 
 
+async def pinned_device_customers(
+    db: AsyncSession,
+    bound: Iterable[tuple[int, str]],
+    *,
+    now: datetime,
+) -> set[int]:
+    """Purchases paired by the reseller to a TV/console/IoT device on their own MAC.
+
+    Read-only; the caller owns the transaction.
+    """
+    pairs = {(cid, normalize_mac_address(mac)) for cid, mac in bound if cid and mac}
+    if not pairs:
+        return set()
+    rows = await db.execute(
+        select(DevicePairing.customer_id, DevicePairing.device_mac, DevicePairing.expires_at)
+        .where(
+            DevicePairing.customer_id.in_({cid for cid, _ in pairs}),
+            DevicePairing.is_active.is_(True),
+            DevicePairing.device_type.in_(PINNED_DEVICE_TYPES),
+        )
+    )
+    pinned: set[int] = set()
+    for cid, device_mac, expires_at in rows.all():
+        if expires_at is not None and expires_at <= now:
+            continue
+        try:
+            if (cid, normalize_mac_address(device_mac)) in pairs:
+                pinned.add(cid)
+        except Exception:
+            continue
+    return pinned
+
+
 def realtime_online(router_id: Optional[int], mac: Optional[str], now: datetime) -> bool:
     """True when a fresh real-time push shows this MAC online on the router."""
     from app.services.realtime_state import get_device_live
@@ -234,11 +281,14 @@ def classify_device_use(
     last_seen: Optional[datetime],
     online_now: bool,
     now: datetime,
+    paired_device: bool = False,
 ) -> DeviceUse:
     if not mac:
         return DeviceUse(customer_id, None, False, "no_device")
     if online_now:
         return DeviceUse(customer_id, mac, True, "online_now", last_seen)
+    if paired_device:
+        return DeviceUse(customer_id, mac, True, "paired_device", last_seen)
     if (
         not is_randomized_mac(mac)
         and last_seen is not None
@@ -270,6 +320,7 @@ async def assess_bound_devices(
         for c in customers if c.mac_address
     ]
     last_seen = await device_last_seen(db, bound, now=now)
+    pinned = await pinned_device_customers(db, bound, now=now)
     await db.commit()
 
     online: set[str] = {
@@ -280,6 +331,7 @@ async def assess_bound_devices(
     to_probe = [
         mac for cid, mac in bound
         if mac not in online
+        and cid not in pinned
         and (is_randomized_mac(mac) or cid not in last_seen
              or now - last_seen[cid] >= FIXED_DEVICE_RECENT_WINDOW)
     ]
@@ -297,6 +349,7 @@ async def assess_bound_devices(
             last_seen=last_seen.get(c.id),
             online_now=bool(mac and mac in online),
             now=now,
+            paired_device=c.id in pinned,
         )
     return result
 
@@ -347,24 +400,41 @@ def pick_blocker(
 
 
 def plan_in_use_detail(use: DeviceUse) -> dict:
-    """409 body the captive portal shows when every purchase is in use."""
+    """409 body the captive portal shows when every purchase is in use.
+
+    Whoever gets this holds a valid plan, so it never tells them to buy: SwapNet
+    (router 624, 5 Nov 2026) had a paid user refused 90 seconds before the old
+    MAC logged out, and one user paid while an earlier plan was still running.
+
+    Each wait stated here is the real one for that kind of device. "About 2
+    minutes" is the hotspot keepalive that drops a phone's old session
+    (DEFAULT_HOTSPOT_KEEPALIVE_TIMEOUT). A vendor MAC stays held for
+    FIXED_DEVICE_RECENT_WINDOW after it goes offline, so 2 minutes would be false
+    there, and a paired device never moves on its own.
+    """
     tail = mac_tail(use.mac)
-    if use.randomized:
+    if use.reason == "paired_device":
         message = (
-            f"This plan is in use on another phone right now (MAC ending {tail}). "
-            "If that was this phone, wait a minute and try again. "
-            "Otherwise, buy a plan for this device."
+            f"Your plan is already paid and paired to a TV or other device (MAC ending {tail}). "
+            "Ask your provider to move it to this device."
+        )
+    elif use.randomized:
+        message = (
+            f"Your plan is already paid and in use on another device (MAC ending {tail}). "
+            "Wait about 2 minutes and try again. "
+            "It can't move here while that device is online."
         )
     else:
         message = (
-            f"This plan is in use on another device (MAC ending {tail}). "
-            "Buy a plan for this device."
+            f"Your plan is already paid and stays on another device (MAC ending {tail}), "
+            "such as a TV or laptop. It can move here once that device has been off "
+            "for a full day, or your provider can move it sooner."
         )
     return {
         "error": PLAN_IN_USE_ERROR,
         "message": message,
         "device_mac_tail": tail,
-        "offer_purchase": True,
+        "offer_purchase": False,
     }
 
 

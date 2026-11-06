@@ -200,6 +200,9 @@ async def _finalize_pending_mobile_money_transaction(
         resolve_mpesa_collection_mode,
     )
 
+    from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+    drop_unpaid_page_plan(customer, tx.amount)
     plan, duration_value, duration_unit = await _resolve_customer_payment_plan(db, customer)
     if not plan:
         raise HTTPException(status_code=400, detail="Customer has no plan assigned")
@@ -430,6 +433,9 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             from app.db.models import PaymentMethod
             
             # Check for pending plan change (customer paying for a different plan)
+            from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+            drop_unpaid_page_plan(customer, mpesa_txn.amount)
             pending_data = None
             if customer.pending_update_data:
                 try:
@@ -1180,6 +1186,8 @@ async def get_payment_status(
                 max_devices = max_devices_for_customer(customer, customer.plan)
                 await db.commit()
 
+        from app.api.fapshi_routes import customer_payment_flags
+        confirmation = await customer_payment_flags(db, customer.id)
         return {
             "customer_id": customer.id,
             "status": customer.status.value,
@@ -1187,6 +1195,7 @@ async def get_payment_status(
             "plan_id": customer.plan_id,
             "plan_name": customer.plan.name if customer.plan else None,
             "delivery": serialize_delivery_attempt(attempt),
+            **confirmation,
             "access_code": access_code,
             "max_devices": max_devices,
         }

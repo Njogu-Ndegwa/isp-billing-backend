@@ -12,6 +12,7 @@ import string
 
 from app.db.database import get_db
 from app.db.models import (
+    RouterAuthMethod,
     Router, Customer, Plan, CustomerStatus, ConnectionType,
     CustomerPayment, PaymentMethod, PaymentStatus, DurationUnit,
     Payment, CustomerRating, ProvisioningLog, MpesaTransaction,
@@ -219,12 +220,28 @@ async def _payment_paybills(db: AsyncSession, user, router_ids) -> dict:
     failure here returns {} instead of failing the customer list.
     """
     from app.services.customer_expiry_notifications import resolve_paybills
+    from app.services.customer_pay_by_mpesa import matchable_paybills
 
     try:
-        return await resolve_paybills(db, user, set(router_ids) or {None})
+        paybills = await resolve_paybills(db, user, set(router_ids) or {None})
+        # Only a paybill the C2B handler would match for this reseller.
+        return await matchable_paybills(db, user.id, paybills)
     except Exception:
         logger.exception("Could not resolve payment paybills for user %s", getattr(user, "id", None))
         return {}
+
+
+async def _pay_by_mpesa_map(db: AsyncSession, customers, paybills: dict) -> dict:
+    """{customer_id: Pay by M-Pesa card} (paybill, account, amount or why not)."""
+    from app.services.customer_pay_by_mpesa import pay_by_mpesa, pending_plans
+
+    customers = list(customers)
+    try:
+        plans = await pending_plans(db, customers)
+    except Exception:
+        logger.exception("Could not load pending plans for the Pay by M-Pesa card")
+        plans = {}
+    return {c.id: pay_by_mpesa(c, paybills.get(c.router_id), plans) for c in customers}
 
 
 router = APIRouter(tags=["customers"])
@@ -625,6 +642,23 @@ async def edit_customer(
                 or customer.router_id != old_router_id
             )
 
+        shared_devices_changed: list[int] = []
+        if ("expiry" in update_fields or "plan_id" in update_fields) and not customer.subscription_owner_id:
+            # Every device on a shared plan runs on the owner's expiry and plan.
+            from app.services.subscription_sharing import carry_owner_edit_to_shared_devices
+
+            shared_devices_changed = await carry_owner_edit_to_shared_devices(
+                db, owner_customer=customer
+            )
+
+        cap_raised_customer_ids: list[int] = []
+        if customer.plan_id != old_plan_id and target_plan:
+            from app.services.subscription_sharing import raise_open_caps_after_plan_edit
+
+            cap_raised_customer_ids = await raise_open_caps_after_plan_edit(
+                db, customer=customer, plan=target_plan
+            )
+
         await db.commit()
         await db.refresh(customer, attribute_names=["plan", "router"])
 
@@ -652,7 +686,22 @@ async def edit_customer(
             # deadline in the binding: move it later if the edit extended it.
             from app.services.expiry_tag_sync import schedule_expiry_tag_sync
 
-            schedule_expiry_tag_sync([customer.id], "admin expiry edit")
+            schedule_expiry_tag_sync([customer.id, *shared_devices_changed], "admin expiry edit")
+
+        plan_push = None
+        if customer.plan_id != old_plan_id and customer.plan and not customer.pppoe_username:
+            old_speed = (
+                await db.execute(select(Plan.speed).where(Plan.id == old_plan_id))
+            ).scalar_one_or_none()
+            if old_speed != customer.plan.speed:
+                # Without this the customer stays on the old speed until the next
+                # fleet queue sync, while the dashboard already shows the new plan.
+                from app.services.subscription_sharing import push_plan_edit_to_router
+
+                plan_push = await push_plan_edit_to_router(
+                    db, customer=customer, plan=customer.plan, router=customer.router,
+                )
+            await db.commit()
 
         provision_status = None
         provision_error = None
@@ -688,7 +737,9 @@ async def edit_customer(
                 # has their secret (the customer page says "Re-save the
                 # customer to provision it again"), through the attempt path
                 # so an unreachable router is retried. Only a real login
-                # change reconnects the customer's devices.
+                # change reconnects the customer's devices. A real change on a
+                # customer FUP is holding down also has to settle that hold, or
+                # the write gives them full speed for the rest of the period.
                 from app.services.pppoe_resync import push_active_pppoe_customer
 
                 delivered = await push_active_pppoe_customer(
@@ -696,6 +747,7 @@ async def edit_customer(
                     action="pppoe_edit" if pppoe_changed else "pppoe_resave",
                     disconnect=pppoe_changed,
                     skip_if_fup_restricted=not pppoe_changed,
+                    settle_fup_hold=pppoe_changed,
                 )
                 delivered = {
                     "provision_result": delivered.get("result"),
@@ -714,6 +766,13 @@ async def edit_customer(
                 old_ip=old_static_ip, old_router=old_static_router,
                 pin_cleared=bool(old_static_mac) and not customer.static_mac,
             )
+
+        if cap_raised_customer_ids:
+            # After the router pushes above: a device they held for FUP gets the new
+            # plan's speed from this lift, so nobody drops twice.
+            from app.services.fup import lift_restrictions_after_cap_raise
+
+            asyncio.create_task(lift_restrictions_after_cap_raise(cap_raised_customer_ids))
 
         return {
             "success": True,
@@ -748,6 +807,8 @@ async def edit_customer(
             "pppoe_provision_error": provision_error,
             "activated_paid_until": activating,
             "static_reprovisioned": static_status,
+            # {"pushed": n, "held_by_fup": n} when a hotspot plan edit changed the speed.
+            "plan_push": plan_push,
         }
     except HTTPException:
         raise
@@ -906,16 +967,113 @@ async def delete_customer(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Delete a customer and all related data.
+    """Delete a customer and all related data, including their shared devices.
 
     PPPoE customers must be removed from the router before the DB row is
     deleted. If RouterOS cleanup fails, the customer is kept so the cleanup can
     be retried instead of leaving an orphaned online secret.
-    """
-    try:
-        user = await get_current_user(token, db)
-        enforce_active_subscription(user)
 
+    Devices sharing this customer's plan run on it and could never renew again,
+    so they go too. Their router access is removed after the rows are gone.
+    """
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+
+    shared_devices = await _load_shared_devices(db, customer_id, user.id)
+    response = await _delete_customer_row(customer_id, db, user)
+
+    removed_ids: list[int] = []
+    for device in shared_devices:
+        await _delete_customer_row(device["id"], db, user)
+        removed_ids.append(device["id"])
+    pending = await _remove_shared_devices_from_routers(db, shared_devices)
+
+    if removed_ids:
+        logger.info(
+            "Customer %s deleted with %d shared device(s) %s; router cleanup pending for %s",
+            customer_id, len(removed_ids), removed_ids, pending,
+        )
+    return {
+        **response,
+        "shared_devices_removed": len(removed_ids),
+        "shared_devices_router_pending": pending,
+    }
+
+
+async def _load_shared_devices(db: AsyncSession, owner_id: int, user_id: int) -> list[dict]:
+    """Plain data for the devices on ``owner_id``'s plan, safe to use after commit."""
+    from app.api.device_pairing import _router_cleanup_info
+
+    rows = (
+        await db.execute(
+            select(Customer)
+            .options(selectinload(Customer.router))
+            .where(Customer.subscription_owner_id == owner_id, Customer.user_id == user_id)
+            .order_by(Customer.id)
+        )
+    ).scalars().all()
+    devices = []
+    for row in rows:
+        auth_value, router_info = _router_cleanup_info(row.router) if row.router else (None, None)
+        devices.append({
+            "id": row.id,
+            "mac": normalize_mac_address(row.mac_address) if row.mac_address else None,
+            "router_id": row.router_id,
+            "auth": auth_value,
+            "router_info": router_info,
+        })
+    await db.commit()
+    return devices
+
+
+async def _remove_shared_devices_from_routers(db: AsyncSession, devices: list[dict]) -> list[str]:
+    """Best effort, with nothing held open. Returns the MACs still on a router.
+
+    A router that fails is not retried for its other devices, so one dead tunnel
+    can't hold the request up once per device.
+    """
+    from app.api.device_pairing import (
+        _delete_radius_shared_device_entries,
+        _remove_shared_device_from_direct_router_sync,
+    )
+
+    pending: list[str] = []
+    failed_routers: set[int] = set()
+    radius_cleaned = False
+    for device in devices:
+        mac = device["mac"]
+        if not mac:
+            continue
+        if device["auth"] == RouterAuthMethod.RADIUS.value:
+            await _delete_radius_shared_device_entries(db, mac)
+            radius_cleaned = True
+            continue
+        if not device["router_info"]:
+            continue
+        if device["router_id"] in failed_routers:
+            pending.append(mac)
+            continue
+        try:
+            result = await asyncio.to_thread(
+                _remove_shared_device_from_direct_router_sync, device["router_info"], mac,
+            )
+        except Exception as exc:
+            result = {"success": False, "error": str(exc)}
+        if not result.get("success"):
+            logger.warning(
+                "Could not remove shared device %s from router %s: %s",
+                mac, device["router_id"], result.get("error"),
+            )
+            failed_routers.add(device["router_id"])
+            pending.append(mac)
+    if radius_cleaned:
+        await db.commit()
+    return pending
+
+
+async def _delete_customer_row(customer_id: int, db: AsyncSession, user) -> dict:
+    """Delete one customer row and its child rows."""
+    try:
         stmt = (
             select(Customer)
             .options(selectinload(Customer.plan), selectinload(Customer.router))
@@ -1280,6 +1438,7 @@ async def get_customers_api(
         result = await db.execute(stmt)
         rows = result.all()
         paybills = await _payment_paybills(db, user, {c.router_id for c, _ in rows})
+        pay_cards = await _pay_by_mpesa_map(db, (c for c, _ in rows), paybills)
 
         return [
             {
@@ -1298,6 +1457,7 @@ async def get_customers_api(
                 "router_id": c.router_id,
                 "account_number": c.account_number,
                 "payment_paybill": paybills.get(c.router_id),
+                "pay_by_mpesa": pay_cards[c.id],
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
                 **pause_fields(c),
@@ -1358,6 +1518,7 @@ async def get_active_customers(
         result = await db.execute(stmt)
         rows = result.all()
         paybills = await _payment_paybills(db, user, {c.router_id for c, _ in rows})
+        pay_cards = await _pay_by_mpesa_map(db, (c for c, _ in rows), paybills)
 
         return [
             {
@@ -1377,6 +1538,7 @@ async def get_active_customers(
                 "router_id": c.router_id,
                 "account_number": c.account_number,
                 "payment_paybill": paybills.get(c.router_id),
+                "pay_by_mpesa": pay_cards[c.id],
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
                 **pause_fields(c),
@@ -1420,6 +1582,7 @@ async def get_customer_detail(
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
         paybills = await _payment_paybills(db, user, {customer.router_id})
+        pay_cards = await _pay_by_mpesa_map(db, [customer], paybills)
 
         return {
             "id": customer.id,
@@ -1437,6 +1600,7 @@ async def get_customer_detail(
             "router_id": customer.router_id,
             "account_number": customer.account_number,
             "payment_paybill": paybills.get(customer.router_id),
+            "pay_by_mpesa": pay_cards[customer.id],
             "wallet_credit_kes": customer.wallet_credit_kes,
             **grace_fields(customer, datetime.utcnow()),
             **pause_fields(customer),

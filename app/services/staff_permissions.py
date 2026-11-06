@@ -237,6 +237,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Added a device to customer {customer_id}"),
     (("DELETE",), "/api/customers/{customer_id}/devices/{pairing_id}", "customers.manage",
      "Removed a device from customer {customer_id}"),
+    (("PATCH",), "/api/customers/{customer_id}/devices/{pairing_id}", "customers.manage",
+     "Changed a device's type for customer {customer_id}"),
     ((R,), "/api/customers/{customer_id}/pppoe-credentials", "customers.manage", None),
     ((R, "POST", "DELETE"), "/api/remove-user/{router_id}/{mac_address}", "customers.manage",
      "Removed device {mac_address} from router {router_id}"),
@@ -292,6 +294,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/routers/{router_id}/illegal-connections", "routers.view", None),
     ((R,), "/api/routers/{router_id}/interfaces", "routers.view", None),
     ((R,), "/api/routers/{router_id}/interfaces/restart-options", "routers.view", None),
+    ((R,), "/api/routers/{router_id}/access-points", "routers.view", None),
+    ((R,), "/api/routers/{router_id}/access-points/{ap_mac}/status", "routers.view", None),
     ((R,), "/api/routers/{router_id}/load-balancing", "routers.view", None),
     ((R,), "/api/routers/{router_id}/port-analytics", "routers.view", None),
     ((R,), "/api/routers/{router_id}/port-config-jobs/{job_id}", "routers.view", None),
@@ -327,6 +331,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     (("DELETE",), "/api/routers/{router_id}", "routers.manage", "Deleted router {router_id}"),
     (("PUT",), "/api/routers/{router_id}/identity", "routers.manage",
      "Renamed router {router_id}"),
+    (("PUT",), "/api/routers/{router_id}/pppoe-expired-redirect", "routers.manage",
+     "Changed the expired PPPoE payment-page redirect on router {router_id}"),
     (("PUT",), "/api/routers/{router_id}/status-alerts", "routers.manage",
      "Changed status alerts on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/remediate-captive-portal", "routers.manage",
@@ -349,6 +355,14 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Rebooted router {router_id}"),
     (("POST",), "/api/routers/{router_id}/interfaces/{interface_name}/restart", "routers.manage",
      "Restarted port {interface_name} on router {router_id}"),
+    (("PUT",), "/api/routers/{router_id}/access-points/{ap_mac}/credential", "routers.manage",
+     "Saved access-point password for {ap_mac} on router {router_id}"),
+    (("DELETE",), "/api/routers/{router_id}/access-points/{ap_mac}/credential", "routers.manage",
+     "Removed access-point password for {ap_mac} on router {router_id}"),
+    (("POST",), "/api/routers/{router_id}/access-points/{ap_mac}/reboot", "routers.manage",
+     "Rebooted access point {ap_mac} on router {router_id}"),
+    (("POST",), "/api/routers/{router_id}/access-points/{ap_mac}/make-safe", "routers.manage",
+     "Made access point {ap_mac} a safe AP on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/remove-illegal-users", "routers.manage",
      "Removed illegal users on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/sync", "routers.manage",
@@ -503,6 +517,17 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     (("PUT",), "/api/ads/{ad_id}", "portal.manage", "Edited portal ad {ad_id}"),
     (("DELETE",), "/api/ads/{ad_id}", "portal.manage", "Deleted portal ad {ad_id}"),
     (("POST",), "/api/ads/media/upload-url", "portal.manage", "Uploaded a photo or video for a portal ad"),
+    # Selling ads through Bitwave (the business pays Bitwave by M-Pesa): the
+    # same split, managers sell and prompt, dashboard viewers only read.
+    # Takedown, refunds and review rules are Bitwave-admin only (left out).
+    ((R,), "/api/ad-sales", ADS_VIEW, None),
+    ((R,), "/api/ad-sales/quote", ADS_VIEW, None),
+    ((R,), "/api/ad-sales/access", ADS_VIEW, None),
+    ((R,), "/api/ads/{ad_id}/sale", ADS_VIEW, None),
+    (("POST",), "/api/ad-sales", "portal.manage", "Sold a portal ad and sent the business an M-Pesa prompt"),
+    (("POST",), "/api/ads/{ad_id}/sale", "portal.manage", "Put sold portal ad {ad_id} up for payment"),
+    (("POST",), "/api/ads/{ad_id}/sale/prompt", "portal.manage", "Sent an M-Pesa prompt for sold portal ad {ad_id}"),
+    (("POST",), "/api/ads/{ad_id}/sale/renew", "portal.manage", "Sent a renewal prompt for sold portal ad {ad_id}"),
 ]
 
 # Endpoints that never need a user token: a staff token sent to them grants
@@ -528,6 +553,10 @@ OWNER_LOGGED_TEMPLATES = OWNER_ALERT_TEMPLATES | frozenset({
     "/api/reseller/withdraw",
     # Port restarts drop customers for a few seconds: keep who/when/how.
     "/api/routers/{router_id}/interfaces/{interface_name}/restart",
+    # AP control reboots / reconfigures a customer's access point: keep a record.
+    "/api/routers/{router_id}/access-points/{ap_mac}/reboot",
+    "/api/routers/{router_id}/access-points/{ap_mac}/make-safe",
+    "/api/routers/{router_id}/access-points/{ap_mac}/credential",
 })
 
 

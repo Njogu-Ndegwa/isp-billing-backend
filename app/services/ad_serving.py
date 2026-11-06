@@ -8,7 +8,8 @@ So a portal load costs no ad query at all on a warm cache, and an ad edit
 shows up within a minute (sooner: every write path calls invalidate_ad_cache).
 
 An ad reaches a router when:
-  * it is active, approved, and inside its starts_at / expires_at window;
+  * it is active, approved, and inside its starts_at / expires_at window
+    (a sold ad, slot "reseller", must have one: its paid period);
   * its owner is Bitwave (owner_user_id NULL) or the reseller who owns the
     router; and
   * its router_ids is NULL (all of the owner's routers, or the whole network
@@ -38,6 +39,7 @@ from sqlalchemy import select
 from app.core.cache import cache
 from app.db import database as db_module
 from app.db.models import Ad, AdEvent
+from app.services.ad_media import public_media_url
 from app.services.plan_cache import normalize_router_ids
 
 logger = logging.getLogger(__name__)
@@ -78,7 +80,7 @@ def serialize_portal_ad(ad: Ad) -> dict:
         "id": ad.id,
         "title": ad.title,
         "description": ad.description,
-        "image_url": ad.image_url,
+        "image_url": public_media_url(ad.image_url),
         "seller_name": ad.seller_name,
         "seller_location": ad.seller_location,
         "phone_number": ad.phone_number,
@@ -90,8 +92,8 @@ def serialize_portal_ad(ad: Ad) -> dict:
         "category": ad.category,
         "placement": ad.placement or "local",
         "media_type": ad.media_type or "image",
-        "video_url": ad.video_url,
-        "poster_url": ad.poster_url,
+        "video_url": public_media_url(ad.video_url),
+        "poster_url": public_media_url(ad.poster_url),
         "image_fit": ad.image_fit or "cover",
         "bg_color": ad.bg_color,
         "slot": ad.slot or "platform",
@@ -113,6 +115,9 @@ async def _load_live_ads(db) -> list[dict]:
         .where(Ad.status == "approved")
         .where((Ad.starts_at == None) | (Ad.starts_at <= now))  # noqa: E711
         .where((Ad.expires_at == None) | (Ad.expires_at > now))  # noqa: E711
+        # A sold ad runs only inside a paid period (app/services/ad_sales.py
+        # sets starts_at/expires_at when paid weeks start): never open-ended.
+        .where((Ad.slot != "reseller") | (Ad.expires_at != None))  # noqa: E711
         .order_by(Ad.priority.desc(), Ad.created_at.desc(), Ad.id.desc())
     )
     return [serialize_portal_ad(ad) for ad in result.scalars().all()]

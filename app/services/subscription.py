@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, or_
 from app.db.models import (
-    Subscription, SubscriptionInvoice, SubscriptionPayment,
+    Subscription, SubscriptionFreeSetupGrant, SubscriptionInvoice, SubscriptionPayment,
     User, UserRole, SubscriptionStatus, InvoiceStatus, SubscriptionPaymentStatus,
     Customer, CustomerPayment, Plan, ConnectionType, CustomerStatus, PaymentStatus,
 )
@@ -52,6 +52,28 @@ TRIAL_DAYS = 7
 GRACE_PERIOD_DAYS = 5
 DUE_SOON_THRESHOLD_DAYS = 5
 MAX_INVOICE_PERIOD_MONTHS = 1
+FREE_SETUP_DAYS = 7
+# The 06:00 job misses an account suspended at 08:00 the same day its window
+# ended, so it keeps looking this far back for one that still has no invoice.
+FREE_SETUP_INVOICE_LOOKBACK = timedelta(days=2)
+
+
+def in_free_setup(user: User, now: datetime | None = None) -> bool:
+    """Whether this account is inside an admin Free setup time window."""
+    until = user.free_setup_until
+    return until is not None and until > (now or datetime.utcnow())
+
+
+def outside_free_setup(now: datetime):
+    """SQL filter for the billing, reminder and suspension jobs."""
+    return or_(User.free_setup_until.is_(None), User.free_setup_until <= now)
+
+
+def billable_period_start(user: User, period_start: datetime) -> datetime:
+    """Sales made during a Free setup window are never charged for afterwards."""
+    if user.free_setup_until and user.free_setup_until > period_start:
+        return user.free_setup_until
+    return period_start
 
 
 def add_calendar_months(dt: datetime, months: int) -> datetime:
@@ -234,7 +256,8 @@ async def generate_monthly_invoices(db: AsyncSession) -> dict:
             User.subscription_status.in_([
                 SubscriptionStatus.ACTIVE,
                 SubscriptionStatus.TRIAL,
-            ])
+            ]),
+            outside_free_setup(now),
         )
     )).scalars().all()
 
@@ -278,12 +301,15 @@ async def check_overdue_invoices(db: AsyncSession) -> dict:
     suspended = 0
 
     for invoice in overdue_invoices:
-        invoice.status = InvoiceStatus.OVERDUE
-        marked_overdue += 1
-
         user = (await db.execute(
             select(User).where(User.id == invoice.user_id)
         )).scalar_one_or_none()
+
+        if user and in_free_setup(user, now):
+            continue
+
+        invoice.status = InvoiceStatus.OVERDUE
+        marked_overdue += 1
 
         if user and user.subscription_status not in (
             SubscriptionStatus.SUSPENDED, SubscriptionStatus.INACTIVE
@@ -323,6 +349,7 @@ async def check_overdue_invoices(db: AsyncSession) -> dict:
             User.subscription_status == SubscriptionStatus.TRIAL,
             User.subscription_expires_at.isnot(None),
             User.subscription_expires_at < now,
+            outside_free_setup(now),
         )
     )).scalars().all()
 
@@ -341,6 +368,7 @@ async def check_overdue_invoices(db: AsyncSession) -> dict:
             User.subscription_status == SubscriptionStatus.ACTIVE,
             User.subscription_expires_at.isnot(None),
             User.subscription_expires_at < now,
+            outside_free_setup(now),
         )
     )).scalars().all()
 
@@ -440,6 +468,160 @@ async def deactivate_subscription(
 
     await db.flush()
     return user
+
+
+class FreeSetupRefused(Exception):
+    """The Free setup press was refused; nothing was changed."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+def free_setup_grant_dict(grant: SubscriptionFreeSetupGrant) -> dict:
+    return {
+        "id": grant.id,
+        "granted_by_email": grant.granted_by_email,
+        "granted_at": grant.created_at.isoformat() if grant.created_at else None,
+        "free_until": grant.free_until.isoformat(),
+        "previous_status": grant.previous_status,
+        "new_status": grant.new_status,
+        "previous_expires_at": grant.previous_expires_at.isoformat() if grant.previous_expires_at else None,
+        "new_expires_at": grant.new_expires_at.isoformat(),
+        "waived_invoices": grant.waived_invoices or [],
+        "is_override": bool(grant.is_override),
+        "override_reason": grant.override_reason,
+    }
+
+
+async def grant_free_setup(
+    db: AsyncSession,
+    reseller_id: int,
+    admin: User,
+    *,
+    override: bool = False,
+    override_reason: str | None = None,
+    now: datetime | None = None,
+) -> SubscriptionFreeSetupGrant:
+    """Give one account FREE_SETUP_DAYS without a bill in the way.
+
+    Waives its unpaid invoices, lifts a suspension, moves the end date out (never
+    in), opens the window the billing jobs respect and writes the audit row. All
+    in the caller's transaction, so it commits or fails as one.
+
+    The status it restores is TRIAL for an account that never paid, because
+    ACTIVE is what the sales figures and the lead backfill read as paying, and
+    ACTIVE only for one that has really paid. It never touches the lead.
+    """
+    now = now or datetime.utcnow()
+
+    # Row lock: a double press waits here, then sees the first press's grant.
+    user = (await db.execute(
+        select(User)
+        .where(User.id == reseller_id, User.role == UserRole.RESELLER)
+        .with_for_update()
+    )).scalar_one_or_none()
+    if not user:
+        raise FreeSetupRefused(404, "Reseller not found")
+
+    # Only the status PATCH sets INACTIVE, so it is someone's deliberate choice
+    # rather than a billing suspension. Nothing records why an account was
+    # SUSPENDED, so a suspension from the Suspend button is lifted like any other.
+    if user.subscription_status == SubscriptionStatus.INACTIVE:
+        raise FreeSetupRefused(
+            409, "This account was set to inactive by hand. Change its status first.",
+        )
+
+    prior = (await db.execute(
+        select(SubscriptionFreeSetupGrant)
+        .where(SubscriptionFreeSetupGrant.user_id == reseller_id)
+        .order_by(SubscriptionFreeSetupGrant.created_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    reason = (override_reason or "").strip() or None
+    if prior and not override:
+        raise FreeSetupRefused(
+            409,
+            f"Free setup time was already given on {prior.created_at.date()} "
+            f"by {prior.granted_by_email}. Giving it again needs an override and a reason.",
+        )
+    if prior and not reason:
+        raise FreeSetupRefused(400, "Giving free setup time again needs a reason.")
+
+    unpaid = (await db.execute(
+        select(SubscriptionInvoice)
+        .where(
+            SubscriptionInvoice.user_id == reseller_id,
+            SubscriptionInvoice.status.in_([InvoiceStatus.PENDING, InvoiceStatus.OVERDUE]),
+        )
+        .order_by(SubscriptionInvoice.created_at.asc())
+        .with_for_update()
+    )).scalars().all()
+    waived = []
+    for invoice in unpaid:
+        amount_paid = await get_invoice_amount_paid(db, invoice.id)
+        waived.append({
+            "invoice_id": invoice.id,
+            "period_start": invoice.period_start.isoformat(),
+            "period_end": invoice.period_end.isoformat(),
+            "final_charge": invoice.final_charge,
+            "amount_paid": amount_paid,
+            "balance_waived": max(round(invoice.final_charge - amount_paid, 2), 0.0),
+            "currency": invoice.currency,
+            "status_before": invoice.status.value,
+        })
+        invoice.status = InvoiceStatus.WAIVED
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.user_id == reseller_id)
+    )).scalar_one_or_none()
+
+    previous_status = user.subscription_status
+    if previous_status == SubscriptionStatus.SUSPENDED:
+        paid_ever = (await db.execute(
+            select(func.count(SubscriptionPayment.id)).where(
+                SubscriptionPayment.user_id == reseller_id,
+                SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+            )
+        )).scalar() or 0
+        user.subscription_status = (
+            SubscriptionStatus.ACTIVE if paid_ever else SubscriptionStatus.TRIAL
+        )
+        if sub:
+            sub.status = user.subscription_status
+            sub.updated_at = now
+
+    free_until = now + timedelta(days=FREE_SETUP_DAYS)
+    previous_expires_at = user.subscription_expires_at
+    if previous_expires_at is None or previous_expires_at < free_until:
+        user.subscription_expires_at = free_until
+        if sub:
+            sub.current_period_end = free_until
+            sub.updated_at = now
+    user.free_setup_until = free_until
+
+    grant = SubscriptionFreeSetupGrant(
+        user_id=reseller_id,
+        granted_by_id=admin.id,
+        granted_by_email=admin.email,
+        free_until=free_until,
+        previous_status=previous_status.value,
+        new_status=user.subscription_status.value,
+        previous_expires_at=previous_expires_at,
+        new_expires_at=user.subscription_expires_at,
+        waived_invoices=waived,
+        is_override=bool(prior),
+        override_reason=reason if prior else None,
+        created_at=now,
+    )
+    db.add(grant)
+    await db.flush()
+    logger.info(
+        "[SUBSCRIPTION] Free setup time for reseller %s by %s until %s, waived %s invoice(s)",
+        reseller_id, admin.email, free_until, len(waived),
+    )
+    return grant
 
 
 async def get_pending_invoice(db: AsyncSession, user_id: int) -> SubscriptionInvoice | None:
@@ -1022,10 +1204,19 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
     expiring_resellers = (await db.execute(
         select(User).where(
             User.role == UserRole.RESELLER,
-            User.subscription_status.in_([
-                SubscriptionStatus.ACTIVE,
-                SubscriptionStatus.TRIAL,
-            ]),
+            or_(
+                User.subscription_status.in_([
+                    SubscriptionStatus.ACTIVE,
+                    SubscriptionStatus.TRIAL,
+                ]),
+                # Window ended between 06:00 and 08:00 UTC: suspended at 08:00
+                # before this job could bill them, so bill them the next day.
+                and_(
+                    User.subscription_status == SubscriptionStatus.SUSPENDED,
+                    User.free_setup_until >= now - FREE_SETUP_INVOICE_LOOKBACK,
+                ),
+            ),
+            outside_free_setup(now),
             User.subscription_expires_at.isnot(None),
             User.subscription_expires_at >= lookback,
             User.subscription_expires_at <= cutoff,
@@ -1062,6 +1253,7 @@ async def generate_pre_expiry_invoices(db: AsyncSession) -> dict:
                     first_invoice_fallback_start(reseller)
                 )
 
+            period_start = billable_period_start(reseller, period_start)
             period_end = now
             period_start = cap_invoice_period_start(period_start, period_end)
             if period_start >= period_end:
@@ -1137,6 +1329,7 @@ async def generate_catchup_invoices(db: AsyncSession) -> dict:
                 SubscriptionStatus.ACTIVE,
                 SubscriptionStatus.TRIAL,
             ]),
+            outside_free_setup(now),
         )
     )).scalars().all()
 
@@ -1188,6 +1381,7 @@ async def generate_catchup_invoices(db: AsyncSession) -> dict:
                 else:
                     period_start = first_invoice_fallback_start(reseller)
 
+            period_start = billable_period_start(reseller, period_start)
             period_end = now
             period_start = cap_invoice_period_start(period_start, period_end)
             if period_start >= period_end:

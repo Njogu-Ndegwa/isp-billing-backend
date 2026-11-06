@@ -28,6 +28,7 @@ from app.db.models import (
     ResellerPaymentMethodType,
     RouterAuthMethod,
 )
+from app.services.fapshi_reconciliation import capture_purchase_snapshot
 from app.services.auth import verify_token
 from app.services.payment_gateway import encrypt_credential, initiate_customer_payment
 from tests.factories import make_customer, make_plan, make_reseller, make_router
@@ -231,6 +232,7 @@ async def test_status_poll_records_and_provisions_a_success_only_once(db, monkey
     db.add(method)
     await db.flush()
     txn = FapshiTransaction(
+        purchase_snapshot=await capture_purchase_snapshot(db, customer, amount=500),
         trans_id="FAPSHI-SUCCESS-1",
         external_id="BW-external-1",
         reseller_id=reseller.id,
@@ -291,10 +293,12 @@ async def test_status_poll_records_and_provisions_a_success_only_once(db, monkey
 async def test_provider_agnostic_portal_poll_reconciles_fapshi(db, monkeypatch):
     reseller = await make_reseller(db)
     plan = await make_plan(db, reseller, price=500)
+    router = await make_router(db, reseller)
     customer = await make_customer(
         db,
         reseller,
         plan,
+        router,
         phone="670000002",
         mac_address="",
         status=CustomerStatus.PENDING,
@@ -311,6 +315,7 @@ async def test_provider_agnostic_portal_poll_reconciles_fapshi(db, monkeypatch):
     db.add(method)
     await db.flush()
     db.add(FapshiTransaction(
+        purchase_snapshot=await capture_purchase_snapshot(db, customer, amount=500),
         trans_id="PORTAL-POLL-1",
         external_id="BW-portal-poll",
         reseller_id=reseller.id,
@@ -380,6 +385,7 @@ async def test_fapshi_success_provisions_radius_captive_portal_credentials(
     db.add(method)
     await db.flush()
     db.add(FapshiTransaction(
+        purchase_snapshot=await capture_purchase_snapshot(db, customer, amount=500),
         trans_id="RADIUS-FAPSHI-1",
         external_id="BW-radius-fapshi",
         reseller_id=reseller.id,

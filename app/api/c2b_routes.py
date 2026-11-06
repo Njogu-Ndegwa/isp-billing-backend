@@ -174,6 +174,14 @@ async def register_reseller_c2b(
             status_code=400,
             detail="C2B registration only applies to mpesa_paybill_with_keys methods",
         )
+    # Register (and keep) the shortcode exactly as Safaricom will send it
+    # back, so the confirmation handler's exact match finds this method.
+    from app.services.payment_numbers import InvalidNumber, normalize_fields
+
+    try:
+        normalize_fields(pm, ("mpesa_shortcode",))
+    except InvalidNumber as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not pm.mpesa_consumer_key_encrypted or not pm.mpesa_consumer_secret_encrypted or not pm.mpesa_shortcode:
         raise HTTPException(
             status_code=400,

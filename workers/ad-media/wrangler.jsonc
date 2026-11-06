@@ -1,0 +1,13 @@
+{
+  "name": "bitwave-ad-media",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "isp.bitwavetechnologies.com/media/*", "zone_name": "bitwavetechnologies.com" }
+  ],
+  "r2_buckets": [
+    { "binding": "AD_MEDIA", "bucket_name": "bitwave-ad-media" }
+  ]
+}

@@ -449,6 +449,9 @@ async def handle_confirmation(
 
     # 5. Handle pending plan change (customer paying for a different plan)
     import json as _json
+    from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+    drop_unpaid_page_plan(customer, fields.trans_amount)
     plan = customer.plan
     pending_data = None
     if customer.pending_update_data:

@@ -30,6 +30,7 @@ from app.services.device_entitlements import (
     PLAN_IN_USE_ERROR,
     classify_device_use,
     is_randomized_mac,
+    plan_in_use_detail,
     probe_online_macs_sync,
 )
 from tests.factories import make_customer, make_plan, make_reseller, make_router
@@ -196,9 +197,10 @@ async def test_device_without_own_plan_is_refused_while_tv_in_use(db, router_io)
 
     assert exc.value.status_code == 409
     assert exc.value.detail["error"] == PLAN_IN_USE_ERROR
-    assert exc.value.detail["offer_purchase"] is True
+    assert exc.value.detail["offer_purchase"] is False
     assert "F3:3F" in exc.value.detail["message"]
-    assert "Buy a plan for this device" in exc.value.detail["message"]
+    assert "already paid" in exc.value.detail["message"]
+    assert "buy" not in exc.value.detail["message"].lower()
     assert await _mac_of(db, tv) == TV_MAC
     assert router_io.cleaned == []
     assert router_io.provisioned == []
@@ -250,7 +252,12 @@ async def test_rotated_phone_whose_old_mac_is_still_live_waits(db, router_io):
         await _reconnect(db, router, PHONE_MAC_ROTATED)
 
     assert exc.value.status_code == 409
-    assert "wait a minute" in exc.value.detail["message"]
+    assert "already paid" in exc.value.detail["message"]
+    assert "wait about 2 minutes" in exc.value.detail["message"].lower()
+    assert "buy" not in exc.value.detail["message"].lower()
+    assert exc.value.detail["offer_purchase"] is False
+    attempt = (await db.execute(select(ReconnectionAttempt))).scalars().one()
+    assert attempt.failure_reason == "plan_in_use:online_now"
     assert await _mac_of(db, phone) == PHONE_MAC
     assert await _mac_of(db, tv) == TV_MAC
     assert router_io.cleaned == []
@@ -492,3 +499,304 @@ async def test_live_probe_unreachable_router_is_unknown(monkeypatch):
     assert probe_online_macs_sync(
         {"ip": "10.0.0.2", "username": "a", "password": "b", "port": 8728}, [TV_MAC],
     ) is None
+
+
+# ------------------------------------------------------------ paired devices
+# Router 446, 4 Nov 2026: a TV paired with a "Device pairing voucher" was off
+# for over a day; a phone typing the voucher code took its purchase, and the
+# TV came back to "connected, no internet".
+
+from app.db.models import DeviceType  # noqa: E402
+
+
+async def _pair(db, customer, *, device_type=DeviceType.TV, mac=None, active=True,
+                expires_at=None):
+    db.add(DevicePairing(
+        customer_id=customer.id,
+        device_mac=mac or customer.mac_address,
+        device_name="Living room TV",
+        device_type=device_type,
+        router_id=customer.router_id,
+        plan_id=customer.plan_id,
+        is_active=active,
+        expires_at=expires_at or customer.expiry,
+        is_subscription_share=False,
+    ))
+    await db.commit()
+
+
+async def test_paired_tv_unseen_for_days_is_not_taken_by_a_phone(db, router_io):
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _pair(db, tv)
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(days=2))
+
+    with pytest.raises(HTTPException) as exc:
+        await _reconnect(db, router, OTHER_PHONE_MAC)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == PLAN_IN_USE_ERROR
+    assert "paired to a TV" in exc.value.detail["message"]
+    assert await _mac_of(db, tv) == TV_MAC
+    assert router_io.cleaned == [] and router_io.provisioned == []
+    attempt = (await db.execute(select(ReconnectionAttempt))).scalars().all()[-1]
+    assert attempt.failure_reason == "plan_in_use:paired_device"
+    # A pinned device needs no live probe: it is in use by definition.
+    assert TV_MAC not in sum(router_io.probed, [])
+
+
+async def test_paired_tv_is_not_taken_by_code_either(db, router_io):
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _pair(db, tv)
+    await _receipt(db, tv, "SIGTV00446")
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(days=2))
+
+    with pytest.raises(HTTPException) as exc:
+        await _reconnect(db, router, OTHER_PHONE_MAC, code="SIGTV00446")
+
+    assert exc.value.status_code == 409
+    assert await _mac_of(db, tv) == TV_MAC
+
+
+async def test_paired_tv_still_reconnects_itself(db, router_io):
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _pair(db, tv)
+
+    result = await _reconnect(db, router, TV_MAC)
+
+    assert result["customer_name"] == "Vivian TV"
+    assert await _mac_of(db, tv) == TV_MAC
+
+
+@pytest.mark.parametrize("pairing", [
+    {"active": False},
+    {"expires_at": datetime.utcnow() - timedelta(minutes=1)},
+    {"mac": "3C:5A:B4:99:99:99"},          # stale pairing on another MAC
+    {"device_type": DeviceType.OTHER},     # shared phones are not pinned
+])
+async def test_pairing_that_does_not_pin_keeps_old_rule(db, router_io, pairing):
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _pair(db, tv, **pairing)
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(hours=2))
+
+    result = await _reconnect(db, router, NEW_LAPTOP_MAC)
+
+    assert result["customer_name"] == "Vivian TV"
+    assert await _mac_of(db, tv) == NEW_LAPTOP_MAC
+
+
+async def test_classification_paired_device():
+    now = datetime.utcnow()
+    use = classify_device_use(customer_id=1, mac=TV_MAC, last_seen=None,
+                              online_now=False, now=now, paired_device=True)
+    assert use.in_use and use.reason == "paired_device"
+
+
+# ------------------------------------------------- refusal text (SwapNet, 5 Nov)
+# Whoever is refused holds a valid plan: no reason may push them to buy, and each
+# reason states the wait that is true for it.
+
+
+def _refusal(mac, *, online_now=False, recent=False, paired_device=False, reason):
+    now = datetime.utcnow()
+    use = classify_device_use(
+        customer_id=1, mac=mac,
+        last_seen=now - timedelta(hours=3) if recent else None,
+        online_now=online_now, now=now, paired_device=paired_device,
+    )
+    assert use.in_use and use.reason == reason
+    return plan_in_use_detail(use)
+
+
+@pytest.mark.parametrize("mac,kwargs,reason", [
+    (PHONE_MAC, {"online_now": True}, "online_now"),
+    (TV_MAC, {"online_now": True}, "online_now"),
+    (TV_MAC, {"recent": True}, "fixed_device_recent"),
+    (TV_MAC, {"paired_device": True}, "paired_device"),
+    (PHONE_MAC, {"paired_device": True}, "paired_device"),
+])
+async def test_no_refusal_reason_pushes_a_purchase(mac, kwargs, reason):
+    detail = _refusal(mac, reason=reason, **kwargs)
+    message = detail["message"]
+
+    assert detail["error"] == PLAN_IN_USE_ERROR
+    assert detail["offer_purchase"] is False
+    assert detail["device_mac_tail"] == mac[-5:]
+    assert mac[-5:] in message
+    assert "already paid" in message
+    for push in ("buy", "purchase", "pay "):
+        assert push not in message.lower()
+
+
+async def test_phone_refusal_states_the_keepalive_wait():
+    message = _refusal(PHONE_MAC, online_now=True, reason="online_now")["message"]
+
+    assert "another device" in message
+    assert "Wait about 2 minutes and try again." in message
+    assert "a minute" not in message
+
+
+@pytest.mark.parametrize("kwargs,reason", [
+    ({"online_now": True}, "online_now"),
+    ({"recent": True}, "fixed_device_recent"),
+])
+async def test_fixed_device_refusal_does_not_promise_a_short_wait(kwargs, reason):
+    # A vendor MAC is held for a day after it goes offline: 2 minutes would be false.
+    message = _refusal(TV_MAC, reason=reason, **kwargs)["message"]
+
+    assert "minute" not in message
+    assert "full day" in message
+    assert "provider" in message
+
+
+async def test_paired_device_refusal_sends_them_to_the_provider_only():
+    # A paired device never moves by itself, however long it waits.
+    message = _refusal(TV_MAC, paired_device=True, reason="paired_device")["message"]
+
+    assert "paired to a TV" in message
+    assert "provider" in message
+    assert "minute" not in message and "day" not in message
+
+
+# --------------------------------------------------- group plans (Dennis, 4 Nov)
+# A code entered on a new device ADDS it while a slot is free; it never moves
+# the plan off an existing device. Full: refuse, or (phone path) move only an
+# idle, unpaired main device. Router 446 / customer 50758: a 10-device group
+# swapped to a 1-device plan by a later voucher still counts as full.
+
+import asyncio  # noqa: E402
+
+from app.api import device_pairing as device_pairing_api  # noqa: E402
+from app.services.subscription_sharing import active_shared_device_count  # noqa: E402
+
+
+@pytest.fixture
+def share_io(router_io, monkeypatch):
+    """The share path provisions in a background task via device_pairing's import."""
+
+    async def provision_ok(customer_id, router_id, hotspot_payload, *args, **kwargs):
+        router_io.provisioned.append(hotspot_payload["mac_address"])
+        return {"success": True}
+
+    monkeypatch.setattr(device_pairing_api, "provision_hotspot_customer", provision_ok)
+    return router_io
+
+
+async def _drain():
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+NEW_PHONE_1 = "DA:A1:19:00:30:01"
+NEW_PHONE_2 = "DA:A1:19:00:30:02"
+NEW_PHONE_3 = "DA:A1:19:00:30:03"
+
+
+async def _attach_shares(db, owner, macs):
+    for i, mac in enumerate(macs):
+        share = Customer(
+            name=f"Shared {i}", phone="", mac_address=mac,
+            status=CustomerStatus.ACTIVE, expiry=owner.expiry, plan_id=owner.plan_id,
+            user_id=owner.user_id, router_id=owner.router_id,
+            subscription_owner_id=owner.id,
+        )
+        db.add(share)
+        await db.flush()
+        db.add(DevicePairing(
+            customer_id=share.id, device_mac=mac, device_type=DeviceType.OTHER,
+            router_id=owner.router_id, plan_id=owner.plan_id, is_active=True,
+            expires_at=owner.expiry, subscription_owner_customer_id=owner.id,
+            is_subscription_share=True,
+        ))
+    await db.commit()
+
+
+async def test_group_code_on_new_device_adds_it_and_disconnects_nobody(db, share_io):
+    router_io = share_io
+    _r, _p, router, tv, _phone = await _household(db, tv_plan_devices=3, phone_row=False)
+    await _receipt(db, tv, "SIGGRP0001")
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(days=2))  # TV off for days
+
+    result = await _reconnect(db, router, NEW_PHONE_1, code="SIGGRP0001")
+    await _drain()
+
+    assert result["outcome"] == "device_added"
+    assert await _mac_of(db, tv) == TV_MAC
+    assert router_io.cleaned == []
+    assert router_io.provisioned == [NEW_PHONE_1]          # provisioned exactly once
+    assert await active_shared_device_count(db, tv.id) == 1
+
+
+async def test_group_code_never_exceeds_the_device_limit(db, share_io):
+    router_io = share_io
+    _r, _p, router, tv, _phone = await _household(db, tv_plan_devices=3, phone_row=False)
+    await _receipt(db, tv, "SIGGRP0002")
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(days=2))
+
+    for mac in (NEW_PHONE_1, NEW_PHONE_2):
+        assert (await _reconnect(db, router, mac, code="SIGGRP0002"))["outcome"] == "device_added"
+    # Same device again: no second slot, no second provisioning of a new row.
+    await _reconnect(db, router, NEW_PHONE_2, code="SIGGRP0002")
+    await _drain()
+    assert await active_shared_device_count(db, tv.id) == 2
+    assert sorted(router_io.provisioned).count(NEW_PHONE_1) == 1
+
+    with pytest.raises(HTTPException) as exc:
+        await _reconnect(db, router, NEW_PHONE_3, code="SIGGRP0002")
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "device_limit_reached"
+    assert "in use on all its 3 devices" in exc.value.detail["message"]
+    assert await _mac_of(db, tv) == TV_MAC
+    assert router_io.cleaned == []
+    assert NEW_PHONE_3 not in router_io.provisioned
+    assert await active_shared_device_count(db, tv.id) == 2
+
+
+async def test_group_swapped_to_single_device_plan_is_full_not_movable(db, share_io):
+    router_io = share_io
+    # 50758: limit now 1 (TV BUNDLE), 2+ shared devices still attached, TV
+    # unseen for days and not paired. A code from a new device must not take it.
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _attach_shares(db, tv, [NEW_PHONE_1, NEW_PHONE_2])
+    await _receipt(db, tv, "SIGGRP0003")
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(days=2))
+
+    with pytest.raises(HTTPException) as exc:
+        await _reconnect(db, router, NEW_PHONE_3, code="SIGGRP0003")
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "device_limit_reached"
+    assert "in use on all its 3 devices" in exc.value.detail["message"]
+    assert await _mac_of(db, tv) == TV_MAC
+    assert router_io.cleaned == [] and router_io.provisioned == []
+    assert await active_shared_device_count(db, tv.id) == 2
+
+
+async def test_swapped_group_by_phone_never_moves_a_paired_tv(db, share_io):
+    router_io = share_io
+    _r, _p, router, tv, _phone = await _household(db, phone_row=False)
+    await _pair(db, tv)
+    await _attach_shares(db, tv, [NEW_PHONE_1])
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(days=2))
+
+    with pytest.raises(HTTPException) as exc:
+        await _reconnect(db, router, NEW_PHONE_3)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "device_limit_reached"
+    assert await _mac_of(db, tv) == TV_MAC
+    assert router_io.cleaned == []
+
+
+async def test_full_group_by_phone_never_moves_a_paired_tv(db, share_io):
+    router_io = share_io
+    _r, _p, router, tv, _phone = await _household(db, tv_plan_devices=2, phone_row=False)
+    await _pair(db, tv)
+    await _attach_shares(db, tv, [NEW_PHONE_1])
+    await _seen(db, tv, FIXED_DEVICE_RECENT_WINDOW + timedelta(days=2))
+
+    with pytest.raises(HTTPException) as exc:
+        await _reconnect(db, router, NEW_PHONE_3)
+
+    assert exc.value.status_code == 409
+    assert await _mac_of(db, tv) == TV_MAC
+    assert router_io.cleaned == [] and router_io.provisioned == []

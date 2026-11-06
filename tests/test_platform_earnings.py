@@ -410,7 +410,10 @@ async def test_shop_sales_and_transaction_charges_are_reported_but_not_earnings(
 
     result = await svc.compute_platform_earnings(db, "month")
 
-    assert result["not_counted"] == {"shop_sales": 3_500, "reseller_transaction_charges": 33}
+    assert result["not_counted"] == {
+        "shop_sales": 3_500, "reseller_transaction_charges": 33,
+        "ads_paid_not_yet_running": 0.0, "ad_refunds_due": 0.0,
+    }
     assert result["earnings"]["total"] == 0
 
 

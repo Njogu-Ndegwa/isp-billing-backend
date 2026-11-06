@@ -18,6 +18,7 @@ from app.services.provisioning import (
     is_token_expired,
     derive_insurance_ip,
     router_mgmt_ca_pem,
+    DEVICE_MODE_UPDATE_COMMAND,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,10 +109,13 @@ async def create_provision_token(
             )
     else:
         note = (
-            "IMPORTANT: Before running this command on the MikroTik, ensure "
-            "device-mode hotspot is enabled. Run: "
-            "/system/device-mode/update hotspot=yes  "
-            "then tap the physical reset button on the router (quick tap, do NOT hold)."
+            "This command connects the router to the billing system remotely. "
+            "IMPORTANT: Before running it on the MikroTik, ensure device-mode "
+            "allows fetch, scheduler and hotspot (home mode blocks all three, "
+            f"basic mode blocks hotspot). Run: {DEVICE_MODE_UPDATE_COMMAND}  "
+            "then within 5 minutes tap the physical reset or mode button on the "
+            "router (quick tap, do NOT hold) or unplug the power and plug it back "
+            "in. A normal reboot cancels the change."
         )
 
     if token_obj.management_tunnel == "sstp":

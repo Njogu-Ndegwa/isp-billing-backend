@@ -61,6 +61,7 @@ from app.db.models import (
 from app.services.markets import reseller_market
 from app.services.messaging import count_segments
 from app.services.reseller_welcome import _resolve_sender_admin_id
+from app.services.subscription import in_free_setup, outside_free_setup
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +423,8 @@ async def send_expiry_reminder(user_id: int, stage: str, expires_at: datetime,
             # Re-check under the session: they may have paid since the scan.
             if user.subscription_expires_at != expires_at:
                 return None
+            if in_free_setup(user, now):
+                return None
             suspended_notice = stage == EXPIRED_STAGE
             if suspended_notice:
                 if (user.subscription_status != SubscriptionStatus.SUSPENDED
@@ -515,6 +518,7 @@ def _candidates_query(now: datetime, horizon: timedelta):
         User.subscription_expires_at <= now + horizon,
         # Past expiry we keep going only until the suspension run (< 1 day).
         User.subscription_expires_at >= now - timedelta(days=1),
+        outside_free_setup(now),
     )
 
 
@@ -527,6 +531,7 @@ def _suspended_candidates_query(now: datetime):
         User.subscription_expires_at <= now,
         # Suspension runs < 1 day after expiry, the notice window is 1 day more.
         User.subscription_expires_at >= now - timedelta(days=1) - SUSPENDED_NOTICE_WINDOW,
+        outside_free_setup(now),
     )
 
 
@@ -647,6 +652,7 @@ async def reminder_overview(db, *, days: int = 7, recent_limit: int = 100,
             User.subscription_expires_at.isnot(None),
             User.subscription_expires_at <= now + horizon,
             User.subscription_expires_at >= now - timedelta(days=1),
+            outside_free_setup(now),
         ).order_by(User.subscription_expires_at.asc())
     )).scalars().all()
     users = [u for u in users if now < next_suspension_run_at(u.subscription_expires_at)]

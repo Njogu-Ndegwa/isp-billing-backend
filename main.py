@@ -128,6 +128,7 @@ from app.api.payment_routes import router as payment_router
 from app.api.dashboard_routes import router as dashboard_router
 from app.api.mikrotik_routes import router as mikrotik_router
 from app.api.ads_routes import router as ads_router
+from app.api.ad_sales_routes import router as ad_sales_router
 from app.api.ratings_routes import router as ratings_router
 from app.api.voucher_routes import router as voucher_router
 from app.api.provisioning import router as provisioning_router
@@ -168,6 +169,8 @@ from app.api.static_ip_import_routes import router as static_ip_import_router
 from app.api.customer_device_routes import router as customer_device_router
 from app.api.admin_support_desk_routes import router as admin_support_desk_router
 from app.api.staff_routes import router as staff_router
+from app.api.pppoe_expired_routes import router as pppoe_expired_router
+from app.api.router_ap_routes import router as router_ap_router
 
 app.include_router(session_monitor_router)
 app.include_router(auth_router)
@@ -182,6 +185,7 @@ app.include_router(payment_router)
 app.include_router(dashboard_router)
 app.include_router(mikrotik_router)
 app.include_router(ads_router)
+app.include_router(ad_sales_router)
 app.include_router(ratings_router)
 app.include_router(voucher_router)
 app.include_router(provisioning_router)
@@ -222,6 +226,8 @@ app.include_router(static_ip_import_router)
 app.include_router(customer_device_router)
 app.include_router(admin_support_desk_router)
 app.include_router(staff_router)
+app.include_router(pppoe_expired_router)
+app.include_router(router_ap_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -831,6 +837,31 @@ async def run_payment_method_migrations():
         await conn.run_sync(
             lambda c: FapshiTransaction.__table__.create(c, checkfirst=True)
         )
+        # Durable confirmation queue and immutable purchase contract. Legacy
+        # rows intentionally retain a NULL snapshot and are review-held.
+        await conn.execute(sa_text("""
+            ALTER TABLE fapshi_transactions
+            ADD COLUMN IF NOT EXISTS purchase_snapshot JSON,
+            ADD COLUMN IF NOT EXISTS customer_payment_id INTEGER REFERENCES customer_payments(id),
+            ADD COLUMN IF NOT EXISTS provider_status VARCHAR(20),
+            ADD COLUMN IF NOT EXISTS review_reason VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS check_attempts INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS check_lease_until TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS check_lease_token VARCHAR(64),
+            ADD COLUMN IF NOT EXISTS last_check_error VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS fulfillment_pending BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS applied_expiry TIMESTAMP
+        """))
+        await conn.execute(sa_text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_fapshi_customer_payment
+            ON fapshi_transactions (customer_payment_id)
+        """))
+        await conn.execute(sa_text("""
+            CREATE INDEX IF NOT EXISTS ix_fapshi_confirmation_due
+            ON fapshi_transactions (next_check_at, id)
+            WHERE review_reason IS NULL
+        """))
 
         # Buy Goods till payouts (2026-07-21): the pre-existing enum type
         # no-ops the CREATE TYPE above via duplicate_object, so new values
@@ -1567,7 +1598,10 @@ async def run_subscription_migrations():
     await _run_sql("Reset expired trial dates",
         "UPDATE users SET subscription_expires_at = NOW() + INTERVAL '7 days' "
         "WHERE role::text = 'reseller' AND subscription_status::text = 'trial' "
-        "AND subscription_expires_at < NOW()"
+        "AND subscription_expires_at < NOW() "
+        # A used Free setup window must end when it ends, not get 7 more days
+        # because a deploy landed before the next suspension run.
+        "AND free_setup_until IS NULL"
     )
     # Step 7: Fix legacy columns that may have been created with NOT NULL
     for col in ("is_active", "paid_on", "expires_on", "plan_type", "cost"):
@@ -2689,6 +2723,25 @@ async def run_staff_migrations():
         ))
 
 
+async def run_free_setup_column_migration():
+    """Add users.free_setup_until (nullable, so the previous release still runs).
+
+    Every User query reads this column, login included, so like the staff
+    migration it must succeed before serving rather than fail quietly.
+    """
+    async with async_engine.begin() as conn:
+        if conn.dialect.name == "sqlite":
+            columns = (await conn.execute(sa_text("PRAGMA table_info(users)"))).all()
+            if "free_setup_until" not in {row[1] for row in columns}:
+                await conn.execute(sa_text(
+                    "ALTER TABLE users ADD COLUMN free_setup_until TIMESTAMP NULL"
+                ))
+        else:
+            await conn.execute(sa_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_setup_until TIMESTAMP NULL"
+            ))
+
+
 async def run_settlement_mode_migrations():
     """Add users.settlement_mode ('platform' | 'direct').
 
@@ -2753,6 +2806,18 @@ async def run_static_ip_migrations():
             ALTER TABLE customers
             ADD COLUMN IF NOT EXISTS static_mac VARCHAR(50) NULL
         """))
+
+
+async def run_router_ap_credential_migrations():
+    """Create router_ap_credentials: encrypted web-admin logins for access points
+    (Tenda) behind a router, used by the on-demand access-point actions
+    (app/services/ap_control.py). New table only; idempotent (checkfirst)."""
+    async with async_engine.begin() as conn:
+        from app.db.models import RouterApCredential
+        await conn.run_sync(
+            lambda c: RouterApCredential.__table__.create(c, checkfirst=True)
+        )
+    logger.info("Migration: Ensured router_ap_credentials table exists")
 
 
 async def run_management_tunnel_migrations():
@@ -2925,6 +2990,19 @@ async def run_router_status_alert_migrations():
     logger.info("Router status-alert migrations complete")
 
 
+async def run_pppoe_expired_redirect_migrations():
+    """Add routers.pppoe_expired_redirect (per-router opt-in: expired PPPoE
+    customers are walled and redirected to the payment portal instead of being
+    removed) and routers.pppoe_expired_redirect_config. Idempotent."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS pppoe_expired_redirect BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS pppoe_expired_redirect_config JSON NULL
+        """))
+    logger.info("PPPoE expired-redirect migrations complete")
+
+
 async def run_router_reachability_probe_migrations():
     """Record, once, when the reachability probe went live: outages that began
     before it are not announced to resellers (router_status_alerts
@@ -2982,6 +3060,17 @@ async def run_subscription_reminder_migrations():
             lambda c: SubscriptionExpiryReminder.__table__.create(c, checkfirst=True)
         )
     logger.info("Migration: subscription_expiry_reminders table ready")
+
+
+async def run_subscription_free_setup_migrations():
+    """Create the Free setup time audit table. Idempotent."""
+    from app.db.models import SubscriptionFreeSetupGrant
+
+    async with async_engine.begin() as conn:
+        await conn.run_sync(
+            lambda c: SubscriptionFreeSetupGrant.__table__.create(c, checkfirst=True)
+        )
+    logger.info("Migration: subscription_free_setup_grants table ready")
 
 
 async def run_feedback_migrations():
@@ -3392,6 +3481,42 @@ async def run_hero_ads_migrations():
     logger.info("Hero ads migrations complete")
 
 
+async def run_ad_sales_migrations():
+    """Selling ads through Bitwave (2026-11): creates the new tables ad_sales,
+    ad_sale_payments and ad_review_events if they are missing, then adds the
+    columns for time off and refunds of unused days. Additive only: every new
+    column is nullable or has a default, and no row is changed. Idempotent:
+    safe on every startup.
+    """
+    from sqlalchemy import inspect
+    from app.db.models import AdReviewEvent, AdSale, AdSalePayment
+
+    async with async_engine.begin() as conn:
+        tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+        missing = [
+            model.__table__
+            for model in (AdSale, AdSalePayment, AdReviewEvent)
+            if model.__tablename__ not in tables
+        ]
+        if missing:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=missing))
+            logger.info("Ad sales migration: created %s", ", ".join(t.name for t in missing))
+        await conn.execute(sa_text(
+            "ALTER TABLE ad_sales "
+            "ADD COLUMN IF NOT EXISTS off_since TIMESTAMP NULL, "
+            "ADD COLUMN IF NOT EXISTS off_seconds_total INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(sa_text(
+            "ALTER TABLE ad_sale_payments "
+            "ADD COLUMN IF NOT EXISTS refund_amount INTEGER NULL, "
+            "ADD COLUMN IF NOT EXISTS refund_unused_days INTEGER NULL, "
+            "ADD COLUMN IF NOT EXISTS reseller_recovery INTEGER NULL, "
+            "ADD COLUMN IF NOT EXISTS bitwave_refund_part INTEGER NULL, "
+            "ADD COLUMN IF NOT EXISTS recovery_charge_id INTEGER NULL"
+        ))
+    logger.info("Ad sales migrations complete")
+
+
 @app.on_event("startup")
 async def startup_event():
     if shadow_mode_enabled():
@@ -3439,6 +3564,7 @@ async def startup_event():
 
     # Auth queries below include users.token_version; migrate before any user reads.
     await run_staff_migrations()
+    await run_free_setup_column_migration()
 
     try:
         await run_password_reset_migrations()
@@ -3517,6 +3643,20 @@ async def startup_event():
         logger.info("FUP / usage tracking migrations completed successfully")
     except Exception as e:
         logger.error(f"FUP / usage tracking migration failed (non-fatal): {e}")
+
+    try:
+        # Once-only in effect: repaired rows no longer match, and periods opened
+        # after the fix are excluded by date. Loosens caps, never tightens.
+        from app.db.database import AsyncSessionLocal
+        from app.services.usage_tracking import repair_stale_cap_snapshots
+
+        async with AsyncSessionLocal() as repair_db:
+            repaired_caps = await repair_stale_cap_snapshots(repair_db)
+            await repair_db.commit()
+        if repaired_caps:
+            logger.warning("[FUP] Repaired stale usage caps: %s", repaired_caps)
+    except Exception as e:
+        logger.error(f"Stale usage cap repair failed (non-fatal): {e}")
 
     try:
         await run_payment_history_migrations()
@@ -3605,6 +3745,11 @@ async def startup_event():
         logger.error(f"Management-tunnel migration failed (non-fatal): {e}")
 
     try:
+        await run_router_ap_credential_migrations()
+    except Exception as e:
+        logger.error(f"Router AP credential migration failed (non-fatal): {e}")
+
+    try:
         await run_expiry_reaper_migrations()
         logger.info("Expiry-reaper migration completed successfully")
     except Exception as e:
@@ -3675,6 +3820,12 @@ async def startup_event():
         logger.error(f"Subscription reminder migration failed (non-fatal): {e}")
 
     try:
+        await run_subscription_free_setup_migrations()
+        logger.info("Free setup time migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Free setup time migration failed (non-fatal): {e}")
+
+    try:
         await run_hot_path_index_migrations()
         logger.info("Hot-path index migrations completed successfully")
     except Exception as e:
@@ -3716,6 +3867,16 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Hero ads migration failed (non-fatal): {e}")
 
+    try:
+        await run_ad_sales_migrations()
+    except Exception as e:
+        logger.error(f"Ad sales migration failed (non-fatal): {e}")
+
+    try:
+        await run_pppoe_expired_redirect_migrations()
+    except Exception as e:
+        logger.error(f"PPPoE expired-redirect migration failed (non-fatal): {e}")
+
     from app.config import settings as app_settings
     if not scheduler_enabled():
         if scheduler.running:
@@ -3742,6 +3903,28 @@ async def startup_event():
         name='Remove expired hotspot users from MikroTik',
         replace_existing=True,
         max_instances=1
+    )
+    # Sold ads: confirm M-Pesa prompts whose callback never came, and time
+    # out the ones nobody answered (app/services/ad_sales.py).
+    from app.services.ad_sales import reconcile_ad_sale_payments_background
+    scheduler.add_job(
+        reconcile_ad_sale_payments_background,
+        trigger=IntervalTrigger(seconds=60),
+        id='ad_sale_payment_reconcile',
+        name='Confirm or time out M-Pesa prompts for sold ads',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,
+    )
+    from app.services.fapshi_reconciliation import recheck_pending_fapshi_background
+    scheduler.add_job(
+        recheck_pending_fapshi_background,
+        trigger=IntervalTrigger(seconds=30),
+        id='fapshi_confirmation_recheck',
+        name='Confirm delayed Fapshi collections and retry durable delivery',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=30,
     )
     # Safety-net bypass scan + idle-credential reaper. Split out of the job
     # above so the 5-6 min fleet scan no longer pauses removals; each keeps its

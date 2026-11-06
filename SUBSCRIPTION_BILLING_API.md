@@ -506,6 +506,40 @@ Waive a specific invoice for a reseller.
 
 ---
 
+### POST `/api/admin/subscriptions/{reseller_id}/free-setup`
+
+Admin only. "Free setup time (7 days)", for an account that signed up but never got
+a router working. One transaction, for this reseller only:
+
+1. Waives its pending and overdue invoices. Paid invoices and completed payments are
+   never touched, and nothing is refunded.
+2. Lifts a suspension: back to `trial` if it never paid, `active` if it has. An
+   `inactive` account is refused with 409 (only a hand edit sets that status).
+3. Sets the end date to now + 7 days, or leaves it if already later.
+4. Sets `users.free_setup_until` to now + 7 days. Until then the invoice jobs (and
+   `request-invoice`), the suspension check and the renewal reminders skip the account.
+5. Writes a `subscription_free_setup_grants` row: who, when, before and after, each
+   invoice waived with its amounts.
+
+It never touches the lead or creates a payment.
+
+One use per account. Another press returns 409 unless the body has `override: true`
+and an `override_reason`.
+
+**Body (optional):** `{ "override": true, "override_reason": "Router arrived late" }`
+
+**Response:** `{ "message": "Free setup time given", "grant": { ... } }`. The same
+grants come back on `GET /api/admin/subscriptions/{reseller_id}` under `free_setup`.
+
+**When the window ends** (T = press + 7 days, times UTC): the first invoice comes at
+the first 06:00 at or after T, with `period_start` = T so sales made during the window
+are not charged. Suspension comes at the first 08:00 at or after T unless they have
+paid. If T falls between 06:00 and 08:00, suspension comes first and the invoice
+follows at the next 06:00. If the end date was already later than T, the usual dates
+for that end date apply. Reminders resume at T.
+
+---
+
 ### POST `/api/admin/subscriptions/generate-invoices`
 
 Manually trigger monthly invoice generation for the previous month.

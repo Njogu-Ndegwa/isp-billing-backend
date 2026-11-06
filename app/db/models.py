@@ -158,6 +158,10 @@ class User(Base):
         server_default="trial"
     )
     subscription_expires_at = Column(DateTime, nullable=True)
+    # End of an admin "Free setup time" window (SubscriptionFreeSetupGrant has
+    # who pressed it). Until then the invoice, reminder and suspension jobs leave
+    # this account alone; afterwards normal billing resumes. NULL = never granted.
+    free_setup_until = Column(DateTime, nullable=True)
     # Country market (app/services/markets.py): fixes the reseller's operating
     # currency (plan prices, customer payments, revenue), how the platform
     # bills them and how they pay, plus language/timezone defaults. Plain
@@ -657,6 +661,13 @@ class Router(Base):
     snmp_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     cpu_load = Column(Integer, nullable=True)
     cpu_checked_at = Column(DateTime, nullable=True)
+    # Expired PPPoE customers stay connected in a walled state and every web
+    # page redirects to the payment portal (app/services/pppoe_expired_redirect.py).
+    # Off by default; toggled per router by the owner, which applies or removes
+    # the RouterOS side. _config holds what was applied (pool, proxy port, the
+    # proxy-access syntax this RouterOS accepts, whether we enabled /ip proxy).
+    pppoe_expired_redirect = Column(Boolean, nullable=False, default=False, server_default="false")
+    pppoe_expired_redirect_config = Column(JSON, nullable=True)
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 
@@ -1179,6 +1190,112 @@ class AdEvent(Base):
         Index("ix_ad_events_day", "day"),
     )
 
+
+class AdSale(Base):
+    """An ad a reseller sold to a local business, paid through Bitwave.
+
+    One row per sold ad (slot "reseller"). The business pays Bitwave's own
+    paybill by STK push; Bitwave keeps 20% and the reseller's 80% joins their
+    normal payout balance once the paid weeks start running. See
+    app/services/ad_sales.py.
+
+    ad_id has no foreign key on purpose (like ad_events): money records must
+    outlive an ad that is later deleted.
+    """
+    __tablename__ = "ad_sales"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ad_id = Column(Integer, nullable=False, unique=True, index=True)
+    reseller_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    business_name = Column(String(150), nullable=False)
+    # Normalised 2547XXXXXXXX / 2541XXXXXXXX: who gets the M-Pesa prompt.
+    business_phone = Column(String(20), nullable=False)
+    price_per_week = Column(Integer, nullable=False)       # whole KES
+    weeks = Column(Integer, nullable=False)                # weeks in the first order
+    # Paid weeks that have not started running yet (paid before approval).
+    weeks_banked = Column(Integer, nullable=False, default=0, server_default="0")
+    # When the running paid period last stopped showing (paused, Show Ads off, or
+    # an old pending status). NULL = the clock is running. Coming back moves
+    # ads.expires_at out by the time it was off (app/services/ad_sales.py).
+    off_since = Column(DateTime, nullable=True)
+    # Total time given back so far, in seconds.
+    off_seconds_total = Column(Integer, nullable=False, default=0, server_default="0")
+    # The shop's read-only link: report, and the pay button while a payment is due.
+    share_token = Column(String(48), nullable=False, unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdSalePayment(Base):
+    """One M-Pesa prompt for a sold ad, and the money it brought in.
+
+    Prompts for the same order (the first sale, or one renewal) share
+    order_key: resending a prompt adds a row with the same key. The first
+    paid row of an order is the payment; a later paid row on the same key is
+    a duplicate and is flagged for refund, never credited.
+
+    Money is whole KES. bitwave_fee = floor(amount * 20 / 100) and
+    reseller_share = amount - bitwave_fee (the remainder goes to the reseller).
+    credited_at is set when the paid weeks start running; only then does
+    reseller_share count towards the reseller's payout balance and
+    bitwave_fee towards Bitwave's earnings.
+    """
+    __tablename__ = "ad_sale_payments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sale_id = Column(Integer, ForeignKey("ad_sales.id"), nullable=False, index=True)
+    ad_id = Column(Integer, nullable=False, index=True)
+    reseller_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    kind = Column(String(10), nullable=False)               # initial | renewal
+    order_key = Column(String(40), nullable=False, index=True)
+    weeks = Column(Integer, nullable=False)
+    price_per_week = Column(Integer, nullable=False)
+    amount = Column(Integer, nullable=False)
+    bitwave_fee = Column(Integer, nullable=False)
+    reseller_share = Column(Integer, nullable=False)
+    phone = Column(String(20), nullable=False)
+    # awaiting_payment -> paid | failed | timed_out (a late success callback
+    # still turns failed/timed_out into paid: the money is real).
+    status = Column(String(20), nullable=False, default="awaiting_payment", index=True)
+    checkout_request_id = Column(String(128), nullable=True, unique=True)
+    merchant_request_id = Column(String(128), nullable=True)
+    mpesa_receipt = Column(String(64), nullable=True, unique=True)
+    result_desc = Column(String(255), nullable=True)
+    paid_at = Column(DateTime, nullable=True)
+    is_duplicate = Column(Boolean, nullable=False, default=False, server_default="false")
+    credited_at = Column(DateTime, nullable=True, index=True)
+    # None | due | refunded. Never automatic: an admin refunds by hand and
+    # records it here.
+    refund_status = Column(String(10), nullable=True, index=True)
+    refund_reason = Column(String(300), nullable=True)
+    # What the shop gets back. NULL = the whole amount (a payment that never ran).
+    # Otherwise refund_amount = reseller_recovery + bitwave_refund_part, set once
+    # when an ad that has run is stopped with whole days unused.
+    refund_amount = Column(Integer, nullable=True)
+    refund_unused_days = Column(Integer, nullable=True)
+    reseller_recovery = Column(Integer, nullable=True)
+    bitwave_refund_part = Column(Integer, nullable=True)
+    # The reseller_transaction_charges row that recovers reseller_recovery. No
+    # foreign key, like ad_id: money records outlive what they point at.
+    recovery_charge_id = Column(Integer, nullable=True)
+    refunded_at = Column(DateTime, nullable=True)
+    refunded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdReviewEvent(Base):
+    """Append-only history of an ad's status: approve, reject, auto_approve,
+    takedown. Remembers takedowns so an edit can't put an ad back live."""
+    __tablename__ = "ad_review_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ad_id = Column(Integer, nullable=False, index=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    slot = Column(String(10), nullable=False)
+    action = Column(String(20), nullable=False)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    note = Column(String(300), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
 class AdClick(Base):
     __tablename__ = "ad_clicks"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1523,6 +1640,19 @@ class FapshiTransaction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     confirmed_at = Column(DateTime, nullable=True)
+    # Immutable contract/baseline captured before Direct Pay; NULL legacy rows
+    # require review rather than guessing what a later plan change purchased.
+    purchase_snapshot = Column(JSON, nullable=True)
+    customer_payment_id = Column(Integer, ForeignKey("customer_payments.id"), nullable=True, unique=True)
+    provider_status = Column(String(20), nullable=True)
+    review_reason = Column(String(100), nullable=True)
+    next_check_at = Column(DateTime, nullable=True)
+    check_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    check_lease_until = Column(DateTime, nullable=True)
+    check_lease_token = Column(String(64), nullable=True)
+    last_check_error = Column(String(100), nullable=True)
+    fulfillment_pending = Column(Boolean, nullable=False, default=False, server_default="false")
+    applied_expiry = Column(DateTime, nullable=True)
 
     customer = relationship("Customer")
     reseller = relationship("User")
@@ -2475,6 +2605,31 @@ class SubscriptionExpiryReminder(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+class SubscriptionFreeSetupGrant(Base):
+    """One row per press of the admin "Free setup time" button: the audit trail.
+
+    Waivers have no other record, so this keeps who pressed it, what the account
+    looked like before, and each invoice waived with its amounts. Also the
+    one-use guard: an account with a row needs a deliberate override to get
+    another window. ``waived_invoices`` is a copy, not a link, so a later change
+    to an invoice never rewrites what was waived.
+    """
+    __tablename__ = "subscription_free_setup_grants"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    granted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    granted_by_email = Column(String, nullable=False)
+    free_until = Column(DateTime, nullable=False)
+    previous_status = Column(String(20), nullable=False)
+    new_status = Column(String(20), nullable=False)
+    previous_expires_at = Column(DateTime, nullable=True)
+    new_expires_at = Column(DateTime, nullable=False)
+    waived_invoices = Column(JSON, nullable=False, default=list)
+    is_override = Column(Boolean, nullable=False, default=False, server_default="false")
+    override_reason = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class FeedbackKind(str, enum.Enum):
     BUG = "bug"
     IDEA = "idea"
@@ -3026,3 +3181,53 @@ class SupportDeskDecision(Base):
     decided_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     consumed_at = Column(DateTime, nullable=True, index=True)
+
+
+class RouterApCredential(Base):
+    """Web admin login for an access point (a Tenda) behind a router.
+
+    The reseller types the AP's admin password once on the router's
+    Diagnostics page; it is stored Fernet-encrypted with the same helper as
+    the M-Pesa keys (``app.services.payment_gateway.encrypt_credential``) and
+    is never returned by the API or written to logs. Used only for on-demand
+    actions run from the MikroTik with ``/tool fetch``
+    (``app/services/ap_control.py``): status, reboot, "make it a safe AP".
+
+    ``router_id`` is a plain int, not an FK, like ``customer_events``: a stale
+    row must never block deleting a router. One row per (router, AP MAC).
+
+    Lockout: ``failed_login_count`` counts consecutive failed logins; at
+    ``ap_control.MAX_FAILED_LOGINS`` no further login is attempted until the
+    password is replaced, so a wrong password is never retried blindly (and
+    the AP's own lockout is never triggered by us).
+
+    ``last_status`` is the last status read (mode, DHCP, IP, firmware...) with
+    no secrets; the detector uses it to flag router-mode / DHCP-on APs.
+    Startup migration: run_router_ap_credential_migrations() in main.py.
+    """
+    __tablename__ = "router_ap_credentials"
+    __table_args__ = (
+        UniqueConstraint("router_id", "ap_mac", name="uq_router_ap_credentials_router_mac"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    router_id = Column(Integer, nullable=False, index=True)
+    ap_mac = Column(String(17), nullable=False)
+    vendor = Column(String(30), nullable=False, default="Tenda", server_default="Tenda")
+    model = Column(String(40), nullable=True)
+    username = Column(String(64), nullable=False, default="admin", server_default="admin")
+    password_encrypted = Column(Text, nullable=False)
+    # base64 | md5 | plain, as detected from the AP's login page on last use
+    login_method = Column(String(16), nullable=True)
+    last_login_ok = Column(Boolean, nullable=True)
+    failed_login_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(String(255), nullable=True)
+    last_ip = Column(String(45), nullable=True)
+    last_status = Column(JSON, nullable=True)
+    last_status_at = Column(DateTime, nullable=True)
+    last_action = Column(String(32), nullable=True)
+    last_action_at = Column(DateTime, nullable=True)
+    last_reboot_at = Column(DateTime, nullable=True)
+    updated_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)

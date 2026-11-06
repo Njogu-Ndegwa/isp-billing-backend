@@ -5,13 +5,20 @@ Ownership (hero ads, 2026-10):
   * Bitwave (an admin) creates "platform" ads. They are approved on creation
     and run network-wide or on the routers listed in router_ids.
   * A reseller creates ads only for their own routers: "house" (their own
-    promo) or "reseller" (one they sold). Every reseller ad starts pending and
-    needs an admin's approval before any portal shows it; editing its content
-    sends it back to pending.
+    promo) or "reseller" (one they sold).
   * A reseller sees, edits and deletes only their own ads. Before this, any
     reseller could edit or delete any ad and publish to every portal.
 
-Serving and counting live in app/services/ad_serving.py.
+Review rules (Dennis, 5 Nov 2026; app/services/ad_review.py): nobody reviews
+an ad first. Every reseller submit runs automatic checks (blocked words, a
+valid phone, media). A "house" ad is locked to the reseller's own network name
+and support number and goes live at once; a sold ad ("reseller" slot) is created
+through /api/ad-sales, is paid by the business through Bitwave, and goes live
+when that payment is confirmed. An edit keeps a live ad live. An admin's
+takedown is the safety net.
+
+Serving and counting live in app/services/ad_serving.py; selling and payment
+in app/services/ad_sales.py and app/api/ad_sales_routes.py.
 """
 
 import logging
@@ -28,7 +35,7 @@ from app.db.database import get_db
 from app.db.models import (
     Ad, AdBadgeType, AdClick, AdEvent, Advertiser, Router, User, UserRole,
 )
-from app.services import ad_media
+from app.services import ad_media, ad_review, ad_sales
 from app.services.ad_serving import (
     CLICK_TYPES, IMAGE_FITS, MEDIA_TYPES, PLACEMENTS, STATUSES,
     build_event_rows, device_key_for, get_live_ads_cached, invalidate_ad_cache,
@@ -44,8 +51,9 @@ router = APIRouter(tags=["ads"])
 
 _BADGES = {"hot": AdBadgeType.HOT, "new": AdBadgeType.NEW, "sale": AdBadgeType.SALE}
 _COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_MEDIA_FIELDS = ("image_url", "video_url", "poster_url")
 _PHONE_RE = re.compile(r"^\+?[0-9 ]{9,16}$")
-# Content edits that send a reseller's approved ad back for review.
+# Content edits: what the automatic checks run again for.
 _REVIEWED_FIELDS = {
     "title", "description", "image_url", "seller_name", "seller_location",
     "phone_number", "whatsapp_number", "price", "media_type", "video_url",
@@ -191,6 +199,7 @@ def _check_media_url(url: Optional[str], field: str) -> Optional[str]:
     if base:
         if not url.startswith(base + "/"):
             raise HTTPException(status_code=400, detail=f"{field} must be uploaded through the dashboard")
+        url = ad_media.public_media_url(url)
     elif not url.startswith("https://"):
         raise HTTPException(status_code=400, detail=f"{field} must be an https:// link")
     return url[:500]
@@ -236,14 +245,15 @@ async def _load_owned_ad(db: AsyncSession, user: User, ad_id: int) -> Ad:
     return ad
 
 
-def _serialize_manage(ad: Ad, stats: Optional[dict] = None, owner_name: Optional[str] = None) -> dict:
+def _serialize_manage(ad: Ad, stats: Optional[dict] = None, owner_name: Optional[str] = None,
+                      sale: Optional[dict] = None) -> dict:
     stats = stats or {}
     return {
         "id": ad.id,
         "advertiser_id": ad.advertiser_id,
         "title": ad.title,
         "description": ad.description,
-        "image_url": ad.image_url,
+        "image_url": ad_media.public_media_url(ad.image_url),
         "seller_name": ad.seller_name,
         "seller_location": ad.seller_location,
         "phone_number": ad.phone_number,
@@ -257,8 +267,8 @@ def _serialize_manage(ad: Ad, stats: Optional[dict] = None, owner_name: Optional
         "priority": ad.priority,
         "placement": ad.placement,
         "media_type": ad.media_type,
-        "video_url": ad.video_url,
-        "poster_url": ad.poster_url,
+        "video_url": ad_media.public_media_url(ad.video_url),
+        "poster_url": ad_media.public_media_url(ad.poster_url),
         "image_fit": ad.image_fit,
         "bg_color": ad.bg_color,
         "slot": ad.slot,
@@ -275,6 +285,8 @@ def _serialize_manage(ad: Ad, stats: Optional[dict] = None, owner_name: Optional
         # Unique devices per day, summed, over the last 30 days.
         "views_count": int(stats.get("impression", 0)),
         "clicks_count": int(stats.get("click", 0)),
+        # Sold ads only: payment status, amounts and the business's link.
+        "sale": sale,
     }
 
 
@@ -339,7 +351,7 @@ def _apply_fields(ad: Ad, data: dict) -> None:
         ad.media_type = _check_choice(data["media_type"], MEDIA_TYPES, "media_type")
     if "image_fit" in data and data["image_fit"] is not None:
         ad.image_fit = _check_choice(data["image_fit"], IMAGE_FITS, "image_fit")
-    for field in ("image_url", "video_url", "poster_url"):
+    for field in _MEDIA_FIELDS:
         if field in data:
             setattr(ad, field, _check_media_url(data[field], field))
     if "bg_color" in data:
@@ -415,14 +427,16 @@ async def list_manage_ads(
     placement: Optional[str] = None,
     owner_user_id: Optional[int] = None,
     bitwave_only: bool = False,
+    newly_live: bool = False,
     page: int = 1,
     per_page: int = 50,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Admins see every ad; a reseller sees their own. ?status=pending is the
-    review queue. Admins can narrow to one reseller (?owner_user_id=) or to
-    Bitwave's own ads (?bitwave_only=true)."""
+    """Admins see every ad; a reseller sees their own. Admins can narrow to one
+    reseller (?owner_user_id=) or to Bitwave's own ads (?bitwave_only=true).
+    ?newly_live=true lists resellers' ads on portals now, newest go-live first,
+    for an admin to check after the fact (nothing waits for this)."""
     user = await get_current_user(token, db)
     page, per_page = max(page, 1), min(max(per_page, 1), 100)
     q = select(Ad)
@@ -436,14 +450,29 @@ async def list_manage_ads(
         q = q.where(Ad.status == _check_choice(status, STATUSES, "status"))
     if placement:
         q = q.where(Ad.placement == _check_choice(placement, PLACEMENTS, "placement"))
+    order = (Ad.created_at.desc(), Ad.id.desc())
+    if newly_live:
+        now = datetime.utcnow()
+        q = q.where(
+            Ad.owner_user_id != None,  # noqa: E711
+            Ad.status == "approved",
+            Ad.is_active == True,  # noqa: E712
+            (Ad.expires_at == None) | (Ad.expires_at > now),  # noqa: E711
+            (Ad.slot != "reseller") | (Ad.expires_at != None),  # noqa: E711
+        )
+        order = (func.coalesce(Ad.starts_at, Ad.reviewed_at, Ad.created_at).desc(), Ad.id.desc())
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
     ads = (await db.execute(
-        q.order_by(Ad.created_at.desc(), Ad.id.desc()).offset((page - 1) * per_page).limit(per_page)
+        q.order_by(*order).offset((page - 1) * per_page).limit(per_page)
     )).scalars().all()
     totals = await _event_totals(db, [a.id for a in ads])
     names = await _owner_names(db, [a.owner_user_id for a in ads])
+    sales = await ad_sales.summaries_for_ads(db, list(ads))
     return {
-        "ads": [_serialize_manage(a, totals.get(a.id), names.get(a.owner_user_id)) for a in ads],
+        "ads": [
+            _serialize_manage(a, totals.get(a.id), names.get(a.owner_user_id), sales.get(a.id))
+            for a in ads
+        ],
         "pagination": {
             "page": page, "per_page": per_page, "total": total,
             "total_pages": (total + per_page - 1) // per_page,
@@ -459,9 +488,23 @@ async def get_manage_ad(
 ):
     user = await get_current_user(token, db)
     ad = await _load_owned_ad(db, user, ad_id)
+    return await _manage_view(db, ad)
+
+
+async def _manage_view(db: AsyncSession, ad: Ad) -> dict:
     totals = await _event_totals(db, [ad.id])
     names = await _owner_names(db, [ad.owner_user_id])
-    return _serialize_manage(ad, totals.get(ad.id), names.get(ad.owner_user_id))
+    sales = await ad_sales.summaries_for_ads(db, [ad])
+    return _serialize_manage(ad, totals.get(ad.id), names.get(ad.owner_user_id), sales.get(ad.id))
+
+
+async def _auto_approve(db: AsyncSession, ad: Ad) -> None:
+    ad.status = "approved"
+    ad.review_note = "Approved automatically"
+    ad.reviewed_at = datetime.utcnow()
+    ad.reviewed_by = None
+    ad_review.record_event(db, ad, ad_review.ACTION_AUTO_APPROVE, None)
+    await ad_sales.on_approved(db, ad)
 
 
 @router.post("/api/ads")
@@ -480,7 +523,13 @@ async def create_ad(
             raise HTTPException(status_code=400, detail="Bitwave ads use the platform slot")
     else:
         slot = request.slot or "house"
-        if slot not in ("house", "reseller"):
+        if slot == "reseller":
+            # A sold ad is paid for through Bitwave: POST /api/ad-sales.
+            raise HTTPException(
+                status_code=400,
+                detail="An ad you sold is created with the business's payment details (POST /api/ad-sales)",
+            )
+        if slot != "house":
             raise HTTPException(status_code=400, detail="slot must be house or reseller")
         if request.advertiser_id is not None:
             raise HTTPException(status_code=400, detail="Only Bitwave ads can be linked to an advertiser")
@@ -505,8 +554,13 @@ async def create_ad(
     _apply_fields(ad, data)
     _check_media_complete(ad)
     ad.router_ids = await _check_router_scope(db, user, request.router_ids)
+    if not admin:
+        await ad_review.run_submit_checks(db, ad, user)
 
     db.add(ad)
+    await db.flush()
+    if not admin and await ad_review.decide_status(db, ad, user) == "approved":
+        await _auto_approve(db, ad)
     await db.commit()
     await db.refresh(ad)
     await invalidate_ad_cache()
@@ -525,6 +579,8 @@ async def update_ad(
     enforce_active_subscription(user)
     ad = await _load_owned_ad(db, user, ad_id)
     admin = _is_admin(user)
+    # Before anything on the ad changes: see ad_sales.lock_sale_for_ad.
+    sale = await ad_sales.lock_sale_for_ad(db, ad)
 
     data = request.model_dump(exclude_unset=True)
     if "advertiser_id" in data:
@@ -537,36 +593,53 @@ async def update_ad(
                 raise HTTPException(status_code=404, detail="Advertiser not found")
         ad.advertiser_id = advertiser_id
     slot = data.pop("slot", None)
-    if slot is not None:
-        allowed = ("platform",) if ad.owner_user_id is None else ("house", "reseller")
-        ad.slot = _check_choice(slot, allowed, "slot")
+    if slot is not None and slot != ad.slot:
+        # A free promo can't turn into a sold ad (or back) by an edit: the
+        # sold one is paid for, the free one is locked to the reseller's own
+        # network. Make a new ad instead.
+        raise HTTPException(status_code=400, detail="An ad's type can't be changed; create a new ad instead")
+    if ad.slot == "reseller":
+        # A sold ad runs for the weeks paid for; nobody edits its dates.
+        for field in ("starts_at", "expires_at"):
+            if field in data:
+                sent = _parse_dt(data.pop(field), field)
+                if sent != getattr(ad, field):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="A sold ad runs for the weeks paid for; its dates can't be edited",
+                    )
     if "router_ids" in data:
         ad.router_ids = await _check_router_scope(db, user, data.pop("router_ids"))
     if not admin:
         data.pop("priority", None)
     is_active = data.pop("is_active", None)
 
+    # Media links saved before the /m/ path compare equal to their new form.
     before = {f: getattr(ad, f) for f in _REVIEWED_FIELDS}
+    for f in _MEDIA_FIELDS:
+        before[f] = ad_media.public_media_url(before[f])
     _apply_fields(ad, data)
     _check_media_complete(ad)
     if is_active is not None:
         ad.is_active = bool(is_active)
 
-    # A reseller changing what customers see goes back to the review queue.
-    # Compared by value, so re-saving the form unchanged keeps it live.
+    # A reseller changing what customers see runs the automatic checks again.
+    # A live ad stays live. An ad still marked pending or rejected goes live
+    # now, unless Bitwave took it down: that stays down until an admin says so.
+    # Compared by value, so re-saving the form unchanged keeps it as it was.
     changed = any(getattr(ad, f) != before[f] for f in _REVIEWED_FIELDS)
-    if not admin and changed and ad.status != "pending":
-        ad.status = "pending"
-        ad.review_note = None
-        ad.reviewed_at = None
-        ad.reviewed_by = None
+    if not admin and changed:
+        await ad_review.run_submit_checks(db, ad, user)
+        if ad.status != "approved" and await ad_review.decide_status(db, ad, user) == "approved":
+            await _auto_approve(db, ad)
+    # Paused or back on: the paid time stops or the end date moves out.
+    if sale is not None:
+        await ad_sales.sync_off_state(db, sale, ad)
 
     await db.commit()
     await db.refresh(ad)
     await invalidate_ad_cache()
-    totals = await _event_totals(db, [ad.id])
-    names = await _owner_names(db, [ad.owner_user_id])
-    return _serialize_manage(ad, totals.get(ad.id), names.get(ad.owner_user_id))
+    return await _manage_view(db, ad)
 
 
 @router.delete("/api/ads/{ad_id}")
@@ -577,6 +650,7 @@ async def delete_ad(
 ):
     user = await get_current_user(token, db)
     ad = await _load_owned_ad(db, user, ad_id)
+    await ad_sales.assert_deletable(db, ad)
     # Legacy click rows reference the ad; ad_events have no FK and are kept
     # so past reports still add up.
     await db.execute(delete(AdClick).where(AdClick.ad_id == ad_id))
@@ -601,15 +675,29 @@ async def review_ad(
     note = (request.note or "").strip()[:300] or None
     if action == "reject" and not note:
         raise HTTPException(status_code=400, detail="Say why the ad was rejected, so the reseller can fix it")
+    await ad_sales.lock_sale_for_ad(db, ad)
     ad.status = "approved" if action == "approve" else "rejected"
     ad.review_note = note
     ad.reviewed_at = datetime.utcnow()
     ad.reviewed_by = user.id
+    if ad.owner_user_id is not None:
+        ad_review.record_event(
+            db, ad, ad_review.ACTION_APPROVE if action == "approve" else ad_review.ACTION_REJECT,
+            user.id, note,
+        )
+    # Nothing waits for this route any more. It handles rows from before the
+    # review was removed, and an admin undoing a takedown. A paid sold ad goes
+    # live now (its paid weeks start here, once). One rejected before it ran
+    # waits for a full refund; one that has run is refunded its unused days.
+    if action == "approve":
+        await ad_sales.on_approved(db, ad)
+    else:
+        await ad_sales.on_rejected(db, ad, note or "", actor_id=user.id)
     await db.commit()
     await db.refresh(ad)
     await invalidate_ad_cache()
     logger.info("Ad #%s %sd by admin %s", ad_id, action, user.id)
-    return _serialize_manage(ad)
+    return await _manage_view(db, ad)
 
 
 @router.post("/api/ads/media/upload-url")
@@ -647,7 +735,16 @@ async def create_media_upload(
 # Public: the portal's legacy feed and its view/tap beacons
 # ========================================
 
+# The same three handlers under neutral paths. EasyList and friends block URLs
+# like /ads and /ads/click, so the portal calls these instead. The old paths stay
+# for portal pages still cached on phones. Keep words like ad, ads, banner,
+# sponsor, promo, click and impression out of these paths.
+PORTAL_LIST_PATH = "/api/public/spots"
+PORTAL_TAP_PATH = "/api/public/spots/tap"
+PORTAL_SEEN_PATH = "/api/public/spots/seen"
+
 @router.get("/api/ads")
+@router.get(PORTAL_LIST_PATH)
 async def get_ads(
     page: int = 1,
     per_page: int = 20,
@@ -678,6 +775,7 @@ async def _live_ad_ids(db: AsyncSession) -> set:
 
 
 @router.post("/api/ads/click")
+@router.post(PORTAL_TAP_PATH)
 async def record_ad_click(
     request: AdClickRequest,
     db: AsyncSession = Depends(get_db),
@@ -704,6 +802,7 @@ async def record_ad_click(
 
 
 @router.post("/api/ads/impression")
+@router.post(PORTAL_SEEN_PATH)
 async def record_ad_impression(
     request: AdImpressionRequest,
     db: AsyncSession = Depends(get_db),

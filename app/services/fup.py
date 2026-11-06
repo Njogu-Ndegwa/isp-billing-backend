@@ -26,10 +26,12 @@ from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.db.models import (
     ConnectionType,
     Customer,
+    CustomerStatus,
     CustomerUsagePeriod,
     FupAction,
     Plan,
@@ -44,7 +46,7 @@ from app.services.mikrotik_api import (
 )
 from app.services.subscription_sharing import max_devices_for_customer
 from app.services.customer_grace import has_access_time
-from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes, fup_window_start
+from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes, fup_window_start, get_open_period
 from app.services.hotspot_mac_login import (
     block_customer as mac_login_block_customer,
     mac_login_enabled,
@@ -94,9 +96,15 @@ def _router_info(router: Router) -> dict:
     }
 
 
-def hotspot_throttle_rate_for_plan(plan: Optional[Plan]) -> str:
-    """Return the RouterOS rate string used when a hotspot plan is throttled."""
-    return parse_speed_to_mikrotik(
+def hotspot_throttle_speed_for_plan(plan: Optional[Plan]) -> str:
+    """The speed a throttled hotspot plan gets, in PLAN format (download/upload).
+
+    Queue sync and the MAC-login functions take plan-format speeds and convert
+    them themselves, so hand them this, not the converted rate: converting
+    twice swaps the direction back. Until 2026-11-04 that made a TV BUNDLE
+    throttle of "2M/0.5M" (2 Mbps down) reach the router as 2M up / 500k DOWN.
+    """
+    return (
         (plan.fup_throttle_profile if plan else None)
         or DEFAULT_HOTSPOT_FUP_THROTTLE_RATE
     )
@@ -481,11 +489,12 @@ def _restore_hotspot_sync(router_info: dict, mac_address: str, normal_rate_limit
         api.disconnect()
 
 
-def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, rate_limit: str = "") -> dict:
+def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, plan_speed: str = "") -> dict:
     """FUP on a MAC-login router: move the user between profiles, or disable it.
 
     The router owns the session queue there, so there is no plan_ queue to
-    re-limit; the user's profile carries the rate.
+    re-limit; the user's profile carries the rate. ``plan_speed`` is in plan
+    format (download/upload); ``set_customer_rate`` converts it.
     """
     api = MikroTikAPI(
         router_info["ip"], router_info["username"], router_info["password"], router_info["port"],
@@ -496,7 +505,7 @@ def _mac_login_sync(router_info: dict, action: str, normalized_mac: str, rate_li
     try:
         if action == "block":
             return mac_login_block_customer(api, normalized_mac)
-        return mac_login_set_customer_rate(api, normalized_mac, rate_limit)
+        return mac_login_set_customer_rate(api, normalized_mac, plan_speed)
     finally:
         api.disconnect()
 
@@ -517,12 +526,12 @@ async def apply_throttle(
         if not router:
             return {"error": "no_router"}
         info = _router_info(router)
-        rate_limit = hotspot_throttle_rate_for_plan(plan)
+        throttle_speed = hotspot_throttle_speed_for_plan(plan)
         await db.commit()
         if mac_login_enabled(info["id"]):
-            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, rate_limit)
+            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, throttle_speed)
         return await asyncio.to_thread(
-            _set_hotspot_queue_limit_sync, info, normalized_mac, rate_limit
+            _set_hotspot_queue_limit_sync, info, normalized_mac, parse_speed_to_mikrotik(throttle_speed)
         )
 
     if not customer.pppoe_username:
@@ -588,12 +597,12 @@ async def restore_normal_profile(
         if not router:
             return {"error": "no_router"}
         info = _router_info(router)
-        rate_limit = parse_speed_to_mikrotik(plan.speed if plan else "")
+        plan_speed = plan.speed if plan else ""
         await db.commit()
         if mac_login_enabled(info["id"]):
-            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, rate_limit)
+            return await asyncio.to_thread(_mac_login_sync, info, "rate", normalized_mac, plan_speed)
         return await asyncio.to_thread(
-            _restore_hotspot_sync, info, normalized_mac, rate_limit
+            _restore_hotspot_sync, info, normalized_mac, parse_speed_to_mikrotik(plan_speed)
         )
 
     if not customer.pppoe_username:
@@ -643,6 +652,37 @@ async def _reset_daily_trigger(
     return True
 
 
+def _mark_lifted(period: CustomerUsagePeriod, now: datetime) -> None:
+    """Record a lift inside a running period and re-arm the cap.
+
+    Every path that applies a cap requires an empty ``fup_triggered_at``, so one
+    left filled means this device can never be throttled again this period, even
+    if its group later goes over. ``fup_reverted_at`` keeps when it was lifted.
+    """
+    period.fup_reverted_at = now
+    period.fup_triggered_at = None
+    period.fup_action_taken = None
+
+
+async def _is_walled_expired_pppoe(
+    db: AsyncSession, customer: Customer, plan: Plan, now: datetime
+) -> bool:
+    """An expired customer on a PPPoE expired-redirect router: hands off.
+
+    Their walled session has a queue and traffic, so the usage jobs get here.
+    Throttling or restoring points the secret at a real profile and kicks the
+    session, which would take an unpaid customer out of the wall onto working
+    internet. Renewal lifts the trigger anyway. Routers without the switch have
+    no such session and are decided as before.
+    """
+    if plan.connection_type != ConnectionType.PPPOE:
+        return False
+    if customer.status == CustomerStatus.ACTIVE and has_access_time(customer, now):
+        return False
+    router = await _load_router(db, customer.router_id)
+    return bool(router and getattr(router, "pppoe_expired_redirect", False))
+
+
 async def evaluate_and_enforce(
     db: AsyncSession,
     customer: Customer,
@@ -662,13 +702,20 @@ async def evaluate_and_enforce(
     plan = plan if plan is not None else customer.plan
     if not plan or plan.connection_type not in (ConnectionType.PPPOE, ConnectionType.HOTSPOT):
         return None
+    if await _is_walled_expired_pppoe(db, customer, plan, now or datetime.utcnow()):
+        return None
 
     cap_bytes = _cap_bytes(period, plan)
     if cap_bytes is None:
         # Uncapped plan: if a stale trigger exists, clear it.
         if period.fup_triggered_at and not period.fup_reverted_at:
-            await restore_normal_profile(db, customer, plan)
-            period.fup_reverted_at = now or datetime.utcnow()
+            res = await restore_normal_profile(db, customer, plan)
+            if res.get("error"):
+                # Still restricted on the router, so stay recorded and retry on
+                # the next evaluation.
+                logger.warning(f"[FUP] Uncapped revert failed for customer={customer.id}: {res}")
+                return None
+            _mark_lifted(period, now or datetime.utcnow())
         return None
 
     now = now or datetime.utcnow()
@@ -722,11 +769,139 @@ async def evaluate_and_enforce(
             f"used={used_bytes} < cap={cap_bytes}"
         )
         if period.fup_action_taken in (FupAction.THROTTLE, FupAction.BLOCK):
-            await restore_normal_profile(db, customer, plan)
-        period.fup_reverted_at = now
+            res = await restore_normal_profile(db, customer, plan)
+            if res.get("error"):
+                # Still throttled on the router, so stay recorded and retry on
+                # the next evaluation.
+                logger.warning(f"[FUP] Auto-revert failed for {identifier}: {res}")
+                return None
+        _mark_lifted(period, now)
         return None
 
     return None
+
+
+async def lift_restrictions_after_cap_raise(customer_ids: list[int]) -> None:
+    """Lift a throttle or block that a just-raised cap no longer justifies.
+
+    Runs in the background after a dashboard plan edit, so the reseller isn't kept
+    waiting on the router. Only re-checks a device that is restricted right now, so
+    it can never restrict one. A device still over the bigger cap stays as it is. If
+    this fails the trigger stays recorded and the next evaluation retries. A device
+    with no access time is skipped, because restoring would re-open its binding.
+    """
+    from app.db.database import async_session
+
+    for customer_id in customer_ids:
+        try:
+            async with async_session() as db:
+                customer = (
+                    await db.execute(
+                        select(Customer)
+                        .options(selectinload(Customer.plan))
+                        .where(Customer.id == customer_id)
+                    )
+                ).scalar_one_or_none()
+                period = await get_open_period(db, customer_id)
+                now = datetime.utcnow()
+                if (
+                    customer is None
+                    or period is None
+                    or period.fup_triggered_at is None
+                    or period.fup_reverted_at is not None
+                    or customer.status != CustomerStatus.ACTIVE
+                    or not has_access_time(customer, now)
+                ):
+                    await db.commit()
+                    continue
+                await evaluate_and_enforce(db, customer, period, plan=customer.plan, now=now)
+                await db.commit()
+        except Exception as exc:
+            logger.error(f"[FUP] Lift after cap raise failed for customer={customer_id}: {exc}")
+
+
+async def _pppoe_action_to_keep(
+    db: AsyncSession,
+    customer: Customer,
+    period: CustomerUsagePeriod,
+    plan: Optional[Plan],
+    now: datetime,
+) -> Optional[FupAction]:
+    """The throttle or block this period's cap still calls for, or None to lift it.
+
+    Same test as :func:`evaluate_and_enforce`: usage against the period's cap, so a
+    bigger cap still under the usage keeps it and a smaller cap waits for the next
+    period. None too when the plan's rule for going over is only to notify.
+    """
+    cap_bytes = _cap_bytes(period, plan)
+    if cap_bytes is None:
+        return None
+    used_bytes = await fup_usage_bytes(
+        db, customer, period, plan=plan, now=now, cap_bytes=cap_bytes
+    )
+    if used_bytes < cap_bytes:
+        return None
+    action = _effective_action(period, plan)
+    return action if action in (FupAction.THROTTLE, FupAction.BLOCK) else None
+
+
+async def settle_pppoe_hold_after_delivery(customer_id: int) -> None:
+    """Finish a delivery that just wrote a FUP-held customer's secret.
+
+    Delivery leaves the secret on the plan's normal profile, and a recorded trigger
+    is never applied again by anything else, so the customer would keep full speed
+    for the rest of the period. The delivery must not have kicked the session: each
+    branch here does that, so the customer reconnects once.
+
+    If the router drops now, a hold to keep re-arms the cap so the next evaluation
+    applies it, and a lift stays recorded so the next evaluation retries it.
+    """
+    from app.db.database import async_session
+
+    async with async_session() as db:
+        customer = (
+            await db.execute(
+                select(Customer)
+                .options(selectinload(Customer.plan))
+                .where(Customer.id == customer_id)
+            )
+        ).scalar_one_or_none()
+        period = await get_open_period(db, customer_id)
+        if (
+            customer is None
+            or period is None
+            or period.fup_triggered_at is None
+            or period.fup_reverted_at is not None
+            or period.fup_action_taken not in (FupAction.THROTTLE, FupAction.BLOCK)
+        ):
+            await db.commit()
+            return
+
+        now = datetime.utcnow()
+        plan = customer.plan
+        keep = await _pppoe_action_to_keep(db, customer, period, plan, now)
+        try:
+            if keep == FupAction.THROTTLE:
+                result = await apply_throttle(db, customer, plan)
+            elif keep == FupAction.BLOCK:
+                result = await apply_block(db, customer, plan)
+            else:
+                result = await restore_normal_profile(db, customer, plan)
+        except Exception as exc:  # the edit is saved; don't fail it over the router
+            result = {"error": str(exc)}
+
+        if keep is None:
+            if result.get("error"):
+                logger.warning(f"[FUP] Lift after delivery failed for customer={customer_id}: {result}")
+            else:
+                _mark_lifted(period, now)
+        elif result.get("error"):
+            logger.warning(f"[FUP] Re-applying {keep.value} failed for customer={customer_id}: {result}")
+            period.fup_triggered_at = None
+            period.fup_action_taken = None
+        else:
+            period.fup_action_taken = keep
+        await db.commit()
 
 
 async def revert(

@@ -35,6 +35,7 @@ from app.services.provisioning_retry_policy import (
     retry_due_clause,
     retryable_connectivity_error_clause,
 )
+from app.services.fapshi_reconciliation import non_fapshi_attempt_clause
 from app.config import settings
 from app.services.router_availability import record_router_availability
 
@@ -586,6 +587,7 @@ async def retry_pending_pppoe_provisioning_background():
                     .join(Customer, ProvisioningAttempt.customer_id == Customer.id)
                     .join(Plan, Customer.plan_id == Plan.id)
                     .where(
+                        non_fapshi_attempt_clause(),
                         Customer.pppoe_username.isnot(None),
                         Plan.connection_type == ConnectionType.PPPOE,
                         ProvisioningAttempt.provisioning_state.in_(
@@ -618,6 +620,7 @@ async def retry_pending_pppoe_provisioning_background():
                     .join(Plan, Customer.plan_id == Plan.id)
                     .join(Router, Customer.router_id == Router.id)
                     .where(
+                        non_fapshi_attempt_clause(),
                         Customer.status == CustomerStatus.ACTIVE,
                         Customer.pppoe_username.isnot(None),
                         Customer.expiry.isnot(None),
@@ -748,13 +751,24 @@ async def retry_pending_pppoe_provisioning_background():
                     "router_password": router.password,
                     "router_port": router.port,
                 }
-                await provision_pppoe_customer(
+                # A retried login or plan change on a customer FUP is holding
+                # down settles the hold, the same as when the first push works.
+                async with db_module.async_session() as db:
+                    fup_hold = await active_fup_restriction(db, customer.id)
+                    await db.commit()
+                if fup_hold:
+                    payload["disconnect"] = False
+                delivered = await provision_pppoe_customer(
                     customer_id=customer.id,
                     router_id=router.id,
                     pppoe_payload=payload,
                     action="pppoe_retry",
                     attempt_id=attempt.id,
                 )
+                if fup_hold and delivered.get("success"):
+                    from app.services.fup import settle_pppoe_hold_after_delivery
+
+                    await settle_pppoe_hold_after_delivery(customer.id)
 
     except Exception as exc:
         logger.error("[PPPoE-RETRY] Background retry job failed: %s", exc)

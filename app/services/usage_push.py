@@ -161,6 +161,8 @@ class IngestResult:
     accepted: int = 0
     rejected: int = 0
     over_cap_customer_ids: list[int] = field(default_factory=list)
+    # Throttled or blocked, but no longer over the cap.
+    release_fup_customer_ids: list[int] = field(default_factory=list)
     # canonical hotspot MAC -> customer id, for customers live on this router.
     live_hotspot_customers: dict[str, int] = field(default_factory=dict)
     # "pppoe:<username>" -> customer id, for PPPoE customers live on this router.
@@ -613,6 +615,20 @@ async def ingest_usage_reports(
                 )
                 if used_bytes >= cap_bytes:
                     result.over_cap_customer_ids.append(customer.id)
+            elif (
+                period is not None
+                and period.fup_triggered_at is not None
+                and period.fup_reverted_at is None
+                and customer.id not in result.release_fup_customer_ids
+            ):
+                # Cap removed or raised above usage. Real-time routers are not
+                # watched by the cap sampler, so nothing else lifts the throttle
+                # before the next renewal.
+                still_over = cap_bytes > 0 and await fup_usage_bytes(
+                    db, customer, period, plan=plan, now=now, cap_bytes=cap_bytes
+                ) >= cap_bytes
+                if not still_over:
+                    result.release_fup_customer_ids.append(customer.id)
 
             if pending >= PUSH_COMMIT_CHUNK:
                 await db.commit()
