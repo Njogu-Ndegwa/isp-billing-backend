@@ -47,6 +47,7 @@ from app.services import (
 from app.services.code_attempt_limiter import reset_code_attempt_limiter
 from app.services.reseller_payments import record_customer_payment
 from app.services.subscription_sharing import sync_shared_subscription_devices_after_owner_renewal
+from app.services import usage_tracking
 from app.services.usage_tracking import repair_stale_cap_snapshots
 from tests.conftest import running_on_postgres
 from tests.factories import make_customer, make_plan, make_reseller, make_router
@@ -1761,6 +1762,16 @@ async def test_expired_owner_added_to_another_plan_lets_go_of_its_own_devices(db
 # ---------------------------------------------------------------- stale cap repair
 
 
+@pytest.fixture
+def repair_window_open(monkeypatch):
+    """The repair only looks at periods opened before a fixed date, and these
+    tests open theirs now. Without this they stop testing anything once that date
+    has passed: "nothing repaired" would come from the date, not from the rule."""
+    monkeypatch.setattr(
+        usage_tracking, "STALE_CAP_REPAIR_BEFORE", datetime.utcnow() + timedelta(days=1)
+    )
+
+
 async def _stale_group(db, fake, *, big_cap=204800):
     """What the old bug left behind: a 2 GB cap on a 200 GB purchase."""
     reseller, router = await _reseller_router(db)
@@ -1781,6 +1792,7 @@ async def _stale_group(db, fake, *, big_cap=204800):
     return reseller, router, big, owner, shared
 
 
+@pytest.mark.usefixtures("repair_window_open")
 async def test_repair_gives_owner_and_devices_the_cap_they_paid_for(db, router_os):
     _reseller, _router, big, owner, shared = await _stale_group(db, router_os)
 
@@ -1797,6 +1809,7 @@ async def test_repair_gives_owner_and_devices_the_cap_they_paid_for(db, router_o
     assert await repair_stale_cap_snapshots(db) == []
 
 
+@pytest.mark.usefixtures("repair_window_open")
 async def test_repair_lifts_a_wrong_throttle_but_not_a_right_one(db, router_os):
     _reseller, _router, big, owner, _shared = await _stale_group(db, router_os)
     period = await _meter(db, owner, 3000)
@@ -1812,6 +1825,23 @@ async def test_repair_lifts_a_wrong_throttle_but_not_a_right_one(db, router_os):
     assert TV not in router_os.throttled
 
 
+async def test_repair_skips_a_period_opened_from_the_cutoff_on(db, router_os, monkeypatch):
+    """Periods opened after the fix got the right cap, so a low cap on one is not
+    this bug. One second earlier the same row is repaired."""
+    _reseller, _router, big, owner, _shared = await _stale_group(db, router_os)
+    opened = (await _open_period(db, owner)).period_start
+
+    monkeypatch.setattr(usage_tracking, "STALE_CAP_REPAIR_BEFORE", opened)
+    assert await repair_stale_cap_snapshots(db) == []
+    assert (await _open_period(db, owner)).cap_mb_snapshot == 2048
+
+    monkeypatch.setattr(usage_tracking, "STALE_CAP_REPAIR_BEFORE", opened + timedelta(seconds=1))
+    assert [r["customer_id"] for r in await repair_stale_cap_snapshots(db)] == [owner.id]
+    await db.commit()
+    assert (await _open_period(db, owner)).cap_mb_snapshot == big.data_cap_mb
+
+
+@pytest.mark.usefixtures("repair_window_open")
 async def test_repair_leaves_a_resellers_later_cap_edit_alone(db, router_os):
     """A plan whose cap was raised and not carried over is not this bug: the
     snapshot does not match the previous purchase's plan."""
@@ -1830,6 +1860,7 @@ async def test_repair_leaves_a_resellers_later_cap_edit_alone(db, router_os):
     assert (await _open_period(db, owner)).cap_mb_snapshot == 150
 
 
+@pytest.mark.usefixtures("repair_window_open")
 async def test_repair_never_tightens(db, router_os):
     """TV bundle bought on a 240 GB plan: the stale cap is bigger than the plan
     paid for. Taking it away is a product decision, so it stays."""
