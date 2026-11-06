@@ -9,6 +9,7 @@ from app.db.database import get_db
 from app.db.models import PortalSettings, Router, User
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
+from app.services import ad_media
 from app.services.router_helpers import get_router_by_id
 from app.services.plan_cache import DEFAULT_PLAN_SORT_ORDER, VALID_PLAN_SORT_ORDERS
 
@@ -128,6 +129,11 @@ class PortalSettingsUpdate(BaseModel):
         return v
 
 
+class HeroImageUploadRequest(BaseModel):
+    content_type: str
+    size: int
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +181,18 @@ def _settings_to_dict(s: PortalSettings) -> dict:
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
     }
+
+
+def _check_hero_image_url(url: Optional[str]) -> None:
+    """A link on our media host must be a hero photo, not a video or an ad path.
+
+    Anything else (the preset links the dashboard sends, values already stored)
+    is left alone: the portal only loads bundled presets for those, so they keep
+    rendering exactly as they did.
+    """
+    base = ad_media.public_media_base()
+    if url and base and url.startswith(f"{base}/") and not ad_media.is_portal_hero_url(url):
+        raise HTTPException(status_code=400, detail="header_bg_image_url must be uploaded through the dashboard")
 
 
 async def _get_or_create_settings(db: AsyncSession, user_id: int) -> PortalSettings:
@@ -228,6 +246,7 @@ async def update_portal_settings(
     """
     user = await get_current_user(token, db)
     enforce_active_subscription(user)
+    _check_hero_image_url(request.header_bg_image_url)
 
     settings = await _get_or_create_settings(db, user.id)
 
@@ -279,6 +298,36 @@ async def update_portal_settings(
         "message": "Portal settings updated successfully",
         "updated_fields": changed,
         "settings": _settings_to_dict(settings),
+    }
+
+
+@router.post("/api/portal/settings/hero-image/upload-url")
+async def create_hero_image_upload(
+    request: HeroImageUploadRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """A presigned PUT for the reseller's own hero photo. The browser uploads
+    straight to storage, then saves public_url as header_bg_image_url."""
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    try:
+        ticket = ad_media.create_portal_hero_upload(
+            request.content_type, request.size, owner_label=f"r{user.id}",
+        )
+    except ad_media.MediaNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ad_media.MediaRejected as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "upload_url": ticket.upload_url,
+        "public_url": ticket.public_url,
+        "key": ticket.key,
+        "content_type": ticket.content_type,
+        "max_bytes": ticket.max_bytes,
+        "expires_in": ticket.expires_in,
+        "method": "PUT",
+        "headers": {"Content-Type": ticket.content_type},
     }
 
 

@@ -176,7 +176,7 @@ Wipes all customizations and recreates the row with system defaults. Useful as a
 | `welcome_title` | string | null | Defaults to the reseller's `business_name`. |
 | `welcome_subtitle` | string | null | Short tagline shown under the title. |
 | `company_logo_url` | string | null | URL of the ISP logo image. Shown in the header. |
-| `header_bg_image_url` | string | null | Background image for the `hero` header style only. |
+| `header_bg_image_url` | string | null | Background image for the `hero` header style only. A preset link, or a photo from `POST /api/portal/settings/hero-image/upload-url`. The portal loads bundled preset files for anything except an uploaded photo. |
 | `footer_text` | string | null | Text shown at the bottom of the portal. |
 | `portal_support_phone` | string | null | Overrides the user-level `support_phone` on the portal. |
 | `portal_support_whatsapp` | string | null | WhatsApp number for the support button. |
@@ -317,3 +317,14 @@ After saving, link to the live portal with their router's identity so they can p
 ```
 https://portal.yourdomain.com/?router=<identity>
 ```
+
+## Uploading a hero photo
+
+`POST /api/portal/settings/hero-image/upload-url` with `{"content_type": "image/jpeg", "size": <bytes>}`
+(auth required, active subscription) returns the same ticket as `POST /api/ads/media/upload-url`.
+JPEG or WebP only, 300 KB at most; R2 rejects anything else because the content type and length are
+signed. PUT the file to `upload_url`, then save `public_url` as `header_bg_image_url`.
+
+The photo is served from `AD_MEDIA_PUBLIC_BASE`, the backend host every router already has in its
+walled garden. The portal falls back to its own origin, then to a bundled preset, so a phone that
+cannot reach that host still gets a working page. `503` means storage is not configured.
