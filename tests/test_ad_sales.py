@@ -172,18 +172,44 @@ def test_split_floors_bitwaves_20_percent_and_gives_the_reseller_the_rest(amount
 
 def test_split_is_whole_shillings_for_every_valid_order():
     for weeks in range(1, 13):
-        for price in (200, 201, 333, 999, 1234, 12_500):
+        for price in (1, 2, 3, 4, 5, 199, 200, 201, 333, 999, 1234, 12_500, 12_501, 20_833):
             fee, share = ad_sales.split_amount(weeks * price)
             assert isinstance(fee, int) and isinstance(share, int)
             assert fee + share == weeks * price
             assert fee <= weeks * price * 20 / 100 < fee + 1
 
 
-@pytest.mark.parametrize("weeks,price", [(0, 300), (13, 300), (2, 199), (2, 0), (2, 12_501), (1.5, 300), (2, 250.5)])
+@pytest.mark.parametrize("weeks,price", [
+    (0, 300), (13, 300), (2, 0), (2, -5), (1, 250_001), (12, 20_834), (1.5, 300), (2, 250.5),
+])
 def test_bad_terms_are_refused(weeks, price):
     with pytest.raises(Exception) as exc:
         ad_sales.validate_terms(weeks, price)
     assert getattr(exc.value, "status_code", None) == 400
+
+
+@pytest.mark.parametrize("weeks,price,fee,share", [
+    (1, 1, 0, 1),                   # the lowest there is: all of it to the reseller
+    (1, 4, 0, 4),
+    (1, 5, 1, 4),                   # the first shilling Bitwave's 20% reaches
+    (2, 1, 0, 2),
+    (1, 199, 39, 160),              # under the old KES 200 floor
+    (1, 12_501, 2_500, 10_001),     # over the old KES 12,500 ceiling
+    (12, 20_833, 49_999, 199_997),  # 249,996: the most 12 weeks can come to
+    (1, 250_000, 50_000, 200_000),  # exactly what one M-Pesa payment can take
+])
+def test_any_whole_price_that_fits_one_mpesa_payment_is_fine(weeks, price, fee, share):
+    q = ad_sales.quote(weeks, price)
+    assert (q["amount"], q["bitwave_fee"], q["reseller_share"]) == (weeks * price, fee, share)
+    assert fee + share == weeks * price and share > 0
+
+
+def test_a_total_over_the_mpesa_limit_says_what_to_do():
+    with pytest.raises(Exception) as exc:
+        ad_sales.validate_terms(12, 25_000)
+    assert exc.value.status_code == 400
+    assert "KES 250,000" in exc.value.detail and "KES 300,000" in exc.value.detail
+    assert "Lower the price or the weeks" in exc.value.detail
 
 
 def test_quote_shows_the_shop_total_the_fee_and_the_reseller_share():
@@ -194,13 +220,35 @@ def test_quote_shows_the_shop_total_the_fee_and_the_reseller_share():
 
 
 @pytest.mark.asyncio
-async def test_minimum_price_is_enforced_on_create(client, db, monkeypatch, stk):
+async def test_a_free_ad_is_refused_on_create(client, db, monkeypatch, stk):
     reseller = await _reseller(db)
     _auth_as(monkeypatch, reseller)
-    r = await client.post("/api/ad-sales", json={**SOLD, "price_per_week": 150})
+    r = await client.post("/api/ad-sales", json={**SOLD, "price_per_week": 0})
     assert r.status_code == 400
-    assert "200" in r.json()["detail"]
+    assert "KES 1" in r.json()["detail"]
     assert stk == []
+
+
+@pytest.mark.asyncio
+async def test_a_total_over_the_mpesa_limit_is_refused_before_anything_is_saved(client, db, monkeypatch, stk):
+    reseller = await _reseller(db)
+    _auth_as(monkeypatch, reseller)
+    r = await client.post("/api/ad-sales", json={**SOLD, "weeks": 12, "price_per_week": 20_834})
+    assert r.status_code == 400 and "KES 250,000" in r.json()["detail"]
+    assert stk == []
+    assert (await db.execute(select(AdSalePayment))).scalars().all() == []
+    assert (await db.execute(select(Ad))).scalars().all() == []
+
+
+@pytest.mark.parametrize("price,fee,share", [(1, 0, 1), (4, 0, 4), (5, 1, 4), (12_501, 2_500, 10_001)])
+@pytest.mark.asyncio
+async def test_a_low_or_high_price_goes_to_mpesa_as_set(client, db, monkeypatch, stk, price, fee, share):
+    reseller = await _reseller(db)
+    out = await _sell(client, monkeypatch, reseller, {**SOLD, "weeks": 1, "price_per_week": price})
+    assert stk[-1]["amount"] == price
+    p = (await _payments(db, out["ad"]["id"]))[0]
+    assert (p.amount, p.bitwave_fee, p.reseller_share) == (price, fee, share)
+    assert out["sale"]["amount_due"] == price and out["sale"]["price_per_week"] == price
 
 
 # ---------------------------------------------------------------------------

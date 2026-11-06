@@ -97,6 +97,11 @@ async def _fresh_payments(db, ad_id):
     (1005, 7, 1, (143, 114, 29)),
     (500, 14, 7, (250, 200, 50)),
     (200, 0, 3, (0, 0, 0)),
+    (1, 7, 3, (0, 0, 0)),          # 0.43 rounds down: nothing to give back
+    (1, 7, 7, (1, 1, 0)),
+    (4, 7, 6, (3, 3, 0)),          # no fee on KES 4, so all of it is the reseller's
+    (5, 7, 6, (4, 3, 1)),          # kept 1 splits 0 / 1, and the KES 1 fee goes back
+    (5, 7, 2, (1, 0, 1)),          # kept 4 still splits 0 / 4
 ])
 def test_refund_for_unused_days(amount, paid, unused, expected):
     assert ad_sales.refund_for_unused_days(amount, paid, unused) == expected
@@ -104,7 +109,7 @@ def test_refund_for_unused_days(amount, paid, unused, expected):
 
 def test_the_refund_and_both_splits_add_up_for_every_order_and_day():
     for weeks in range(1, ad_sales.MAX_WEEKS + 1):
-        for price in (200, 201, 333, 999, 1234, 12_500):
+        for price in (1, 2, 3, 4, 5, 6, 9, 10, 199, 200, 201, 333, 999, 1234, 12_500, 20_833):
             amount = weeks * price
             fee, share = ad_sales.split_amount(amount)
             paid_days = weeks * 7
@@ -512,7 +517,7 @@ async def test_a_paused_or_show_ads_off_paid_ad_cant_be_deleted(client, db, monk
 
 
 # ---------------------------------------------------------------------------
-# Rules 4 and 5: gross split, price cap
+# Rule 4: gross split. The price is the reseller's (Dennis, 6 Nov 2026)
 # ---------------------------------------------------------------------------
 
 def test_the_split_is_on_the_gross_amount_and_no_mpesa_fee_is_taken():
@@ -520,14 +525,106 @@ def test_the_split_is_on_the_gross_amount_and_no_mpesa_fee_is_taken():
     assert (q["amount"], q["bitwave_fee"], q["reseller_share"]) == (200, 40, 160)
 
 
-@pytest.mark.parametrize("price,ok", [(12_500, True), (12_501, False)])
-def test_the_weekly_cap_stays_at_12500(price, ok):
-    assert ad_sales.MAX_PRICE_PER_WEEK == 12_500
+@pytest.mark.parametrize("price,ok", [(12_501, True), (250_000, True), (250_001, False)])
+def test_the_only_ceiling_is_one_mpesa_payment(price, ok):
+    assert ad_sales.MAX_TOTAL == 250_000
     if ok:
         assert ad_sales.validate_terms(1, price)[1] == price
     else:
         with pytest.raises(Exception):
             ad_sales.validate_terms(1, price)
+
+
+# ---------------------------------------------------------------------------
+# Tiny prices: the money still adds up and nothing goes negative
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("price,fee,share,refund,reseller_part,bitwave_part", [
+    (1, 0, 1, 0, 0, 0),     # 3 of 7 days of KES 1 is under a shilling: no refund, no debit
+    (4, 0, 4, 1, 1, 0),
+    (5, 1, 4, 2, 1, 1),     # kept 3 splits 0 / 3
+])
+@pytest.mark.asyncio
+async def test_a_tiny_payment_goes_live_credits_and_stops_cleanly(client, db, monkeypatch, stk, price, fee, share,
+                                                                  refund, reseller_part, bitwave_part):
+    reseller, admin = await _reseller(db), await make_admin(db)
+    ad_id = await _live(client, db, monkeypatch, stk, reseller, {**SOLD, "weeks": 1, "price_per_week": price})
+    p = (await _fresh_payments(db, ad_id))[0]
+    assert (p.amount, p.bitwave_fee, p.reseller_share) == (price, fee, share) and p.credited_at is not None
+    assert await get_unpaid_balance(db, reseller.id) == share
+
+    await _used(db, ad_id, 3.5)     # 3 whole days of the 7 are left
+    _auth_as(monkeypatch, admin)
+    for _ in range(2):              # and repeating it adds nothing
+        assert (await client.post(f"/api/ads/{ad_id}/takedown", json={"note": "Misleading"})).status_code == 200
+    assert ad_id not in await _live_ids(db)
+
+    p = (await _fresh_payments(db, ad_id))[0]
+    charges = await _recovery_charges(db, reseller)
+    assert await get_unpaid_balance(db, reseller.id) == share - reseller_part >= 0
+    if refund:
+        assert (p.refund_status, p.refund_amount) == ("due", refund)
+        assert (p.reseller_recovery, p.bitwave_refund_part) == (reseller_part, bitwave_part)
+        assert [c.amount for c in charges] == [reseller_part]
+    else:
+        assert p.refund_status is None and charges == []
+    sale = (await client.get(f"/api/ads/{ad_id}/sale")).json()
+    assert sale["state"] == "taken_down"
+    assert sale["shop_net_total"] == price - refund
+    assert sale["reseller_share_net_total"] + sale["bitwave_fee_net_total"] == price - refund
+
+
+@pytest.mark.asyncio
+async def test_a_kes_1_renewal_and_shop_link_prompt_work(client, db, monkeypatch, stk):
+    reseller = await _reseller(db)
+    ad_id = await _live(client, db, monkeypatch, stk, reseller, {**SOLD, "weeks": 1, "price_per_week": 3})
+    await _age_prompts(db, ad_id, 20)
+    _auth_as(monkeypatch, reseller)
+    r = await client.post(f"/api/ads/{ad_id}/sale/renew",
+                          json={"weeks": 2, "price_per_week": 1, "confirm_new_price": True})
+    assert r.status_code == 200, r.text
+    assert stk[-1]["amount"] == 2
+    assert r.json()["due_price_per_week"] == 1 and r.json()["price_changed_from"] == 3
+
+    await _age_prompts(db, ad_id, 20)
+    sale = await _sale(db, ad_id)
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback(f"ws_CO_{len(stk)}", code=1032))
+    r = await client.post(f"/api/public/promo/{sale.share_token}/pay", json={})
+    assert r.status_code == 200, r.text
+    assert stk[-1]["amount"] == 2
+
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback(f"ws_CO_{len(stk)}", receipt="RKX2", amount=2))
+    renewal = (await _fresh_payments(db, ad_id))[-1]
+    assert (renewal.status, renewal.amount, renewal.bitwave_fee, renewal.reseller_share) == ("paid", 2, 0, 2)
+    assert (await _sale(db, ad_id)).price_per_week == 1
+
+
+@pytest.mark.parametrize("body", [
+    {"price_per_week": 0, "confirm_new_price": True},
+    {"weeks": 0},
+    {"weeks": 12, "price_per_week": 20_834, "confirm_new_price": True},
+])
+@pytest.mark.asyncio
+async def test_a_renewal_with_bad_terms_is_refused_instead_of_falling_back(client, db, monkeypatch, stk, body):
+    reseller = await _reseller(db)
+    ad_id = await _live(client, db, monkeypatch, stk, reseller)
+    await _age_prompts(db, ad_id, 20)
+    _auth_as(monkeypatch, reseller)
+    sent = len(stk)
+    r = await client.post(f"/api/ads/{ad_id}/sale/renew", json=body)
+    assert r.status_code == 400
+    assert len(stk) == sent and len(await _fresh_payments(db, ad_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_order_at_the_old_top_price_can_still_be_sent_again(client, db, monkeypatch, stk):
+    reseller = await _reseller(db)
+    out = await _sell(client, monkeypatch, reseller, {**SOLD, "weeks": 12, "price_per_week": 12_500})
+    ad_id = out["ad"]["id"]
+    await client.post("/api/mpesa/ad-sales/callback", json=_callback(f"ws_CO_{len(stk)}", code=1032))
+    await _age_prompts(db, ad_id, 20)
+    assert (await client.post(f"/api/ads/{ad_id}/sale/prompt", json={})).status_code == 200
+    assert stk[-1]["amount"] == 150_000
 
 
 # ---------------------------------------------------------------------------

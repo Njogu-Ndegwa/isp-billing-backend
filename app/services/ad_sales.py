@@ -2,14 +2,18 @@
 
 Money
 -----
-* The reseller sets a price per week (at least MIN_PRICE_PER_WEEK KES) and a
-  number of whole weeks (MIN_WEEKS..MAX_WEEKS). The business pays the total
+* The reseller charges whatever they want (Dennis, 6 Nov 2026): the weekly price
+  only has to be a whole number of shillings, KES 1 or more, for a number of
+  whole weeks (MIN_WEEKS..MAX_WEEKS). The total has to fit in one M-Pesa payment
+  (MAX_TOTAL). The business pays the total
   by M-Pesa STK push to BITWAVE's own paybill (the system shortcode), even
   when the reseller settles hotspot money directly to their own till: that is
   what lets Bitwave take its cut.
 * Split, in whole KES: ``bitwave_fee = floor(amount * 20 / 100)`` and
   ``reseller_share = amount - bitwave_fee``. Any odd shilling from the
-  rounding goes to the reseller (KES 1,005 -> Bitwave 201, reseller 804).
+  rounding goes to the reseller (KES 1,005 -> Bitwave 201, reseller 804). There
+  is no minimum fee: on KES 1 to 4 Bitwave's part rounds down to 0 and the
+  reseller gets all of it.
 * The reseller's 80% is credited when the paid weeks start running (go-live,
   or an extension of a live ad). Nobody reviews an ad first, so that is the
   moment the payment is confirmed. An old ad rejected before it ran was never
@@ -22,9 +26,8 @@ Money
   that payment comes out of Bitwave's 20%; nothing here takes it from the
   reseller. Their normal payout transfer fee still applies when money is sent
   (mpesa_b2b.compute_fee_breakdown).
-* The weekly price is capped at MAX_PRICE_PER_WEEK. A new price applies from the
-  next renewal only. Each payment row keeps the price it was paid at, and
-  AdSale.price_per_week moves when a renewal at a new price is actually paid.
+* A new price applies from the next renewal only. Each payment row keeps the
+  price it was paid at, and AdSale.price_per_week moves when a renewal at a new price is actually paid.
   A reseller has to confirm they told the shop before a renewal at a new price
   goes out, and the shop's link shows the old and the new price.
 
@@ -115,13 +118,16 @@ from app.db.models import Ad, AdEvent, AdSale, AdSalePayment, ResellerTransactio
 logger = logging.getLogger(__name__)
 
 FEE_PERCENT = 20
-MIN_PRICE_PER_WEEK = 200
-MAX_PRICE_PER_WEEK = 12_500
+# An STK push takes whole shillings and nothing below 1. There is no other limit
+# on the weekly price: the reseller decides it.
+MIN_PRICE_PER_WEEK = 1
 MIN_WEEKS = 1
 MAX_WEEKS = 12
-# One STK push can't exceed Safaricom's per-transaction ceiling; 12 weeks at
-# the maximum weekly price stays under it.
-MAX_TOTAL = MAX_PRICE_PER_WEEK * MAX_WEEKS
+# Safaricom's limit on one M-Pesa transaction, PayBill included: KES 250,000
+# (safaricom.co.ke/personal/m-pesa/mpesa-charges, and its September 2023 press
+# release on the CBK approval). One order is one STK push, so price x weeks has
+# to fit.
+MAX_TOTAL = 250_000
 WEEK = timedelta(days=7)
 DAY = timedelta(days=1)
 DAYS_PER_WEEK = 7
@@ -246,9 +252,16 @@ def validate_terms(weeks, price_per_week) -> tuple[int, int, int]:
         raise HTTPException(status_code=400, detail=f"An ad runs for {MIN_WEEKS} to {MAX_WEEKS} weeks")
     if price_i < MIN_PRICE_PER_WEEK:
         raise HTTPException(status_code=400, detail=f"The price must be at least KES {MIN_PRICE_PER_WEEK} a week")
-    if price_i > MAX_PRICE_PER_WEEK:
-        raise HTTPException(status_code=400, detail=f"The price can be at most KES {MAX_PRICE_PER_WEEK:,} a week")
-    return weeks_i, price_i, weeks_i * price_i
+    total = weeks_i * price_i
+    if total > MAX_TOTAL:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"M-Pesa takes at most KES {MAX_TOTAL:,} in one payment and this comes to KES {total:,}. "
+                "Lower the price or the weeks."
+            ),
+        )
+    return weeks_i, price_i, total
 
 
 def quote(weeks: int, price_per_week: int) -> dict:
@@ -448,7 +461,10 @@ async def prepare_renewal(db: AsyncSession, sale: AdSale, ad: Optional[Ad], *,
                                     weeks=weeks, price_per_week=price_per_week,
                                     confirm_new_price=confirm_new_price)
     check_prompt_limits(payments, now)
-    weeks_i, price, _ = validate_terms(weeks or sale.weeks, price_per_week or sale.price_per_week)
+    weeks_i, price, _ = validate_terms(
+        weeks if weeks is not None else sale.weeks,
+        price_per_week if price_per_week is not None else sale.price_per_week,
+    )
     target = normalize_business_phone(phone) if phone else sale.business_phone
     _require_price_told(price, sale, confirm_new_price)
     sale.business_phone = target
