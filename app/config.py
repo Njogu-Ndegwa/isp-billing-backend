@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     # /complete), once their encrypted management tunnel answers. hAP lite/mini
     # are skipped. False = switch off (existing routers are unaffected).
     REALTIME_PUSH_INSTALL_AT_SETUP: bool = True
+    # Post-provision check (app/services/provision_verify.py): after /complete,
+    # check the new router over its management tunnel (hotspot, WAN, DNS,
+    # tunnel, usage push, stuck script jobs, CPU), store the result on the
+    # provisioning token and tell the reseller. False = no check, no message.
+    PROVISION_VERIFY_ENABLED: bool = True
+    # When stuck script jobs are the ONLY fault: remove them, and if that does
+    # not clear it, reboot the router once. False = report only.
+    PROVISION_VERIFY_AUTO_FIX: bool = True
     # When a router comes back online, re-add the missing PPPoE secrets of its
     # active customers and remove secrets left by deleted/moved customers
     # (app/services/pppoe_resync.py). False = switch the sweep off.

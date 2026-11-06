@@ -157,17 +157,32 @@ def _spawn_sms(sms_id: int, sender_id: Optional[str]) -> None:
 
 
 async def send_overload_alert(router_id: int, level: str, subject: str, body: str,
-                              now: Optional[datetime] = None) -> bool:
+                              now: Optional[datetime] = None, *, setup_grace: bool = False) -> bool:
     """Claim today's slot for this level and create inbox (+ SMS) rows.
 
     Own short session; the provider send happens after commit. Never raises.
     Returns True only when a new alert was created.
+
+    ``setup_grace`` (the CPU alerts): hold the alert back while the router is
+    still in its post-provision window (provision_verify.in_setup_grace: up to
+    30 min after registration, until the setup check passes). Nothing is
+    claimed and the process-local attempt mark is cleared, so the alert can
+    still go once the window closes.
     """
     now = now or datetime.utcnow()
     day_start = local_midnight_utc(now)
     column = _stamp_column(level)
     try:
         async with database.async_session() as db:
+            if setup_grace:
+                from app.services.provision_verify import setup_grace_active
+
+                if await setup_grace_active(db, router_id, now):
+                    await db.rollback()
+                    _attempted.pop((router_id, level), None)
+                    logger.info("Router overload alert (%s) held back: router %s is in its "
+                                "post-provision setup window", level, router_id)
+                    return False
             claim = await db.execute(
                 update(Router)
                 .where(Router.id == router_id,
@@ -371,5 +386,5 @@ async def poll_router_cpu(now: Optional[datetime] = None) -> int:
         if level is None:
             continue
         subject, body = render_cpu_alert(name or f"#{router_id}", level, load)
-        await send_overload_alert(router_id, level, subject, body, now=now)
+        await send_overload_alert(router_id, level, subject, body, now=now, setup_grace=True)
     return len(readings)

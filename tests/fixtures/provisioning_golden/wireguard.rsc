@@ -362,8 +362,9 @@
     :log warning "Provisioning: Could not notify server (register manually via admin panel)"
 }
 
-# ---- STEP 10: REBOOT ----
+# ---- STEP 10: DONE ----
+# No reboot: everything above is already live. The import ends here so the
+# terminal gets its prompt back; the server checks the router over the
+# management tunnel in a few minutes and tells the reseller the result.
 
-:log info "Provisioning complete! Rebooting in 5 seconds..."
-:delay 5s
-/system reboot
+:log info "Provisioning complete! No reboot needed -- Bitwave will check the router in a few minutes."

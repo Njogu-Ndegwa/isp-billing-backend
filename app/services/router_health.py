@@ -171,7 +171,7 @@ async def record_and_evaluate(router_id: int, sample: HealthSample, *, source: s
         if level is None or not oa.should_attempt(router_id, level, now):
             return
         subject, body = oa.render_cpu_alert(name, level, cpu)
-        _spawn(oa.send_overload_alert(router_id, level, subject, body, now=now))
+        _spawn(oa.send_overload_alert(router_id, level, subject, body, now=now, setup_grace=True))
     except Exception:
         logger.exception("router_health: evaluation failed for router %s", router_id)
 
