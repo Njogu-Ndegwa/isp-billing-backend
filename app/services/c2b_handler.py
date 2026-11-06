@@ -107,7 +107,10 @@ def parse_c2b_payload(payload: dict) -> Optional[C2BPayloadFields]:
         trans_id = str(payload.get("TransID") or "").strip()
         if not trans_id:
             return None
-        bill_ref = str(payload.get("BillRefNumber") or "").strip()
+        # Account numbers are often pasted with grouping spaces (including
+        # nonbreaking spaces). Remove whitespace before validation and lookup;
+        # leave punctuation and other characters for the validator to reject.
+        bill_ref = "".join(str(payload.get("BillRefNumber") or "").split())
         raw_amount = payload.get("TransAmount")
         if raw_amount is None or raw_amount == "":
             return None

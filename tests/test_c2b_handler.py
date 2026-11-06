@@ -23,6 +23,7 @@ from app.config import settings
 from app.db.models import (
     C2BTransaction,
     C2BTransactionStatus,
+    CollectionMode,
     ConnectionType,
     Customer,
     CustomerPayment,
@@ -329,7 +330,8 @@ async def test_confirmation_duplicate_trans_id_idempotent(db, session_factory):
 # ---------------------------------------------------------------------------
 
 
-async def test_confirmation_wrong_reseller_paybill(db, session_factory):
+@pytest.mark.parametrize("separator", ["", " "])
+async def test_confirmation_wrong_reseller_paybill(db, session_factory, separator):
     """Customer of reseller A; payment arrives on reseller B's paybill via a
     ResellerPaymentMethod with mpesa_shortcode != platform."""
     # Set up reseller A with the customer
@@ -350,7 +352,7 @@ async def test_confirmation_wrong_reseller_paybill(db, session_factory):
     # Payment comes in on B's shortcode, with A's customer's account number
     payload = _make_payload(
         trans_id="RJ008",
-        bill_ref=customer_a.account_number,
+        bill_ref=separator.join(customer_a.account_number),
         amount=500,
         shortcode="987654",
     )
@@ -424,3 +426,67 @@ async def test_validation_rejects_unknown_account(db):
     payload = _make_payload(trans_id="V003", bill_ref=_valid_account("9999999"), amount=500)
     result = await handle_validation(payload, db)
     assert result == REJECT_INVALID_ACCOUNT
+
+
+@pytest.mark.parametrize("separator", [" ", "\t", "\u00a0", "\u202f"])
+async def test_whitespace_reference_validates_and_credits_once(db, session_factory, separator):
+    _, _, _, customer = await _seed_pppoe_customer(
+        db, account_number=_valid_account("0123456")
+    )
+    account = customer.account_number
+    formatted = separator + separator.join([account[:4], account[4:7], account[7:]]) + separator
+    payload = _make_payload(trans_id="SPACED001", bill_ref=formatted, amount=500)
+    bg, queued = _make_bg()
+
+    assert await handle_validation(payload, db) == ACCEPT_RESPONSE
+    assert await handle_confirmation(payload, db, background_tasks=bg) == SUCCESS_RESPONSE
+    await db.refresh(customer)
+    paid_expiry = customer.expiry
+    assert paid_expiry > datetime.utcnow() + timedelta(days=29, hours=23)
+
+    # A provider retry with compact formatting must still be the same receipt.
+    payload["BillRefNumber"] = account
+    assert await handle_confirmation(payload, db, background_tasks=bg) == SUCCESS_RESPONSE
+
+    async with session_factory() as s:
+        txn = (await s.execute(
+            select(C2BTransaction).where(C2BTransaction.trans_id == "SPACED001")
+        )).scalar_one()
+        assert txn.bill_ref_number == account
+        assert txn.status == C2BTransactionStatus.PROCESSED
+        assert txn.matched_customer_id == customer.id
+        assert txn.matched_reseller_id == customer.user_id
+        payments = (await s.execute(
+            select(CustomerPayment).where(CustomerPayment.customer_id == customer.id)
+        )).scalars().all()
+        assert len(payments) == 1
+        assert payments[0].payment_reference == "SPACED001"
+        assert payments[0].amount == 500
+        assert payments[0].collection_mode == CollectionMode.SYSTEM_COLLECTED
+        assert payments[0].counts_as_revenue is True
+        refreshed = await s.get(Customer, customer.id)
+        assert refreshed.expiry == paid_expiry
+        assert refreshed.wallet_credit_kes == 0
+        assert (await s.execute(select(UnmatchedC2BPayment))).scalars().all() == []
+    assert len(queued) == 1
+
+
+@pytest.mark.parametrize("bill_ref", [
+    "0123-4566", "0123A4566", "012 3456", "0123 4567", "   ",
+])
+async def test_reference_normalization_does_not_repair_invalid_accounts(db, bill_ref):
+    _, _, _, customer = await _seed_pppoe_customer(
+        db, account_number=_valid_account("0123456")
+    )
+    payload = _make_payload(trans_id="INVALID001", bill_ref=bill_ref, amount=500)
+    bg, queued = _make_bg()
+
+    assert await handle_validation(payload, db) == REJECT_INVALID_ACCOUNT
+    assert await handle_confirmation(payload, db, background_tasks=bg) == SUCCESS_RESPONSE
+    unmatched = (await db.execute(select(UnmatchedC2BPayment))).scalar_one()
+    assert unmatched.reason == UnmatchedC2BReason.INVALID_LUHN
+    assert (await db.execute(select(CustomerPayment))).scalars().all() == []
+    await db.refresh(customer)
+    assert customer.status == CustomerStatus.INACTIVE
+    assert customer.expiry is None
+    assert queued == []
