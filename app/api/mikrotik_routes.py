@@ -244,6 +244,12 @@ def _shape_health_response(
     return result
 
 
+def _snapshot_static_users(snapshot) -> int:
+    """Online static-IP customers on a snapshot; 0 for snapshots written before
+    the split (they counted static customers as hotspot)."""
+    return max(0, int(getattr(snapshot, "active_static_users", None) or 0))
+
+
 def _health_payload_offline(
     payload: dict,
     *,
@@ -264,6 +270,7 @@ def _health_payload_offline(
     result["active_users"] = 0
     result["active_hotspot_users"] = 0
     result["active_pppoe_users"] = 0
+    result["active_static_users"] = 0
     result["active_total_users"] = 0
     result["_full_pppoe_sessions"] = []
     result["bandwidth"] = {"download_mbps": 0.0, "upload_mbps": 0.0}
@@ -286,6 +293,7 @@ def _health_payload_from_snapshot(
     """Build a contract-compatible health payload from the latest snapshot."""
     snapshot_active_queues = 0
     active_hotspot_users = 0
+    active_static_users = 0
     current_download_mbps = 0.0
     current_upload_mbps = 0.0
     snapshot_age = None
@@ -298,12 +306,13 @@ def _health_payload_from_snapshot(
             if persisted_hotspot is None
             else max(0, int(persisted_hotspot))
         )
+        active_static_users = _snapshot_static_users(latest_snapshot)
         current_download_mbps = round((latest_snapshot.avg_download_bps or 0) / 1000000, 2)
         current_upload_mbps = round((latest_snapshot.avg_upload_bps or 0) / 1000000, 2)
         snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
 
-    active_pppoe_users = max(0, snapshot_active_queues - active_hotspot_users)
-    total_active_users = active_hotspot_users + active_pppoe_users
+    active_pppoe_users = max(0, snapshot_active_queues - active_hotspot_users - active_static_users)
+    total_active_users = active_hotspot_users + active_pppoe_users + active_static_users
 
     return {
         "system": {
@@ -333,6 +342,7 @@ def _health_payload_from_snapshot(
         "active_users": active_hotspot_users,
         "active_hotspot_users": active_hotspot_users,
         "active_pppoe_users": active_pppoe_users,
+        "active_static_users": active_static_users,
         "active_total_users": total_active_users,
         "_full_pppoe_sessions": [],
         "bandwidth": {
@@ -379,6 +389,7 @@ def _health_payload_from_live_result(
     # snapshot's persisted hotspot figure and add the live PPPoE on top, which
     # always yields a self-consistent total = hotspot + pppoe.
     snapshot_hotspot_users = 0
+    active_static_users = 0
     current_download_mbps = 0.0
     current_upload_mbps = 0.0
     snapshot_age = None
@@ -389,13 +400,16 @@ def _health_payload_from_live_result(
             snapshot_hotspot_users = max(0, latest_snapshot.active_queues or 0)
         else:
             snapshot_hotspot_users = max(0, int(persisted_hotspot))
+        active_static_users = _snapshot_static_users(latest_snapshot)
         current_download_mbps = round((latest_snapshot.avg_download_bps or 0) / 1000000, 2)
         current_upload_mbps = round((latest_snapshot.avg_upload_bps or 0) / 1000000, 2)
         snapshot_age = (datetime.utcnow() - latest_snapshot.recorded_at).total_seconds()
 
     active_hotspot_users = snapshot_hotspot_users
     if pppoe_active.get("skipped") and latest_snapshot:
-        active_pppoe_users = max(0, (latest_snapshot.active_queues or 0) - active_hotspot_users)
+        active_pppoe_users = max(
+            0, (latest_snapshot.active_queues or 0) - active_hotspot_users - active_static_users
+        )
     else:
         active_pppoe_users = (
             pppoe_active.get("count", len(pppoe_active.get("data", []) or []))
@@ -405,7 +419,7 @@ def _health_payload_from_live_result(
     active_pppoe_sessions = (
         pppoe_active.get("data", []) if not pppoe_active.get("error") else []
     )
-    total_active_users = active_hotspot_users + active_pppoe_users
+    total_active_users = active_hotspot_users + active_pppoe_users + active_static_users
 
     return {
         "system": {
@@ -435,6 +449,7 @@ def _health_payload_from_live_result(
         "active_users": active_hotspot_users,
         "active_hotspot_users": active_hotspot_users,
         "active_pppoe_users": active_pppoe_users,
+        "active_static_users": active_static_users,
         "active_total_users": total_active_users,
         "_full_pppoe_sessions": active_pppoe_sessions,
         "bandwidth": {
@@ -1554,7 +1569,8 @@ async def get_bandwidth_history(
             pppoe_upload_mb = _bytes_to_mb((getattr(s, "pppoe_upload_bytes", 0) or 0) + extra[2])
             pppoe_download_mb = _bytes_to_mb((getattr(s, "pppoe_download_bytes", 0) or 0) + extra[3])
             active_hotspot = int(getattr(s, "active_hotspot_users", 0) or 0)
-            active_pppoe = max(0, int(s.active_queues or 0) - active_hotspot)
+            active_static = _snapshot_static_users(s)
+            active_pppoe = max(0, int(s.active_queues or 0) - active_hotspot - active_static)
             data.append({
                 "timestamp": s.recorded_at.isoformat(),
                 "routerId": s.router_id,
@@ -1566,6 +1582,7 @@ async def get_bandwidth_history(
                 "activeSessions": s.active_sessions,
                 "activeHotspotUsers": active_hotspot,
                 "activePppoeUsers": active_pppoe,
+                "activeStaticUsers": active_static,
                 "hotspotUploadMB": hotspot_upload_mb,
                 "hotspotDownloadMB": hotspot_download_mb,
                 "hotspotTotalMB": round(hotspot_upload_mb + hotspot_download_mb, 2),
