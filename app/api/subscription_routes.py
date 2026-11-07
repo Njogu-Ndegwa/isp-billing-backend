@@ -1585,7 +1585,7 @@ class AdminSubscriptionPatch(BaseModel):
     subscription_status: Optional[str] = None
     subscription_expires_at: Optional[str] = None
     adjust_days: Optional[int] = None
-    # Country market (KE, CM, UG, TZ): sets currency, pricing, payment methods.
+    # Country market (KE, CM, UG, TZ, ZM): sets currency, pricing, payment methods.
     market_code: Optional[str] = None
     # Price in the market's subscription currency (flat fee, or the minimum
     # for usage markets). Send clear_price_override=true to remove it.

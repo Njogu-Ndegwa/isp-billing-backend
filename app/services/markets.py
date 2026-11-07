@@ -95,6 +95,11 @@ MARKETS: dict[str, Market] = {
                  _INTERNATIONAL_PRICING, (PAY_CARD,), usd_rate=3818.0),
     "TZ": Market("TZ", "Tanzania", "TZS", "sw", ("sw", "en"), "Africa/Dar_es_Salaam", "255",
                  _INTERNATIONAL_PRICING, (PAY_CARD,), usd_rate=2649.0),
+    # Zambia: no mobile-money collection gateway yet, so resellers here sell
+    # vouchers (set the router's payment_methods to ["voucher"]).
+    # usd_rate: open.er-api.com mid-market rate on 2026-11-07.
+    "ZM": Market("ZM", "Zambia", "ZMW", "en", ("en",), "Africa/Lusaka", "260",
+                 _INTERNATIONAL_PRICING, (PAY_CARD,), usd_rate=20.32),
 }
 
 
