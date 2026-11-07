@@ -142,13 +142,17 @@ class FakeRouterOS:
     address lists to exercise the installers."""
 
     def __init__(self, identity, *, board="RB951Ui-2HnD", arch="mipsbe", version="6.49.19", cpu=10,
-                 reachable=True, sstp=None, wg=None, peers=None, hotspot=True):
+                 reachable=True, sstp=None, wg=None, peers=None, hotspot=True,
+                 filter_rules=None, raw_rules=None, conntrack="auto"):
         self.identity, self.board, self.arch, self.version = identity, board, arch, version
         self.cpu, self.reachable, self.hotspot = cpu, reachable, hotspot
         self.sstp = sstp or []          # [{"name": "sstp-hetzner", "disabled": "false"}]
         self.wg = wg or []              # [{"name": "wg-hz", "disabled": "false"}]
         self.peers = peers or []        # [{"interface": "wg-hz"}]
-        self.menus = {"/system/script": [], "/system/scheduler": [], "/ip/firewall/address-list": []}
+        self.menus = {"/system/script": [], "/system/scheduler": [], "/ip/firewall/address-list": [],
+                      "/ip/firewall/filter": list(filter_rules or []),
+                      "/ip/firewall/raw": list(raw_rules or []),
+                      "/ip/firewall/connection/tracking": [{"enabled": conntrack}]}
         self.commands = []
         self.connects = 0
         self._id = 0
@@ -261,6 +265,158 @@ def test_watchdog_install_is_idempotent_and_swaps_kind():
     fake.named("/system/script", wd.SCRIPT_NAME_SSTP)["source"] = "# v2"
     assert wd.install_watchdog(fake, wd.KIND_SSTP, "10.0.0.5").status == "updated"
     assert len(fake.menus["/system/scheduler"]) == 1
+
+
+def test_wg_watchdog_rotates_the_listen_port_only_after_a_failed_reset():
+    src = wd.render_watchdog_source(wd.KIND_WG, "10.0.0.154")
+    assert "bw-mgmt-watchdog-wg v5" in src and "__" not in src
+    assert f":rndnum from={wd.ROTATE_PORT_MIN} to={wd.ROTATE_PORT_MAX}" in src
+    assert "/interface wireguard set $wi listen-port=$np" in src
+    # rotate is armed only inside the "backoff entry already there" branch, and only with working internet
+    backoff = src.index(":if ([:len $b] > 0) do={")
+    arm = src.index(":if ($up) do={ :set rotate true }")
+    assert backoff < arm < src.index(":if ($up = false) do={ :set hold 60 }")
+    # the port moves while the peer is disabled, before it is re-enabled
+    assert src.index("peers disable $p") < src.index(":if ($rotate) do={") < src.index("peers enable $p }")
+    assert "listen-port" not in wd.render_watchdog_source(wd.KIND_SSTP, "10.0.0.154")
+    # the rotation range stays clear of the provisioning ports and the ephemeral range
+    assert 51834 < wd.ROTATE_PORT_MIN or wd.ROTATE_PORT_MAX < 51820
+    assert wd.ROTATE_PORT_MAX < 49152
+
+
+def test_wg_watchdog_without_rotation_keeps_the_reset_but_never_moves_the_port():
+    src = wd.render_watchdog_source(wd.KIND_WG, "10.0.0.154", rotate=False)
+    assert "bw-mgmt-watchdog-wg v5" in src and "__" not in src
+    assert ":set rotate true" not in src and "rotation off" in src
+    assert "peers disable $p" in src and "peers enable $p" in src          # the reset is still there
+    # the arm line really is in the normal template (so the replace above can never silently miss)
+    assert ":set rotate true" in wd.render_watchdog_source(wd.KIND_WG, "10.0.0.154")
+    # SSTP has nothing to switch off
+    assert wd.render_watchdog_source(wd.KIND_SSTP, "10.0.0.5", rotate=False) == \
+        wd.render_watchdog_source(wd.KIND_SSTP, "10.0.0.5")
+
+
+# --- install-time firewall check (WireGuard port rotation) ------------------------
+
+ACCEPT_EST = {".id": "*1", "chain": "input", "action": "accept",
+              "connection-state": "established,related,untracked"}
+DROP_INVALID = {".id": "*2", "chain": "input", "action": "drop", "connection-state": "invalid"}
+DROP_NOT_LAN = {".id": "*5", "chain": "input", "action": "drop", "in-interface-list": "!LAN"}
+DEFCONF = [ACCEPT_EST, DROP_INVALID,
+           {".id": "*3", "chain": "input", "action": "accept", "protocol": "icmp"},
+           DROP_NOT_LAN,
+           {".id": "*E", "chain": "input", "action": "accept", "protocol": "udp", "dst-port": "51823"}]
+
+
+@pytest.mark.parametrize("spec,overlap", [
+    ("", True), ("51820", False), ("51820,51823", False), ("40000-48999", True),
+    ("45000", True), ("30000-39999,49000-50000", False), ("!22", True), ("ssh", True),
+])
+def test_port_overlap(spec, overlap):
+    assert wd._ports_overlap(spec, wd.ROTATE_PORT_MIN, wd.ROTATE_PORT_MAX) is overlap
+
+
+@pytest.mark.parametrize("rules,raw,conntrack,ok", [
+    # RouterOS defconf (HOME951 / RONGAI, 2026-10-12): established accepted before the WAN drop
+    (DEFCONF, [], "auto", True),
+    # no rules at all: the input chain accepts everything
+    ([], [], "auto", True),
+    # catch-all WAN drop above the established accept
+    ([DROP_NOT_LAN, ACCEPT_EST], [], "auto", False),
+    # a UDP drop over the rotation range above the established accept
+    ([{".id": "*9", "chain": "input", "action": "drop", "protocol": "udp", "dst-port": "1024-65535"},
+      ACCEPT_EST], [], "auto", False),
+    # drops aimed elsewhere (TCP, other ports, a blocklist) do not matter
+    ([{".id": "*7", "chain": "input", "action": "drop", "protocol": "tcp", "dst-port": "64872-64875"},
+      {".id": "*8", "chain": "input", "action": "drop", "protocol": "udp", "dst-port": "53"},
+      {".id": "*6", "chain": "input", "action": "drop", "src-address-list": "blacklist"},
+      ACCEPT_EST, DROP_NOT_LAN], [], "auto", True),
+    # a negated blocklist ("drop everything not in allowed") does matter
+    ([{".id": "*6", "chain": "input", "action": "drop", "src-address-list": "!allowed"}, ACCEPT_EST],
+     [], "auto", False),
+    # a jump is followed: a harmless custom chain falls through to the defconf rules...
+    ([{".id": "*J", "chain": "input", "action": "jump", "jump-target": "custom"},
+      {".id": "*K", "chain": "custom", "action": "drop", "protocol": "tcp", "dst-port": "64872-64875"},
+      *DEFCONF], [], "auto", True),
+    # ...a custom chain that drops UDP does not
+    ([{".id": "*J", "chain": "input", "action": "jump", "jump-target": "custom"},
+      {".id": "*K", "chain": "custom", "action": "drop", "protocol": "udp"},
+      *DEFCONF], [], "auto", False),
+    # disabled rules are ignored
+    ([{**DROP_NOT_LAN, "disabled": "true"}, ACCEPT_EST], [], "auto", True),
+    # connection tracking off: nothing is "established", so the WAN drop eats the replies
+    (DEFCONF, [], "no", False),
+    # a raw drop that can hit the replies
+    (DEFCONF, [{".id": "*R", "chain": "prerouting", "action": "drop", "protocol": "udp"}], "auto", False),
+    (DEFCONF, [{".id": "*R", "chain": "prerouting", "action": "drop", "src-address-list": "ddos"}],
+     "auto", True),
+    # our own anti-tethering raw rules (15 routers in the 2026-10-12 scan): TTL-specific, harmless
+    (DEFCONF, [{".id": "*2", "chain": "prerouting", "action": "drop", "in-interface": "bridge",
+                "ttl": "equal:63", "comment": "ISP_BILLING_ANTI_TETHERING"},
+               {".id": "*3", "chain": "prerouting", "action": "drop", "in-interface": "bridge",
+                "ttl": "equal:127", "comment": "ISP_BILLING_ANTI_TETHERING"}], "auto", True),
+])
+def test_wg_firewall_check(rules, raw, conntrack, ok):
+    fake = FakeRouterOS("R", filter_rules=rules, raw_rules=raw, conntrack=conntrack, **WG)
+    res = wd.check_wg_firewall(fake)
+    assert res.ok is ok, res.reason
+    assert fake.writes() == []                                  # read-only
+
+
+def test_wg_firewall_check_fails_closed_when_unreadable():
+    class Broken(FakeRouterOS):
+        def send_command(self, cmd, args=None):
+            if cmd == "/ip/firewall/filter/print":
+                return {"error": "not enough permissions"}
+            return super().send_command(cmd, args)
+    res = wd.check_wg_firewall(Broken("R", **WG))
+    assert res.ok is False and res.transient
+
+    class Raising(FakeRouterOS):
+        def send_command(self, cmd, args=None):
+            if cmd.startswith("/ip/firewall/"):
+                raise OSError("connection reset")
+            return super().send_command(cmd, args)
+    res = wd.check_wg_firewall(Raising("R", **WG))
+    assert res.ok is False and res.transient and res.reason.startswith("check failed")
+    # a real verdict is never transient
+    assert not wd.check_wg_firewall(FakeRouterOS("R", filter_rules=[DROP_NOT_LAN, ACCEPT_EST], **WG)).transient
+
+
+@pytest.mark.asyncio
+async def test_unreadable_firewall_changes_nothing_and_retries_soon(db, wired):
+    class Flaky(FakeRouterOS):
+        broken = True
+
+        def send_command(self, cmd, args=None):
+            if cmd == "/ip/firewall/filter/print" and self.broken:
+                return {"error": "timeout"}
+            return super().send_command(cmd, args)
+    r = await _router(db, "10.0.0.161", "Router-5012")
+    fake = wired["10.0.0.161"] = Flaky("Router-5012", **WG)
+    [o] = await enrol.standard_runtime_enrol_background()
+    assert not o.watchdog.installed and o.watchdog.reason.startswith("firewall check failed")
+    assert not fake.named("/system/script", wd.SCRIPT_NAME_WG)          # nothing written
+    assert enrol.recheck_after(o.watchdog.reason) == timedelta(minutes=30)
+    fake.broken = False
+    [o] = await enrol.standard_runtime_enrol_background(now=datetime.utcnow() + timedelta(minutes=31))
+    assert o.watchdog.installed and o.watchdog.reason == "installed (wg v5, installed)"
+    assert (await _reload(db, r.id)).mgmt_watchdog_installed_at
+
+
+def test_watchdog_version_tag():
+    assert wd.version_tag(wd.KIND_WG) == "wg v5"
+    assert wd.is_current("wg", "installed (wg v5, updated)")
+    assert not wd.is_current("wg", "installed (wg, installed)")        # recorded before versions
+    assert not wd.is_current(None, "installed (wg v5, updated)")
+    assert wd.is_current("sstp", f"installed ({wd.version_tag(wd.KIND_SSTP)}, unchanged)")
+    assert enrol.watchdog_needed(None, None, None)
+    assert enrol.watchdog_needed(datetime.utcnow(), "wg", "installed (wg, installed)")
+    assert not enrol.watchdog_needed(datetime.utcnow(), "wg", "installed (wg v5, unchanged)")
+    # rotation-less install: not current (looked at again), on the weekly cadence
+    norot = "firewall: drop rule *5 in input before established-accept; installed (wg v5 norotate, updated)"
+    assert not wd.is_current("wg", norot) and enrol.watchdog_needed(datetime.utcnow(), "wg", norot)
+    assert enrol.recheck_after(norot) == timedelta(days=7)
 
 
 def test_watchdog_paused_scheduler_is_not_re_enabled():
@@ -386,6 +542,68 @@ async def test_wireguard_router_gets_the_wg_watchdog(db, wired):
     assert fake.named("/system/scheduler", wd.SCRIPT_NAME_WG)
     assert not fake.named("/system/script", wd.SCRIPT_NAME_SSTP)
     assert (await _reload(db, r.id)).mgmt_watchdog_kind == "wg"
+
+
+@pytest.mark.asyncio
+async def test_outdated_watchdog_is_upgraded_in_place_once(db, wired):
+    """Routers enrolled with the v4 WG watchdog get v5 from the background job."""
+    old = datetime.utcnow() - timedelta(days=2)
+    r = await _router(db, "10.0.0.154", "Router-0983", mgmt_watchdog_installed_at=old,
+                      mgmt_watchdog_checked_at=old, mgmt_watchdog_kind="wg",
+                      mgmt_watchdog_reason="installed (wg, installed)",
+                      checkin_installed_at=old, checkin_checked_at=old,
+                      checkin_install_reason="installed (installed)")
+    fake = wired["10.0.0.154"] = FakeRouterOS("Router-0983", **WG)
+    wd.install_watchdog(fake, wd.KIND_WG, "10.0.0.154")
+    sched = fake.named("/system/scheduler", wd.SCRIPT_NAME_WG)
+    fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"] = "# bw-mgmt-watchdog-wg v4"
+    fake.commands.clear()
+    [o] = await enrol.standard_runtime_enrol_background()
+    assert o.checkin is None                                   # installed check-in is not touched
+    assert o.watchdog.installed and "wg v5, updated" in o.watchdog.reason
+    assert "v5" in fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"]
+    assert fake.menus["/system/scheduler"] == [sched]           # scheduler left as it was
+    row = await _reload(db, r.id)
+    assert wd.is_current(row.mgmt_watchdog_kind, row.mgmt_watchdog_reason)
+    fake.commands.clear()
+    assert await enrol.standard_runtime_enrol_background(now=datetime.utcnow() + timedelta(days=1)) == []
+    assert fake.commands == []
+
+
+@pytest.mark.asyncio
+async def test_wg_rotation_follows_the_routers_firewall(db, wired):
+    """A firewall that could drop replies on a rotated port: v5 without rotation,
+    checked again a week later, rotation switched on once the firewall passes."""
+    r = await _router(db, "10.0.0.160", "Router-5010")
+    fake = wired["10.0.0.160"] = FakeRouterOS("Router-5010", filter_rules=[DROP_NOT_LAN, ACCEPT_EST], **WG)
+    [o] = await enrol.standard_runtime_enrol_background()
+    assert o.watchdog.installed and o.watchdog.reason.startswith("firewall: drop rule *5")
+    assert wd.NOROTATE in o.watchdog.reason
+    src = fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"]
+    assert "v5" in src and ":set rotate true" not in src
+    assert not any(c.startswith("/ip/firewall/filter/") and not c.endswith("/print") for c in fake.writes())
+    row = await _reload(db, r.id)
+    assert row.mgmt_watchdog_installed_at and not wd.is_current(row.mgmt_watchdog_kind, row.mgmt_watchdog_reason)
+    # not looked at again within the week
+    fake.commands.clear()
+    assert await enrol.standard_runtime_enrol_background(now=datetime.utcnow() + timedelta(days=6)) == []
+    assert fake.commands == []
+    # the reseller fixed the rule order: the weekly re-check switches rotation on
+    fake.menus["/ip/firewall/filter"] = list(DEFCONF)
+    [o] = await enrol.standard_runtime_enrol_background(now=datetime.utcnow() + timedelta(days=8))
+    assert o.watchdog.installed and o.watchdog.reason == "installed (wg v5, updated)"
+    assert ":set rotate true" in fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"]
+    row = await _reload(db, r.id)
+    assert wd.is_current(row.mgmt_watchdog_kind, row.mgmt_watchdog_reason)
+
+
+@pytest.mark.asyncio
+async def test_sstp_router_is_not_firewall_checked(db, wired):
+    await _router(db, "10.0.100.21", "Router-5011")
+    fake = wired["10.0.100.21"] = FakeRouterOS("Router-5011", filter_rules=[DROP_NOT_LAN, ACCEPT_EST], **SSTP)
+    [o] = await enrol.standard_runtime_enrol_background()
+    assert o.watchdog.installed and o.watchdog.reason.startswith("installed (sstp v3")
+    assert not fake.did("/ip/firewall/filter/print")
 
 
 @pytest.mark.asyncio
