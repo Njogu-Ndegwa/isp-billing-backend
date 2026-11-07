@@ -21,6 +21,10 @@ one test. Table (warning / critical):
     safety_net.spike               removals > max(20, 5 x baseline)       / > max(100, 10 x baseline)
     jobs.stale                     no finish for 3 x interval (min 5 min) / > 6 x interval
     db_pool.pressure               pressure warning                       / pressure critical
+    problem_routers.site_online_tunnel_down
+                                   a site still taking portal payments    / oldest waiting >= 30 min
+                                   with a paid customer waiting >= 10 min   or >= 10 waiting in all
+                                   and no management contact
 """
 
 from __future__ import annotations
@@ -73,6 +77,10 @@ SAFETY_NET_SPIKE_CRIT_MULTIPLIER = 10
 JOBS_STALE_WARN_MULTIPLIER = 3
 JOBS_STALE_CRIT_MULTIPLIER = 6
 JOBS_STALE_MIN_MINUTES = 5
+
+TUNNEL_DOWN_WAIT_WARN_MINUTES = 10
+TUNNEL_DOWN_WAIT_CRIT_MINUTES = 30
+TUNNEL_DOWN_WAITING_CRIT = 10
 
 LOCAL_UTC_OFFSET_HOURS = 3   # EAT; mirrors settings.LOCAL_UTC_OFFSET_HOURS
 
@@ -403,6 +411,39 @@ def evaluate(sections: dict, now: Optional[datetime] = None) -> list[dict]:
              + (f"; last error: {item.get('last_error')}" if item.get("last_error") else "")
              + ")."),
             round(since, 1), round(thr, 1),
+        ))
+
+    # problem routers: site online, management tunnel down ----------------------
+    # Customers keep paying through the router's portal, so the site has internet,
+    # but we cannot reach the router to connect them (RONGAI / HOME951,
+    # 2026-10-12: ~75 min, 212 retries, no alert). The problem-routers section
+    # never moves the overall status; this alert is how it reaches someone.
+    sites = []
+    for site in (s.get("problem_routers") or {}).get("tunnel_down_sites") or []:
+        try:
+            oldest = datetime.fromisoformat(str(site["oldest_waiting_at"]).rstrip("Z"))
+        except (KeyError, ValueError):
+            continue
+        minutes = (now - oldest).total_seconds() / 60
+        if minutes >= TUNNEL_DOWN_WAIT_WARN_MINUTES:
+            sites.append((minutes, site))
+    if sites:
+        sites.sort(key=lambda x: -x[0])
+        worst = sites[0][0]
+        total = sum(int(site.get("waiting") or 0) for _, site in sites)
+        severity = ("critical" if worst >= TUNNEL_DOWN_WAIT_CRIT_MINUTES or total >= TUNNEL_DOWN_WAITING_CRIT
+                    else "warning")
+        listed = "; ".join(
+            f"{site.get('router_name')} ({site.get('reseller')}): {site.get('waiting')} waiting, "
+            f"oldest {minutes:.0f} min" for minutes, site in sites[:4])
+        more = f" and {len(sites) - 4} more" if len(sites) > 4 else ""
+        alerts.append(_alert(
+            "problem_routers.site_online_tunnel_down", severity, "Site online, tunnel down",
+            (f"{len(sites)} router(s) still take portal payments we cannot deliver: {listed}{more}. "
+             "The site has internet but our management tunnel is not reaching the router; "
+             "its watchdog moves the WireGuard port after a failed reset, otherwise check the "
+             "site's modem."),
+            total, TUNNEL_DOWN_WAIT_WARN_MINUTES,
         ))
 
     # db pool -----------------------------------------------------------------
