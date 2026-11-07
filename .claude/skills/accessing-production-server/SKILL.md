@@ -50,6 +50,12 @@ Everything runs on one Hetzner box, and customer routers are reachable **only th
 `isp_wg_manager` because its tunnels carry transit for routers without a native Hetzner path.
 **`isp_billing_app` there must stay STOPPED.** Starting it on 2026-09-22 let a stale scheduler
 delete 1,062 paid-client router bindings. Never `docker compose up` on that box.
+- You don't need AWS to reach routers: run router scripts in `isp_billing_hetzner_app`, which
+  reaches every router natively or through `wg-aws-transit`.
+- If you do SSH there: no `docker compose/start/restart/run/exec`, no `.env` edits, stdlib
+  `python3` only, clean `/tmp` afterwards, and one SSH connection at a time — UFW `LIMIT` on
+  port 22 resets rapid reconnects. Finish with `docker ps` showing only postgres, radius and
+  wg-manager. Full rules: AGENTS.md "Rules for agents on the AWS box".
 
 ## Run patterns
 - **One-off command / logs:**
