@@ -272,3 +272,18 @@ def test_block_braces_balance(monkeypatch, variant):
         block = _step(_script(monkeypatch, variant), title)
         assert block.count("{") == block.count("}"), (variant, title)
         assert block.count("[") == block.count("]"), (variant, title)
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_rules_use_syntax_both_routeros_6_and_7_accept(monkeypatch, variant):
+    # The .rsc does not branch on version for these steps, and a v6-token
+    # router may run v7 (and the reverse). RouterOS 6 only understands
+    # space-separated menu paths, so no "/ip/firewall/..." forms, and nothing
+    # version-specific that would need wrapping in [:parse].
+    for title in ("STEP 4b", "STEP 9b: ANTI-TUNNEL"):
+        block = _step(_script(monkeypatch, variant), title)
+        assert "/ip/" not in block, (variant, title)
+        assert ":parse" not in block, (variant, title)
+        for line in block.splitlines():
+            if "firewall" in line:
+                assert "/ip firewall " in line, (variant, title, line)
