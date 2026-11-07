@@ -31,6 +31,7 @@ from app.db.models import (
     VoucherStatus,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services.markets import get_market
 from app.services.subscription import enforce_active_subscription
 from app.services.router_availability import (
     build_router_status,
@@ -1898,7 +1899,7 @@ async def get_router_by_identity(
 ):
     """Lookup router by MikroTik system identity (for frontend captive portal)"""
     stmt = (
-        select(Router, User.business_name)
+        select(Router, User.business_name, User.market_code)
         .join(User, Router.user_id == User.id)
         .where(Router.identity == identity)
     )
@@ -1908,7 +1909,7 @@ async def get_router_by_identity(
     if not row:
         raise HTTPException(status_code=404, detail=f"Router with identity '{identity}' not found")
     
-    router_obj, business_name = row
+    router_obj, business_name, market_code = row
     await db.refresh(router_obj, ["assigned_payment_method"])
     pm = router_obj.assigned_payment_method
     assigned_method_type = (
@@ -1930,6 +1931,8 @@ async def get_router_by_identity(
         "business_name": business_name,
         "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
         "payment_provider": payment_provider,
+        # Plan prices are in the owner's market currency.
+        "currency": get_market(market_code).currency,
         "payment_method_id": router_obj.payment_method_id,
         "assigned_payment_method": {
             "id": pm.id,

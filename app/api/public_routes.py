@@ -16,6 +16,7 @@ from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normali
 from app.services.router_helpers import get_router_by_id
 from app.services.customer_grace import access_floor, effective_expiry, has_access_time
 from app.services.ad_serving import ads_for_router, network_ads
+from app.services.markets import reseller_market
 from app.services.plan_cache import (
     get_plans_cached,
     select_portal_plans,
@@ -844,6 +845,8 @@ async def get_portal_data(
             "business_name": reseller.business_name,
             "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
             "payment_provider": collection_gateway,
+            # Plan prices are in the owner's market currency (KES, XAF, ZMW...).
+            "currency": reseller_market(reseller).currency,
             "support_phone": reseller.support_phone,
         },
         "plans": plans,
