@@ -287,3 +287,21 @@ def test_rules_use_syntax_both_routeros_6_and_7_accept(monkeypatch, variant):
         for line in block.splitlines():
             if "firewall" in line:
                 assert "/ip firewall " in line, (variant, title, line)
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_reboot_runs_detached_never_inline(monkeypatch, variant):
+    # Inline under /import from a terminal, /system reboot waits for a y/N
+    # answer; with the terminal closed the import hung for 50+ minutes and the
+    # router never rebooted (router 689, 2026-11-07). It must only appear
+    # inside an :execute job, which has no console on RouterOS 6 or 7.
+    script = _script(monkeypatch, variant)
+    reboots = [line.strip() for line in script.splitlines() if "/system reboot" in line]
+    assert reboots == [':execute script=":delay 5s; /system reboot"'], (variant, reboots)
+    # Nothing else in the script waits on a console prompt either.
+    for prompt in ("/system reset-configuration", "/system shutdown", "/system package downgrade",
+                   "/system routerboard upgrade", "/ip hotspot setup"):
+        assert prompt not in script, (variant, prompt)
+    for line in script.splitlines():
+        if "/certificate import" in line:
+            assert "passphrase=" in line, (variant, line)

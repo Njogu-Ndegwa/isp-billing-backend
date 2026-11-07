@@ -1672,12 +1672,24 @@ def _rsc_notify_server(token: ProvisioningToken) -> str:
 
 
 def _rsc_reboot() -> str:
+    """Reboot from a background job, never inline.
+
+    Run inline under /import from a terminal, /system reboot asks
+    "Reboot, yes? [y/N]" on the console. When that terminal is closed (Winbox
+    New Terminal, router 689 on 2026-11-07) nobody answers: the import job
+    hangs for good, burns CPU and the router never reboots. A job started with
+    :execute (RouterOS 6 and 7) has no console, so the reboot runs without a
+    prompt, and the import itself finishes and returns at once.
+    """
     return """
 # ---- STEP 10: REBOOT ----
 
 :log info "Provisioning complete! Rebooting in 5 seconds..."
-:delay 5s
-/system reboot
+:do {
+    :execute script=":delay 5s; /system reboot"
+} on-error={
+    :log warning "Provisioning: could not schedule the reboot -- reboot the router manually"
+}
 """
 
 

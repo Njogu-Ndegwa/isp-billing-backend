@@ -393,5 +393,8 @@
 # ---- STEP 10: REBOOT ----
 
 :log info "Provisioning complete! Rebooting in 5 seconds..."
-:delay 5s
-/system reboot
+:do {
+    :execute script=":delay 5s; /system reboot"
+} on-error={
+    :log warning "Provisioning: could not schedule the reboot -- reboot the router manually"
+}
