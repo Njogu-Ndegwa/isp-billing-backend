@@ -240,6 +240,11 @@ def _lb_enable_sync(router_info: dict, wan_ports: List[str],
                     api, port, idx, wan1_port=wan_ports[0], wan_ports=wan_ports
                 )
                 report["convert"][port] = conv
+                if conv.get("subnet_clash"):
+                    # Same IP range as another line: hard stop, convert no more.
+                    report["subnet_clash"] = conv["subnet_clash"]
+                    report["dormant_ports"].append(port)
+                    break
                 if conv.get("success") and not conv.get("aborted"):
                     report["converted_ports"].append(port)
                 else:
@@ -249,14 +254,22 @@ def _lb_enable_sync(router_info: dict, wan_ports: List[str],
                 # onto the next WAN, so leaving it dormant is safe.
                 report["dormant_ports"].append(port)
 
-        report["seed"] = mikrotik_lb.lb_seed_paid(api, active_customers)
-        report["verify"] = mikrotik_lb.lb_verify(api)
+        if report.get("subnet_clash"):
+            report["error"] = "wan_subnet_clash"
+            # The port is already back as it was. When this run is what put
+            # LB on the router, take it off again so the router ends exactly
+            # as it started; a router that already had LB keeps it untouched.
+            if not pre.get("existing_pcc_rules"):
+                report["rollback"] = mikrotik_lb.lb_rollback(api)
+        else:
+            report["seed"] = mikrotik_lb.lb_seed_paid(api, active_customers)
+            report["verify"] = mikrotik_lb.lb_verify(api)
         if deadman and not deadman.get("aborted"):
             if report["converted_ports"] and not mikrotik_lb.lb_internet_ok(api):
                 report["deadman_left_armed"] = report["converted_ports"]
             else:
                 report["deadman_disarmed"] = mikrotik_lb.lb_disarm_convert_deadman(api)
-        report["success"] = True
+        report["success"] = not report.get("subnet_clash")
         return report
     finally:
         api.disconnect()
@@ -402,6 +415,24 @@ async def enable_load_balancing(
                 "message": "Preflight found blockers; nothing was changed on the router",
                 "blockers": (result.get("preflight") or {}).get("blockers", []),
                 "preflight": result.get("preflight"),
+            },
+        )
+    if result.get("error") == "wan_subnet_clash":
+        clash = result["subnet_clash"]
+        undone = bool(result.get("rollback"))
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": clash["message"],
+                "blockers": [clash["message"]],
+                "subnet_clash": clash,
+                "router_state": (
+                    f"{clash['port']} was put back as it was"
+                    + ("; load balancing was not left on" if undone
+                       else "; the existing load balancing was left as it was")
+                ),
+                "preflight": result.get("preflight"),
+                "convert": result.get("convert"),
             },
         )
     _raise_for_router_error(result, router_obj)

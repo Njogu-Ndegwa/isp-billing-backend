@@ -246,6 +246,176 @@ def _port_macs_block(classified: dict) -> bool:
     return bool(classified["clients"]) or len(classified["upstream"]) > UPSTREAM_MAX_MACS
 
 
+# --- second line in the same subnet as another WAN: hard stop ----------------
+#
+# Two modems handing out the same LAN range (both 192.168.1.1, or both ONTs on
+# 192.168.100.1) put two connected routes for one subnet on the router. The
+# instant the second port holds a lease, traffic for that subnet — including the
+# default route's gateway and the management tunnel — can leave through the
+# wrong port. Router 537 (2026-09-30) lost management that way mid-convert, and
+# router 487 (2026-10-28) nearly did. So it is refused, not warned about:
+# detected before anything is written where we can, and rolled back if the
+# lease shows it anyway.
+
+LB_SUBNET_ARP_PROBE_COUNT = 2
+
+_ORDINALS = {1: "second", 2: "third", 3: "fourth"}
+
+
+def _wan_networks(api, ports: List[str]) -> List[dict]:
+    """[{port, network, gateway}] for every address/lease held on *ports*."""
+    seen = set()
+    out: List[dict] = []
+
+    def add(port, addr, gateway=None):
+        iface = _safe_interface(addr)
+        if not iface or iface.network.prefixlen == iface.max_prefixlen:
+            return  # /32 (PPPoE-style) addresses do not claim a LAN range
+        key = (port, str(iface.network), gateway or "")
+        if key not in seen:
+            seen.add(key)
+            out.append({"port": port, "network": iface.network, "gateway": gateway})
+
+    for d in _rd(api, "/ip/dhcp-client/print"):
+        if d.get("interface") in ports and d.get("status") == "bound":
+            add(d.get("interface"), d.get("address"), d.get("gateway"))
+    for a in _rd(api, "/ip/address/print", ["address", "interface"]):
+        if a.get("interface") in ports:
+            add(a.get("interface"), a.get("address"))
+    return out
+
+
+def _range_label(network) -> str:
+    """192.168.1.0/24 -> '192.168.1.x'; anything else stays CIDR."""
+    if network.version == 4 and network.prefixlen == 24:
+        return ".".join(str(network.network_address).split(".")[:3]) + ".x"
+    return str(network)
+
+
+def _suggest_modem_ip(api, avoid: List[Any]) -> str:
+    """A 192.168.N.1 that no subnet on the router (or the clash) already uses."""
+    taken = list(avoid)
+    for a in _rd(api, "/ip/address/print", ["address", "interface"]):
+        iface = _safe_interface(a.get("address"))
+        if iface:
+            taken.append(iface.network)
+    start = 2
+    for net in avoid:
+        parts = str(net.network_address).split(".")
+        if net.version == 4 and parts[:2] == ["192", "168"]:
+            start = int(parts[2]) + 1
+            break
+    for third in list(range(start, 255)) + list(range(2, start)):
+        cand = ipaddress.ip_address(f"192.168.{third}.1")
+        if not any(cand in n for n in taken):
+            return str(cand)
+    return "192.168.2.1"
+
+
+def lb_subnet_clash_message(wan_index: int, network, suggestion: str,
+                            other: str = "the first") -> str:
+    line = _ORDINALS.get(wan_index, f"WAN{wan_index + 1}")
+    return (f"Your {line} line uses the same IP range as {other} "
+            f"({_range_label(network)}). Change the {line} modem's LAN IP "
+            f"(e.g. to {suggestion}) and try again.")
+
+
+def _subnet_clash(api, port: str, wan_index: int, other: dict, detected_by: str,
+                  evidence: Any, wan1_port: Optional[str] = None) -> dict:
+    suggestion = _suggest_modem_ip(api, [other["network"]])
+    against = ("the first" if other["port"] == wan1_port or wan1_port is None
+               else f"the line on {other['port']}")
+    return {
+        "port": port,
+        "clashes_with": other["port"],
+        "network": str(other["network"]),
+        "detected_by": detected_by,
+        "evidence": evidence,
+        "suggested_modem_ip": suggestion,
+        "message": lb_subnet_clash_message(wan_index, other["network"], suggestion,
+                                           against),
+    }
+
+
+def _lease_subnet_clash(api, port: str, wan_index: int, address: Optional[str],
+                        gateway: Optional[str], others: List[dict],
+                        wan1_port: Optional[str] = None) -> Optional[dict]:
+    """Clash when *port*'s lease range overlaps another WAN's, either way round."""
+    lease = _safe_interface(address)
+    gw = None
+    try:
+        gw = ipaddress.ip_address(gateway) if gateway else None
+    except ValueError:
+        gw = None
+    for o in others:
+        hit = (lease is not None and lease.network.overlaps(o["network"])) or \
+              (gw is not None and gw in o["network"])
+        if not hit and lease is not None and o.get("gateway"):
+            try:
+                hit = ipaddress.ip_address(o["gateway"]) in lease.network
+            except ValueError:
+                pass
+        if hit:
+            return _subnet_clash(api, port, wan_index, o, "lease",
+                                 {"address": address, "gateway": gateway}, wan1_port)
+    return None
+
+
+def _arp_answers(api, port: str, address: str) -> bool:
+    """True when something on *port* answers ARP for *address*.
+
+    Best effort: a router that cannot ARP-ping out of an address-less port just
+    reports no reply, and the lease-time check still catches the clash.
+    """
+    r = api.send_command("/ping", {"address": address, "arp-ping": "yes",
+                                   "interface": port,
+                                   "count": str(LB_SUBNET_ARP_PROBE_COUNT)})
+    rows = r.get("data", []) if r.get("success") else []
+    return bool(rows) and str(rows[-1].get("received") or "0") not in ("0", "")
+
+
+def lb_precheck_subnet_clash(api, port: str, wan_index: int, other_wans: List[str],
+                             in_bridge: bool,
+                             upstream: Optional[List[dict]] = None) -> Optional[dict]:
+    """Read-only: does the line on *port* already show it shares a WAN's range?
+
+    Three signals, none of which writes to the router:
+      * a DHCP client already bound on the port with an overlapping lease;
+      * the modem seen on the port while it is still a LAN port (its address,
+        from the upstream classification) falls in another WAN's range;
+      * the port is free (not a bridge member): ARP for each other WAN's gateway
+        out of it — a reply means the second modem sits on the same address.
+    """
+    other_wans = [p for p in other_wans if p != port]
+    wan1 = other_wans[0] if other_wans else None
+    others = _wan_networks(api, other_wans)
+    if not others:
+        return None
+    for d in _rd(api, "/ip/dhcp-client/print"):
+        if d.get("interface") == port and d.get("status") == "bound":
+            clash = _lease_subnet_clash(api, port, wan_index, d.get("address"),
+                                        d.get("gateway"), others, wan1)
+            if clash:
+                clash["detected_by"] = "existing_lease"
+                return clash
+    for dev in upstream or []:
+        for raw in dev.get("addresses") or []:
+            try:
+                ip = ipaddress.ip_address(raw)
+            except ValueError:
+                continue
+            o = next((o for o in others if ip in o["network"]), None)
+            if o:
+                return _subnet_clash(api, port, wan_index, o, "upstream_device",
+                                     {"mac": dev.get("mac"), "address": raw}, wan1)
+    if not in_bridge:
+        for o in others:
+            if o.get("gateway") and _arp_answers(api, port, o["gateway"]):
+                return _subnet_clash(api, port, wan_index, o, "arp_probe",
+                                     {"answered": o["gateway"]}, wan1)
+    return None
+
+
 # --- preflight ---------------------------------------------------------------
 
 def lb_preflight(api, wan_ports: List[str]) -> dict:
@@ -306,23 +476,37 @@ def lb_preflight(api, wan_ports: List[str]) -> dict:
             if existing_dhcp else None,
         }
         report["per_port"][port] = info
-        if idx > 0 and in_bridge and macs:
+        if idx == 0:
+            continue
+        blocked = False
+        upstream: List[dict] = []
+        if in_bridge and macs:
             classified = _classify_port_macs(api, macs, report["lan_bridge"])
             info["upstream_devices"] = classified["upstream"]
             if _port_macs_block(classified):
+                blocked = True
                 report["blockers"].append(
                     f"{len(macs)} client MAC(s) learned on {port} while it is a bridge "
                     "port — that port serves customers/devices; converting it "
                     "disconnects them. Pick another port or move them."
                 )
             else:
-                seen = ", ".join(f"{u['mac']} ({'/'.join(u['addresses'])})"
-                                 for u in classified["upstream"])
-                report["warnings"].append(
-                    f"{port} is still a LAN port but has what looks like the second "
-                    f"line's modem on it: {seen}. Enabling takes {port} out of the "
-                    "LAN and puts it back if the modem does not hand out DHCP."
-                )
+                upstream = classified["upstream"]
+        clash = None
+        if not blocked and (existing_dhcp or upstream or links.get(port) == "true"):
+            clash = lb_precheck_subnet_clash(
+                api, port, idx, [p for p in wan_ports if p != port],
+                in_bridge=bool(in_bridge), upstream=upstream)
+        if clash:
+            info["subnet_clash"] = clash
+            report["blockers"].append(clash["message"])
+        elif upstream:
+            seen = ", ".join(f"{u['mac']} ({'/'.join(u['addresses'])})" for u in upstream)
+            report["warnings"].append(
+                f"{port} is still a LAN port but has what looks like the second "
+                f"line's modem on it: {seen}. Enabling takes {port} out of the "
+                "LAN and puts it back if the modem does not hand out DHCP."
+            )
     _step(report, "read.ports", True, report["per_port"])
 
     dsn = _rd(api, "/ip/dhcp-server/network/print")
@@ -750,7 +934,10 @@ def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1",
                     wan_ports: Optional[List[str]] = None) -> dict:
     """Pull *port* out of the LAN bridge and turn it into WAN<wan_index+1>.
 
-    Hard aborts: no link; port is a bridge member with learned client MACs.
+    Hard aborts: no link; port is a bridge member with learned client MACs; the
+    line on the port uses the same IP range as another WAN (refused before any
+    write when the modem or an ARP probe shows it, rolled back when only the
+    lease shows it — report["subnet_clash"] carries the details).
     *wan_ports* (all WANs, WAN1 first) lets RouterOS 6 rebuild its whole route
     set; without it the WAN list is taken as [wan1_port, ..., port].
     """
@@ -787,6 +974,20 @@ def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1",
         report["upstream_devices"] = classified["upstream"]
     _step(report, "check.bridge_macs", True,
           {"in_bridge": in_bridge, "upstream_in_lan": upstream_in_lan})
+
+    # Same range as another WAN? Refuse while nothing has been written yet.
+    other_wans = [p for p in (wan_ports or [wan1_port]) if p != port]
+    other_wans += [d.get("interface") for d in _rd(api, "/ip/dhcp-client/print")
+                   if d.get("interface") not in other_wans + [port]
+                   and d.get("status") == "bound"]
+    clash = lb_precheck_subnet_clash(api, port, wan_index, other_wans, in_bridge,
+                                     report.get("upstream_devices"))
+    if clash:
+        report["subnet_clash"] = clash
+        report["aborted"] = clash["message"]
+        _step(report, "check.subnet_clash", False, clash)
+        return report
+    _step(report, "check.subnet_clash", True)
 
     removed_from: List[str] = []
     for p in bridge_ports:
@@ -835,25 +1036,18 @@ def lb_convert_port(api, port: str, wan_index: int, wan1_port: str = "ether1",
     _step(report, "check.dhcp_bound", True, report["lease"])
 
     report["warnings"] = []
-    lease_if = _safe_interface(report["lease"].get("address"))
-    for d in _rd(api, "/ip/dhcp-client/print"):
-        if d.get("interface") == port or d.get("status") != "bound":
-            continue
-        other = _safe_interface(d.get("address"))
-        if not (lease_if and other):
-            continue
-        if lease_if.ip == other.ip:
-            report["warnings"].append(
-                f"{port} got the same address as {d.get('interface')} "
-                f"({lease_if.ip}) — balancing still routes, but change the second "
-                "modem's LAN subnet (e.g. 192.168.101.1) to keep the lines apart"
-            )
-        elif lease_if.network == other.network:
-            report["warnings"].append(
-                f"{port} and {d.get('interface')} share subnet {lease_if.network} "
-                "(both modems use the same LAN range) — works via interface-pinned "
-                "gateways; changing the second modem's LAN subnet is cleaner"
-            )
+    # The lease is the proof the ARP probe could not always give. An overlapping
+    # lease is already live on the router, so undo the convert straight away —
+    # DHCP client first — before any route is built on top of it.
+    clash = _lease_subnet_clash(api, port, wan_index, report["lease"].get("address"), gw,
+                                _wan_networks(api, other_wans), other_wans[0])
+    if clash:
+        report["subnet_clash"] = clash
+        report["aborted"] = clash["message"]
+        _step(report, "check.subnet_clash.lease", False, clash)
+        _revert_convert(api, report, port, removed_from, added_dhcp, added_nat)
+        return report
+    _step(report, "check.subnet_clash.lease", True)
 
     major = _read_ros_major(api)
     if major == 6:
