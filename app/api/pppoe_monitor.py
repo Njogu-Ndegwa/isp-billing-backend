@@ -666,6 +666,26 @@ def _pppoe_users_sync(router_info: dict) -> dict:
         api.disconnect()
 
 
+def _pppoe_server_summary(api: MikroTikAPI) -> dict:
+    """Which interfaces run an enabled PPPoE server (``lookup_success`` False if unread).
+
+    A login can be perfect and still never connect when no port answers PPPoE
+    discovery, so the customer page needs this alongside the secret check.
+    """
+    try:
+        result = api.get_pppoe_server_status()
+    except Exception as e:  # noqa: BLE001 - the rest of the presence check still matters
+        return {"lookup_success": False, "enabled_interfaces": [], "error": str(e)}
+    if not result.get("success"):
+        return {"lookup_success": False, "enabled_interfaces": [], "error": result.get("error")}
+    enabled = [
+        s.get("interface", "")
+        for s in result.get("data", [])
+        if not s.get("disabled")
+    ]
+    return {"lookup_success": True, "enabled_interfaces": enabled, "error": None}
+
+
 def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
     """Check whether one DB-owned PPPoE username exists on the MikroTik."""
     api = MikroTikAPI(
@@ -679,6 +699,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
         secret_data = api.get_pppoe_secret_detail(username)
         if secret_data.get("error"):
             return {"error": secret_data["error"]}
+        pppoe_server = _pppoe_server_summary(api)
 
         secret = secret_data.get("data") if secret_data.get("found") else None
         if not secret:
@@ -698,6 +719,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "session_lookup_success": None,
                 "session_found": None,
                 "session_lookup_error": None,
+                "pppoe_server": pppoe_server,
             }
 
         if secret.get("disabled"):
@@ -717,6 +739,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "session_lookup_success": None,
                 "session_found": None,
                 "session_lookup_error": None,
+                "pppoe_server": pppoe_server,
             }
 
         session_lookup = api.get_pppoe_session_with_bandwidth(username)
@@ -752,6 +775,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
             "session_lookup_success": session_lookup_success,
             "session_found": bool(session_lookup.get("found")) if session_lookup_success else None,
             "session_lookup_error": session_lookup.get("error") if not session_lookup_success else None,
+            "pppoe_server": pppoe_server,
         }
     except Exception as e:
         logger.error(f"PPPoE customer presence error for {username}: {e}")
@@ -862,6 +886,8 @@ async def pppoe_customer_presence(
             Router.username.label("router_username"),
             Router.password.label("router_password"),
             Router.port.label("router_port"),
+            Router.pppoe_ports.label("router_pppoe_ports"),
+            Router.dual_ports.label("router_dual_ports"),
             Plan.name.label("plan_name"),
             Plan.speed.label("plan_speed"),
             Plan.max_shared_users.label("plan_max_shared_users"),
@@ -984,6 +1010,20 @@ async def pppoe_customer_presence(
         and not db_customer["is_expired"]
     )
 
+    # Live read of /interface/pppoe-server/server. None = could not tell.
+    server_read = presence.get("pppoe_server") or {}
+    enabled_server_interfaces = list(server_read.get("enabled_interfaces") or [])
+    pppoe_server_available = (
+        bool(enabled_server_interfaces) if server_read.get("lookup_success") is True else None
+    )
+    pppoe_server = {
+        "available": pppoe_server_available,
+        "enabled_interfaces": enabled_server_interfaces,
+        # What Ports configuration last saved, for context; the live read wins.
+        "configured_pppoe_ports": list(row["router_pppoe_ports"] or []),
+        "configured_dual_ports": list(row["router_dual_ports"] or []),
+    }
+
     if not present:
         verdict = {
             "code": "missing_from_mikrotik",
@@ -1000,6 +1040,12 @@ async def pppoe_customer_presence(
         verdict = {
             "code": "present_but_profile_missing",
             "message": "The PPP secret exists, but its referenced PPP profile was not found on the router.",
+            "our_side_confirmed": False,
+        }
+    elif pppoe_server_available is False and online is not True:
+        verdict = {
+            "code": "no_pppoe_server",
+            "message": "No port on this router runs a PPPoE server, so no device can connect with this login.",
             "our_side_confirmed": False,
         }
     elif profile_rate_matches is False:
@@ -1050,6 +1096,7 @@ async def pppoe_customer_presence(
         },
         "billing_active": billing_active,
         "speed_enforcement": speed_enforcement,
+        "pppoe_server": pppoe_server,
         "device_limit": {
             "plan_max_devices": max(1, int(row["plan_max_shared_users"] or 1)),
             "max_devices_override": row["customer_max_devices_override"],

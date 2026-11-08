@@ -410,6 +410,110 @@ async def test_pppoe_customer_presence_flags_plan_rate_mismatch(db, monkeypatch)
     assert response["verdict"]["our_side_confirmed"] is False
 
 
+def _offline_presence(username, pppoe_server):
+    return {
+        "success": True,
+        "username": username,
+        "present_on_router": True,
+        "online": False,
+        "state": "offline",
+        "secret": {"name": username, "profile": "pppoe_5M_5M", "disabled": False},
+        "active_session": None,
+        "active_sessions": [],
+        "profile_detail": {"name": "pppoe_5M_5M", "rate_limit": "5400000/5400000"},
+        "profile_lookup_success": True,
+        "session_lookup_success": True,
+        "pppoe_server": pppoe_server,
+    }
+
+
+async def test_pppoe_customer_presence_flags_router_without_pppoe_server(db, monkeypatch):
+    # Router 599 (8 Nov 2026): every port hotspot-only, login fine, the page
+    # still said "set up correctly". The login can never connect there.
+    pppoe_monitor._pppoe_presence_cache.clear()
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+
+    async def _run_with_guard(_router_id, _fn, _router_info, username, **_kwargs):
+        return _offline_presence(
+            username, {"lookup_success": True, "enabled_interfaces": [], "error": None},
+        )
+
+    monkeypatch.setattr(pppoe_monitor, "run_with_guard", _run_with_guard)
+
+    response = await pppoe_monitor.pppoe_customer_presence(customer.id, db, _token(reseller), refresh=True)
+
+    assert response["verdict"]["code"] == "no_pppoe_server"
+    assert response["verdict"]["our_side_confirmed"] is False
+    assert response["pppoe_server"] == {
+        "available": False,
+        "enabled_interfaces": [],
+        "configured_pppoe_ports": [],
+        "configured_dual_ports": [],
+    }
+
+
+async def test_pppoe_customer_presence_ok_when_a_port_runs_pppoe(db, monkeypatch):
+    pppoe_monitor._pppoe_presence_cache.clear()
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+    router.pppoe_ports = ["ether4"]
+    await db.commit()
+
+    async def _run_with_guard(_router_id, _fn, _router_info, username, **_kwargs):
+        return _offline_presence(
+            username, {"lookup_success": True, "enabled_interfaces": ["ether4"], "error": None},
+        )
+
+    monkeypatch.setattr(pppoe_monitor, "run_with_guard", _run_with_guard)
+
+    response = await pppoe_monitor.pppoe_customer_presence(customer.id, db, _token(reseller), refresh=True)
+
+    assert response["verdict"]["code"] == "router_account_exists_but_customer_offline"
+    assert response["pppoe_server"]["available"] is True
+    assert response["pppoe_server"]["enabled_interfaces"] == ["ether4"]
+    assert response["pppoe_server"]["configured_pppoe_ports"] == ["ether4"]
+
+
+async def test_pppoe_customer_presence_unknown_server_read_keeps_verdict(db, monkeypatch):
+    pppoe_monitor._pppoe_presence_cache.clear()
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+
+    async def _run_with_guard(_router_id, _fn, _router_info, username, **_kwargs):
+        return _offline_presence(
+            username, {"lookup_success": False, "enabled_interfaces": [], "error": "timeout"},
+        )
+
+    monkeypatch.setattr(pppoe_monitor, "run_with_guard", _run_with_guard)
+
+    response = await pppoe_monitor.pppoe_customer_presence(customer.id, db, _token(reseller), refresh=True)
+
+    assert response["verdict"]["code"] == "router_account_exists_but_customer_offline"
+    assert response["pppoe_server"]["available"] is None
+
+
+async def test_pppoe_server_summary_ignores_disabled_servers():
+    api = MikroTikAPI.__new__(MikroTikAPI)
+    api.get_pppoe_server_status = Mock(return_value={
+        "success": True,
+        "data": [
+            {"interface": "ether3", "disabled": True},
+            {"interface": "bridge-pppoe", "disabled": False},
+        ],
+    })
+    assert pppoe_monitor._pppoe_server_summary(api) == {
+        "lookup_success": True,
+        "enabled_interfaces": ["bridge-pppoe"],
+        "error": None,
+    }
+
+    api.get_pppoe_server_status = Mock(return_value={"success": True, "data": [
+        {"interface": "ether3", "disabled": True},
+    ]})
+    assert pppoe_monitor._pppoe_server_summary(api)["enabled_interfaces"] == []
+
+    api.get_pppoe_server_status = Mock(return_value={"error": "Not connected"})
+    assert pppoe_monitor._pppoe_server_summary(api)["lookup_success"] is False
+
+
 async def test_edit_active_pppoe_plan_reprovisions_with_new_speed(db, monkeypatch):
     reseller = await make_reseller(db)
     old_plan = await make_plan(
