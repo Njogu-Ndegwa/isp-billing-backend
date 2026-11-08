@@ -1849,8 +1849,11 @@ async def create_router_api(
             password=request.password,
             port=request.port,
             payment_methods=request.payment_methods or ["mpesa", "voucher"],
+            # A hand-added router is an existing box: nothing pushes the
+            # anti-tethering rules to it, so the flag must not claim it's on.
+            hotspot_sharing_blocked=False,
         )
-        
+
         db.add(router_obj)
         await db.commit()
         await db.refresh(router_obj)

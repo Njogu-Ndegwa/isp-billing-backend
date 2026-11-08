@@ -368,6 +368,37 @@
 :do { /system script remove [find name="bitwave-command-agent"] } on-error={}
 
 
+# ---- STEP 8b: ANTI-TETHERING (on by default) ----
+# Blocks customers sharing their plan via phone hotspot or their own router.
+# The reseller can turn it off per router in the dashboard.
+
+:foreach i in=[/ip firewall raw find where comment="ISP_BILLING_ANTI_TETHERING"] do={ :do { /ip firewall raw remove $i } on-error={} }
+:foreach i in=[/ip firewall mangle find where comment="ISP_BILLING_ANTI_TETHERING"] do={ :do { /ip firewall mangle remove $i } on-error={} }
+:foreach i in=[/ip firewall filter find where comment="ISP_BILLING_ANTI_TETHERING"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:do {
+    :local bwAnchor ""
+    :local bwStatic [/ip firewall raw find where chain=prerouting disabled=no dynamic=no]
+    :if ([:len $bwStatic] > 0) do={ :set bwAnchor [:pick $bwStatic 0] }
+    :foreach hs in=[/ip hotspot find where disabled=no] do={
+        :local bwIf [/ip hotspot get $hs interface]
+        :foreach bwTtl in={"equal:63";"equal:127";"equal:254"} do={
+            :local bwPlaced false
+            :if ([:len $bwStatic] > 0) do={
+                :do {
+                    /ip firewall raw add chain=prerouting action=drop in-interface=$bwIf src-address-list=!bitwave-static ttl=$bwTtl comment="ISP_BILLING_ANTI_TETHERING" place-before=$bwAnchor
+                    :set bwPlaced true
+                } on-error={}
+            }
+            :if ($bwPlaced = false) do={
+                /ip firewall raw add chain=prerouting action=drop in-interface=$bwIf src-address-list=!bitwave-static ttl=$bwTtl comment="ISP_BILLING_ANTI_TETHERING"
+            }
+        }
+    }
+    :log info "Provisioning: anti-tethering rules applied"
+} on-error={
+    :log error "Provisioning: could not add ISP_BILLING_ANTI_TETHERING rules"
+}
+
 # ---- STEP 9: NOTIFY SERVER ----
 
 :delay 2s

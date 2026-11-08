@@ -98,6 +98,7 @@ def test_enable_anti_tethering_strict_mode_orders_drop_before_fasttrack_and_clam
             "new-ttl": "set:1",
             "passthrough": "yes",
             "out-interface": "bridge",
+            "dst-address-list": "!bitwave-static",
             "comment": MikroTikAPI.ANTI_TETHER_COMMENT,
             "place-before": "*20",
         }
