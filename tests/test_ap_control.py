@@ -988,7 +988,9 @@ async def test_claim_is_held_while_a_timed_out_write_is_still_running(client, db
 
 
 def test_nothing_runs_against_a_router_at_startup_or_on_a_schedule():
-    # Only the HTTP routes reach the AP-control code: no job or startup step can.
+    # Only the HTTP routes (and the CPE service they call) reach the AP-control
+    # code: no job or startup step can. The PPPoE CPE path reuses ap_control's
+    # login/transport helpers, so it is a legitimate importer too.
     import pathlib
     import re
 
@@ -997,7 +999,11 @@ def test_nothing_runs_against_a_router_at_startup_or_on_a_schedule():
     files = [pathlib.Path("main.py"), *pathlib.Path("app").rglob("*.py")]
     importers = {str(f.as_posix()) for f in files
                  if f.name != "ap_control.py" and pattern.search(f.read_text(encoding="utf-8"))}
-    assert importers == {"app/api/router_ap_routes.py"}
+    assert importers == {
+        "app/api/router_ap_routes.py",
+        "app/api/customer_cpe_routes.py",
+        "app/services/cpe_control.py",
+    }
 
 
 def test_tenda_seen_only_on_the_bridge_is_listed_but_gets_no_password():

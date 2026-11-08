@@ -3231,3 +3231,59 @@ class RouterApCredential(Base):
     updated_by_user_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class CustomerCpeCredential(Base):
+    """Web-admin login for a PPPoE customer's own router / CPE (a Tenda).
+
+    Sibling of :class:`RouterApCredential`, but keyed by the PPPoE **customer**,
+    not by a MAC on a router port. The device dials the reseller's PPPoE server
+    (WAN = PPPoE) and sits at the customer's home behind APs/fibre; it is reached
+    by resolving the customer's active PPPoE session on the MikroTik
+    (``/ppp active`` -> ``address``) and ``/tool fetch`` to that IP on the
+    device's remote-management port. The on-demand actions live in
+    ``app/services/cpe_control.py``: status, reboot, and the "disconnect session"
+    fallback (which reuses the existing reset-session path).
+
+    The admin password is stored Fernet-encrypted with the same helper as the
+    M-Pesa keys (``app.services.payment_gateway.encrypt_credential``) and is
+    never returned by the API or written to logs.
+
+    ``customer_id`` is a plain int, not an FK, like ``router_ap_credentials``: a
+    stale row must never block deleting a customer. One row per customer.
+
+    ``port`` is the device's web-admin port (80 on the LAN; the Tenda remote
+    web-management port -- often 8080/8888 -- on the WAN). ``last_ip`` is only
+    the last session address seen, kept for display; it is NEVER the identity
+    and is re-resolved live on every action.
+
+    Startup migration: run_customer_cpe_credential_migrations() in main.py.
+    """
+    __tablename__ = "customer_cpe_credentials"
+    __table_args__ = (
+        UniqueConstraint("customer_id", name="uq_customer_cpe_credentials_customer"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, nullable=False, index=True)
+    vendor = Column(String(30), nullable=False, default="Tenda", server_default="Tenda")
+    model = Column(String(40), nullable=True)
+    username = Column(String(64), nullable=False, default="admin", server_default="admin")
+    password_encrypted = Column(Text, nullable=False)
+    port = Column(Integer, nullable=False, default=80, server_default="80")
+    # Optional device MAC, for display only (the identity is the PPPoE customer).
+    device_mac = Column(String(17), nullable=True)
+    # base64 | md5 | plain, as detected from the device on last use
+    login_method = Column(String(16), nullable=True)
+    last_login_ok = Column(Boolean, nullable=True)
+    failed_login_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(String(255), nullable=True)
+    last_ip = Column(String(45), nullable=True)
+    last_status = Column(JSON, nullable=True)
+    last_status_at = Column(DateTime, nullable=True)
+    last_action = Column(String(32), nullable=True)
+    last_action_at = Column(DateTime, nullable=True)
+    last_reboot_at = Column(DateTime, nullable=True)
+    updated_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)

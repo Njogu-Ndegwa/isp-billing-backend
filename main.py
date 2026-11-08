@@ -171,6 +171,7 @@ from app.api.admin_support_desk_routes import router as admin_support_desk_route
 from app.api.staff_routes import router as staff_router
 from app.api.pppoe_expired_routes import router as pppoe_expired_router
 from app.api.router_ap_routes import router as router_ap_router
+from app.api.customer_cpe_routes import router as customer_cpe_router
 
 app.include_router(session_monitor_router)
 app.include_router(auth_router)
@@ -228,6 +229,7 @@ app.include_router(admin_support_desk_router)
 app.include_router(staff_router)
 app.include_router(pppoe_expired_router)
 app.include_router(router_ap_router)
+app.include_router(customer_cpe_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -2820,6 +2822,18 @@ async def run_router_ap_credential_migrations():
     logger.info("Migration: Ensured router_ap_credentials table exists")
 
 
+async def run_customer_cpe_credential_migrations():
+    """Create customer_cpe_credentials: encrypted web-admin logins for a PPPoE
+    customer's own router/CPE, used by the on-demand CPE actions
+    (app/services/cpe_control.py). New table only; idempotent (checkfirst)."""
+    async with async_engine.begin() as conn:
+        from app.db.models import CustomerCpeCredential
+        await conn.run_sync(
+            lambda c: CustomerCpeCredential.__table__.create(c, checkfirst=True)
+        )
+    logger.info("Migration: Ensured customer_cpe_credentials table exists")
+
+
 async def run_management_tunnel_migrations():
     """Add routers.management_tunnel (e.g. "sstp") so ops health can show routers
     whose management tunnel differs from what their ip_address range implies.
@@ -3748,6 +3762,11 @@ async def startup_event():
         await run_router_ap_credential_migrations()
     except Exception as e:
         logger.error(f"Router AP credential migration failed (non-fatal): {e}")
+
+    try:
+        await run_customer_cpe_credential_migrations()
+    except Exception as e:
+        logger.error(f"Customer CPE credential migration failed (non-fatal): {e}")
 
     try:
         await run_expiry_reaper_migrations()
