@@ -79,6 +79,7 @@ _FIXED_OFFSETS = {
     "Africa/Kampala": (3, "EAT"),
     "Africa/Dar_es_Salaam": (3, "EAT"),
     "Africa/Douala": (1, "WAT"),
+    "Africa/Lusaka": (2, "CAT"),
 }
 
 # main.py schedules check_overdue_invoices at 08:00 UTC. That run is what
