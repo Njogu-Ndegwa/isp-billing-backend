@@ -123,12 +123,31 @@ def _whole_rate(number: str, unit: str) -> str:
     return f"{int(value.to_integral_value())}{unit}"
 
 
+# One side of a plan speed as resellers type it: a number, an optional unit
+# prefix, then any of the "per second" spellings seen in real plans:
+# 5M, 5MB, 5MBS, 5MBPS, 5MBIT, 5MBITS, 5MPS, 512K, 512KBPS, .5M. Matched on the
+# upper-cased, space-free text, after "/s" has been folded into "PS" by
+# ``_fold_per_second``. A unit-less number is Mbps (or raw bps in slash form).
+_PLAN_RATE_PART_RE = re.compile(
+    r'^(\d+(?:\.\d+)?|\.\d+)(?:(K|M|G)(?:B|BIT|BITS)?(?:PS|S)?|BPS)?$'
+)
+# "5mb/s", "5 Mbit/s", "2M/S": the "/s" means per second, not upload/download.
+_PER_SECOND_RE = re.compile(r'(?<=[KMGBT])\s*/\s*S(?![A-Z0-9])', re.IGNORECASE)
+# Fleet sanity cap: anything above 10 Gbit/s is a typo, not a plan speed.
+_MAX_PLAN_RATE_BPS = Decimal(10_000_000_000)
+_PLAN_UNIT_BPS = {"": 1, "K": 1_000, "M": 1_000_000, "G": 1_000_000_000}
+
+
+def _fold_per_second(text: str) -> str:
+    return _PER_SECOND_RE.sub("PS", text)
+
+
 def _normalize_mikrotik_rate_part(part: str, *, slash_context: bool = False) -> Optional[str]:
     value = str(part or "").strip().upper().replace(" ", "")
     if not value:
         return None
 
-    match = re.match(r'^(\d+(?:\.\d+)?)(K|M|G)?(?:BPS)?$', value)
+    match = _PLAN_RATE_PART_RE.match(value)
     if not match:
         return None
 
@@ -164,22 +183,70 @@ def parse_speed_to_mikrotik(speed: str) -> str:
     if not speed:
         return ""
 
-    speed_text = str(speed).strip()
+    parsed = try_parse_speed_to_mikrotik(speed)
+    if parsed:
+        return parsed
+
+    # Plan create/edit now rejects speeds this cannot read (see
+    # ``plan_speed_error``); only plans saved before that can still get here.
+    logger.warning(
+        f"[PLAN-SPEED] Could not parse speed '{speed}', using default 10M/10M; "
+        "edit the plan to a speed like 5M or 5M/2M"
+    )
+    return "10M/10M"
+
+
+def _rate_part_bps(rate: str) -> Decimal:
+    unit = rate[-1].upper() if rate and rate[-1].isalpha() else ""
+    number = rate[:-1] if unit else rate
+    return Decimal(number) * _PLAN_UNIT_BPS[unit]
+
+
+def try_parse_speed_to_mikrotik(speed: Optional[str]) -> Optional[str]:
+    """``parse_speed_to_mikrotik`` without the silent 10M/10M fallback.
+
+    Returns the RouterOS upload/download rate-limit, or None when the text is
+    not a speed (empty, words, more than one "/"). "0M/0M" is kept: RouterOS
+    reads 0 as unlimited and some PPPoE plans rely on it.
+    """
+    if speed is None:
+        return None
+    # A trailing "/" ("5M/5/") is a typo, not a third side.
+    speed_text = _fold_per_second(str(speed).strip()).rstrip("/").strip()
+    if not speed_text:
+        return None
+
     if "/" in speed_text:
-        download, upload = [part.strip() for part in speed_text.split("/", 1)]
+        parts = [part.strip() for part in speed_text.split("/")]
+        if len(parts) != 2:
+            return None
+        download, upload = parts
         normalized_download = _normalize_mikrotik_rate_part(download, slash_context=True)
         normalized_upload = _normalize_mikrotik_rate_part(upload, slash_context=True)
-        if normalized_upload and normalized_download:
-            return f"{normalized_upload}/{normalized_download}"
-        logger.warning(f"Could not parse speed '{speed}', using default 10M/10M")
-        return "10M/10M"
+        if not (normalized_upload and normalized_download):
+            return None
+        return f"{normalized_upload}/{normalized_download}"
 
     normalized = _normalize_mikrotik_rate_part(speed_text)
-    if normalized:
-        return f"{normalized}/{normalized}"
+    if not normalized:
+        return None
+    return f"{normalized}/{normalized}"
 
-    logger.warning(f"Could not parse speed '{speed}', using default 10M/10M")
-    return "10M/10M"
+
+PLAN_SPEED_HELP = "Use a speed like 5M or 5M/2M (download/upload)"
+
+
+def plan_speed_error(speed: Optional[str]) -> Optional[str]:
+    """The message to show a reseller whose plan speed cannot be read, or None."""
+    shown = str(speed or "").strip()
+    if not shown:
+        return f"Speed is required. {PLAN_SPEED_HELP}."
+    parsed = try_parse_speed_to_mikrotik(speed)
+    if not parsed:
+        return f"Speed '{shown}' is not recognised. {PLAN_SPEED_HELP}."
+    if any(_rate_part_bps(side) > _MAX_PLAN_RATE_BPS for side in parsed.split("/")):
+        return f"Speed '{shown}' is above 10 Gbps. {PLAN_SPEED_HELP}."
+    return None
 
 
 def _router_error_is_duplicate(error: str) -> bool:

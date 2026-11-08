@@ -3,6 +3,7 @@ from sqlalchemy import select
 from datetime import datetime
 from app.db.models import Plan
 from app.core.cache import cache
+from app.services.mikrotik_api import plan_speed_error
 from typing import Optional, List, Dict
 import logging
 
@@ -222,6 +223,9 @@ def _serialize_plan(plan: Plan) -> Dict:
         "id": plan.id,
         "name": plan.name,
         "speed": plan.speed,
+        # False for plans saved before speeds were validated whose text the
+        # router code cannot read ("Unlimited", "1om/10m"): they get 10M/10M.
+        "speed_recognised": plan_speed_error(plan.speed) is None,
         "price": plan.price,
         "duration_value": plan.duration_value,
         "duration_unit": plan.duration_unit.value,

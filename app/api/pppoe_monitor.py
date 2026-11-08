@@ -18,6 +18,7 @@ from app.services.router_availability import record_router_availability, router_
 from app.services.monitor_liveness import clear_live_state, mark_snapshot_unverified
 
 import asyncio
+import re
 import logging
 
 logger = logging.getLogger(__name__)
@@ -686,6 +687,31 @@ def _pppoe_server_summary(api: MikroTikAPI) -> dict:
     return {"lookup_success": True, "enabled_interfaces": enabled, "error": None}
 
 
+def _recent_auth_failures(api: MikroTikAPI, username: str) -> dict:
+    """Count "user <name> authentication failed" lines in the router's log.
+
+    Read only when the login is missing or disabled on the router: that is
+    when a client router keeps dialling with credentials the reseller was
+    shown but that are not live yet (LKR0101: 457 failures in 12 minutes on
+    8 Nov 2026). The memory log holds the last ~1000 lines, so this is "recent",
+    not a full history.
+    """
+    try:
+        logs = api.get_router_logs(topics="ppp", limit=1000)
+    except Exception as e:  # noqa: BLE001 - the presence check must still answer
+        return {"lookup_success": False, "count": 0, "last_at": None, "error": str(e)}
+    if not logs.get("success"):
+        return {"lookup_success": False, "count": 0, "last_at": None, "error": logs.get("error")}
+    pattern = re.compile(rf"\buser {re.escape(username)} authentication failed", re.IGNORECASE)
+    hits = [e for e in logs.get("data", []) if pattern.search(e.get("message", "") or "")]
+    return {
+        "lookup_success": True,
+        "count": len(hits),
+        "last_at": hits[-1].get("time") if hits else None,
+        "error": None,
+    }
+
+
 def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
     """Check whether one DB-owned PPPoE username exists on the MikroTik."""
     api = MikroTikAPI(
@@ -720,6 +746,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "session_found": None,
                 "session_lookup_error": None,
                 "pppoe_server": pppoe_server,
+                "auth_failures": _recent_auth_failures(api, username),
             }
 
         if secret.get("disabled"):
@@ -740,6 +767,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "session_found": None,
                 "session_lookup_error": None,
                 "pppoe_server": pppoe_server,
+                "auth_failures": _recent_auth_failures(api, username),
             }
 
         session_lookup = api.get_pppoe_session_with_bandwidth(username)
@@ -776,6 +804,8 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
             "session_found": bool(session_lookup.get("found")) if session_lookup_success else None,
             "session_lookup_error": session_lookup.get("error") if not session_lookup_success else None,
             "pppoe_server": pppoe_server,
+            # Only read when the login is not live; see _recent_auth_failures.
+            "auth_failures": None,
         }
     except Exception as e:
         logger.error(f"PPPoE customer presence error for {username}: {e}")
@@ -1097,6 +1127,9 @@ async def pppoe_customer_presence(
         "billing_active": billing_active,
         "speed_enforcement": speed_enforcement,
         "pppoe_server": pppoe_server,
+        # {"count", "last_at", "lookup_success"} when the login is missing or
+        # disabled on the router, else None.
+        "auth_failures": presence.get("auth_failures"),
         "device_limit": {
             "plan_max_devices": max(1, int(row["plan_max_shared_users"] or 1)),
             "max_devices_override": row["customer_max_devices_override"],
