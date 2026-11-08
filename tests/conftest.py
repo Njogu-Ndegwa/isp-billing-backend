@@ -191,6 +191,8 @@ async def engine(monkeypatch):
     monkeypatch.setattr(_router_agent_routes, "async_session", factory)
     import app.services.router_agent_fleet as _router_agent_fleet
     monkeypatch.setattr(_router_agent_fleet, "async_session", factory)
+    import app.services.deleted_customer_cleanup as _deleted_customer_cleanup
+    monkeypatch.setattr(_deleted_customer_cleanup, "async_session", factory)
 
     try:
         yield eng
@@ -253,6 +255,19 @@ def _no_live_presence_probe(monkeypatch):
         return None
 
     monkeypatch.setattr(device_entitlements, "probe_online_macs", _unknown)
+
+
+@pytest.fixture(autouse=True)
+def _no_deleted_customer_router_cleanup(monkeypatch):
+    """Deleting a hotspot customer cleans its router. Default that to "removed"
+    so no delete test dials a router; the cleanup tests patch it."""
+    from app.services import deleted_customer_cleanup
+
+    def _removed(_router_info, customers_data):
+        return {"removed": [{"id": c["id"]} for c in customers_data], "failed": [], "connected": True}
+
+    monkeypatch.setattr(deleted_customer_cleanup, "_cleanup_on_router", _removed)
+    deleted_customer_cleanup._router_failed_at.clear()
 
 
 @pytest.fixture(autouse=True)

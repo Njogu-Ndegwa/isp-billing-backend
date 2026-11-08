@@ -110,6 +110,7 @@ EXPIRY_NOTIFICATION_MAX_OVERDUE = timedelta(days=7)
 EXPIRY_REAPER_GRACE = timedelta(minutes=3)
 SAFETY_NET_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
 ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL = timedelta(minutes=5)
+DELETED_CUSTOMER_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
 BANDWIDTH_MAX_ROUTERS_PER_RUN = 8
 BANDWIDTH_RUN_TIME_BUDGET_SECONDS = 90
 BANDWIDTH_HISTORY_RETENTION_DAYS = 30
@@ -183,6 +184,7 @@ queue_sync_running = False
 inactive_pppoe_reconcile_running = False
 _last_safety_net_cleanup_at: datetime | None = None
 _last_access_credential_reaper_at: datetime | None = None
+_last_deleted_customer_cleanup_at: datetime | None = None
 _bandwidth_router_cursor = 0
 _queue_sync_router_cursor = 0
 _mac_login_reconcile_cursor = 0
@@ -2288,6 +2290,7 @@ async def expiry_housekeeping_background():
     interval guards below) without delaying removals.
     """
     global housekeeping_running, _last_safety_net_cleanup_at, _last_access_credential_reaper_at
+    global _last_deleted_customer_cleanup_at
     if housekeeping_running:
         return
     if _background_db_pool_is_busy("CRON-SAFETY-NET"):
@@ -2315,6 +2318,15 @@ async def expiry_housekeeping_background():
                     logger.info(f"[CRON] Released {released} idle access credential(s)")
         except Exception as reap_err:
             logger.error(f"[CRON] Access credential reaper failed: {reap_err}")
+
+        try:
+            if _interval_due(_last_deleted_customer_cleanup_at, now, DELETED_CUSTOMER_CLEANUP_MIN_INTERVAL):
+                _last_deleted_customer_cleanup_at = now
+                from app.services.deleted_customer_cleanup import retry_pending_cleanups
+
+                await retry_pending_cleanups(now)
+        except Exception as deleted_err:
+            logger.error(f"[CRON] Deleted-customer router cleanup retry failed: {deleted_err}")
     finally:
         housekeeping_running = False
 

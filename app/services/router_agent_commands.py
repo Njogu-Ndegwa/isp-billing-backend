@@ -143,6 +143,7 @@ def render_hotspot_remove_action(
 :do {{ /ip hotspot active remove [find user=\"{user}\"] }} on-error={{}}
 :do {{ /ip hotspot ip-binding remove [find mac-address=\"{mac}\"] }} on-error={{}}
 :do {{ /ip hotspot user remove [find name=\"{user}\"] }} on-error={{}}
+:do {{ /ip hotspot user remove [find name=\"{mac}\"] }} on-error={{}}
 :do {{ /ip hotspot host remove [find mac-address=\"{mac}\"] }} on-error={{}}
 :do {{ /ip dhcp-server lease remove [find mac-address=\"{mac}\"] }} on-error={{}}
 :do {{ /queue simple remove [find name=\"plan_{user}\"] }} on-error={{}}
@@ -152,6 +153,7 @@ def render_hotspot_remove_action(
 :if ([:len [/ip hotspot ip-binding find mac-address=\"{mac}\"]] > 0) do={{ :error \"binding remains\" }}
 :if ([:len [/ip hotspot active find mac-address=\"{mac}\"]] > 0) do={{ :error \"session remains\" }}
 :if ([:len [/ip hotspot user find name=\"{user}\"]] > 0) do={{ :error \"user remains\" }}
+:if ([:len [/ip hotspot user find name=\"{mac}\"]] > 0) do={{ :error \"MAC-login user remains\" }}
 :if ([:len [/ip hotspot host find mac-address=\"{mac}\"]] > 0) do={{ :error \"host remains\" }}
 :if ([:len [/queue simple find name=\"plan_{user}\"]] > 0) do={{ :error \"queue remains\" }}
 {f':if ([:len [/ip firewall address-list find list="LB_PAID" comment="PAID:{mac}"]] > 0) do={{ :error "LB_PAID remains" }}' if lb_enabled else ''}
@@ -416,6 +418,36 @@ async def queue_hotspot_remove_command(
     )
 
 
+async def queue_hotspot_remove_for_deleted_customer(
+    *, router_id: int, deleted_customer_id: int, mac_address: str, lb_enabled: bool = False,
+) -> int | None:
+    """Removal for a customer whose row is already gone.
+
+    ``customer_id`` stays NULL (the FK target no longer exists); delivery
+    cancels the command if another live customer holds the MAC by then.
+    """
+    mac = normalize_mac_address(mac_address)
+    username = mac.replace(":", "")
+    return await _enqueue_command(
+        router_id=router_id,
+        customer_id=None,
+        attempt_id=None,
+        idempotency_key=f"hotspot-remove:{router_id}:deleted-{deleted_customer_id}",
+        command_type="hotspot_remove",
+        action_script=render_hotspot_remove_action(
+            mac_address=mac, username=username, lb_enabled=lb_enabled,
+        ),
+        metadata={
+            "expiry_generation": "deleted",
+            "deleted_customer_id": deleted_customer_id,
+            "mac_address": mac,
+            "username": username,
+            "lb_enabled": lb_enabled,
+        },
+        expires_at=datetime.utcnow() + timedelta(days=7),
+    )
+
+
 async def queue_pppoe_remove_command(
     *, router_id: int, customer_id: int, username: str
 ) -> int | None:
@@ -518,6 +550,15 @@ async def next_command_for_router(router_id: int) -> RouterCommand | None:
                 )
                 command.updated_at = now
                 continue
+            if (
+                command.customer_id is None
+                and command.command_type == "hotspot_remove"
+                and await _mac_now_used_on_router(db, command)
+            ):
+                command.state = "cancelled"
+                command.last_error = "MAC is used by a live customer on this router"
+                command.updated_at = now
+                continue
             if customer is not None:
                 customer_is_live = (
                     customer.status == CustomerStatus.ACTIVE
@@ -571,6 +612,16 @@ async def next_command_for_router(router_id: int) -> RouterCommand | None:
         if commands:
             await db.commit()
     return None
+
+
+async def _mac_now_used_on_router(db, command: RouterCommand) -> bool:
+    """A customer-less removal must not take a MAC someone else now pays for."""
+    mac = (command.metadata_json or {}).get("mac_address")
+    if not mac:
+        return False
+    from app.services.deleted_customer_cleanup import macs_in_use_on_router
+
+    return bool(await macs_in_use_on_router(db, command.router_id, {normalize_mac_address(mac)}))
 
 
 async def expire_active_commands(now: datetime | None = None) -> int:
