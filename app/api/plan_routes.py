@@ -23,6 +23,7 @@ from app.services.plan_cache import (
 )
 from app.services.subscription import enforce_active_subscription
 from app.services.payment_plan import payment_plan_id
+from app.services.mikrotik_api import plan_speed_error
 from app.services.usage_tracking import FUP_PERIOD_PLAN, FUP_PERIODS, plan_fup_period
 import logging
 
@@ -33,6 +34,16 @@ router = APIRouter(tags=["plans"])
 VALID_PLAN_TYPES = [pt.value for pt in PlanType]
 VALID_FUP_ACTIONS = [a.value for a in FupAction]
 MAX_SHARED_USERS_LIMIT = 50
+
+
+def _validate_plan_speed(speed: Optional[str]) -> None:
+    """Reject a speed the router code cannot read.
+
+    Unreadable speeds used to be saved and then silently provisioned as
+    10M/10M ("5mbs" gave a 5 Mbps plan a 10 Mbps profile, 8 Nov 2026)."""
+    error = plan_speed_error(speed)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
 
 
 def _parse_fup_action(value: Optional[str]) -> Optional[FupAction]:
@@ -255,7 +266,8 @@ async def create_plan_api(
             raise HTTPException(status_code=400, detail="Price cannot be negative")
         if request.duration_value < 1:
             raise HTTPException(status_code=400, detail="Duration value must be at least 1")
-        
+        _validate_plan_speed(request.speed)
+
         # Validate connection type
         try:
             connection_type_enum = ConnectionType(request.connection_type.lower())
@@ -456,6 +468,7 @@ async def update_plan_api(
             plan.name = request.name
         previous_speed = plan.speed
         if request.speed is not None:
+            _validate_plan_speed(request.speed)
             plan.speed = request.speed
         if request.price is not None:
             plan.price = request.price

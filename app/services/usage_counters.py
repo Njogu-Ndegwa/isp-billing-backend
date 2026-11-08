@@ -68,25 +68,19 @@ def plan_line_rate_bps(plan: Optional[Plan]) -> int:
     """Fastest direction of the plan's speed in bps, or 0 when it can't be read.
 
     Reads the speed exactly the way provisioning does
-    (``_normalize_mikrotik_rate_part``): a bare number means Mbps — ``"5/5"``,
+    (``try_parse_speed_to_mikrotik``): a bare number means Mbps — ``"5/5"``,
     ``"10"``, ``"5mbps"`` are 5/10/5 Mbps, and 1,000+ inside ``a/b`` is
     already raw bps. Reading ``"5/5"`` as 5 bit/s clipped genuine usage on
     every unit-less plan (2026-09-29..10-02). Any part that can't be read
     returns 0, so the guard stays off rather than guessing low.
     """
-    from app.services.mikrotik_api import _normalize_mikrotik_rate_part
+    from app.services.mikrotik_api import try_parse_speed_to_mikrotik
 
     speed = str(getattr(plan, "speed", "") or "").strip()
-    if not speed:
+    parsed = try_parse_speed_to_mikrotik(speed) if speed else None
+    if not parsed:
         return 0
-    parts = speed.split("/", 1) if "/" in speed else [speed]
-    rates = []
-    for part in parts:
-        normalized = _normalize_mikrotik_rate_part(part, slash_context=len(parts) > 1)
-        if not normalized:
-            return 0
-        rates.append(_rate_to_bps(normalized))
-    return max(rates, default=0)
+    return max((_rate_to_bps(part) for part in parsed.split("/")), default=0)
 
 
 def line_rate_ceiling_bytes(plan: Optional[Plan], elapsed_seconds: float) -> Optional[int]:
