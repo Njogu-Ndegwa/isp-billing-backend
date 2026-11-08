@@ -22,6 +22,11 @@ QUEUE_FASTTRACK_BYPASS_LIST = "isp_queue_limited_clients"
 QUEUE_FASTTRACK_BYPASS_SRC_COMMENT = "ISP_BILLING_QUEUE_BYPASS_SRC"
 QUEUE_FASTTRACK_BYPASS_DST_COMMENT = "ISP_BILLING_QUEUE_BYPASS_DST"
 
+# Plain (no-auth) ports: bridge-plain must be trusted for DHCP/DNS on input,
+# or the defconf "drop all not coming from LAN" rule starves its clients.
+PLAIN_TRUST_COMMENT = "ISP_BILLING_PLAIN_TRUST"
+PLAIN_TRUST_INPUT_RULES = (("udp", "67-68"), ("udp", "53"), ("tcp", "53"))
+
 DUAL_BRIDGE_NAME = "bridge-dual"
 DUAL_BRIDGE_IP = "192.168.91.1/24"
 DUAL_HOTSPOT_POOL_NAME = "dual-hotspot-pool"
@@ -6469,6 +6474,8 @@ class MikroTikAPI:
                 if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
                     errors.append(f"NAT: {result['error']}")
 
+            errors.extend(self._ensure_plain_bridge_trusted(bridge_name))
+
             port_errors = []
             for port in target_ports:
                 current_bridge = bridge_map.get(port, "")
@@ -6500,6 +6507,88 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error setting up plain infrastructure: {e}")
             return {"error": str(e), "partial_errors": errors}
+
+    def _ensure_plain_bridge_trusted(self, bridge_name: str = "bridge-plain") -> List[str]:
+        """Let plain-port devices reach the router's DHCP and DNS.
+
+        The defconf firewall drops input "not coming from LAN", so a new
+        bridge-plain that is not in the LAN interface list gets no DHCP lease.
+        If a LAN list exists, add bridge-plain to it (once). Otherwise add a
+        narrow input accept for DHCP (udp 67-68) and DNS (udp/tcp 53) from
+        bridge-plain, placed before the first input rule. Returns warnings.
+        """
+        lists = self.send_command("/interface/list/print")
+        if lists.get("error"):
+            return [f"Interface list: {lists['error']}"]
+        has_lan = any(
+            (item.get("name") or "") == "LAN" for item in lists.get("data") or []
+        )
+
+        if has_lan:
+            members = self.send_command("/interface/list/member/print")
+            if members.get("error"):
+                return [f"LAN list member: {members['error']}"]
+            if any(
+                m.get("list") == "LAN" and m.get("interface") == bridge_name
+                for m in members.get("data") or []
+            ):
+                return []
+            result = self.send_command("/interface/list/member/add", {
+                "list": "LAN",
+                "interface": bridge_name,
+                "comment": PLAIN_TRUST_COMMENT,
+            })
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                return [f"LAN list member: {result['error']}"]
+            logger.info(f"Plain infrastructure: added '{bridge_name}' to LAN interface list")
+            return []
+
+        filters = self.send_command("/ip/firewall/filter/print")
+        if filters.get("error"):
+            return [f"Plain input accept: {filters['error']}"]
+        rules = filters.get("data") or []
+        existing = {
+            (r.get("protocol"), r.get("dst-port"))
+            for r in rules
+            if r.get("comment") == PLAIN_TRUST_COMMENT and r.get("in-interface") == bridge_name
+        }
+        first_input_id = next(
+            (r.get(".id") for r in rules if r.get("chain") == "input" and r.get(".id")),
+            None,
+        )
+        warnings = []
+        for protocol, dst_port in PLAIN_TRUST_INPUT_RULES:
+            if (protocol, dst_port) in existing:
+                continue
+            args = {
+                "chain": "input",
+                "action": "accept",
+                "in-interface": bridge_name,
+                "protocol": protocol,
+                "dst-port": dst_port,
+                "comment": PLAIN_TRUST_COMMENT,
+            }
+            if first_input_id:
+                args["place-before"] = first_input_id
+            result = self.send_command("/ip/firewall/filter/add", args)
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                warnings.append(f"Plain input accept {protocol}/{dst_port}: {result['error']}")
+        return warnings
+
+    def _remove_plain_bridge_trust(self, bridge_name: str = "bridge-plain") -> None:
+        """Undo _ensure_plain_bridge_trusted when the plain bridge is removed."""
+        members = self.send_command("/interface/list/member/print")
+        if members.get("success"):
+            for m in members.get("data") or []:
+                if m.get("list") == "LAN" and m.get("interface") == bridge_name and m.get(".id"):
+                    self.send_command("/interface/list/member/remove", {"numbers": m[".id"]})
+                    logger.info(f"Removed '{bridge_name}' from LAN interface list")
+
+        filters = self.send_command("/ip/firewall/filter/print")
+        if filters.get("success"):
+            for r in filters.get("data") or []:
+                if r.get("comment") == PLAIN_TRUST_COMMENT and r.get(".id"):
+                    self.send_command("/ip/firewall/filter/remove", {"numbers": r[".id"]})
 
     def teardown_plain_infrastructure(
         self,
@@ -6551,6 +6640,10 @@ class MikroTikAPI:
                         aid = addr.get(".id")
                         if aid:
                             self.send_command("/ip/address/remove", {"numbers": aid})
+
+            # Drop the LAN trust before the bridge goes, while the member still
+            # resolves by name (afterwards RouterOS shows it as an unknown *id).
+            self._remove_plain_bridge_trust(bridge_name)
 
             bridges = self.send_command("/interface/bridge/print")
             if bridges.get("success") and bridges.get("data"):
