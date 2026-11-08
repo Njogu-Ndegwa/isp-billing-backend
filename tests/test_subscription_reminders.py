@@ -202,6 +202,26 @@ def test_inbox_message_states_the_expiry_in_local_time():
     assert "KES 1,200" in body
 
 
+def test_every_market_timezone_has_a_fixed_offset():
+    # Without one, a market falls back to Nairobi's offset when the runtime has
+    # no tz database, and its messages say "local time" instead of the zone.
+    from app.services.markets import MARKETS
+    from app.services.subscription_reminders import _FIXED_OFFSETS
+
+    missing = sorted({m.timezone for m in MARKETS.values()} - set(_FIXED_OFFSETS))
+    assert missing == []
+
+
+def test_zambia_inbox_message_uses_cat_and_usd():
+    # 07:58 UTC is 9:58AM in Lusaka (UTC+2).
+    expires = datetime(2026, 11, 14, 7, 58)
+    _, body = render_reminder_inbox(
+        expires, expires - T24, 10.0, "USD", trial=True, tz_name="Africa/Lusaka",
+    )
+    assert "9:58AM CAT" in body
+    assert "USD 10" in body
+
+
 # --------------------------------------------------------------------------
 # Send path
 # --------------------------------------------------------------------------
