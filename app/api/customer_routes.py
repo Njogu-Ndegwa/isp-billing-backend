@@ -51,6 +51,7 @@ from app.services.customer_pause import (
     resume_customer,
 )
 from app.services.mikrotik_api import normalize_mac_address
+from app.services import deleted_customer_cleanup
 from app.services.static_ip import (
     INVALID_STATIC_IP_MESSAGE,
     customer_should_have_access,
@@ -975,10 +976,15 @@ async def delete_customer(
 
     Devices sharing this customer's plan run on it and could never renew again,
     so they go too. Their router access is removed after the rows are gone.
+
+    A hotspot customer's user, ip-binding and session are removed from the
+    router once the row is gone. An unreachable router does not block the
+    delete: the cleanup is queued and retried (``deleted_customer_cleanup``).
     """
     user = await get_current_user(token, db)
     enforce_active_subscription(user)
 
+    hotspot_target = await _load_hotspot_cleanup_target(db, customer_id, user.id)
     shared_devices = await _load_shared_devices(db, customer_id, user.id)
     response = await _delete_customer_row(customer_id, db, user)
 
@@ -987,6 +993,15 @@ async def delete_customer(
         await _delete_customer_row(device["id"], db, user)
         removed_ids.append(device["id"])
     pending = await _remove_shared_devices_from_routers(db, shared_devices)
+    if pending:
+        await deleted_customer_cleanup.queue_for_retry(
+            [d["target"] for d in shared_devices if d["mac"] in pending and d["target"]],
+            "shared device router cleanup failed at delete",
+        )
+
+    router_cleanup = await deleted_customer_cleanup.remove_deleted_customer_from_router(
+        hotspot_target
+    )
 
     if removed_ids:
         logger.info(
@@ -995,9 +1010,24 @@ async def delete_customer(
         )
     return {
         **response,
+        "router_cleanup": router_cleanup,
         "shared_devices_removed": len(removed_ids),
         "shared_devices_router_pending": pending,
     }
+
+
+async def _load_hotspot_cleanup_target(db: AsyncSession, customer_id: int, user_id: int):
+    """Router cleanup data for a hotspot customer, read before its row is deleted."""
+    customer = (
+        await db.execute(
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(Customer.id == customer_id, Customer.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+    target = deleted_customer_cleanup.cleanup_target(customer) if customer else None
+    await db.commit()
+    return target
 
 
 async def _load_shared_devices(db: AsyncSession, owner_id: int, user_id: int) -> list[dict]:
@@ -1007,7 +1037,7 @@ async def _load_shared_devices(db: AsyncSession, owner_id: int, user_id: int) ->
     rows = (
         await db.execute(
             select(Customer)
-            .options(selectinload(Customer.router))
+            .options(selectinload(Customer.router), selectinload(Customer.plan))
             .where(Customer.subscription_owner_id == owner_id, Customer.user_id == user_id)
             .order_by(Customer.id)
         )
@@ -1021,6 +1051,7 @@ async def _load_shared_devices(db: AsyncSession, owner_id: int, user_id: int) ->
             "router_id": row.router_id,
             "auth": auth_value,
             "router_info": router_info,
+            "target": deleted_customer_cleanup.cleanup_target(row),
         })
     await db.commit()
     return devices
