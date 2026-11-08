@@ -12,6 +12,7 @@ Two flavors of endpoint live here:
    - POST /api/payment-methods/{id}/register-c2b
    - GET  /api/c2b/unmatched
    - POST /api/c2b/unmatched/{id}/attribute
+   - POST /api/admin/c2b/unmatched/{id}/credit-reseller  (admin only)
 
 The handler logic itself lives in app/services/c2b_handler.py so it stays
 unit-testable without spinning up an HTTP client.
@@ -405,6 +406,42 @@ async def attribute_unmatched_c2b(
         "new_wallet_credit_kes": customer.wallet_credit_kes,
         "c2b_transaction_id": txn.id,
     }
+
+
+# ---------------------------------------------------------------------------
+# Admin: credit an unmatched platform-paybill payment to a reseller
+# ---------------------------------------------------------------------------
+
+
+class CreditUnmatchedToResellerRequest(BaseModel):
+    reseller_id: int
+    reason: str
+
+
+@router.post("/api/admin/c2b/unmatched/{unmatched_id}/credit-reseller")
+async def credit_unmatched_c2b_to_reseller(
+    unmatched_id: int,
+    request: CreditUnmatchedToResellerRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+) -> dict:
+    """Bitwave admins only. Add an unmatched platform-paybill payment to a
+    reseller's earnings (withdrawable like any platform-collected payment)
+    without linking a customer, plan or subscription. Refuses a second credit.
+    See app/services/c2b_reseller_credit.py."""
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    from app.services.c2b_reseller_credit import credit_unmatched_to_reseller
+
+    return await credit_unmatched_to_reseller(
+        db,
+        unmatched_id=unmatched_id,
+        reseller_id=request.reseller_id,
+        reason=request.reason,
+        admin=user,
+    )
 
 
 # ---------------------------------------------------------------------------
