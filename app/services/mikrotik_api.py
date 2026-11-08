@@ -1123,11 +1123,26 @@ class MikroTikAPI:
     # A tethered device behind a phone hotspot arrives with TTL=63 or 127
     # because the phone already decremented it once.
     #
-    # We scope the raw rules to the hotspot interface(s) so we don't
-    # accidentally drop WAN or other traffic.
+    # Scope: only packets arriving on a hotspot server's interface. What that
+    # leaves alone, and why:
+    #   * PPPoE customers: their IP traffic arrives on dynamic pppoe-in
+    #     interfaces, never on the hotspot bridge, even on dual ports.
+    #   * Plain (no-auth) ports: moved to bridge-plain, not a hotspot iface.
+    #   * Management: WireGuard/SSTP/L2TP tunnels are their own interfaces,
+    #     and router-originated traffic (check-in, fetch) never hits
+    #     prerouting.
+    #   * Static-IP customers: they sit ON the hotspot LAN (bypassed by IP)
+    #     and are usually the customer's own router, so their devices arrive
+    #     with TTL 63. Every static IP is in the bitwave-static address list
+    #     (app/services/static_ip.py), which every rule excludes.
+    # MAC-bypassed ip-bindings are NOT exempt: a router-mode AP the reseller
+    # bypassed loses the devices behind it until it is put in AP/bridge mode.
     # ------------------------------------------------------------------
     ANTI_TETHER_COMMENT = "ISP_BILLING_ANTI_TETHERING"
     ANTI_TETHER_PACKET_MARK = "isp_tethered_traffic"
+    # Same list app/services/static_ip.py maintains (STATIC_ADDRESS_LIST);
+    # not imported because static_ip imports this module.
+    ANTI_TETHER_EXEMPT_SRC_LIST = "bitwave-static"
     ANTI_TETHER_TTL_MATCHES = ("equal:63", "equal:127", "equal:254")
     ANTI_TETHER_RAW_TTL_MODE = "raw-ttl-drop"
     ANTI_TETHER_STRICT_TTL_MODE = "ttl-marker-plus-return-ttl-clamp"
@@ -1206,6 +1221,7 @@ class MikroTikAPI:
                     "chain": "prerouting",
                     "action": "drop",
                     "in-interface": iface,
+                    "src-address-list": "!" + self.ANTI_TETHER_EXEMPT_SRC_LIST,
                     "ttl": ttl_match,
                     "comment": self.ANTI_TETHER_COMMENT,
                 }
@@ -1262,6 +1278,7 @@ class MikroTikAPI:
                         "new-packet-mark": self.ANTI_TETHER_PACKET_MARK,
                         "passthrough": "no",
                         "in-interface": iface,
+                        "src-address-list": "!" + self.ANTI_TETHER_EXEMPT_SRC_LIST,
                         "ttl": ttl_match,
                         "comment": self.ANTI_TETHER_COMMENT,
                     }
@@ -1278,6 +1295,7 @@ class MikroTikAPI:
                     "new-ttl": "set:1",
                     "passthrough": "yes",
                     "out-interface": iface,
+                    "dst-address-list": "!" + self.ANTI_TETHER_EXEMPT_SRC_LIST,
                     "comment": self.ANTI_TETHER_COMMENT,
                 }
                 if postrouting_insert_id:

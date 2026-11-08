@@ -1562,6 +1562,63 @@ def _rsc_anti_tunnel(token: ProvisioningToken) -> str:
     return chr(10).join(lines)
 
 
+def _rsc_anti_tethering() -> str:
+    """Anti-tethering on by default: drop hotspot traffic that already passed
+    through another router or a phone hotspot (TTL 63/127/254).
+
+    Byte-for-byte the rules MikroTikAPI.enable_anti_tethering() pushes in its
+    default raw-ttl-drop mode -- same table, chain, matches and comment -- so
+    the admin toggle's disable/repair find and replace them. One drop per
+    enabled hotspot server interface and TTL, placed before the first static
+    prerouting rule. Static-IP customers (address list bitwave-static) are
+    exempt; see the scoping note above ANTI_TETHER_COMMENT.
+
+    Runs before /complete, which records routers.hotspot_sharing_blocked=True.
+    Idempotent: managed rules in raw, mangle and filter (strict mode) are
+    removed by comment first.
+    """
+    from app.services.mikrotik_api import MikroTikAPI
+
+    comment = MikroTikAPI.ANTI_TETHER_COMMENT
+    exempt = MikroTikAPI.ANTI_TETHER_EXEMPT_SRC_LIST
+    ttls = ";".join(f'"{ttl}"' for ttl in MikroTikAPI.ANTI_TETHER_TTL_MATCHES)
+    add = (
+        "/ip firewall raw add chain=prerouting action=drop in-interface=$bwIf"
+        f" src-address-list=!{exempt} ttl=$bwTtl comment=\"{comment}\""
+    )
+    return f"""
+# ---- STEP 8b: ANTI-TETHERING (on by default) ----
+# Blocks customers sharing their plan via phone hotspot or their own router.
+# The reseller can turn it off per router in the dashboard.
+
+:foreach i in=[/ip firewall raw find where comment="{comment}"] do={{ :do {{ /ip firewall raw remove $i }} on-error={{}} }}
+:foreach i in=[/ip firewall mangle find where comment="{comment}"] do={{ :do {{ /ip firewall mangle remove $i }} on-error={{}} }}
+:foreach i in=[/ip firewall filter find where comment="{comment}"] do={{ :do {{ /ip firewall filter remove $i }} on-error={{}} }}
+:do {{
+    :local bwAnchor ""
+    :local bwStatic [/ip firewall raw find where chain=prerouting disabled=no dynamic=no]
+    :if ([:len $bwStatic] > 0) do={{ :set bwAnchor [:pick $bwStatic 0] }}
+    :foreach hs in=[/ip hotspot find where disabled=no] do={{
+        :local bwIf [/ip hotspot get $hs interface]
+        :foreach bwTtl in={{{ttls}}} do={{
+            :local bwPlaced false
+            :if ([:len $bwStatic] > 0) do={{
+                :do {{
+                    {add} place-before=$bwAnchor
+                    :set bwPlaced true
+                }} on-error={{}}
+            }}
+            :if ($bwPlaced = false) do={{
+                {add}
+            }}
+        }}
+    }}
+    :log info "Provisioning: anti-tethering rules applied"
+}} on-error={{
+    :log error "Provisioning: could not add {comment} rules"
+}}"""
+
+
 def _rsc_walled_garden(token: ProvisioningToken) -> str:
     backup_ip_line = ""
     insurance_public_ip = (settings.INSURANCE_SERVER_PUBLIC_IP or "").strip()
@@ -1728,6 +1785,8 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
     parts.append(_rsc_api_access_hetzner(token) if hetzner else _rsc_api_access())
     parts.append(_rsc_identity_and_user(token))
     parts.append(_rsc_remove_router_command_agent())
+    # Before /complete, which records the router with anti-tethering ON.
+    parts.append(_rsc_anti_tethering())
     parts.append(_rsc_notify_server(token))
     # After /complete: the relay block would reject a RouterOS 6 router's
     # plain-HTTP /complete to the Cloudflare-fronted backend.
@@ -2067,6 +2126,9 @@ async def complete_provisioning(
         payment_methods=token.payment_methods,
         # The generated RouterOS script no longer installs the outbound agent.
         router_agent_enabled=False,
+        # STEP 8b of the script installed the anti-tethering rules, so the
+        # admin toggle starts ON; the reseller can turn it off per router.
+        hotspot_sharing_blocked=True,
     )
     if token_mgmt_to_hetzner(token):
         # "wireguard" (wg-hz) / "sstp" (sstp-hetzner): the router's only

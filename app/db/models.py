@@ -588,7 +588,11 @@ class Router(Base):
     availability_successes = Column(Integer, nullable=False, default=0, server_default="0")
     emergency_active = Column(Boolean, nullable=False, default=False, server_default="false")
     emergency_message = Column(String(500), nullable=True)
-    hotspot_sharing_blocked = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Anti-tethering. New routers default to ON (provisioning installs the
+    # rules in the setup script). server_default stays "false" so existing
+    # rows and raw-SQL inserts are unchanged -- no migration. A router added
+    # by hand (POST /api/routers/create) gets no rules and sets False itself.
+    hotspot_sharing_blocked = Column(Boolean, nullable=False, default=True, server_default="false")
     # Opt-in per router: when true, paid-user provisioning that can't be pushed over
     # the WireGuard tunnel is queued for the router to PULL over an outbound HTTPS
     # check-in instead. Intended only for flaky/Starlink-fed routers. Default false

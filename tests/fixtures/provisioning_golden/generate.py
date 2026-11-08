@@ -11,7 +11,9 @@ config: both are hotspot fixes that apply with the flag on or off), and
 again when the anti-tunnel step (STEP 4b lift + STEP 9b HTTP Injector rules)
 was added (fix/provision-anti-tunnel: a hotspot security fix for every token),
 and when STEP 10 moved the reboot into an :execute job (an inline reboot
-waits for a y/N prompt and hung a terminal import on router 689).
+waits for a y/N prompt and hung a terminal import on router 689), and when
+STEP 8b made anti-tethering the default for new routers (feat/anti-
+tethering-default: same raw rules as MikroTikAPI.enable_anti_tethering).
 tests/test_provisioning_hetzner.py asserts the flag-off output -- and the
 output for legacy tokens with the flag on -- is byte-for-byte identical to
 them. Only regenerate on purpose, and explain the diff in the PR.
