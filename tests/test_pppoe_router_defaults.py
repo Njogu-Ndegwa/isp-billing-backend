@@ -452,6 +452,126 @@ def test_setup_plain_infrastructure_repairs_existing_bridge_stack():
     assert any(command == "/ip/firewall/nat/add" for command, _ in commands)
 
 
+class _FakePlainRouter:
+    """Stateful stand-in for the RouterOS pieces the plain-port trust touches."""
+
+    def __init__(self, has_lan_list=True, members=None, filters=None):
+        self.lists = [{"name": "all"}] + ([{"name": "LAN"}, {"name": "WAN"}] if has_lan_list else [])
+        self.members = list(members or [])
+        self.filters = list(filters or [])
+        self.commands = []
+        self._next = 100
+
+    def _id(self):
+        self._next += 1
+        return f"*{self._next:X}"
+
+    def send_command(self, command, args=None):
+        args = dict(args or {})
+        self.commands.append((command, args))
+        if command == "/interface/bridge/port/print":
+            return {"success": True, "data": [{"interface": "ether5", "bridge": "bridge"}]}
+        if command == "/interface/list/print":
+            return {"success": True, "data": self.lists}
+        if command == "/interface/list/member/print":
+            return {"success": True, "data": list(self.members)}
+        if command == "/interface/list/member/add":
+            self.members.append({".id": self._id(), **args})
+            return {"success": True}
+        if command == "/interface/list/member/remove":
+            self.members = [m for m in self.members if m[".id"] != args["numbers"]]
+            return {"success": True}
+        if command == "/ip/firewall/filter/print":
+            return {"success": True, "data": list(self.filters)}
+        if command == "/ip/firewall/filter/add":
+            rule = {".id": self._id(), **args}
+            before = args.get("place-before")
+            idx = next((i for i, r in enumerate(self.filters) if r[".id"] == before), len(self.filters))
+            self.filters.insert(idx, rule)
+            return {"success": True}
+        if command == "/ip/firewall/filter/remove":
+            self.filters = [r for r in self.filters if r[".id"] != args["numbers"]]
+            return {"success": True}
+        if command.endswith("/print"):
+            return {"success": True, "data": []}
+        return {"success": True}
+
+    def api(self):
+        api = _connected_api()
+        api.send_command = self.send_command
+        api.send_command_optimized = lambda command, proplist=None, query=None: {"success": True, "data": []}
+        api.remove_bridge_port = lambda *args, **kwargs: {"success": True}
+        api.add_bridge_port = lambda *args, **kwargs: {"success": True}
+        return api
+
+
+DEFCONF_INPUT = [
+    {".id": "*1", "chain": "input", "action": "accept", "connection-state": "established,related,untracked"},
+    {".id": "*2", "chain": "input", "action": "drop", "in-interface-list": "!LAN"},
+]
+
+
+def test_plain_setup_adds_bridge_plain_to_lan_list_once():
+    router = _FakePlainRouter(has_lan_list=True, filters=DEFCONF_INPUT,
+                              members=[{".id": "*A", "list": "LAN", "interface": "bridge"}])
+    api = router.api()
+
+    assert api.setup_plain_infrastructure(["ether5"])["success"] is True
+    assert api.setup_plain_infrastructure(["ether5"])["success"] is True
+
+    plain = [m for m in router.members if m["interface"] == "bridge-plain"]
+    assert len(plain) == 1 and plain[0]["list"] == "LAN"
+    # LAN list present: no extra firewall rules needed.
+    assert router.filters == DEFCONF_INPUT
+
+
+def test_plain_setup_respects_existing_manual_lan_membership():
+    router = _FakePlainRouter(has_lan_list=True, members=[
+        {".id": "*A", "list": "LAN", "interface": "bridge-plain", "comment": "added by hand"},
+    ])
+    api = router.api()
+
+    assert api.setup_plain_infrastructure(["ether5"])["success"] is True
+    assert not any(c == "/interface/list/member/add" for c, _ in router.commands)
+
+
+def test_plain_setup_without_lan_list_adds_narrow_input_accepts_first_once():
+    router = _FakePlainRouter(has_lan_list=False, filters=DEFCONF_INPUT)
+    api = router.api()
+
+    assert api.setup_plain_infrastructure(["ether5"])["success"] is True
+    assert api.setup_plain_infrastructure(["ether5"])["success"] is True
+
+    ours = [r for r in router.filters if r.get("comment") == "ISP_BILLING_PLAIN_TRUST"]
+    assert sorted((r["protocol"], r["dst-port"]) for r in ours) == [
+        ("tcp", "53"), ("udp", "53"), ("udp", "67-68"),
+    ]
+    assert all(r["chain"] == "input" and r["action"] == "accept"
+               and r["in-interface"] == "bridge-plain" for r in ours)
+    # Placed ahead of the existing input rules so a later drop can't win.
+    assert router.filters[-2:] == DEFCONF_INPUT
+    assert not any(c == "/interface/list/member/add" for c, _ in router.commands)
+
+
+def test_plain_teardown_removes_lan_membership_and_fallback_rules():
+    router = _FakePlainRouter(
+        has_lan_list=True,
+        members=[
+            {".id": "*A", "list": "LAN", "interface": "bridge"},
+            {".id": "*B", "list": "LAN", "interface": "bridge-plain"},
+        ],
+        filters=DEFCONF_INPUT + [{".id": "*C", "chain": "input", "action": "accept",
+                                  "in-interface": "bridge-plain", "protocol": "udp",
+                                  "dst-port": "67-68", "comment": "ISP_BILLING_PLAIN_TRUST"}],
+    )
+    api = router.api()
+
+    assert api.teardown_plain_infrastructure(ports_to_restore=["ether5"])["success"] is True
+
+    assert router.members == [{".id": "*A", "list": "LAN", "interface": "bridge"}]
+    assert router.filters == DEFCONF_INPUT
+
+
 def test_ensure_hotspot_server_sets_keepalive_default_on_create():
     api = _connected_api()
     calls = []
