@@ -54,6 +54,16 @@ def encode_password(password: str, method: str) -> str:
     return password
 
 
+# Web-admin port defaults.
+#   * 80  on the LAN side (a hotspot AP, or a CPE reached on its LAN).
+#   * Tenda "Remote Web Management" (WAN side) defaults to 8080 on the AC / O
+#     series and some builds expose 8888; it is configurable on the device, so
+#     the per-device port is authoritative and this is only the suggested
+#     default (VERIFIED 8080 from Tenda O3/R502 manuals; 8888 seen in the field).
+DEFAULT_LAN_WEB_PORT = 80
+DEFAULT_WAN_REMOTE_MGMT_PORT = 8080
+
+
 # Normalised working modes the orchestration reasons about.
 MODE_AP = "ap"            # pure access point / bridge: what a safe AP must be
 MODE_ROUTER = "router"    # routes + NATs: the dangerous one behind a hotspot
@@ -265,7 +275,11 @@ class TendaApAdapter(ApAdapter):
         )
 
     def reboot_request(self) -> ApRequest:
-        return ApRequest("post", self.reboot_path, {})
+        # CONFIRMED form: POST /goform/SysToolReboot with body action=0
+        # (marc0u/tenda-wifi AC15 client; Talos TALOS-2025-2167 AC6). An empty
+        # body is ignored by some firmware, so we send action=0 explicitly --
+        # this is one of the hotspot-test "reboot did nothing" suspects.
+        return ApRequest("post", self.reboot_path, {"action": "0"})
 
     def set_ap_mode_requests(self) -> List[ApRequest]:
         # ASSUMED payload: workMode=ap puts the box in pure AP/bridge mode.

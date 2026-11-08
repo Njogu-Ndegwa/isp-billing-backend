@@ -73,17 +73,28 @@ class RouterFetchHttpClient:
     """
 
     def __init__(self, api, base_host: str, *, scheme: str = "http",
+                 port: Optional[int] = None,
                  header_fields: Optional[List[str]] = None):
         self.api = api
         self.base_host = base_host
         self.scheme = scheme
+        # Optional non-default web port. A hotspot-LAN AP answers on 80 (port
+        # left None -> no ":port" in the URL, unchanged behaviour); a PPPoE CPE
+        # answers on its remote-management port (often 8888), passed here.
+        try:
+            self.port: Optional[int] = int(port) if port else None
+        except (TypeError, ValueError):
+            self.port = None
         self.cookie: Optional[str] = None
         self._extra_headers = header_fields or []
 
     def _url(self, path: str) -> str:
         if not path.startswith("/"):
             path = "/" + path
-        return f"{self.scheme}://{self.base_host}{path}"
+        host = self.base_host
+        if self.port and self.port != 80:
+            host = f"{self.base_host}:{self.port}"
+        return f"{self.scheme}://{host}{path}"
 
     def _headers(self, extra: Optional[Dict[str, str]] = None) -> str:
         fields: List[str] = list(self._extra_headers)
